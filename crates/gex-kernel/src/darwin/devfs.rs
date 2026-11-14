@@ -15,7 +15,14 @@
 //! random) gets the first free slot of the table when it runs, after the
 //! slots the kexts that started before it took: that number is the
 //! boot's, not the kernel source's, and it is reported where it is seen.
-//! So are the nodes IOKit's drivers make (the disks, among them).
+//!
+//! The disks' nodes are `IOMediaBSDClient`'s: a block `disk<N><slice>` and
+//! a character `rdisk<N><slice>` per medium, made as each takes its minor
+//! ([`super::storage`]). Its clients start only once `bsd_autoconf` has run
+//! the pseudo-devices' inits and publishes IOBSD, and the root's media
+//! have theirs before the root is mounted: the disks' nodes follow the
+//! pseudo-devices'. That every volume's are made before devfs is mounted,
+//! as the root's are, goes with the stand-in order of the media.
 
 use crate::vfs::{FileType, Metadata, Times};
 use std::collections::HashMap;
@@ -33,6 +40,8 @@ pub enum Kind {
     /// A terminal, whose node the terminal layer opens
     /// ([`super::ttydev`]).
     Terminal,
+    /// A disk's node, block or character (`IOMediaBSDClient`'s `dkopen`).
+    Disk { block: bool },
     /// A driver whose device is not modelled: its open is reported.
     Unmodelled(&'static str),
 }
@@ -59,6 +68,8 @@ const BPF_MAJOR: u32 = 23;
 
 /// `MAXPHYSIO` on arm64: a character device's `va_iosize`.
 pub const MAXPHYSIO: i32 = 64 * 1024;
+/// `BLKDEV_IOSIZE` (bsd/arm/param.h): a block device's `va_iosize`.
+pub const BLKDEV_IOSIZE: i32 = 2048;
 /// `UF_HIDDEN`: what `devfs_getattr` gives the root's `va_flags`.
 pub const UF_HIDDEN: u32 = 0x8000;
 
@@ -92,14 +103,57 @@ const LATE: &[Node] = &[
     node("urandom", None, 1, ROOT, WHEEL, 0o666, Kind::Random),
 ];
 
+/// The disks' nodes, in the order `MinorTable::insert` makes them: each
+/// medium's block node, then its character node.
+fn disks() -> &'static [Node] {
+    static DISKS: std::sync::OnceLock<Vec<Node>> = std::sync::OnceLock::new();
+    DISKS.get_or_init(|| {
+        let (uid, gid, mode) = super::storage::DISK_OWNER;
+        let mut out = Vec::new();
+        for (m, minor) in super::storage::media_order().into_iter().zip(0..) {
+            let name = super::storage::media_bsd_name(m);
+            for (prefix, block) in [("", true), ("r", false)] {
+                let name: &'static str = Box::leak(format!("{prefix}{name}").into_boxed_str());
+                out.push(node(name, Some(super::storage::DISK_MAJOR), minor, uid, gid, mode, Kind::Disk { block }));
+            }
+        }
+        out
+    })
+}
+
+/// Every node of this table, in the order the boot makes them.
+fn nodes() -> impl Iterator<Item = &'static Node> {
+    EARLY.iter().chain(LATE).chain(disks())
+}
+
 /// A devfs node of this table by name.
 pub fn lookup(name: &str) -> Option<&'static Node> {
-    EARLY.iter().chain(LATE).find(|n| n.name == name)
+    nodes().find(|n| n.name == name)
+}
+
+/// A node's file type: a disk's block node is a block device.
+pub fn file_type(n: &Node) -> FileType {
+    match n.kind {
+        Kind::Disk { block: true } => FileType::BlockDevice,
+        _ => FileType::CharDevice,
+    }
+}
+
+/// `devfs_getattr`'s `va_iosize` of a node of type `t`: `BLKDEV_IOSIZE`
+/// (2048 on arm) for a block device, `MAXPHYSIO` for a character one, the
+/// mount's `f_iosize` (512) else.
+pub fn iosize(t: FileType) -> u32 {
+    match t {
+        FileType::BlockDevice => BLKDEV_IOSIZE as u32,
+        FileType::CharDevice => MAXPHYSIO as u32,
+        _ => 512,
+    }
 }
 
 /// The nodes the boot makes, in order (each goes at its directory's end),
 /// all before `devfs_kernel_mount` copies the plane: `devfs_init`'s and
-/// pf's, the BSD ptys' pairs, ptmx, then the late pseudo-devices.
+/// pf's, the BSD ptys' pairs, ptmx, the late pseudo-devices, then the
+/// disks'.
 fn boot_names() -> &'static [String] {
     static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     NAMES.get_or_init(|| {
@@ -112,6 +166,7 @@ fn boot_names() -> &'static [String] {
         }
         out.push("ptmx".into());
         out.extend(LATE.iter().map(|n| n.name.to_string()));
+        out.extend(disks().iter().map(|n| n.name.to_string()));
         out
     })
 }
@@ -294,7 +349,7 @@ pub fn metadata(n: &'static Node) -> Metadata {
     let dev = (n.major.unwrap_or(0) << 24) | n.minor;
     let (mtime, times) = with_times(n.name, |t| t.getattr());
     Metadata {
-        file_type: FileType::CharDevice,
+        file_type: file_type(n),
         size: 0,
         mode: n.mode,
         ino: ino_of(n.name).unwrap_or(0),
@@ -325,19 +380,18 @@ pub fn root_metadata() -> Metadata {
 /// The boot node a stat's attributes are of (by its inode number and
 /// device), if they are one of this table's.
 pub fn node_of(md: &Metadata) -> Option<&'static Node> {
-    if md.file_type != FileType::CharDevice {
+    if !matches!(md.file_type, FileType::CharDevice | FileType::BlockDevice) {
         return None;
     }
-    EARLY.iter().chain(LATE).find(|n| ino_of(n.name) == Some(md.ino) && super::ttydev::linux_rdev((n.major.unwrap_or(0) << 24) | n.minor) == md.rdev)
+    nodes().find(|n| file_type(n) == md.file_type && ino_of(n.name) == Some(md.ino) && super::ttydev::linux_rdev((n.major.unwrap_or(0) << 24) | n.minor) == md.rdev)
 }
 
 /// What `vn_stat` makes of a devfs vnode's attributes beyond the node's:
-/// `st_blksize` its `va_iosize` (`MAXPHYSIO` for a character device, the
-/// mount's `f_iosize` else), `st_blocks` the size rounded to the mount's
-/// 512-byte blocks, no birth time (devfs has no `va_create_time`), and the
-/// root owned by root, hidden.
+/// `st_blksize` its `va_iosize` ([`iosize`]), `st_blocks` the size rounded
+/// to the mount's 512-byte blocks, no birth time (devfs has no
+/// `va_create_time`), and the root owned by root, hidden.
 pub fn stat_fixup(st: &mut crate::fs::Stat, md: &Metadata, path: &str) {
-    st.blksize = if md.file_type == FileType::CharDevice { MAXPHYSIO } else { 512 };
+    st.blksize = iosize(md.file_type) as i32;
     st.blocks = (md.size as i64 + 511) / 512;
     st.birth = Some((0, 0));
     if path == "/dev" {

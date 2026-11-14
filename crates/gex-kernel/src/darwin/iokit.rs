@@ -257,10 +257,23 @@ pub fn class(t: &[Node], i: u32) -> Result<&'static str, String> {
 /// namespace's disk, its AppleAPFSContainerScheme, the AppleAPFSMedia that
 /// is the container's synthesized whole disk, its AppleAPFSContainer, and an
 /// AppleAPFSVolume for each volume by slot (the order the container
-/// publishes them). The BSD names are the device's units'
-/// ([`super::storage::units`]).
+/// publishes them). Each medium has what `IOMediaBSDClient::createNodes`
+/// sets on it: its "BSD Name" (the device's units',
+/// [`super::storage::units`]), and as 32-bit numbers its "BSD Unit" (its
+/// whole disk's anchor), "BSD Major" and "BSD Minor".
 pub(crate) fn add_volumes(t: &mut Vec<Node>) {
-    let named = |b: String| vec![("BSD Name".to_string(), Prop::Str(b))];
+    use super::storage::Media;
+    let named = |m: Media| {
+        let name = super::storage::media_bsd_name(m);
+        let minor = super::storage::media_by_name(&name).map_or(0, |(_, minor)| minor);
+        let unit = if m == Media::Partition { super::storage::units().main } else { super::storage::units().container };
+        vec![
+            ("BSD Name".to_string(), Prop::Str(name)),
+            ("BSD Unit".to_string(), Prop::Num(u64::from(unit), 32)),
+            ("BSD Major".to_string(), Prop::Num(u64::from(super::storage::DISK_MAJOR), 32)),
+            ("BSD Minor".to_string(), Prop::Num(u64::from(minor), 32)),
+        ]
+    };
     let service = |name: &str, class: &'static str, parent: Option<u32>, service_props: Vec<(String, Prop)>| Node {
         name: name.to_string(),
         props: Vec::new(),
@@ -272,18 +285,18 @@ pub(crate) fn add_volumes(t: &mut Vec<Node>) {
         nub: None,
     };
     let store = t.len() as u32;
-    t.push(service("Container", "IOMedia", None, named(super::storage::partition_bsd_name())));
+    t.push(service("Container", "IOMedia", None, named(Media::Partition)));
     let scheme = t.len() as u32;
     t.push(service("AppleAPFSContainerScheme", "AppleAPFSContainerScheme", Some(store), Vec::new()));
     t[store as usize].children.push(scheme);
     let media = t.len() as u32;
-    t.push(service("AppleAPFSMedia", "AppleAPFSMedia", Some(scheme), named(super::storage::container_bsd_name())));
+    t.push(service("AppleAPFSMedia", "AppleAPFSMedia", Some(scheme), named(Media::Container)));
     t[scheme as usize].children.push(media);
     let container = t.len() as u32;
     t.push(service("AppleAPFSContainer", "AppleAPFSContainer", Some(media), Vec::new()));
     t[media as usize].children.push(container);
     for v in super::storage::VOLUMES {
-        let mut service_props = named(super::storage::volume_bsd_name(v.index));
+        let mut service_props = named(Media::Volume(v.index));
         service_props.push(("FullName".to_string(), Prop::Str(v.name.to_string())));
         // The volume's role by name (each volume here is named for its role).
         service_props.push(("Role".to_string(), Prop::Strs(vec![v.name.to_string()])));

@@ -69,6 +69,7 @@ pub fn vtype_of(t: FileType) -> u32 {
         FileType::Regular => vt::VREG,
         FileType::Directory => vt::VDIR,
         FileType::CharDevice => vt::VCHR,
+        FileType::BlockDevice => vt::VBLK,
         FileType::Symlink => vt::VLNK,
         FileType::Socket => vt::VSOCK,
         FileType::Fifo => vt::VFIFO,
@@ -142,7 +143,7 @@ pub fn sb_vnode(path: &str, md: &Metadata) -> SbVnode {
         tty: super::ttydev::vnode_is_tty(md),
         mode: Some((md.mode & 0xfff) as u16),
         flags: file_flags(path),
-        rdev: if md.file_type == FileType::CharDevice { super::attrcall::darwin_dev(md.rdev) } else { 0 },
+        rdev: if matches!(md.file_type, FileType::CharDevice | FileType::BlockDevice) { super::attrcall::darwin_dev(md.rdev) } else { 0 },
         fs: super::kern::fs_name(mnt),
         of: Some((path.to_string(), md.clone())),
         ..Default::default()

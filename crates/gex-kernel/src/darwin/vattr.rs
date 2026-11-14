@@ -281,7 +281,7 @@ pub fn authattr(cred: &super::cred::Cred, old: &Owned, set: &mut SetAttr) -> Res
 fn same_kind(k: Kind, t: FileType) -> bool {
     matches!(
         (k, t),
-        (Kind::Dir, FileType::Directory) | (Kind::File, FileType::Regular) | (Kind::Link, FileType::Symlink) | (Kind::Char, FileType::CharDevice) | (Kind::Fifo, FileType::Fifo) | (Kind::Socket, FileType::Socket)
+        (Kind::Dir, FileType::Directory) | (Kind::File, FileType::Regular) | (Kind::Link, FileType::Symlink) | (Kind::Char, FileType::CharDevice) | (Kind::Block, FileType::BlockDevice) | (Kind::Fifo, FileType::Fifo) | (Kind::Socket, FileType::Socket)
     )
 }
 
@@ -291,6 +291,7 @@ fn type_name(t: FileType) -> &'static str {
         FileType::Directory => "directory",
         FileType::Symlink => "symbolic link",
         FileType::CharDevice => "character device",
+        FileType::BlockDevice => "block device",
         FileType::Fifo => "FIFO",
         FileType::Socket => "socket",
     }

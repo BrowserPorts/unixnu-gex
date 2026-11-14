@@ -75,6 +75,7 @@ fn vtype_of(t: FileType) -> u32 {
         FileType::Regular => VREG,
         FileType::Directory => VDIR,
         FileType::CharDevice => VCHR,
+        FileType::BlockDevice => VBLK,
         FileType::Symlink => VLNK,
         FileType::Socket => VSOCK,
         FileType::Fifo => VFIFO,
@@ -144,7 +145,7 @@ fn vnode(pio: &PathIo<'_>, path: &str, md: &Metadata, name: Option<&str>, want_c
     let owned = if want_owner { super::vattr::get(pio.ns, path, md, None)? } else { super::vattr::Owned { uid: 0, gid: 0, mode: md.mode & 0o7777, flags: 0 } };
     let (data_alloc, rdev) = match md.file_type {
         FileType::Regular => (roundup(md.size, u64::from(vfsstat::BSIZE)), 0),
-        FileType::CharDevice => (0, darwin_dev(st.rdev)),
+        FileType::CharDevice | FileType::BlockDevice => (0, darwin_dev(st.rdev)),
         _ => (0, 0),
     };
     Ok(Vn {
@@ -222,7 +223,7 @@ fn devfs_vnode(mnt: &Mount, path: &str, md: &Metadata, name: Option<&str>) -> Vn
     if is_root {
         unsupported.common |= cmn::PAROBJID | cmn::PARENTID;
     }
-    let is_chr = md.file_type == FileType::CharDevice;
+    let is_dev = matches!(md.file_type, FileType::CharDevice | FileType::BlockDevice);
     Vn {
         vtype: vtype_of(md.file_type),
         tag: VT_DEVFS,
@@ -247,8 +248,8 @@ fn devfs_vnode(mnt: &Mount, path: &str, md: &Metadata, name: Option<&str>) -> Vn
         data_size: md.size,
         data_alloc: roundup(md.size, 512),
         // The node's device, makedev(0, 0) (the console's) included.
-        rdev: if is_chr { darwin_dev(md.rdev) } else { 0 },
-        iosize: if is_chr { super::devfs::MAXPHYSIO as u32 } else { 512 },
+        rdev: if is_dev { darwin_dev(md.rdev) } else { 0 },
+        iosize: super::devfs::iosize(md.file_type),
         // `perms`, the attribute call's.
         user_access: 0,
         encoding: ENCODING,
@@ -585,6 +586,7 @@ impl Kernel {
             al::vtype::VDIR => FileType::Directory,
             al::vtype::VLNK => FileType::Symlink,
             al::vtype::VCHR => FileType::CharDevice,
+            al::vtype::VBLK => FileType::BlockDevice,
             al::vtype::VSOCK => FileType::Socket,
             al::vtype::VFIFO => FileType::Fifo,
             _ => FileType::Regular,

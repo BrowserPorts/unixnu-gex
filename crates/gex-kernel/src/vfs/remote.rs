@@ -212,6 +212,7 @@ pub fn file_type_code(t: FileType) -> u32 {
         FileType::CharDevice => 3,
         FileType::Fifo => 4,
         FileType::Socket => 5,
+        FileType::BlockDevice => 6,
     }
 }
 
@@ -222,6 +223,7 @@ pub fn file_type_of(code: u32) -> FileType {
         3 => FileType::CharDevice,
         4 => FileType::Fifo,
         5 => FileType::Socket,
+        6 => FileType::BlockDevice,
         _ => FileType::Regular,
     }
 }

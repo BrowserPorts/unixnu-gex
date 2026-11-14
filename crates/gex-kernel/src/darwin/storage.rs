@@ -82,6 +82,9 @@ pub struct Facts {
     /// the container's `AppleAPFSMedia`: the anchor numbers they took as
     /// the NAND's namespaces' disks registered at boot.
     pub units: Option<Units>,
+    /// The order the storage's media took their BSD minors in
+    /// ([`media_order`]).
+    pub media_order: Option<[Media; MEDIA]>,
     /// The size in bytes of disk0, the main namespace (its IOMedia's
     /// "Size", 4096-byte blocks).
     pub disk0_bytes: Option<u64>,
@@ -97,7 +100,7 @@ pub struct Units {
 /// The web device's facts. Unset until measured on a 64 GB J120 erase-
 /// restored with 21H461; each, once measured, is set here with the
 /// measurement cited.
-pub const DEVICE: Facts = Facts { units: None, disk0_bytes: None };
+pub const DEVICE: Facts = Facts { units: None, media_order: None, disk0_bytes: None };
 
 /// What measures [`Facts::units`].
 pub const UNITS_MEASUREMENT: &str = "the BSD names of the main NVMe namespace's IOMedia and of the AppleAPFSMedia (a sysdiagnose's ioreg IOMedia entries)";
@@ -115,12 +118,98 @@ pub fn units() -> Units {
     DEVICE.units.unwrap_or(STAND_IN_UNITS)
 }
 
+/// A medium of the storage that `IOMediaBSDClient` gives nodes to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Media {
+    /// The main namespace's whole disk.
+    Whole,
+    /// The GPT partition the container is in.
+    Partition,
+    /// The container's `AppleAPFSMedia`.
+    Container,
+    /// The container's volume at this slot.
+    Volume(u32),
+}
+
+/// How many media have nodes: the disk, its partition, the container and
+/// its volumes.
+pub const MEDIA: usize = 3 + VOLUMES.len();
+
+/// The major `IOMediaBSDClient` takes for every disk, block and character
+/// alike: `devsw_add(-1)`, in IOStorageFamily's `IOMediaBSDClientGlobals`
+/// constructor, gives the first slot from 1 (`bdevsw_isfree(-1)`) free in
+/// both switches. It runs before anything else adds a device: AppleARMPlatform
+/// links IOStorageFamily (its OSBundleLibraries in the kernelcache's prelink
+/// info), so the family is started, its constructors run, before the platform
+/// expert starts and `setPlatform` first publishes IOResources; the kernel's
+/// own `cdevsw_add(-1)` callers (pf in `dlil_init`, the pseudo-devices of
+/// `bsd_autoconf`, fsevents) run after `bsd_init`'s `IOKitInitializeTime`
+/// waits for the platform's IORTC; memdev's `bdevsw_add(-1)` runs only for a
+/// RAM disk; and the kexts that call `cdevsw_add` (IOCryptoAcceleratorFamily,
+/// IOSerialFamily, AppleOnboardSerial, AppleEmbeddedGPS, AppleStockholmControl,
+/// AppleBluetooth) and APFS, which calls `bdevsw_add`, start from nubs below
+/// the platform expert. `bdevsw` (conf.c) is all `NO_BDEVICE` and `cdevsw[1]`
+/// is `NO_CDEVICE`: the slot is 1.
+pub const DISK_MAJOR: u32 = 1;
+
+/// The owner, group and mode of a disk's nodes: `UID_ROOT`, `GID_OPERATOR`,
+/// 0640, as `MinorTable::insert` gives a medium with no `owner-uid`,
+/// `owner-gid` or `owner-mode` (only the disk image drivers set them).
+pub const DISK_OWNER: (u32, u32, u32) = (0, 5, 0o640);
+
+/// What stands in for [`Facts::media_order`] while it is unset: the order
+/// the media register in, the disk, its partition (the GPT scheme publishes
+/// it from its start on the disk), the container (the container scheme's,
+/// on the partition), then the volumes by slot. `IOMediaBSDClient` matches
+/// only once `bsd_autoconf`'s `IOKitBSDInit` publishes the IOBSD resource,
+/// so the media registered by then take their minors in the order the
+/// matching threads start their clients: a fact of the boot, not of the
+/// kernelcache. A reported shortcut ([`unmeasured`]).
+pub const STAND_IN_MEDIA_ORDER: [Media; MEDIA] = {
+    let mut out = [Media::Whole, Media::Partition, Media::Container, Media::Volume(0), Media::Volume(0), Media::Volume(0), Media::Volume(0), Media::Volume(0), Media::Volume(0), Media::Volume(0)];
+    let mut i = 0;
+    while i < VOLUMES.len() {
+        out[3 + i] = Media::Volume(VOLUMES[i].index);
+        i += 1;
+    }
+    out
+};
+
+/// What measures [`Facts::media_order`].
+pub const MEDIA_ORDER_MEASUREMENT: &str = "the BSD Minor of each IOMedia (a sysdiagnose's ioreg IOMedia entries), or `ls -l /dev/disk*`";
+
+/// The media in the order they took their minors: the device's, or the
+/// stand-in. A medium's minor is its place here (`MinorTable::insert`
+/// takes the first free slot, and none is freed at boot).
+pub fn media_order() -> [Media; MEDIA] {
+    DEVICE.media_order.unwrap_or(STAND_IN_MEDIA_ORDER)
+}
+
+/// A medium's BSD name (`"disk%d%s"`: its whole disk's unit and its slice
+/// path).
+pub fn media_bsd_name(m: Media) -> String {
+    match m {
+        Media::Whole => main_bsd_name(),
+        Media::Partition => partition_bsd_name(),
+        Media::Container => container_bsd_name(),
+        Media::Volume(i) => volume_bsd_name(i),
+    }
+}
+
+/// The medium a BSD name is of, with its minor.
+pub fn media_by_name(name: &str) -> Option<(Media, u32)> {
+    media_order().into_iter().zip(0..).find(|&(m, _)| media_bsd_name(m) == name)
+}
+
 /// The facts still unset, each with what measures it, as the line gexc
 /// reports at start; none once all are measured.
 pub fn unmeasured() -> Option<String> {
     let mut gaps = Vec::new();
     if DEVICE.units.is_none() {
         gaps.push(format!("the storage's BSD units (stand-in disk{}, disk{}; measure {UNITS_MEASUREMENT})", STAND_IN_UNITS.main, STAND_IN_UNITS.container));
+    }
+    if DEVICE.media_order.is_none() {
+        gaps.push(format!("the disks' BSD minors (stand-in: the media's registration order; measure {MEDIA_ORDER_MEASUREMENT})"));
     }
     gaps.push(format!("vfs.generic.apfs's sysctl number (stand-in {}; measure {})", super::sysctl::APFS_NODE_STAND_IN, super::sysctl::APFS_NODE_MEASUREMENT));
     if DEVICE.disk0_bytes.is_none() {
@@ -229,6 +318,15 @@ mod tests {
         assert_eq!(DEVICE, Facts::default(), "the device's facts stay unset until measured");
         assert_eq!(volume_bsd_name(4), "disk1s5");
         assert!(unmeasured().is_some());
+    }
+
+    #[test]
+    fn minors_follow_the_media_order() {
+        assert_eq!(media_by_name("disk0"), Some((Media::Whole, 0)));
+        assert_eq!(media_by_name("disk0s1"), Some((Media::Partition, 1)));
+        assert_eq!(media_by_name("disk1"), Some((Media::Container, 2)));
+        assert_eq!(media_by_name("disk1s5"), Some((Media::Volume(4), 7)));
+        assert_eq!(media_by_name("disk1s8"), None);
     }
 
     #[test]

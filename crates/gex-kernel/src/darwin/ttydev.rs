@@ -1206,6 +1206,11 @@ impl Kernel {
             self.darwin_unimplemented(format!("opening /dev/{}: {what}", n.name));
             return Err(Errno::ENXIO);
         }
+        if let super::devfs::Kind::Disk { block } = n.kind {
+            let sw = if block { "bdevsw" } else { "cdevsw" };
+            self.darwin_unimplemented(format!("opening /dev/{}: the disk's {sw} open (IOMediaBSDClient's dkopen of its IOMedia)", n.name));
+            return Err(Errno::ENXIO);
+        }
         Ok(())
     }
 

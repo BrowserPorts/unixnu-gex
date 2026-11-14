@@ -104,6 +104,8 @@ pub enum FileType {
     Directory,
     Symlink,
     CharDevice,
+    /// A block device (a Darwin disk's `disk<N>` node).
+    BlockDevice,
     Fifo,
     Socket,
 }
@@ -116,6 +118,7 @@ impl FileType {
             FileType::Directory => 0o040000,
             FileType::Symlink => 0o120000,
             FileType::CharDevice => 0o020000,
+            FileType::BlockDevice => 0o060000,
             FileType::Fifo => 0o010000,
             FileType::Socket => 0o140000,
         }
@@ -126,6 +129,7 @@ impl FileType {
             FileType::Fifo => 1,
             FileType::CharDevice => 2,
             FileType::Directory => 4,
+            FileType::BlockDevice => 6,
             FileType::Regular => 8,
             FileType::Symlink => 10,
             FileType::Socket => 12,

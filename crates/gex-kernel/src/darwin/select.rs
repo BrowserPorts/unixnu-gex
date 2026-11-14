@@ -174,7 +174,7 @@ impl Kernel {
         if self.darwin_vnode_of(&file).is_none() || file.is_tty() {
             return false;
         }
-        file.metadata().is_ok_and(|md| matches!(md.file_type, FileType::Regular | FileType::Directory | FileType::Symlink | FileType::CharDevice))
+        file.metadata().is_ok_and(|md| matches!(md.file_type, FileType::Regular | FileType::Directory | FileType::Symlink | FileType::CharDevice | FileType::BlockDevice))
     }
 }
 

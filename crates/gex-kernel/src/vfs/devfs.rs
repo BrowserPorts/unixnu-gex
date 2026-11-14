@@ -139,7 +139,7 @@ fn darwin_open(n: &'static crate::darwin::devfs::Node) -> Arc<dyn FileHandle> {
         Kind::Null => Device::Null,
         Kind::Zero => Device::Zero,
         Kind::Random => Device::Random,
-        Kind::Unmodelled(_) => return Arc::new(UnmodelledDev(n)),
+        Kind::Unmodelled(_) | Kind::Disk { .. } => return Arc::new(UnmodelledDev(n)),
         Kind::Terminal => unreachable!("a lookup of a terminal node gives the terminal layer's vnode"),
     };
     Arc::new(DevHandle { device, darwin: Some(n) })
@@ -487,7 +487,8 @@ impl FileHandle for DevDir {
             let ttys: std::collections::HashMap<String, u64> = crate::darwin::ttydev::list().into_iter().collect();
             for name in crate::darwin::devfs::list() {
                 let ino = crate::darwin::devfs::ino_of(&name).or_else(|| ttys.get(&name).copied()).unwrap_or(0);
-                out.push(DirEntry { name, file_type: FileType::CharDevice, ino });
+                let file_type = crate::darwin::devfs::lookup(&name).map_or(FileType::CharDevice, crate::darwin::devfs::file_type);
+                out.push(DirEntry { name, file_type, ino });
             }
             return Ok(out);
         }

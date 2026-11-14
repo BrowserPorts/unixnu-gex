@@ -129,7 +129,7 @@ fn kind_name(t: FileType) -> &'static str {
         FileType::Regular => "file",
         FileType::Directory => "directory",
         FileType::Symlink => "symbolic link",
-        FileType::CharDevice => "device",
+        FileType::CharDevice | FileType::BlockDevice => "device",
         FileType::Fifo => "FIFO",
         FileType::Socket => "socket",
     }

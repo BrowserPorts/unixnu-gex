@@ -127,7 +127,7 @@ fn immutable(ctx: &Ctx<'_>, f: u32, append: bool, ignore: bool) -> Result<(), Er
 /// for a delete's `DELETE_CHILD`), `file` being the file whose ownership
 /// the entitlement's override goes by.
 fn check_immutable(ctx: &Ctx<'_>, n: &Node, file: &Node, dir: Option<&Node>, mut rights: u32, ignore: bool) -> Result<(), Denied> {
-    if matches!(n.vtype, FileType::Socket | FileType::Fifo | FileType::CharDevice) {
+    if matches!(n.vtype, FileType::Socket | FileType::Fifo | FileType::CharDevice | FileType::BlockDevice) {
         rights &= !kauth::WRITE_DATA;
     }
     if rights & kauth::WRITE_RIGHTS == 0 {

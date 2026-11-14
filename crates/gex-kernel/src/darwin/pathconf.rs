@@ -59,7 +59,7 @@ enum Fs {
 
 fn fs_of(path: &str, ty: FileType) -> Fs {
     match ty {
-        FileType::CharDevice => Fs::Spec,
+        FileType::CharDevice | FileType::BlockDevice => Fs::Spec,
         FileType::Fifo => Fs::Fifo,
         FileType::Directory if path == "/dev" || path.starts_with("/dev/") => Fs::Devfs,
         _ => Fs::Apfs,

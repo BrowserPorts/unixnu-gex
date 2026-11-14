@@ -1265,6 +1265,7 @@ fn vnode_info(st: &[u8], ty: crate::vfs::FileType, fsid: u32, fsid2: u32) -> [u8
     let vtype: u32 = match ty {
         T::Regular => 1,
         T::Directory => 2,
+        T::BlockDevice => 3,
         T::CharDevice => 4,
         T::Symlink => 5,
         T::Socket => 6,

@@ -312,7 +312,8 @@ impl Kernel {
 
     /// `mount_common` of a mount on `at` (not `MNT_UPDATE`) as `fmount`
     /// makes it, as far as it is modelled.
-    fn darwin_mount_common(&mut self, _m: &mut GuestMem<'_>, fstype: &str, at: &str, _data: u64, mut flags: u64) -> Result<u64, Errno> {
+    fn darwin_mount_common(&mut self, m: &mut GuestMem<'_>, fstype: &str, at: &str, data: u64, mut flags: u64) -> Result<u64, Errno> {
+        const MAXPATHLEN: usize = 1024;
         const MNT_NOEXEC: u64 = 0x4;
         const MNT_NOSUID: u64 = 0x8;
         const MNT_NODEV: u64 = 0x10;
@@ -346,8 +347,58 @@ impl Kernel {
         if md.file_type != crate::vfs::FileType::Directory {
             return Err(Errno::ENOTDIR);
         }
-        self.darwin_unimplemented(format!("mounting {fstype} on {at} (flags {flags:#x}): mac_mount_check_mount (Sandbox's mpo_mount_check_mount), then the device's open (dkopen) and APFS's apfs_vfsop_mount"));
-        Err(Errno::EPERM)
+        let e = self.darwin_mac_check_mount_mount(super::macvfs::sb_vnode(at, &md), b"apfs");
+        if e != 0 {
+            return Err(super::errno::errno_of(e as i32));
+        }
+        // APFS's vfsconf entry has VFC_VFSLOCALARGS: the arguments start
+        // with the device's path, which mount_common looks up (FOLLOW) and
+        // authorizes, and the filesystem is given what follows it.
+        const NBLKDEV: u32 = 24;
+        const ENOTBLK: i32 = 15;
+        const MNT_RDONLY: u64 = 0x1;
+        let devpath = m.read_u64(data)?;
+        if devpath == 0 {
+            // No device: the filesystem is asked with none.
+            self.darwin_unimplemented(format!("mounting {fstype} on {at} with no device (flags {flags:#x}): apfs_vfsop_mount"));
+            return Err(Errno::EIO);
+        }
+        self.darwin_sb_namei(m, super::bsd::AT_FDCWD as u64, devpath, true, false)?;
+        let raw = m.read_cstr(devpath, MAXPATHLEN)?;
+        let given = String::from_utf8_lossy(&raw).into_owned();
+        let abs = self.path_io().at_path_str(super::bsd::dirfd(super::bsd::AT_FDCWD as u64) as i32, &given)?;
+        let dmd = self.vfs.metadata(&abs)?;
+        let dev = self.vfs.canonical(&abs);
+        if dmd.file_type != crate::vfs::FileType::BlockDevice {
+            return Err(super::errno::errno_of(ENOTBLK));
+        }
+        let node = super::devfs::node_of(&dmd).filter(|n| matches!(n.kind, super::devfs::Kind::Disk { .. }));
+        let Some(node) = node else {
+            self.darwin_unimplemented(format!("mounting {fstype} from {dev}: a block device that is no disk's"));
+            return Err(Errno::ENXIO);
+        };
+        if node.major.unwrap_or(0) >= NBLKDEV {
+            return Err(Errno::ENXIO);
+        }
+        let ronly = flags & MNT_RDONLY != 0;
+        if !issuser {
+            // vnode_authorize: KAUTH_VNODE_READ_DATA, and WRITE_DATA for a
+            // mount that writes.
+            self.darwin_node_access((node.uid, node.gid, node.mode), true, !ronly)?;
+        }
+        // vfs_setmounting: a device a mount is mounted from is busy (the
+        // root's, the System volume's, since mountroot). One open
+        // elsewhere would be too (vcount): no disk node opens here.
+        let medium = super::storage::media_by_name(node.name.trim_start_matches('r')).map(|(m, _)| m);
+        if super::kern::mounts().iter().any(|mnt| super::kern::mount_volume(mnt).map(super::storage::Media::Volume) == medium) {
+            return Err(Errno::EBUSY);
+        }
+        let e = self.darwin_mac_check_vnode_open(super::macvfs::sb_vnode(&dev, &dmd), if ronly { 1 } else { 3 });
+        if e != 0 {
+            return Err(super::errno::errno_of(e as i32));
+        }
+        self.darwin_unimplemented(format!("mounting {fstype} from {given} on {at} (flags {flags:#x}): the device's open (VNOP_OPEN: IOMediaBSDClient's dkopen opens its medium, the AppleAPFSVolume, whose open is APFS's), then apfs_vfsop_mount"));
+        Err(Errno::EIO)
     }
 
     /// `fsctl(path, cmd, data, options)`.

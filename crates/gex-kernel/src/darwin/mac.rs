@@ -63,6 +63,7 @@ pub mod op {
     pub const FILE_LOCK: usize = 16;
     pub const FILE_MAP_EXECUTABLE: usize = 17;
     pub const FILE_MKNOD: usize = 18;
+    pub const FILE_MOUNT: usize = 19;
     pub const FILE_READ: usize = 21;
     pub const FILE_READ_DATA: usize = 22;
     pub const FILE_READ_METADATA: usize = 23;

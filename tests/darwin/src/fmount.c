@@ -3,14 +3,16 @@
 // than MFSNAMELEN ENAMETOOLONG, a descriptor that is no vnode's EINVAL, a
 // volume's root (or what is mounted on) EBUSY; then mount_common's
 // prepare_coveredvp: someone other than root must own the directory
-// (EPERM), and it must be one (ENOTDIR). Nothing is mounted by any of
-// them: the mount list stays as it was.
+// (EPERM), and it must be one (ENOTDIR); then the MAC policies' check,
+// Sandbox's file-mount, which the platform profile refuses this program.
+// Nothing is mounted by any of them: the mount list stays as it was.
 
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/mount.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 // Declared in a header the SDK leaves out.
@@ -61,6 +63,19 @@ int main(void) {
     // Someone other than root on a directory of root's.
     if (getuid() == 0 && (setgid(20) || setuid(501))) return bad("setuid", errno, 0);
     if (expect("another's directory", fmount("apfs", tmp, 0, args), EPERM)) return 1;
+
+    // On a directory of one's own, the MAC policies are asked
+    // (mac_mount_check_mount): the platform profile refuses a program
+    // like this one file-mount.
+    snprintf(path, sizeof path, "/private/var/tmp/fmount-dir-%d", getpid());
+    rmdir(path);
+    if (mkdir(path, 0755)) return bad("mkdir", errno, 0);
+    int dir = open(path, O_RDONLY | O_DIRECTORY);
+    if (dir < 0) return bad("open dir", errno, 0);
+    *(const char **)args = "/dev/disk1s5";
+    if (expect("file-mount", fmount("apfs", dir, MNT_DONTBROWSE, args), EPERM)) return 1;
+    close(dir);
+    rmdir(path);
 
     if (getfsstat(NULL, 0, MNT_NOWAIT) != before) return bad("the mounts after", getfsstat(NULL, 0, MNT_NOWAIT), before);
     printf("fmount ok\n");

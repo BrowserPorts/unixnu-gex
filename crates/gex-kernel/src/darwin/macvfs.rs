@@ -441,6 +441,15 @@ impl Kernel {
         self.darwin_sb_vnode_check(op::FILE_READ_METADATA, v)
     }
 
+    /// `mac_mount_check_mount` of a mount of type `fstype` on the directory
+    /// `v`: Sandbox's hook (slot 87 of its ops, 0xfffffff0069f6e14) asks
+    /// file-mount of the directory's vnode with the type's name in the
+    /// arguments' file system name (`strlcpy`, 16 bytes); AMFI has none.
+    pub(crate) fn darwin_mac_check_mount_mount(&mut self, mut v: SbVnode, fstype: &'static [u8]) -> u32 {
+        v.fs = &fstype[..fstype.len().min(15)];
+        self.darwin_sb_vnode_check(op::FILE_MOUNT, v)
+    }
+
     /// `mpo_vnode_check_open` of open mode `fmode` (FREAD, FWRITE, O_TRUNC):
     /// file-read-data to read, then file-write-data to write or truncate.
     pub(crate) fn darwin_mac_check_vnode_open(&mut self, v: SbVnode, fmode: u32) -> u32 {

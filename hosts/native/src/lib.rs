@@ -1346,6 +1346,12 @@ fn run_process(
             }
         }
         gex_kernel::darwin::boot(tc.as_deref(), sandbox, device_tree.as_deref(), volume_attrs).map_err(|e| anyhow!("the boot payload: {e}"))?;
+        // launchd, the kernel's first process, starts with the kernel's
+        // mounts alone and mounts the other volumes itself; another
+        // program runs on a system launchd has booted.
+        if opts.exe.as_deref() == Some("/sbin/launchd") {
+            gex_kernel::darwin::kern::set_boot_state(gex_kernel::darwin::kern::BootState::Kernel);
+        }
         // The panel: the test embedder's recorder when asked for.
         if let Some(dir) = &opts.darwin_frames {
             std::fs::create_dir_all(dir).map_err(|e| anyhow!("making {}: {e}", dir.display()))?;

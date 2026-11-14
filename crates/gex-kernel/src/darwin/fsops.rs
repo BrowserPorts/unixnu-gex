@@ -278,6 +278,78 @@ impl Kernel {
         }
     }
 
+    /// `fmount(type, fd, flags, data)`: a mount on the directory `fd` is
+    /// open on, through `mount_common` with `KERNEL_MOUNT_FMOUNT`.
+    pub(crate) fn darwin_fmount(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
+        const MFSNAMELEN: usize = 15;
+        const MNT_UNION: u64 = 0x20;
+        const MNT_ROOTFS: u64 = 0x4000;
+        const MNT_IMGSRC_BY_INDEX: u64 = 0x2000_0000;
+        let flags = a[2] as u32 as u64;
+        if flags & (MNT_IMGSRC_BY_INDEX | MNT_ROOTFS) != 0 {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        if flags & MNT_UNION != 0 {
+            return Err(Errno::EPERM);
+        }
+        // copyinstr into fstypename[MFSNAMELEN].
+        let mut tb = [0u8; MFSNAMELEN];
+        let n = m.read_cstr_into(a[0], &mut tb)?.ok_or(Errno::ENAMETOOLONG)?;
+        let fstype = String::from_utf8_lossy(&tb[..n]).into_owned();
+        // file_vnode: a descriptor that is no vnode's is EINVAL.
+        let file = self.fds.get(a[1] as i32)?;
+        if self.darwin_vnode_of(&file).is_none() {
+            return Err(Errno::EINVAL);
+        }
+        let at = file.path.clone();
+        // vnode_getparent: a volume's root has none; mounted on, or the
+        // root, it is busy.
+        if at == "/" || super::kern::is_mount_point(&at) {
+            return Err(Errno::EBUSY);
+        }
+        self.darwin_mount_common(m, &fstype, &at, a[3], flags)
+    }
+
+    /// `mount_common` of a mount on `at` (not `MNT_UPDATE`) as `fmount`
+    /// makes it, as far as it is modelled.
+    fn darwin_mount_common(&mut self, _m: &mut GuestMem<'_>, fstype: &str, at: &str, _data: u64, mut flags: u64) -> Result<u64, Errno> {
+        const MNT_NOEXEC: u64 = 0x4;
+        const MNT_NOSUID: u64 = 0x8;
+        const MNT_NODEV: u64 = 0x10;
+        const MNT_UPDATE: u64 = 0x1_0000;
+        if flags & MNT_UPDATE != 0 {
+            // The update of a mount: fmount's directory is never a mount's
+            // root (above), whose VROOT the update needs.
+            return Err(Errno::EINVAL);
+        }
+        let issuser = self.dtask.cred.uid == 0;
+        // Not root: no set-id programs, no devices, and no execution where
+        // the covered directory's volume allows none.
+        if !issuser {
+            flags |= MNT_NOSUID | MNT_NODEV;
+            if super::kern::mount_of(at).flags as u64 & MNT_NOEXEC != 0 {
+                flags |= MNT_NOEXEC;
+            }
+        }
+        // The vfsconf entry of the type: APFS's is the one modelled.
+        if fstype != "apfs" {
+            self.darwin_unimplemented(format!("a mount of type {fstype:?} (which filesystems the vfsconf table has: only APFS's mounts are modelled)"));
+            return Err(Errno::ENODEV);
+        }
+        // prepare_coveredvp: a user other than root must own the directory;
+        // it must be one; nothing may be mounted on it, nor be mounting.
+        let md = self.vfs.metadata(at)?;
+        let owner = super::vattr::get(&self.vfs, at, &md, None)?;
+        if owner.uid != self.dtask.cred.uid && !issuser {
+            return Err(Errno::EPERM);
+        }
+        if md.file_type != crate::vfs::FileType::Directory {
+            return Err(Errno::ENOTDIR);
+        }
+        self.darwin_unimplemented(format!("mounting {fstype} on {at} (flags {flags:#x}): mac_mount_check_mount (Sandbox's mpo_mount_check_mount), then the device's open (dkopen) and APFS's apfs_vfsop_mount"));
+        Err(Errno::EPERM)
+    }
+
     /// `fsctl(path, cmd, data, options)`.
     pub(crate) fn darwin_fsctl(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
         const MAXPATHLEN: usize = 1024;

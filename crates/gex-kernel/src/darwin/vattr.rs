@@ -82,13 +82,20 @@ fn within(path: &str, at: &str) -> bool {
     path == at || path.strip_prefix(at).is_some_and(|r| r.starts_with('/'))
 }
 
-/// Whether canonical path `path` is on the Data volume.
+/// Whether canonical path `path` is on the Data volume, as a booted system
+/// has it in place ([`super::kern::BootState::Booted`]). While only the
+/// kernel's mounts are (launchd's boot), `/private/var` is the system
+/// volume's own directory until a mount covers it.
 pub fn on_data(path: &str) -> bool {
-    within(path, DATA) && !OTHER_VOLUMES.iter().any(|v| within(path, v.0))
+    super::kern::boot_state() == super::kern::BootState::Booted && within(path, DATA) && !OTHER_VOLUMES.iter().any(|v| within(path, v.0))
 }
 
-/// The other volume `path` is on, if it is on one.
+/// The other volume `path` is on, if a booted system has one there
+/// ([`on_data`]'s rule).
 fn other_volume(path: &str) -> Option<(&'static str, &'static str, bool)> {
+    if super::kern::boot_state() != super::kern::BootState::Booted {
+        return None;
+    }
     OTHER_VOLUMES.iter().copied().find(|v| within(path, v.0))
 }
 
@@ -100,7 +107,7 @@ pub fn device_nosuid(path: &str) -> bool {
     match m.vol {
         Some(Vol::System) => on_data(path) || other_volume(path).is_some(),
         Some(Vol::OsCryptex) => true,
-        None => false,
+        None => m.flags & super::kern::MNT_NOSUID != 0,
     }
 }
 

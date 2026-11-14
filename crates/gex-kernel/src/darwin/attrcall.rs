@@ -4,7 +4,7 @@
 
 use super::attrlist::{self as al, dir, ext, file, fsopt, vol, AttrList, AttrSet, Reply, VolCaps, VolInfo, Vn};
 use super::bsd::dirfd;
-use super::kern::{mount_of, vfsstat, Mount, MOUNTS};
+use super::kern::{mount_of, vfsstat, Mount};
 use crate::errno::Errno;
 use crate::syscalls::{Kernel, PathIo};
 use crate::vfs::{FileType, Metadata};
@@ -155,7 +155,7 @@ fn vnode(pio: &PathIo<'_>, path: &str, md: &Metadata, name: Option<&str>, want_c
         path: path.to_string(),
         relpath,
         fsid: (mnt.fsid as u32, vfsstat::APFS_TYPENUM),
-        is_mount_point: MOUNTS.iter().any(|m| m.on == path),
+        is_mount_point: super::kern::is_mount_point(path),
         fileid: md.ino,
         parentid,
         mode: owned.mode,

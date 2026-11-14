@@ -161,9 +161,10 @@ pub enum Fs {
     Devfs,
 }
 
-/// `MNT_RDONLY`, `MNT_LOCAL`, `MNT_ROOTFS`, `MNT_DONTBROWSE`,
+/// `MNT_RDONLY`, `MNT_NOSUID`, `MNT_LOCAL`, `MNT_ROOTFS`, `MNT_DONTBROWSE`,
 /// `MNT_MULTILABEL`.
 const MNT_RDONLY: u32 = 0x1;
+pub(crate) const MNT_NOSUID: u32 = 0x8;
 const MNT_LOCAL: u32 = 0x1000;
 pub(crate) const MNT_ROOTFS: u32 = 0x4000;
 const MNT_DONTBROWSE: u32 = 0x10_0000;
@@ -177,16 +178,92 @@ pub const DEVFS_TYPENUM: u32 = 19;
 /// kernel address that each boot makes anew; this is this boot's.
 pub const DEVFS_FSID: u32 = 0x9a3c_51e7;
 
-/// What an iOS 17 system has mounted, in the order of the mount list: the
-/// system volume, devfs (`devfs_kernel_mount` in `bsd_init`, right after
-/// the root: MNT_DONTBROWSE, MNT_LOCAL from `devfs_mount`, MNT_MULTILABEL
-/// from its MACF `vfc_flags`), and the SystemOS cryptex the shared cache
-/// is in, by the filesystem id its dynamic data names.
-pub const MOUNTS: &[Mount] = &[
+/// What the system has mounted when its first program starts, in the order
+/// of the mount list: the system volume, devfs (`devfs_kernel_mount` in
+/// `bsd_init`, right after the root: MNT_DONTBROWSE, MNT_LOCAL from
+/// `devfs_mount`, MNT_MULTILABEL from its MACF `vfc_flags`), and the
+/// SystemOS cryptex the shared cache is in, by the filesystem id its
+/// dynamic data names (standing for libignition's graft, which is not
+/// made yet).
+const BOOT_MOUNTS: &[Mount] = &[
     Mount { on: "/", from: From::Snapshot(0), fsid: 0x0100_0002, flags: MNT_RDONLY | MNT_ROOTFS, fs: Fs::Apfs, vol: Some(super::volattrs::Vol::System) },
     Mount { on: "/dev", from: From::Devfs, fsid: DEVFS_FSID as u64, flags: MNT_LOCAL | MNT_DONTBROWSE | MNT_MULTILABEL, fs: Fs::Devfs, vol: None },
     Mount { on: "/System/Cryptexes/OS", from: From::OsCryptex, fsid: super::CACHE_FS_ID, flags: MNT_RDONLY | MNT_DONTBROWSE, fs: Fs::Apfs, vol: Some(super::volattrs::Vol::OsCryptex) },
 ];
+
+/// The mount list (`mountlist`): the boot's mounts, then each one mounted
+/// since, in the order they were (`mount_list_add` puts a new mount at the
+/// end). One for the whole system, as XNU keeps it: every process sees a
+/// mount made by any. A mount's record lives as long as the system.
+static MOUNT_LIST: std::sync::RwLock<Vec<&'static Mount>> = std::sync::RwLock::new(Vec::new());
+
+/// The mounts, in the order of the mount list.
+pub fn mounts() -> Vec<&'static Mount> {
+    {
+        let l = MOUNT_LIST.read().unwrap_or_else(|e| e.into_inner());
+        if !l.is_empty() {
+            return l.clone();
+        }
+    }
+    let mut l = MOUNT_LIST.write().unwrap_or_else(|e| e.into_inner());
+    if l.is_empty() {
+        l.extend(BOOT_MOUNTS.iter());
+    }
+    l.clone()
+}
+
+/// Put `mnt` at the end of the mount list (`mount_list_add`).
+pub fn mount_list_add(mnt: Mount) -> &'static Mount {
+    mounts();
+    let mnt: &'static Mount = Box::leak(Box::new(mnt));
+    MOUNT_LIST.write().unwrap_or_else(|e| e.into_inner()).push(mnt);
+    MOUNT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    mnt
+}
+
+/// `mount_generation`: how many times the mount list has changed.
+static MOUNT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many times the mount list has changed.
+pub fn mount_generation() -> u64 {
+    MOUNT_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Whether something is mounted on `path` (a covered vnode's
+/// `v_mountedhere`).
+pub fn is_mount_point(path: &str) -> bool {
+    mounts().iter().any(|m| m.on == path)
+}
+
+/// What the system has mounted when its first program starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BootState {
+    /// The kernel's mounts alone ([`BOOT_MOUNTS`]): launchd, the first
+    /// process, mounts the other volumes itself.
+    Kernel,
+    /// A system launchd has booted, where gexc runs another program in its
+    /// place: the volumes the device tree's fstab names (the Data volume and
+    /// the others) are in place over the system volume's directories,
+    /// which their owners, modes and flags follow ([`super::vattr`]).
+    Booted,
+}
+
+static BOOT_STATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set what the system has mounted at start: [`BootState::Kernel`] when
+/// launchd is the first program.
+pub fn set_boot_state(state: BootState) {
+    BOOT_STATE.store(state == BootState::Kernel, std::sync::atomic::Ordering::Release);
+}
+
+/// What the system had mounted at start.
+pub fn boot_state() -> BootState {
+    if BOOT_STATE.load(std::sync::atomic::Ordering::Acquire) {
+        BootState::Kernel
+    } else {
+        BootState::Booted
+    }
+}
 
 /// The volume the preboot cryptexes are on: what `vnode_lookup` of
 /// `/private/preboot/Cryptexes` finds the mount of, for the shared region's
@@ -194,7 +271,7 @@ pub const MOUNTS: &[Mount] = &[
 /// cryptex at `/System/Cryptexes/OS`, the mount above standing for the
 /// Preboot volume's graft of it, and no `/private/preboot/Cryptexes`.
 pub fn preboot_cryptex_volume() -> Option<&'static str> {
-    MOUNTS.iter().find(|m| m.on == "/System/Cryptexes/OS").map(|m| m.on)
+    mounts().into_iter().find(|m| m.on == "/System/Cryptexes/OS").map(|m| m.on)
 }
 
 /// A mount's `f_mntfromname`. A volume's is its device's path (what
@@ -301,11 +378,12 @@ pub mod vfsstat {
 /// The mount a path is on: the one with the longest mount point that
 /// holds it.
 pub fn mount_of(path: &str) -> &'static Mount {
-    MOUNTS
-        .iter()
+    let l = mounts();
+    l.iter()
+        .copied()
         .filter(|mt| path == mt.on || path.starts_with(&format!("{}/", mt.on.trim_end_matches('/'))))
         .max_by_key(|mt| mt.on.len())
-        .unwrap_or(&MOUNTS[0])
+        .unwrap_or(l[0])
 }
 
 /// One `struct statfs64` for `mnt`.
@@ -545,6 +623,7 @@ impl Kernel {
             sys::IOPOLICYSYS => res(self.darwin_iopolicysys(m, a[0] as i32, a[1])),
             sys::FSYNC | sys::FSYNC_NOCANCEL | sys::FDATASYNC => res(self.darwin_fsync(m, a[0] as i32)),
             sys::MOUNT => res(self.darwin_mount(m, a)),
+            sys::FMOUNT => res(self.darwin_fmount(m, a)),
             sys::GETXATTR => res(self.darwin_getxattr(m, false, a)),
             sys::FGETXATTR => res(self.darwin_getxattr(m, true, a)),
             sys::SETATTRLIST => res(self.darwin_setattrlist(m, a)),
@@ -1189,7 +1268,7 @@ impl Kernel {
         }
         let fs = u64::from(m.read_u32(a[2])?) | u64::from(m.read_u32(a[2] + 4)?) << 32;
         // mount_lookupby_volfsid, by the first half.
-        let Some(mnt) = MOUNTS.iter().find(|mnt| mnt.fsid as u32 == fs as u32) else {
+        let Some(mnt) = mounts().into_iter().find(|mnt| mnt.fsid as u32 == fs as u32) else {
             return Err(Errno::EOPNOTSUPP);
         };
         let image = self.dtask.image_files.iter().find(|f| (f.0, f.1) == (fs, a[3])).map(|f| f.2.clone());
@@ -1253,7 +1332,7 @@ impl Kernel {
     /// `getfsstat64(buf, bufsize, flags)`: the mounts, or how many there
     /// are when `buf` is null.
     fn darwin_getfsstat(&mut self, m: &mut GuestMem<'_>, buf: u64, size: u64) -> Result<u64, Errno> {
-        let mounts = MOUNTS;
+        let mounts = mounts();
         if buf == 0 {
             return Ok(mounts.len() as u64);
         }
@@ -1323,11 +1402,12 @@ impl Kernel {
                 return Err(Errno::EINVAL);
             }
         }
+        let mounts = mounts();
         if buf == 0 {
-            return Ok(MOUNTS.len() as u64);
+            return Ok(mounts.len() as u64);
         }
-        let n = maxcount.min(MOUNTS.len());
-        for (i, mnt) in MOUNTS.iter().take(n).enumerate() {
+        let n = maxcount.min(mounts.len());
+        for (i, mnt) in mounts.iter().take(n).enumerate() {
             m.write(buf + (i * STATFS_SIZE) as u64, &statfs_ino32(mnt))?;
         }
         Ok(n as u64)

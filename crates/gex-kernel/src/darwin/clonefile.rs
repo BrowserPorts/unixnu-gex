@@ -61,7 +61,7 @@ impl Kernel {
     fn darwin_clone_internal(&mut self, m: &GuestMem<'_>, src: &str, handle: Option<Arc<dyn FileHandle>>, md: Metadata, found: Option<super::macvfs::Found>, dst_dirfd: u64, dst: u64, flags: u64) -> Result<u64, Errno> {
         match md.file_type {
             FileType::Regular | FileType::Symlink => {}
-            FileType::Directory if src == "/" || super::kern::MOUNTS.iter().any(|mnt| mnt.on == src) => return Err(Errno::EINVAL),
+            FileType::Directory if src == "/" || super::kern::is_mount_point(src) => return Err(Errno::EINVAL),
             FileType::Directory => {}
             _ => return Err(Errno::EINVAL),
         }

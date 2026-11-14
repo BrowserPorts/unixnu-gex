@@ -258,24 +258,13 @@ fn devfs_vnode(mnt: &Mount, path: &str, md: &Metadata, name: Option<&str>) -> Vn
     }
 }
 
-/// The volume's UUID. The root image keeps none, so each volume is given a
-/// stable one of its own, made from where it is mounted and from what
-/// (a name-based UUID, version 8 for the vendor-defined layout: FNV-1a over
-/// the two names, twice with different seeds).
-fn volume_uuid(mnt: &Mount, from: &str) -> [u8; 16] {
-    let hash = |seed: u64| {
-        let mut h = 0xcbf2_9ce4_8422_2325u64 ^ seed;
-        for b in mnt.on.bytes().chain([0]).chain(from.bytes()) {
-            h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        h
-    };
-    let mut u = [0u8; 16];
-    u[..8].copy_from_slice(&hash(0).to_be_bytes());
-    u[8..].copy_from_slice(&hash(0x9e37_79b9_7f4a_7c15).to_be_bytes());
-    u[6] = (u[6] & 0x0f) | 0x80;
-    u[8] = (u[8] & 0x3f) | 0x80;
-    u
+/// The volume's UUID: the container's volume's ([`super::storage::volume_uuid`]),
+/// or the OS cryptex's, its image's.
+fn volume_uuid(mnt: &Mount) -> [u8; 16] {
+    match super::kern::mount_volume(mnt) {
+        Some(i) => super::storage::volume_uuid(i),
+        None => super::storage::OS_CRYPTEX_UUID,
+    }
 }
 
 /// The volume `mnt` as `getvolattrlist` has it, its root's owner read
@@ -292,7 +281,7 @@ fn volume(pio: &PathIo<'_>, mnt: &Mount, want_owner: bool) -> Result<VolInfo, Er
         typenum: vfsstat::APFS_TYPENUM,
         typename: "apfs".into(),
         mntonname: mnt.on.into(),
-        mntfromname: from.clone(),
+        mntfromname: from,
         mnt_flag: mnt.flags,
         bsize: vfsstat::BSIZE,
         iosize: vfsstat::IOSIZE,
@@ -302,7 +291,7 @@ fn volume(pio: &PathIo<'_>, mnt: &Mount, want_owner: bool) -> Result<VolInfo, Er
         fssubtype: APFS_FSSUBTYPE,
         caps: APFS_CAPS,
         attributes: apfs_attributes(),
-        uuid: volume_uuid(mnt, &from),
+        uuid: volume_uuid(mnt),
         // `f_maxobjcount`, as APFS says it: no limit.
         max_objcount: u32::MAX,
         quota: 0,

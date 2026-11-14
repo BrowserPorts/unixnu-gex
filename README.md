@@ -700,7 +700,9 @@ is the reference (search `crates/gex-kernel/src/` for
   (spaceman) after the restore and first boot. The root's
   `f_mntfromname` is the System volume's device path: whether APFS's
   mountroot names the root snapshot's own device instead is not yet
-  traced. The OS cryptex is still a mount of its own at
+  traced. Volumes have the UUIDs newfs_apfs gives their roles; the System
+  volume has the system image's, as ASR's restore of it, whether ASR keeps
+  it not yet traced. The OS cryptex is still a mount of its own at
   `/System/Cryptexes/OS` rather than Preboot's graft of it. The number of
   the sysctl node `vfs.generic.apfs` is the boot's (APFS, lifs and hfs
   register after IOBSD), so giving it out is reported. APFS's `fsctl`s

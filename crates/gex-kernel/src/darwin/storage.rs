@@ -148,6 +148,55 @@ pub fn volume_bsd_name(index: u32) -> String {
     format!("{}s{}", container_bsd_name(), index + 1)
 }
 
+/// A hex digit's value.
+const fn hex(c: u8) -> u8 {
+    match c {
+        b'0'..=b'9' => c - b'0',
+        b'a'..=b'f' => c - b'a' + 10,
+        _ => c - b'A' + 10,
+    }
+}
+
+/// `uuid_parse` of a string, at compile time.
+const fn uuid(s: &str) -> [u8; 16] {
+    let b = s.as_bytes();
+    let mut out = [0u8; 16];
+    let (mut i, mut o) = (0, 0);
+    while o < 16 {
+        if b[i] == b'-' {
+            i += 1;
+            continue;
+        }
+        out[o] = hex(b[i]) << 4 | hex(b[i + 1]);
+        i += 2;
+        o += 1;
+    }
+    out
+}
+
+/// A volume's UUID. newfs_apfs gives the volumes the restore adds (`-D`,
+/// no `-T`) the UUID `uuid_from_role` makes of their role:
+/// 61706673-7575-6964-RRRR-766f6c756d00 ("apfsuuid", the role, "volum").
+/// The System volume is then ASR's restore of the system image's volume,
+/// whose UUID is 04769D26-2CA0-4825-B443-E2E5F88300F2 (044-76040-038.dmg);
+/// whether ASR keeps it or the volume's own is not yet traced, and the
+/// image's stands in (a reported shortcut).
+pub fn volume_uuid(index: u32) -> [u8; 16] {
+    let Some(v) = volume(index) else { return [0; 16] };
+    if v.role == role::SYSTEM {
+        return SYSTEM_IMAGE_UUID;
+    }
+    let mut u = uuid("61706673-7575-6964-0000-766f6c756d00");
+    u[8..10].copy_from_slice(&v.role.to_be_bytes());
+    u
+}
+
+/// The system image's volume's UUID (044-76040-038.dmg).
+pub const SYSTEM_IMAGE_UUID: [u8; 16] = uuid("04769D26-2CA0-4825-B443-E2E5F88300F2");
+
+/// The SystemOS cryptex image's volume's UUID (044-76034-038.dmg).
+pub const OS_CRYPTEX_UUID: [u8; 16] = uuid("8846FE78-2910-4297-AF97-D59BB6F8FC16");
+
 /// The name of the System volume's sealed snapshot the restore makes and
 /// the root is mounted from: "com.apple.os.update-" and, in hex capitals,
 /// the root hash the root hash object holds (`copy_arv_apfs_system_snapshot_name`,
@@ -179,5 +228,12 @@ mod tests {
         assert_eq!(DEVICE, Facts::default(), "the device's facts stay unset until measured");
         assert_eq!(volume_bsd_name(4), "disk1s5");
         assert!(unmeasured().is_some());
+    }
+
+    #[test]
+    fn volumes_take_their_roles_uuids() {
+        assert_eq!(volume_uuid(4), uuid("61706673-7575-6964-0010-766f6c756d00"), "Preboot");
+        assert_eq!(volume_uuid(3), uuid("61706673-7575-6964-0140-766f6c756d00"), "Hardware");
+        assert_eq!(volume_uuid(0), SYSTEM_IMAGE_UUID);
     }
 }

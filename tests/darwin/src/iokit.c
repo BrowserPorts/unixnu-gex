@@ -1,6 +1,8 @@
 // IOKit from a task: the main port, the device tree's entries and their
 // properties, a path that does not exist, the APFS volumes as services
-// with their roles and the container above them (an iterator over them
+// with their roles (the seven an erase restore makes) and the container's
+// synthesized disk above them (its BSD name is the device's, which
+// apfsroles covers; an iterator over them
 // reset to its first), and a matching
 // notification: the volumes already there, the last first, then none; a
 // termination notification has none, and an unknown kind is refused.
@@ -55,12 +57,9 @@ int main(void) {
         CFStringRef name = CFArrayGetValueAtIndex(role, 0);
         if (CFStringCompare(name, CFSTR("System"), 0) == kCFCompareEqualTo) {
             system++;
-            io_registry_entry_t scheme = IO_OBJECT_NULL, media = IO_OBJECT_NULL;
-            if (IORegistryEntryGetParentEntry(v, kIOServicePlane, &scheme) != KERN_SUCCESS) return bad("the volume's scheme", 0, 1);
-            if (IORegistryEntryGetParentEntry(scheme, kIOServicePlane, &media) != KERN_SUCCESS) return bad("the scheme's media", 0, 1);
-            CFTypeRef bsd = IORegistryEntryCreateCFProperty(media, CFSTR("BSD Name"), kCFAllocatorDefault, 0);
-            if (bsd == NULL || CFGetTypeID(bsd) != CFStringGetTypeID() || CFStringCompare(bsd, CFSTR("disk1"), 0) != kCFCompareEqualTo) return bad("the container's BSD name", 0, 1);
-            CFRelease(bsd);
+            io_registry_entry_t container = IO_OBJECT_NULL, media = IO_OBJECT_NULL;
+            if (IORegistryEntryGetParentEntry(v, kIOServicePlane, &container) != KERN_SUCCESS || !IOObjectConformsTo(container, "AppleAPFSContainer")) return bad("the volume's container", 0, 1);
+            if (IORegistryEntryGetParentEntry(container, kIOServicePlane, &media) != KERN_SUCCESS || !IOObjectConformsTo(media, "AppleAPFSMedia")) return bad("the container's media", 0, 1);
         }
         CFRelease(role);
         IOObjectRelease(v);
@@ -75,7 +74,7 @@ int main(void) {
     }
     if (again != volumes) return bad("volumes after a reset", again, volumes);
     IOObjectRelease(it);
-    if (volumes != 6) return bad("volumes", volumes, 6);
+    if (volumes != 7) return bad("volumes", volumes, 7);
     if (system != 1) return bad("system volumes", system, 1);
 
     uint64_t a[64], b[64];

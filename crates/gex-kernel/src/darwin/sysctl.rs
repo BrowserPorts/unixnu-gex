@@ -219,7 +219,7 @@ static KEXT_NODES: &[Node] = &[
     // apfs.kext's (sysctl_oid structs from 0xfffffff007b2d4c0), registered
     // in its list's order (0xfffffff006f2b578: edt_fstab first, the node
     // itself last), each OID_AUTO number one past its siblings' highest.
-    Node { path: "vfs.generic.apfs", number: UNSETTLED_NUMBER, kind: 0xc040_0001, fmt: "N", handler: false },
+    Node { path: "vfs.generic.apfs", number: APFS_NODE_STAND_IN, kind: 0xc040_0001, fmt: "N", handler: false },
     Node { path: "vfs.generic.apfs.edt_fstab", number: 100, kind: 0x2040_0000, fmt: "-", handler: true },
     Node { path: "vfs.generic.apfs.unwritten_freeze_threshold", number: 101, kind: 0xc040_0004, fmt: "Q", handler: true },
     Node { path: "vfs.generic.apfs.proc_free_blocks_threshold", number: 102, kind: 0x4040_0002, fmt: "I", handler: true },
@@ -233,22 +233,17 @@ static KEXT_NODES: &[Node] = &[
     Node { path: "vfs.generic.apfs.allocated", number: 110, kind: 0x80c0_0004, fmt: "Q", handler: true },
 ];
 
-/// The number of a node whose OID_AUTO number this kernel cannot know: it
-/// stands in the tree for it, and is never given out ([`unsettled`]).
-const UNSETTLED_NUMBER: i32 = i32::MIN;
-
-/// Why a node's number is unsettled. `vfs.generic.apfs`: one past the
-/// highest of `vfs.generic`'s children when APFS registers it, which it
-/// does once the IOBSD resource is published (the container scheme's wait,
+/// What stands in for `vfs.generic.apfs`'s number: one past the highest of
+/// `vfs.generic`'s children (106) when APFS registers it, which it does once
+/// the IOBSD resource is published (the container scheme's wait,
 /// 0xfffffff00666b464), as lifs and hfs register `vfs.generic.lifs` and
-/// `vfs.generic.hfs` on their own matching of it: which goes first is the
-/// boot's.
-const UNSETTLED_WHY: &str = "the number of sysctl node vfs.generic.apfs: 107, 108 or 109 as APFS, lifs and hfs register under vfs.generic after IOBSD is published, an order of the boot's to be measured (sysctl.name2oid of vfs.generic.apfs on the device)";
+/// `vfs.generic.hfs` on their own matching of it: 107 if APFS is first. The
+/// order is the boot's; a reported shortcut until measured
+/// ([`APFS_NODE_MEASUREMENT`]).
+pub const APFS_NODE_STAND_IN: i32 = 107;
 
-/// Why `oid` cannot be given out, when it holds an unsettled number.
-pub fn unsettled(oid: &[i32]) -> Option<&'static str> {
-    oid.contains(&UNSETTLED_NUMBER).then_some(UNSETTLED_WHY)
-}
+/// What measures `vfs.generic.apfs`'s number.
+pub const APFS_NODE_MEASUREMENT: &str = "sysctl.name2oid of vfs.generic.apfs on the device";
 
 struct Tree {
     /// Every node with its numbers from the root, in their order.

@@ -488,12 +488,16 @@ hello from /var/tmp/gex-exec-fat with 1 argument" 0
     console) check_root console "console ok" 0 ;;
     stackfb) check_root stackfb "stackfb ok" 0 ;;
     # apfsroles' devices are disk1's while the storage's units are
-    # unmeasured stand-ins; the number of vfs.generic.apfs, which
-    # sysctlbyname of edt_fstab asks for, is the boot's: reported, which a
-    # strict run stops at.
+    # unmeasured stand-ins.
     apfsroles) check_root apfsroles "apfsroles errors ok
 preboot /dev/disk1s5
-system /dev/disk1s1" $STRICT_STOP ;;
+system /dev/disk1s1
+/dev/disk1s3 /private/xarts apfs nosuid,nodev,nobrowse,rw 0x100
+/dev/disk1s1 / apfs ro 0x1
+/dev/disk1s5 /private/preboot apfs nosuid,nodev,nobrowse,ro 0x10
+/dev/disk1s2 /private/var apfs nosuid,nodev,rw 0x40
+/dev/disk1s6 /private/var/MobileSoftwareUpdate apfs nosuid,nodev,nobrowse,rw 0xc0
+/dev/disk1s4 /private/var/hardware apfs nosuid,nodev,nobrowse,rw 0x140" 0 ;;
     *)
         echo "FAIL $1: no such program"
         fail=1

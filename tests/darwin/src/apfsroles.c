@@ -8,9 +8,7 @@
 // its type after them, and role).
 //
 // The device paths are the container's BSD name's, disk1 while the
-// storage's units are unmeasured stand-ins. sysctlbyname asks for the
-// edt_fstab node's numbers, and vfs.generic.apfs's is the boot's to give:
-// reported, which a strict run stops at.
+// storage's units are unmeasured stand-ins.
 
 #include <errno.h>
 #include <stdint.h>

@@ -122,10 +122,11 @@ pub fn unmeasured() -> Option<String> {
     if DEVICE.units.is_none() {
         gaps.push(format!("the storage's BSD units (stand-in disk{}, disk{}; measure {UNITS_MEASUREMENT})", STAND_IN_UNITS.main, STAND_IN_UNITS.container));
     }
+    gaps.push(format!("vfs.generic.apfs's sysctl number (stand-in {}; measure {})", super::sysctl::APFS_NODE_STAND_IN, super::sysctl::APFS_NODE_MEASUREMENT));
     if DEVICE.disk0_bytes.is_none() {
         gaps.push(format!("disk0's capacity (APFS statfs counts are stand-ins; measure {CAPACITY_MEASUREMENT})"));
     }
-    (!gaps.is_empty()).then(|| format!("unmeasured 64 GB J120 facts answered with stand-ins: {}", gaps.join("; ")))
+    (!gaps.is_empty()).then(|| format!("unmeasured facts of a 64 GB J120 answered with stand-ins: {}", gaps.join("; ")))
 }
 
 /// The main namespace's whole disk's BSD name (`disk<main>`).

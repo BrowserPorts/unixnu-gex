@@ -197,15 +197,19 @@ pub fn preboot_cryptex_volume() -> Option<&'static str> {
     MOUNTS.iter().find(|m| m.on == "/System/Cryptexes/OS").map(|m| m.on)
 }
 
-/// A mount's `f_mntfromname`. A volume's is its device's path; the root's
-/// that of the System volume it is mounted from (the sealed snapshot
-/// [`super::storage::ROOT_SNAPSHOT`] is what APFS mounts of it). The
-/// cryptex mount stands for Preboot's graft, which has no device of its
-/// own: its name is the stand-in's.
+/// A mount's `f_mntfromname`. A volume's is its device's path (what
+/// mount_common copies from the path given). The root's is what
+/// `vfs_rootmountalloc_internal` gives it, "root_device": APFS's mountroot
+/// (`apfs_vfsop_mountroot`, which mounts the sealed snapshot
+/// [`super::storage::ROOT_SNAPSHOT`] of the System volume from `rootvp`)
+/// does not rename it, as only its snapshot and by-role mounts name a
+/// mount's device. The cryptex mount stands for Preboot's graft, which has
+/// no device of its own: its name is the stand-in's.
 pub fn mount_from(mnt: &Mount) -> String {
     match mnt.from {
         From::Devfs => "devfs".to_string(),
-        From::Volume(i) | From::Snapshot(i) => format!("/dev/{}", super::storage::volume_bsd_name(i)),
+        From::Volume(i) => format!("/dev/{}", super::storage::volume_bsd_name(i)),
+        From::Snapshot(_) => "root_device".to_string(),
         From::OsCryptex => "/dev/disk3s1".to_string(),
     }
 }
@@ -1379,14 +1383,7 @@ impl Kernel {
         use sysctl::ctl;
         let oid = match &name {
             Some(n) => sysctl::name2oid(n)?,
-            None => {
-                // A number this kernel cannot know is not one a caller has.
-                if let Some(why) = sysctl::unsettled(&oid) {
-                    self.darwin_unimplemented(why.to_string());
-                    return Err(Errno::ENOENT);
-                }
-                oid
-            }
+            None => oid,
         };
         let (node, tail) = sysctl::find(&oid)?;
         // The name it is checked under, as the walk builds it.
@@ -1415,13 +1412,7 @@ impl Kernel {
         match node.path {
             "sysctl.name" => req.out(m, sysctl::name_of(tail).as_bytes()).and_then(|()| req.out(m, b"\0")),
             "sysctl.next" => match sysctl::next(tail) {
-                Some(o) => match sysctl::unsettled(&o) {
-                    Some(why) => {
-                        self.darwin_unimplemented(why.to_string());
-                        Err(Errno::EIO)
-                    }
-                    None => req.out(m, &oid_bytes(&o)),
-                },
+                Some(o) => req.out(m, &oid_bytes(&o)),
                 None => Err(Errno::ENOENT),
             },
             "sysctl.name2oid" => {
@@ -1434,10 +1425,6 @@ impl Kernel {
                 let bytes = req.input(m, req.newlen as usize)?;
                 let n = String::from_utf8_lossy(&bytes).trim_end_matches('\0').to_string();
                 let o = sysctl::name2oid(&n)?;
-                if let Some(why) = sysctl::unsettled(&o) {
-                    self.darwin_unimplemented(why.to_string());
-                    return Err(Errno::EIO);
-                }
                 req.out(m, &oid_bytes(&o))
             }
             "vfs.generic.apfs.edt_fstab" => self.darwin_sysctl_edt_fstab(m, req),

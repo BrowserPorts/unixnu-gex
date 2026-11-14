@@ -132,10 +132,24 @@ const ENOPOLICY: i32 = 103;
 /// A mount, as `getfsstat64` reports it.
 pub struct Mount {
     pub on: &'static str,
-    pub from: &'static str,
+    pub from: From,
     pub fsid: u64,
     pub flags: u32,
     pub fs: Fs,
+}
+
+/// What a mount is of: its `f_mntfromname`'s source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum From {
+    /// devfs, "devfs".
+    Devfs,
+    /// The sealed system snapshot of the container's volume at this slot,
+    /// which the root is mounted from.
+    Snapshot(u32),
+    /// The container's volume at this slot.
+    Volume(u32),
+    /// The SystemOS cryptex, standing for Preboot's graft of it.
+    OsCryptex,
 }
 
 /// The filesystem a mount is of.
@@ -167,9 +181,9 @@ pub const DEVFS_FSID: u32 = 0x9a3c_51e7;
 /// from its MACF `vfc_flags`), and the SystemOS cryptex the shared cache
 /// is in, by the filesystem id its dynamic data names.
 pub const MOUNTS: &[Mount] = &[
-    Mount { on: "/", from: "/dev/disk0s1s1", fsid: 0x0100_0002, flags: MNT_RDONLY | MNT_ROOTFS, fs: Fs::Apfs },
-    Mount { on: "/dev", from: "devfs", fsid: DEVFS_FSID as u64, flags: MNT_LOCAL | MNT_DONTBROWSE | MNT_MULTILABEL, fs: Fs::Devfs },
-    Mount { on: "/System/Cryptexes/OS", from: "/dev/disk3s1", fsid: super::CACHE_FS_ID, flags: MNT_RDONLY | MNT_DONTBROWSE, fs: Fs::Apfs },
+    Mount { on: "/", from: From::Snapshot(0), fsid: 0x0100_0002, flags: MNT_RDONLY | MNT_ROOTFS, fs: Fs::Apfs },
+    Mount { on: "/dev", from: From::Devfs, fsid: DEVFS_FSID as u64, flags: MNT_LOCAL | MNT_DONTBROWSE | MNT_MULTILABEL, fs: Fs::Devfs },
+    Mount { on: "/System/Cryptexes/OS", from: From::OsCryptex, fsid: super::CACHE_FS_ID, flags: MNT_RDONLY | MNT_DONTBROWSE, fs: Fs::Apfs },
 ];
 
 /// The volume the preboot cryptexes are on: what `vnode_lookup` of
@@ -179,6 +193,28 @@ pub const MOUNTS: &[Mount] = &[
 /// Preboot volume's graft of it, and no `/private/preboot/Cryptexes`.
 pub fn preboot_cryptex_volume() -> Option<&'static str> {
     MOUNTS.iter().find(|m| m.on == "/System/Cryptexes/OS").map(|m| m.on)
+}
+
+/// A mount's `f_mntfromname`. A volume's is its device's path; the root's
+/// that of the System volume it is mounted from (the sealed snapshot
+/// [`super::storage::ROOT_SNAPSHOT`] is what APFS mounts of it). The
+/// cryptex mount stands for Preboot's graft, which has no device of its
+/// own: its name is the stand-in's.
+pub fn mount_from(mnt: &Mount) -> String {
+    match mnt.from {
+        From::Devfs => "devfs".to_string(),
+        From::Volume(i) | From::Snapshot(i) => format!("/dev/{}", super::storage::volume_bsd_name(i)),
+        From::OsCryptex => "/dev/disk3s1".to_string(),
+    }
+}
+
+/// The container's volume a mount is on (APFS's source volume for its
+/// ioctls), if it is on one.
+pub fn mount_volume(mnt: &Mount) -> Option<u32> {
+    match mnt.from {
+        From::Snapshot(i) | From::Volume(i) => Some(i),
+        From::Devfs | From::OsCryptex => None,
+    }
 }
 
 /// A mount's `vfsstatfs` counts and type: `f_bsize`, `f_iosize`,
@@ -206,17 +242,10 @@ pub fn fs_name(mnt: &Mount) -> &'static [u8] {
 
 fn counts(mnt: &Mount) -> Counts {
     match mnt.fs {
-        Fs::Apfs => Counts {
-            bsize: vfsstat::BSIZE,
-            iosize: vfsstat::IOSIZE,
-            blocks: vfsstat::BLOCKS,
-            bfree: vfsstat::BFREE,
-            bavail: vfsstat::BAVAIL,
-            files: vfsstat::FILES,
-            ffree: vfsstat::FFREE,
-            typenum: vfsstat::APFS_TYPENUM,
-            name: fs_name(mnt),
-        },
+        Fs::Apfs => {
+            let a = apfs_counts(mnt);
+            Counts { bsize: vfsstat::BSIZE, iosize: vfsstat::IOSIZE, blocks: a.blocks, bfree: a.bfree, bavail: a.bavail, files: a.files, ffree: a.ffree, typenum: vfsstat::APFS_TYPENUM, name: fs_name(mnt) }
+        }
         // devfs_statfs: 512-byte blocks of its bookkeeping, nothing free.
         Fs::Devfs => Counts {
             bsize: 512,
@@ -232,19 +261,33 @@ fn counts(mnt: &Mount) -> Counts {
     }
 }
 
+/// An APFS volume's counts, as `apfs_vfsop_getattr` gives them: blocks of
+/// the container, free and available, and its files and free ones.
+pub struct ApfsCounts {
+    pub blocks: u64,
+    pub bfree: u64,
+    pub bavail: u64,
+    pub files: u64,
+    pub ffree: u64,
+}
+
+/// The counts of the APFS volume `mnt` is of: stand-ins while disk0's
+/// capacity is unmeasured ([`super::storage::unmeasured`]); exact ones need
+/// the capacity and APFS's space accounting (its spaceman) of the
+/// container after the restore and first boot.
+pub fn apfs_counts(_mnt: &Mount) -> ApfsCounts {
+    ApfsCounts { blocks: 8 << 20, bfree: 4 << 20, bavail: 4 << 20, files: 1 << 24, ffree: 1 << 23 }
+}
+
 /// `sizeof(struct statfs64)`.
 pub const STATFS64_SIZE: usize = 2168;
 
 /// What the volumes report of themselves, in `statfs` and `getattrlist`
-/// alike: the block size, the preferred transfer size and the counts.
+/// alike: the block size and the preferred transfer size (the counts are
+/// [`apfs_counts`]').
 pub mod vfsstat {
     pub const BSIZE: u32 = 4096;
     pub const IOSIZE: u32 = 1 << 20;
-    pub const BLOCKS: u64 = 8 << 20;
-    pub const BFREE: u64 = 4 << 20;
-    pub const BAVAIL: u64 = 4 << 20;
-    pub const FILES: u64 = 1 << 24;
-    pub const FFREE: u64 = 1 << 23;
     /// `vfs_typenum` of APFS: `f_type`, and the second word of `f_fsid`.
     pub const APFS_TYPENUM: u32 = 0x1a;
 }
@@ -262,6 +305,7 @@ pub fn mount_of(path: &str) -> &'static Mount {
 /// One `struct statfs64` for `mnt`.
 pub fn statfs64(mnt: &Mount) -> Vec<u8> {
     let c = counts(mnt);
+    let from = mount_from(mnt);
     let mut b = vec![0u8; STATFS64_SIZE];
     let mut put = |o: usize, v: &[u8]| b[o..o + v.len()].copy_from_slice(v);
     put(0, &c.bsize.to_le_bytes());
@@ -278,7 +322,7 @@ pub fn statfs64(mnt: &Mount) -> Vec<u8> {
     put(64, &mnt.flags.to_le_bytes());
     put(72, c.name);
     put(88, mnt.on.as_bytes());
-    put(1112, mnt.from.as_bytes());
+    put(1112, from.as_bytes());
     b
 }
 
@@ -295,6 +339,7 @@ const MNAMELEN_INO32: usize = 90;
 /// `strlcpy` cuts them.
 pub fn statfs_ino32(mnt: &Mount) -> [u8; STATFS_SIZE] {
     let c = counts(mnt);
+    let from = mount_from(mnt);
     let mut b = [0u8; STATFS_SIZE];
     let mut put = |o: usize, v: &[u8]| b[o..o + v.len()].copy_from_slice(v);
     put(8, &u64::from(c.bsize).to_le_bytes());
@@ -314,7 +359,7 @@ pub fn statfs_ino32(mnt: &Mount) -> [u8; STATFS_SIZE] {
     };
     name(104, MFSNAMELEN, c.name);
     name(119, MNAMELEN_INO32, mnt.on.as_bytes());
-    name(209, MNAMELEN_INO32, mnt.from.as_bytes());
+    name(209, MNAMELEN_INO32, from.as_bytes());
     b
 }
 
@@ -1321,7 +1366,14 @@ impl Kernel {
         use sysctl::ctl;
         let oid = match &name {
             Some(n) => sysctl::name2oid(n)?,
-            None => oid,
+            None => {
+                // A number this kernel cannot know is not one a caller has.
+                if let Some(why) = sysctl::unsettled(&oid) {
+                    self.darwin_unimplemented(why.to_string());
+                    return Err(Errno::ENOENT);
+                }
+                oid
+            }
         };
         let (node, tail) = sysctl::find(&oid)?;
         // The name it is checked under, as the walk builds it.
@@ -1350,7 +1402,13 @@ impl Kernel {
         match node.path {
             "sysctl.name" => req.out(m, sysctl::name_of(tail).as_bytes()).and_then(|()| req.out(m, b"\0")),
             "sysctl.next" => match sysctl::next(tail) {
-                Some(o) => req.out(m, &oid_bytes(&o)),
+                Some(o) => match sysctl::unsettled(&o) {
+                    Some(why) => {
+                        self.darwin_unimplemented(why.to_string());
+                        Err(Errno::EIO)
+                    }
+                    None => req.out(m, &oid_bytes(&o)),
+                },
                 None => Err(Errno::ENOENT),
             },
             "sysctl.name2oid" => {
@@ -1363,8 +1421,13 @@ impl Kernel {
                 let bytes = req.input(m, req.newlen as usize)?;
                 let n = String::from_utf8_lossy(&bytes).trim_end_matches('\0').to_string();
                 let o = sysctl::name2oid(&n)?;
+                if let Some(why) = sysctl::unsettled(&o) {
+                    self.darwin_unimplemented(why.to_string());
+                    return Err(Errno::EIO);
+                }
                 req.out(m, &oid_bytes(&o))
             }
+            "vfs.generic.apfs.edt_fstab" => self.darwin_sysctl_edt_fstab(m, req),
             "sysctl.oidfmt" => {
                 let (kind, fmt) = sysctl::oid_fmt(tail)?;
                 req.out(m, &kind.to_le_bytes())?;
@@ -1416,6 +1479,24 @@ impl Kernel {
         let control = m.read_u64(msg + 32).unwrap_or(0);
         let controllen = m.read_u32(msg + 40).unwrap_or(0);
         control != 0 && controllen != 0
+    }
+
+    /// `vfs.generic.apfs.edt_fstab` ([`super::apfs::edt_fstab`]): the size
+    /// with no room given, else the entries copied out as they are.
+    fn darwin_sysctl_edt_fstab(&mut self, m: &mut GuestMem<'_>, req: &mut SysctlReq) -> Result<(), Errno> {
+        match super::apfs::edt_fstab(req.oldlen)? {
+            super::apfs::Fstab::Size(n) => {
+                req.oldidx = n;
+                Ok(())
+            }
+            super::apfs::Fstab::Entries(b) => {
+                req.oldidx = b.len() as u64;
+                if b.is_empty() {
+                    return Ok(());
+                }
+                m.write(req.old, &b).map_err(|_| Errno::EFAULT)
+            }
+        }
     }
 
     /// `sysctl_loadavg`: `averunnable` as a 64-bit process's `struct

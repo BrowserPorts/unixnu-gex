@@ -257,7 +257,8 @@ impl Kernel {
         let given = std::str::from_utf8(&raw).map_err(|_| Errno::EINVAL)?;
         let abs = self.path_io().at_path_str(dirfd(super::bsd::AT_FDCWD as u64) as i32, given)?;
         let md = if options & FSOPT_NOFOLLOW == 0 { self.vfs.metadata(&abs) } else { self.vfs.metadata_nofollow(&abs) }?;
-        self.darwin_fsctl_checked(m, md.file_type, cmd, data)
+        let at = self.vfs.canonical(&abs);
+        self.darwin_fsctl_checked(m, &at, md.file_type, cmd, data)
     }
 
     /// `ffsctl(fd, cmd, data, options)`.
@@ -268,11 +269,13 @@ impl Kernel {
             return Err(Errno::EINVAL);
         }
         let md = file.handle.metadata()?;
-        self.darwin_fsctl_checked(m, md.file_type, a[1], a[2])
+        let at = file.path.clone();
+        self.darwin_fsctl_checked(m, &at, md.file_type, a[1], a[2])
     }
 
-    /// `mac_mount_check_fsctl`, then `fsctl_internal`.
-    fn darwin_fsctl_checked(&mut self, m: &mut GuestMem<'_>, kind: crate::vfs::FileType, cmd: u64, data: u64) -> Result<u64, Errno> {
+    /// `mac_mount_check_fsctl`, then `fsctl_internal`, for the vnode at
+    /// `at`.
+    fn darwin_fsctl_checked(&mut self, m: &mut GuestMem<'_>, at: &str, kind: crate::vfs::FileType, cmd: u64, data: u64) -> Result<u64, Errno> {
         const IOCPARM_MASK: u64 = 0x1fff;
         const IOCPARM_MAX: u64 = IOCPARM_MASK + 1;
         const IOC_OUT: u64 = 0x4000_0000;
@@ -292,9 +295,22 @@ impl Kernel {
         if size > IOCPARM_MAX {
             return Err(Errno::EINVAL);
         }
-        // Copied in before anything looks at the command.
+        // Copied in before anything looks at the command (zeroes for a
+        // command that only copies out).
+        let mut buf = vec![0u8; size as usize];
         if cmd & IOC_IN != 0 && size != 0 {
-            m.read(data, size as usize)?;
+            buf = m.read(data, size as usize)?.to_vec();
+        }
+        // VNOP_IOCTL: APFS's own commands, of a vnode on one of the
+        // container's volumes; what it fills in copied out on success.
+        if let Some(volume) = super::kern::mount_volume(super::kern::mount_of(at)) {
+            if let Some(r) = self.darwin_apfs_ioctl(volume, cmd, &mut buf) {
+                r?;
+                if cmd & IOC_OUT != 0 && size != 0 {
+                    m.write(data, &buf)?;
+                }
+                return Ok(0);
+            }
         }
         if cmd != APFSIOC_VIRTUAL_INTERFACE {
             self.darwin_unimplemented(format!("fsctl command {cmd:#x}"));

@@ -269,10 +269,10 @@ fn devfs_vnode(pio: &PathIo<'_>, mnt: &Mount, path: &str, md: &Metadata, name: O
 /// stable one of its own, made from where it is mounted and from what
 /// (a name-based UUID, version 8 for the vendor-defined layout: FNV-1a over
 /// the two names, twice with different seeds).
-fn volume_uuid(mnt: &Mount) -> [u8; 16] {
+fn volume_uuid(mnt: &Mount, from: &str) -> [u8; 16] {
     let hash = |seed: u64| {
         let mut h = 0xcbf2_9ce4_8422_2325u64 ^ seed;
-        for b in mnt.on.bytes().chain([0]).chain(mnt.from.bytes()) {
+        for b in mnt.on.bytes().chain([0]).chain(from.bytes()) {
             h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
         }
         h
@@ -292,21 +292,23 @@ fn volume(pio: &PathIo<'_>, mnt: &Mount) -> Result<VolInfo, Errno> {
     }
     let md = pio.ns.metadata(mnt.on)?;
     let root = vnode(pio, mnt.on, &md, None, false)?;
+    let from = super::kern::mount_from(mnt);
+    let counts = super::kern::apfs_counts(mnt);
     Ok(VolInfo {
         typenum: vfsstat::APFS_TYPENUM,
         typename: "apfs".into(),
         mntonname: mnt.on.into(),
-        mntfromname: mnt.from.into(),
+        mntfromname: from.clone(),
         mnt_flag: mnt.flags,
         bsize: vfsstat::BSIZE,
         iosize: vfsstat::IOSIZE,
-        blocks: vfsstat::BLOCKS,
-        bfree: vfsstat::BFREE,
-        bavail: vfsstat::BAVAIL,
+        blocks: counts.blocks,
+        bfree: counts.bfree,
+        bavail: counts.bavail,
         fssubtype: APFS_FSSUBTYPE,
         caps: APFS_CAPS,
         attributes: apfs_attributes(),
-        uuid: volume_uuid(mnt),
+        uuid: volume_uuid(mnt, &from),
         // `f_maxobjcount`, as APFS says it: no limit.
         max_objcount: u32::MAX,
         quota: 0,
@@ -378,7 +380,7 @@ fn devfs_volume(pio: &PathIo<'_>, mnt: &Mount) -> Result<VolInfo, Errno> {
         typenum: super::kern::DEVFS_TYPENUM,
         typename: "devfs".into(),
         mntonname: mnt.on.into(),
-        mntfromname: mnt.from.into(),
+        mntfromname: "devfs".into(),
         mnt_flag: mnt.flags,
         bsize: 512,
         iosize: 512,

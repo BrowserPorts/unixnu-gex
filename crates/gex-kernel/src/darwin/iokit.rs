@@ -252,49 +252,43 @@ pub fn class(t: &[Node], i: u32) -> Result<&'static str, String> {
     Err(format!("the class of the device tree entry {}", n.name))
 }
 
-/// One `AppleAPFSVolume` for each volume of `/filesystems/fstab`, in its
-/// order: `disk1s1` and on, the numbers this device's container would give
-/// them being iBoot's and the storage's to know.
-fn add_volumes(t: &mut Vec<Node>) {
-    let Some(Some(fstab)) = from_path(t, "IODeviceTree:/filesystems/fstab").ok() else { return };
-    let vols: Vec<(String, Vec<(String, Vec<u8>)>)> = t[fstab as usize].children.iter().map(|&c| (t[c as usize].name.clone(), t[c as usize].props.clone())).collect();
-    // `physical_store_to_container` and `APFSContainerGetBootDevice`'s walk:
-    // the physical store's IOMedia, its AppleAPFSContainerScheme, the
-    // AppleAPFSMedia that is the synthesized disk, its AppleAPFSContainer,
-    // and the volumes under that.
-    let service = |name: &str, class: &'static str, parent: Option<u32>, bsd: Option<&str>| Node {
+/// The storage's IOMedia tree as the device registers it
+/// ([`super::storage`]): the GPT partition "Container" of the main
+/// namespace's disk, its AppleAPFSContainerScheme, the AppleAPFSMedia that
+/// is the container's synthesized whole disk, its AppleAPFSContainer, and an
+/// AppleAPFSVolume for each volume by slot (the order the container
+/// publishes them). The BSD names are the device's units'
+/// ([`super::storage::units`]).
+pub(crate) fn add_volumes(t: &mut Vec<Node>) {
+    let named = |b: String| vec![("BSD Name".to_string(), Prop::Str(b))];
+    let service = |name: &str, class: &'static str, parent: Option<u32>, service_props: Vec<(String, Prop)>| Node {
         name: name.to_string(),
         props: Vec::new(),
         class,
-        service_props: bsd.map_or(Vec::new(), |b| vec![("BSD Name".to_string(), Prop::Str(b.to_string()))]),
+        service_props,
         parent,
         children: Vec::new(),
         kernel_only: false,
         nub: None,
     };
     let store = t.len() as u32;
-    t.push(service("disk0s1", "IOMedia", None, Some("disk0s1")));
+    t.push(service("Container", "IOMedia", None, named(super::storage::partition_bsd_name())));
     let scheme = t.len() as u32;
-    t.push(service("AppleAPFSContainerScheme", "AppleAPFSContainerScheme", Some(store), None));
+    t.push(service("AppleAPFSContainerScheme", "AppleAPFSContainerScheme", Some(store), Vec::new()));
     t[store as usize].children.push(scheme);
     let media = t.len() as u32;
-    t.push(service("AppleAPFSMedia", "AppleAPFSMedia", Some(scheme), Some("disk1")));
+    t.push(service("AppleAPFSMedia", "AppleAPFSMedia", Some(scheme), named(super::storage::container_bsd_name())));
     t[scheme as usize].children.push(media);
     let container = t.len() as u32;
-    t.push(service("AppleAPFSContainer", "AppleAPFSContainer", Some(media), None));
+    t.push(service("AppleAPFSContainer", "AppleAPFSContainer", Some(media), Vec::new()));
     t[media as usize].children.push(container);
-    for (n, (_, props)) in vols.iter().enumerate() {
-        let text = |k: &str| props.iter().find(|(p, _)| p == k).map_or(String::new(), |(_, v)| String::from_utf8_lossy(&v[..v.iter().position(|&c| c == 0).unwrap_or(v.len())]).into_owned());
-        let name = text("vol.fs_name");
-        let bsd = format!("disk1s{}", n + 1);
-        let service_props = vec![
-            ("BSD Name".to_string(), Prop::Str(bsd)),
-            ("FullName".to_string(), Prop::Str(name.clone())),
-            // The volume's role by name (`vol.fs_role` agrees with them).
-            ("Role".to_string(), Prop::Strs(vec![name.clone()])),
-        ];
+    for v in super::storage::VOLUMES {
+        let mut service_props = named(super::storage::volume_bsd_name(v.index));
+        service_props.push(("FullName".to_string(), Prop::Str(v.name.to_string())));
+        // The volume's role by name (each volume here is named for its role).
+        service_props.push(("Role".to_string(), Prop::Strs(vec![v.name.to_string()])));
         let id = t.len() as u32;
-        t.push(Node { name, props: Vec::new(), class: "AppleAPFSVolume", service_props, parent: Some(container), children: Vec::new(), kernel_only: false, nub: None });
+        t.push(service(v.name, "AppleAPFSVolume", Some(container), service_props));
         t[container as usize].children.push(id);
     }
 }
@@ -430,23 +424,17 @@ pub fn conforms(t: &[Node], i: u32, class: &str) -> Result<bool, String> {
     }
 }
 
-/// `IORegistryEntry::getLocation`: of a volume, its index in the container,
-/// one less than the number ending its BSD name.
+/// `IORegistryEntry::getLocation`: of a volume, its slot in the container.
 pub fn location(n: &Node) -> Option<String> {
-    let Some((_, Prop::Str(bsd))) = n.service_props.iter().find(|(k, _)| k == "BSD Name") else { return None };
-    let at = bsd.rfind('s')? + 1;
-    let digits = &bsd[at..];
-    // Zero-based: `disk1s1` is index 0.
-    digits.parse::<u32>().ok()?.checked_sub(1).map(|i| i.to_string())
+    if n.class != "AppleAPFSVolume" {
+        return None;
+    }
+    super::storage::VOLUMES.iter().find(|v| v.name == n.name).map(|v| v.index.to_string())
 }
 
-/// The role (`vol.fs_role`) of the volume at `index` in the container.
+/// The role of the volume at slot `index` in the container.
 pub fn volume_role(index: u64) -> Option<u16> {
-    let tree = tree();
-    let fstab = from_path(tree, "IODeviceTree:/filesystems/fstab").ok()??;
-    let vol = tree[fstab as usize].children.get(usize::try_from(index).ok()?)?;
-    let (_, v) = tree[*vol as usize].props.iter().find(|(k, _)| k == "vol.fs_role")?;
-    Some(u16::from_le_bytes(v.get(..2)?.try_into().ok()?))
+    super::storage::volume(u32::try_from(index).ok()?).map(|v| v.role)
 }
 
 /// `IOGetBootManifestHash`: `/chosen`'s `boot-manifest-hash`.

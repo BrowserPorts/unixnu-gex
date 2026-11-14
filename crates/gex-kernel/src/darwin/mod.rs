@@ -15,6 +15,7 @@ use gex_abi::ctx;
 
 pub mod aio;
 pub mod amfi;
+pub mod apfs;
 pub mod applematch;
 pub mod attrcall;
 pub mod attrlist;
@@ -82,6 +83,7 @@ pub mod reason;
 pub mod rlimit;
 pub mod sandbox;
 pub mod shregion;
+pub mod storage;
 pub mod sandboxes;
 pub mod sched;
 pub mod sockbuf;
@@ -134,6 +136,10 @@ pub struct SandboxProfiles {
 pub fn boot(trust_cache: Option<&[u8]>, sandbox: SandboxProfiles, device_tree: Option<&[u8]>, system_attrs: Option<Vec<u8>>) -> Result<(), String> {
     if let Some(t) = device_tree {
         iokit::set_tree(t)?;
+    }
+    // The device facts that stand in until measured, once at start.
+    if let Some(gaps) = storage::unmeasured() {
+        eprintln!("[gex] Darwin: {gaps}");
     }
     if let Some(a) = system_attrs {
         volattrs::set_system(a)?;

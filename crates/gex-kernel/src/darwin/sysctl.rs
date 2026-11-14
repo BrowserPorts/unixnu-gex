@@ -216,7 +216,39 @@ pub struct Node {
 static KEXT_NODES: &[Node] = &[
     Node { path: "security.mac.amfi", number: 100, kind: ctl::RD | ctl::WR | 0x00e0_0000 | ctl::TYPE_NODE, fmt: "N", handler: false },
     Node { path: "security.mac.amfi.developer_mode_status", number: 100, kind: ctl::RD | 0x00e0_0000 | 2, fmt: "I", handler: true },
+    // apfs.kext's (sysctl_oid structs from 0xfffffff007b2d4c0), registered
+    // in its list's order (0xfffffff006f2b578: edt_fstab first, the node
+    // itself last), each OID_AUTO number one past its siblings' highest.
+    Node { path: "vfs.generic.apfs", number: UNSETTLED_NUMBER, kind: 0xc040_0001, fmt: "N", handler: false },
+    Node { path: "vfs.generic.apfs.edt_fstab", number: 100, kind: 0x2040_0000, fmt: "-", handler: true },
+    Node { path: "vfs.generic.apfs.unwritten_freeze_threshold", number: 101, kind: 0xc040_0004, fmt: "Q", handler: true },
+    Node { path: "vfs.generic.apfs.proc_free_blocks_threshold", number: 102, kind: 0x4040_0002, fmt: "I", handler: true },
+    Node { path: "vfs.generic.apfs.alloc_inject_ctl", number: 103, kind: 0x4440_0002, fmt: "-", handler: true },
+    Node { path: "vfs.generic.apfs.authapfs_state", number: 104, kind: 0x8440_0002, fmt: "I", handler: true },
+    Node { path: "vfs.generic.apfs.rangelist_verification_mode", number: 105, kind: 0xc040_0002, fmt: "I", handler: true },
+    Node { path: "vfs.generic.apfs.nx_allow_all_external_mounts", number: 106, kind: 0xc440_0002, fmt: "I", handler: true },
+    Node { path: "vfs.generic.apfs.oc_voluntary_flush", number: 107, kind: 0xc440_0002, fmt: "I", handler: true },
+    Node { path: "vfs.generic.apfs.oc_dirty_threshold", number: 108, kind: 0xc440_0002, fmt: "I", handler: true },
+    Node { path: "vfs.generic.apfs.wbc_bypass", number: 109, kind: 0xc440_0002, fmt: "I", handler: true },
+    Node { path: "vfs.generic.apfs.allocated", number: 110, kind: 0x80c0_0004, fmt: "Q", handler: true },
 ];
+
+/// The number of a node whose OID_AUTO number this kernel cannot know: it
+/// stands in the tree for it, and is never given out ([`unsettled`]).
+const UNSETTLED_NUMBER: i32 = i32::MIN;
+
+/// Why a node's number is unsettled. `vfs.generic.apfs`: one past the
+/// highest of `vfs.generic`'s children when APFS registers it, which it
+/// does once the IOBSD resource is published (the container scheme's wait,
+/// 0xfffffff00666b464), as lifs and hfs register `vfs.generic.lifs` and
+/// `vfs.generic.hfs` on their own matching of it: which goes first is the
+/// boot's.
+const UNSETTLED_WHY: &str = "the number of sysctl node vfs.generic.apfs: 107, 108 or 109 as APFS, lifs and hfs register under vfs.generic after IOBSD is published, an order of the boot's to be measured (sysctl.name2oid of vfs.generic.apfs on the device)";
+
+/// Why `oid` cannot be given out, when it holds an unsettled number.
+pub fn unsettled(oid: &[i32]) -> Option<&'static str> {
+    oid.contains(&UNSETTLED_NUMBER).then_some(UNSETTLED_WHY)
+}
 
 struct Tree {
     /// Every node with its numbers from the root, in their order.

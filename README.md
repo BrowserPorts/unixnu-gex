@@ -685,9 +685,27 @@ is the reference (search `crates/gex-kernel/src/` for
   never posted: the level stays normal.
 - **Files and devices.** The filesystems keep no file owners and no access
   control lists, so the `chown` family and ACLs are refused and reported.
-  Also reported: `mount`, `mkfifo` and `mknod`, `fsctl`, `F_PREALLOCATE`,
+  Also reported: `mount`, `mkfifo` and `mknod`, `F_PREALLOCATE`,
   data protection classes, `fsgetpath` by object id, resource fork offsets,
   `RENAME_SECLUDE`, and opening a device whose driver is not modelled.
+- **Storage (reported shortcuts).** The volumes and their indexes are the
+  erase restore's (System 0, Data 1, xART 2, Hardware 3, Preboot 4,
+  Update 5, User 6), but two facts of a 64 GB J120 are unmeasured and
+  answered with stand-ins, which gexc names on stderr at start: the
+  storage's BSD units (stand-ins disk0 and disk1, so volumes are
+  `disk1s<index+1>`; measured from a sysdiagnose's ioreg IOMedia entries)
+  and disk0's capacity (measured the same way, or `ideviceinfo -q
+  com.apple.disk_usage`). APFS volumes' statfs counts are the stand-in
+  numbers; exact ones need the capacity and APFS's space accounting
+  (spaceman) after the restore and first boot. The root's
+  `f_mntfromname` is the System volume's device path: whether APFS's
+  mountroot names the root snapshot's own device instead is not yet
+  traced. The OS cryptex is still a mount of its own at
+  `/System/Cryptexes/OS` rather than Preboot's graft of it. The number of
+  the sysctl node `vfs.generic.apfs` is the boot's (APFS, lifs and hfs
+  register after IOBSD), so giving it out is reported. APFS's `fsctl`s
+  other than `APFSIOC_GET_DEV_BY_ROLE` and the virtual-interface query
+  are reported.
 - **Sockets.** Interface `ioctl`s know only `lo0`. Out-of-band data,
   `SO_LINGER`, `SO_DONTROUTE`, `SO_OOBINLINE`, address sharing
   (`SO_REUSEADDR`, `SO_REUSEPORT`) when a bind is refused, keepalive probes

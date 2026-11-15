@@ -1195,10 +1195,10 @@ impl Kernel {
         }
     }
 
-    /// `vn_open` of a devfs node of [`super::devfs`]'s: its owner, group
-    /// and mode checked, then the device's open, which for a device not
-    /// modelled is reported.
-    pub(crate) fn darwin_devnode_open(&mut self, fd: i32) -> Result<(), Errno> {
+    /// `vn_open` of a devfs node of [`super::devfs`]'s, opened with the
+    /// Darwin open flags `dflags`: its owner, group and mode checked, then
+    /// the device's open, which for a device not modelled is reported.
+    pub(crate) fn darwin_devnode_open(&mut self, fd: i32, dflags: u64) -> Result<(), Errno> {
         let Ok(file) = self.fds.get(fd) else { return Ok(()) };
         let Some(n) = file.handle.darwin_devnode() else { return Ok(()) };
         self.darwin_node_access((n.uid, n.gid, n.mode), file.readable, file.writable)?;
@@ -1207,11 +1207,39 @@ impl Kernel {
             return Err(Errno::ENXIO);
         }
         if let super::devfs::Kind::Disk { block } = n.kind {
-            let sw = if block { "bdevsw" } else { "cdevsw" };
-            self.darwin_unimplemented(format!("opening /dev/{}: the disk's {sw} open (IOMediaBSDClient's dkopen of its IOMedia)", n.name));
+            // spec_open: a block device whose medium is mounted is busy
+            // (vfs_mountedon); then the switch's d_open, dkopen. The
+            // character node's write checks need securelevel >= 1.
+            const FREAD: u32 = 0x1;
+            const FWRITE: u32 = 0x2;
+            const O_SHLOCK: u32 = 0x10;
+            const O_EXLOCK: u32 = 0x20;
+            if block {
+                let medium = super::storage::media_by_name(n.name).map(|(m, _)| m);
+                if super::kern::mounts().iter().any(|mnt| super::kern::mount_volume(mnt).map(super::storage::Media::Volume) == medium) {
+                    return Err(Errno::EBUSY);
+                }
+            }
+            let mut fflags = if file.readable { FREAD } else { 0 } | if file.writable { FWRITE } else { 0 };
+            fflags |= dflags as u32 & (O_SHLOCK | O_EXLOCK);
+            self.darwin_dkopen(n.minor, fflags, block, &format!("/dev/{}", n.name))?;
+            self.darwin_unimplemented(format!("opening /dev/{}: what the open disk node does after dkopen (its I/O and last close, dkclose)", n.name));
             return Err(Errno::ENXIO);
         }
         Ok(())
+    }
+
+    /// `dkopen` of a disk's minor; a part of it that is not modelled is
+    /// reported, and fails as a medium's refused open does (EBUSY).
+    pub(crate) fn darwin_dkopen(&mut self, minor: u32, fflags: u32, block: bool, what: &str) -> Result<(), Errno> {
+        match super::dkopen::dkopen(minor, fflags, block) {
+            Ok(()) => Ok(()),
+            Err(super::dkopen::Refused::Errno(e)) => Err(super::errno::errno_of(e)),
+            Err(super::dkopen::Refused::Unmodelled(m)) => {
+                self.darwin_unimplemented(format!("dkopen of {what}: {m}"));
+                Err(Errno::EBUSY)
+            }
+        }
     }
 
     /// open1's end for a terminal: one opened without O_NOCTTY by a

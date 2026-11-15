@@ -1071,7 +1071,7 @@ impl Kernel {
                     let got = self.darwin_open1(&mut gm, super::bsd::sys::OPEN, la, None)?;
                     // A device's own open, and open1's controlling
                     // terminal for an open that takes no lock.
-                    if let Err(e) = self.darwin_devnode_open(got).and_then(|()| self.darwin_tty_open_now(got)) {
+                    if let Err(e) = self.darwin_devnode_open(got, u64::from(oflag)).and_then(|()| self.darwin_tty_open_now(got)) {
                         let _ = self.darwin_close(got);
                         return Err(e);
                     }

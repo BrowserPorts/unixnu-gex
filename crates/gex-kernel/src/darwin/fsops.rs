@@ -397,7 +397,13 @@ impl Kernel {
         if e != 0 {
             return Err(super::errno::errno_of(e as i32));
         }
-        self.darwin_unimplemented(format!("mounting {fstype} from {given} on {at} (flags {flags:#x}): the device's open (VNOP_OPEN: IOMediaBSDClient's dkopen opens its medium, the AppleAPFSVolume, whose open is APFS's), then apfs_vfsop_mount"));
+        // VNOP_OPEN(devvp, FREAD, or FREAD|FWRITE): spec_open's block
+        // device open, IOMediaBSDClient's dkopen.
+        const FREAD: u32 = 0x1;
+        const FWRITE: u32 = 0x2;
+        let fflags = if ronly { FREAD } else { FREAD | FWRITE };
+        self.darwin_dkopen(node.minor, fflags, true, &given)?;
+        self.darwin_unimplemented(format!("mounting {fstype} from {given} on {at} (flags {flags:#x}): apfs_vfsop_mount (and, should it fail, VNOP_CLOSE of the device: dkclose)"));
         Err(Errno::EIO)
     }
 

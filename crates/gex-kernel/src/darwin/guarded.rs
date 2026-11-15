@@ -261,7 +261,7 @@ impl Kernel {
         match self.darwin_open1(m, raw, a, guard) {
             Ok(fd) => {
                 // A devfs node's vn_open: its access, its device's open.
-                if let Err(e) = self.darwin_devnode_open(fd) {
+                if let Err(e) = self.darwin_devnode_open(fd, dflags) {
                     let _ = self.fds.close(fd);
                     let _ = super::set_result(m, self.ctx_addr, e.as_return());
                     return SyscallOutcome::Continue;

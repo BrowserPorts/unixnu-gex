@@ -211,6 +211,19 @@ pub const SYSTEM_UNENCRYPTED: bool = true;
 /// What measures [`SYSTEM_UNENCRYPTED`].
 pub const SYSTEM_UNENCRYPTED_MEASUREMENT: &str = "`statfs(\"/\")`'s f_flags on the device: MNT_CPROTECT (0x80) clear means unencrypted";
 
+/// Whether the volumes' IOMedia are writable (`IOMedia::isWritable`, the
+/// `isWritable` APFS gives `IOMedia::init`, which it calls only through
+/// the vtable, 0xfffffff006f27da0): unmeasured. Stand-in: writable.
+pub const VOLUMES_WRITABLE: bool = true;
+
+/// What measures [`VOLUMES_WRITABLE`].
+pub const VOLUMES_WRITABLE_MEASUREMENT: &str = "the \"Writable\" property of the AppleAPFSVolume entries (a sysdiagnose's ioreg IOMedia entries)";
+
+/// Whether a volume's IOMedia is writable ([`VOLUMES_WRITABLE`]).
+pub fn volume_writable() -> bool {
+    VOLUMES_WRITABLE
+}
+
 /// The facts still unset, each with what measures it, as the line gexc
 /// reports at start; none once all are measured.
 pub fn unmeasured() -> Option<String> {
@@ -223,6 +236,7 @@ pub fn unmeasured() -> Option<String> {
     }
     gaps.push(format!("vfs.generic.apfs's sysctl number (stand-in {}; measure {})", super::sysctl::APFS_NODE_STAND_IN, super::sysctl::APFS_NODE_MEASUREMENT));
     gaps.push(format!("whether the System volume is unencrypted (stand-in {SYSTEM_UNENCRYPTED}, no MNT_CPROTECT on /; measure {SYSTEM_UNENCRYPTED_MEASUREMENT})"));
+    gaps.push(format!("whether the volumes' IOMedia are writable (stand-in {VOLUMES_WRITABLE}; measure {VOLUMES_WRITABLE_MEASUREMENT})"));
     if DEVICE.disk0_bytes.is_none() {
         gaps.push(format!("disk0's capacity (APFS statfs counts are stand-ins; measure {CAPACITY_MEASUREMENT})"));
     }

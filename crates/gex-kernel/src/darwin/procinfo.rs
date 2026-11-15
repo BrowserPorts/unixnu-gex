@@ -914,13 +914,14 @@ impl Kernel {
                 let Ok(md) = file.metadata() else { return Err(e::EBADF) };
                 out.extend_from_slice(&fileinfo(desc, file, dtype::VNODE));
                 let path = super::vattr::vnode_path(&self.vfs, &file.path, &md);
-                let mnt = super::kern::mount_of(&path);
+                // (the mount the vnode was opened on)
+                let mnt = super::kern::mount_of_seen(&path, file.darwin_mounts_seen);
                 // vn_stat's: the vnode's owner, group, mode and flags (the
                 // caller's for the host's standard streams, no file here).
                 let o = if file.handle.is_host_stdio() {
                     super::vattr::Owned { uid: self.creds.uid(), gid: self.creds.gid(), mode: md.mode & 0o7777, flags: 0 }
                 } else {
-                    let Ok(o) = super::vattr::get(&self.vfs, &path, &md, Some(file.handle.as_ref())) else { return Err(e::EIO) };
+                    let Ok(o) = super::vattr::get_on(&self.vfs, mnt, &path, &md, Some(file.handle.as_ref())) else { return Err(e::EIO) };
                     o
                 };
                 let st = crate::fs::Stat { uid: o.uid, gid: o.gid, mode: md.file_type.mode_bits() | o.mode, flags: o.flags, dev: u64::from(mnt.fsid as u32), ..Kernel::stat_from(&md) }.encode_darwin();

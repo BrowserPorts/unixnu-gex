@@ -852,7 +852,7 @@ impl Kernel {
     /// recorded.
     pub(crate) fn darwin_setattr(&mut self, m: &GuestMem<'_>, target: SetTarget, mut set: super::vattr::SetAttr, call: Call) -> Result<u64, Errno> {
         let (canon, old, file) = self.darwin_setattr_auth(m, &target, &mut set, call, 0)?;
-        self.darwin_setattr_apply(&canon, old, file.as_ref().map(|f| f.handle.as_ref()), set, call)
+        self.darwin_setattr_apply(&canon, old, file.as_deref(), set, call)
     }
 
     /// [`Kernel::darwin_setattr`]'s checks, `extra` rights (setattrlist's
@@ -866,7 +866,9 @@ impl Kernel {
             return Err(Errno::EOPNOTSUPP);
         }
         let handle = file.as_ref().map(|f| f.handle.as_ref());
-        let old = match super::vattr::of(&self.vfs, &canon, &md, handle) {
+        // (a descriptor's vnode on the mount it was opened on)
+        let on = file.as_ref().map_or_else(|| super::kern::mount_of(&canon), |f| super::kern::mount_of_file(f));
+        let old = match super::vattr::of_on(&self.vfs, on, &canon, &md, handle) {
             Ok(o) => o,
             Err(why) => {
                 self.darwin_unimplemented(why);
@@ -881,7 +883,7 @@ impl Kernel {
             Err(e) => return Err(e),
         };
         if call == Call::Chmod || action != 0 {
-            let node = super::vauth::Node { vtype: md.file_type, attrs: Ok(old), mnt_flags: super::vattr::device_mnt_flags(&canon) };
+            let node = super::vauth::Node { vtype: md.file_type, attrs: Ok(old), mnt_flags: super::vattr::device_mnt_flags_on(on, &canon) };
             let action = if call == Call::Chflags { action | kauth::NOIMMUTABLE } else { action };
             match self.darwin_authorize(&cred, &node, None, action) {
                 Ok(()) => {}
@@ -893,15 +895,18 @@ impl Kernel {
     }
 
     /// `vnode_setattr` of what `set` asks of the file at canonical `canon`
-    /// with attributes `old` (open as `handle`), its checks passed.
-    pub(crate) fn darwin_setattr_apply(&mut self, canon: &str, old: super::vattr::Owned, handle: Option<&dyn crate::vfs::FileHandle>, set: super::vattr::SetAttr, call: Call) -> Result<u64, Errno> {
+    /// with attributes `old` (open as `file`, whose vnode is on the mount
+    /// it was opened on), its checks passed.
+    pub(crate) fn darwin_setattr_apply(&mut self, canon: &str, old: super::vattr::Owned, file: Option<&crate::file::OpenFile>, set: super::vattr::SetAttr, call: Call) -> Result<u64, Errno> {
         use super::vattr::flags as vf;
         let canon = canon.to_string();
-        if super::vattr::device_mnt_flags(&canon) & super::vauth::mnt::RDONLY != 0 {
+        let handle = file.map(|f| f.handle.as_ref());
+        let on = file.map_or_else(|| super::kern::mount_of(&canon), super::kern::mount_of_file);
+        if super::vattr::device_mnt_flags_on(on, &canon) & super::vauth::mnt::RDONLY != 0 {
             return Err(Errno::EROFS);
         }
         let attrs = set.uid.is_some() || set.gid.is_some() || set.mode.is_some() || set.flags.is_some();
-        if attrs && super::kern::mount_of(&canon).fs == super::kern::Fs::Devfs {
+        if attrs && on.fs == super::kern::Fs::Devfs {
             self.darwin_unimplemented(format!("{} of devfs node {canon} (devfs_setattr)", call.name()));
             return Err(Errno::EOPNOTSUPP);
         }
@@ -973,7 +978,7 @@ impl Kernel {
         let target = if path == 0 { SetTarget::Fd(dirfd) } else { SetTarget::Path { dirfd, path, follow: true } };
         let mut set = super::vattr::SetAttr { times: true, utimes_null: tptr == 0, ..Default::default() };
         let (canon, old, file) = self.darwin_setattr_auth(m, &target, &mut set, Call::Utimes(tptr == 0), 0)?;
-        self.darwin_setattr_apply(&canon, old, file.as_ref().map(|f| f.handle.as_ref()), set, Call::Utimes(tptr == 0))?;
+        self.darwin_setattr_apply(&canon, old, file.as_deref(), set, Call::Utimes(tptr == 0))?;
         self.path_io().set_times_at(m, dirfd, path, atime, mtime, true)
     }
 
@@ -988,7 +993,7 @@ impl Kernel {
         if file.handle.metadata()?.file_type != crate::vfs::FileType::Directory {
             return Err(Errno::EINVAL);
         }
-        if let Some(what) = super::kern::unmodelled_files_at(&file.path, true) {
+        if let Some(what) = super::kern::unmodelled_files_on(super::kern::mount_of_file(&file), &file.path, true) {
             self.darwin_unimplemented(format!("reading the directory {}: {what}", file.path));
             return Err(Errno::EIO);
         }

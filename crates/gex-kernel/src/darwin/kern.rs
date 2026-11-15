@@ -283,6 +283,12 @@ pub fn mount_of_seen(path: &str, seen: usize) -> &'static Mount {
         .unwrap_or(l[0])
 }
 
+/// The mount the vnode an open file is on is on (`v_mount`): the one its
+/// path was on when it was opened.
+pub fn mount_of_file(file: &crate::file::OpenFile) -> &'static Mount {
+    mount_of_seen(&file.path, file.darwin_mounts_seen)
+}
+
 /// Put `mnt` at the end of the mount list (`mount_list_add`).
 pub fn mount_list_add(mnt: Mount) -> &'static Mount {
     mounts();
@@ -388,7 +394,11 @@ pub fn unmodelled_files(mnt: &Mount) -> Option<String> {
 /// is not. On the Preboot volume: a path through one of its root's
 /// entries the tickets make, and a listing of its root.
 pub fn unmodelled_files_at(path: &str, at_root: bool) -> Option<String> {
-    let mnt = mount_of(path);
+    unmodelled_files_on(mount_of(path), path, at_root)
+}
+
+/// [`unmodelled_files_at`] of a vnode on mount `mnt` (an open file's).
+pub fn unmodelled_files_on(mnt: &Mount, path: &str, at_root: bool) -> Option<String> {
     let below = path != mnt.on;
     if !below && !at_root {
         return None;

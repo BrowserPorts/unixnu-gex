@@ -117,9 +117,13 @@ fn peek_dev(dev: u32) -> Option<(u32, u64, bool)> {
 }
 
 /// The sleep of a call that came to a vnode being revoked: until the
-/// reclaim, uninterruptibly.
-fn reclaim_wait(cell: &Arc<TtyCell>) -> SleepReq {
-    SleepReq { chan: tty::Chan::Reclaim, timo: 0, pcatch: false, gen: cell.lock().gen }
+/// reclaim, uninterruptibly; none once the revoke is over. The channel's
+/// wakeups are counted before the vnode is looked at again: the reclaim
+/// marks it done before it wakes the channel, so a reclaim the look missed
+/// is a wakeup the sleep sees.
+fn reclaim_wait(cell: &Arc<TtyCell>, target: &TtyDev) -> Option<SleepReq> {
+    let req = cell.lock().sleep_req(tty::Chan::Reclaim, 0, false);
+    target.terminating().then_some(req)
 }
 
 /// A call in a terminal's vnode (its iocount), for as long as it runs.
@@ -1586,8 +1590,9 @@ impl Kernel {
             Err(e) => return self.darwin_tty_result(m, Err(e)),
         };
         if resumed.is_none() && target.terminating() {
-            let req = reclaim_wait(&cell);
-            return self.darwin_tty_sleep(m, Op::Read { fd, iov, st }, dev, cell, req);
+            if let Some(req) = reclaim_wait(&cell, &target) {
+                return self.darwin_tty_sleep(m, Op::Read { fd, iov, st }, dev, cell, req);
+            }
         }
         let _io = IoRef::enter(&cell, (target.dev(), o.vid));
         let count = iov.total;
@@ -1642,8 +1647,9 @@ impl Kernel {
             Err(e) => return self.darwin_tty_result(m, Err(e)),
         };
         if resumed.is_none() && target.terminating() {
-            let req = reclaim_wait(&cell);
-            return self.darwin_tty_sleep(m, Op::Write { fd, iov, st, ptc }, dev, cell, req);
+            if let Some(req) = reclaim_wait(&cell, &target) {
+                return self.darwin_tty_sleep(m, Op::Write { fd, iov, st, ptc }, dev, cell, req);
+            }
         }
         let _io = IoRef::enter(&cell, (target.dev(), o.vid));
         let count = iov.total;
@@ -1843,8 +1849,9 @@ impl Kernel {
                         Ok((_, _, c)) => c,
                         Err(e) => return self.darwin_tty_result(m, Err(e)),
                     };
-                    let req = reclaim_wait(&cell);
-                    return self.darwin_tty_sleep(m, Op::Ioctl { fd, com, data, udata, st }, dev, cell, req);
+                    if let Some(req) = reclaim_wait(&cell, &t) {
+                        return self.darwin_tty_sleep(m, Op::Ioctl { fd, com, data, udata, st }, dev, cell, req);
+                    }
                 }
             }
         }
@@ -2117,7 +2124,7 @@ fn revoke_begin(dev: u32) -> Option<(Arc<TtyCell>, Revoking)> {
 fn revoke_drained(cell: &Arc<TtyCell>, r: &Revoking) -> Result<(), SleepReq> {
     let tp = cell.lock();
     if tp.vnode_busy(r.v) {
-        return Err(SleepReq { chan: tty::Chan::Drain, timo: 0, pcatch: false, gen: tp.gen });
+        return Err(tp.sleep_req(tty::Chan::Drain, 0, false));
     }
     Ok(())
 }

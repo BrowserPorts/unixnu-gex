@@ -211,6 +211,26 @@ pub const SYSTEM_UNENCRYPTED: bool = true;
 /// What measures [`SYSTEM_UNENCRYPTED`].
 pub const SYSTEM_UNENCRYPTED_MEASUREMENT: &str = "`statfs(\"/\")`'s f_flags on the device: MNT_CPROTECT (0x80) clear means unencrypted";
 
+/// Whether the Preboot volume's `apfs_fs_flags` have `APFS_FS_UNENCRYPTED`
+/// (or `APFS_FS_ONEKEY`), which keeps `MNT_CPROTECT` off its mount
+/// (0xfffffff0066cd35c). The restore makes it (`newfs_apfs -A`, whose
+/// arguments `restored_external` builds per role); what it gives it is
+/// unmeasured. Stand-in: unencrypted, as the System volume's stand-in is.
+pub const PREBOOT_UNENCRYPTED: bool = true;
+
+/// What measures [`PREBOOT_UNENCRYPTED`].
+pub const PREBOOT_UNENCRYPTED_MEASUREMENT: &str = "`statfs(\"/private/preboot\")`'s f_flags on the device: MNT_CPROTECT (0x80) clear means unencrypted";
+
+/// Whether the volume at slot `index` is unencrypted (or one-key): the
+/// System's and Preboot's stand-ins; none for the others yet.
+pub fn volume_unencrypted(index: u32) -> Option<bool> {
+    match volume(index)?.role {
+        role::SYSTEM => Some(SYSTEM_UNENCRYPTED),
+        role::PREBOOT => Some(PREBOOT_UNENCRYPTED),
+        _ => None,
+    }
+}
+
 /// Whether the volumes' IOMedia are writable (`IOMedia::isWritable`, the
 /// `isWritable` APFS gives `IOMedia::init`, which it calls only through
 /// the vtable, 0xfffffff006f27da0): unmeasured. Stand-in: writable.
@@ -257,6 +277,7 @@ pub fn unmeasured() -> Option<String> {
     }
     gaps.push(format!("vfs.generic.apfs's sysctl number (stand-in {}; measure {})", super::sysctl::APFS_NODE_STAND_IN, super::sysctl::APFS_NODE_MEASUREMENT));
     gaps.push(format!("whether the System volume is unencrypted (stand-in {SYSTEM_UNENCRYPTED}, no MNT_CPROTECT on /; measure {SYSTEM_UNENCRYPTED_MEASUREMENT})"));
+    gaps.push(format!("whether the Preboot volume is unencrypted (stand-in {PREBOOT_UNENCRYPTED}, no MNT_CPROTECT on its mount; measure {PREBOOT_UNENCRYPTED_MEASUREMENT})"));
     gaps.push(format!("whether the volumes' IOMedia are writable (stand-in {VOLUMES_WRITABLE}; measure {VOLUMES_WRITABLE_MEASUREMENT})"));
     gaps.push(format!("whether disk0 is write-protected (stand-in writable: {DISK_WRITABLE}; measure {DISK_WRITABLE_MEASUREMENT})"));
     if DEVICE.disk0_bytes.is_none() {

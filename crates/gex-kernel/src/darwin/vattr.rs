@@ -360,6 +360,9 @@ pub fn of(ns: &Namespace, path: &str, md: &Metadata, handle: Option<&dyn FileHan
         return devfs(path, md);
     }
     let Some(vol) = mnt.vol else {
+        if let Some(what) = super::kern::unmodelled_files(mnt) {
+            return Err(format!("the owner of {path}: {what}"));
+        }
         return Err(format!("the owner of {path}: the volume mounted on {} keeps none here", mnt.on));
     };
     if let Some(o) = recorded(ns, path, handle)? {

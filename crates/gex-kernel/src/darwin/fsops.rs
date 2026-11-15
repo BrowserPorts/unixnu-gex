@@ -390,7 +390,8 @@ impl Kernel {
         // root's, the System volume's, since mountroot), as is the
         // container's medium APFS loaded the container from. One open
         // elsewhere would be too (vcount): no disk node opens here.
-        if super::storage::media_by_name(node.name.trim_start_matches('r')).is_some_and(|(m, _)| super::dkopen::mounted_on(m)) {
+        let medium = super::storage::media_by_name(node.name.trim_start_matches('r')).map(|(m, _)| m);
+        if medium.is_some_and(super::dkopen::mounted_on) {
             return Err(Errno::EBUSY);
         }
         let e = self.darwin_mac_check_vnode_open(super::macvfs::sb_vnode(&dev, &dmd), if ronly { 1 } else { 3 });
@@ -403,8 +404,99 @@ impl Kernel {
         const FWRITE: u32 = 0x2;
         let fflags = if ronly { FREAD } else { FREAD | FWRITE };
         self.darwin_dkopen(node.minor, fflags, true, &given)?;
-        self.darwin_unimplemented(format!("mounting {fstype} from {given} on {at} (flags {flags:#x}): apfs_vfsop_mount (and, should it fail, VNOP_CLOSE of the device: dkclose)"));
-        Err(Errno::EIO)
+        // The new mount's flags: APFS's vfsconf flags within MNT_VISFLAGMASK
+        // (MNT_LOCAL), MNT_RDONLY as asked; on a SECURE_KERNEL without
+        // CONFIG_MNT_SUID, the iOS release configuration, MNT_NOSUID always;
+        // then the settable flags asked for. MNT_MULTILABEL, which APFS's
+        // vfsconf allows (no VFS_TBLNOMACLABEL in its vfe_flags 0x16479),
+        // would have the root labelled (vnode_label).
+        const MNT_LOCAL: u64 = 0x1000;
+        const MNT_MULTILABEL: u64 = 0x400_0000;
+        const SETTABLE: u64 = 0x8 | 0x4 | 0x10 | 0x2 | 0x20 | 0x40 | 0x20_0000 | 0x10_0000 | 0x40_0000 | 0x200_0000 | 0x1000_0000 | 0x8000_0000 | 0x400 | 0x80;
+        if flags & MNT_MULTILABEL != 0 {
+            self.darwin_unimplemented(format!("mounting {fstype} from {given} on {at} with MNT_MULTILABEL: the root's label (vnode_label)"));
+            self.darwin_mount_close(node.minor, &given);
+            return Err(Errno::EIO);
+        }
+        let mnt_flag = (MNT_LOCAL | (flags & MNT_RDONLY) | MNT_NOSUID | (flags & SETTABLE)) as u32;
+        // VFS_MOUNT: apfs_vfsop_mount, given the arguments after the path.
+        let mut raw_args = [0u8; super::apfsmount::ARGS_SIZE];
+        match m.read(data + 8, super::apfsmount::ARGS_SIZE) {
+            Ok(b) => raw_args.copy_from_slice(b),
+            Err(e) => {
+                self.darwin_mount_close(node.minor, &given);
+                return Err(e);
+            }
+        }
+        let args = super::apfsmount::Args::parse(&raw_args);
+        let dev = (node.major.unwrap_or(0) << 24) | node.minor;
+        let Some(medium) = medium else {
+            self.darwin_unimplemented(format!("mounting {fstype} from {given}: a disk node with no medium"));
+            return Err(Errno::EIO);
+        };
+        let mounted = match super::apfsmount::vfsop_mount(&args, mnt_flag, medium, dev, &given) {
+            Ok(v) => v,
+            Err(r) => {
+                if let super::apfsmount::Refused::Unmodelled(u) = &r {
+                    self.darwin_unimplemented(format!("mounting {fstype} from {given} on {at}: {u}"));
+                }
+                self.darwin_mount_close(node.minor, &given);
+                return Err(match r {
+                    super::apfsmount::Refused::Errno(e) => super::errno::errno_of(e),
+                    super::apfsmount::Refused::Unmodelled(_) => Errno::EIO,
+                });
+            }
+        };
+        // mac_mount_check_mount_late: Sandbox's (0xfffffff0069fa500), for a
+        // writable mount with a mount point and the sync roots not loaded
+        // yet, looks up /private/var and asks APFS its volume's role
+        // (0x40024a6c): the Data volume's has the sync roots loaded from
+        // /private/var/db/Sandbox/syncroots.v2. A removable mount's device
+        // is looked into then; neither is modelled.
+        const MNT_REMOVABLE: u32 = 0x200;
+        let var_role = super::kern::mount_volume(super::kern::mount_of("/private/var")).and_then(super::storage::volume).map(|v| v.role);
+        if mounted.flags & MNT_RDONLY as u32 == 0 && var_role == Some(super::storage::role::DATA) {
+            self.darwin_unimplemented(format!("mounting {fstype} from {given} on {at}: Sandbox's load of its sync roots (/private/var/db/Sandbox/syncroots.v2) at the first writable mount with /private/var on the Data volume"));
+            self.darwin_mount_close(node.minor, &given);
+            return Err(Errno::EIO);
+        }
+        if mounted.flags & MNT_REMOVABLE != 0 {
+            self.darwin_unimplemented(format!("mounting {fstype} from {given} on {at}: Sandbox's look at a removable mount's device"));
+            self.darwin_mount_close(node.minor, &given);
+            return Err(Errno::EIO);
+        }
+        // The covered directory's mountedhere, mount_generation, checkdirs
+        // (a process whose directory is the covered one now has the
+        // mount's root: here every path through the mount point reaches
+        // it), VFS_START (APFS has none), mount_list_add, and the device
+        // marked mounted on.
+        let mnt = super::kern::mount_list_add(super::kern::Mount {
+            on: Box::leak(at.to_string().into_boxed_str()),
+            from: super::kern::From::Volume(mounted.volume),
+            fsid: u64::from(mounted.fsid0),
+            flags: mounted.flags,
+            fs: super::kern::Fs::Apfs,
+            vol: None,
+        });
+        // IOBSDMountChange (IOPOLLED_COREFILE, from
+        // CONFIG_KDP_INTERACTIVE_DEBUGGING): a writable local mount whose
+        // covered path starts the kernel core's, /private/var/vm/kernelcore,
+        // has the core file opened.
+        const KERNEL_CORE: &str = "/private/var/vm/kernelcore";
+        if mnt.flags & MNT_RDONLY as u32 == 0 && KERNEL_CORE.starts_with(mnt.on) {
+            self.darwin_unimplemented(format!("mounting {fstype} on {at}: IOBSDMountChange's open of the kernel core file {KERNEL_CORE}"));
+        }
+        Ok(0)
+    }
+
+    /// mount_common's failure after the device's open: VNOP_CLOSE of the
+    /// block device, its last close (no other open of it), dkclose.
+    fn darwin_mount_close(&mut self, minor: u32, given: &str) {
+        match super::dkopen::dkclose(minor, true) {
+            Ok(()) => {}
+            Err(super::dkopen::Refused::Errno(_)) => {}
+            Err(super::dkopen::Refused::Unmodelled(u)) => self.darwin_unimplemented(format!("dkclose of {given}: {u}")),
+        }
     }
 
     /// `fsctl(path, cmd, data, options)`.
@@ -878,6 +970,10 @@ impl Kernel {
         let bufsize = bufsize.min(GETDIRENTRIES_MAXBUFSIZE);
         if file.handle.metadata()?.file_type != crate::vfs::FileType::Directory {
             return Err(Errno::EINVAL);
+        }
+        if let Some(what) = super::kern::unmodelled_files_at(&file.path, true) {
+            self.darwin_unimplemented(format!("reading the directory {}: {what}", file.path));
+            return Err(Errno::EIO);
         }
         Ok((file, bufsize))
     }

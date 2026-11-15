@@ -231,6 +231,12 @@ impl Kernel {
         }
         // (the directory only for a relative path, as nameiat asks)
         let start = if raw.starts_with('/') { None } else { self.darwin_sb_start(dirfd) };
+        // A path below a mount whose files are not modelled.
+        let abs = crate::vfs::normalize(&raw, start.as_ref().map_or("/", |s| s.path.as_str()));
+        if let Some(what) = super::kern::unmodelled_files_at(&abs, false) {
+            self.darwin_unimplemented(format!("looking up {abs}: {what}"));
+            return Err(Errno::EIO);
+        }
         self.darwin_sb_lookup(start, &raw, follow, nofollow_any)
     }
 

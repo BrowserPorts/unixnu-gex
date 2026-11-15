@@ -321,6 +321,30 @@ pub fn mount_from(mnt: &Mount) -> String {
     }
 }
 
+/// What of a mount's files is not modelled, if any: a volume mounted at
+/// run time holds its own files, which this root does not have.
+pub fn unmodelled_files(mnt: &Mount) -> Option<String> {
+    match mnt.from {
+        From::Volume(i) => {
+            let name = super::storage::volume(i).map_or("?", |v| v.name);
+            let what = if super::storage::volume(i).is_some_and(|v| v.role == super::storage::role::PREBOOT) { " (what the restore's populate_preboot_volume put there)" } else { "" };
+            Some(format!("the files of the {name} volume mounted on {}{what}", mnt.on))
+        }
+        _ => None,
+    }
+}
+
+/// The mount with files not modelled that canonical path `path` is
+/// below (or, with `at_root`, at the root of), with what is not.
+pub fn unmodelled_files_at(path: &str, at_root: bool) -> Option<String> {
+    let mnt = mount_of(path);
+    let below = path != mnt.on;
+    if !below && !at_root {
+        return None;
+    }
+    unmodelled_files(mnt)
+}
+
 /// The container's volume a mount is on (APFS's source volume for its
 /// ioctls), if it is on one.
 pub fn mount_volume(mnt: &Mount) -> Option<u32> {

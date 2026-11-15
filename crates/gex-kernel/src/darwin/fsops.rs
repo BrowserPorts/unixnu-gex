@@ -387,10 +387,10 @@ impl Kernel {
             self.darwin_node_access((node.uid, node.gid, node.mode), true, !ronly)?;
         }
         // vfs_setmounting: a device a mount is mounted from is busy (the
-        // root's, the System volume's, since mountroot). One open
+        // root's, the System volume's, since mountroot), as is the
+        // container's medium APFS loaded the container from. One open
         // elsewhere would be too (vcount): no disk node opens here.
-        let medium = super::storage::media_by_name(node.name.trim_start_matches('r')).map(|(m, _)| m);
-        if super::kern::mounts().iter().any(|mnt| super::kern::mount_volume(mnt).map(super::storage::Media::Volume) == medium) {
+        if super::storage::media_by_name(node.name.trim_start_matches('r')).is_some_and(|(m, _)| super::dkopen::mounted_on(m)) {
             return Err(Errno::EBUSY);
         }
         let e = self.darwin_mac_check_vnode_open(super::macvfs::sb_vnode(&dev, &dmd), if ronly { 1 } else { 3 });

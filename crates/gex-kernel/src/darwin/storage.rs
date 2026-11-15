@@ -224,6 +224,27 @@ pub fn volume_writable() -> bool {
     VOLUMES_WRITABLE
 }
 
+/// Whether the NVMe namespace reports itself write-protected: its
+/// `IONVMeBlockStorageDevice::reportWriteProtection` (0xfffffff006a96f7c,
+/// slot 0x5a8 of its vtable 0xfffffff006fab200) answers bit 0 of the
+/// controller's byte +0x189, which the controller sets at run time. disk0's
+/// IOMedia is writable when it is not (IOBlockStorageDriver.cpp
+/// `instantiateMediaObject`: `!_writeProtected`), and the GPT partition
+/// (IOGUIDPartitionScheme.cpp) and the container's `AppleAPFSMedia` (the
+/// container scheme's start, 0xfffffff0066829d4, `isWritable()` of the
+/// partition at 0xfffffff006682de4) are writable as it is. Unmeasured.
+/// Stand-in: writable.
+pub const DISK_WRITABLE: bool = true;
+
+/// What measures [`DISK_WRITABLE`].
+pub const DISK_WRITABLE_MEASUREMENT: &str = "the \"Writable\" property of disk0's IOMedia (a sysdiagnose's ioreg IOMedia entries)";
+
+/// Whether disk0, its partition and the container's medium are writable
+/// ([`DISK_WRITABLE`]).
+pub fn disk_writable() -> bool {
+    DISK_WRITABLE
+}
+
 /// The facts still unset, each with what measures it, as the line gexc
 /// reports at start; none once all are measured.
 pub fn unmeasured() -> Option<String> {
@@ -237,6 +258,7 @@ pub fn unmeasured() -> Option<String> {
     gaps.push(format!("vfs.generic.apfs's sysctl number (stand-in {}; measure {})", super::sysctl::APFS_NODE_STAND_IN, super::sysctl::APFS_NODE_MEASUREMENT));
     gaps.push(format!("whether the System volume is unencrypted (stand-in {SYSTEM_UNENCRYPTED}, no MNT_CPROTECT on /; measure {SYSTEM_UNENCRYPTED_MEASUREMENT})"));
     gaps.push(format!("whether the volumes' IOMedia are writable (stand-in {VOLUMES_WRITABLE}; measure {VOLUMES_WRITABLE_MEASUREMENT})"));
+    gaps.push(format!("whether disk0 is write-protected (stand-in writable: {DISK_WRITABLE}; measure {DISK_WRITABLE_MEASUREMENT})"));
     if DEVICE.disk0_bytes.is_none() {
         gaps.push(format!("disk0's capacity (APFS statfs counts are stand-ins; measure {CAPACITY_MEASUREMENT})"));
     }

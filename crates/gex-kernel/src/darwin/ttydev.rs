@@ -1215,8 +1215,7 @@ impl Kernel {
             const O_SHLOCK: u32 = 0x10;
             const O_EXLOCK: u32 = 0x20;
             if block {
-                let medium = super::storage::media_by_name(n.name).map(|(m, _)| m);
-                if super::kern::mounts().iter().any(|mnt| super::kern::mount_volume(mnt).map(super::storage::Media::Volume) == medium) {
+                if super::storage::media_by_name(n.name).is_some_and(|(m, _)| super::dkopen::mounted_on(m)) {
                     return Err(Errno::EBUSY);
                 }
             }

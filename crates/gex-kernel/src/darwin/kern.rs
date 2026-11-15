@@ -242,6 +242,31 @@ pub fn mounts() -> Vec<&'static Mount> {
     l.clone()
 }
 
+/// How many mounts the list has.
+pub fn mount_count() -> usize {
+    {
+        let l = MOUNT_LIST.read().unwrap_or_else(|e| e.into_inner());
+        if !l.is_empty() {
+            return l.len();
+        }
+    }
+    mounts().len()
+}
+
+/// The mount `path` was on when the list had `seen` mounts: a vnode
+/// looked up then keeps the mount it is on (`v_mount`), whatever has been
+/// mounted on its path since. The list only grows: nothing unmounts here.
+pub fn mount_of_seen(path: &str, seen: usize) -> &'static Mount {
+    let l = mounts();
+    let n = seen.clamp(1, l.len());
+    l[..n]
+        .iter()
+        .copied()
+        .filter(|mt| path == mt.on || path.starts_with(&format!("{}/", mt.on.trim_end_matches('/'))))
+        .max_by_key(|mt| mt.on.len())
+        .unwrap_or(l[0])
+}
+
 /// Put `mnt` at the end of the mount list (`mount_list_add`).
 pub fn mount_list_add(mnt: Mount) -> &'static Mount {
     mounts();
@@ -1415,7 +1440,7 @@ impl Kernel {
                 if self.darwin_vnode_of(&file).is_none() || std::sync::Arc::clone(&file.handle).as_posix_sem().is_some() {
                     return Err(Errno::EINVAL);
                 }
-                file.path.clone()
+                return Ok(mount_of_seen(&file.path, file.darwin_mounts_seen));
             }
         };
         Ok(mount_of(&canon))

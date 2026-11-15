@@ -51,6 +51,10 @@ pub struct OpenFile {
     fg_count: std::sync::atomic::AtomicU32,
     /// Its `vn_closefile` has run.
     darwin_closed: std::sync::atomic::AtomicBool,
+    /// How many mounts the Darwin mount list had when this was opened: the
+    /// mount its vnode is on is among them (`crate::darwin::kern::mount_of_seen`),
+    /// not one mounted on its path since.
+    pub darwin_mounts_seen: usize,
     /// A path to unlink when the last descriptor to this file closes. Set for
     /// `O_TMPFILE`: Linux makes such a file nameless at once, but gex keeps it
     /// named (`.gex-tmpfile-*`) so the `linkat("/proc/self/fd/N", target,
@@ -232,6 +236,7 @@ impl OpenFile {
             darwin_sockopt: Mutex::new(None),
             fg_count: std::sync::atomic::AtomicU32::new(0),
             darwin_closed: std::sync::atomic::AtomicBool::new(false),
+            darwin_mounts_seen: crate::darwin::kern::mount_count(),
         })
     }
 
@@ -264,6 +269,7 @@ impl OpenFile {
             darwin_sockopt: Mutex::new(None),
             fg_count: std::sync::atomic::AtomicU32::new(0),
             darwin_closed: std::sync::atomic::AtomicBool::new(false),
+            darwin_mounts_seen: crate::darwin::kern::mount_count(),
         })
     }
 

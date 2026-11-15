@@ -116,8 +116,12 @@ pub fn device_nosuid(path: &str) -> bool {
 /// Preboot volume) read-only, the Data volume and the others the fstab
 /// mounts `rw` writable, devfs writable.
 pub fn device_mnt_flags(path: &str) -> u32 {
+    device_mnt_flags_on(super::kern::mount_of(path), path)
+}
+
+/// [`device_mnt_flags`] of a vnode on mount `m` (an open file's).
+pub fn device_mnt_flags_on(m: &super::kern::Mount, path: &str) -> u32 {
     use super::vauth::mnt;
-    let m = super::kern::mount_of(path);
     if m.fs == super::kern::Fs::Devfs {
         return 0;
     }
@@ -355,11 +359,25 @@ pub fn record(ns: &Namespace, path: &str, handle: Option<&dyn FileHandle>, o: &O
 /// followed; a mount point is the mounted volume's root), and open as
 /// `handle` if it is. `Err` says why there are none.
 pub fn of(ns: &Namespace, path: &str, md: &Metadata, handle: Option<&dyn FileHandle>) -> Result<Owned, String> {
-    let mnt = super::kern::mount_of(path);
+    of_on(ns, super::kern::mount_of(path), path, md, handle)
+}
+
+/// [`of`] of a vnode on mount `mnt`: an open file's, whose mount is the
+/// one it was opened on ([`super::kern::mount_of_file`]), whatever has
+/// been mounted on its path since.
+pub fn of_on(ns: &Namespace, mnt: &super::kern::Mount, path: &str, md: &Metadata, handle: Option<&dyn FileHandle>) -> Result<Owned, String> {
     if mnt.fs == super::kern::Fs::Devfs {
         return devfs(path, md);
     }
     let Some(vol) = mnt.vol else {
+        if super::kern::is_preboot(mnt) {
+            // Each of its files has its record: the restore's from the
+            // volume's making (super::preboot), the guest's from its own.
+            if let Some(what) = super::kern::unmodelled_files_on(mnt, path, false) {
+                return Err(format!("the owner of {path}: {what}"));
+            }
+            return recorded(ns, path, handle)?.ok_or_else(|| format!("the owner of {path}: a file of the Preboot volume with no record"));
+        }
         if let Some(what) = super::kern::unmodelled_files(mnt) {
             return Err(format!("the owner of {path}: {what}"));
         }
@@ -400,7 +418,12 @@ pub fn of(ns: &Namespace, path: &str, md: &Metadata, handle: Option<&dyn FileHan
 /// [`of`], or reported (stopping a strict run when the call ends) and
 /// `EIO`, the call's error: the volume's attributes cannot be read.
 pub fn get(ns: &Namespace, path: &str, md: &Metadata, handle: Option<&dyn FileHandle>) -> Result<Owned, Errno> {
-    of(ns, path, md, handle).map_err(|e| {
+    get_on(ns, super::kern::mount_of(path), path, md, handle)
+}
+
+/// [`get`] of a vnode on mount `mnt` ([`of_on`]).
+pub fn get_on(ns: &Namespace, mnt: &super::kern::Mount, path: &str, md: &Metadata, handle: Option<&dyn FileHandle>) -> Result<Owned, Errno> {
+    of_on(ns, mnt, path, md, handle).map_err(|e| {
         super::note_unimplemented(e);
         Errno::EIO
     })

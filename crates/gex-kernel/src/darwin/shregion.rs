@@ -139,6 +139,9 @@ pub struct File {
     pub path: String,
     /// The vnode (its mount and inode, `Kernel::darwin_vnode_of`).
     pub vnode: (u64, u64),
+    /// The mount the vnode is on (`v_mount`): a descriptor's, the one it
+    /// was opened on.
+    pub mnt: &'static super::kern::Mount,
 }
 
 impl std::fmt::Debug for File {
@@ -420,7 +423,7 @@ pub fn file_path(fsid: u32, ino: u64) -> Option<String> {
     let q = queue();
     for r in &q.regions {
         let c = r.contents();
-        if let Some(f) = c.files.iter().find(|f| f.vnode.1 == ino && super::kern::mount_of(&f.path).fsid as u32 == fsid) {
+        if let Some(f) = c.files.iter().find(|f| f.vnode.1 == ino && f.mnt.fsid as u32 == fsid) {
             return Some(f.path.clone());
         }
     }
@@ -1128,7 +1131,8 @@ impl Kernel {
             }
             mappings.push(mp);
         }
-        let file = Arc::new(File { handle, path: canonical, vnode });
+        let mnt = super::kern::mount_of(&canonical);
+        let file = Arc::new(File { handle, path: canonical, vnode, mnt });
         let dynamic = (h.shared_region_start + h.dynamic_data.map_or(0, |d| d.0), h.dynamic_data.map_or(0, |d| d.1));
         let subcaches = h.subcaches.iter().map(|s| s.suffix.clone()).collect();
         Ok((Preflight { file, mappings, subcaches, max_slide: h.max_slide, dynamic }, ids))
@@ -1152,7 +1156,7 @@ impl Kernel {
                 return Err(super::errno::errno_of(e as i32));
             }
         }
-        let owner = match super::vattr::of(&self.vfs, &f.path, &md, Some(f.handle.as_ref())) {
+        let owner = match super::vattr::of_on(&self.vfs, f.mnt, &f.path, &md, Some(f.handle.as_ref())) {
             Ok(o) => o.uid,
             Err(why) => {
                 self.darwin_unimplemented(why);
@@ -1162,7 +1166,7 @@ impl Kernel {
         if owner != 0 {
             return Err(Errno::EPERM);
         }
-        let file_mount = super::kern::mount_of(&f.path).on;
+        let file_mount = f.mnt.on;
         if file_mount != super::kern::mount_of("/").on && Some(file_mount) != super::kern::preboot_cryptex_volume() {
             return Err(Errno::EPERM);
         }
@@ -1289,7 +1293,8 @@ impl Kernel {
             }
             let Some(vnode) = self.darwin_vnode_of(&file) else { return Err(Errno::EINVAL) };
             let path = self.vfs.canonical(&file.path);
-            let f = Arc::new(File { handle: Arc::clone(&file.handle), path, vnode });
+            let mnt = super::kern::mount_of_file(&file);
+            let f = Arc::new(File { handle: Arc::clone(&file.handle), path, vnode, mnt });
             self.darwin_sr_check_file(&f, &srf.mappings, true)?;
             srf.file = Some(f);
         }

@@ -200,6 +200,22 @@ const MNT_CPROTECT: u32 = 0x80;
 const ROOT_FLAGS: u32 = MNT_RDONLY | MNT_LOCAL | MNT_ROOTFS | MNT_DOVOLFS | MNT_JOURNALED | MNT_NOATIME | if super::storage::SYSTEM_UNENCRYPTED { 0 } else { MNT_CPROTECT };
 
 
+/// `nblkdev`, the size of `bdevsw`: `vfs_getnewfsid` adds it to the type
+/// number for its major (folded to 0x18000000 at 0xfffffff0073769ac).
+pub const NBLKDEV: u32 = 24;
+
+/// The root's `f_fsid.val[0]`: APFS's `handle_snapshot_mount`, mounting
+/// the sealed snapshot, gives the mount a virtual device's only when
+/// 0xfffffff0066812b4 matches the volume to `/chosen`'s `apfs-preboot-uuid`
+/// or `boot-uuid` ([`super::storage::BOOT_UUID_MATCHES`]); else
+/// (0xfffffff0066ccdb4) `vfs_getnewfsid`: `makedev(nblkdev + vfc_typenum,
+/// ++mntid_gen)`, the first since boot (no mount precedes the root), with
+/// the type number in `val[1]`.
+pub const ROOT_FSID: u32 = (NBLKDEV + vfsstat::APFS_TYPENUM) << 24 | 1;
+
+// The root on a virtual snapshot device is not modelled.
+const _: () = assert!(!super::storage::BOOT_UUID_MATCHES, "the root's virtual snapshot device (0xfffffff00667f0a0)");
+
 /// `FT_DEVFS`, devfs's `vfc_typenum`.
 pub const DEVFS_TYPENUM: u32 = 19;
 
@@ -216,7 +232,7 @@ pub const DEVFS_FSID: u32 = 0x9a3c_51e7;
 /// dynamic data names (standing for libignition's graft, which is not
 /// made yet).
 const BOOT_MOUNTS: &[Mount] = &[
-    Mount { on: "/", from: From::Snapshot(0), fsid: 0x0100_0002, flags: ROOT_FLAGS, fs: Fs::Apfs, vol: Some(super::volattrs::Vol::System) },
+    Mount { on: "/", from: From::Snapshot(0), fsid: ROOT_FSID as u64, flags: ROOT_FLAGS, fs: Fs::Apfs, vol: Some(super::volattrs::Vol::System) },
     Mount { on: "/dev", from: From::Devfs, fsid: DEVFS_FSID as u64, flags: MNT_LOCAL | MNT_DONTBROWSE | MNT_MULTILABEL, fs: Fs::Devfs, vol: None },
     Mount { on: "/System/Cryptexes/OS", from: From::OsCryptex, fsid: super::CACHE_FS_ID, flags: MNT_RDONLY | MNT_DONTBROWSE, fs: Fs::Apfs, vol: Some(super::volattrs::Vol::OsCryptex) },
 ];
@@ -265,6 +281,12 @@ pub fn mount_of_seen(path: &str, seen: usize) -> &'static Mount {
         .filter(|mt| path == mt.on || path.starts_with(&format!("{}/", mt.on.trim_end_matches('/'))))
         .max_by_key(|mt| mt.on.len())
         .unwrap_or(l[0])
+}
+
+/// The mount the vnode an open file is on is on (`v_mount`): the one its
+/// path was on when it was opened.
+pub fn mount_of_file(file: &crate::file::OpenFile) -> &'static Mount {
+    mount_of_seen(&file.path, file.darwin_mounts_seen)
 }
 
 /// Put `mnt` at the end of the mount list (`mount_list_add`).
@@ -330,42 +352,63 @@ pub fn preboot_cryptex_volume() -> Option<&'static str> {
 }
 
 /// A mount's `f_mntfromname`. A volume's is its device's path (what
-/// mount_common copies from the path given). The root's is what
-/// `vfs_rootmountalloc_internal` gives it, "root_device": APFS's mountroot
-/// (`apfs_vfsop_mountroot`, which mounts the sealed snapshot
-/// [`super::storage::ROOT_SNAPSHOT`] of the System volume from `rootvp`)
-/// does not rename it, as only its snapshot and by-role mounts name a
-/// mount's device. The cryptex mount stands for Preboot's graft, which has
-/// no device of its own: its name is the stand-in's.
+/// mount_common copies from the path given). The root's: APFS's
+/// `container_rootmount` copies the System volume's device's path into it
+/// (0xfffffff00667fcc4), and `handle_snapshot_mount`, mounting the sealed
+/// snapshot [`super::storage::ROOT_SNAPSHOT`] without a virtual device
+/// ([`ROOT_FSID`]), puts the snapshot's name and "@" before it
+/// (0xfffffff0066d0d0c: `"%s%s%s"`). The cryptex mount stands for
+/// Preboot's graft, which has no device of its own: its name is the
+/// stand-in's.
 pub fn mount_from(mnt: &Mount) -> String {
     match mnt.from {
         From::Devfs => "devfs".to_string(),
         From::Volume(i) => format!("/dev/{}", super::storage::volume_bsd_name(i)),
-        From::Snapshot(_) => "root_device".to_string(),
+        From::Snapshot(i) => format!("{}@/dev/{}", super::storage::ROOT_SNAPSHOT, super::storage::volume_bsd_name(i)),
         From::OsCryptex => "/dev/disk3s1".to_string(),
     }
 }
 
+/// Whether a mount is of the Preboot volume, whose files are modelled
+/// ([`super::preboot`]) but for those the device's tickets make.
+pub fn is_preboot(mnt: &Mount) -> bool {
+    matches!(mnt.from, From::Volume(i) if super::storage::volume(i).is_some_and(|v| v.role == super::storage::role::PREBOOT))
+}
+
 /// What of a mount's files is not modelled, if any: a volume mounted at
-/// run time holds its own files, which this root does not have.
+/// run time holds its own files, which this root does not have, but for
+/// the Preboot volume's ([`unmodelled_files_at`] says which of those).
 pub fn unmodelled_files(mnt: &Mount) -> Option<String> {
     match mnt.from {
+        From::Volume(_) if is_preboot(mnt) => None,
         From::Volume(i) => {
             let name = super::storage::volume(i).map_or("?", |v| v.name);
-            let what = if super::storage::volume(i).is_some_and(|v| v.role == super::storage::role::PREBOOT) { " (what the restore's populate_preboot_volume put there)" } else { "" };
-            Some(format!("the files of the {name} volume mounted on {}{what}", mnt.on))
+            Some(format!("the files of the {name} volume mounted on {}", mnt.on))
         }
         _ => None,
     }
 }
 
 /// The mount with files not modelled that canonical path `path` is
-/// below (or, with `at_root`, at the root of), with what is not.
+/// below (or, with `at_root`, at the root of: a listing of it), with what
+/// is not. On the Preboot volume: a path through one of its root's
+/// entries the tickets make, and a listing of its root.
 pub fn unmodelled_files_at(path: &str, at_root: bool) -> Option<String> {
-    let mnt = mount_of(path);
+    unmodelled_files_on(mount_of(path), path, at_root)
+}
+
+/// [`unmodelled_files_at`] of a vnode on mount `mnt` (an open file's).
+pub fn unmodelled_files_on(mnt: &Mount, path: &str, at_root: bool) -> Option<String> {
     let below = path != mnt.on;
     if !below && !at_root {
         return None;
+    }
+    if is_preboot(mnt) {
+        if !below {
+            return Some(super::preboot::root_listing());
+        }
+        let rel = path[mnt.on.trim_end_matches('/').len()..].trim_start_matches('/');
+        return super::preboot::unmodelled(rel.split('/').next().unwrap_or(""));
     }
     unmodelled_files(mnt)
 }
@@ -2293,5 +2336,15 @@ mod tests {
         let l = mask_to_linux(d);
         assert_eq!(l, (1 << 9) | (1 << 16));
         assert_eq!(mask_from_linux(l), d);
+    }
+
+    /// The root, mounted from the System volume's sealed snapshot with no
+    /// virtual device: its device's path after the snapshot's name, and
+    /// the first fsid `vfs_getnewfsid` gives an APFS mount.
+    #[test]
+    fn the_root_is_named_for_its_snapshot() {
+        let root = &BOOT_MOUNTS[0];
+        assert_eq!(mount_from(root), format!("{}@/dev/disk1s1", super::super::storage::ROOT_SNAPSHOT));
+        assert_eq!(root.fsid, 0x3200_0001);
     }
 }

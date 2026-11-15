@@ -27,6 +27,7 @@ pub mod ptmx;
 pub mod ctty;
 pub mod devfs;
 pub mod apfsmount;
+pub mod preboot;
 pub mod dkopen;
 pub mod tty;
 pub mod ttydev;

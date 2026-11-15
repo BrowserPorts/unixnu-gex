@@ -728,7 +728,12 @@ is the reference (search `crates/gex-kernel/src/` for
   (spaceman) after the restore and first boot. Volumes have the UUIDs newfs_apfs gives their roles; the System
   volume has the system image's, as ASR's restore of it, whether ASR keeps
   it not yet traced. The OS cryptex is still a mount of its own at
-  `/System/Cryptexes/OS` rather than Preboot's graft of it. The number of
+  `/System/Cryptexes/OS` rather than Preboot's graft of it. A mount of the
+  Preboot volume has the files the restore leaves there (its root and
+  `Cryptexes`), dated when it is first mounted, which stands in for the
+  restore's time; the files the device's personalized tickets make (the
+  directory named by the AP ticket's hash, `active`, `cryptex1`) are
+  reported, as is a listing of its root. The number of
   the sysctl node `vfs.generic.apfs` is the boot's (APFS, lifs and hfs
   register after IOBSD is published): 107 stands in, as if APFS went
   first, until `sysctl.name2oid` of it on the device measures it. APFS's `fsctl`s

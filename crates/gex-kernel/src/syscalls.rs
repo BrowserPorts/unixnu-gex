@@ -4073,23 +4073,27 @@ impl PathIo<'_> {
         let md = file.metadata()?;
         // (a descriptor of a link itself, O_SYMLINK's, is the link's)
         let at = self.darwin.then(|| crate::darwin::vattr::vnode_path(self.ns, &file.path, &md));
-        let st = self.stat_owned(&md, at.as_deref(), Some(file.handle.as_ref()))?;
-        m.write(buf, &self.encode_stat(&st, &md, at.as_deref()))?;
+        // (the vnode's mount the one it was opened on)
+        let mnt = self.darwin.then(|| crate::darwin::kern::mount_of_file(&file));
+        let st = self.stat_owned(&md, at.as_deref(), Some(file.handle.as_ref()), mnt)?;
+        m.write(buf, &self.encode_stat(&st, &md, at.as_deref(), mnt))?;
         Ok(0)
     }
 
     /// A `struct stat` in this process's layout. A Darwin vnode's device is
-    /// its mount's (`va_fsid`, `f_fsid.val[0]`), what `at` is on; a socket
-    /// or anything else not in the namespace has none.
-    fn encode_stat(&self, st: &Stat, md: &crate::vfs::Metadata, at: Option<&str>) -> crate::fs::StatBytes {
+    /// its mount's (`va_fsid`, `f_fsid.val[0]`): `mnt`, an open file's, or
+    /// the one `at` is on; a socket or anything else not in the namespace
+    /// has none.
+    fn encode_stat(&self, st: &Stat, md: &crate::vfs::Metadata, at: Option<&str>, mnt: Option<&crate::darwin::kern::Mount>) -> crate::fs::StatBytes {
         if self.darwin {
             let mut st = st.clone();
+            let on = |p: &str| mnt.unwrap_or_else(|| crate::darwin::kern::mount_of(p));
             st.dev = match at {
-                Some(p) if p.starts_with('/') && md.file_type != crate::vfs::FileType::Socket => crate::darwin::kern::mount_of(p).fsid as u32 as u64,
+                Some(p) if p.starts_with('/') && md.file_type != crate::vfs::FileType::Socket => on(p).fsid as u32 as u64,
                 _ => 0,
             };
             if let Some(p) = at {
-                if p.starts_with('/') && crate::darwin::kern::mount_of(p).fs == crate::darwin::kern::Fs::Devfs {
+                if p.starts_with('/') && on(p).fs == crate::darwin::kern::Fs::Devfs {
                     crate::darwin::devfs::stat_fixup(&mut st, md, p);
                 }
             }
@@ -4120,7 +4124,7 @@ impl PathIo<'_> {
     /// and flags ([`crate::darwin::vattr`]); what is in no namespace (a
     /// pipe's, and the host's standard streams, whatever their names) is
     /// the caller's, as `pipe_stat` gives it.
-    fn stat_owned(&self, md: &crate::vfs::Metadata, at: Option<&str>, handle: Option<&dyn crate::vfs::FileHandle>) -> Result<Stat, Errno> {
+    fn stat_owned(&self, md: &crate::vfs::Metadata, at: Option<&str>, handle: Option<&dyn crate::vfs::FileHandle>, mnt: Option<&crate::darwin::kern::Mount>) -> Result<Stat, Errno> {
         if self.darwin {
             // A terminal node's device is the node's, makedev(0, 0) (the
             // console's) included.
@@ -4130,7 +4134,7 @@ impl PathIo<'_> {
                 }
             }
             if let Some(p) = at.filter(|p| p.starts_with('/') && !handle.is_some_and(|h| h.is_host_stdio())) {
-                let o = crate::darwin::vattr::get(self.ns, p, md, handle)?;
+                let o = crate::darwin::vattr::get_on(self.ns, mnt.unwrap_or_else(|| crate::darwin::kern::mount_of(p)), p, md, handle)?;
                 let rdev = if crate::darwin::ttydev::node_owner(md).is_some() || crate::darwin::devfs::node_of(md).is_some() { md.rdev } else { Kernel::stat_from(md).rdev };
                 return Ok(Stat { uid: o.uid, gid: o.gid, mode: md.file_type.mode_bits() | o.mode, flags: o.flags, rdev, ..Kernel::stat_from(md) });
             }
@@ -4183,8 +4187,8 @@ impl PathIo<'_> {
                 self.ns.canonical(&p)
             }
         });
-        let st = self.stat_owned(&md, at.as_deref(), None)?;
-        m.write(buf, &self.encode_stat(&st, &md, at.as_deref()))?;
+        let st = self.stat_owned(&md, at.as_deref(), None, None)?;
+        m.write(buf, &self.encode_stat(&st, &md, at.as_deref(), None))?;
         crate::phase::mark(9);
         Ok(0)
     }

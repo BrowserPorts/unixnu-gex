@@ -97,9 +97,10 @@ const OWNER_ATTRS: u32 = al::cmn::OWNERID | al::cmn::GRPID | al::cmn::ACCESSMASK
 /// The vnode at `path` (absolute, with every link on it followed) as the
 /// attribute code sees it; its owner, group, mode and flags read when
 /// `want_owner` (`vnode_getattr` fetches only what is asked for), its
-/// `user_access` left for the caller.
-fn vnode(pio: &PathIo<'_>, path: &str, md: &Metadata, name: Option<&str>, want_children: bool, want_owner: bool) -> Result<Vn, Errno> {
-    let mnt: &Mount = mount_of(path);
+/// `user_access` left for the caller. Its mount is `on`, an open file's
+/// (the one it was opened on), or the one `path` is on.
+fn vnode(pio: &PathIo<'_>, path: &str, md: &Metadata, name: Option<&str>, want_children: bool, want_owner: bool, on: Option<&'static Mount>) -> Result<Vn, Errno> {
+    let mnt: &Mount = on.unwrap_or_else(|| mount_of(path));
     if mnt.fs == super::kern::Fs::Devfs {
         // A listing of the directory devfs is mounted on finds the
         // directory it covers, not devfs's root.
@@ -142,7 +143,7 @@ fn vnode(pio: &PathIo<'_>, path: &str, md: &Metadata, name: Option<&str>, want_c
     };
     let t = |s: i64, ns: u32| (s, i64::from(ns));
     let birth = t(st.mtime, st.mtime_ns);
-    let owned = if want_owner { super::vattr::get(pio.ns, path, md, None)? } else { super::vattr::Owned { uid: 0, gid: 0, mode: md.mode & 0o7777, flags: 0 } };
+    let owned = if want_owner { super::vattr::get_on(pio.ns, mnt, path, md, None)? } else { super::vattr::Owned { uid: 0, gid: 0, mode: md.mode & 0o7777, flags: 0 } };
     let (data_alloc, rdev) = match md.file_type {
         FileType::Regular => (roundup(md.size, u64::from(vfsstat::BSIZE)), 0),
         FileType::CharDevice | FileType::BlockDevice => (0, darwin_dev(st.rdev)),
@@ -270,12 +271,12 @@ fn volume_uuid(mnt: &Mount) -> [u8; 16] {
 
 /// The volume `mnt` as `getvolattrlist` has it, its root's owner read
 /// when `want_owner`.
-fn volume(pio: &PathIo<'_>, mnt: &Mount, want_owner: bool) -> Result<VolInfo, Errno> {
+fn volume(pio: &PathIo<'_>, mnt: &'static Mount, want_owner: bool) -> Result<VolInfo, Errno> {
     if mnt.fs == super::kern::Fs::Devfs {
         return devfs_volume(pio, mnt);
     }
     let md = pio.ns.metadata(mnt.on)?;
-    let root = vnode(pio, mnt.on, &md, None, false, want_owner)?;
+    let root = vnode(pio, mnt.on, &md, None, false, want_owner, Some(mnt))?;
     let from = super::kern::mount_from(mnt);
     let counts = super::kern::apfs_counts(mnt);
     Ok(VolInfo {
@@ -697,7 +698,7 @@ impl Kernel {
             }
         }
         if any {
-            self.darwin_setattr_apply(&canon, old, file.as_ref().map(|f| f.handle.as_ref()), va, super::fsops::Call::Setattrlist)?;
+            self.darwin_setattr_apply(&canon, old, file.as_deref(), va, super::fsops::Call::Setattrlist)?;
         }
         if attrs.modtime.is_some() || attrs.acctime.is_some() {
             self.path_io().set_times_at(m, dir, path, attrs.acctime, attrs.modtime, follow)?;
@@ -727,7 +728,7 @@ impl Kernel {
     /// what is returned); for a file's, the getattr check of its
     /// attributes (a descriptor's, `file_cred` given, is let through),
     /// whether it takes the times out of them.
-    fn darwin_attrlist_mac(&mut self, f: Option<&super::macvfs::Found>, alist: &AttrList, size: u64, by_fd: bool) -> Result<(bool, Option<super::mac::SbVnode>), Errno> {
+    fn darwin_attrlist_mac(&mut self, f: Option<&super::macvfs::Found>, alist: &AttrList, size: u64, by_fd: Option<&'static Mount>) -> Result<(bool, Option<super::mac::SbVnode>), Errno> {
         let mac = |e: u32| if e == 0 { Ok(()) } else { Err(super::errno::errno_of(e as i32)) };
         let Some(f) = f.filter(|_| size >= 4 && alist.bitmapcount == al::BIT_MAP_COUNT) else { return Ok((false, None)) };
         let v = super::macvfs::sb_vnode(&f.path, &f.md);
@@ -736,11 +737,11 @@ impl Kernel {
             if alist.set.common & (al::cmn::OWNERID | al::cmn::GRPID | al::cmn::ACCESSMASK | al::cmn::FLAGS | al::cmn::SCRIPT) == 0 {
                 return Ok((false, None));
             }
-            let on = mount_of(&f.path).on;
+            let on = by_fd.unwrap_or_else(|| mount_of(&f.path)).on;
             let md = self.vfs.metadata(on)?;
             return Ok((false, Some(super::macvfs::sb_vnode(on, &md))));
         }
-        if by_fd {
+        if by_fd.is_some() {
             return Ok((false, None));
         }
         let (e, scrub) = self.darwin_mac_check_vnode_getattr(v);
@@ -792,10 +793,10 @@ impl Kernel {
             };
             (md, resolved)
         };
-        let (scrub, root) = self.darwin_attrlist_mac(found.as_ref(), &alist, size, false)?;
+        let (scrub, root) = self.darwin_attrlist_mac(found.as_ref(), &alist, size, None)?;
         let (result, missing) = {
             let pio = self.path_io();
-            self.attrlist_vnode(&pio, &resolved, &md, None, &alist, size as usize, options, scrub)
+            self.attrlist_vnode(&pio, &resolved, &md, None, &alist, size as usize, options, scrub, None)
         };
         for what in missing {
             self.darwin_unimplemented(what);
@@ -809,7 +810,7 @@ impl Kernel {
     /// `fgetattrlist(fd, alist, attributeBuffer, bufferSize, options)`.
     pub(crate) fn darwin_fgetattrlist(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
         let fd = a[0] as i32;
-        let (alist, md, path) = {
+        let (alist, md, path, mnt) = {
             let pio = self.path_io();
             let f = pio.map.fds.get(fd)?;
             // A descriptor that is not a vnode (a pipe, a socket, a kqueue)
@@ -820,13 +821,14 @@ impl Kernel {
             let alist = read_alist(m, a[1])?;
             let md = f.metadata()?;
             let path = f.dir_path()?.unwrap_or_else(|| f.path.clone());
-            (alist, md, path)
+            // The vnode's mount: the one the descriptor was opened on.
+            (alist, md, path, super::kern::mount_of_file(&f))
         };
         let found = self.darwin_sb_fd_vnode(fd);
-        let (_, root) = self.darwin_attrlist_mac(found.as_ref(), &alist, a[3], true)?;
+        let (_, root) = self.darwin_attrlist_mac(found.as_ref(), &alist, a[3], Some(mnt))?;
         let (result, missing) = {
             let pio = self.path_io();
-            self.attrlist_vnode(&pio, &path, &md, None, &alist, a[3] as usize, a[4], false)
+            self.attrlist_vnode(&pio, &path, &md, None, &alist, a[3] as usize, a[4], false, Some(mnt))
         };
         for what in missing {
             self.darwin_unimplemented(what);
@@ -840,7 +842,7 @@ impl Kernel {
     /// `getattrlist_internal` and the volume form it hands over to; a
     /// file's times taken out with `scrub` (Sandbox's getattr check).
     #[allow(clippy::too_many_arguments)]
-    fn attrlist_vnode(&self, pio: &PathIo<'_>, path: &str, md: &Metadata, name: Option<&str>, alist: &AttrList, size: usize, options: u64, scrub: bool) -> (Result<Reply, Errno>, Vec<String>) {
+    fn attrlist_vnode(&self, pio: &PathIo<'_>, path: &str, md: &Metadata, name: Option<&str>, alist: &AttrList, size: usize, options: u64, scrub: bool, on: Option<&'static Mount>) -> (Result<Reply, Errno>, Vec<String>) {
         let use_fork = options & fsopt::ATTR_CMN_EXTENDED != 0;
         let mut missing = Vec::new();
         let want_owner = alist.set.common & OWNER_ATTRS != 0;
@@ -850,7 +852,7 @@ impl Kernel {
             if alist.set.file != 0 || alist.set.dir != 0 || (alist.set.fork != 0 && !use_fork) {
                 return (Err(Errno::EINVAL), missing);
             }
-            let mnt = mount_of(path);
+            let mnt = on.unwrap_or_else(|| mount_of(path));
             let r = volume(pio, mnt, want_owner).and_then(|mut vi| {
                 if want_access {
                     vi.root.user_access = self.darwin_user_access(mnt.on, &vi.root);
@@ -863,7 +865,7 @@ impl Kernel {
             return (r, missing);
         }
         let want_children = alist.set.dir & dir::ENTRYCOUNT != 0;
-        let r = vnode(pio, path, md, name, want_children, want_owner).and_then(|mut vn| {
+        let r = vnode(pio, path, md, name, want_children, want_owner, on).and_then(|mut vn| {
             if scrub {
                 (vn.crtime, vn.acctime, vn.modtime, vn.chgtime, vn.bkuptime, vn.addedtime) = ((0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0));
             }
@@ -942,7 +944,7 @@ impl Kernel {
                     continue;
                 };
                 let isdir = cmd.file_type == FileType::Directory;
-                let (r, missing) = self.attrlist_vnode(&pio, &child, &cmd, Some(&ent.name), &alist, kern_size, options | fsopt::REPORT_FULLSIZE, false);
+                let (r, missing) = self.attrlist_vnode(&pio, &child, &cmd, Some(&ent.name), &alist, kern_size, options | fsopt::REPORT_FULLSIZE, false, None);
                 notes.extend(missing);
                 let mut entry: Vec<u8> = match r {
                     Ok(r) => r.bytes[..r.copy].to_vec(),

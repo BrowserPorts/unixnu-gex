@@ -1,5 +1,10 @@
 // libdispatch signal sources: SIGUSR1 ignored, a source counting it, and
 // two signals sent to the process itself (EVFILT_SIGNAL).
+//
+// What is timed is the signals' delivery: the 5 seconds start when they
+// are sent, not when the timer that sends them is armed (nothing bounds
+// when a new process's queue first runs a block), and the timeout runs on
+// the source's own queue, so it and the handler never both report.
 
 #include <dispatch/dispatch.h>
 #include <signal.h>
@@ -23,10 +28,10 @@ int main(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_MSEC), q, ^{
         kill(getpid(), SIGUSR1);
         kill(getpid(), SIGUSR1);
-    });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-        printf("dispatch-signal timed out at %lu\n", seen);
-        exit(1);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), q, ^{
+            printf("dispatch-signal timed out at %lu\n", seen);
+            exit(1);
+        });
     });
     dispatch_main();
 }

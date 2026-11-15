@@ -415,6 +415,9 @@ pub enum Chan {
     Reclaim,
 }
 
+/// The number of [`Chan`]s.
+const CHANS: usize = Chan::Reclaim as usize + 1;
+
 /// A terminal vnode: its device and the identity (`v_id`) it has until a
 /// revoke reclaims it.
 pub type Vnode = (u32, u64);
@@ -471,13 +474,16 @@ impl SyncWake {
 
 /// A sleep a function asks for (`ttysleep(tp, chan, pri, wmesg, timo)`):
 /// the channel, the timeout in ticks (0 for none), whether a signal may
-/// end it (`PCATCH`), and the generation it began in.
+/// end it (`PCATCH`), the generation it began in, and the channel's
+/// wakeups counted when it was asked for under the terminal's lock
+/// ([`Tty::wake_seq`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SleepReq {
     pub chan: Chan,
     pub timo: i32,
     pub pcatch: bool,
     pub gen: i32,
+    pub seq: u64,
 }
 
 /// How a sleep ended, as `msleep0` reports it.
@@ -651,6 +657,8 @@ pub struct Tty {
     woken: std::collections::HashMap<u64, Vnode>,
     /// The revokes draining one of its vnodes.
     draining: u32,
+    /// The wakeups of each channel so far, by [`Chan`].
+    wakes: [u64; CHANS],
 }
 
 /// A terminal's `t_oproc`.
@@ -768,6 +776,7 @@ impl Tty {
             vnode_io: std::collections::HashMap::new(),
             woken: std::collections::HashMap::new(),
             draining: 0,
+            wakes: [0; CHANS],
         }
     }
 
@@ -779,24 +788,46 @@ impl Tty {
         if self.state & ts::REVOKE != 0 {
             return Err(ERESTART);
         }
-        Ok(SleepReq { chan, timo, pcatch, gen: self.gen })
+        Ok(self.sleep_req(chan, timo, pcatch))
+    }
+
+    /// The sleep on `chan` decided now, under the lock: the wakeups of the
+    /// channel so far go with it.
+    pub fn sleep_req(&self, chan: Chan, timo: i32, pcatch: bool) -> SleepReq {
+        SleepReq { chan, timo, pcatch, gen: self.gen, seq: self.wake_seq(chan) }
+    }
+
+    /// The wakeups of `chan` so far.
+    pub fn wake_seq(&self, chan: Chan) -> u64 {
+        self.wakes[chan as usize]
     }
 
     /// Queue the calling thread on `req`'s channel; the token that
     /// [`Self::unsleep`] takes it off with.
     /// `via`: the vnode the call sleeps in, whose iocount it holds.
     pub fn enqueue(&mut self, req: &SleepReq, waker: Waker, via: Option<Vnode>) -> u64 {
-        let token = self.next_token;
-        self.next_token += 1;
-        self.sleepers.push(Sleeper { chan: req.chan, token, waker: Wake::Thread(waker), via });
-        token
+        self.enqueue_waker(req, Wake::Thread(waker), via)
     }
 
     /// [`Self::enqueue`] for a wait taken here and now.
     pub fn enqueue_sync(&mut self, req: &SleepReq, w: Arc<SyncWake>) -> u64 {
+        self.enqueue_waker(req, Wake::Sync(w), None)
+    }
+
+    /// `msleep`'s queueing: XNU puts the thread on the channel's wait
+    /// queue before it lets go of the lock it decided to sleep under, so
+    /// no wakeup can come between the two. The decision was made under
+    /// this lock taken earlier: a wakeup of the channel since then is the
+    /// one that would have found the thread queued, and it is woken now.
+    fn enqueue_waker(&mut self, req: &SleepReq, waker: Wake, via: Option<Vnode>) -> u64 {
         let token = self.next_token;
         self.next_token += 1;
-        self.sleepers.push(Sleeper { chan: req.chan, token, waker: Wake::Sync(w), via: None });
+        let s = Sleeper { chan: req.chan, token, waker, via };
+        if self.wake_seq(req.chan) == req.seq {
+            self.sleepers.push(s);
+        } else {
+            self.woke(s);
+        }
         token
     }
 
@@ -887,22 +918,27 @@ impl Tty {
 
     /// `wakeup(chan)`.
     pub fn wakeup(&mut self, chan: Chan) {
+        self.wakes[chan as usize] += 1;
         let mut i = 0;
         while i < self.sleepers.len() {
             if self.sleepers[i].chan == chan {
                 let s = self.sleepers.swap_remove(i);
-                // Woken, it is still in its vnode until it is back in its
-                // call ([`Self::unsleep`]).
-                if let Some(v) = s.via {
-                    self.woken.insert(s.token, v);
-                }
-                match &s.waker {
-                    Wake::Thread(w) => wake(w),
-                    Wake::Sync(w) => w.wake(),
-                }
+                self.woke(s);
             } else {
                 i += 1;
             }
+        }
+    }
+
+    /// A sleeper woken: still in its vnode until it is back in its call
+    /// ([`Self::unsleep`]).
+    fn woke(&mut self, s: Sleeper) {
+        if let Some(v) = s.via {
+            self.woken.insert(s.token, v);
+        }
+        match &s.waker {
+            Wake::Thread(w) => wake(w),
+            Wake::Sync(w) => w.wake(),
         }
     }
 

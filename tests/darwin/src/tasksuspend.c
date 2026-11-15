@@ -5,6 +5,13 @@
 // call then answers KERN_SUCCESS; a resume with no hold is KERN_FAILURE;
 // task_suspend2's token, given back once the task runs, has no hold left
 // to release.
+//
+// The hold reaches a thread when it next leaves its CPU or goes back to
+// user space (task_hold_locked's thread_hold, task_wait_locked's
+// thread_wait), which XNU does not bound in time, and nothing bounds how
+// soon after its first tick the child gets to its call either: the child
+// says when it calls (S), and its ticks must stop after that and then stay
+// stopped.
 
 #include <errno.h>
 #include <fcntl.h>
@@ -17,6 +24,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 extern kern_return_t task_suspend2(task_t, task_suspension_token_t *);
@@ -40,14 +48,15 @@ static void *ticker(void *a) {
 }
 
 // The child: ticks from a thread, then, once it has ticked (the parent
-// waits for a tick), suspends its own task; once resumed, says how its
-// call went.
+// waits for a tick), says it suspends its own task and does; once resumed,
+// says how its call went.
 static int child(const char *mode) {
     pthread_t t;
     pthread_create(&t, NULL, ticker, NULL);
     while (!ticked) usleep(10000);
     usleep(100000);
     char msg[32];
+    write(1, "S", 1);
     if (!strcmp(mode, "legacy")) {
         kern_return_t kr = task_suspend(mach_task_self());
         snprintf(msg, sizeof msg, "R%d,%d", kr, task_resume(mach_task_self()));
@@ -61,6 +70,12 @@ static int child(const char *mode) {
 }
 
 static char self[PATH_MAX];
+
+static double now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1e9;
+}
 
 static int drain(int fd, int ms, char *buf, int max) {
     int n = 0;
@@ -85,13 +100,28 @@ static int run(const char *mode) {
     pid_t pid;
     if (posix_spawn(&pid, self, &fa, NULL, args, env)) return bad("spawning", errno, 0);
     close(p[1]);
-    // Its first tick, however long it takes to start.
+    // Its first tick, and its word that it suspends itself, however long
+    // they take to come.
     char c, buf[256];
     read(p[0], &c, 1);
+    while (c != 'S' && read(p[0], &c, 1) == 1) {}
+    if (c != 'S') return bad("the child's suspension", c, 'S');
+    // The ticks the hold has not yet stopped, then none for a second, all
+    // within ten seconds.
     fcntl(p[0], F_SETFL, O_NONBLOCK);
-    usleep(400000);
-    drain(p[0], 50, buf, sizeof buf);
-    if (drain(p[0], 300, buf, sizeof buf)) return bad("ticks from a suspended task", (long)strlen(buf), 0);
+    double start = now(), last = start;
+    long after = 0;
+    for (;;) {
+        ssize_t k = read(p[0], buf, sizeof buf);
+        double t = now();
+        if (k > 0) {
+            after += k;
+            last = t;
+        }
+        if (t - last >= 1) break;
+        if (t - start >= 10) return bad("ticks from a suspended task", after, 0);
+        usleep(10000);
+    }
     kill(pid, SIGCONT);
     int n = 0;
     char all[512] = {0};

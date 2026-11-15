@@ -1296,6 +1296,38 @@ mod tests {
     }
 
     #[test]
+    fn a_drain_woken_before_it_is_queued_is_woken() {
+        let mut env = Rec::default();
+        let (minor, cell) = pair(&mut env);
+        let mut u = VecUio::writer(b"out");
+        let mut ws = WriteState::default();
+        assert_eq!(ptswrite(&mut cell.lock(), &mut u, 0, &caller(), &mut env, &mut ws, None), Io::Done(Ok(())));
+        // ttywait decides to sleep under the lock; the primary's read
+        // empties the queue (TSA_OCOMPLETE's wakeup) before the sleeper is
+        // queued under the lock taken again.
+        let req = match cell.lock().ttywait(None) {
+            Io::Sleep(r) => r,
+            Io::Done(r) => panic!("ttywait with output queued: {r:?}"),
+        };
+        assert_eq!(req.chan, Chan::OComplete);
+        assert_eq!(master_read(&cell), b"out");
+        let w = Arc::new(tty::SyncWake::default());
+        let token = cell.lock().enqueue_sync(&req, Arc::clone(&w));
+        assert!(w.wait(Some(std::time::Instant::now())), "the wakeup before the queueing is the sleeper's");
+        cell.lock().unsleep(token);
+        assert_eq!(cell.lock().ttywait(Some((req, Woke::Awakened))), Io::Done(Ok(())));
+        // A sleep decided after the wakeup waits for the next one.
+        let req = cell.lock().sleep_req(Chan::OComplete, 0, false);
+        let w = Arc::new(tty::SyncWake::default());
+        let token = cell.lock().enqueue_sync(&req, Arc::clone(&w));
+        assert!(!w.wait(Some(std::time::Instant::now())));
+        cell.lock().unsleep(token);
+        let mut cs = PtsClose::default();
+        ptsclose(&cell, makedev(PTSD_MAJOR, minor), 0, false, &mut env, &mut cs, None);
+        ptcclose(&cell, makedev(PTMX_MAJOR, minor), &mut env);
+    }
+
+    #[test]
     fn the_replica_hangs_up_when_the_primary_closes() {
         let mut env = Rec::default();
         let (minor, cell) = pair(&mut env);

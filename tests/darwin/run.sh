@@ -138,25 +138,42 @@ place() {
     fi
 }
 
-# record_of FILE: whether FILE has gex's record of its owner, group, mode
-# and flags (its own, not what a link names).
-record_of() {
-    if command -v xattr >/dev/null 2>&1; then
-        xattr -s -p user.gex.darwin.attrs "$1" >/dev/null 2>&1
-    else
-        getfattr -h -n user.gex.darwin.attrs "$1" >/dev/null 2>&1
-    fi
-}
-
-# What earlier runs of these programs left in the root's /private/var/tmp,
-# made before gex kept the owners of the files a program makes there:
-# with no record, nothing says whose they are, and a run that meets one
-# stops. Those of the names this runner and its programs use, ten minutes
-# old, are removed (a run in progress makes its own afresh).
-if [ -n "${GEX_DARWIN_ROOT:-}" ] && [ -d "$GEX_DARWIN_ROOT/private/var/tmp" ]; then
-    find "$GEX_DARWIN_ROOT/private/var/tmp" -mindepth 1 -maxdepth 1 \( -name 'gex-darwin-*' -o -name 'gex-exec*' -o -name 'gex-spawn-*' -o -name 'gex-kq*' -o -name 'gex-ioctl*' -o -name 'gex-codesig*' -o -name 'gex-pathrules-*' \) -mmin +10 | while read -r f; do
-        record_of "$f" || rm -rf "$f"
+# Each run has a root of its own. GEX_DARWIN_ROOT is shared by every run
+# of these programs (other checkouts' too, at once), the programs are put
+# in its /var/tmp under fixed names, and they make files there by fixed
+# names or by pid (every guest's first process is pid 2): runs at once
+# would meet each other's files, and a run killed part way would leave
+# files a later one trips on. So the run clones the root (clonefile(2) on
+# APFS, a reflink copy elsewhere: the clone shares the root's blocks) into
+# a directory of its own beside it, on its volume (GEX_DARWIN_ROOT.runs),
+# empties the clone's /private/var/tmp, and runs everything there. The
+# guest sees the root as it is, at the device's paths; only the shared
+# root is never written. The clone goes when the run ends; one a killed run
+# left is removed by the next run once that run's runner (the pid its name
+# starts with) is gone.
+if [ -n "${GEX_DARWIN_ROOT:-}" ]; then
+    SHARED=${GEX_DARWIN_ROOT%/}
+    RUNS=$SHARED.runs
+    mkdir -p "$RUNS" || exit 1
+    for d in "$RUNS"/*; do
+        [ -d "$d" ] || continue
+        owner=${d##*/}
+        kill -0 "${owner%%.*}" 2>/dev/null && continue
+        chmod -R u+rwX "$d" 2>/dev/null
+        rm -rf "$d"
     done
+    RUN=$(mktemp -d "$RUNS/$$.XXXXXX") || exit 1
+    # The clone's removal takes a while; the run does not wait for it.
+    trap '(chmod -R u+rwX "$RUN" 2>/dev/null; rm -rf "$RUN") &' EXIT
+    trap 'exit 1' HUP INT TERM
+    if ! python3 -I -c 'import ctypes, sys; c = ctypes.CDLL(None, use_errno=True); sys.exit(ctypes.get_errno() if c.clonefile(sys.argv[1].encode(), sys.argv[2].encode(), 1) else 0)' "$SHARED" "$RUN/root" 2>/dev/null &&
+        ! cp -a --reflink=always "$SHARED" "$RUN/root" 2>/dev/null; then
+        echo "FAIL run.sh: $SHARED cannot be cloned into $RUNS (it needs APFS's clonefile or a reflink copy)" >&2
+        exit 1
+    fi
+    chmod -R u+rwX "$RUN/root/private/var/tmp" 2>/dev/null
+    find "$RUN/root/private/var/tmp" -mindepth 1 -maxdepth 1 -exec rm -rf {} + || exit 1
+    GEX_DARWIN_ROOT=$RUN/root
 fi
 
 fail=0

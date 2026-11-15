@@ -68,15 +68,21 @@ int main(void) {
     if (status & CS_PLATFORM_BINARY) {
         pthread_t t[3];
         for (int i = 0; i < 3; i++) pthread_create(&t[i], NULL, spin, NULL);
-        host_load_info_data_t prev = li;
+        // Each look is timed from before its call, where its read may be,
+        // to after it: two looks' reads are no further apart than from
+        // before the first to after the second.
+        host_load_info_data_t prev;
         int steps = 0;
         double last = now(), start = last;
+        n = HOST_LOAD_INFO_COUNT;
+        host_statistics(h, HOST_LOAD_INFO, (host_info_t)&prev, &n);
         while (steps < 4 && now() - start < 10) {
             usleep(5000);
             n = HOST_LOAD_INFO_COUNT;
+            double before = now();
             host_statistics(h, HOST_LOAD_INFO, (host_info_t)&li, &n);
-            double at = now(), gap = at - last;
-            last = at;
+            double gap = now() - last;
+            last = before;
             if (!memcmp(&li, &prev, sizeof li)) continue;
             // Two passes (two counts) may fall between looks far apart.
             if (gap > 0.1) {

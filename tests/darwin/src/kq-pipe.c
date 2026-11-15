@@ -2,6 +2,11 @@
 // EOF when the writer closes, EV_CLEAR, a read filter on the write end
 // that only fires at EOF), on a regular file (the bytes past the offset),
 // and a libdispatch read source on a pipe another thread writes.
+//
+// The read source's 5 seconds start when the writer has closed its end,
+// not when the source is made (nothing bounds when a new process's queues
+// first run a block), and the timeout runs on the source's own queue, so
+// it and the handler never both report.
 
 #include <dispatch/dispatch.h>
 #include <fcntl.h>
@@ -97,10 +102,10 @@ int main(void) {
         write(dw, "defg", 4);
         usleep(10000);
         close(dw);
-    });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-        printf("kq-pipe: the read source timed out at %zu\n", got);
-        exit(1);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), qq, ^{
+            printf("kq-pipe: the read source timed out at %zu\n", got);
+            exit(1);
+        });
     });
     dispatch_main();
 }

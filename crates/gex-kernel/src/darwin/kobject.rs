@@ -544,6 +544,11 @@ impl Kernel {
                     RunState::Wait
                 };
                 self.procs.sched.set_state(self.pid, tid, state);
+                // The thread blocking (thread_select) or made runnable
+                // (thread_setrun) has its usage brought up to date.
+                if let Some(ns) = self.thread_signals.get(tid).and_then(|s| s.cpu.times()).map(|(u, s)| u + s) {
+                    self.procs.sched.update_usage(tid, super::mach::ns_to_abs(ns));
+                }
             }
             t.offcpu = off;
         }

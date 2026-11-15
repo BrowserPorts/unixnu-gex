@@ -726,6 +726,8 @@ impl Kernel {
         if let Some(t) = self.signals.thread().cpu.rollover() {
             self.procs.add_dead_cpu(self.pid, t);
         }
+        // Its usage starts over with it, from the time it now counts from.
+        self.procs.sched.renew_usage(self.tid, 0);
         // fork_create_child: the CPU limit's timer from the new proc's.
         if self.dtask.rlim_cpu != (0, 0) {
             self.darwin_vtimer_set(super::itimer::vt::RLIM);

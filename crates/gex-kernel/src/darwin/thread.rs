@@ -229,6 +229,9 @@ pub struct DThread {
     pub ctx_addr: u64,
     /// thread_get_state's and thread_set_state's holds (thread_stop).
     pub stop_holds: u32,
+    /// Whether its wait, while it is off its CPU, keeps its kernel stack
+    /// (`thread->kernel_stack`).
+    pub kstack: KStack,
     /// Its registers were set: it goes back to user space at its pc.
     pub redirect: bool,
     /// The thread, made but not started (created suspended).
@@ -251,6 +254,18 @@ pub struct DThread {
     pub servicer_override: u8,
     /// Its alternate stack, sigreturn token and last exception state.
     pub sig: super::signal::ThreadSig,
+}
+
+/// What becomes of a waiting thread's kernel stack, by the wait XNU's call
+/// makes: a wait blocked at a continuation has its stack discarded as the
+/// thread is switched out (`thread_dispatch`), any other keeps it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KStack {
+    #[default]
+    Kept,
+    Discarded,
+    /// Which of the two XNU's wait is has not been established here.
+    Unknown(&'static str),
 }
 
 /// Every Darwin thread of the process, by tid.

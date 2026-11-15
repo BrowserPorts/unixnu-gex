@@ -55,7 +55,7 @@ fn i32_at(b: &[u8], o: usize) -> Option<i32> {
 }
 
 /// An out array of `integer_t`s, MIG-style: its count, then the words.
-fn words(w: &[u32]) -> Vec<u8> {
+pub(super) fn words(w: &[u32]) -> Vec<u8> {
     let mut o = (w.len() as u32).to_le_bytes().to_vec();
     for x in w {
         o.extend_from_slice(&x.to_le_bytes());
@@ -1093,7 +1093,7 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
         // thread_info(thread, flavor, &thread_info_outCnt) ->
         // thread_info_out[] (at most THREAD_INFO_MAX, 32 words).
         (Kobject::Thread(t), 3612) => match (arg(req, 0), arg(req, 1)) {
-            (Some(flavor), Some(cnt)) => thread_info(k, *t, flavor, (cnt as u32).min(32)),
+            (Some(flavor), Some(cnt)) => super::thinfo::thread_info(k, *t, flavor, (cnt as u32).min(32)),
             _ => bad(),
         },
         // thread_get_mach_voucher(thread, which) -> voucher: a send right
@@ -1444,8 +1444,6 @@ fn task_info(flavor: i32, count: u32, dyld_infos: (u64, u64), audit: [u32; 8]) -
     }
 }
 
-/// `thread_info` of thread `t`: KERN_TERMINATED once it has ended, else
-/// `thread_info_internal` with the caller's count checked as XNU checks it.
 /// `host_statistics`'s flavors (`mach/host_info.h`).
 mod hstat {
     pub const LOAD_INFO: i32 = 1;
@@ -1541,35 +1539,6 @@ fn host_statistics(k: &mut Kernel, is64: bool, flavor: i32, count: u32) -> Reply
         LOAD_CACHE.lock().unwrap_or_else(|e| e.into_inner()).data = data;
     }
     Reply::ok(words(&data))
-}
-
-fn thread_info(k: &mut Kernel, t: i32, flavor: i32, count: u32) -> Reply {
-    const THREAD_IDENTIFIER_INFO: i32 = 4;
-    const THREAD_IDENTIFIER_INFO_COUNT: u32 = 6;
-    const KERN_TERMINATED: i32 = 37;
-    let Some(th) = k.thread_signals.get(t) else { return Reply::err(KERN_TERMINATED) };
-    match flavor {
-        // thread_id, thread_handle (cthread_self) and dispatch_qaddr
-        // (thread_dispatchqaddr: the handle plus the process's dispatch
-        // queue offset, none without a handle).
-        THREAD_IDENTIFIER_INFO => {
-            if count < THREAD_IDENTIFIER_INFO_COUNT {
-                return Reply::err(KERN_INVALID_ARGUMENT);
-            }
-            let handle = th.tsd();
-            let qaddr = if handle == 0 { 0 } else { handle.wrapping_add(k.dtask.pthread.dispatch_queue_offset) };
-            let mut w = Vec::with_capacity(6);
-            for v in [th.darwin_id(), handle, qaddr] {
-                w.extend_from_slice(&[v as u32, (v >> 32) as u32]);
-            }
-            Reply::ok(words(&w))
-        }
-        _ => {
-            let mut r = Reply::err(KERN_INVALID_ARGUMENT);
-            r.unimplemented = Some(format!("thread_info flavor {flavor}"));
-            r
-        }
-    }
 }
 
 /// The weakest flavor of task port each routine served here takes (its MIG

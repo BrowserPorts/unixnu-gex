@@ -62,6 +62,15 @@ pub fn host_thread_ending(tid: i32) {
     ThreadCpu(inner).end();
 }
 
+/// Guest thread `tid`'s processor time so far, its user and system time
+/// together, in nanoseconds: none unless it runs on a host thread here and
+/// the host's per-thread clocks are kept.
+pub fn thread_time_ns(tid: i32) -> Option<u64> {
+    let inner = running().get(&tid).and_then(Weak::upgrade)?;
+    let (user, sys) = ThreadCpu(inner).times()?;
+    Some(user + sys)
+}
+
 impl ThreadCpu {
     /// The time since the last change charged to the state it was in, then
     /// the next state. Called on the thread's own host thread.
@@ -181,7 +190,7 @@ impl ThreadCpu {
 /// `absolutetime_to_microtime` of a time kept in nanoseconds: its Mach
 /// time's whole seconds (`rtclock_sec_divisor`) and the microseconds past
 /// them (`rtclock_usec_divisor`).
-fn microtime(ns: u64) -> (u64, u32) {
+pub(crate) fn microtime(ns: u64) -> (u64, u32) {
     let (numer, denom) = crate::darwin::mach::TIMEBASE;
     let abs = (u128::from(ns) * u128::from(denom) / u128::from(numer)) as u64;
     let sec_divisor = 1_000_000_000 * u64::from(denom) / u64::from(numer);

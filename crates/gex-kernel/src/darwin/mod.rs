@@ -90,6 +90,7 @@ pub mod shregion;
 pub mod storage;
 pub mod sandboxes;
 pub mod sched;
+pub mod thinfo;
 pub mod sockbuf;
 pub mod unixsock;
 pub mod sema;

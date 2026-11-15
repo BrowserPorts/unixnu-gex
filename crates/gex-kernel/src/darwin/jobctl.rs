@@ -290,6 +290,8 @@ impl Kernel {
             self.darwin_set_offcpu(m, tid, false);
             return Hold::Deliver;
         }
+        // thread_apc_ast parks it at its continuation, thread_suspended.
+        self.dtask.threads.map.entry(tid).or_default().kstack = super::thread::KStack::Discarded;
         self.darwin_set_offcpu(m, tid, true);
         Hold::Park
     }

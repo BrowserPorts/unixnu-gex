@@ -11343,10 +11343,13 @@ impl Kernel {
             };
             self.dtask.syscall_exit = false;
         }
-        if self.darwin && matches!(out, SyscallOutcome::Blocking(_)) {
-            self.darwin_workq_sched_block();
-            let tid = self.tid;
-            self.darwin_set_offcpu(m, tid, true);
+        if self.darwin {
+            if let SyscallOutcome::Blocking(op) = &out {
+                self.darwin_note_wait(op);
+                self.darwin_workq_sched_block();
+                let tid = self.tid;
+                self.darwin_set_offcpu(m, tid, true);
+            }
         }
         if self.darwin && !self.dtask.pending_replies.is_empty() {
             self.darwin_pending_ready(m);
@@ -12156,10 +12159,13 @@ impl Kernel {
             self.darwin_set_offcpu(m, tid, false);
         }
         let out = self.finish_blocking_inner(m, r);
-        if self.darwin && matches!(out, SyscallOutcome::Blocking(_)) {
-            self.darwin_workq_sched_block();
-            let tid = self.tid;
-            self.darwin_set_offcpu(m, tid, true);
+        if self.darwin {
+            if let SyscallOutcome::Blocking(op) = &out {
+                self.darwin_note_wait(op);
+                self.darwin_workq_sched_block();
+                let tid = self.tid;
+                self.darwin_set_offcpu(m, tid, true);
+            }
         }
         out
     }

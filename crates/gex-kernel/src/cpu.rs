@@ -1,8 +1,12 @@
-//! Processor time: what each guest thread has used, read from the host
-//! thread that runs it. Its time in the kernel (a call or a trap, from its
-//! entry to its return) is its system time and the rest its user time; the
+//! Processor time: what each Darwin thread has used, read from the host
+//! thread that runs it (recount's). Its time in the kernel (a call or a
+//! trap, from its entry to its return) and the rest are kept apart; the
 //! host's wait in a blocked call is neither, as a blocked thread runs on no
-//! processor.
+//! processor. The release kernel is built without
+//! `PRECISE_USER_KERNEL_TIME` (`config_skip_precise_user_kernel_time` in
+//! `MASTER.arm64`'s `MACH_RELEASE`), so recount charges a thread's time in
+//! the kernel to its user time, and every time it reports has a system time
+//! of 0 (as 21H461's `retrieve_thread_basic_info` stores it).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
@@ -153,10 +157,18 @@ impl ThreadCpu {
         self.sample(State::Ended);
     }
 
-    /// Its user and system time so far, in nanoseconds: a running thread's
-    /// current stretch read from its host thread. None without the host's
-    /// clocks.
+    /// Its user and system time so far, in nanoseconds, as recount reports
+    /// them: all of it user time, its time in the kernel too, and a system
+    /// time of 0. None without the host's clocks.
     pub fn times(&self) -> Option<(u64, u64)> {
+        let (user, kernel) = self.split()?;
+        Some((user + kernel, 0))
+    }
+
+    /// Its time out of the kernel and in it so far, in nanoseconds: a
+    /// running thread's current stretch read from its host thread. None
+    /// without the host's clocks.
+    fn split(&self) -> Option<(u64, u64)> {
         crate::darwin::workq::host_clocks()?;
         let i = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let (mut user, mut sys) = (i.user, i.sys);

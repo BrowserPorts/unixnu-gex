@@ -3,7 +3,9 @@
 // while the host translates its code: a new process's main thread has
 // used little of it by main); the
 // process's (getrusage RUSAGE_SELF) holds the same time; a child's, reaped,
-// is its parent's RUSAGE_CHILDREN, a child killed as it computes too. An
+// is its parent's RUSAGE_CHILDREN, a child killed as it computes too. The
+// release kernel counts a thread's time in the kernel as user time
+// (recount without PRECISE_USER_KERNEL_TIME): no system time at all. An
 // exec's thread keeps the time its thread had (thread_copy_resource_info),
 // and its process the time of its process.
 
@@ -33,6 +35,12 @@ static uint64_t usage_ns(int who) {
     struct rusage ru;
     getrusage(who, &ru);
     return tv_ns(ru.ru_utime) + tv_ns(ru.ru_stime);
+}
+
+static long system_us(int who) {
+    struct rusage ru;
+    getrusage(who, &ru);
+    return (long)ru.ru_stime.tv_sec * 1000000 + ru.ru_stime.tv_usec;
 }
 
 static volatile uint64_t sink;
@@ -67,6 +75,8 @@ int main(int argc, char **argv) {
     usleep(200000);
     uint64_t t2 = thread_ns();
     if (t2 - t1 > 50 * ms) return bad("time asleep", (long)((t2 - t1) / ms), 0);
+    // Calls made (getrusage, usleep, the clock's): still no system time.
+    if (system_us(RUSAGE_SELF)) return bad("the process's system time", system_us(RUSAGE_SELF), 0);
 
     // A child computing, then exiting; then one killed as it computes.
     int st;
@@ -92,6 +102,7 @@ int main(int argc, char **argv) {
     waitpid(pid, &st, 0);
     uint64_t c2 = usage_ns(RUSAGE_CHILDREN);
     if (c2 - c1 < 90 * ms) return bad("a killed child's time", (long)((c2 - c1) / ms), 100);
+    if (system_us(RUSAGE_CHILDREN)) return bad("the children's system time", system_us(RUSAGE_CHILDREN), 0);
 
     // A child that computes, then execs this program.
     pid = fork();

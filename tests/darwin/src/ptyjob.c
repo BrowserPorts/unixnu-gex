@@ -195,10 +195,20 @@ int main(void) {
     size_t n = 0;
     char b[256];
     // The parent types what the child waits for, drains the echo, and
-    // collects the reports until every writer is gone.
+    // collects the reports until every writer is gone. Nothing bounds how
+    // long a step takes (each of three is a fork, and its child's exit
+    // waited for): only a minute with nothing at all says the run is stuck.
     for (;;) {
         struct pollfd p[2] = {{rp[0], POLLIN, 0}, {m, POLLIN, 0}};
-        if (poll(p, 2, 5000) <= 0) break;
+        int ready = poll(p, 2, 60000);
+        if (ready < 0) {
+            printf("ptyjob: poll: %d after %s\n", errno, seen);
+            return 1;
+        }
+        if (ready == 0) {
+            printf("ptyjob: no report for a minute after %s\n", seen);
+            return 1;
+        }
         if (p[1].revents & POLLIN) read(m, b, sizeof b);
         if (p[0].revents & (POLLIN | POLLHUP)) {
             ssize_t r = read(rp[0], b, sizeof b);

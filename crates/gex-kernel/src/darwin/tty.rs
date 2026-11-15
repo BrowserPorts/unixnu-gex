@@ -657,6 +657,9 @@ pub struct Tty {
     woken: std::collections::HashMap<u64, Vnode>,
     /// The revokes draining one of its vnodes.
     draining: u32,
+    /// The vnodes a revoke is reclaiming (VL_TERMINATE), marked and
+    /// cleared under this lock, where a call takes its iocount.
+    reclaiming: Vec<Vnode>,
     /// The wakeups of each channel so far, by [`Chan`].
     wakes: [u64; CHANS],
 }
@@ -776,6 +779,7 @@ impl Tty {
             vnode_io: std::collections::HashMap::new(),
             woken: std::collections::HashMap::new(),
             draining: 0,
+            reclaiming: Vec::new(),
             wakes: [0; CHANS],
         }
     }
@@ -874,15 +878,29 @@ impl Tty {
         self.vnode_io.contains_key(&v) || self.sleepers.iter().any(|s| s.via == Some(v)) || self.woken.values().any(|&w| w == v)
     }
 
-    /// A revoke of vnode `v` begins: its drain counted, and, with a call
-    /// in the vnode, TIOCREVOKE sent (whether it was).
+    /// Whether a revoke is reclaiming vnode `v`.
+    pub fn reclaiming(&self, v: Vnode) -> bool {
+        self.reclaiming.contains(&v)
+    }
+
+    /// A revoke of vnode `v` begins: the vnode marked as being reclaimed
+    /// (no call comes into it from now on), its drain counted, and, with a
+    /// call in the vnode, TIOCREVOKE sent (whether it was).
     pub fn revoke_begin(&mut self, v: Vnode) -> bool {
+        self.reclaiming.push(v);
         self.draining += 1;
         let busy = self.vnode_busy(v);
         if busy {
             self.revoke_tty();
         }
         busy
+    }
+
+    /// Vnode `v`'s reclaim is done (its generation has moved on): the calls
+    /// that waited for it are woken, to find it dead.
+    pub fn reclaimed(&mut self, v: Vnode) {
+        self.reclaiming.retain(|&r| r != v);
+        self.wakeup(Chan::Reclaim);
     }
 
     /// A revoke's drain is over: TIOCREVOKECLEAR, if it sent TIOCREVOKE.

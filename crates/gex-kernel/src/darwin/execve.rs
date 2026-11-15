@@ -721,13 +721,13 @@ impl Kernel {
                 *p = n;
             });
         }
-        // The exec's new thread counts from nothing, the old one's time
-        // rolled into the task's (task_rollup_accounting_info).
-        if let Some(t) = self.signals.thread().cpu.rollover() {
-            self.procs.add_dead_cpu(self.pid, t);
-        }
-        // Its usage starts over with it, from the time it now counts from.
-        self.procs.sched.renew_usage(self.tid, 0);
+        // The exec's new thread has the old one's processor time
+        // (thread_copy_resource_info's recount_thread_copy), which is the
+        // same host thread's here, and its sched_time_save; its usage
+        // starts over at this tick (thread_create_internal's sched_stamp).
+        // The threads the exec ended are in the task's
+        // (task_rollup_accounting_info after task_complete_halt).
+        self.procs.sched.renew_usage(self.tid);
         // fork_create_child: the CPU limit's timer from the new proc's.
         if self.dtask.rlim_cpu != (0, 0) {
             self.darwin_vtimer_set(super::itimer::vt::RLIM);

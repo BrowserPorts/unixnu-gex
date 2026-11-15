@@ -3,11 +3,14 @@
 // while the host translates its code: a new process's main thread has
 // used little of it by main); the
 // process's (getrusage RUSAGE_SELF) holds the same time; a child's, reaped,
-// is its parent's RUSAGE_CHILDREN, a child killed as it computes too.
+// is its parent's RUSAGE_CHILDREN, a child killed as it computes too. An
+// exec's thread keeps the time its thread had (thread_copy_resource_info),
+// and its process the time of its process.
 
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -42,8 +45,19 @@ static void spin(uint64_t ns) {
     }
 }
 
-int main(void) {
+// After the exec of a thread that had used `argv[2]` and a process that
+// had used `argv[3]`.
+static int after_exec(char **argv) {
+    uint64_t t = thread_ns(), u = usage_ns(RUSAGE_SELF);
+    uint64_t before = strtoull(argv[2], NULL, 10), process = strtoull(argv[3], NULL, 10);
+    if (t < before) return bad("the thread's clock after an exec", (long)(t / 1000000), (long)(before / 1000000));
+    if (u < process) return bad("the process's time after an exec", (long)(u / 1000000), (long)(process / 1000000));
+    return 0;
+}
+
+int main(int argc, char **argv) {
     const uint64_t ms = 1000000;
+    if (argc == 4) return after_exec(argv);
     uint64_t t0 = thread_ns(), u0 = usage_ns(RUSAGE_SELF);
     if (t0 > 500 * ms) return bad("the main thread's time by main", (long)(t0 / ms), 0);
     spin(100 * ms);
@@ -78,6 +92,20 @@ int main(void) {
     waitpid(pid, &st, 0);
     uint64_t c2 = usage_ns(RUSAGE_CHILDREN);
     if (c2 - c1 < 90 * ms) return bad("a killed child's time", (long)((c2 - c1) / ms), 100);
+
+    // A child that computes, then execs this program.
+    pid = fork();
+    if (pid == 0) {
+        spin(100 * ms);
+        char t[24], u[24];
+        snprintf(t, sizeof t, "%llu", (unsigned long long)thread_ns());
+        snprintf(u, sizeof u, "%llu", (unsigned long long)usage_ns(RUSAGE_SELF));
+        char *args[] = {argv[0], "exec", t, u, NULL};
+        execv(argv[0], args);
+        _exit(100);
+    }
+    waitpid(pid, &st, 0);
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) return bad("the exec'd child's status", st, 0);
     printf("cputime ok\n");
     return 0;
 }

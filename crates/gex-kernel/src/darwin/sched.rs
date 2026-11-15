@@ -237,12 +237,12 @@ impl Sched {
     }
 
     /// The exec's new thread that thread `tid` becomes: its usage starts
-    /// over at this tick, its time from `total`.
-    pub fn renew_usage(&self, tid: i32, total: u64) {
+    /// over at this tick, from the old thread's `sched_time_save`.
+    pub fn renew_usage(&self, tid: i32) {
         let mut s = self.lock();
         let stamp = s.tick as u32;
         if let Some(t) = s.threads.get_mut(&tid) {
-            t.usage = Usage { stamp, time_save: total, cpu_usage: 0 };
+            t.usage = Usage { stamp, time_save: t.usage.time_save, cpu_usage: 0 };
         }
     }
 

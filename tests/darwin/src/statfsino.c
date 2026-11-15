@@ -106,6 +106,11 @@ int main(void) {
     fill(&u);
     if (sys5(SYS_STATFS64, (long)"/", (long)&w, 0, 0, 0) || sys5(SYS_STATFS, (long)"/", (long)&u, 0, 0, 0)) return bad("statfs /", errno, 0);
     fail |= same("statfs /", &u, &w, 303);
+    // The root's flags: the kernel's (read-only, the root, local, from
+    // APFS's vfsconf entry) and APFS's (no access times, journaled, volfs
+    // paths), with no content protection on the System volume.
+    unsigned long rootflags = MNT_RDONLY | MNT_LOCAL | MNT_ROOTFS | MNT_DOVOLFS | MNT_JOURNALED | MNT_NOATIME;
+    fail |= w.f_flags != rootflags ? bad("root f_flags", w.f_flags, rootflags) : 0;
 
     fill(&u);
     if (sys5(SYS_STATFS64, (long)file, (long)&w, 0, 0, 0) || sys5(SYS_STATFS, (long)file, (long)&u, 0, 0, 0)) return bad("statfs file", errno, 0);

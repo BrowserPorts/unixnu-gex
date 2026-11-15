@@ -201,6 +201,16 @@ pub fn media_by_name(name: &str) -> Option<(Media, u32)> {
     media_order().into_iter().zip(0..).find(|&(m, _)| media_bsd_name(m) == name)
 }
 
+/// Whether the System volume's `apfs_fs_flags` have `APFS_FS_UNENCRYPTED`,
+/// which keeps `MNT_CPROTECT` off the root (APFS's live mount,
+/// 0xfffffff0066cd35c). The restore makes the volume; what it gives it is
+/// unmeasured. Stand-in: unencrypted, as the SystemOS cryptex image's
+/// volume is (fs_flags 0x1 in 044-76034-038.dmg).
+pub const SYSTEM_UNENCRYPTED: bool = true;
+
+/// What measures [`SYSTEM_UNENCRYPTED`].
+pub const SYSTEM_UNENCRYPTED_MEASUREMENT: &str = "`statfs(\"/\")`'s f_flags on the device: MNT_CPROTECT (0x80) clear means unencrypted";
+
 /// The facts still unset, each with what measures it, as the line gexc
 /// reports at start; none once all are measured.
 pub fn unmeasured() -> Option<String> {
@@ -212,6 +222,7 @@ pub fn unmeasured() -> Option<String> {
         gaps.push(format!("the disks' BSD minors (stand-in: the media's registration order; measure {MEDIA_ORDER_MEASUREMENT})"));
     }
     gaps.push(format!("vfs.generic.apfs's sysctl number (stand-in {}; measure {})", super::sysctl::APFS_NODE_STAND_IN, super::sysctl::APFS_NODE_MEASUREMENT));
+    gaps.push(format!("whether the System volume is unencrypted (stand-in {SYSTEM_UNENCRYPTED}, no MNT_CPROTECT on /; measure {SYSTEM_UNENCRYPTED_MEASUREMENT})"));
     if DEVICE.disk0_bytes.is_none() {
         gaps.push(format!("disk0's capacity (APFS statfs counts are stand-ins; measure {CAPACITY_MEASUREMENT})"));
     }

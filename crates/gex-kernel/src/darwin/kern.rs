@@ -161,14 +161,44 @@ pub enum Fs {
     Devfs,
 }
 
-/// `MNT_RDONLY`, `MNT_NOSUID`, `MNT_LOCAL`, `MNT_ROOTFS`, `MNT_DONTBROWSE`,
-/// `MNT_MULTILABEL`.
+/// `MNT_RDONLY`, `MNT_NOSUID`, `MNT_LOCAL`, `MNT_ROOTFS`, `MNT_DOVOLFS`,
+/// `MNT_DONTBROWSE`, `MNT_JOURNALED`, `MNT_MULTILABEL`, `MNT_NOATIME`,
+/// `MNT_CPROTECT`.
 const MNT_RDONLY: u32 = 0x1;
 pub(crate) const MNT_NOSUID: u32 = 0x8;
 const MNT_LOCAL: u32 = 0x1000;
 pub(crate) const MNT_ROOTFS: u32 = 0x4000;
+const MNT_DOVOLFS: u32 = 0x8000;
 const MNT_DONTBROWSE: u32 = 0x10_0000;
+const MNT_JOURNALED: u32 = 0x80_0000;
 const MNT_MULTILABEL: u32 = 0x400_0000;
+const MNT_NOATIME: u32 = 0x1000_0000;
+const MNT_CPROTECT: u32 = 0x80;
+
+/// The root's flags, as mounting it leaves them:
+/// - `vfs_rootmountalloc_internal`: `MNT_RDONLY | MNT_ROOTFS`, and the
+///   `vfc_flags` of APFS's vfsconf entry within `MNT_VISFLAGMASK`. Those are
+///   `MNT_LOCAL` alone: APFS's `vfs_fsadd` (0xfffffff00666aa6c) passes
+///   `vfe_flags` 0x16479, with `VFS_TBLLOCALVOL`, which `vfs_fsadd` turns
+///   into `MNT_LOCAL`; nothing in `vfs_fsadd` sets `MNT_MULTILABEL`.
+/// - `apfs_vfsop_mount`, for every mount: `vfs_setflags(MNT_NOATIME)`
+///   (0xfffffff0066c6254), then `vfs_clearflags(MNT_STRICTATIME)`.
+/// - APFS's mount of a live volume: `vfs_setflags(MNT_JOURNALED)`
+///   (0xfffffff0066cd314), and `MNT_DOVOLFS` once the volume's private
+///   vnodes load (0xfffffff0066cd50c). `MNT_CPROTECT` only for a volume
+///   whose `apfs_fs_flags` have neither `APFS_FS_UNENCRYPTED` nor
+///   `APFS_FS_ONEKEY` (0xfffffff0066cd35c), which the System volume has
+///   ([`super::storage::SYSTEM_UNENCRYPTED`]). `MNT_DONTBROWSE` only for the
+///   Recovery, VM, Preboot, Installer, Sidecar and Enterprise roles
+///   (0xfffffff0066cd3c4), not the System's.
+/// - No `MNT_NOSUID`: on a `SECURE_KERNEL` without `CONFIG_MNT_SUID` (the
+///   iOS release configuration) `mount_common` sets it on every mount it
+///   makes or updates, but `vfs_mountroot` does not go through it. No
+///   `MNT_SNAPSHOT`: APFS sets it only on a snapshot mount on a covered
+///   directory (0xfffffff0066ccecc), not on the root it mounts from its
+///   sealed snapshot.
+const ROOT_FLAGS: u32 = MNT_RDONLY | MNT_LOCAL | MNT_ROOTFS | MNT_DOVOLFS | MNT_JOURNALED | MNT_NOATIME | if super::storage::SYSTEM_UNENCRYPTED { 0 } else { MNT_CPROTECT };
+
 
 /// `FT_DEVFS`, devfs's `vfc_typenum`.
 pub const DEVFS_TYPENUM: u32 = 19;
@@ -186,7 +216,7 @@ pub const DEVFS_FSID: u32 = 0x9a3c_51e7;
 /// dynamic data names (standing for libignition's graft, which is not
 /// made yet).
 const BOOT_MOUNTS: &[Mount] = &[
-    Mount { on: "/", from: From::Snapshot(0), fsid: 0x0100_0002, flags: MNT_RDONLY | MNT_ROOTFS, fs: Fs::Apfs, vol: Some(super::volattrs::Vol::System) },
+    Mount { on: "/", from: From::Snapshot(0), fsid: 0x0100_0002, flags: ROOT_FLAGS, fs: Fs::Apfs, vol: Some(super::volattrs::Vol::System) },
     Mount { on: "/dev", from: From::Devfs, fsid: DEVFS_FSID as u64, flags: MNT_LOCAL | MNT_DONTBROWSE | MNT_MULTILABEL, fs: Fs::Devfs, vol: None },
     Mount { on: "/System/Cryptexes/OS", from: From::OsCryptex, fsid: super::CACHE_FS_ID, flags: MNT_RDONLY | MNT_DONTBROWSE, fs: Fs::Apfs, vol: Some(super::volattrs::Vol::OsCryptex) },
 ];

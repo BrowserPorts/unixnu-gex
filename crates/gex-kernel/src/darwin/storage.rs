@@ -244,6 +244,18 @@ pub fn volume_writable() -> bool {
     VOLUMES_WRITABLE
 }
 
+/// Whether iBoot's `/chosen` names the System volume as the one booted:
+/// `apfs-preboot-uuid` its volume group's UUID, or `boot-uuid` its own or
+/// its group's (APFS's 0xfffffff0066812b4). Then the root's snapshot gets
+/// a virtual device of its own (0xfffffff00667f0a0); else a new fsid and
+/// its name before the device's ([`super::kern::ROOT_FSID`],
+/// [`super::kern::mount_from`]). The IPSW's device tree has neither
+/// property: iBoot adds what it adds at boot. Stand-in: no match.
+pub const BOOT_UUID_MATCHES: bool = false;
+
+/// What measures [`BOOT_UUID_MATCHES`].
+pub const BOOT_UUID_MEASUREMENT: &str = "`statfs(\"/\")`'s f_mntfromname on the device: \"com.apple.os.update-...@/dev/disk1s1\" for no match, a snapshot device's path for one";
+
 /// Whether the NVMe namespace reports itself write-protected: its
 /// `IONVMeBlockStorageDevice::reportWriteProtection` (0xfffffff006a96f7c,
 /// slot 0x5a8 of its vtable 0xfffffff006fab200) answers bit 0 of the
@@ -279,6 +291,7 @@ pub fn unmeasured() -> Option<String> {
     gaps.push(format!("whether the System volume is unencrypted (stand-in {SYSTEM_UNENCRYPTED}, no MNT_CPROTECT on /; measure {SYSTEM_UNENCRYPTED_MEASUREMENT})"));
     gaps.push(format!("whether the Preboot volume is unencrypted (stand-in {PREBOOT_UNENCRYPTED}, no MNT_CPROTECT on its mount; measure {PREBOOT_UNENCRYPTED_MEASUREMENT})"));
     gaps.push(super::preboot::TIMES_STAND_IN.to_string());
+    gaps.push(format!("whether iBoot's /chosen boot-uuid or apfs-preboot-uuid names the System volume (stand-in {BOOT_UUID_MATCHES}: the root mounted from its snapshot by name, with a new fsid; measure {BOOT_UUID_MEASUREMENT})"));
     gaps.push(format!("whether the volumes' IOMedia are writable (stand-in {VOLUMES_WRITABLE}; measure {VOLUMES_WRITABLE_MEASUREMENT})"));
     gaps.push(format!("whether disk0 is write-protected (stand-in writable: {DISK_WRITABLE}; measure {DISK_WRITABLE_MEASUREMENT})"));
     if DEVICE.disk0_bytes.is_none() {

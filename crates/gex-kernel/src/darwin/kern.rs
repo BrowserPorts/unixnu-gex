@@ -200,6 +200,22 @@ const MNT_CPROTECT: u32 = 0x80;
 const ROOT_FLAGS: u32 = MNT_RDONLY | MNT_LOCAL | MNT_ROOTFS | MNT_DOVOLFS | MNT_JOURNALED | MNT_NOATIME | if super::storage::SYSTEM_UNENCRYPTED { 0 } else { MNT_CPROTECT };
 
 
+/// `nblkdev`, the size of `bdevsw`: `vfs_getnewfsid` adds it to the type
+/// number for its major (folded to 0x18000000 at 0xfffffff0073769ac).
+pub const NBLKDEV: u32 = 24;
+
+/// The root's `f_fsid.val[0]`: APFS's `handle_snapshot_mount`, mounting
+/// the sealed snapshot, gives the mount a virtual device's only when
+/// 0xfffffff0066812b4 matches the volume to `/chosen`'s `apfs-preboot-uuid`
+/// or `boot-uuid` ([`super::storage::BOOT_UUID_MATCHES`]); else
+/// (0xfffffff0066ccdb4) `vfs_getnewfsid`: `makedev(nblkdev + vfc_typenum,
+/// ++mntid_gen)`, the first since boot (no mount precedes the root), with
+/// the type number in `val[1]`.
+pub const ROOT_FSID: u32 = (NBLKDEV + vfsstat::APFS_TYPENUM) << 24 | 1;
+
+// The root on a virtual snapshot device is not modelled.
+const _: () = assert!(!super::storage::BOOT_UUID_MATCHES, "the root's virtual snapshot device (0xfffffff00667f0a0)");
+
 /// `FT_DEVFS`, devfs's `vfc_typenum`.
 pub const DEVFS_TYPENUM: u32 = 19;
 
@@ -216,7 +232,7 @@ pub const DEVFS_FSID: u32 = 0x9a3c_51e7;
 /// dynamic data names (standing for libignition's graft, which is not
 /// made yet).
 const BOOT_MOUNTS: &[Mount] = &[
-    Mount { on: "/", from: From::Snapshot(0), fsid: 0x0100_0002, flags: ROOT_FLAGS, fs: Fs::Apfs, vol: Some(super::volattrs::Vol::System) },
+    Mount { on: "/", from: From::Snapshot(0), fsid: ROOT_FSID as u64, flags: ROOT_FLAGS, fs: Fs::Apfs, vol: Some(super::volattrs::Vol::System) },
     Mount { on: "/dev", from: From::Devfs, fsid: DEVFS_FSID as u64, flags: MNT_LOCAL | MNT_DONTBROWSE | MNT_MULTILABEL, fs: Fs::Devfs, vol: None },
     Mount { on: "/System/Cryptexes/OS", from: From::OsCryptex, fsid: super::CACHE_FS_ID, flags: MNT_RDONLY | MNT_DONTBROWSE, fs: Fs::Apfs, vol: Some(super::volattrs::Vol::OsCryptex) },
 ];
@@ -330,18 +346,19 @@ pub fn preboot_cryptex_volume() -> Option<&'static str> {
 }
 
 /// A mount's `f_mntfromname`. A volume's is its device's path (what
-/// mount_common copies from the path given). The root's is what
-/// `vfs_rootmountalloc_internal` gives it, "root_device": APFS's mountroot
-/// (`apfs_vfsop_mountroot`, which mounts the sealed snapshot
-/// [`super::storage::ROOT_SNAPSHOT`] of the System volume from `rootvp`)
-/// does not rename it, as only its snapshot and by-role mounts name a
-/// mount's device. The cryptex mount stands for Preboot's graft, which has
-/// no device of its own: its name is the stand-in's.
+/// mount_common copies from the path given). The root's: APFS's
+/// `container_rootmount` copies the System volume's device's path into it
+/// (0xfffffff00667fcc4), and `handle_snapshot_mount`, mounting the sealed
+/// snapshot [`super::storage::ROOT_SNAPSHOT`] without a virtual device
+/// ([`ROOT_FSID`]), puts the snapshot's name and "@" before it
+/// (0xfffffff0066d0d0c: `"%s%s%s"`). The cryptex mount stands for
+/// Preboot's graft, which has no device of its own: its name is the
+/// stand-in's.
 pub fn mount_from(mnt: &Mount) -> String {
     match mnt.from {
         From::Devfs => "devfs".to_string(),
         From::Volume(i) => format!("/dev/{}", super::storage::volume_bsd_name(i)),
-        From::Snapshot(_) => "root_device".to_string(),
+        From::Snapshot(i) => format!("{}@/dev/{}", super::storage::ROOT_SNAPSHOT, super::storage::volume_bsd_name(i)),
         From::OsCryptex => "/dev/disk3s1".to_string(),
     }
 }
@@ -2309,5 +2326,15 @@ mod tests {
         let l = mask_to_linux(d);
         assert_eq!(l, (1 << 9) | (1 << 16));
         assert_eq!(mask_from_linux(l), d);
+    }
+
+    /// The root, mounted from the System volume's sealed snapshot with no
+    /// virtual device: its device's path after the snapshot's name, and
+    /// the first fsid `vfs_getnewfsid` gives an APFS mount.
+    #[test]
+    fn the_root_is_named_for_its_snapshot() {
+        let root = &BOOT_MOUNTS[0];
+        assert_eq!(mount_from(root), format!("{}@/dev/disk1s1", super::super::storage::ROOT_SNAPSHOT));
+        assert_eq!(root.fsid, 0x3200_0001);
     }
 }

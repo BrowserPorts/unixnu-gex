@@ -4,9 +4,9 @@
 // own; the flavor list; too short a count, or a 32-bit flavor, is
 // KERN_INVALID_ARGUMENT; the NEON state read and written back; the debug
 // state zeros, set with nothing enabled, refused with a context ID
-// (KERN_PROTECTION_FAILURE); a thread waiting in a call has that call's
-// trap as its exception state, and, its pc set, goes on there once its
-// call is done.
+// (KERN_PROTECTION_FAILURE); a thread waiting in a call (TH_STATE_WAITING
+// by thread_info) has that call's trap as its exception state, and, its pc
+// set, goes on there once its call is done.
 
 #include <mach/mach.h>
 #include <pthread.h>
@@ -90,11 +90,16 @@ int main(void) {
     n = ARM_THREAD_STATE64_COUNT;
     if ((kr = thread_get_state(mach_thread_self(), ARM_THREAD_STATE64, (thread_state_t)&ts, &n)) || !arm_thread_state64_get_sp(ts)) return bad("its own state", kr, 0);
 
-    // A thread waiting in a call, sent on elsewhere.
+    // A thread waiting in a call, sent on elsewhere: once thread_info
+    // has it waiting (in its read()), as long as that takes.
     pipe(p);
     pthread_create(&t, NULL, reader, NULL);
-    usleep(100000);
     th = pthread_mach_thread_np(t);
+    thread_basic_info_data_t bi;
+    do {
+        n = THREAD_BASIC_INFO_COUNT;
+        if ((kr = thread_info(th, THREAD_BASIC_INFO, (thread_info_t)&bi, &n))) return bad("the reader's basic info", kr, 0);
+    } while (bi.run_state != TH_STATE_WAITING && !usleep(1000));
     thread_suspend(th);
     // Its exception state: the svc #0x80 it trapped with (EC 0x15, IL),
     // with no fault address.

@@ -465,6 +465,20 @@ impl Kernel {
             self.darwin_mount_close(node.minor, &given);
             return Err(Errno::EIO);
         }
+        // The volume's files: the Preboot volume's as the restore left
+        // them (super::preboot); no other volume's are modelled, and a
+        // path below its mount is reported (kern::unmodelled_files_at).
+        let files = match super::storage::volume(mounted.volume).map(|v| v.role) {
+            Some(super::storage::role::PREBOOT) => match super::preboot::volume() {
+                Ok(fs) => Some(fs),
+                Err(why) => {
+                    self.darwin_unimplemented(why);
+                    self.darwin_mount_close(node.minor, &given);
+                    return Err(Errno::EIO);
+                }
+            },
+            _ => None,
+        };
         // The covered directory's mountedhere, mount_generation, checkdirs
         // (a process whose directory is the covered one now has the
         // mount's root: here every path through the mount point reaches
@@ -478,6 +492,9 @@ impl Kernel {
             fs: super::kern::Fs::Apfs,
             vol: None,
         });
+        if let Some(fs) = files {
+            self.vfs.mount(mnt.on, fs);
+        }
         // IOBSDMountChange (IOPOLLED_COREFILE, from
         // CONFIG_KDP_INTERACTIVE_DEBUGGING): a writable local mount whose
         // covered path starts the kernel core's, /private/var/vm/kernelcore,

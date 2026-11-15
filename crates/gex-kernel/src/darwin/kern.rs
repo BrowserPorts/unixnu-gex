@@ -346,26 +346,42 @@ pub fn mount_from(mnt: &Mount) -> String {
     }
 }
 
+/// Whether a mount is of the Preboot volume, whose files are modelled
+/// ([`super::preboot`]) but for those the device's tickets make.
+pub fn is_preboot(mnt: &Mount) -> bool {
+    matches!(mnt.from, From::Volume(i) if super::storage::volume(i).is_some_and(|v| v.role == super::storage::role::PREBOOT))
+}
+
 /// What of a mount's files is not modelled, if any: a volume mounted at
-/// run time holds its own files, which this root does not have.
+/// run time holds its own files, which this root does not have, but for
+/// the Preboot volume's ([`unmodelled_files_at`] says which of those).
 pub fn unmodelled_files(mnt: &Mount) -> Option<String> {
     match mnt.from {
+        From::Volume(_) if is_preboot(mnt) => None,
         From::Volume(i) => {
             let name = super::storage::volume(i).map_or("?", |v| v.name);
-            let what = if super::storage::volume(i).is_some_and(|v| v.role == super::storage::role::PREBOOT) { " (what the restore's populate_preboot_volume put there)" } else { "" };
-            Some(format!("the files of the {name} volume mounted on {}{what}", mnt.on))
+            Some(format!("the files of the {name} volume mounted on {}", mnt.on))
         }
         _ => None,
     }
 }
 
 /// The mount with files not modelled that canonical path `path` is
-/// below (or, with `at_root`, at the root of), with what is not.
+/// below (or, with `at_root`, at the root of: a listing of it), with what
+/// is not. On the Preboot volume: a path through one of its root's
+/// entries the tickets make, and a listing of its root.
 pub fn unmodelled_files_at(path: &str, at_root: bool) -> Option<String> {
     let mnt = mount_of(path);
     let below = path != mnt.on;
     if !below && !at_root {
         return None;
+    }
+    if is_preboot(mnt) {
+        if !below {
+            return Some(super::preboot::root_listing());
+        }
+        let rel = path[mnt.on.trim_end_matches('/').len()..].trim_start_matches('/');
+        return super::preboot::unmodelled(rel.split('/').next().unwrap_or(""));
     }
     unmodelled_files(mnt)
 }

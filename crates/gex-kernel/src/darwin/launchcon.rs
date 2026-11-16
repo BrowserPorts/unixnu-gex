@@ -1397,7 +1397,7 @@ impl crate::syscalls::Kernel {
         let canonical = self.vfs.canonical(&self.vfs.absolute(path));
         let mnt = super::kern::mount_of(&canonical);
         let described = self.vfs.mount_id_of(&canonical) == self.vfs.mount_id_of(mnt.on);
-        let rootfs = described.then_some(mnt.flags & super::kern::MNT_ROOTFS != 0);
+        let rootfs = described.then_some(mnt.flags() & super::kern::MNT_ROOTFS != 0);
         (canonical, rootfs)
     }
 

@@ -64,6 +64,7 @@ pub mod op {
     pub const FILE_MAP_EXECUTABLE: usize = 17;
     pub const FILE_MKNOD: usize = 18;
     pub const FILE_MOUNT: usize = 19;
+    pub const FILE_MOUNT_UPDATE: usize = 20;
     pub const FILE_READ: usize = 21;
     pub const FILE_READ_DATA: usize = 22;
     pub const FILE_READ_METADATA: usize = 23;
@@ -262,6 +263,10 @@ pub struct SbVnode {
     pub of: Option<(String, crate::vfs::Metadata)>,
     /// Its filesystem's name (`vfs_name`).
     pub fs: &'static [u8],
+    /// The mount it is on, when it is not the one its path is on now (an
+    /// open file's, a covered directory's): its owner, mode and flags are
+    /// read of it.
+    pub mnt: Option<&'static super::kern::Mount>,
     /// An extended attribute's name (`args[0xe8]`), an ioctl's command
     /// (`args[0x140]`).
     pub xattr: Option<Vec<u8>>,

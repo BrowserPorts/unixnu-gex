@@ -154,6 +154,84 @@ pub fn vfsop_mount(args: &Args, mut flags: u32, medium: Media, dev: u32, from: &
     Ok(Mounted { volume: v, flags, fsid0: dev })
 }
 
+/// Whether the container is read-only to APFS (its `+0x12b`): loaded so
+/// for the root, until a writing mount of one of its volumes updates it to
+/// read-write (`nx_ro_to_rw`, which clears it at 0xfffffff0066718b0). On a
+/// system launchd has booted, the Data volume is mounted read-write.
+pub fn container_read_only() -> bool {
+    super::kern::boot_state() == super::kern::BootState::Kernel && !CONTAINER_RW.load(std::sync::atomic::Ordering::Acquire)
+}
+
+static CONTAINER_RW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A writing mount of a volume of the container has updated it to
+/// read-write.
+pub fn container_made_writable() {
+    CONTAINER_RW.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// `MNT_ROOTFS`.
+const MNT_ROOTFS: u32 = 0x4000;
+
+/// `apfs_vfsop_mount` of an update (`vfs_isupdate`, 0xfffffff0066c62c8),
+/// with the mount's flags `flags` as `mount_common` leaves them and APFS's
+/// read-only state of the volume `apfs_ro` (its `+0x354`), both changed in
+/// place; `reload` and `write_upgrade` are `vfs_isreload` and
+/// `vfs_iswriteupgrade`.
+///
+/// - Every mount first: `MNT_NOATIME` set and `MNT_STRICTATIME` cleared;
+///   the root's `MNT_IGNORE_OWNERSHIP` cleared (0xfffffff0066c62b4).
+/// - The volume's mount is waited for while it is being updated or
+///   unmounted (`fs + 0x120 & 0x200000820`, "mount_wait_(un)mount"):
+///   `mount_common`'s `MNT_LMOUNT` and `MNT_LUNMOUNT` keep two from
+///   meeting here. A volume being unmounted (bit 11) is EBUSY, one no
+///   longer mounted (no bit 6) EBUSY; every mount here is mounted.
+/// - `MNT_RELOAD`: EINVAL ("reload mounts not supported",
+///   0xfffffff0066c65b4).
+/// - Read-only asked of a volume APFS has writable: EINVAL ("vfs mount
+///   structure specifies read only but apfs mount structure doesn't",
+///   0xfffffff0066c6644): APFS has no downgrade to read-only.
+/// - A write upgrade (0xfffffff0066c665c: 0xfffffff0066d1894, then the
+///   container's and the volume's upgrade) is not modelled.
+/// - `apfs_mount_update` (0xfffffff006716ac8) with the flags (`MNT_RDONLY`
+///   in bit 0 of the arguments' first word, 0xfffffff0066c66b4): a
+///   read-only container leaves the volume read-only; a read-only volume
+///   asked to be writable is upgraded (not modelled, and unreached: that
+///   is a write upgrade); else the volume's read-only state is the
+///   mount's.
+/// - Then (0xfffffff0066c6c88) a mount that ignores ownership has its
+///   files' owner set (`vfs_setowner`), not modelled; and the volume's
+///   background work resumes (0xfffffff0066d1a84), which nothing here
+///   sees.
+pub fn vfsop_update(flags: &mut u32, apfs_ro: &mut bool, reload: bool, write_upgrade: bool, args: &Args) -> Result<(), Refused> {
+    *flags |= mnt::NOATIME;
+    *flags &= !mnt::STRICTATIME;
+    if *flags & MNT_ROOTFS != 0 && *flags & mnt::IGNORE_OWNERSHIP != 0 {
+        *flags &= !mnt::IGNORE_OWNERSHIP;
+    }
+    if reload {
+        return Err(Refused::Errno(EINVAL));
+    }
+    if *flags & mnt::RDONLY != 0 && !*apfs_ro {
+        return Err(Refused::Errno(EINVAL));
+    }
+    if write_upgrade {
+        return Err(Refused::Unmodelled("APFS's upgrade of a read-only volume's mount to read-write (0xfffffff0066d1894)".into()));
+    }
+    let rdonly = *flags & mnt::RDONLY != 0;
+    if container_read_only() {
+        *apfs_ro = true;
+    } else if *apfs_ro && !rdonly {
+        return Err(Refused::Unmodelled("apfs_mount_update's upgrade of a read-only volume to read-write (0xfffffff006716b4c)".into()));
+    } else {
+        *apfs_ro = rdonly;
+    }
+    if *flags & mnt::IGNORE_OWNERSHIP != 0 {
+        return Err(Refused::Unmodelled(format!("an APFS update that ignores ownership (owner {}, group {}: vfs_setowner)", args.uid as i32, args.gid as i32)));
+    }
+    Ok(())
+}
+
 /// 0xfffffff0066d2cb8: a device path's container path and volume index:
 /// past the path's last "@", digits at its end after an "s" that does not
 /// follow a "/" give the index (less one) and end the container's path.
@@ -181,6 +259,21 @@ mod tests {
         assert_eq!(split_device_path("com.apple.os.update-X@/dev/disk1s1"), ("/dev/disk1".to_string(), Some(0)));
         assert_eq!(split_device_path("/dev/disk1"), ("/dev/disk1".to_string(), None));
         assert!(dontbrowse_role(0x10) && dontbrowse_role(0x4) && !dontbrowse_role(0x1) && !dontbrowse_role(0x40));
+    }
+
+    #[test]
+    fn updates() {
+        let args = Args { mode: 0, uid: u32::MAX, gid: u32::MAX };
+        // The root's update to read-only: MNT_NOATIME again, the volume
+        // still read-only.
+        let root = 0x1 | 0x1000 | 0x4000 | 0x8000 | 0x80_0000 | 0x8;
+        let (mut f, mut ro) = (root & !mnt::NOATIME, true);
+        assert_eq!(vfsop_update(&mut f, &mut ro, false, false, &args), Ok(()));
+        assert_eq!((f, ro), (root | mnt::NOATIME, true));
+        // No reload; no downgrade of a writable volume.
+        assert_eq!(vfsop_update(&mut root.clone(), &mut true, true, false, &args), Err(Refused::Errno(EINVAL)));
+        assert_eq!(vfsop_update(&mut 0x1, &mut false, false, false, &args), Err(Refused::Errno(EINVAL)));
+        assert!(matches!(vfsop_update(&mut 0, &mut true, false, true, &args), Err(Refused::Unmodelled(_))));
     }
 
     #[test]

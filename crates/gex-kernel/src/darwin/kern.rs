@@ -130,14 +130,57 @@ const MAC_MAX_POLICY_NAME: usize = 32;
 const ENOPOLICY: i32 = 103;
 
 /// A mount, as `getfsstat64` reports it, and the sealed volume whose
-/// image gives its files' owners, modes and flags, if one does.
+/// image gives its files' owners, modes and flags, if one does. What an
+/// update changes ([`MountState`]) is behind its lock.
+#[derive(Debug)]
 pub struct Mount {
     pub on: &'static str,
     pub from: From,
     pub fsid: u64,
-    pub flags: u32,
     pub fs: Fs,
     pub vol: Option<super::volattrs::Vol>,
+    /// `mnt_vfsstat.f_owner`: the user whose mount it is, whom
+    /// `mount_common` lets update it besides root.
+    pub owner: u32,
+    state: std::sync::Mutex<MountState>,
+}
+
+/// What of a mount changes after it is made.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MountState {
+    /// `mnt_flag`.
+    pub flags: u32,
+    /// `mnt_lflag`'s `MNT_LMOUNT` and `MNT_LUNMOUNT`: a mount or unmount
+    /// under way.
+    pub lflag: u32,
+    /// The `f_mntfromname` an update that named a device gave it (the
+    /// path as the call gave it, `cn_pnbuf`), in place of [`mount_from`]'s.
+    pub from_name: Option<String>,
+    /// APFS's read-only state of a volume's mount (its `fs + 0x354`):
+    /// set for a snapshot mount (0xfffffff0066ccb24), and for a live one
+    /// read-only or of a read-only container (0xfffffff0067155e0); none
+    /// for a mount that is not APFS's.
+    pub apfs_ro: Option<bool>,
+}
+
+/// `MNT_LUNMOUNT`, `MNT_LMOUNT` (`mount_internal.h`).
+pub const MNT_LUNMOUNT: u32 = 0x2;
+pub const MNT_LMOUNT: u32 = 0x80;
+
+impl Mount {
+    pub fn new(on: &'static str, from: From, fsid: u64, flags: u32, fs: Fs, vol: Option<super::volattrs::Vol>, owner: u32, apfs_ro: Option<bool>) -> Mount {
+        Mount { on, from, fsid, fs, vol, owner, state: std::sync::Mutex::new(MountState { flags, lflag: 0, from_name: None, apfs_ro }) }
+    }
+
+    /// `mnt_flag`.
+    pub fn flags(&self) -> u32 {
+        self.state().flags
+    }
+
+    /// What of it changes, locked.
+    pub fn state(&self) -> std::sync::MutexGuard<'_, MountState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 /// What a mount is of: its `f_mntfromname`'s source.
@@ -199,6 +242,20 @@ const MNT_CPROTECT: u32 = 0x80;
 ///   sealed snapshot.
 const ROOT_FLAGS: u32 = MNT_RDONLY | MNT_LOCAL | MNT_ROOTFS | MNT_DOVOLFS | MNT_JOURNALED | MNT_NOATIME | if super::storage::SYSTEM_UNENCRYPTED { 0 } else { MNT_CPROTECT };
 
+/// The root's flags on a system launchd has booted: launchd's boot task
+/// mount-phase-1 runs `/sbin/mount -P 1`, whose entry for "/" in the
+/// device tree's fstab (`fs_spec` the System volume's device, as
+/// `vfs.generic.apfs.edt_fstab` gives it to libsystem_info's `_fsi_get_fs`
+/// at 0x197316110, type "ro") is not mounted by `ismounted`'s test (the
+/// root's `f_mntfromname` has the snapshot's name before the device's),
+/// so `mountfs` runs `mount_apfs -o ro,update`: mount(2) with
+/// `MNT_RDONLY | MNT_UPDATE` (mount_apfs's option table at 0x100008030
+/// and 0x1000081c8). `mount_common`'s update clears the settable flags,
+/// sets `MNT_NOSUID` (SECURE_KERNEL without CONFIG_MNT_SUID) and none of
+/// the others; `apfs_vfsop_mount` sets `MNT_NOATIME` again and leaves the
+/// rest ([`super::apfsmount::vfsop_update`]).
+const ROOT_FLAGS_BOOTED: u32 = ROOT_FLAGS | MNT_NOSUID;
+
 
 /// `nblkdev`, the size of `bdevsw`: `vfs_getnewfsid` adds it to the type
 /// number for its major (folded to 0x18000000 at 0xfffffff0073769ac).
@@ -230,12 +287,19 @@ pub const DEVFS_FSID: u32 = 0x9a3c_51e7;
 /// `devfs_mount`, MNT_MULTILABEL from its MACF `vfc_flags`), and the
 /// SystemOS cryptex the shared cache is in, by the filesystem id its
 /// dynamic data names (standing for libignition's graft, which is not
-/// made yet).
-const BOOT_MOUNTS: &[Mount] = &[
-    Mount { on: "/", from: From::Snapshot(0), fsid: ROOT_FSID as u64, flags: ROOT_FLAGS, fs: Fs::Apfs, vol: Some(super::volattrs::Vol::System) },
-    Mount { on: "/dev", from: From::Devfs, fsid: DEVFS_FSID as u64, flags: MNT_LOCAL | MNT_DONTBROWSE | MNT_MULTILABEL, fs: Fs::Devfs, vol: None },
-    Mount { on: "/System/Cryptexes/OS", from: From::OsCryptex, fsid: super::CACHE_FS_ID, flags: MNT_RDONLY | MNT_DONTBROWSE, fs: Fs::Apfs, vol: Some(super::volattrs::Vol::OsCryptex) },
-];
+/// made yet). All are the kernel's (`f_owner` 0). On a system launchd has
+/// booted, `/sbin/mount -P 1` has updated the root ([`ROOT_FLAGS_BOOTED`]).
+fn boot_mounts() -> [Mount; 3] {
+    let root_flags = match boot_state() {
+        BootState::Kernel => ROOT_FLAGS,
+        BootState::Booted => ROOT_FLAGS_BOOTED,
+    };
+    [
+        Mount::new("/", From::Snapshot(0), ROOT_FSID as u64, root_flags, Fs::Apfs, Some(super::volattrs::Vol::System), 0, Some(true)),
+        Mount::new("/dev", From::Devfs, DEVFS_FSID as u64, MNT_LOCAL | MNT_DONTBROWSE | MNT_MULTILABEL, Fs::Devfs, None, 0, None),
+        Mount::new("/System/Cryptexes/OS", From::OsCryptex, super::CACHE_FS_ID, MNT_RDONLY | MNT_DONTBROWSE, Fs::Apfs, Some(super::volattrs::Vol::OsCryptex), 0, Some(true)),
+    ]
+}
 
 /// The mount list (`mountlist`): the boot's mounts, then each one mounted
 /// since, in the order they were (`mount_list_add` puts a new mount at the
@@ -253,7 +317,7 @@ pub fn mounts() -> Vec<&'static Mount> {
     }
     let mut l = MOUNT_LIST.write().unwrap_or_else(|e| e.into_inner());
     if l.is_empty() {
-        l.extend(BOOT_MOUNTS.iter());
+        l.extend(boot_mounts().into_iter().map(|m| &*Box::leak(Box::new(m))));
     }
     l.clone()
 }
@@ -315,7 +379,7 @@ pub fn is_mount_point(path: &str) -> bool {
 /// What the system has mounted when its first program starts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BootState {
-    /// The kernel's mounts alone ([`BOOT_MOUNTS`]): launchd, the first
+    /// The kernel's mounts alone ([`boot_mounts`]): launchd, the first
     /// process, mounts the other volumes itself.
     Kernel,
     /// A system launchd has booted, where gexc runs another program in its
@@ -359,8 +423,12 @@ pub fn preboot_cryptex_volume() -> Option<&'static str> {
 /// ([`ROOT_FSID`]), puts the snapshot's name and "@" before it
 /// (0xfffffff0066d0d0c: `"%s%s%s"`). The cryptex mount stands for
 /// Preboot's graft, which has no device of its own: its name is the
-/// stand-in's.
+/// stand-in's. An update that names a device renames it
+/// ([`MountState::from_name`]).
 pub fn mount_from(mnt: &Mount) -> String {
+    if let Some(name) = mnt.state().from_name.clone() {
+        return name;
+    }
     match mnt.from {
         From::Devfs => "devfs".to_string(),
         From::Volume(i) => format!("/dev/{}", super::storage::volume_bsd_name(i)),
@@ -508,6 +576,20 @@ pub fn mount_of(path: &str) -> &'static Mount {
         .unwrap_or(l[0])
 }
 
+/// The mount the vnode `mnt` covers is on (`vfs_vnodecovered`'s
+/// `v_mount`): among the mounts before it in the list, the one with the
+/// longest mount point that holds its own. The root covers none: itself.
+pub fn covered_mount(mnt: &Mount) -> &'static Mount {
+    let l = mounts();
+    let n = l.iter().position(|m| std::ptr::eq(*m, mnt)).unwrap_or(l.len());
+    l[..n]
+        .iter()
+        .copied()
+        .filter(|mt| mnt.on == mt.on || mnt.on.starts_with(&format!("{}/", mt.on.trim_end_matches('/'))))
+        .max_by_key(|mt| mt.on.len())
+        .unwrap_or(l[0])
+}
+
 /// One `struct statfs64` for `mnt`.
 pub fn statfs64(mnt: &Mount) -> Vec<u8> {
     let c = counts(mnt);
@@ -525,7 +607,7 @@ pub fn statfs64(mnt: &Mount) -> Vec<u8> {
     put(48, &(mnt.fsid as u32).to_le_bytes());
     put(52, &c.typenum.to_le_bytes());
     put(60, &c.typenum.to_le_bytes());
-    put(64, &mnt.flags.to_le_bytes());
+    put(64, &mnt.flags().to_le_bytes());
     put(72, c.name);
     put(88, mnt.on.as_bytes());
     put(1112, from.as_bytes());
@@ -558,7 +640,7 @@ pub fn statfs_ino32(mnt: &Mount) -> [u8; STATFS_SIZE] {
     put(64, &(mnt.fsid as u32).to_le_bytes());
     put(68, &c.typenum.to_le_bytes());
     put(78, &(c.typenum as u16).to_le_bytes());
-    put(80, &u64::from(mnt.flags).to_le_bytes());
+    put(80, &u64::from(mnt.flags()).to_le_bytes());
     let mut name = |o: usize, size: usize, v: &[u8]| {
         let n = v.len().min(size - 1);
         b[o..o + n].copy_from_slice(&v[..n]);
@@ -2338,12 +2420,10 @@ mod tests {
         assert_eq!(mask_from_linux(l), d);
     }
 
-    /// The root, mounted from the System volume's sealed snapshot with no
-    /// virtual device: its device's path after the snapshot's name, and
     /// the first fsid `vfs_getnewfsid` gives an APFS mount.
     #[test]
     fn the_root_is_named_for_its_snapshot() {
-        let root = &BOOT_MOUNTS[0];
+        let root = &boot_mounts()[0];
         assert_eq!(mount_from(root), format!("{}@/dev/disk1s1", super::super::storage::ROOT_SNAPSHOT));
         assert_eq!(root.fsid, 0x3200_0001);
     }

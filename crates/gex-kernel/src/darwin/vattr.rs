@@ -99,15 +99,15 @@ fn other_volume(path: &str) -> Option<(&'static str, &'static str, bool)> {
     OTHER_VOLUMES.iter().copied().find(|v| within(path, v.0))
 }
 
-/// Whether the device's volume `path` is on is mounted nosuid: the Data
-/// volume and the others the fstab mounts so (all but the system
-/// volume), and the cryptex graft's Preboot.
+/// Whether the device's volume `path` is on is mounted nosuid: the root
+/// once `mount -P 1` has updated it, the Data volume and the others the
+/// fstab mounts so, and the cryptex graft's Preboot.
 pub fn device_nosuid(path: &str) -> bool {
     let m = super::kern::mount_of(path);
     match m.vol {
-        Some(Vol::System) => on_data(path) || other_volume(path).is_some(),
+        Some(Vol::System) => m.flags() & super::kern::MNT_NOSUID != 0 || on_data(path) || other_volume(path).is_some(),
         Some(Vol::OsCryptex) => true,
-        None => m.flags & super::kern::MNT_NOSUID != 0,
+        None => m.flags() & super::kern::MNT_NOSUID != 0,
     }
 }
 
@@ -133,7 +133,7 @@ pub fn device_mnt_flags_on(m: &super::kern::Mount, path: &str) -> u32 {
             return if ro { mnt::RDONLY } else { 0 };
         }
     }
-    m.flags & mnt::RDONLY
+    m.flags() & mnt::RDONLY
 }
 
 impl Owned {

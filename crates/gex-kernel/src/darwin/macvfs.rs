@@ -122,10 +122,9 @@ fn join(dir: &str, name: &str) -> String {
     }
 }
 
-/// A file's flags (`va_flags`): the filesystems here keep none, and devfs
-/// gives its root UF_HIDDEN.
-fn file_flags(path: &str) -> u32 {
-    let mnt = super::kern::mount_of(path);
+/// A file's flags (`va_flags`) on mount `mnt`: the filesystems here keep
+/// none, and devfs gives its root UF_HIDDEN.
+fn file_flags(mnt: &super::kern::Mount, path: &str) -> u32 {
     if mnt.fs == super::kern::Fs::Devfs && path == mnt.on {
         super::devfs::UF_HIDDEN
     } else {
@@ -135,17 +134,23 @@ fn file_flags(path: &str) -> u32 {
 
 /// The vnode Sandbox reads of file `md` at `path` (no link on it).
 pub fn sb_vnode(path: &str, md: &Metadata) -> SbVnode {
-    let mnt = super::kern::mount_of(path);
+    sb_vnode_on(super::kern::mount_of(path), path, md)
+}
+
+/// [`sb_vnode`] of a vnode on mount `mnt` (an open file's, a covered
+/// directory's), whatever has been mounted on its path since.
+pub fn sb_vnode_on(mnt: &'static super::kern::Mount, path: &str, md: &Metadata) -> SbVnode {
     SbVnode {
         path: path.as_bytes().to_vec(),
         mount_len: if path == mnt.on { -1 } else { mnt.on.len() as i64 },
         vtype: Some(vtype_of(md.file_type)),
         tty: super::ttydev::vnode_is_tty(md),
         mode: Some((md.mode & 0xfff) as u16),
-        flags: file_flags(path),
+        flags: file_flags(mnt, path),
         rdev: if matches!(md.file_type, FileType::CharDevice | FileType::BlockDevice) { super::attrcall::darwin_dev(md.rdev) } else { 0 },
         fs: super::kern::fs_name(mnt),
         of: Some((path.to_string(), md.clone())),
+        mnt: Some(mnt),
         ..Default::default()
     }
 }
@@ -177,9 +182,10 @@ impl Kernel {
     /// The owner, group, mode and flags of the file Sandbox's vnode `v`
     /// reads them of ([`SbVnode::of`]); none where `v` gives its own.
     pub(crate) fn darwin_sb_attrs(&self, v: &SbVnode) -> Result<Option<super::vattr::Owned>, String> {
-        match &v.of {
-            Some((path, md)) => super::vattr::of(&self.vfs, path, md, None).map(Some),
-            None => Ok(None),
+        match (&v.of, v.mnt) {
+            (Some((path, md)), Some(mnt)) => super::vattr::of_on(&self.vfs, mnt, path, md, None).map(Some),
+            (Some((path, md)), None) => super::vattr::of(&self.vfs, path, md, None).map(Some),
+            (None, _) => Ok(None),
         }
     }
 
@@ -454,6 +460,17 @@ impl Kernel {
     pub(crate) fn darwin_mac_check_mount_mount(&mut self, mut v: SbVnode, fstype: &'static [u8]) -> u32 {
         v.fs = &fstype[..fstype.len().min(15)];
         self.darwin_sb_vnode_check(op::FILE_MOUNT, v)
+    }
+
+    /// `mac_mount_check_remount` of a mount whose filesystem is `fsname`,
+    /// covering vnode `v`: Sandbox's hook (slot 88 of its ops,
+    /// 0xfffffff0069f6ed0) asks file-mount-update (op 20) of `v` with the
+    /// mount in the arguments (`args[0x130]`, `args[0x190]` bit 5), whose
+    /// filesystem's name the filters read (0xfffffff006a07160: `vfs_name`
+    /// of `args[0x130]`'s mount); AMFI has none.
+    pub(crate) fn darwin_mac_check_mount_remount(&mut self, mut v: SbVnode, fsname: &'static [u8]) -> u32 {
+        v.fs = &fsname[..fsname.len().min(15)];
+        self.darwin_sb_vnode_check(op::FILE_MOUNT_UPDATE, v)
     }
 
     /// `mpo_vnode_check_open` of open mode `fmode` (FREAD, FWRITE, O_TRUNC):

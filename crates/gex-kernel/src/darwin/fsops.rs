@@ -239,36 +239,74 @@ impl Kernel {
         }
     }
 
-    /// `mount(type, dir, flags, data)`, of a bind mount; another file
-    /// system's is reported.
+    /// `mount(type, dir, flags, data)` (`__mac_mount` with no label): the
+    /// type's name copied in (MFSNAMELEN with its NUL), the directory
+    /// looked up (FOLLOW; `MNT_NOFOLLOW` NAMEI_NOFOLLOW_ANY), `MNT_UNION`
+    /// EPERM (no CONFIG_UNION_MOUNTS on a release kernel), and the root
+    /// volume's root an update, which SECURE_KERNEL allows only read-only
+    /// (EPERM); then `mount_common`. CONFIG_IMGSRC_ACCESS is not in a
+    /// release kernel: `MNT_IMGSRC_BY_INDEX` is a flag like the others.
     pub(crate) fn darwin_mount(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
         const MFSNAMELEN: usize = 15;
+        const MNT_RDONLY: u64 = 0x1;
+        const MNT_UNION: u64 = 0x20;
+        const MNT_ROOTFS: u32 = 0x4000;
+        const MNT_UPDATE: u64 = 0x1_0000;
+        const MNT_NOFOLLOW: u64 = 0x800_0000;
+        let mut flags = a[2] as u32 as u64;
+        let mut tb = [0u8; MFSNAMELEN];
+        let n = m.read_cstr_into(a[0], &mut tb)?.ok_or(Errno::ENAMETOOLONG)?;
+        let fstype = String::from_utf8_lossy(&tb[..n]).into_owned();
+        let cwd = super::bsd::AT_FDCWD as u64;
+        let nofollow_any = flags & MNT_NOFOLLOW != 0;
+        self.darwin_sb_namei(m, cwd, a[1], true, nofollow_any)?;
+        if nofollow_any {
+            self.darwin_no_link_on_the_way(m, cwd, a[1])?;
+        }
+        let abs = self.path_io().at_path(m, dirfd(cwd) as i32, a[1])?;
+        let md = self.vfs.metadata(&abs)?;
+        let at = self.vfs.canonical(&abs);
+        if flags & MNT_UNION != 0 {
+            return Err(Errno::EPERM);
+        }
+        // The vnode found: a mount's root (VROOT) when the path is where
+        // the topmost mount there is mounted.
+        let top = super::kern::mount_of(&at);
+        let vroot = (top.on == at).then_some(top);
+        if vroot.is_some_and(|r| r.flags() & MNT_ROOTFS != 0) {
+            flags |= MNT_UPDATE;
+            if flags & MNT_RDONLY == 0 {
+                return Err(Errno::EPERM);
+            }
+        }
+        if flags & MNT_UPDATE != 0 {
+            // mount_common: an update names a mount's root (EINVAL).
+            let Some(mnt) = vroot else { return Err(Errno::EINVAL) };
+            return self.darwin_mount_update(m, mnt, a[3], flags);
+        }
+        if fstype == "bindfs" {
+            return self.darwin_bindfs_mount(m, &at, &md, a[3]);
+        }
+        self.darwin_mount_common(m, &fstype, &at, a[3], flags)
+    }
+
+    /// A bind mount of the directory `data` names on directory `at`.
+    fn darwin_bindfs_mount(&mut self, m: &mut GuestMem<'_>, at: &str, md: &crate::vfs::Metadata, data: u64) -> Result<u64, Errno> {
         const MAXPATHLEN: usize = 1024;
-        const MNT_UPDATE: u64 = 0x0001_0000;
         const BINDFS_ENTITLEMENT: &str = "com.apple.private.bindfs-allow";
-        let fstype = m.read_cstr(a[0], MFSNAMELEN)?;
-        let dir = String::from_utf8_lossy(&m.read_cstr(a[1], MAXPATHLEN)?).into_owned();
-        let at = self.path_io().at_path_str(dirfd(super::bsd::AT_FDCWD as u64) as i32, &dir)?;
-        if self.vfs.metadata(&at)?.file_type != crate::vfs::FileType::Directory {
+        if md.file_type != crate::vfs::FileType::Directory {
             return Err(Errno::ENOTDIR);
         }
         self.darwin_suser()?;
-        if fstype != b"bindfs" {
-            self.darwin_unimplemented(format!("mount of {:?} at {dir}", String::from_utf8_lossy(&fstype)));
-            return Err(Errno::EOPNOTSUPP);
-        }
-        if a[2] & MNT_UPDATE != 0 {
-            return Err(Errno::EOPNOTSUPP);
-        }
         if !self.darwin_task_entitled(BINDFS_ENTITLEMENT) {
             return Err(Errno::EPERM);
         }
-        let from = String::from_utf8_lossy(&m.read_cstr(a[3], MAXPATHLEN - 1)?).into_owned();
+        let from = String::from_utf8_lossy(&m.read_cstr(data, MAXPATHLEN - 1)?).into_owned();
         let from = self.path_io().at_path_str(dirfd(super::bsd::AT_FDCWD as u64) as i32, &from)?;
         self.vfs.metadata(&from)?;
         match self.vfs.bound_subtree(&from)? {
             Some(fs) => {
-                self.vfs.mount(&at, fs);
+                self.vfs.mount(at, fs);
                 Ok(0)
             }
             None => {
@@ -276,6 +314,192 @@ impl Kernel {
                 Err(Errno::EOPNOTSUPP)
             }
         }
+    }
+
+    /// `mount_common`'s update of mount `mnt` (`MNT_UPDATE`, `vp` its root)
+    /// with flags `flags` and the filesystem's arguments at `data`:
+    /// - a mount or unmount of it under way: EBUSY; then it is the
+    ///   update's (`MNT_LMOUNT`) until the end;
+    /// - `MNT_RELOAD` of a writable mount: ENOTSUP; turning off
+    ///   `MNT_CPROTECT`: EINVAL; `MNT_REMOVABLE` kept; no mount here backs
+    ///   the root (`MNTK_BACKS_ROOT`, a disk image's);
+    /// - someone other than the mount's owner must be root (EPERM);
+    /// - `mac_mount_check_remount`: Sandbox's hook (slot 88,
+    ///   0xfffffff0069f6ed0) asks file-mount-update of the covered vnode
+    ///   (`vfs_vnodecovered`; the root vnode for the root,
+    ///   `vfs_rootvnode`), with the mount for its filters (`args[0x130]`,
+    ///   `args[0x190]` bit 5: the filesystem's name is the mount's); AMFI
+    ///   has none;
+    /// - not root: `MNT_NOSUID | MNT_NODEV`, and `MNT_NOEXEC` if the mount
+    ///   has it;
+    /// - the flags: `MNT_RDONLY` asked sets it, or a read-only mount asked
+    ///   for none wants read-write (`MNTK_WANTRDWR`; no mount here has
+    ///   `MNTK_TYPENAME_OVERRIDE`); the settable flags cleared, then
+    ///   `MNT_NOSUID` (SECURE_KERNEL without CONFIG_MNT_SUID: "we can catch
+    ///   update mounts as well"), then those asked; `MNT_MULTILABEL` asked
+    ///   is set (no filesystem here has VFC_VFSNOMACLABEL);
+    /// - a filesystem with VFC_VFSLOCALARGS (APFS): the device's path from
+    ///   the arguments; given, looked up (FOLLOW), a block device (ENOTBLK)
+    ///   of a major below `nblkdev` (ENXIO), authorized for one not root,
+    ///   and the mount's `f_mntfromname` is it; then a read-only mount
+    ///   that wants read-write has its device opened for writing;
+    /// - VFS_MOUNT; then `MNTK_WANTRDWR` clears `MNT_RDONLY`,
+    ///   `MNT_UPDATE | MNT_RELOAD | MNT_FORCE` are cleared, a failure
+    ///   puts the flags back as they were, and `vfs_event_signal(VQ_UPDATE)`
+    ///   (no EVFILT_FS here); `enablequotas` is HFS's alone.
+    fn darwin_mount_update(&mut self, m: &mut GuestMem<'_>, mnt: &'static super::kern::Mount, data: u64, flags: u64) -> Result<u64, Errno> {
+        {
+            let mut st = mnt.state();
+            if st.lflag & (super::kern::MNT_LUNMOUNT | super::kern::MNT_LMOUNT) != 0 {
+                return Err(Errno::EBUSY);
+            }
+            st.lflag |= super::kern::MNT_LMOUNT;
+        }
+        let r = self.darwin_mount_update_locked(m, mnt, data, flags);
+        mnt.state().lflag &= !super::kern::MNT_LMOUNT;
+        r
+    }
+
+    fn darwin_mount_update_locked(&mut self, m: &mut GuestMem<'_>, mnt: &'static super::kern::Mount, data: u64, mut flags: u64) -> Result<u64, Errno> {
+        const MAXPATHLEN: usize = 1024;
+        const MNT_RDONLY: u32 = 0x1;
+        const MNT_NOEXEC: u32 = 0x4;
+        const MNT_NOSUID: u32 = 0x8;
+        const MNT_NODEV: u32 = 0x10;
+        const MNT_CPROTECT: u32 = 0x80;
+        const MNT_REMOVABLE: u32 = 0x200;
+        const MNT_UPDATE: u32 = 0x1_0000;
+        const MNT_RELOAD: u32 = 0x4_0000;
+        const MNT_FORCE: u32 = 0x8_0000;
+        const MNT_MULTILABEL: u32 = 0x400_0000;
+        const SETTABLE: u32 = MNT_NOSUID | MNT_NOEXEC | MNT_NODEV | 0x2 | 0x20 | 0x40 | 0x20_0000 | 0x10_0000 | 0x40_0000 | 0x200_0000 | 0x1000_0000 | 0x8000_0000 | 0x400 | MNT_CPROTECT;
+        const NBLKDEV: u32 = 24;
+        const ENOTBLK: i32 = 15;
+        let now = mnt.flags();
+        if flags as u32 & MNT_RELOAD != 0 && now & MNT_RDONLY == 0 {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        if now & MNT_CPROTECT != 0 && flags as u32 & MNT_CPROTECT == 0 {
+            return Err(Errno::EINVAL);
+        }
+        if now & MNT_REMOVABLE != 0 {
+            flags |= u64::from(MNT_REMOVABLE);
+        }
+        let uid = self.dtask.cred.uid;
+        if mnt.owner != uid {
+            self.darwin_suser()?;
+        }
+        // mac_mount_check_remount.
+        let covered = self.darwin_covered_vnode(mnt)?;
+        let e = self.darwin_mac_check_mount_remount(covered, super::kern::fs_name(mnt));
+        if e != 0 {
+            return Err(super::errno::errno_of(e as i32));
+        }
+        if uid != 0 {
+            flags |= u64::from(MNT_NOSUID | MNT_NODEV);
+            if now & MNT_NOEXEC != 0 {
+                flags |= u64::from(MNT_NOEXEC);
+            }
+        }
+        let flags = flags as u32;
+        let old = now;
+        let mut new = now | (flags & (MNT_RELOAD | MNT_FORCE | MNT_UPDATE));
+        let mut wantrdwr = false;
+        if flags & MNT_RDONLY != 0 {
+            new |= MNT_RDONLY;
+        } else if new & MNT_RDONLY != 0 {
+            wantrdwr = true;
+        }
+        new &= !SETTABLE;
+        new |= MNT_NOSUID;
+        new |= flags & SETTABLE;
+        if flags & MNT_MULTILABEL != 0 {
+            new |= MNT_MULTILABEL;
+        }
+        mnt.state().flags = new;
+        let r = self.darwin_mount_update_fs(m, mnt, data, &mut new, wantrdwr, MAXPATHLEN, NBLKDEV, ENOTBLK);
+        if wantrdwr {
+            new &= !MNT_RDONLY;
+        }
+        new &= !(MNT_UPDATE | MNT_RELOAD | MNT_FORCE);
+        mnt.state().flags = if r.is_err() { old } else { new };
+        r.map(|()| 0)
+    }
+
+    /// The update's device (VFC_VFSLOCALARGS) and VFS_MOUNT, the mount's
+    /// flags `flags` as they stand, changed as the filesystem changes them.
+    #[allow(clippy::too_many_arguments)]
+    fn darwin_mount_update_fs(&mut self, m: &mut GuestMem<'_>, mnt: &'static super::kern::Mount, data: u64, flags: &mut u32, wantrdwr: bool, maxpathlen: usize, nblkdev: u32, enotblk: i32) -> Result<(), Errno> {
+        const MNT_RDONLY: u32 = 0x1;
+        const MNT_RELOAD: u32 = 0x4_0000;
+        match mnt.fs {
+            // devfs_mount: an update does nothing.
+            super::kern::Fs::Devfs => return Ok(()),
+            super::kern::Fs::Apfs => {}
+        }
+        if mnt.from == super::kern::From::OsCryptex {
+            self.darwin_unimplemented(format!("an update of {}, the mount standing for Preboot's graft of the SystemOS cryptex", mnt.on));
+            return Err(Errno::EIO);
+        }
+        let devpath = m.read_u64(data)?;
+        if devpath != 0 {
+            self.darwin_sb_namei(m, super::bsd::AT_FDCWD as u64, devpath, true, false)?;
+            let raw = m.read_cstr(devpath, maxpathlen)?;
+            let given = String::from_utf8_lossy(&raw).into_owned();
+            let abs = self.path_io().at_path_str(dirfd(super::bsd::AT_FDCWD as u64) as i32, &given)?;
+            let dmd = self.vfs.metadata(&abs)?;
+            if dmd.file_type != crate::vfs::FileType::BlockDevice {
+                return Err(super::errno::errno_of(enotblk));
+            }
+            let Some(node) = super::devfs::node_of(&dmd) else {
+                self.darwin_unimplemented(format!("an update of {} from {abs}: a block device that is not devfs's", mnt.on));
+                return Err(Errno::ENXIO);
+            };
+            if node.major.unwrap_or(0) >= nblkdev {
+                return Err(Errno::ENXIO);
+            }
+            if self.dtask.cred.uid != 0 {
+                self.darwin_node_access((node.uid, node.gid, node.mode), true, *flags & MNT_RDONLY == 0)?;
+            }
+            mnt.state().from_name = Some(given);
+        }
+        // Named or not (mount_common's `else` pairs with a first mount's
+        // open of the device), a read-only mount that wants read-write:
+        if *flags & MNT_RDONLY != 0 && wantrdwr {
+            // bdevsw's d_open of the mount's device for writing (dkopen),
+            // then APFS's write upgrade.
+            self.darwin_unimplemented(format!("the read-write upgrade of {}: its device opened for writing and APFS's upgrade (0xfffffff0066d1894)", mnt.on));
+            return Err(Errno::EIO);
+        }
+        // VFS_MOUNT: apfs_vfsop_mount copies in its arguments first.
+        let mut raw_args = [0u8; super::apfsmount::ARGS_SIZE];
+        raw_args.copy_from_slice(m.read(data + 8, super::apfsmount::ARGS_SIZE)?);
+        let args = super::apfsmount::Args::parse(&raw_args);
+        let mut ro = mnt.state().apfs_ro.unwrap_or(false);
+        match super::apfsmount::vfsop_update(flags, &mut ro, *flags & MNT_RELOAD != 0, wantrdwr, &args) {
+            Ok(()) => {
+                mnt.state().apfs_ro = Some(ro);
+                Ok(())
+            }
+            Err(super::apfsmount::Refused::Errno(e)) => Err(super::errno::errno_of(e)),
+            Err(super::apfsmount::Refused::Unmodelled(u)) => {
+                self.darwin_unimplemented(format!("the update of {}: {u}", mnt.on));
+                Err(Errno::EIO)
+            }
+        }
+    }
+
+    /// The vnode a mount covers (`vfs_vnodecovered`), as Sandbox reads it:
+    /// the directory it is mounted on, on the mount below it; the root
+    /// vnode for the root (`vfs_rootvnode`), which covers none.
+    fn darwin_covered_vnode(&mut self, mnt: &'static super::kern::Mount) -> Result<super::mac::SbVnode, Errno> {
+        const MNT_ROOTFS: u32 = 0x4000;
+        let md = self.vfs.metadata(mnt.on)?;
+        if mnt.flags() & MNT_ROOTFS != 0 {
+            return Ok(super::macvfs::sb_vnode_on(mnt, mnt.on, &md));
+        }
+        let below = super::kern::covered_mount(mnt);
+        Ok(super::macvfs::sb_vnode_on(below, mnt.on, &md))
     }
 
     /// `fmount(type, fd, flags, data)`: a mount on the directory `fd` is
@@ -328,7 +552,7 @@ impl Kernel {
         // the covered directory's volume allows none.
         if !issuser {
             flags |= MNT_NOSUID | MNT_NODEV;
-            if super::kern::mount_of(at).flags as u64 & MNT_NOEXEC != 0 {
+            if super::kern::mount_of(at).flags() as u64 & MNT_NOEXEC != 0 {
                 flags |= MNT_NOEXEC;
             }
         }
@@ -484,25 +708,21 @@ impl Kernel {
         // mount's root: here every path through the mount point reaches
         // it), VFS_START (APFS has none), mount_list_add, and the device
         // marked mounted on.
-        let mnt = super::kern::mount_list_add(super::kern::Mount {
-            on: Box::leak(at.to_string().into_boxed_str()),
-            from: super::kern::From::Volume(mounted.volume),
-            fsid: u64::from(mounted.fsid0),
-            flags: mounted.flags,
-            fs: super::kern::Fs::Apfs,
-            vol: None,
-        });
+        // The mount's owner is the caller (`f_owner`); APFS's volume is
+        // read-only as the mount is (the container, written to by a
+        // writing mount, is writable after it: nx_ro_to_rw).
+        let rdonly = mounted.flags & MNT_RDONLY as u32 != 0;
+        if !rdonly {
+            super::apfsmount::container_made_writable();
+        }
+        let mnt = super::kern::mount_list_add(super::kern::Mount::new(Box::leak(at.to_string().into_boxed_str()), super::kern::From::Volume(mounted.volume), u64::from(mounted.fsid0), mounted.flags, super::kern::Fs::Apfs, None, self.dtask.cred.uid, Some(rdonly)));
         if let Some(fs) = files {
             self.vfs.mount(mnt.on, fs);
         }
-        // IOBSDMountChange (IOPOLLED_COREFILE, from
-        // CONFIG_KDP_INTERACTIVE_DEBUGGING): a writable local mount whose
-        // covered path starts the kernel core's, /private/var/vm/kernelcore,
-        // has the core file opened.
-        const KERNEL_CORE: &str = "/private/var/vm/kernelcore";
-        if mnt.flags & MNT_RDONLY as u32 == 0 && KERNEL_CORE.starts_with(mnt.on) {
-            self.darwin_unimplemented(format!("mounting {fstype} on {at}: IOBSDMountChange's open of the kernel core file {KERNEL_CORE}"));
-        }
+        // IOBSDMountChange: an empty function in this kernel
+        // (0xfffffff007852a84 is a `ret`; no IOPOLLED_COREFILE in a release
+        // build, whose configuration has no CONFIG_KDP_INTERACTIVE_DEBUGGING):
+        // no kernel core file is opened.
         Ok(0)
     }
 

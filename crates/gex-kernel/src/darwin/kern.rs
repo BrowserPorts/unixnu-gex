@@ -1782,6 +1782,15 @@ impl Kernel {
                 }
                 None => Err(Errno::ENOENT),
             },
+            // sysctl_hw_generic's HW_TARGET: PEGetTargetName into 64 bytes,
+            // EINVAL when it has none, out with its terminator.
+            "hw.target" => match super::iokit::target_name() {
+                Some(mut s) => {
+                    s.push(0);
+                    req.out(m, &s)
+                }
+                None => Err(Errno::EINVAL),
+            },
             "kern.dyld_flags" => self.darwin_sysctl_dyld_flags(m, req),
             "kern.progressoptions" | "kern.consoleoptions" => self.darwin_sysctl_progressoptions(m, node.path, req),
             "vm.loadavg" => self.darwin_sysctl_loadavg(m, req),

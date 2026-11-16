@@ -457,6 +457,32 @@ pub fn boot_manifest_hash() -> Option<&'static [u8]> {
     t[chosen as usize].props.iter().find(|(k, _)| k == "boot-manifest-hash").map(|(_, v)| v.as_slice())
 }
 
+/// `IODTPlatformExpert::getTargetName` on arm: `getModelName` of the
+/// platform expert's provider, the device tree's root, with the 64 bytes
+/// `PEGetTargetName` is given ([`target_name_of`]).
+pub fn target_name() -> Option<Vec<u8>> {
+    target_name_of(tree())
+}
+
+/// `getModelName` of tree `t`'s root: `compatible`'s first string, a
+/// leading "AAPL," dropped, '/' and ' ' made '-', at most 63 bytes (the 64
+/// less one, less one more for the terminator). `None` with no
+/// `compatible`, which `hw.target` answers with EINVAL.
+pub fn target_name_of(t: &[Node]) -> Option<Vec<u8>> {
+    const MAX_LENGTH: usize = 64 - 1;
+    let (_, v) = t.first()?.props.iter().find(|(k, _)| k == "compatible")?;
+    let first = &v[..v.iter().position(|&c| c == 0).unwrap_or(v.len())];
+    let s = first.strip_prefix(b"AAPL,").unwrap_or(first);
+    let mut name = Vec::new();
+    for &c in s {
+        name.push(if c == b'/' || c == b' ' { b'-' } else { c });
+        if name.len() >= MAX_LENGTH {
+            break;
+        }
+    }
+    Some(name)
+}
+
 /// A value in a matching dictionary.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DictValue {
@@ -1429,6 +1455,21 @@ mod tests {
         let mut t = parse(&b).unwrap();
         add_root(&mut t);
         t
+    }
+
+    #[test]
+    fn the_target_is_the_roots_first_compatible() {
+        assert_eq!(target_name_of(&small_tree()).unwrap(), b"J120AP");
+        let mut b = Vec::new();
+        node(&mut b, "device-tree", &[("compatible", b"AAPL,Power Mac/G5\0x\0")], 0);
+        assert_eq!(target_name_of(&parse(&b).unwrap()).unwrap(), b"Power-Mac-G5");
+        let mut b = Vec::new();
+        node(&mut b, "device-tree", &[("compatible", format!("{}\0", "A".repeat(80)).as_bytes())], 0);
+        assert_eq!(target_name_of(&parse(&b).unwrap()).unwrap().len(), 63);
+        let mut b = Vec::new();
+        node(&mut b, "device-tree", &[], 0);
+        assert_eq!(target_name_of(&parse(&b).unwrap()), None);
+        assert_eq!(target_name_of(&[]), None);
     }
 
     fn all(t: &[Node], r: &mut RegistryIter) -> Vec<u32> {

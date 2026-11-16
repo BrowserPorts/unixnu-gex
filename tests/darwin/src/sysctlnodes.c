@@ -109,6 +109,11 @@ int main(void) {
     errno = 0;
     if (sysctlbyname("security.mac.amfi.developer_mode_status", NULL, NULL, &w, sizeof w) != -1 || errno != EPERM) return bad("setting developer_mode_status", errno, EPERM);
 
+    // The target: the device tree's compatible, as the platform expert
+    // names it.
+    len = sizeof buf;
+    if (sysctlbyname("hw.target", buf, &len, NULL, 0) != 0 || strcmp(buf, "J120AP") != 0 || len != 7) return bad("hw.target", (long)len, 7);
+
     // The name of a node that does not exist.
     errno = 0;
     len = sizeof buf;

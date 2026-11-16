@@ -1091,7 +1091,8 @@ impl Kernel {
         let md = handle.metadata().map_err(|e| format!("{path}: {e:?}"))?;
         let canonical = self.vfs.canonical(&self.vfs.absolute(path));
         let vnode = (self.vfs.mount_id_of(&canonical), md.ino);
-        let ids = (super::kern::mount_of(&canonical).fsid as u32, md.ino);
+        // (stat's device: a cryptex graft's own, else its mount's)
+        let ids = (super::graftfs::devt_at(&canonical).unwrap_or(super::kern::mount_of(&canonical).fsid as u32), md.ino);
         // The header and the tables it points at (dyld reads the first
         // page; the image list a main cache names is past it).
         let mut head = vec![0u8; md.size.min(8 << 20) as usize];

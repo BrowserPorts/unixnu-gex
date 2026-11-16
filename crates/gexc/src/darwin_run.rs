@@ -3,7 +3,8 @@
 //! A static program (no `LC_LOAD_DYLINKER`) is mapped as it is and started
 //! at its `LC_UNIXTHREAD` pc. A dynamic one starts in dyld, read from the
 //! Darwin root (`--sysroot`), with the shared cache mapped where it was
-//! linked: the root's cryptex copy, or `GEX_DARWIN_CACHE`. The system
+//! linked: the OS cryptex's, at its graft on the Preboot volume (the root's
+//! `/System/Cryptexes/OS` is a link to it), or `GEX_DARWIN_CACHE`'s. The system
 //! boots with the payload in `GEX_DARWIN_BOOT` (its trust cache bundle,
 //! the Sandbox's platform profile).
 
@@ -40,13 +41,20 @@ pub fn run(mut ra: RunArgs, bytes: &[u8]) -> Result<ExitCode> {
     ra.opts.darwin_dyld_infos_size = img.dyld_infos_size;
     if img.program.interp.is_some() {
         let root = root.as_ref().expect("a root for dyld");
+        // The cache's path as the guest names it: the OS cryptex's, which
+        // the system's graft of the cryptex serves (the kernel reports a
+        // graft it cannot make), or GEX_DARWIN_CACHE's file in the root.
         let cache = match std::env::var_os("GEX_DARWIN_CACHE") {
-            Some(p) => PathBuf::from(p),
-            None => root.join(gex_kernel::darwin::CACHE_PATH.trim_start_matches('/')),
+            Some(p) => {
+                let p = PathBuf::from(p);
+                if !p.exists() {
+                    bail!("no shared cache at {} (GEX_DARWIN_CACHE)", p.display());
+                }
+                let rel = p.strip_prefix(root).with_context(|| format!("the shared cache {} is not in the root {}", p.display(), root.display()))?;
+                format!("/{}", rel.display())
+            }
+            None => gex_kernel::darwin::CACHE_PATH.to_string(),
         };
-        if !cache.exists() {
-            bail!("no shared cache at {} (set GEX_DARWIN_CACHE)", cache.display());
-        }
         ra.opts.darwin_cache = Some(cache);
     }
     let program = img.program;

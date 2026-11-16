@@ -222,9 +222,10 @@ pub struct RunOptions {
     /// A Darwin (Mach-O) program: the kernel speaks the Darwin system call
     /// ABI to it (`gex_kernel::darwin`).
     pub darwin: bool,
-    /// A Darwin program's dyld shared cache (its main file; the subcaches
-    /// sit beside it), mapped at its shared region before the program runs.
-    pub darwin_cache: Option<std::path::PathBuf>,
+    /// A Darwin program's dyld shared cache, its main file's path as the
+    /// guest names it (the subcaches sit beside it), mapped at its shared
+    /// region before the program runs.
+    pub darwin_cache: Option<String>,
     /// Where dyld's `dyld_all_image_infos` is (its `__all_image_info`
     /// section, slid): the kernel records it at exec, as task_info
     /// (TASK_DYLD_INFO) reports it.
@@ -1360,11 +1361,10 @@ fn run_process(
         if let Some(anchor) = read("img4_anchor.der")? {
             gex_kernel::darwin::image4::set_anchor(anchor).map_err(|e| anyhow!("the boot payload: {e}"))?;
         }
-        // The sealed volumes' owners, modes and flags, which an extracted
-        // root does not keep: the system volume's and the SystemOS
-        // cryptex's.
+        // The system volume's owners, modes and flags, which an extracted
+        // root does not keep.
         let mut volume_attrs = Vec::new();
-        for vol in [gex_kernel::darwin::volattrs::Vol::System, gex_kernel::darwin::volattrs::Vol::OsCryptex] {
+        for vol in [gex_kernel::darwin::volattrs::Vol::System] {
             if let Some(spec) = read(vol.file())? {
                 volume_attrs.push((vol, spec));
             }
@@ -1380,7 +1380,7 @@ fn run_process(
                 Some(path) => Ticket::File(path.to_string()),
             },
             nonce_hash: opts.darwin_cryptex1_nonce_hash.clone().filter(|h| !h.is_empty()),
-            host: Some(Host { size: darwin_host_size, read: darwin_host_read }),
+            host: Some(Host { size: darwin_host_size, read: darwin_host_read, sha384: Some(darwin_host_sha384) }),
         };
         gex_kernel::darwin::boot(tc.as_deref(), sandbox, device_tree.as_deref(), volume_attrs, cryptex1).map_err(|e| anyhow!("the boot payload: {e}"))?;
         // The panel: the test embedder's recorder when asked for.
@@ -1444,6 +1444,12 @@ fn run_process(
     // Mounts survive an exec, so they are only established for a new process.
     if fresh {
         mount_filesystems(&mut kernel, opts, Arc::clone(&proc_state))?;
+    }
+    // A system launchd has booted has its Preboot volume mounted, with the
+    // boot cryptexes grafted on it; launchd itself grafts them.
+    if opts.darwin && fresh {
+        gex_kernel::darwin::graftfs::set_file_dir(gex_cache::graft_file_dir);
+        kernel.darwin_boot_grafts();
     }
     // The compositor binds a name in the guest's unix-socket namespace (shared
     // across the process tree). Bound before anything runs, or a client that
@@ -5201,29 +5207,19 @@ fn place_image(
     if opts.darwin {
         gex_kernel::darwin::shregion::set_slid_dir(gex_cache::slid_cache_dir);
         let boot = match (opts.darwin_cache.as_deref(), opts.sysroot.as_deref()) {
-            (Some(cache), Some(root)) => {
-                let guest = cache.strip_prefix(root).map_err(|_| anyhow!("the shared cache {} is not in the root {}", cache.display(), root.display()))?;
-                let guest = format!("/{}", guest.display());
+            (Some(guest), Some(_)) => {
                 let (dir, main) = guest.rsplit_once('/').ok_or_else(|| anyhow!("the shared cache's path {guest}"))?;
                 Some((dir.to_string(), main.to_string()))
             }
-            (Some(cache), None) => bail!("the shared cache {} without a root", cache.display()),
+            (Some(guest), None) => bail!("the shared cache {guest} without a root"),
             _ => None,
         };
         let mut gm = GuestMem::new(memory.bytes());
         store.data_mut().with_kernel(|k| -> Result<()> {
             if let Some((dir, main)) = &boot {
                 if k.procs.virtual_init() {
-                    // libignition in launchd's dyld loaded the OS cryptex's
-                    // trust cache before mapping the cache from it.
-                    if let Some(boot) = &opts.darwin_boot {
-                        let p = boot.join("os.dmg.trustcache");
-                        match std::fs::read(&p) {
-                            Ok(b) => gex_kernel::darwin::trustcache::add_loaded(gex_kernel::darwin::trustcache::im4p_module(&b).map_err(|e| anyhow!("{}: {e:?}", p.display()))?),
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                            Err(e) => bail!("reading {}: {e}", p.display()),
-                        }
-                    }
+                    // From the OS cryptex's graft, whose trust cache the
+                    // boot loaded (Kernel::darwin_boot_grafts).
                     k.darwin_boot_shared_region(dir, main).map_err(|e| anyhow!("the boot's shared region: {e}"))?;
                 }
             }
@@ -8800,6 +8796,48 @@ fn wine32_image_at(pc: u64) -> Option<(String, u64)> {
 /// files: `None` for what is not a readable file.
 fn darwin_host_size(path: &str) -> Option<u64> {
     std::fs::metadata(path).ok().filter(|m| m.is_file()).map(|m| m.len())
+}
+
+/// A host file's SHA-384, kept in gex's cache ([`gex_cache::digest_dir`])
+/// under a name made of its path and identity (size, modification time,
+/// inode, device): a file hashed whole is read again only once it has
+/// changed. None when it cannot be read.
+fn darwin_host_sha384(path: &str) -> Option<[u8; 48]> {
+    use sha2::Digest;
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+    let identity = |md: &std::fs::Metadata| format!("{}\0{}.{}\0{}\0{}", md.len(), md.mtime(), md.mtime_nsec(), md.ino(), md.dev());
+    let before = std::fs::metadata(path).ok().filter(|m| m.is_file())?;
+    let key = format!("gex host sha384 1\0{path}\0{}", identity(&before));
+    let name: String = sha2::Sha256::digest(key.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+    let kept = gex_cache::digest_dir().map(|d| d.join(format!("{name}.sha384")));
+    if let Some(b) = kept.as_ref().and_then(|p| std::fs::read(p).ok()) {
+        if let Ok(d) = <[u8; 48]>::try_from(b.as_slice()) {
+            return Some(d);
+        }
+    }
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut h = sha2::Sha384::new();
+    let mut buf = vec![0u8; 8 << 20];
+    loop {
+        let n = f.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    let d: [u8; 48] = h.finalize().into();
+    // Kept only when the file did not change while it was read.
+    let after = std::fs::metadata(path).ok()?;
+    if let (Some(p), true) = (kept, identity(&after) == identity(&before)) {
+        if p.parent().is_some_and(|dir| std::fs::create_dir_all(dir).is_ok()) {
+            let tmp = p.with_extension(format!("tmp{}", std::process::id()));
+            if std::fs::write(&tmp, d).is_ok() && std::fs::rename(&tmp, &p).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+        }
+    }
+    Some(d)
 }
 
 /// A host file's bytes at `offset`, all of `into` or false.

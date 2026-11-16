@@ -4,9 +4,11 @@
 # than the last build; GEXC picks the runner.
 # With program names, only those run; without, all of them.
 #
-# A dynamic program needs a Darwin root (GEX_DARWIN_ROOT: dyld and the
-# shared cache, as UniXNU's webroot lays them out) and runs from inside it.
-# Without one it is skipped, or fails when it was asked for by name.
+# A dynamic program needs a Darwin root (GEX_DARWIN_ROOT: dyld, as UniXNU's
+# webroot lays it out) and runs from inside it, and the restore source
+# (GEX_DARWIN_RESTORE) whose OS cryptex image, grafted on the booted
+# system's Preboot volume, holds the shared cache. Without them it is
+# skipped, or fails when it was asked for by name.
 #
 # The system boots with the device's payload (GEX_DARWIN_BOOT: its trust
 # cache bundle and the Sandbox's platform profile and profile collections)
@@ -117,7 +119,7 @@ fi
 if [ -n "${GEX_DARWIN_BOOT:-}" ] && [ -f "$GEX_DARWIN_BOOT/DeviceTree" ]; then
     cp "$GEX_DARWIN_BOOT/DeviceTree" "$BOOT/"
 fi
-for f in sandbox_profile.bin sandbox_builtin.bin sandbox_protobox.bin img4_anchor.der os.dmg.trustcache SystemVolume.attrs SystemOS.attrs; do
+for f in sandbox_profile.bin sandbox_builtin.bin sandbox_protobox.bin img4_anchor.der SystemVolume.attrs; do
     if [ -n "${GEX_DARWIN_BOOT:-}" ] && [ -f "$GEX_DARWIN_BOOT/$f" ]; then
         cp "$GEX_DARWIN_BOOT/$f" "$BOOT/"
     fi
@@ -205,15 +207,17 @@ check() {
 check_root() {
     name=$1 want_out=$2 want_status=$3
     shift 3
-    if [ -z "${GEX_DARWIN_ROOT:-}" ]; then
+    for v in GEX_DARWIN_ROOT GEX_DARWIN_RESTORE; do
+        eval "val=\${$v:-}"
+        [ -n "$val" ] && continue
         if [ "$named" -gt 0 ]; then
-            echo "FAIL $name: no Darwin root (set GEX_DARWIN_ROOT)"
+            echo "FAIL $name: no $v (set it)"
             fail=1
         else
-            echo "SKIP $name (set GEX_DARWIN_ROOT)"
+            echo "SKIP $name (set $v)"
         fi
         return
-    fi
+    done
     mkdir -p "$GEX_DARWIN_ROOT/var/tmp"
     place "$HERE/bin/$name" "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-$name"
     # shellcheck disable=SC2086

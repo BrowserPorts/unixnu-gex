@@ -437,10 +437,6 @@ impl Kernel {
             super::kern::Fs::Devfs => return Ok(()),
             super::kern::Fs::Apfs => {}
         }
-        if mnt.from == super::kern::From::OsCryptex {
-            self.darwin_unimplemented(format!("an update of {}, the mount standing for Preboot's graft of the SystemOS cryptex", mnt.on));
-            return Err(Errno::EIO);
-        }
         let devpath = m.read_u64(data)?;
         if devpath != 0 {
             self.darwin_sb_namei(m, super::bsd::AT_FDCWD as u64, devpath, true, false)?;
@@ -731,7 +727,7 @@ impl Kernel {
 
     /// A file of the system volume at `path`, its bytes and attributes,
     /// as `copyfile` reads them; `None` when the volume has none there.
-    fn darwin_system_file(&self, path: &str) -> Result<Option<(Vec<u8>, super::vattr::Owned)>, String> {
+    pub(crate) fn darwin_system_file(&self, path: &str) -> Result<Option<(Vec<u8>, super::vattr::Owned)>, String> {
         let md = match self.vfs.metadata(path) {
             Ok(md) => md,
             Err(crate::errno::Errno::ENOENT) => return Ok(None),

@@ -63,9 +63,10 @@ it, on a 16 KiB boundary, relocating the slid mappings by their slide
 info; every task in the region sees it, and every task after enters it as
 it is. An unused region is kept two minutes. When pid 1 is the kernel's
 own, standing in for launchd, the boot's region holds what launchd's dyld
-mapped at boot: the OS cryptex's trust cache loaded (as libignition loads
-it), the cache's files preflighted and their code signatures added as
-dyld does, and the same mapping call made with dyld's arguments.
+mapped at boot: the cache's files, on the OS cryptex's graft (with its
+trust cache loaded, as the boot left them: see the storage paragraph of
+the known gaps), preflighted and their code signatures added as dyld
+does, and the same mapping call made with dyld's arguments.
 `/sbin/launchd` as the first program finds its region empty. libmalloc's nano
 allocator, in a process exec engages it for (a spawn with
 `_POSIX_SPAWN_NANO_ALLOCATOR`, as an app's is), takes the 512 MiB after
@@ -354,12 +355,15 @@ the guest sees its files through host passthrough. gexc reads from it:
 
 - dyld, at the path the program's `LC_LOAD_DYLINKER` names
   (`<ipados-root>/usr/lib/dyld`);
-- the shared cache, at
-  `<ipados-root>/System/Cryptexes/OS/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64`,
-  with its subcaches beside it. iOS 17 keeps the shared cache in the
-  SystemOS cryptex, so the cryptex's contents go under
-  `System/Cryptexes/OS`. `GEX_DARWIN_CACHE` names another location for the
-  cache's main file.
+- nothing of the cryptexes: iOS 17 keeps the shared cache in the SystemOS
+  cryptex, which the system grafts on its Preboot volume, and the root has
+  `System/Cryptexes/OS` and `System/Cryptexes/App` as the device's system
+  volume has them, links to `../../private/preboot/Cryptexes/OS` and
+  `../../private/preboot/Cryptexes/App`. The guest reads the shared cache
+  (`/System/Cryptexes/OS/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64`
+  and its subcaches) from the graft, which gex makes from the restore
+  source's image (`GEX_DARWIN_RESTORE`, below). `GEX_DARWIN_CACHE` names
+  another cache's main file in the root.
 
 The test runner copies its programs into `<ipados-root>/var/tmp/`, so the
 directory must be writable.
@@ -413,7 +417,6 @@ missing has effects:
 | `sandbox_protobox.bin` | the Sandbox kext's protobox profile collection (profiles named by executable path), a compiled collection blob from the kernelcache | every exec is reported and killed, since its protobox profile cannot be looked up |
 | `img4_anchor.der` | AppleImage4's root certificate for Cryptex1 manifests ("Apple DDI Secure Boot Root CA - G1"), from the kernelcache | the evaluation of a cryptex boot graft's ticket is reported when it reaches the certificate chain |
 | `DeviceTree` | the flattened device tree: the payload of the IPSW's device tree image (an IM4P) for this device | the IOKit registry has no device tree, which is reported |
-| `os.dmg.trustcache` | the SystemOS cryptex's trust cache, an IM4P (in the IPSW, the `Firmware/<os cryptex>.dmg.trustcache` whose cdhashes are the shared cache's files'), which libignition loads at boot | with pid 1 standing in for launchd, the boot's shared region cannot be mapped: the cache's ad-hoc signatures are in no trust cache |
 | `SystemVolume.attrs` | the system volume's owners, modes and file flags, which an extracted root does not keep: an mtree(5)-layout specification (flags in hexadecimal) that `tools/darwin-volume-attrs.py` writes from the IPSW's root filesystem image mounted read-only with its owners honoured (`hdiutil attach -readonly -nobrowse -owners on`); read when first looked in (`volattrs::lookup`) | a lookup of a system volume file's attributes says the payload has none |
 
 A `TrustCache` that does not load stops the boot. `tools/darwin-trust-cache.py`
@@ -490,9 +493,9 @@ What gexc sets up:
 |---|---|
 | `GEX_DARWIN_BOOT` | the boot payload (above); the system boots from it once, and an `execve` runs on the same system |
 | `GEX_DARWIN_STRICT=1` | strict mode (above) |
-| `GEX_DARWIN_CACHE` | the shared cache's main file, when it is not at the root's cryptex path |
+| `GEX_DARWIN_CACHE` | the shared cache's main file, a file in the root, in place of the OS cryptex's |
 | `GEX_DARWIN_FRAMES` | a directory the frames the framebuffer presents are recorded into, one file each (`hosts/native/src/darwin_frames.rs`) |
-| `GEX_DARWIN_RESTORE` | the files the restore installs the Preboot volume's Cryptex1 (`/private/preboot/cryptex1/current`) from: a directory holding the IPSW's `BuildManifest.plist` and the build identity's `Cryptex1,` components at their paths in the IPSW (the two cryptex images and their `Firmware/*.root_hash` and `Firmware/*.trustcache`), each checked against its digest at the volume's first mount. Without it, looking in `cryptex1` is reported |
+| `GEX_DARWIN_RESTORE` | the files the restore installs the Preboot volume's Cryptex1 (`/private/preboot/cryptex1/current`) from: a directory holding the IPSW's `BuildManifest.plist` and the build identity's `Cryptex1,` components at their paths in the IPSW (the two cryptex images and their `Firmware/*.root_hash` and `Firmware/*.trustcache`), each checked against its digest at the volume's first mount (gexc keeps a file's digest in its cache until the file changes). A system launchd has booted has the two cryptexes grafted from these images, and their trust caches loaded, as its boot left them. Without it, looking in `cryptex1` or in a booted system's grafts is reported, and a dynamic program, whose shared cache is in the OS cryptex, cannot start |
 | `GEX_DARWIN_CRYPTEX1_TICKET` | the Cryptex1 ticket's source: a file, the device's own `cryptex1/current/apticket.<target>.<ECID>.im4m` copied from its Preboot volume, or `web-device`, the web device's own platform (not implemented). Without a file, looking up the ticket is reported |
 | `GEX_DARWIN_CRYPTEX1_NONCE_HASH` | the device's current cryptex1 boot nonce hash, in hexadecimal: what its AppleImage4 makes of the cryptex1 boot nonce in its NVRAM (entangled with its UID key when the device asks for it), which the Cryptex1 ticket's `cnch` must be when the system grafts its cryptexes. Only the device has it: while the device has not rolled the nonce since its restore, it is the device's ticket's `cnch`. Without it, evaluating a ticket that carries a `cnch` is reported |
 | environment | without `--env` or `--host-env`, `PATH=/usr/bin:/bin` and `HOME=/var/mobile` |
@@ -511,11 +514,12 @@ cargo build --release -p gexc
 tests/darwin/build.sh
 
 # Every program:
-GEX_DARWIN_ROOT=<ipados-root> GEX_DARWIN_BOOT=<ipados-boot> tests/darwin/run.sh
+GEX_DARWIN_ROOT=<ipados-root> GEX_DARWIN_BOOT=<ipados-boot> \
+    GEX_DARWIN_RESTORE=<ipados-restore> tests/darwin/run.sh
 
 # Some, by name:
 GEX_DARWIN_ROOT=<ipados-root> GEX_DARWIN_BOOT=<ipados-boot> \
-    tests/darwin/run.sh hello dispatch xpc-anon
+    GEX_DARWIN_RESTORE=<ipados-restore> tests/darwin/run.sh hello dispatch xpc-anon
 ```
 
 `run.sh` runs each program under gexc and compares its output and exit
@@ -527,6 +531,7 @@ exits 1 when any fails. It builds the programs first when
 |---|---|
 | `GEXC` | the gexc to run (default `target/release/gexc`) |
 | `GEX_DARWIN_ROOT` | the root for the dynamic programs, which run from its `/var/tmp`. Without it they are skipped, or fail when named |
+| `GEX_DARWIN_RESTORE` | the restore source (gexc's, above), whose OS cryptex image holds the shared cache the dynamic programs map. Without it they are skipped, or fail when named |
 | `GEX_DARWIN_BOOT` | the device's boot payload. Its trust cache, with the test programs' cdhashes added, goes to `tests/darwin/bin/boot/TrustCache`, with its `DeviceTree` and Sandbox blobs beside it, and gexc boots from there. Without it, the trust cache holds the test programs only |
 | `GEX_DARWIN_WEBMETAL` | WebMetal's plugin bundle, as UniXNU's `scripts/build-web-metal-plugin.py` builds it (`<out>/ios/AGXMetalA10.bundle`), which `metal` loads. Without it `metal` is skipped, or fails when named |
 
@@ -625,9 +630,11 @@ is the reference (search `crates/gex-kernel/src/` for
   `b3a8` on an `rgba16float` canvas (each 10-bit code as its nearest half
   float); it refuses other formats, blending, scaling and transforms, and
   a browser without `rgba16float` canvases (Firefox 151) refuses `b3a8`.
-- **Code signing.** Besides the static trust cache, only the OS cryptex's
-  is loaded, at a boot pid 1 stands in for; loading one at run time (AMFI's
-  user client, after a cryptex's manifest is checked) is not implemented.
+- **Code signing.** Besides the static trust cache, only the boot
+  cryptexes' are loaded: by libignition through AMFI, or, on a system
+  launchd has booted, as its boot loaded them; loading one at run time
+  (AMFI's user client, after a cryptex's manifest is checked) is not
+  implemented.
   CMS signatures (CoreTrust and amfid) are not
   implemented. AMFI's `__mac_syscall` calls for local signing, trust cache
   loading and launch constraints are reported.
@@ -637,8 +644,9 @@ is the reference (search `crates/gex-kernel/src/` for
   facts are `on-authorized-authapfs-volume` (APFS's authorization of a
   volume is not modelled), `on-system-volume` for a file under a bind
   mount, and every fact of pid 1 but `is-init-proc` when pid 1 is the
-  kernel's own rather than launchd. The kernel's mount list has no data
-  volume, so a file under `/private/var` is on the system volume here.
+  kernel's own rather than launchd. Of the volumes a booted system mounts
+  after the kernel's, the mount list has only the Preboot volume: a file
+  under `/private/var` is on the system volume here.
   Library validation of an OOP-JIT mapping is reported.
 - **Sandbox.** A process gets its sandbox as the kext gives it: at exec
   from its `seatbelt-profiles` entitlement, its spawn's Sandbox attributes,
@@ -747,8 +755,7 @@ is the reference (search `crates/gex-kernel/src/` for
   numbers; exact ones need the capacity and APFS's space accounting
   (spaceman) after the restore and first boot. Volumes have the UUIDs newfs_apfs gives their roles; the System
   volume has the system image's, as ASR's restore of it, whether ASR keeps
-  it not yet traced. The OS cryptex is still a mount of its own at
-  `/System/Cryptexes/OS` rather than Preboot's graft of it. `graftdmg` and
+  it not yet traced. `graftdmg` and
   `ungraftdmg` make XNU's and APFS's checks, and AppleImage4 evaluates a
   cryptex boot graft's payload against its Cryptex1 ticket as the kext
   does (the certificate chain to its DDI root, the signature, the
@@ -766,14 +773,26 @@ is the reference (search `crates/gex-kernel/src/` for
   recorded in its image's file-system-owned attributes
   (`com.apple.fs.graft-*`, which no attribute call reads or lists), and a
   later graft of the image reuses a recorded range that is still valid.
+  A mapping of a sealed graft's file maps the host's copy of it, made
+  once from the graft's checked bytes and kept in gexc's cache under the
+  volume's root hash, which seals them. A system launchd has booted (a
+  run of any program but launchd) has its Preboot volume mounted where
+  libignition mounted it, then read-only as the fstab names it (what
+  makes it so is untraced, and its flags stand in until measured), and
+  the result of a boot whose evaluations passed: the OS and App cryptexes
+  grafted from the restore source's images, each root hash authenticated
+  against the restore's payload, their ranges taken and recorded as on a
+  writable host, and their trust caches loaded (the Cryptex1 ticket's own
+  evaluation is the device's, and is not made again); without a restore
+  source, what the grafts hold is reported.
   Compressed files are read as AppleFSCompressionTypeZlib's decmpfs
   chunks are fetched: uncompressed (types 9, 10) and LZBITMAP (types 13,
   14; the SystemOS cryptex's linkedit and symbols subcaches among them),
   decoded as the kernel's own decoder does, the format having no
   published specification, with a sealed volume's expanded bytes checked
   against the data hashes kept under the resource fork's stream; zlib,
-  LZVN and LZFSE files are reported where they are read, as are an
-  ungraft and the grafts a booted system's Preboot volume has. A mount of the
+  LZVN and LZFSE files are reported where they are read, as is an
+  ungraft. A mount of the
   Preboot volume has the files the restore leaves there (its root and
   `Cryptexes`), dated when it is first mounted, which stands in for the
   restore's time; the files the device's personalized tickets make (the

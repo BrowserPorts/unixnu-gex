@@ -182,6 +182,11 @@ fn with<R>(f: impl FnOnce(&mut Table) -> Result<R, Refused>) -> Result<R, Refuse
 /// volume's container medium, the provider of the volume's
 /// `AppleAPFSContainer`, for reading. `bdevvp` panics when the open fails.
 fn boot() -> Result<Table, String> {
+    boot_in(super::kern::boot_state())
+}
+
+/// [`boot`]'s table for a system in boot state `state`.
+fn boot_in(state: super::kern::BootState) -> Result<Table, String> {
     let mut t = Table {
         minors: vec![MinorSlot::default(); super::storage::MEDIA],
         media: vec![MediaOpens::default(); super::storage::MEDIA],
@@ -199,6 +204,18 @@ fn boot() -> Result<Table, String> {
             Ok(()) => {}
             Err(Refused::Errno(e)) => return Err(format!("bdevvp's open of {} at boot failed ({e}): the kernel panics (\"bdevvp failed: open\")", super::storage::media_bsd_name(m))),
             Err(Refused::Unmodelled(u)) => return Err(format!("bdevvp's open of {} at boot: {u}", super::storage::media_bsd_name(m))),
+        }
+    }
+    // A booted system's: the Preboot volume's, which libignition's
+    // read-write mount of it opened (mount_common's VNOP_OPEN of the
+    // device, FREAD | FWRITE: super::kern::boot_mounts).
+    if state == super::kern::BootState::Booted {
+        let preboot = super::storage::volume_with_role(super::storage::role::PREBOOT).ok_or("the container has no Preboot volume")?.index;
+        let m = Media::Volume(preboot);
+        match dkopen_in(&mut t, minor_of(m) as u32, FREAD | FWRITE, true) {
+            Ok(()) => {}
+            Err(Refused::Errno(e)) => return Err(format!("the booted system's open of {} for its Preboot mount failed ({e})", super::storage::media_bsd_name(m))),
+            Err(Refused::Unmodelled(u)) => return Err(format!("the booted system's open of {} for its Preboot mount: {u}", super::storage::media_bsd_name(m))),
         }
     }
     Ok(t)
@@ -661,7 +678,7 @@ mod tests {
     #[test]
     fn boot_opens_and_a_volume_open() {
         use access::*;
-        let mut t = boot().expect("the root's opens");
+        let mut t = boot_in(super::super::kern::BootState::Kernel).expect("the root's opens");
         let sys = Media::Volume(0);
         // The root volume's first dkopen was made a writer's, shared by the
         // volume; the container medium holds the AppleAPFSContainer's
@@ -684,5 +701,9 @@ mod tests {
         // which holds it open: refused.
         assert_eq!(dkopen_in(&mut t, minor_of(Media::Partition) as u32, FREAD | FWRITE, false), Err(Refused::Errno(EBUSY)));
         assert_eq!(t.minors[minor_of(Media::Partition)], MinorSlot::default());
+        // A booted system's table has the Preboot mount's open already.
+        let b = boot_in(super::super::kern::BootState::Booted).expect("a booted system's opens");
+        assert_eq!(b.container.writers, vec![Client::Media(sys), Client::Media(preboot)]);
+        assert_eq!(b.minors[minor_of(preboot)].bdev_level, t.minors[minor_of(preboot)].bdev_level);
     }
 }

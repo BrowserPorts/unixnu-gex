@@ -1,11 +1,10 @@
-//! The owners, modes and file flags of the files of the device's sealed
-//! volumes, as their images have them: the system volume, and the SystemOS
-//! cryptex the shared cache is in. A host's extraction of the root keeps
+//! The owners, modes and file flags of the files of the device's system
+//! volume, as its image has them. A host's extraction of the root keeps
 //! its files' contents but not these: they come from the boot payload's
-//! `SystemVolume.attrs` and `SystemOS.attrs`, which
-//! `tools/darwin-volume-attrs.py` writes from the IPSW's root filesystem
-//! image and its SystemOS cryptex image (mtree(5)-style specifications;
-//! their `flags` are `st_flags` in hexadecimal).
+//! `SystemVolume.attrs`, which `tools/darwin-volume-attrs.py` writes from
+//! the IPSW's root filesystem image (an mtree(5)-style specification; its
+//! `flags` are `st_flags` in hexadecimal). A cryptex's files are read from
+//! its image, inodes and all ([`super::graftfs`]).
 //!
 //! [`lookup`] answers for a path of a volume as the guest names it below
 //! the volume's root, its components taken as they are (no link
@@ -224,10 +223,6 @@ impl Volume {
 pub enum Vol {
     /// The system volume, `/`.
     System,
-    /// The SystemOS cryptex (`os.dmg`), which the device grafts at
-    /// `/private/preboot/Cryptexes/OS` and this root has at
-    /// `/System/Cryptexes/OS`.
-    OsCryptex,
 }
 
 impl Vol {
@@ -235,23 +230,19 @@ impl Vol {
     pub fn file(self) -> &'static str {
         match self {
             Vol::System => "SystemVolume.attrs",
-            Vol::OsCryptex => "SystemOS.attrs",
         }
     }
 
     fn name(self) -> &'static str {
         match self {
             Vol::System => "the device's system volume",
-            Vol::OsCryptex => "the device's SystemOS cryptex",
         }
     }
 
     fn slot(self) -> &'static Slot {
         static SYSTEM: Slot = Slot { spec: Mutex::new(None), read: OnceLock::new() };
-        static OS_CRYPTEX: Slot = Slot { spec: Mutex::new(None), read: OnceLock::new() };
         match self {
             Vol::System => &SYSTEM,
-            Vol::OsCryptex => &OS_CRYPTEX,
         }
     }
 }
@@ -335,20 +326,9 @@ x
         assert_eq!(v.lookup("/etc"), a(Kind::Link, 0, 0, 0o755, 0));
         assert_eq!(v.lookup("/bin/ps"), a(Kind::File, 0, 0, 0o4755, 0x20));
         assert_eq!(v.lookup("/var"), a(Kind::Link, 0, 80, 0o755, 0));
+        // The cryptexes are links to their grafts on the Preboot volume.
+        assert_eq!(v.lookup("/System/Cryptexes/OS"), a(Kind::Link, 0, 0, 0o755, 0));
         assert_eq!(v.lookup("/System/Cryptexes/OS/System"), None);
-    }
-
-    /// The SystemOS cryptex's, from the same payload: the shared cache is
-    /// root's, group admin.
-    #[test]
-    #[ignore = "needs the boot payload's SystemOS.attrs"]
-    fn reads_the_device_os_cryptex() {
-        let dir = std::env::var("GEX_DARWIN_BOOT").expect("GEX_DARWIN_BOOT");
-        let v = parse(&std::fs::read(format!("{dir}/SystemOS.attrs")).unwrap()).unwrap();
-        let a = |kind, uid, gid, mode, flags| Some(Attrs { kind, uid, gid, mode, flags });
-        assert_eq!(v.lookup("/"), a(Kind::Dir, 0, 0, 0o755, 0));
-        assert_eq!(v.lookup("/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64"), a(Kind::File, 0, 80, 0o755, 0));
-        assert_eq!(v.lookup("/sbin/launchd"), None);
     }
 
     #[test]

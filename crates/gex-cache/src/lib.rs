@@ -389,6 +389,19 @@ pub fn slid_cache_dir() -> Option<PathBuf> {
     Some(gex_cache_root()?.join("dsc-slid"))
 }
 
+/// Where the digests of host files hashed whole are kept, each named by
+/// the file's path and its identity (size, modification time, inode,
+/// device) when it was hashed.
+pub fn digest_dir() -> Option<PathBuf> {
+    Some(gex_cache_root()?.join("digests"))
+}
+
+/// Where the files of a sealed cryptex image are kept as the host can map
+/// them, each named by the image volume's root hash and the file.
+pub fn graft_file_dir() -> Option<PathBuf> {
+    Some(gex_cache_root()?.join("graft-files"))
+}
+
 /// Where compiled modules live.
 pub fn cache_dir() -> Option<PathBuf> {
     Some(gex_cache_root()?.join("modules"))

@@ -198,8 +198,6 @@ pub enum From {
     Snapshot(u32),
     /// The container's volume at this slot.
     Volume(u32),
-    /// The SystemOS cryptex, standing for Preboot's graft of it.
-    OsCryptex,
 }
 
 /// The filesystem a mount is of.
@@ -295,27 +293,77 @@ pub const DEVFS_TYPENUM: u32 = 19;
 pub const DEVFS_FSID: u32 = 0x9a3c_51e7;
 
 /// What the system has mounted when its first program starts, in the order
-/// of the mount list: the system volume, devfs (`devfs_kernel_mount` in
-/// `bsd_init`, right after the root: MNT_DONTBROWSE, MNT_LOCAL from
-/// `devfs_mount`, MNT_MULTILABEL from its MACF `vfc_flags`), and the
-/// SystemOS cryptex the shared cache is in, by the filesystem id its
-/// dynamic data names (standing for libignition's graft, which is not
-/// made yet). All are the kernel's (`f_owner` 0). On a system launchd has
-/// booted, `/sbin/mount -P 1` has updated the root ([`ROOT_FLAGS_BOOTED`]).
-fn boot_mounts() -> [Mount; 3] {
+/// of the mount list: the system volume, then devfs (`devfs_kernel_mount`
+/// in `bsd_init`, right after the root: MNT_DONTBROWSE, MNT_LOCAL from
+/// `devfs_mount`, MNT_MULTILABEL from its MACF `vfc_flags`), both the
+/// kernel's (`f_owner` 0). On a system launchd has booted, `/sbin/mount -P
+/// 1` has updated the root ([`ROOT_FLAGS_BOOTED`]), and the Preboot volume
+/// is mounted where libignition's preboot stage mounted it
+/// ([`booted_preboot_mount`]), the first mount after the kernel's; the
+/// volumes launchd mounts after it are not in the list.
+fn boot_mounts() -> Vec<Mount> {
     let root_flags = match boot_state() {
         BootState::Kernel => ROOT_FLAGS,
         BootState::Booted => ROOT_FLAGS_BOOTED,
     };
-    let mounts = [
+    let mut mounts = vec![
         Mount::new("/", From::Snapshot(0), ROOT_FSID as u64, root_flags, Fs::Apfs, Some(super::volattrs::Vol::System), 0, Some(true)),
         Mount::new("/dev", From::Devfs, DEVFS_FSID as u64, MNT_LOCAL | MNT_DONTBROWSE | MNT_MULTILABEL, Fs::Devfs, None, 0, None),
-        Mount::new("/System/Cryptexes/OS", From::OsCryptex, super::CACHE_FS_ID, MNT_RDONLY | MNT_DONTBROWSE, Fs::Apfs, Some(super::volattrs::Vol::OsCryptex), 0, Some(true)),
     ];
     // devfs_mount's devfs_statfs left devfs's counts as they were at its
     // mount in bsd_init ([`DEVFS_STAT_STAND_IN`]).
     refresh_stat(&mounts[1]);
+    if boot_state() == BootState::Booted {
+        match booted_preboot_mount() {
+            Ok(m) => mounts.push(m),
+            Err(why) => super::note_unimplemented(format!("the booted system's mount of the Preboot volume: {why}")),
+        }
+    }
     mounts
+}
+
+/// Where libignition's preboot stage mounts the Preboot volume (dyld's
+/// `_preboot_fire`, 0x62d44): from its device by role (0x10,
+/// `ignition_get_devnode_by_role`), on the mount point of its role.
+pub const PREBOOT_ON: &str = "/private/preboot";
+
+/// libignition's `fmount("apfs", fd, MNT_DONTBROWSE, args)` of the Preboot
+/// volume (0x62fa8..0x62fc0): its arguments are of mode 1, with owner and
+/// group 99 (0x62ddc..0x62df0).
+const PREBOOT_ARGS: super::apfsmount::Args = super::apfsmount::Args { mode: 1, uid: 99, gid: 99 };
+const PREBOOT_FMOUNT_FLAGS: u32 = MNT_DONTBROWSE;
+
+/// What stands in for the flags of a booted system's Preboot mount.
+pub const PREBOOT_BOOTED_FLAGS_STAND_IN: &str = "the flags of a booted system's Preboot mount (stand-in: libignition's preboot stage's read-write fmount of it, read-only once booted as the device tree's fstab names it, by an update not traced; measure statfs(\"/private/preboot\").f_flags on the device)";
+
+/// The Preboot volume's mount on a booted system: libignition's, made by
+/// launchd (root, `f_owner` 0) ([`ignition_preboot_mount`]), read-only
+/// once booted as the device tree's fstab names it: neither libignition
+/// (its only mount calls are this `fmount` and the root's) nor what makes
+/// it read-only later is traced ([`PREBOOT_BOOTED_FLAGS_STAND_IN`]).
+fn booted_preboot_mount() -> Result<Mount, String> {
+    let m = ignition_preboot_mount()?;
+    {
+        let mut st = m.state();
+        st.flags |= MNT_RDONLY;
+        st.apfs_ro = Some(true);
+    }
+    Ok(m)
+}
+
+/// libignition's mount of the Preboot volume as it made it: `mount_common`
+/// gives a new mount `MNT_LOCAL` and, on a SECURE_KERNEL without
+/// CONFIG_MNT_SUID, `MNT_NOSUID`; APFS's live mount the rest
+/// ([`super::apfsmount::vfsop_mount`]), its `f_fsid.val[0]` the device's.
+pub fn ignition_preboot_mount() -> Result<Mount, String> {
+    let v = super::storage::volume_with_role(super::storage::role::PREBOOT).ok_or("the container has no Preboot volume")?;
+    let name = super::storage::volume_bsd_name(v.index);
+    let (_, minor) = super::storage::media_by_name(&name).ok_or_else(|| format!("no medium is named {name}"))?;
+    let dev = (super::storage::DISK_MAJOR << 24) | minor;
+    let flags = MNT_LOCAL | MNT_NOSUID | PREBOOT_FMOUNT_FLAGS;
+    let m = super::apfsmount::vfsop_mount(&PREBOOT_ARGS, flags, super::storage::Media::Volume(v.index), dev, &format!("/dev/{name}")).map_err(|r| format!("{r:?}"))?;
+    let ro = m.flags & MNT_RDONLY != 0;
+    Ok(Mount::new(PREBOOT_ON, From::Volume(m.volume), u64::from(m.fsid0), m.flags, Fs::Apfs, None, 0, Some(ro)))
 }
 
 /// devfs's counts as its mount at boot left them in `mnt_vfsstat`, which a
@@ -430,14 +478,11 @@ pub fn boot_state() -> BootState {
 /// The volume the preboot cryptexes are on: what `vnode_lookup` of
 /// `/private/preboot/Cryptexes` finds the mount of, for the shared region's
 /// check of where a cache is (devices without SIP): the Preboot volume's
-/// mount once one covers it; before that, the OS cryptex's mount at
-/// `/System/Cryptexes/OS`, standing for the booted system's graft of it.
+/// mount once one covers it. Before that the system volume's
+/// `/private/preboot` is empty and the lookup fails: none.
 pub fn preboot_cryptex_volume() -> Option<&'static str> {
     let m = mount_of("/private/preboot/Cryptexes");
-    if is_preboot(m) {
-        return Some(m.on);
-    }
-    mounts().into_iter().find(|m| m.on == "/System/Cryptexes/OS").map(|m| m.on)
+    is_preboot(m).then_some(m.on)
 }
 
 /// A mount's `f_mntfromname`. A volume's is its device's path (what
@@ -446,9 +491,7 @@ pub fn preboot_cryptex_volume() -> Option<&'static str> {
 /// (0xfffffff00667fcc4), and `handle_snapshot_mount`, mounting the sealed
 /// snapshot [`super::storage::ROOT_SNAPSHOT`] without a virtual device
 /// ([`ROOT_FSID`]), puts the snapshot's name and "@" before it
-/// (0xfffffff0066d0d0c: `"%s%s%s"`). The cryptex mount stands for
-/// Preboot's graft, which has no device of its own: its name is the
-/// stand-in's. An update that names a device renames it
+/// (0xfffffff0066d0d0c: `"%s%s%s"`). An update that names a device renames it
 /// ([`MountState::from_name`]).
 pub fn mount_from(mnt: &Mount) -> String {
     if let Some(name) = mnt.state().from_name.clone() {
@@ -458,7 +501,6 @@ pub fn mount_from(mnt: &Mount) -> String {
         From::Devfs => "devfs".to_string(),
         From::Volume(i) => format!("/dev/{}", super::storage::volume_bsd_name(i)),
         From::Snapshot(i) => format!("{}@/dev/{}", super::storage::ROOT_SNAPSHOT, super::storage::volume_bsd_name(i)),
-        From::OsCryptex => "/dev/disk3s1".to_string(),
     }
 }
 
@@ -513,7 +555,7 @@ pub fn unmodelled_files_on(mnt: &Mount, path: &str, at_root: bool) -> Option<Str
 pub fn mount_volume(mnt: &Mount) -> Option<u32> {
     match mnt.from {
         From::Snapshot(i) | From::Volume(i) => Some(i),
-        From::Devfs | From::OsCryptex => None,
+        From::Devfs => None,
     }
 }
 
@@ -2702,5 +2744,24 @@ mod tests {
         let root = &boot_mounts()[0];
         assert_eq!(mount_from(root), format!("{}@/dev/disk1s1", super::super::storage::ROOT_SNAPSHOT));
         assert_eq!(root.fsid, 0x3200_0001);
+    }
+
+    /// libignition mounts the Preboot volume read-write, nosuid (every
+    /// mount on a release kernel), not browsable (asked, and the Preboot
+    /// role's), from the volume's device, whose number is its fsid
+    /// (disk1s5, the eighth medium, while the minors stand in); a booted
+    /// system has it read-only.
+    #[test]
+    fn the_booted_preboot_mount_is_libignitions() {
+        let m = ignition_preboot_mount().unwrap();
+        assert_eq!(m.on, "/private/preboot");
+        assert_eq!(mount_from(&m), "/dev/disk1s5");
+        assert_eq!(m.flags(), MNT_LOCAL | MNT_NOSUID | MNT_DONTBROWSE | MNT_NOATIME | MNT_JOURNALED | MNT_DOVOLFS);
+        assert_eq!(m.fsid, 0x0100_0007);
+        assert_eq!(m.state().apfs_ro, Some(false));
+        assert!(is_preboot(&m));
+        let b = booted_preboot_mount().unwrap();
+        assert_eq!(b.flags(), m.flags() | MNT_RDONLY);
+        assert_eq!((b.fsid, b.state().apfs_ro), (m.fsid, Some(true)));
     }
 }

@@ -210,6 +210,9 @@ pub struct GraftFs {
     pub dir_parent_ino: u64,
     /// The graft's device (its `fs + 0x3a8`).
     pub devt: u32,
+    /// The sealed volume's root hash, which names its contents (none for
+    /// an unsealed one).
+    pub seal: Option<Vec<u8>>,
 }
 
 impl GraftFs {
@@ -403,6 +406,84 @@ pub struct GraftHandle {
     ino: afs::Inode,
 }
 
+/// Where the host keeps a sealed graft's files as files of its own
+/// ([`set_file_dir`]).
+static FILE_DIR: std::sync::OnceLock<fn() -> Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+
+/// Where the host keeps the files of sealed grafts it can map: each a
+/// regular file's bytes as the graft serves them (its data checked
+/// against the volume's data hashes as it was read), named by the
+/// volume's root hash, which seals every file's data hashes, and the
+/// file's data stream: what a mapping of the file pages in, which the host
+/// then maps from there rather than reading it into memory.
+pub fn set_file_dir(f: fn() -> Option<std::path::PathBuf>) {
+    let _ = FILE_DIR.set(f);
+}
+
+/// The host's files of sealed grafts, kept open while the system runs.
+static HOST_FILES: Mutex<Vec<(std::path::PathBuf, Arc<std::fs::File>)>> = Mutex::new(Vec::new());
+
+impl GraftHandle {
+    /// The host's file of this regular file of a sealed graft, made once
+    /// from the graft's bytes; none where there is no place for it, or
+    /// the graft cannot serve the file whole (its reads report why).
+    fn host_file(&self) -> Option<Arc<std::fs::File>> {
+        use sha2::Digest;
+        use std::io::Write;
+        if self.ino.kind() != afs::mode::S_IFREG {
+            return None;
+        }
+        let seal = self.fs.seal.as_ref()?;
+        let dir = FILE_DIR.get()?()?;
+        let size = self.fs.vol.file_size(&self.ino).ok()?;
+        let mut h = sha2::Sha256::new();
+        h.update(b"gex graft file 1\0");
+        h.update(seal);
+        h.update(self.ino.oid.to_le_bytes());
+        h.update(self.ino.private_id.to_le_bytes());
+        h.update(size.to_le_bytes());
+        let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        let path = dir.join(format!("{hex}.file"));
+        if let Some(f) = HOST_FILES.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(p, _)| *p == path).map(|(_, f)| Arc::clone(f)) {
+            return Some(f);
+        }
+        let kept = std::fs::File::open(&path).ok().filter(|f| f.metadata().is_ok_and(|m| m.len() == size));
+        let f = match kept {
+            Some(f) => f,
+            None => {
+                std::fs::create_dir_all(&dir).ok()?;
+                let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+                let mut out = std::fs::File::create(&tmp).ok()?;
+                let mut buf = vec![0u8; 4 << 20];
+                let mut at = 0u64;
+                while at < size {
+                    let n = match self.fs.vol.read_file(&self.ino, at, &mut buf) {
+                        Ok(n) if n > 0 => n,
+                        _ => {
+                            let _ = std::fs::remove_file(&tmp);
+                            return None;
+                        }
+                    };
+                    if out.write_all(&buf[..n]).is_err() {
+                        let _ = std::fs::remove_file(&tmp);
+                        return None;
+                    }
+                    at += n as u64;
+                }
+                drop(out);
+                if std::fs::rename(&tmp, &path).is_err() {
+                    let _ = std::fs::remove_file(&tmp);
+                    return None;
+                }
+                std::fs::File::open(&path).ok()?
+            }
+        };
+        let f = Arc::new(f);
+        HOST_FILES.lock().unwrap_or_else(|e| e.into_inner()).push((path, Arc::clone(&f)));
+        Some(f)
+    }
+}
+
 impl std::fmt::Debug for GraftHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "GraftHandle({:#x})", self.ino.oid)
@@ -422,6 +503,10 @@ impl FileHandle for GraftHandle {
     }
     fn metadata(&self) -> Result<Metadata, Errno> {
         self.fs.metadata_of(&self.ino)
+    }
+    fn host_fd(&self) -> Option<i32> {
+        use std::os::fd::AsRawFd;
+        self.host_file().map(|f| f.as_raw_fd())
     }
     fn read_dir(&self) -> Result<Vec<DirEntry>, Errno> {
         if !self.ino.is_dir() {
@@ -843,7 +928,7 @@ mod tests {
     fn the_graft_serves_the_images_files() {
         let (vol, _) = os_image();
         let len = vol.sb.next_obj_id;
-        let g = Arc::new(GraftFs { vol, base: 1000, len, dir_ino: 20, dir_parent_ino: 19, devt: 0x0101_0005 });
+        let g = Arc::new(GraftFs { vol, base: 1000, len, dir_ino: 20, dir_parent_ino: 19, devt: 0x0101_0005, seal: None });
         let m = GraftMount(Arc::clone(&g));
         let root = m.metadata("").unwrap();
         assert_eq!((root.ino, root.file_type), (20, FileType::Directory));

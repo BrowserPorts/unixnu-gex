@@ -261,12 +261,10 @@ fn devfs_vnode(mnt: &Mount, path: &str, md: &Metadata, name: Option<&str>) -> Vn
 }
 
 /// The volume's UUID: the container's volume's ([`super::storage::volume_uuid`]),
-/// or the OS cryptex's, its image's.
+/// which every APFS mount is of (a cryptex graft's vnodes are on its host's
+/// mount).
 fn volume_uuid(mnt: &Mount) -> [u8; 16] {
-    match super::kern::mount_volume(mnt) {
-        Some(i) => super::storage::volume_uuid(i),
-        None => super::storage::OS_CRYPTEX_UUID,
-    }
+    super::kern::mount_volume(mnt).map_or([0; 16], super::storage::volume_uuid)
 }
 
 /// The volume `mnt` as `getvolattrlist` has it, its root's owner read

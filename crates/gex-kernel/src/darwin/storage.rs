@@ -295,6 +295,7 @@ pub fn unmeasured() -> Option<String> {
     gaps.push(super::preboot::FOUNDATION_MODE_STAND_IN.to_string());
     gaps.push(super::preboot::NEXT_OBJ_ID_STAND_IN.to_string());
     gaps.push(super::kern::DEVFS_STAT_STAND_IN.to_string());
+    gaps.push(super::kern::PREBOOT_BOOTED_FLAGS_STAND_IN.to_string());
     gaps.push(format!("whether iBoot's /chosen boot-uuid or apfs-preboot-uuid names the System volume (stand-in {BOOT_UUID_MATCHES}: the root mounted from its snapshot by name, with a new fsid; measure {BOOT_UUID_MEASUREMENT})"));
     gaps.push(format!("whether the volumes' IOMedia are writable (stand-in {VOLUMES_WRITABLE}; measure {VOLUMES_WRITABLE_MEASUREMENT})"));
     gaps.push(format!("whether disk0 is write-protected (stand-in writable: {DISK_WRITABLE}; measure {DISK_WRITABLE_MEASUREMENT})"));
@@ -370,8 +371,6 @@ pub fn volume_uuid(index: u32) -> [u8; 16] {
 /// The system image's volume's UUID (044-76040-038.dmg).
 pub const SYSTEM_IMAGE_UUID: [u8; 16] = uuid("04769D26-2CA0-4825-B443-E2E5F88300F2");
 
-/// The SystemOS cryptex image's volume's UUID (044-76034-038.dmg).
-pub const OS_CRYPTEX_UUID: [u8; 16] = uuid("8846FE78-2910-4297-AF97-D59BB6F8FC16");
 
 /// The name of the System volume's sealed snapshot the restore makes and
 /// the root is mounted from: "com.apple.os.update-" and, in hex capitals,

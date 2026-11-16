@@ -25,6 +25,7 @@ gex-dylink.workspace = true
 gex-ir.workspace = true
 
 anyhow = "1"
+sha2 = { version = "0.10", default-features = false }
 # `parallel-compilation` is not a default here because `default-features` is
 # off, and leaving it off made every compile serial. gex hands wasmtime a
 # module with one function per guest basic block -- fifty thousand of them for

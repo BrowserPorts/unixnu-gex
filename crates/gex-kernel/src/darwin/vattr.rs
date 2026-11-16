@@ -3,9 +3,8 @@
 //! read, by where the file is:
 //!
 //! - devfs's nodes: devfs's own (`devfs_getattr`);
-//! - the sealed volumes' files (the system volume, the SystemOS cryptex):
-//!   their images' ([`super::volattrs`]), for a file of the type the image
-//!   has at that path. An overlay file is the system volume's at its path,
+//! - the system volume's files: its image's ([`super::volattrs`]), for a
+//!   file of the type the image has at that path. An overlay file is the system volume's at its path,
 //!   or the system's where the volume has none (`vfs::overlay`'s rule);
 //! - the Data volume (`/private/var`), which restore fills with the system
 //!   image's `/private/var` (restored's "copy var", a BOMCopier copy of
@@ -13,7 +12,10 @@
 //!   image has there, of its type and mode (the extraction kept the modes
 //!   of every one, and neither owners nor flags), has the image's;
 //! - a file the guest made, or whose owner, group, mode or flags it
-//!   changed, wherever it is: what was recorded then ([`RECORD`]).
+//!   changed, wherever it is: what was recorded then ([`RECORD`]); the
+//!   Preboot volume's files, each recorded as the restore made it, and a
+//!   cryptex graft's, which its image's inodes give
+//!   ([`super::graftfs::GraftFs::owned_of`]).
 //!
 //! What none of these covers has no attributes to give: a file of the
 //! extraction the device does not have, or one put in place outside the
@@ -74,8 +76,9 @@ const DATA: &str = "/private/var";
 /// The device's other volumes, which this root has as directories of its
 /// own (the device tree's `/filesystems/fstab`): their mount points, names
 /// and whether they are mounted read-only. What they hold is not the
-/// system image's.
-const OTHER_VOLUMES: [(&str, &str, bool); 4] = [("/private/xarts", "xART", false), ("/private/preboot", "Preboot", true), ("/private/var/MobileSoftwareUpdate", "Update", false), ("/private/var/hardware", "Hardware", false)];
+/// system image's. (The Preboot volume is mounted on a booted system:
+/// [`super::kern::PREBOOT_ON`].)
+const OTHER_VOLUMES: [(&str, &str, bool); 3] = [("/private/xarts", "xART", false), ("/private/var/MobileSoftwareUpdate", "Update", false), ("/private/var/hardware", "Hardware", false)];
 
 /// Whether `path` is `at` or below it.
 fn within(path: &str, at: &str) -> bool {
@@ -101,20 +104,20 @@ fn other_volume(path: &str) -> Option<(&'static str, &'static str, bool)> {
 
 /// Whether the device's volume `path` is on is mounted nosuid: the root
 /// once `mount -P 1` has updated it, the Data volume and the others the
-/// fstab mounts so, and the cryptex graft's Preboot.
+/// fstab mounts so; another mount (the Preboot volume's, a cryptex graft's
+/// host) as its flags say.
 pub fn device_nosuid(path: &str) -> bool {
     let m = super::kern::mount_of(path);
     match m.vol {
         Some(Vol::System) => m.flags() & super::kern::MNT_NOSUID != 0 || on_data(path) || other_volume(path).is_some(),
-        Some(Vol::OsCryptex) => true,
         None => m.flags() & super::kern::MNT_NOSUID != 0,
     }
 }
 
 /// The mount flags `vnode_authorize` reads (`MNT_RDONLY`) of the device's
-/// volume `path` is on: the system volume and the cryptex graft (on the
-/// Preboot volume) read-only, the Data volume and the others the fstab
-/// mounts `rw` writable, devfs writable.
+/// volume `path` is on: the system volume read-only, the Data volume and
+/// the others the fstab mounts `rw` writable, another mount (the Preboot
+/// volume's, a cryptex graft's host) as its flags say, devfs writable.
 pub fn device_mnt_flags(path: &str) -> u32 {
     device_mnt_flags_on(super::kern::mount_of(path), path)
 }

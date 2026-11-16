@@ -591,12 +591,10 @@ pub fn next_pidversion() -> i32 {
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Where iOS 17 keeps the shared cache, inside the SystemOS cryptex.
+/// Where iOS 17's dyld finds the shared cache: in the SystemOS cryptex,
+/// through the system volume's link `/System/Cryptexes/OS` to the
+/// cryptex's graft on the Preboot volume.
 pub const CACHE_PATH: &str = "/System/Cryptexes/OS/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64";
-
-/// `f_fsid.val[0]` of the volume the OS cryptex is on (its files'
-/// `st_dev`).
-pub const CACHE_FS_ID: u64 = 0x0100_0004;
 
 /// Where a Darwin thread puts its system call number.
 pub const NR_SLOT: usize = ctx::x(16);

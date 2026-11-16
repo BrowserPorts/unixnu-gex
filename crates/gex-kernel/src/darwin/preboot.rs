@@ -153,6 +153,10 @@ pub enum Ticket {
 pub struct Host {
     pub size: fn(&str) -> Option<u64>,
     pub read: crate::vfs::tmpfs::LazyFetch,
+    /// A host file's SHA-384 as the host keeps it for a file it has
+    /// hashed whole and that has not changed since (none: hashed here,
+    /// through `read`).
+    pub sha384: Option<fn(&str) -> Option<[u8; 48]>>,
 }
 
 /// Where the restore's Cryptex1 comes from: the files the host's restore
@@ -229,9 +233,12 @@ fn host_read(h: &Host, path: &str) -> Result<Vec<u8>, String> {
     Ok(b)
 }
 
-/// A host file's SHA-384, read in pieces.
+/// A host file's SHA-384: the host's, else read in pieces.
 fn host_sha384(h: &Host, path: &str, size: u64) -> Result<[u8; 48], String> {
     use sha2::Digest;
+    if let Some(d) = h.sha384.and_then(|f| f(path)) {
+        return Ok(d);
+    }
     const PIECE: u64 = 8 << 20;
     let mut d = sha2::Sha384::new();
     let mut buf = vec![0u8; PIECE.min(size) as usize];
@@ -286,19 +293,62 @@ pub fn restore_manifest(identity: &Value) -> Vec<u8> {
 /// Why the entry at `rel` (its path below the volume's root) is not
 /// modelled, if it is not: the entries the AP ticket makes (`active`, a
 /// name that can be the ticket hash's), `cryptex1` when no restore source
-/// is configured, and the Cryptex1 ticket when its source is not a file.
-/// `listing` asks for the directory's entries.
+/// is configured, the Cryptex1 ticket when its source is not a file, and
+/// on a booted system without a restore source what its cryptexes' grafts
+/// hold. `listing` asks for the directory's entries.
 pub fn unmodelled(rel: &str, listing: bool) -> Option<String> {
     let personalized = "personalized from the device's AP ticket, which is not modelled";
     let first = rel.split('/').next().unwrap_or("");
     match first {
         "active" => Some(format!("the Preboot volume's active file (the AP ticket's hash, {personalized})")),
         cryptex1::DIR => cryptex1_unmodelled(rel, listing),
+        "Cryptexes" => booted_graft_unmodelled(rel, listing),
         _ if first.len() == HASH_DIGITS && first.bytes().all(|b| matches!(b, b'0'..=b'9' | b'A'..=b'F')) => {
             Some(format!("the Preboot volume's directory named by the AP ticket's hash ({personalized}): whether {first} is it"))
         }
         _ => None,
     }
+}
+
+/// The grafts of a booted system's Preboot volume ([`BOOTED_GRAFTS`]), made
+/// from the restore source's images: without one, a path below a graft
+/// directory, or a listing of one, is not modelled.
+fn booted_graft_unmodelled(rel: &str, listing: bool) -> Option<String> {
+    if super::kern::boot_state() != super::kern::BootState::Booted || sources().restore.is_some() {
+        return None;
+    }
+    let g = BOOTED_GRAFTS.iter().find(|g| rel.strip_prefix(g.dir).is_some_and(|r| r.starts_with('/') || (r.is_empty() && listing)))?;
+    Some(format!("the booted system's graft of the {} cryptex on /private/preboot/{} (made from the restore source's {}: no restore source is configured, GEX_DARWIN_RESTORE)", g.name, g.dir, g.image))
+}
+
+/// A boot cryptex libignition grafts at boot (its graft stage, after the
+/// preboot stage's mount): the Preboot volume's image in `cryptex1/current`,
+/// its graft directory, libignition's `graftdmg` flags (the SystemOS
+/// cryptex's 0x2d, the AppOS cryptex's 0x2e), its root hash and trust
+/// cache, and the trust cache's type.
+#[derive(Clone, Copy, Debug)]
+pub struct BootGraft {
+    pub name: &'static str,
+    pub image: &'static str,
+    pub dir: &'static str,
+    pub sbc_flags: u64,
+    pub root_hash: &'static str,
+    pub trust_cache: &'static str,
+    pub tc_type: u8,
+}
+
+/// The boot cryptexes in the order libignition grafts them, each trust
+/// cache loaded right after its graft: the SystemOS cryptex, then (on a
+/// sealed boot, the root mounted `MNT_SNAPSHOT`) the AppOS cryptex.
+pub const BOOTED_GRAFTS: [BootGraft; 2] = [
+    BootGraft { name: "OS", image: "os.dmg", dir: "Cryptexes/OS", sbc_flags: 0x2d, root_hash: "os.dmg.root_hash", trust_cache: "os.dmg.trustcache", tc_type: super::trustcache::tc_type::CRYPTEX1_BOOT_OS },
+    BootGraft { name: "App", image: "app.dmg", dir: "Cryptexes/App", sbc_flags: 0x2e, root_hash: "app.dmg.root_hash", trust_cache: "app.dmg.trustcache", tc_type: super::trustcache::tc_type::CRYPTEX1_BOOT_APP },
+];
+
+/// Whether a restore source is configured: the Cryptex1's files, the
+/// cryptexes' images among them, are laid out.
+pub fn has_restore() -> bool {
+    sources().restore.is_some()
 }
 
 fn cryptex1_unmodelled(rel: &str, listing: bool) -> Option<String> {
@@ -436,6 +486,14 @@ mod tests {
         assert!(unmodelled("Cryptexes", false).is_none());
         // No restore source in the unit tests: cryptex1 is reported.
         assert!(unmodelled("cryptex1/current", false).is_some());
+        // Nor, on the booted system the unit tests run on, what the boot
+        // cryptexes' grafts hold: below a graft directory, or its listing.
+        assert!(unmodelled("Cryptexes/OS/System", false).is_some());
+        assert!(unmodelled("Cryptexes/App/x", false).is_some());
+        assert!(unmodelled("Cryptexes/OS", true).is_some());
+        assert!(unmodelled("Cryptexes/OS", false).is_none());
+        assert!(unmodelled("Cryptexes", true).is_none());
+        assert!(unmodelled("Cryptexes/OSX/a", false).is_none());
     }
 
     #[test]
@@ -532,7 +590,7 @@ mod tests {
         let m = Value::Dict(vec![("BuildIdentities".into(), Value::Array(vec![identity.clone()]))]);
         std::fs::write(dir.join("BuildManifest.plist"), plist::to_xml(&m)).unwrap();
         let d = dir.to_str().unwrap().to_string();
-        let s = Sources { restore: Some(d.clone()), ticket: Ticket::File(format!("{d}/ticket")), nonce_hash: None, host: Some(Host { size: host_size, read: host_read }) };
+        let s = Sources { restore: Some(d.clone()), ticket: Ticket::File(format!("{d}/ticket")), nonce_hash: None, host: Some(Host { size: host_size, read: host_read, sha384: None }) };
         let system = |p: &str| -> Result<Option<(Vec<u8>, Owned)>, String> {
             Ok(p.ends_with("SystemVersion.plist").then(|| (b"<plist/>".to_vec(), Owned { uid: 0, gid: 0, mode: 0o444, flags: 0x40 | 0x20 })))
         };

@@ -2,8 +2,10 @@
 // for a task whose com.apple.private.pmap.load-trust-cache entitlement
 // allows the cache's type: a request without its IM4P, or naming a
 // manifest it does not give, is EINVAL; a type the entitlement does not
-// allow, or a task without it, is EPERM; an IM4P that does not decode
-// fails its Image4 evaluation (KERN_FAILURE, ECANCELED).
+// allow, or a task without it, is EPERM (KERN_DENIED); and so is a Cryptex1
+// boot type the system's boot has loaded a cache of already, as it has the
+// SystemOS cryptex's (load_trust_cache_with_type's second boot cache),
+// before the IM4P is evaluated.
 
 #include <errno.h>
 #include <stdint.h>
@@ -56,7 +58,7 @@ int main(int argc, char **argv) {
     l.type = 0x0e;
     if (!load(&l, EPERM, "the AppOS type, which the entitlement does not allow")) return 1;
     l.type = 0x0d;
-    if (!load(&l, ECANCELED, "an IM4P that does not decode")) return 1;
+    if (!load(&l, EPERM, "the SystemOS type, which the boot loaded")) return 1;
     printf("tcload ok\n");
     return 0;
 }

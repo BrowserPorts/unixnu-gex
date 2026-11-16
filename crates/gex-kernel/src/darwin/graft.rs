@@ -670,16 +670,9 @@ impl Kernel {
     /// (EBUSY at [`graftfs::MAX_GRAFTS`]); the directory inside a graft
     /// (EBUSY); the directory one (ENOTDIR); the image compressed (ENOTSUP);
     /// the image inside a graft (EBUSY); the image already grafted, or the
-    /// directory grafted on (EALREADY).
-    ///
-    /// A booted system's Preboot volume has the grafts its boot made, which
-    /// the mount at `/System/Cryptexes/OS` stands for: there they are
-    /// reported where they decide.
+    /// directory grafted on (EALREADY). A booted system's Preboot volume
+    /// has the grafts its boot made ([`Kernel::darwin_boot_grafts`]).
     fn darwin_apfs_graft_checks(&mut self, volume: u32, file: &Found, dir: &Found) -> Result<(), Errno> {
-        if self.darwin_volume_has_cryptex_grafts(volume) {
-            self.darwin_unimplemented(format!("apfs_graft of {} onto {}: the booted system's grafts of the Preboot volume", file.path, dir.path));
-            return Err(Errno::EINVAL);
-        }
         let on = graftfs::grafts_on(volume);
         if on.len() >= graftfs::MAX_GRAFTS {
             return Err(err(e::EBUSY));
@@ -759,7 +752,8 @@ impl Kernel {
         };
         let parent = crate::vfs::normalize("..", &dir.path);
         let dir_parent_ino = self.vfs.metadata(&parent)?.ino;
-        let fs = std::sync::Arc::new(graftfs::GraftFs { vol: image, base, len, dir_ino: dir.md.ino, dir_parent_ino, devt });
+        let seal = image.integrity().ok().flatten().map(|m| m.root_hash);
+        let fs = std::sync::Arc::new(graftfs::GraftFs { vol: image, base, len, dir_ino: dir.md.ino, dir_parent_ino, devt, seal });
         self.vfs.mount(&dir.path, std::sync::Arc::new(graftfs::GraftMount(std::sync::Arc::clone(&fs))));
         graftfs::add(graftfs::Graft { host_volume: volume, host_devt, file_path: file.path.clone(), file_ino: file.md.ino, dir_path: dir.path.clone(), dir_ino: dir.md.ino, flags, fs }, devc, handed);
         Ok(())
@@ -786,10 +780,102 @@ impl Kernel {
         Ok(())
     }
 
-    /// Whether the volume at slot `volume` has grafts this kernel does not
-    /// hold: a booted system's Preboot volume, which has its cryptexes'.
-    fn darwin_volume_has_cryptex_grafts(&self, volume: u32) -> bool {
-        super::storage::volume(volume).is_some_and(|v| v.role == super::storage::role::PREBOOT) && super::kern::boot_state() == super::kern::BootState::Booted
+    /// A booted system's Preboot volume as its boot left it: the files the
+    /// restore made there ([`super::preboot::volume`]) on its mount
+    /// ([`super::kern::PREBOOT_ON`]), and the grafts libignition's graft
+    /// stage made of the boot cryptexes, each trust cache loaded after its
+    /// graft ([`super::preboot::BOOTED_GRAFTS`]). This is the result of a
+    /// boot whose evaluations passed: the Cryptex1 ticket's evaluation (the
+    /// device's own ticket, against its nonce) is not made again; each
+    /// image's root hash is authenticated against the restore's payload, as
+    /// the boot's graft authenticated it against the evaluated one; each
+    /// graft is made as `apfs_graft` makes it on the writable host
+    /// libignition mounted ([`Kernel::darwin_apfs_graft_make`]: its range of
+    /// the host's object identifiers taken and recorded on its image, its
+    /// device the host's next), the mount read-write while they are made
+    /// as it was then ([`super::kern::ignition_preboot_mount`]) and as the
+    /// booted system has it after; each trust cache's module is loaded with
+    /// its Cryptex1 boot type. Without a restore source there are no images
+    /// to graft: what the graft directories would hold is reported where it
+    /// is looked up ([`super::preboot::unmodelled`]); a failure is reported.
+    pub fn darwin_boot_grafts(&mut self) {
+        if super::kern::boot_state() != super::kern::BootState::Booted {
+            return;
+        }
+        let Some(mnt) = super::kern::mounts().into_iter().find(|m| super::kern::is_preboot(m)) else { return };
+        let fs = match super::preboot::volume(&|p| self.darwin_system_file(p)) {
+            Ok(fs) => fs,
+            Err(why) => {
+                self.darwin_unimplemented(format!("the booted system's Preboot volume: {why}"));
+                return;
+            }
+        };
+        self.vfs.mount(mnt.on, fs);
+        if !super::preboot::has_restore() {
+            return;
+        }
+        let booted = (mnt.flags(), mnt.state().apfs_ro);
+        match super::kern::ignition_preboot_mount() {
+            Ok(m) => {
+                let mut st = mnt.state();
+                st.flags = m.flags();
+                st.apfs_ro = m.state().apfs_ro;
+            }
+            Err(why) => {
+                self.darwin_unimplemented(format!("the booted system's grafts: libignition's mount of the Preboot volume: {why}"));
+                return;
+            }
+        }
+        for g in super::preboot::BOOTED_GRAFTS {
+            if let Err(why) = self.darwin_boot_graft(mnt, &g) {
+                self.darwin_unimplemented(format!("the booted system's graft of the {} cryptex on {}/{}: {why}", g.name, mnt.on, g.dir));
+                break;
+            }
+        }
+        let mut st = mnt.state();
+        (st.flags, st.apfs_ro) = booted;
+    }
+
+    /// One of [`Kernel::darwin_boot_grafts`]'s grafts, on the Preboot mount
+    /// `mnt`, and its trust cache.
+    fn darwin_boot_graft(&mut self, mnt: &'static super::kern::Mount, g: &super::preboot::BootGraft) -> Result<(), String> {
+        let volume = super::kern::mount_volume(mnt).ok_or("the Preboot mount is of no volume")?;
+        let at = |name: &str| format!("{}/{}/{name}", mnt.on, super::preboot::cryptex1::CURRENT);
+        let found = |k: &Kernel, path: String| -> Result<Found, String> {
+            let md = k.vfs.metadata(&path).map_err(|e| format!("{path}: {e:?}"))?;
+            Ok(Found { path, md, parent: None, mnt: Some(mnt) })
+        };
+        let payload_of = |k: &Kernel, path: &str| -> Result<Vec<u8>, String> {
+            let b = k.read_file(path).ok_or_else(|| format!("{path}: not readable"))?;
+            let p = super::image4::init_as_payload(&b).map_err(|e| format!("{path}: not an IM4P ({e})"))?;
+            p.data.map(<[u8]>::to_vec).ok_or_else(|| format!("{path}: an IM4P with no data"))
+        };
+        let file = found(self, at(g.image))?;
+        let dir = found(self, format!("{}/{}", mnt.on, g.dir))?;
+        let flags = graft_flags(g.sbc_flags);
+        let medium = self.darwin_graft_medium(&file).map_err(|e| format!("{}: {e:?}", file.path))?;
+        let image = match graftfs::mount_image(medium) {
+            Ok(Ok(v)) => v,
+            Ok(Err(errno)) => return Err(format!("{}: no volume at fs index 0 ({errno})", file.path)),
+            Err(why) => return Err(format!("{}: {why}", file.path)),
+        };
+        let required = graftfs::authentication_required(image.sb.role).ok_or("whether its root hash must be authenticated (a Recovery volume's: the boot-args' arp0)")?;
+        if image.sb.sealed() {
+            let payload = payload_of(self, &at(g.root_hash))?;
+            let im = image.integrity().map_err(|e| format!("{}: its integrity object: {e}", file.path))?.ok_or("a sealed volume with no integrity object")?;
+            let case_insensitive = image.sb.incompat & super::apfsread::incompat::CASE_INSENSITIVE != 0;
+            match graftfs::authenticate_root_hash(required, flags & fsctl::PANIC_ON_AUTHFAIL != 0, &im, Some(&payload), 0, image.container.block_size(), case_insensitive) {
+                graftfs::Auth::Ok => {}
+                graftfs::Auth::Eauth(why) | graftfs::Auth::Panic(why) => return Err(format!("{}: its root hash: {why}", file.path)),
+            }
+        } else if required {
+            return Err(format!("{}: an unsealed image", file.path));
+        }
+        self.darwin_apfs_graft_make(volume, &file, &dir, flags, image).map_err(|e| format!("apfs_graft: {e:?}"))?;
+        let tc = payload_of(self, &at(g.trust_cache))?;
+        super::trustcache::load_module(g.tc_type, Ok(tc)).map_err(|e| format!("its trust cache: {e:?}"))?;
+        super::trustcache::mark_loaded(g.tc_type);
+        Ok(())
     }
 
     /// APFS's `handle_fsioc_ungraft` (0xfffffff0066e3d1c) of a directory
@@ -800,10 +886,6 @@ impl Kernel {
     fn darwin_apfs_handle_fsioc_ungraft(&mut self, volume: u32, dir: &Found) -> Result<(), Errno> {
         if self.dtask.cred.uid != 0 {
             return Err(err(e::EACCES));
-        }
-        if self.darwin_volume_has_cryptex_grafts(volume) {
-            self.darwin_unimplemented(format!("apfs_ungraft_by_ino of {}: the booted system's grafts of the Preboot volume", dir.path));
-            return Err(Errno::EINVAL);
         }
         if graftfs::grafts_on(volume).iter().any(|g| g.dir_path == dir.path) {
             self.darwin_unimplemented(format!("apfs_ungraft_by_ino of the graft on {}", dir.path));

@@ -42,6 +42,35 @@
 //! libignition takes the ECID (0x12, the Cryptex1 ticket's name), the level
 //! (0x2e) and the version (0x32) from it.
 //!
+//! Next to it, the ignition failure blob
+//! (`security.mac.img4.ignition_failure_blob`, `oid_arg1` 0xfffffff007ae5b74,
+//! `oid_arg2` 0xa0, the same kind), which libignition's `ignition_halt`
+//! writes before it aborts (`ignition_write_BRA_blob`): zero until written,
+//! and only its node reads or writes it. Its handler (0xfffffff005a94a9c)
+//! lets the same tasks as the ignition blob's (the entitlement, or the init
+//! process; else EPERM), with no gate; `sysctl_handle_opaque` of the 0xa0
+//! bytes (out, and in when there is a new value), whose error it returns;
+//! then, for every call that gets that far, a read as much as a write, it
+//! writes the NVRAM keys of the table at 0xfffffff006cf6bf8 (the runtime's
+//! 0xfffffff005a92c60: `IODTNVRAM::setProperties` of a one-key dictionary,
+//! once the IONVRAM resource is published; a failure is logged and the
+//! next key written) and forces an NVRAM sync (0xfffffff005a92f70, type 3:
+//! `IONVRAM-FORCESYNCNOW-PROPERTY`, whose result is not looked at). What
+//! libignition puts in it, and the keys:
+//!
+//! | offset | size | what | NVRAM key (system GUID) |
+//! |--------|------|------|-------------------------|
+//! | 0x00 | 2 | zero | |
+//! | 0x02 | 24 | the boot spec's name | `ignition-failure-boot` |
+//! | 0x1a | 24 | the stage's name | `ignition-failure-stage` |
+//! | 0x32 | 8 | the error, a 64-bit integer | `ignition-failure-code` |
+//! | 0x3a | 37 | the volume, "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE" | `ignition-failure-volume` |
+//! | 0x5f | 64 | the halt's message | `ignition-failure-reason` |
+//! | 0x9f | 1 | 0xaa | |
+//!
+//! and `recovery-boot-mode` = "ignition-failure" with its terminator (17
+//! bytes), which sends the next boot to recovery.
+//!
 //! The kext's evaluation of a firmware payload against its manifest, which
 //! APFS asks for a cryptex's graft ([`super::graft`]), is
 //! [`super::image4`]'s for `CHIP_CRYPTEX1_BOOT_AP`, against this device
@@ -165,6 +194,58 @@ pub fn ignition_blob() -> Result<[u8; IGNITION_BLOB_SIZE], String> {
 /// A new blob, from a write of the node.
 pub fn set_ignition_blob(b: [u8; IGNITION_BLOB_SIZE]) {
     *BLOB.lock().unwrap_or_else(|e| e.into_inner()) = Some(b);
+}
+
+/// The failure blob's size: its node's `oid_arg2`.
+pub const IGNITION_FAILURE_BLOB_SIZE: usize = 0xa0;
+
+/// The failure blob: zero in the kext's data until a write of its node.
+static FAILURE_BLOB: Mutex<[u8; IGNITION_FAILURE_BLOB_SIZE]> = Mutex::new([0; IGNITION_FAILURE_BLOB_SIZE]);
+
+/// The failure blob as it is now.
+pub fn ignition_failure_blob() -> [u8; IGNITION_FAILURE_BLOB_SIZE] {
+    *FAILURE_BLOB.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A new failure blob, from a write of its node.
+pub fn set_ignition_failure_blob(b: [u8; IGNITION_FAILURE_BLOB_SIZE]) {
+    *FAILURE_BLOB.lock().unwrap_or_else(|e| e.into_inner()) = b;
+}
+
+/// Apple's system variable GUID, the NVRAM keys' namespace.
+const SYSTEM_GUID: &str = "40A0DDD2-77F8-4392-B4A3-1E7304206516";
+
+/// The table at 0xfffffff006cf6bf8: each key's name in the system GUID,
+/// and its value, a range of the failure blob (offset, length).
+const FAILURE_KEYS: [(&str, usize, usize); 5] = [
+    ("ignition-failure-boot", 0x02, 24),
+    ("ignition-failure-stage", 0x1a, 24),
+    ("ignition-failure-code", 0x32, 8),
+    ("ignition-failure-volume", 0x3a, 37),
+    ("ignition-failure-reason", 0x5f, 64),
+];
+
+/// The table's last key and its value, a string of the kext's
+/// (0xfffffff0052d7f63, its terminator in the 17 bytes).
+const RECOVERY_BOOT_MODE: (&str, &[u8; 17]) = ("recovery-boot-mode", b"ignition-failure\0");
+
+/// What the failure blob's handler writes to NVRAM, in order: each key
+/// (`GUID:name`) and its value's bytes.
+pub fn ignition_failure_nvram(b: &[u8; IGNITION_FAILURE_BLOB_SIZE]) -> Vec<(String, Vec<u8>)> {
+    let mut keys: Vec<(String, Vec<u8>)> = FAILURE_KEYS.iter().map(|&(name, at, len)| (format!("{SYSTEM_GUID}:{name}"), b[at..at + len].to_vec())).collect();
+    keys.push((format!("{SYSTEM_GUID}:{}", RECOVERY_BOOT_MODE.0), RECOVERY_BOOT_MODE.1.to_vec()));
+    keys
+}
+
+/// The failure blob as libignition fills it, for a report: its boot spec,
+/// stage, error and message.
+pub fn ignition_failure_summary(b: &[u8; IGNITION_FAILURE_BLOB_SIZE]) -> String {
+    let text = |at: usize, len: usize| {
+        let s = &b[at..at + len];
+        String::from_utf8_lossy(&s[..s.iter().position(|&c| c == 0).unwrap_or(len)]).into_owned()
+    };
+    let code = i64::from_le_bytes(b[0x32..0x3a].try_into().expect("8 bytes"));
+    format!("boot {:?}, stage {:?}, code {code}, volume {:?}, reason {:?}", text(0x02, 24), text(0x1a, 24), text(0x3a, 37), text(0x5f, 64))
 }
 
 /// The `/chosen` values iBoot fills in at boot, which AppleImage4's AP chip
@@ -302,5 +383,37 @@ mod tests {
         assert!(ignition_blob_of(&tree(&[], &[])).is_err(), "no hash method");
         assert!(ignition_blob_of(&tree(&[("crypto-hash-method", b"sha2-384\0"), ("allow-ecid-mismatch", b"")], &[])).is_err());
         assert!(ignition_blob_of(&tree(&[("crypto-hash-method", b"sha2-384\0")], &[("love", b"21.8.461.0.0,0\0")])).is_err());
+    }
+
+    /// libignition's `ignition_write_BRA_blob`: the boot spec's and the
+    /// stage's names, the error, the volume placeholder, the message and
+    /// 0xaa past it; the keys take their ranges, and recovery-boot-mode
+    /// its string.
+    #[test]
+    fn the_failure_blob_goes_to_its_nvram_keys() {
+        let mut b = [0u8; IGNITION_FAILURE_BLOB_SIZE];
+        b[0x02..0x07].copy_from_slice(b"local");
+        b[0x1a..0x1f].copy_from_slice(b"graft");
+        b[0x32..0x3a].copy_from_slice(&2i64.to_le_bytes());
+        b[0x3a..0x5e].copy_from_slice(b"AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE");
+        let reason = b"failed to open canonical cryptex location";
+        b[0x5f..0x5f + reason.len()].copy_from_slice(reason);
+        b[0x9f] = 0xaa;
+        let keys = ignition_failure_nvram(&b);
+        let names: Vec<&str> = keys.iter().map(|(k, _)| k.strip_prefix("40A0DDD2-77F8-4392-B4A3-1E7304206516:").unwrap()).collect();
+        assert_eq!(names, ["ignition-failure-boot", "ignition-failure-stage", "ignition-failure-code", "ignition-failure-volume", "ignition-failure-reason", "recovery-boot-mode"]);
+        let lens: Vec<usize> = keys.iter().map(|(_, v)| v.len()).collect();
+        assert_eq!(lens, [24, 24, 8, 37, 64, 17]);
+        assert_eq!(&keys[0].1[..6], b"local\0");
+        assert_eq!(keys[2].1, 2i64.to_le_bytes());
+        assert_eq!(keys[3].1[36], 0, "the volume's terminator");
+        assert!(keys[4].1.iter().all(|&c| c != 0xaa), "0x9f is no key's");
+        assert_eq!(keys[5].1, b"ignition-failure\0");
+        assert_eq!(
+            ignition_failure_summary(&b),
+            "boot \"local\", stage \"graft\", code 2, volume \"AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE\", reason \"failed to open canonical cryptex location\""
+        );
+        // Zero until written.
+        assert_eq!(ignition_failure_summary(&[0; IGNITION_FAILURE_BLOB_SIZE]), "boot \"\", stage \"\", code 0, volume \"\", reason \"\"");
     }
 }

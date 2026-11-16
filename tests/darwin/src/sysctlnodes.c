@@ -119,6 +119,13 @@ int main(void) {
     errno = 0;
     len = 0;
     if (sysctlbyname("security.mac.img4.ignition_blob", NULL, &len, NULL, 0) != -1 || errno != EPERM) return bad("the ignition blob, unentitled", errno, EPERM);
+    // So is its failure blob, to read or to write.
+    unsigned char fail[0xa0] = {0};
+    errno = 0;
+    len = sizeof fail;
+    if (sysctlbyname("security.mac.img4.ignition_failure_blob", fail, &len, NULL, 0) != -1 || errno != EPERM) return bad("the failure blob, unentitled", errno, EPERM);
+    errno = 0;
+    if (sysctlbyname("security.mac.img4.ignition_failure_blob", NULL, NULL, fail, sizeof fail) != -1 || errno != EPERM) return bad("writing the failure blob, unentitled", errno, EPERM);
 
     // The name of a node that does not exist.
     errno = 0;

@@ -2,7 +2,8 @@
 // identity the device tree gives it (the IPSW's /chosen, which iBoot would
 // fill in: zero), the secure boot level (0, no LocalPolicy), an empty long
 // OS version, and the bytes the kext never writes. A write of a whole blob
-// takes; a shorter one is refused.
+// takes; a shorter one is refused. The failure blob refuses a short read
+// and a short write.
 
 #include <errno.h>
 #include <stdint.h>
@@ -39,6 +40,14 @@ int main(void) {
     if (sysctlbyname("security.mac.img4.ignition_blob", old, &len, b, sizeof b) != 0 || memcmp(old, b, sizeof b) != 0) return bad("writing the blob", errno, 0);
     errno = 0;
     if (sysctlbyname("security.mac.img4.ignition_blob", NULL, NULL, b, 8) != -1 || errno != EINVAL) return bad("a short write", errno, EINVAL);
+    // The failure blob: any call its handler gets through writes NVRAM
+    // (not modelled), so only the calls sysctl_handle_opaque fails: a read
+    // with too little room, a write of less than the whole blob.
+    errno = 0;
+    len = sizeof small;
+    if (sysctlbyname("security.mac.img4.ignition_failure_blob", small, &len, NULL, 0) != -1 || errno != ENOMEM) return bad("a short read of the failure blob", errno, ENOMEM);
+    errno = 0;
+    if (sysctlbyname("security.mac.img4.ignition_failure_blob", NULL, NULL, b, 8) != -1 || errno != EINVAL) return bad("a short write of the failure blob", errno, EINVAL);
     char target[64];
     len = sizeof target;
     if (sysctlbyname("hw.target", target, &len, NULL, 0) != 0) return bad("hw.target", errno, 0);

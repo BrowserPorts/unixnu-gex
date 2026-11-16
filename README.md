@@ -154,7 +154,10 @@ subsystem, most naming in their header the XNU source they port:
   whose `com.apple.private.pmap.load-trust-cache` entitlement allows the
   type, once for each Cryptex1 boot type, after AppleImage4 evaluates
   their IM4P against the cryptex's ticket; a type that needs
-  AppleKeyStore's unlock state is reported. Sandbox's
+  AppleKeyStore's unlock state is reported. AppleImage4's ignition blob
+  and ignition failure blob sysctls, as its handlers serve them
+  (`img4.rs`); the failure blob's write of its NVRAM keys is reported, as
+  no NVRAM variable store is modelled. Sandbox's
   compiled profiles and their evaluation (`sandbox.rs`), the sandboxes a
   process gets from its exec or `sandbox_init` (`sandboxes.rs`), and
   AppleMatch, the regular expression engine those profiles use

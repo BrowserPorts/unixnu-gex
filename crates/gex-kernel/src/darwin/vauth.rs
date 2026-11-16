@@ -312,7 +312,22 @@ impl Kernel {
     /// The vnode at canonical `path` (its last link not followed), open as
     /// `handle` if it is, as the checks read it.
     pub(crate) fn darwin_vnode_node(&self, path: &str, md: &Metadata, handle: Option<&dyn FileHandle>) -> Node {
-        Node { vtype: md.file_type, attrs: super::vattr::of(&self.vfs, path, md, handle), mnt_flags: super::vattr::device_mnt_flags(path) }
+        self.darwin_vnode_node_on(super::kern::mount_of(path), path, md, handle)
+    }
+
+    /// [`Kernel::darwin_vnode_node`] of a vnode on mount `mnt` (an open
+    /// file's), whatever has been mounted on its path since.
+    pub(crate) fn darwin_vnode_node_on(&self, mnt: &super::kern::Mount, path: &str, md: &Metadata, handle: Option<&dyn FileHandle>) -> Node {
+        Node { vtype: md.file_type, attrs: super::vattr::of_on(&self.vfs, mnt, path, md, handle), mnt_flags: super::vattr::device_mnt_flags_on(mnt, path) }
+    }
+
+    /// [`Kernel::darwin_vnode_node`] of a file a lookup found, or a
+    /// descriptor names (on the mount it was opened on).
+    pub(crate) fn darwin_found_node(&self, f: &super::macvfs::Found) -> Node {
+        match f.mnt {
+            Some(mnt) => self.darwin_vnode_node_on(mnt, &f.path, &f.md, None),
+            None => self.darwin_vnode_node(&f.path, &f.md, None),
+        }
     }
 
     /// [`authorize`] for `cred` in this process.

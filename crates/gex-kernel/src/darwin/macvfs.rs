@@ -79,17 +79,27 @@ pub fn vtype_of(t: FileType) -> u32 {
 /// A file a lookup found: its path (no link on it), its attributes, and
 /// the directory it was found in with the name it was found by, as the
 /// call gave it (none for a path that ends in `.` or `..`, or is the
-/// root).
+/// root); and the mount it is on when that is not the one its path is on
+/// now (an open descriptor's vnode keeps the mount it was opened on).
 #[derive(Clone, Debug)]
 pub struct Found {
     pub path: String,
     pub md: Metadata,
     pub parent: Option<(String, String)>,
+    pub mnt: Option<&'static super::kern::Mount>,
 }
 
 impl Found {
     pub fn is_dir(&self) -> bool {
         self.md.file_type == FileType::Directory
+    }
+
+    /// The vnode Sandbox reads of it.
+    pub fn sb(&self) -> SbVnode {
+        match self.mnt {
+            Some(mnt) => sb_vnode_on(mnt, &self.path, &self.md),
+            None => sb_vnode(&self.path, &self.md),
+        }
     }
 }
 
@@ -160,7 +170,7 @@ pub fn sb_vnode_on(mnt: &'static super::kern::Mount, path: &str, md: &Metadata) 
 /// (`0x...9f4dbc`), on the directory's mount, with the directory's other
 /// attributes and no mode.
 pub fn sb_named(dir: &Found, name: &str, vtype: Option<u32>) -> SbVnode {
-    let d = sb_vnode(&dir.path, &dir.md);
+    let d = dir.sb();
     let path = join(&dir.path, name);
     let on = super::kern::mount_of(&dir.path).on.len() as i64;
     SbVnode { mount_len: if on == path.len() as i64 { -1 } else { on }, path: path.into_bytes(), named: true, vtype, mode: None, ..d }
@@ -207,7 +217,7 @@ impl Kernel {
         let p = self.path_io().at_path_str(super::bsd::dirfd(dirfd) as i32, ".").ok()?;
         let path = self.vfs.canonical(&p);
         let md = self.vfs.metadata(&path).ok()?;
-        (md.file_type == FileType::Directory).then_some(Found { path, md, parent: None })
+        (md.file_type == FileType::Directory).then_some(Found { path, md, parent: None, mnt: None })
     }
 
     /// The working directory, where a lookup of a relative path starts.
@@ -221,7 +231,7 @@ impl Kernel {
         let file = self.fds.get(fd).ok()?;
         self.darwin_vnode_of(&file)?;
         let md = file.handle.metadata().ok()?;
-        Some(Found { path: super::vattr::vnode_path(&self.vfs, &file.path, &md), md, parent: None })
+        Some(Found { path: super::vattr::vnode_path(&self.vfs, &file.path, &md), md, parent: None, mnt: Some(super::kern::mount_of_file(&file)) })
     }
 
     /// `namei` of the path at guest `path` from descriptor `dirfd`
@@ -260,7 +270,7 @@ impl Kernel {
                 Ok(md) => md,
                 Err(_) => return Ok(Lookup::Failed),
             };
-            (Found { path: "/".into(), md, parent: None }, raw.trim_start_matches('/').to_string())
+            (Found { path: "/".into(), md, parent: None, mnt: None }, raw.trim_start_matches('/').to_string())
         } else {
             let Some(start) = start else { return Ok(Lookup::Failed) };
             (start, raw.to_string())
@@ -300,7 +310,7 @@ impl Kernel {
                     if comp == ".." {
                         let up = crate::vfs::parent_of(&cur.path);
                         let Ok(md) = self.vfs.metadata(&up) else { return Ok(Lookup::Failed) };
-                        cur = Found { path: up, md, parent: None };
+                        cur = Found { path: up, md, parent: None, mnt: None };
                     }
                     cur.parent = None;
                     i = end;
@@ -331,7 +341,7 @@ impl Kernel {
                     let next = format!("{target}{tail}");
                     if next.starts_with('/') {
                         let Ok(md) = self.vfs.metadata("/") else { return Ok(Lookup::Failed) };
-                        dir = Found { path: "/".into(), md, parent: None };
+                        dir = Found { path: "/".into(), md, parent: None, mnt: None };
                         rest = next.trim_start_matches('/').to_string();
                     } else {
                         dir = Found { parent: None, ..cur };
@@ -340,7 +350,7 @@ impl Kernel {
                     continue 'pass;
                 }
                 let name = rest[i..].to_string();
-                let found = Found { path: p, md, parent: Some((cur.path.clone(), name)) };
+                let found = Found { path: p, md, parent: Some((cur.path.clone(), name)), mnt: None };
                 if last {
                     // (a slash after a last component that is no directory)
                     if !tail.is_empty() && !found.is_dir() {
@@ -366,10 +376,10 @@ impl Kernel {
                     return Lookup::Failed;
                 }
                 let parent = (!name.is_empty()).then(|| (parent, given.to_string()));
-                Lookup::Found(Found { path: abs.to_string(), md, parent })
+                Lookup::Found(Found { path: abs.to_string(), md, parent, mnt: None })
             }
             Err(_) => match self.vfs.metadata(&parent) {
-                Ok(md) if md.file_type == FileType::Directory && !name.is_empty() => Lookup::Missing { dir: Found { path: parent, md, parent: None }, name: given.to_string() },
+                Ok(md) if md.file_type == FileType::Directory && !name.is_empty() => Lookup::Missing { dir: Found { path: parent, md, parent: None, mnt: None }, name: given.to_string() },
                 _ => Lookup::Failed,
             },
         }
@@ -443,7 +453,7 @@ impl Kernel {
     /// lookup's, from the root vnode), with the subject's sandbox.
     fn darwin_sb_probe(&mut self, prefix: &[u8]) -> u32 {
         let Ok(md) = self.vfs.metadata("/") else { return 1 };
-        let root = Found { path: "/".into(), md, parent: None };
+        let root = Found { path: "/".into(), md, parent: None, mnt: None };
         let v = sb_lookup(&root, &String::from_utf8_lossy(prefix));
         self.darwin_sb_vnode_check(op::FILE_TEST_EXISTENCE, v)
     }
@@ -574,12 +584,12 @@ impl Kernel {
     /// `va_nlink`) the link check of the new name.
     pub(crate) fn darwin_mac_check_vnode_rename(&mut self, from: &Found, to_dir: &Found, name: &str, to: Option<&Found>) -> u32 {
         if let Some(t) = to {
-            let e = self.darwin_mac_check_vnode_unlink(sb_vnode(&t.path, &t.md));
+            let e = self.darwin_mac_check_vnode_unlink(t.sb());
             if e != 0 {
                 return e;
             }
         }
-        let v = sb_vnode(&from.path, &from.md);
+        let v = from.sb();
         let e = self.darwin_sb_vnode_check(op::FILE_WRITE_UNLINK, v.clone());
         if e != 0 {
             return e;
@@ -606,7 +616,7 @@ impl Kernel {
     /// file's without.
     pub(crate) fn darwin_mac_check_vnode_link(&mut self, vp: &Found, dir: &Found, name: &str) -> u32 {
         const OPS: [usize; 37] = [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 32, 33, 34, 35, 36, 37, 38, 40, 109, 110, 111, 112, 120, 121, 161, 190];
-        let s = sb_vnode(&vp.path, &vp.md);
+        let s = vp.sb();
         let d = sb_named(dir, name, s.vtype);
         let mut e = self.darwin_sb_vnode_check(op::FILE_LINK, s.clone());
         if e == 0 {
@@ -649,7 +659,7 @@ impl Kernel {
     /// the name allowed, or denied by its sandbox where the file was by the
     /// platform (tag 1 or 2).
     pub(crate) fn darwin_mac_check_vnode_clone(&mut self, vp: &Found, dir: &Found, name: &str) -> u32 {
-        let s = sb_vnode(&vp.path, &vp.md);
+        let s = vp.sb();
         let d = sb_named(dir, name, s.vtype);
         let mut e = self.darwin_sb_vnode_check(op::FILE_CLONE, s.clone());
         if e == 0 {
@@ -923,7 +933,7 @@ impl Kernel {
             sys::READLINK => self.darwin_sb_readlink_call(m, cwd, a[0]),
             sys::READLINKAT => self.darwin_sb_readlink_call(m, a[0], a[1]),
             sys::FREADLINK => match self.darwin_sb_fd_vnode(a[0] as i32) {
-                Some(f) if f.md.file_type == FileType::Symlink => refused(self.darwin_mac_check_vnode_readlink(sb_vnode(&f.path, &f.md))),
+                Some(f) if f.md.file_type == FileType::Symlink => refused(self.darwin_mac_check_vnode_readlink(f.sb())),
                 _ => Ok(()),
             },
             // unlinkat_internal and rmdirat_internal.
@@ -966,7 +976,7 @@ impl Kernel {
                 };
                 match f {
                     Some(f) => {
-                        let v = sb_vnode(&f.path, &f.md);
+                        let v = f.sb();
                         let mode = if a[3] as i32 == -1 { Ok(()) } else { refused(self.darwin_mac_check_vnode_setmode(v.clone(), a[3] as u32 & 0o7777)) };
                         mode.and_then(|()| if a[4] == REMOVE_ACL { refused(self.darwin_mac_check_vnode_setacl(v)) } else { Ok(()) })
                     }
@@ -980,33 +990,33 @@ impl Kernel {
             sys::CHMOD => self.darwin_sb_chmod_call(m, cwd, a[0], a[1], 0),
             sys::FCHMODAT if flag(3) & !(at::SYMLINK_NOFOLLOW | at::SYMLINK_NOFOLLOW_ANY) == 0 => self.darwin_sb_chmod_call(m, a[0], a[1], a[2], flag(3)),
             sys::FCHMOD => match self.darwin_sb_fd_vnode(a[0] as i32) {
-                Some(f) => refused(self.darwin_mac_check_vnode_setmode(sb_vnode(&f.path, &f.md), a[1] as u32 & 0o7777)),
+                Some(f) => refused(self.darwin_mac_check_vnode_setmode(f.sb(), a[1] as u32 & 0o7777)),
                 None => Ok(()),
             },
             // chflags and fchflags: chflags0's check.
             sys::CHFLAGS => match self.darwin_sb_namei(m, cwd, a[0], true, false) {
-                Ok(Lookup::Found(f)) => refused(self.darwin_mac_check_vnode_setflags(sb_vnode(&f.path, &f.md), a[1] as u32)),
+                Ok(Lookup::Found(f)) => refused(self.darwin_mac_check_vnode_setflags(f.sb(), a[1] as u32)),
                 Ok(_) => Ok(()),
                 Err(e) => Err(e),
             },
             sys::FCHFLAGS => match self.darwin_sb_fd_vnode(a[0] as i32) {
-                Some(f) => refused(self.darwin_mac_check_vnode_setflags(sb_vnode(&f.path, &f.md), a[1] as u32)),
+                Some(f) => refused(self.darwin_mac_check_vnode_setflags(f.sb(), a[1] as u32)),
                 None => Ok(()),
             },
             // truncate: its length checked, then truncate_internal's check.
             sys::TRUNCATE if (a[1] as i64) >= 0 => match self.darwin_sb_namei(m, cwd, a[0], true, false) {
-                Ok(Lookup::Found(f)) => refused(self.darwin_mac_check_vnode_truncate(sb_vnode(&f.path, &f.md))),
+                Ok(Lookup::Found(f)) => refused(self.darwin_mac_check_vnode_truncate(f.sb())),
                 Ok(_) => Ok(()),
                 Err(e) => Err(e),
             },
             // utimes and futimes: the times read, then setutimes' check.
             sys::UTIMES if a[1] == 0 || m.read(a[1], 32).is_ok() => match self.darwin_sb_namei(m, cwd, a[0], true, false) {
-                Ok(Lookup::Found(f)) => refused(self.darwin_mac_check_vnode_setutimes(sb_vnode(&f.path, &f.md))),
+                Ok(Lookup::Found(f)) => refused(self.darwin_mac_check_vnode_setutimes(f.sb())),
                 Ok(_) => Ok(()),
                 Err(e) => Err(e),
             },
             sys::FUTIMES => match self.darwin_sb_fd_vnode(a[0] as i32) {
-                Some(f) if a[1] == 0 || m.read(a[1], 32).is_ok() => refused(self.darwin_mac_check_vnode_setutimes(sb_vnode(&f.path, &f.md))),
+                Some(f) if a[1] == 0 || m.read(a[1], 32).is_ok() => refused(self.darwin_mac_check_vnode_setutimes(f.sb())),
                 _ => Ok(()),
             },
             // Lookups Sandbox has no hook after: their preflights.
@@ -1034,7 +1044,7 @@ impl Kernel {
     /// out of what the call writes.
     fn darwin_sb_stat_call(&mut self, m: &GuestMem<'_>, dirfd: u64, path: u64, follow: bool, nofollow_any: bool) -> Result<(), Errno> {
         let Lookup::Found(f) = self.darwin_sb_namei(m, dirfd, path, follow, nofollow_any)? else { return Ok(()) };
-        let v = sb_vnode(&f.path, &f.md);
+        let v = f.sb();
         refused(self.darwin_mac_check_vnode_stat(v.clone()))?;
         let (e, scrub) = self.darwin_mac_check_vnode_getattr(v);
         refused(e)?;
@@ -1056,7 +1066,7 @@ impl Kernel {
         const ACCESS_EXTENDED_MASK: u32 = 0x003f_fe00;
         let follow = flag & (at::SYMLINK_NOFOLLOW | at::SYMLINK_NOFOLLOW_ANY) == 0;
         let Lookup::Found(f) = self.darwin_sb_namei(m, dirfd, path, follow, flag & at::SYMLINK_NOFOLLOW_ANY != 0)? else { return Ok(()) };
-        refused(self.darwin_mac_check_vnode_access(sb_vnode(&f.path, &f.md), (amode as u32) << 6))?;
+        refused(self.darwin_mac_check_vnode_access(f.sb(), (amode as u32) << 6))?;
         let uflags = amode as u32;
         let dir = f.is_dir();
         let action = if uflags & ACCESS_EXTENDED_MASK == 0 {
@@ -1078,10 +1088,10 @@ impl Kernel {
             return Ok(());
         }
         let cred = if flag & at::EACCESS != 0 { self.dtask.cred.clone() } else { self.dtask.cred.copy_real() };
-        let node = self.darwin_vnode_node(&f.path, &f.md, None);
+        let node = self.darwin_found_node(&f);
         let dnode = if uflags & DELETE_OK != 0 {
             match self.darwin_sb_parent(&f) {
-                Some((d, _)) => Some(self.darwin_vnode_node(&d.path, &d.md, None)),
+                Some((d, _)) => Some(self.darwin_found_node(&d)),
                 None => {
                     self.darwin_unimplemented(format!("access _DELETE_OK of {}, which has no directory to be deleted from", f.path));
                     return Err(Errno::EIO);
@@ -1095,7 +1105,7 @@ impl Kernel {
 
     fn darwin_sb_readlink_call(&mut self, m: &GuestMem<'_>, dirfd: u64, path: u64) -> Result<(), Errno> {
         match self.darwin_sb_namei(m, dirfd, path, false, false)? {
-            Lookup::Found(f) if f.md.file_type == FileType::Symlink => refused(self.darwin_mac_check_vnode_readlink(sb_vnode(&f.path, &f.md))),
+            Lookup::Found(f) if f.md.file_type == FileType::Symlink => refused(self.darwin_mac_check_vnode_readlink(f.sb())),
             _ => Ok(()),
         }
     }
@@ -1109,11 +1119,11 @@ impl Kernel {
         if f.parent.is_none() || super::kern::mount_of(&f.path).on == f.path || f.is_dir() != rmdir {
             return Ok(());
         }
-        refused(self.darwin_mac_check_vnode_unlink(sb_vnode(&f.path, &f.md)))?;
+        refused(self.darwin_mac_check_vnode_unlink(f.sb()))?;
         // vnode_authorize(vp, dvp, KAUTH_VNODE_DELETE).
         let Some((dir, _)) = self.darwin_sb_parent(&f) else { return Ok(()) };
         let cred = self.dtask.cred.clone();
-        let (vp, dvp) = (self.darwin_vnode_node(&f.path, &f.md, None), self.darwin_vnode_node(&dir.path, &dir.md, None));
+        let (vp, dvp) = (self.darwin_found_node(&f), self.darwin_found_node(&dir));
         self.darwin_authorize(&cred, &vp, Some(&dvp), super::vauth::kauth::DELETE)
     }
 
@@ -1139,7 +1149,7 @@ impl Kernel {
     fn darwin_sb_parent(&self, f: &Found) -> Option<(Found, String)> {
         let (dir, name) = f.parent.clone()?;
         let md = self.vfs.metadata(&dir).ok()?;
-        Some((Found { path: dir, md, parent: None }, name))
+        Some((Found { path: dir, md, parent: None, mnt: None }, name))
     }
 
     /// `renameat_internal` of `[fromfd, from, tofd, to]` with renameatx_np's
@@ -1205,12 +1215,12 @@ impl Kernel {
         // EEXIST, another volume EXDEV, before adding to the directory is.
         use super::vauth::kauth;
         let cred = self.dtask.cred.clone();
-        let node = self.darwin_vnode_node(&vp.path, &vp.md, None);
+        let node = self.darwin_found_node(&vp);
         self.darwin_authorize(&cred, &node, None, kauth::LINKTARGET)?;
         if self.vfs.metadata_nofollow(&join(&dir.path, &name)).is_ok() || super::kern::mount_of(&dir.path).on != super::kern::mount_of(&vp.path).on {
             return Ok(());
         }
-        let dnode = self.darwin_vnode_node(&dir.path, &dir.md, None);
+        let dnode = self.darwin_found_node(&dir);
         self.darwin_authorize(&cred, &dnode, None, kauth::ADD_FILE)?;
         self.darwin_keep_attrs(&vp);
         Ok(())
@@ -1262,7 +1272,7 @@ impl Kernel {
     fn darwin_sb_chmod_call(&mut self, m: &GuestMem<'_>, dirfd: u64, path: u64, mode: u64, flag: u64) -> Result<(), Errno> {
         let follow = flag & (at::SYMLINK_NOFOLLOW | at::SYMLINK_NOFOLLOW_ANY) == 0;
         let Lookup::Found(f) = self.darwin_sb_namei(m, dirfd, path, follow, flag & at::SYMLINK_NOFOLLOW_ANY != 0)? else { return Ok(()) };
-        refused(self.darwin_mac_check_vnode_setmode(sb_vnode(&f.path, &f.md), mode as u32 & 0o7777))
+        refused(self.darwin_mac_check_vnode_setmode(f.sb(), mode as u32 & 0o7777))
     }
 }
 
@@ -1281,7 +1291,7 @@ impl Kernel {
     /// and the attributes it is made with, mode `mode`.
     pub(crate) fn darwin_creating(&mut self, dir: &Found, name: &str, action: u32, mode: u32) -> Result<Creating, Errno> {
         let cred = self.dtask.cred.clone();
-        let d = self.darwin_vnode_node(&dir.path, &dir.md, None);
+        let d = self.darwin_found_node(&dir);
         self.darwin_authorize(&cred, &d, None, action)?;
         let owned = match d.attrs {
             Ok(o) => super::vattr::new_file(cred.uid, &o, mode),
@@ -1348,7 +1358,7 @@ impl Kernel {
         if refused_first {
             return Ok(None);
         }
-        refused(self.darwin_mac_check_vnode_open(sb_vnode(&f.path, &f.md), fmode))?;
+        refused(self.darwin_mac_check_vnode_open(f.sb(), fmode))?;
         use super::vauth::kauth;
         let mut action = 0;
         if fmode & FREAD != 0 {
@@ -1358,7 +1368,7 @@ impl Kernel {
             action |= if flags & O_APPEND != 0 && flags & O_TRUNC == 0 { kauth::APPEND_DATA } else { kauth::WRITE_DATA };
         }
         let cred = self.dtask.cred.clone();
-        let node = self.darwin_vnode_node(&f.path, &f.md, None);
+        let node = self.darwin_found_node(&f);
         self.darwin_authorize(&cred, &node, None, action)?;
         // APFS takes the set-user-id and set-group-id bits off a file a
         // user other than root writes to (measured on a Mac's APFS), which
@@ -1376,7 +1386,7 @@ impl Kernel {
     /// lock check of its vnode.
     pub(crate) fn darwin_sb_setlk(&mut self, file: &std::sync::Arc<crate::file::OpenFile>) -> Result<(), Errno> {
         let md = file.handle.metadata()?;
-        let v = sb_vnode(&self.vfs.canonical(&file.path), &md);
+        let v = sb_vnode_on(super::kern::mount_of_file(file), &self.vfs.canonical(&file.path), &md);
         refused(self.darwin_mac_check_file_lock(v, true))
     }
 
@@ -1384,7 +1394,7 @@ impl Kernel {
     /// protection `prot`.
     pub(crate) fn darwin_sb_mmap(&mut self, file: &std::sync::Arc<crate::file::OpenFile>, prot: u64) -> Result<(), Errno> {
         let md = file.handle.metadata()?;
-        let v = sb_vnode(&self.vfs.canonical(&file.path), &md);
+        let v = sb_vnode_on(super::kern::mount_of_file(file), &self.vfs.canonical(&file.path), &md);
         let shared_dyld = self.darwin_vnode_of(file).is_some_and(super::shregion::shared_dyld);
         refused(self.darwin_mac_check_file_mmap(v, prot, shared_dyld))
     }
@@ -1432,7 +1442,7 @@ impl Kernel {
                 self.darwin_creation = Some(self.darwin_creating(&dir, &name, super::vauth::kauth::ADD_FILE, mode)?);
                 Ok(())
             }
-            (Lookup::Found(f), false) if f.md.file_type == FileType::Socket => refused(self.darwin_mac_check_vnode_uipc_connect(sb_vnode(&f.path, &f.md))),
+            (Lookup::Found(f), false) if f.md.file_type == FileType::Socket => refused(self.darwin_mac_check_vnode_uipc_connect(f.sb())),
             _ => Ok(()),
         }
     }

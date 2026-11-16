@@ -1016,7 +1016,7 @@ impl Kernel {
             }
         };
         if let Some(f) = found {
-            let e = self.darwin_mac_check_vnode_setowner(super::macvfs::sb_vnode(&f.path, &f.md));
+            let e = self.darwin_mac_check_vnode_setowner(f.sb());
             if e != 0 {
                 return Err(super::errno::errno_of(e as i32));
             }

@@ -658,7 +658,7 @@ impl Kernel {
         let bytes = m.read(buf, size as usize)?.to_vec();
         // Sandbox's check of the list, before it is unpacked.
         if let Some(f) = &found {
-            let e = self.darwin_mac_check_vnode_setattrlist(super::macvfs::sb_vnode(&f.path, &f.md), alist.bitmapcount, [set.common, set.vol, set.dir, set.file, set.fork]);
+            let e = self.darwin_mac_check_vnode_setattrlist(f.sb(), alist.bitmapcount, [set.common, set.vol, set.dir, set.file, set.fork]);
             if e != 0 {
                 return Err(super::errno::errno_of(e as i32));
             }
@@ -670,7 +670,7 @@ impl Kernel {
         }
         // The flags' check, as they are unpacked.
         if let (Some(f), Some(flags)) = (&found, attrs.flags) {
-            let e = self.darwin_mac_check_vnode_setflags(super::macvfs::sb_vnode(&f.path, &f.md), flags);
+            let e = self.darwin_mac_check_vnode_setflags(f.sb(), flags);
             if e != 0 {
                 return Err(super::errno::errno_of(e as i32));
             }
@@ -731,7 +731,7 @@ impl Kernel {
     fn darwin_attrlist_mac(&mut self, f: Option<&super::macvfs::Found>, alist: &AttrList, size: u64, by_fd: Option<&'static Mount>) -> Result<(bool, Option<super::mac::SbVnode>), Errno> {
         let mac = |e: u32| if e == 0 { Ok(()) } else { Err(super::errno::errno_of(e as i32)) };
         let Some(f) = f.filter(|_| size >= 4 && alist.bitmapcount == al::BIT_MAP_COUNT) else { return Ok((false, None)) };
-        let v = super::macvfs::sb_vnode(&f.path, &f.md);
+        let v = f.sb();
         mac(self.darwin_mac_check_vnode_getattrlist(v.clone()))?;
         if alist.set.vol != 0 {
             if alist.set.common & (al::cmn::OWNERID | al::cmn::GRPID | al::cmn::ACCESSMASK | al::cmn::FLAGS | al::cmn::SCRIPT) == 0 {
@@ -911,6 +911,16 @@ impl Kernel {
             if f.metadata()?.file_type != FileType::Directory {
                 return Err(Errno::ENOTDIR);
             }
+            // The directory's vnode is on the mount it was opened on, and
+            // so are its entries (APFS's own VNOP_GETATTRLISTBULK lists its
+            // directory, not what is mounted on an entry). The files here
+            // are reached by path: a directory a later mount has covered is
+            // not.
+            let dmnt = super::kern::mount_of_file(&f);
+            if !std::ptr::eq(mount_of(&dpath), dmnt) {
+                notes.push(format!("getattrlistbulk of {dpath} from a descriptor opened before {} was mounted over it (its entries are reached by path)", mount_of(&dpath).on));
+                return Err(Errno::EIO);
+            }
             options |= fsopt::ATTR_CMN_EXTENDED;
             let alist = read_alist(m, a[1])?;
             if alist.set.vol != 0 || alist.set.common & al::BULK_REQUIRED != al::BULK_REQUIRED {
@@ -944,7 +954,15 @@ impl Kernel {
                     continue;
                 };
                 let isdir = cmd.file_type == FileType::Directory;
-                let (r, missing) = self.attrlist_vnode(&pio, &child, &cmd, Some(&ent.name), &alist, kern_size, options | fsopt::REPORT_FULLSIZE, false, None);
+                // An entry another mount covers is the directory on this
+                // volume, which the path does not reach (devfs's has its
+                // own report).
+                let top = mount_of(&child);
+                let (r, missing) = if top.on == child && !std::ptr::eq(top, dmnt) && top.fs != super::kern::Fs::Devfs {
+                    (Err(Errno::EOPNOTSUPP), vec![format!("getattrlistbulk's entry {child}: the directory the mount there covers on {}", dmnt.on)])
+                } else {
+                    self.attrlist_vnode(&pio, &child, &cmd, Some(&ent.name), &alist, kern_size, options | fsopt::REPORT_FULLSIZE, false, (top.fs != super::kern::Fs::Devfs).then_some(dmnt))
+                };
                 notes.extend(missing);
                 let mut entry: Vec<u8> = match r {
                     Ok(r) => r.bytes[..r.copy].to_vec(),

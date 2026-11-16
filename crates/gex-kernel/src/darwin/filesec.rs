@@ -31,10 +31,11 @@ fn apfs_filesec() -> [u8; FILESEC_SIZE] {
     b
 }
 
-/// Whether a vnode by its canonical path is devfs's, whose volume keeps no
-/// extended security (as `pathconf`'s `_PC_EXTENDED_SECURITY_NP` says).
-fn on_devfs(canon: &str) -> bool {
-    canon == "/dev" || canon.starts_with("/dev/")
+/// Whether a vnode's mount (the one a descriptor was opened on, or the
+/// one a path is on) is devfs, whose volume keeps no extended security (as
+/// `pathconf`'s `_PC_EXTENDED_SECURITY_NP` says).
+fn on_devfs(mnt: &super::kern::Mount) -> bool {
+    mnt.fs == super::kern::Fs::Devfs
 }
 
 impl Kernel {
@@ -69,7 +70,7 @@ impl Kernel {
                     let dir = self.vfs.canonical(&crate::vfs::parent_of(&abs));
                     format!("{}/{}", dir.trim_end_matches('/'), crate::vfs::basename(&abs))
                 };
-                !on_devfs(&canon)
+                !on_devfs(super::kern::mount_of(&canon))
             }
             // fstat goes on to the file security after the struct's copyout,
             // even a failed one, and a copyout of the security is then the
@@ -83,7 +84,7 @@ impl Kernel {
                     return r;
                 }
                 let file = self.fds.get(a[0] as i32)?;
-                self.darwin_vnode_of(&file).is_some() && !on_devfs(&file.path)
+                self.darwin_vnode_of(&file).is_some() && !on_devfs(super::kern::mount_of_file(&file))
             }
         };
         if !filesec {

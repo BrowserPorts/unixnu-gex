@@ -35,7 +35,8 @@ impl Kernel {
         let abs = self.path_io().at_path(m, dirfd(a[0]) as i32, a[1])?;
         let md = if flags & CLONE_NOFOLLOW != 0 { self.vfs.metadata_nofollow(&abs) } else { self.vfs.metadata(&abs) }?;
         let abs = if flags & CLONE_NOFOLLOW != 0 { abs } else { self.vfs.canonical(&abs) };
-        self.darwin_clone_internal(m, &abs, None, md, found, a[2], a[3], flags)
+        let on = super::kern::mount_of(&abs);
+        self.darwin_clone_internal(m, &abs, on, None, md, found, a[2], a[3], flags)
     }
 
     /// `fclonefileat(src_fd, dst_dirfd, dst, flags)`.
@@ -54,14 +55,17 @@ impl Kernel {
         let md = file.metadata()?;
         let path = super::vattr::vnode_path(&self.vfs, &file.path, &md);
         let found = self.darwin_sb_fd_vnode(a[0] as i32);
-        self.darwin_clone_internal(m, &path, Some(Arc::clone(&file.handle)), md, found, a[1], a[2], flags)
+        // (the source vnode on the mount it was opened on)
+        let on = super::kern::mount_of_file(&file);
+        self.darwin_clone_internal(m, &path, on, Some(Arc::clone(&file.handle)), md, found, a[1], a[2], flags)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn darwin_clone_internal(&mut self, m: &GuestMem<'_>, src: &str, handle: Option<Arc<dyn FileHandle>>, md: Metadata, found: Option<super::macvfs::Found>, dst_dirfd: u64, dst: u64, flags: u64) -> Result<u64, Errno> {
+    fn darwin_clone_internal(&mut self, m: &GuestMem<'_>, src: &str, on: &'static super::kern::Mount, handle: Option<Arc<dyn FileHandle>>, md: Metadata, found: Option<super::macvfs::Found>, dst_dirfd: u64, dst: u64, flags: u64) -> Result<u64, Errno> {
         match md.file_type {
             FileType::Regular | FileType::Symlink => {}
-            FileType::Directory if src == "/" || super::kern::is_mount_point(src) => return Err(Errno::EINVAL),
+            // (a volume's root: the root of the mount it is on)
+            FileType::Directory if src == on.on => return Err(Errno::EINVAL),
             FileType::Directory => {}
             _ => return Err(Errno::EINVAL),
         }
@@ -79,7 +83,7 @@ impl Kernel {
         if self.vfs.metadata_nofollow(&to).is_ok() {
             return Err(Errno::EEXIST);
         }
-        if super::kern::mount_of(src).fsid != super::kern::mount_of(&self.vfs.canonical(&parent)).fsid {
+        if on.fsid != super::kern::mount_of(&self.vfs.canonical(&parent)).fsid {
             return Err(Errno::EXDEV);
         }
         // clonefile_internal's MAC check of the file and the new name.
@@ -99,7 +103,7 @@ impl Kernel {
         self.darwin_authorize(&cred, &dnode, None, add)?;
         let read = kauth::READ_DATA | kauth::READ_ATTRIBUTES | kauth::READ_EXTATTRIBUTES | kauth::READ_SECURITY;
         let read = if handle.is_some() { read & !kauth::READ_DATA } else { read };
-        let fnode = self.darwin_vnode_node(src, &md, handle.as_deref());
+        let fnode = self.darwin_vnode_node_on(on, src, &md, handle.as_deref());
         self.darwin_authorize(&cred, &fnode, None, read)?;
         // The clone's owner, group, mode and flags: the maker's and the
         // directory's group (vnode_authattr_new), or for root without
@@ -120,6 +124,12 @@ impl Kernel {
             (root.uid, root.gid) = (fo.uid, fo.gid);
         }
         root.flags = (fo.flags & !keep) | (d.flags & keep);
+        // The files here are reached by path: a source a later mount has
+        // covered is not.
+        if !std::ptr::eq(on, super::kern::mount_of(src)) {
+            self.darwin_unimplemented(format!("cloning {src} from a descriptor opened before {} was mounted over it (its files are reached by path)", super::kern::mount_of(src).on));
+            return Err(Errno::EIO);
+        }
         let to_canon = format!("{}/{}", dir_canon.trim_end_matches('/'), crate::vfs::basename(&to));
         let done = self.darwin_clone_tree(src, handle, &md, &to).and_then(|()| {
             super::vattr::record(&self.vfs, &to_canon, None, &root).map_err(|why| {
@@ -279,7 +289,7 @@ impl Kernel {
             return Err(Errno::EINVAL);
         }
         if let (Some(f1), Some(f2)) = (f1, f2) {
-            let e = self.darwin_mac_check_vnode_exchangedata(super::macvfs::sb_vnode(&f1.path, &f1.md), super::macvfs::sb_vnode(&f2.path, &f2.md));
+            let e = self.darwin_mac_check_vnode_exchangedata(f1.sb(), f2.sb());
             if e != 0 {
                 return Err(super::errno::errno_of(e as i32));
             }

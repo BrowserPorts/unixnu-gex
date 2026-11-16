@@ -239,7 +239,7 @@ impl Kernel {
         // vn_ioctl: the MAC check of a vnode's command first.
         if matches!(kind, Kind::Tty(_) | Kind::Vnode(_)) {
             let md = file.handle.metadata()?;
-            let v = super::macvfs::sb_vnode(&self.vfs.canonical(&file.path), &md);
+            let v = super::macvfs::sb_vnode_on(super::kern::mount_of_file(file), &self.vfs.canonical(&file.path), &md);
             let e = self.darwin_mac_check_vnode_ioctl(v, com);
             if e != 0 {
                 return Err(super::errno::errno_of(e as i32));

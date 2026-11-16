@@ -1150,7 +1150,7 @@ impl Kernel {
             return Err(Errno::EINVAL);
         }
         if caller {
-            let v = super::macvfs::sb_vnode(&f.path, &md);
+            let v = super::macvfs::sb_vnode_on(f.mnt, &f.path, &md);
             let e = self.darwin_mac_check_file_mmap(v, u64::from(prot::ALL), shared_dyld(f.vnode));
             if e != 0 {
                 return Err(super::errno::errno_of(e as i32));

@@ -41,7 +41,7 @@ enum Target {
 fn xattr_vnode(f: Option<super::macvfs::Found>) -> Option<super::mac::SbVnode> {
     use crate::vfs::FileType;
     let f = f?;
-    matches!(f.md.file_type, FileType::Regular | FileType::Directory | FileType::Symlink | FileType::Socket | FileType::Fifo).then(|| super::macvfs::sb_vnode(&f.path, &f.md))
+    matches!(f.md.file_type, FileType::Regular | FileType::Directory | FileType::Symlink | FileType::Socket | FileType::Fifo).then(|| f.sb())
 }
 
 /// A MAC hook's errno as the call's error.

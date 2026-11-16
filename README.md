@@ -754,11 +754,14 @@ is the reference (search `crates/gex-kernel/src/` for
   `PANIC_ON_AUTHFAIL`), and serves the volume at the graft directory with
   the host's inode numbers and the graft's own device; the Preboot
   volume's next object identifier, where those numbers start, stands in
-  until measured. Files compressed with LZBITMAP (decmpfs type 14, most of
+  until measured. On a writable Preboot volume the graft's range of them is
+  recorded in its image's file-system-owned attributes
+  (`com.apple.fs.graft-*`, which no attribute call reads or lists), and a
+  later graft of the image reuses a recorded range that is still valid.
+  Files compressed with LZBITMAP (decmpfs type 14, most of
   the SystemOS cryptex's compressed files), which has no published
-  specification, are reported where they are read, as are the attribute
-  record a graft leaves on its image on a writable Preboot volume, an
-  ungraft, and the grafts a booted system's Preboot volume has. A mount of the
+  specification, are reported where they are read, as are an
+  ungraft and the grafts a booted system's Preboot volume has. A mount of the
   Preboot volume has the files the restore leaves there (its root and
   `Cryptexes`), dated when it is first mounted, which stands in for the
   restore's time; the files the device's personalized tickets make (the

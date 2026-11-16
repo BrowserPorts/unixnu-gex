@@ -702,6 +702,12 @@ struct Inner {
     /// and every hard link; dropped with the inode's last name. Sparse:
     /// Wine's DOS attributes (`user.DOSATTRIB`) are on a few files.
     xattrs: BTreeMap<u64, BTreeMap<String, Vec<u8>>>,
+    /// Attributes the filesystem keeps on a file for itself, which no
+    /// extended-attribute call reads, lists or changes (APFS's
+    /// `XATTR_FILE_SYSTEM_OWNED` records): by inode, as `xattrs`, and like
+    /// them dropped with the inode's last name. Not in a saved root's
+    /// records ([`persist`]).
+    owned: BTreeMap<u64, BTreeMap<String, Vec<u8>>>,
 }
 
 impl Inner {
@@ -756,6 +762,7 @@ impl Inner {
             if *n == 0 {
                 self.links.remove(&ino);
                 self.xattrs.remove(&ino);
+                self.owned.remove(&ino);
             }
         }
     }
@@ -1330,6 +1337,44 @@ impl TmpFs {
     /// The inode number the next file made takes.
     pub fn next_ino(&self) -> u64 {
         self.inner.lock().unwrap().next_ino
+    }
+
+    /// The least inode number at or above `from` that a file has.
+    pub fn ino_at_or_above(&self, from: u64) -> Option<u64> {
+        self.inner.lock().unwrap().links.range(from..).next().map(|(&ino, _)| ino)
+    }
+
+    /// The filesystem's own attribute `name` of the file at `path`
+    /// ([`Inner::owned`]): ENOENT for no file.
+    pub fn owned_xattr(&self, path: &str, name: &str) -> Result<Option<Vec<u8>>, Errno> {
+        let path = path.trim_start_matches('/');
+        let inner = self.inner.lock().unwrap();
+        let ino = *inner.inos.get(path).ok_or(Errno::ENOENT)?;
+        Ok(inner.owned.get(&ino).and_then(|a| a.get(name)).cloned())
+    }
+
+    /// Set the filesystem's own attribute `name` of the file at `path`
+    /// ([`Inner::owned`]): ENOENT for no file.
+    pub fn set_owned_xattr(&self, path: &str, name: &str, value: &[u8]) -> Result<(), Errno> {
+        let path = path.trim_start_matches('/');
+        let mut inner = self.inner.lock().unwrap();
+        let ino = *inner.inos.get(path).ok_or(Errno::ENOENT)?;
+        inner.owned.entry(ino).or_default().insert(name.to_string(), value.to_vec());
+        Ok(())
+    }
+
+    /// Remove the filesystem's own attribute `name` of the file at `path`
+    /// ([`Inner::owned`]): whether it had it; ENOENT for no file.
+    pub fn remove_owned_xattr(&self, path: &str, name: &str) -> Result<bool, Errno> {
+        let path = path.trim_start_matches('/');
+        let mut inner = self.inner.lock().unwrap();
+        let ino = *inner.inos.get(path).ok_or(Errno::ENOENT)?;
+        let Some(a) = inner.owned.get_mut(&ino) else { return Ok(false) };
+        let had = a.remove(name).is_some();
+        if a.is_empty() {
+            inner.owned.remove(&ino);
+        }
+        Ok(had)
     }
 
     /// Every file the program has made or changed since the root was seeded

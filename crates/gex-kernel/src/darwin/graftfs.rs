@@ -572,6 +572,63 @@ pub fn jobj_range_ok(next: u64, len: u64) -> Result<(), i32> {
     }
 }
 
+/// The attributes in which a writable host records a graft's range on its
+/// image file (`write_graft_file_xattrs`, 0xfffffff006687934), each added
+/// file-system owned (`XATTR_FILE_SYSTEM_OWNED`, 4), so that no attribute
+/// call reads or lists them (APFS's getxattr answers ENOATTR for such a
+/// record, 0xfffffff0067657f8): the host volume's UUID, then the range's
+/// first identifier and its length, each a little-endian `u64`.
+pub mod graft_xattr {
+    pub const VOL_UUID: &str = "com.apple.fs.graft-vol-uuid";
+    pub const JOBJ_ID_BASE: &str = "com.apple.fs.graft-jobj-id-base";
+    pub const JOBJ_ID_LEN: &str = "com.apple.fs.graft-jobj-id-len";
+}
+
+/// The values `write_graft_file_xattrs` adds, in its order.
+pub fn graft_file_xattrs(host_uuid: [u8; 16], base: u64, len: u64) -> [(&'static str, Vec<u8>); 3] {
+    [(graft_xattr::VOL_UUID, host_uuid.to_vec()), (graft_xattr::JOBJ_ID_BASE, base.to_le_bytes().to_vec()), (graft_xattr::JOBJ_ID_LEN, len.to_le_bytes().to_vec())]
+}
+
+/// `get_graft_jobj_range` (0xfffffff006687094): the range an image file's
+/// attributes record (`get` reads one), for a host whose volume UUID is
+/// `host_uuid` and whose next object identifier is `host_next`, `ge` the
+/// least object identifier at or above one (`apfs_lookup_ge_jobj_id`). No
+/// volume UUID is no range; then, in order: a UUID shorter than 16 bytes
+/// or not the host's is EINVAL; no first identifier, or no length, ENOENT;
+/// either shorter than 8 bytes EINVAL; a length of 0 or a range that ends
+/// past `host_next` EINVAL; an identifier in the range EINVAL.
+pub fn recorded_jobj_range(get: &dyn Fn(&str) -> Option<Vec<u8>>, host_uuid: &[u8; 16], host_next: u64, ge: &dyn Fn(u64) -> Option<u64>) -> Result<Option<(u64, u64)>, i32> {
+    const ENOENT: i32 = 2;
+    const EINVAL: i32 = 22;
+    let Some(uuid) = get(graft_xattr::VOL_UUID) else { return Ok(None) };
+    if uuid.len() < 16 || uuid[..16] != host_uuid[..] {
+        return Err(EINVAL);
+    }
+    let word = |name: &str| -> Result<u64, i32> {
+        let v = get(name).ok_or(ENOENT)?;
+        v.get(..8).map(|b| u64::from_le_bytes(b.try_into().unwrap())).ok_or(EINVAL)
+    };
+    let base = word(graft_xattr::JOBJ_ID_BASE)?;
+    let len = word(graft_xattr::JOBJ_ID_LEN)?;
+    let end = base.wrapping_add(len);
+    if len == 0 || end > host_next {
+        return Err(EINVAL);
+    }
+    if ge(base).is_some_and(|id| id < end) {
+        return Err(EINVAL);
+    }
+    Ok(Some((base, len)))
+}
+
+/// `apfs_graft`'s use of a recorded range (0xfffffff006686a84..
+/// 0xfffffff006686c30): one at least as long as the image volume's next
+/// object identifier `need` is the graft's; none, an error (logged) or a
+/// shorter one ("Graft jobj id range length %llu is smaller than graft
+/// next_obj_id %llu") has a range allocated instead.
+pub fn reused_jobj_range(recorded: Result<Option<(u64, u64)>, i32>, need: u64) -> Option<(u64, u64)> {
+    recorded.ok().flatten().filter(|&(_, len)| len >= need)
+}
+
 /// The host volume's graft counters: its device counter and what a
 /// read-only mount has handed out.
 pub fn counters(volume: u32) -> (u8, u64) {
@@ -682,6 +739,43 @@ mod tests {
         // The range may end at 0x0fffffff00000000, not past it.
         assert_eq!(jobj_range_ok(0x0fff_fffe_ffff_ffff, 1), Ok(()));
         assert_eq!(jobj_range_ok(0x0fff_ffff_0000_0000, 1), Err(34));
+    }
+
+    /// A writable host's record of a graft's range is read back only when
+    /// it is whole, the host's and clear of the volume's identifiers.
+    #[test]
+    fn a_recorded_range_is_the_hosts_and_free() {
+        let host = [0x61u8; 16];
+        let rec = |uuid: Option<Vec<u8>>, base: Option<Vec<u8>>, len: Option<Vec<u8>>| {
+            move |name: &str| match name {
+                graft_xattr::VOL_UUID => uuid.clone(),
+                graft_xattr::JOBJ_ID_BASE => base.clone(),
+                graft_xattr::JOBJ_ID_LEN => len.clone(),
+                _ => None,
+            }
+        };
+        let w = |v: u64| Some(v.to_le_bytes().to_vec());
+        let none = |_: u64| None;
+        let all = graft_file_xattrs(host, 17, 3403);
+        assert_eq!(all[0], (graft_xattr::VOL_UUID, host.to_vec()));
+        assert_eq!(all[1].1, 17u64.to_le_bytes());
+        assert_eq!(all[2].1, 3403u64.to_le_bytes());
+        assert_eq!(recorded_jobj_range(&rec(None, w(17), w(3403)), &host, 4000, &none), Ok(None));
+        assert_eq!(recorded_jobj_range(&rec(Some(host.to_vec()), w(17), w(3403)), &host, 3420, &none), Ok(Some((17, 3403))));
+        assert_eq!(recorded_jobj_range(&rec(Some(host[..15].to_vec()), w(17), w(3403)), &host, 4000, &none), Err(22));
+        assert_eq!(recorded_jobj_range(&rec(Some([0u8; 16].to_vec()), w(17), w(3403)), &host, 4000, &none), Err(22));
+        assert_eq!(recorded_jobj_range(&rec(Some(host.to_vec()), None, w(3403)), &host, 4000, &none), Err(2));
+        assert_eq!(recorded_jobj_range(&rec(Some(host.to_vec()), w(17), None), &host, 4000, &none), Err(2));
+        assert_eq!(recorded_jobj_range(&rec(Some(host.to_vec()), Some(vec![1; 7]), w(3403)), &host, 4000, &none), Err(22));
+        assert_eq!(recorded_jobj_range(&rec(Some(host.to_vec()), w(17), w(0)), &host, 4000, &none), Err(22));
+        // The range may end at the host's next identifier, not past it.
+        assert_eq!(recorded_jobj_range(&rec(Some(host.to_vec()), w(17), w(3403)), &host, 3419, &none), Err(22));
+        assert_eq!(recorded_jobj_range(&rec(Some(host.to_vec()), w(17), w(3403)), &host, 4000, &|_| Some(3419)), Err(22));
+        assert_eq!(recorded_jobj_range(&rec(Some(host.to_vec()), w(17), w(3403)), &host, 4000, &|_| Some(3420)), Ok(Some((17, 3403))));
+        assert_eq!(reused_jobj_range(Ok(Some((17, 3403))), 3403), Some((17, 3403)));
+        assert_eq!(reused_jobj_range(Ok(Some((17, 3403))), 3404), None);
+        assert_eq!(reused_jobj_range(Ok(None), 1), None);
+        assert_eq!(reused_jobj_range(Err(22), 1), None);
     }
 
     #[test]

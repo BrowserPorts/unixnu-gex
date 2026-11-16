@@ -71,6 +71,9 @@ pub fn run(mut ra: RunArgs, bytes: &[u8]) -> Result<ExitCode> {
     // it from, and its ticket's source (a file, or web-device).
     ra.opts.darwin_restore = std::env::var_os("GEX_DARWIN_RESTORE").map(PathBuf::from);
     ra.opts.darwin_cryptex1_ticket = std::env::var("GEX_DARWIN_CRYPTEX1_TICKET").ok();
+    // The device's current cryptex1 boot nonce hash, which the ticket's
+    // evaluation needs and only the device has.
+    ra.opts.darwin_cryptex1_nonce_hash = std::env::var("GEX_DARWIN_CRYPTEX1_NONCE_HASH").ok();
     // Its commpage is folded to its alias at the top of the memory in
     // everything translated for it, which needs the addresses its code
     // builds in registers seen as the constants they are; and its tables

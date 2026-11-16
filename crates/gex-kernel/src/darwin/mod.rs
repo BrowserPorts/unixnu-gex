@@ -42,6 +42,7 @@ pub mod fileport;
 pub mod footprint;
 pub mod xattr;
 pub mod iokit;
+pub mod image4;
 pub mod img4;
 pub mod iosurface;
 pub mod osserialize;

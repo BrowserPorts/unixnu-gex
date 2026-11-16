@@ -43,8 +43,11 @@
 //! (0x2e) and the version (0x32) from it.
 //!
 //! The kext's evaluation of a firmware payload against its manifest, which
-//! APFS asks for a cryptex's graft ([`super::graft`]), is not implemented:
-//! it is reported ([`crate::syscalls::Kernel::darwin_img4_firmware_execute`]).
+//! APFS asks for a cryptex's graft ([`super::graft`]), is
+//! [`super::image4`]'s for `CHIP_CRYPTEX1_BOOT_AP`, against this device
+//! tree's `/chosen` and the device's measured cryptex1 boot nonce hash
+//! ([`super::preboot::cryptex1_boot_nonce_hash`]); the other chips are
+//! reported ([`crate::syscalls::Kernel::darwin_img4_firmware_execute`]).
 
 use std::sync::Mutex;
 
@@ -170,6 +173,27 @@ pub fn set_ignition_blob(b: [u8; IGNITION_BLOB_SIZE]) {
 /// they stand in until measured. A reported shortcut (storage::unmeasured).
 pub const CHOSEN_STAND_IN: &str = "the /chosen values iBoot fills in (stand-in: the IPSW device tree's, chip-id, board-id, unique-chip-id, certificate-production-status, certificate-security-mode, effective-production-status-ap and effective-security-mode-ap zero, and no security-domain, chip-epoch, esdm-fuses or manifest-properties love: an ignition blob and a Cryptex1 ticket name of ECID 0; measure IODeviceTree:/chosen on the device, `ioreg -p IODeviceTree -n chosen -l`)";
 
+/// The chip environment AppleImage4 evaluates against: this device tree's
+/// `/chosen`, as its runtime reads it ([`read`]), the device's cryptex1
+/// boot nonce hash, and the anchor the boot payload has.
+struct Device<'a> {
+    tree: &'a [Node],
+}
+
+impl super::image4::Environment for Device<'_> {
+    fn chosen(&self, name: &str, size: usize) -> Result<Option<Vec<u8>>, i32> {
+        read(self.tree, CHOSEN, name, size)
+    }
+
+    fn cryptex1_boot_nonce_hash(&self, _domain: u32) -> Result<Vec<u8>, String> {
+        super::preboot::cryptex1_boot_nonce_hash()
+    }
+
+    fn anchor(&self) -> Result<Vec<u8>, String> {
+        super::image4::anchor()
+    }
+}
+
 impl crate::syscalls::Kernel {
     /// AppleImage4's evaluation of a payload against its Image4 manifest,
     /// as `validate_payload_and_manifest` asks it for a graft:
@@ -178,19 +202,28 @@ impl crate::syscalls::Kernel {
     /// (0xfffffff005a8eb14), `img4_firmware_execute` (0xfffffff005a8edac)
     /// for `sel`'s chip, with the nonce when `sel` gives one, whose
     /// `root_hash_execution_cb` (0xfffffff006680dc8) leaves the status, 0
-    /// with the authenticated payload; -1 when it is not called. The status
-    /// is returned; `None` while the evaluation is not implemented
-    /// (reported).
+    /// with the authenticated payload. The status is returned; `None` where
+    /// what decides it is not implemented, or the kext panics (reported).
     pub(crate) fn darwin_img4_firmware_execute(&mut self, sel: super::graft::Selection, fourcc: u32, payload: &[u8], manifest: &[u8]) -> Option<Result<Vec<u8>, i32>> {
+        use super::image4::Outcome;
         let cc: String = fourcc.to_be_bytes().iter().map(|&b| if b.is_ascii_graphic() { b as char } else { '?' }).collect();
-        self.darwin_unimplemented(format!(
-            "Image4 evaluation of a '{cc}' payload ({} bytes) against its manifest ({} bytes) for {} (img4_firmware_execute, firmware flags {:#x})",
-            payload.len(),
-            manifest.len(),
-            sel.chip.describe(),
-            sel.firmware_flags
-        ));
-        None
+        let what = format!("Image4 evaluation of a '{cc}' payload ({} bytes) against its manifest ({} bytes) for {}", payload.len(), manifest.len(), sel.chip.describe());
+        if sel.chip != super::graft::Chip::Cryptex1BootAp || sel.pdi_nonce || sel.firmware_flags != 0 {
+            self.darwin_unimplemented(format!("{what} (img4_firmware_execute, firmware flags {:#x})", sel.firmware_flags));
+            return None;
+        }
+        match super::image4::execute(fourcc, payload, manifest, &Device { tree: super::iokit::tree() }) {
+            Outcome::Authenticated(data) => Some(Ok(data)),
+            Outcome::Status(s) => Some(Err(s)),
+            Outcome::Panic(why) => {
+                self.darwin_unimplemented(format!("{what}: the kext panics ({why})"));
+                None
+            }
+            Outcome::Unmodelled(why) => {
+                self.darwin_unimplemented(format!("{what}: {why}"));
+                None
+            }
+        }
     }
 }
 

@@ -264,6 +264,9 @@ pub struct RunOptions {
     /// The Cryptex1 ticket's source (`GEX_DARWIN_CRYPTEX1_TICKET`): the
     /// device's own ticket file, or `web-device`.
     pub darwin_cryptex1_ticket: Option<String>,
+    /// The device's current cryptex1 boot nonce hash, hexadecimal
+    /// (`GEX_DARWIN_CRYPTEX1_NONCE_HASH`), a measured input.
+    pub darwin_cryptex1_nonce_hash: Option<String>,
     /// Run ahead-of-time code only (`aot_only`): an ejected Windows
     /// program's runtime, with no tier-1 module and no run-time translator.
     pub aot_only: bool,
@@ -288,6 +291,7 @@ impl Default for RunOptions {
             darwin_frames: None,
             darwin_restore: None,
             darwin_cryptex1_ticket: None,
+            darwin_cryptex1_nonce_hash: None,
             args: Vec::new(),
             env: Vec::new(),
             trace: false,
@@ -1345,6 +1349,10 @@ fn run_process(
         let tc = read("TrustCache")?;
         let sandbox = gex_kernel::darwin::SandboxProfiles { platform: read("sandbox_profile.bin")?, builtin: read("sandbox_builtin.bin")?, protobox: read("sandbox_protobox.bin")? };
         let device_tree = read("DeviceTree")?;
+        // AppleImage4's Cryptex1 anchor, extracted from the kernelcache.
+        if let Some(anchor) = read("img4_anchor.der")? {
+            gex_kernel::darwin::image4::set_anchor(anchor).map_err(|e| anyhow!("the boot payload: {e}"))?;
+        }
         // The sealed volumes' owners, modes and flags, which an extracted
         // root does not keep: the system volume's and the SystemOS
         // cryptex's.
@@ -1364,6 +1372,7 @@ fn run_process(
                 Some("web-device") => Ticket::WebDevice,
                 Some(path) => Ticket::File(path.to_string()),
             },
+            nonce_hash: opts.darwin_cryptex1_nonce_hash.clone().filter(|h| !h.is_empty()),
             host: Some(Host { size: darwin_host_size, read: darwin_host_read }),
         };
         gex_kernel::darwin::boot(tc.as_deref(), sandbox, device_tree.as_deref(), volume_attrs, cryptex1).map_err(|e| anyhow!("the boot payload: {e}"))?;

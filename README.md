@@ -403,6 +403,7 @@ missing has effects:
 | `sandbox_profile.bin` | the Sandbox kext's platform profile, a compiled profile blob from the kernelcache | every Sandbox check is reported and refused (EPERM) |
 | `sandbox_builtin.bin` | the Sandbox kext's builtin profile collection (its named profiles), a compiled collection blob from the kernelcache | a process that would get a builtin profile is reported and its exec killed (or its `sandbox_init` refused, EPERM) |
 | `sandbox_protobox.bin` | the Sandbox kext's protobox profile collection (profiles named by executable path), a compiled collection blob from the kernelcache | every exec is reported and killed, since its protobox profile cannot be looked up |
+| `img4_anchor.der` | AppleImage4's root certificate for Cryptex1 manifests ("Apple DDI Secure Boot Root CA - G1"), from the kernelcache | the evaluation of a cryptex boot graft's ticket is reported when it reaches the certificate chain |
 | `DeviceTree` | the flattened device tree: the payload of the IPSW's device tree image (an IM4P) for this device | the IOKit registry has no device tree, which is reported |
 | `os.dmg.trustcache` | the SystemOS cryptex's trust cache, an IM4P (in the IPSW, the `Firmware/<os cryptex>.dmg.trustcache` whose cdhashes are the shared cache's files'), which libignition loads at boot | with pid 1 standing in for launchd, the boot's shared region cannot be mapped: the cache's ad-hoc signatures are in no trust cache |
 | `SystemVolume.attrs` | the system volume's owners, modes and file flags, which an extracted root does not keep: an mtree(5)-layout specification (flags in hexadecimal) that `tools/darwin-volume-attrs.py` writes from the IPSW's root filesystem image mounted read-only with its owners honoured (`hdiutil attach -readonly -nobrowse -owners on`); read when first looked in (`volattrs::lookup`) | a lookup of a system volume file's attributes says the payload has none |
@@ -432,7 +433,15 @@ python3 tools/darwin-sandbox-blobs.py <kernelcache> <ipados-boot>
 In 21H461's iPad7,1 kernelcache the platform profile is 0x22111 bytes at
 0xfffffff0056ca320, the builtin collection 0xd6d7b bytes at
 0xfffffff0056ecab0 and the protobox collection 0x75bd1 bytes at
-0xfffffff0057c3840. The repository has no tool to unwrap the device tree's
+0xfffffff0057c3840. `tools/darwin-img4-anchor.py` writes `img4_anchor.der`,
+the certificate AppleImage4 keeps at the address given (21H461's iPad7,1:
+0xfffffff0052d4640, the default), checked against the length the kext
+stores after it:
+
+```sh
+python3 tools/darwin-img4-anchor.py <kernelcache> <ipados-boot> [address]
+```
+ The repository has no tool to unwrap the device tree's
 IM4P.
 
 AMFI treats code as platform code when its cdhash is in the static trust
@@ -477,6 +486,7 @@ What gexc sets up:
 | `GEX_DARWIN_FRAMES` | a directory the frames the framebuffer presents are recorded into, one file each (`hosts/native/src/darwin_frames.rs`) |
 | `GEX_DARWIN_RESTORE` | the files the restore installs the Preboot volume's Cryptex1 (`/private/preboot/cryptex1/current`) from: a directory holding the IPSW's `BuildManifest.plist` and the build identity's `Cryptex1,` components at their paths in the IPSW (the two cryptex images and their `Firmware/*.root_hash` and `Firmware/*.trustcache`), each checked against its digest at the volume's first mount. Without it, looking in `cryptex1` is reported |
 | `GEX_DARWIN_CRYPTEX1_TICKET` | the Cryptex1 ticket's source: a file, the device's own `cryptex1/current/apticket.<target>.<ECID>.im4m` copied from its Preboot volume, or `web-device`, the web device's own platform (not implemented). Without a file, looking up the ticket is reported |
+| `GEX_DARWIN_CRYPTEX1_NONCE_HASH` | the device's current cryptex1 boot nonce hash, in hexadecimal: what its AppleImage4 makes of the cryptex1 boot nonce in its NVRAM (entangled with its UID key when the device asks for it), which the Cryptex1 ticket's `cnch` must be when the system grafts its cryptexes. Only the device has it: while the device has not rolled the nonce since its restore, it is the device's ticket's `cnch`. Without it, evaluating a ticket that carries a `cnch` is reported |
 | environment | without `--env` or `--host-env`, `PATH=/usr/bin:/bin` and `HOME=/var/mobile` |
 | identity | the host user's ids, or `--uid`; `/sbin/launchd` runs as root and pid 1, and any other program as a child of a pid 1 that is the kernel's own |
 | memory | always a 64-bit guest memory (`--mem32` is refused): Darwin images live above 4 GiB |
@@ -731,10 +741,14 @@ is the reference (search `crates/gex-kernel/src/` for
   volume has the system image's, as ASR's restore of it, whether ASR keeps
   it not yet traced. The OS cryptex is still a mount of its own at
   `/System/Cryptexes/OS` rather than Preboot's graft of it. `graftdmg` and
-  `ungraftdmg` make XNU's and APFS's checks; AppleImage4's evaluation of a
-  graft's payload against its manifest, and APFS's mount of the container
-  in the image with the authentication of its root hash, are reported, as
-  are the grafts a booted system's Preboot volume has. A mount of the
+  `ungraftdmg` make XNU's and APFS's checks, and AppleImage4 evaluates a
+  cryptex boot graft's payload against its Cryptex1 ticket as the kext
+  does (the certificate chain to its DDI root, the signature, the
+  certificate's and the chip's constraints against `/chosen`, the payload's
+  digest, the cryptex1 boot nonce hash against the measured one); its
+  other chips, APFS's mount of the container in the image with the
+  authentication of its root hash, and the grafts a booted system's
+  Preboot volume has are reported. A mount of the
   Preboot volume has the files the restore leaves there (its root and
   `Cryptexes`), dated when it is first mounted, which stands in for the
   restore's time; the files the device's personalized tickets make (the

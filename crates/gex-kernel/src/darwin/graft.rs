@@ -17,8 +17,9 @@
 //! (`apfs_graft`, 0xfffffff00668611c) whatever the evaluation said: its
 //! status is what the graft's root hash authentication
 //! (0xfffffff0066cdaec) is given, after the container in the image is
-//! mounted. The evaluation ([`Kernel::darwin_img4_firmware_execute`]) and
-//! the graft's mount of the image are not implemented and are reported.
+//! mounted. The evaluation is AppleImage4's
+//! ([`Kernel::darwin_img4_firmware_execute`], [`super::image4`]); the
+//! graft's mount of the image is not implemented and is reported.
 
 use super::macvfs::Found;
 use crate::errno::Errno;

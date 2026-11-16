@@ -164,6 +164,10 @@ pub struct Sources {
     /// `cryptex1` directory is reported.
     pub restore: Option<String>,
     pub ticket: Ticket,
+    /// The device's current cryptex1 boot nonce hash, hexadecimal
+    /// (GEX_DARWIN_CRYPTEX1_NONCE_HASH): what its AppleImage4 makes of the
+    /// nonce in its NVRAM, a measured input ([`cryptex1_boot_nonce_hash`]).
+    pub nonce_hash: Option<String>,
     pub host: Option<Host>,
 }
 
@@ -176,6 +180,27 @@ pub fn set_sources(s: Sources) -> Result<(), String> {
         crate::vfs::tmpfs::set_lazy_fetch(h.read);
     }
     SOURCES.set(s).map_err(|_| "the Cryptex1's sources are set already".to_string())
+}
+
+/// The device's current cryptex1 boot nonce hash, which the Cryptex1
+/// ticket's `cnch` must be: AppleImage4 makes it from the cryptex1 boot
+/// nonce domain's nonce in the device's NVRAM (`nonce-seeds`), entangled
+/// with the device's UID key when the device asks for it, so only the
+/// device has it and the owner supplies it (GEX_DARWIN_CRYPTEX1_NONCE_HASH):
+/// while the device has not rolled the nonce since the restore, it is the
+/// device's ticket's `cnch`.
+pub fn cryptex1_boot_nonce_hash() -> Result<Vec<u8>, String> {
+    let Some(hex) = sources().nonce_hash.as_deref() else {
+        return Err("the device's cryptex1 boot nonce hash (its AppleImage4's hash of the cryptex1 boot nonce in its NVRAM nonce-seeds, entangled with its UID key when asked: a measured input, GEX_DARWIN_CRYPTEX1_NONCE_HASH, is not configured)".to_string());
+    };
+    let hex = hex.trim();
+    if hex.is_empty() || hex.len() % 2 != 0 || hex.len() > 128 {
+        return Err(format!("GEX_DARWIN_CRYPTEX1_NONCE_HASH is not a hash in hexadecimal: {hex:?}"));
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).map_err(|_| format!("GEX_DARWIN_CRYPTEX1_NONCE_HASH is not a hash in hexadecimal: {hex:?}")))
+        .collect()
 }
 
 fn sources() -> &'static Sources {
@@ -489,7 +514,7 @@ mod tests {
         let m = Value::Dict(vec![("BuildIdentities".into(), Value::Array(vec![identity.clone()]))]);
         std::fs::write(dir.join("BuildManifest.plist"), plist::to_xml(&m)).unwrap();
         let d = dir.to_str().unwrap().to_string();
-        let s = Sources { restore: Some(d.clone()), ticket: Ticket::File(format!("{d}/ticket")), host: Some(Host { size: host_size, read: host_read }) };
+        let s = Sources { restore: Some(d.clone()), ticket: Ticket::File(format!("{d}/ticket")), nonce_hash: None, host: Some(Host { size: host_size, read: host_read }) };
         let system = |p: &str| -> Result<Option<(Vec<u8>, Owned)>, String> {
             Ok(p.ends_with("SystemVersion.plist").then(|| (b"<plist/>".to_vec(), Owned { uid: 0, gid: 0, mode: 0o444, flags: 0x40 | 0x20 })))
         };

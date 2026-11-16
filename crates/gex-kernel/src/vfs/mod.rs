@@ -1555,11 +1555,13 @@ impl Namespace {
 
     /// Absolute `abs` with every root-filesystem symlink on it followed,
     /// the last component's too: the name Linux's `/proc/self/fd/N` shows
-    /// for a file opened by `abs`. `abs` itself when the walk fails or
-    /// reaches another mount (which names its own links).
+    /// for a file opened by `abs`. Where the walk reaches another mount, the
+    /// path it reached it by: the root's links followed up to it, the
+    /// mount's own (which it names itself) as they are. `abs` itself when
+    /// the walk fails.
     pub fn canonical(&self, abs: &str) -> String {
         match self.walk(abs, true) {
-            Ok(Some(w)) if !w.at_mount => w.path,
+            Ok(Some(w)) => w.path,
             _ => abs.to_string(),
         }
     }

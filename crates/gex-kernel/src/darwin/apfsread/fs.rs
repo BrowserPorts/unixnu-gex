@@ -308,32 +308,7 @@ pub struct Decmpfs {
 
 /// `DECMPFS_MAGIC` ('cmpf'), `sizeof(decmpfs_disk_header)`.
 pub const DECMPFS_MAGIC: u32 = 0x636d_7066;
-const DECMPFS_HEADER: usize = 16;
-
-/// The decmpfs types AppleFSCompressionTypeZlib (163.140.2, the only
-/// decompressor of this kernelcache) registers (its table at
-/// 0xfffffff006fbcf40), with the compression scheme each names (its type
-/// table at 0xfffffff005873ae4, the scheme's algorithm at
-/// 0xfffffff006b2a580): what reading a file of the type needs.
-pub fn decmpfs_kind(kind: u32) -> Option<&'static str> {
-    Some(match kind {
-        3 => "zlib in the attribute (scheme 0x2ff, COMPRESSION_ZLIB)",
-        4 => "zlib in the resource fork (scheme 0x2ff, COMPRESSION_ZLIB)",
-        7 => "LZVN in the attribute (scheme 0x306, algorithm 0x900)",
-        8 => "LZVN in the resource fork (scheme 0x306, algorithm 0x900)",
-        9 => "uncompressed in the attribute (scheme 0x1cc)",
-        10 => "uncompressed in the resource fork (scheme 0x1cc)",
-        11 => "LZFSE in the attribute (scheme 0x4ff, COMPRESSION_LZFSE)",
-        12 => "LZFSE in the resource fork (scheme 0x4ff, COMPRESSION_LZFSE)",
-        13 => "LZBITMAP in the attribute (scheme 0x5ff, COMPRESSION_LZBITMAP, which has no published specification)",
-        14 => "LZBITMAP in the resource fork (scheme 0x5ff, COMPRESSION_LZBITMAP, which has no published specification)",
-        _ => return None,
-    })
-}
-
-/// The marker a scheme-0x1cc attribute's data starts with (its scheme's
-/// low byte): what follows it is the file, uncompressed.
-const UNCOMPRESSED_MARKER: u8 = 0xcc;
+const DECMPFS_HEADER: usize = super::decmpfs::HEADER;
 
 /// A file-info record's data hash (`j_file_data_hash_val_t`): the stream
 /// offset it starts at, its length in blocks, the hash.
@@ -536,24 +511,7 @@ impl Volume {
     pub fn read_file(&self, ino: &Inode, off: u64, buf: &mut [u8]) -> Result<usize> {
         if ino.compressed() {
             let (h, b) = self.decmpfs(ino)?;
-            return match h.kind {
-                9 => {
-                    let data = &b[DECMPFS_HEADER..];
-                    if data.first() != Some(&UNCOMPRESSED_MARKER) || (data.len() - 1) as u64 != h.uncompressed_size {
-                        return Err(Error::Unsupported(format!("the decmpfs type 9 data of {:#x}: {} bytes where {} are the file's", ino.oid, data.len(), h.uncompressed_size)));
-                    }
-                    let file = &data[1..];
-                    let at = off.min(file.len() as u64) as usize;
-                    let n = buf.len().min(file.len() - at);
-                    buf[..n].copy_from_slice(&file[at..at + n]);
-                    Ok(n)
-                }
-                k => Err(Error::Unsupported(format!(
-                    "reading the compressed file {:#x}: decmpfs type {k} ({})",
-                    ino.oid,
-                    decmpfs_kind(k).unwrap_or("a type the kernel's decompressor does not register")
-                ))),
-            };
+            return self.read_decmpfs(ino, &h, &b, off, buf);
         }
         let size = ino.dstream.map_or(0, |d| d.size);
         self.read_stream(ino.private_id, size, off, buf)
@@ -598,6 +556,44 @@ impl Volume {
             at = to;
         }
         Ok(n)
+    }
+
+    /// Bytes of data stream `id` of `size` bytes from `off` as its extents
+    /// hold them, unchecked: a compressed file's resource fork, whose data
+    /// hashes are those of the bytes it expands to ([`super::decmpfs`]).
+    pub(crate) fn read_stream_unchecked(&self, id: u64, size: u64, off: u64, buf: &mut [u8]) -> Result<usize> {
+        if off >= size {
+            return Ok(0);
+        }
+        let n = buf.len().min((size - off).min(usize::MAX as u64) as usize);
+        self.read_extents(id, off, &mut buf[..n])?;
+        Ok(n)
+    }
+
+    /// Checks `data`, bytes `off..` of a file of `size` bytes whose data
+    /// hashes are stream `id`'s, against the hashes covering them: each
+    /// segment hashed whole, past the file's end as zeros. On a sealed
+    /// volume a compressed file's hashes are of its expanded bytes, kept
+    /// under its resource fork's stream.
+    pub(crate) fn check_expanded(&self, id: u64, off: u64, data: &[u8], size: u64) -> Result<()> {
+        let Some(t) = self.hash_type else { return Ok(()) };
+        let bs = u64::from(self.c().block_size());
+        let end = off + data.len() as u64;
+        let mut at = off;
+        while at < end {
+            let h = self.data_hash(id, at)?.ok_or_else(|| Error::Integrity(format!("no data hash covers byte {at} of what stream {id:#x} expands to")))?;
+            let seg_end = h.offset + u64::from(h.blocks) * bs;
+            if h.offset < off || seg_end.min(size) > end {
+                return Err(Error::Unsupported(format!("a data hash of bytes {}..{seg_end} across the expanded bytes {off}..{end} read at once", h.offset)));
+            }
+            let mut seg = data[(h.offset - off) as usize..(seg_end.min(size) - off) as usize].to_vec();
+            seg.resize((seg_end - h.offset) as usize, 0);
+            if h.hash.len() != t.size() || t.digest(&seg) != h.hash {
+                return Err(Error::Integrity(format!("bytes {}..{seg_end} that stream {id:#x} expands to do not have their data hash", h.offset)));
+            }
+            at = seg_end;
+        }
+        Ok(())
     }
 
     /// The data hash of stream `id` covering byte `at`: the file-info
@@ -785,8 +781,7 @@ mod tests {
 
     /// The SystemOS cryptex's root: its one tree walked whole (every
     /// node's hash checked), the shared cache's header read, and the
-    /// compressed files: uncompressed ones read, the LZBITMAP ones
-    /// refused.
+    /// compressed files' first bytes read.
     #[test]
     #[ignore = "needs GEX_DARWIN_RESTORE's 044-76034-038.dmg (21H461)"]
     fn the_os_cryptex_is_read() {
@@ -832,11 +827,8 @@ mod tests {
                     let (h, _) = v.decmpfs(&ino)?;
                     assert_eq!(h.uncompressed_size, ino.uncompressed_size);
                     let mut b = vec![0u8; 256];
-                    match h.kind {
-                        9 => assert_eq!(v.read_file(&ino, 0, &mut b)?, (h.uncompressed_size as usize).min(256)),
-                        14 => assert!(matches!(v.read_file(&ino, 0, &mut b), Err(Error::Unsupported(_)))),
-                        k => panic!("decmpfs type {k}"),
-                    }
+                    assert!(matches!(h.kind, 9 | 14), "decmpfs type {}", h.kind);
+                    assert_eq!(v.read_file(&ino, 0, &mut b)?, (h.uncompressed_size as usize).min(256));
                 }
             }
             Ok(true)
@@ -847,7 +839,46 @@ mod tests {
         assert!(v.resolve("/System/Library/Caches/com.apple.dyld/no-such-file").unwrap().is_none());
     }
 
-    /// The AppOS cryptex opens and its root is read too.
+    /// The shared cache's subcaches dyld reads before it maps the cache,
+    /// LZBITMAP files (decmpfs type 14), read whole in reads of 4 MiB and
+    /// one byte, every chunk checked against the seal's data hashes: their
+    /// header, size and SHA-256 (libcompression's expansion of the same
+    /// chunks).
+    #[test]
+    #[ignore = "needs GEX_DARWIN_RESTORE's 044-76034-038.dmg (21H461)"]
+    fn the_compressed_subcaches_are_read() {
+        use sha2::Digest;
+        let v = os_volume();
+        for (name, size, digest) in [
+            ("dyld_shared_cache_arm64.34.dyldlinkedit", 27_410_432u64, "2ca97d9b160600576700f7f3097a1a4aa5f5fd4409e23e5ba821f3b9d883221f"),
+            ("dyld_shared_cache_arm64.52.dyldlinkedit", 404_865_024, "5da109fd9ea4f3d62b90dfb0699c03be56adea6ee5d36c6b9bbe5f5a588390ea"),
+            ("dyld_shared_cache_arm64.symbols", 685_817_856, "1126abcd7cbb76957c489ed5a1e2b7bd278b1758bb5b0ff26c32d220480f0b37"),
+        ] {
+            let ino = v.resolve(&format!("/System/Library/Caches/com.apple.dyld/{name}")).unwrap().unwrap();
+            assert!(ino.compressed(), "{name}");
+            assert_eq!(v.decmpfs(&ino).unwrap().0.kind, 14, "{name}");
+            v.decmpfs_validate(&ino).unwrap();
+            assert_eq!(v.file_size(&ino).unwrap(), size, "{name}");
+            let mut head = [0u8; 16];
+            assert_eq!(v.read_file(&ino, 0, &mut head).unwrap(), 16);
+            assert_eq!(&head, b"dyld_v1   arm64\0", "{name}");
+            let mut h = sha2::Sha256::new();
+            let mut buf = vec![0u8; (4 << 20) + 1];
+            let mut off = 0;
+            while off < size {
+                let n = v.read_file(&ino, off, &mut buf).unwrap();
+                assert!(n > 0, "{name} at {off}");
+                h.update(&buf[..n]);
+                off += n as u64;
+            }
+            assert_eq!(v.read_file(&ino, size, &mut buf).unwrap(), 0);
+            let got: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(got, digest, "{name}");
+        }
+    }
+
+    /// The AppOS cryptex opens and its root is read too, its compressed
+    /// files (decmpfs types 9 and 14) whole.
     #[test]
     #[ignore = "needs GEX_DARWIN_RESTORE's 044-75188-038.dmg (21H461)"]
     fn the_app_cryptex_is_read() {
@@ -855,12 +886,33 @@ mod tests {
         let v = c.volume(0).unwrap().unwrap();
         assert!(v.sb.sealed());
         let mut n = 0u64;
-        v.fs_tree.walk(&v.container, &mut |_, _| {
+        let mut inodes = Vec::new();
+        v.fs_tree.walk(&v.container, &mut |k, _| {
             n += 1;
+            if key_header(k)?.1 == jtype::INODE {
+                inodes.push(key_header(k)?.0);
+            }
             Ok(true)
         })
         .unwrap();
         assert_eq!(n, v.fs_tree.info.key_count);
         assert!(v.inode(ROOT_DIR_INO_NUM).unwrap().unwrap().is_dir());
+        let mut kinds = std::collections::BTreeMap::new();
+        let mut buf = vec![0u8; (1 << 16) + 1];
+        for oid in inodes {
+            let ino = v.inode(oid).unwrap().unwrap();
+            if ino.kind() != mode::S_IFREG || !ino.compressed() {
+                continue;
+            }
+            let (h, _) = v.decmpfs(&ino).unwrap();
+            *kinds.entry(h.kind).or_insert(0) += 1;
+            v.decmpfs_validate(&ino).unwrap();
+            let mut off = 0;
+            while let Some(got) = Some(v.read_file(&ino, off, &mut buf).unwrap()).filter(|&g| g > 0) {
+                off += got as u64;
+            }
+            assert_eq!(off, h.uncompressed_size, "{oid:#x}");
+        }
+        assert_eq!(kinds, [(9, 39), (14, 535)].into_iter().collect());
     }
 }

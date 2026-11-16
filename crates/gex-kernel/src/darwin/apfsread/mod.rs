@@ -22,7 +22,8 @@
 //! - file-system records ([`fs`]): inodes, directory entries, extended
 //!   attributes, extents, data streams, extended fields, siblings, and a
 //!   sealed volume's file-info records, whose data hashes are checked as
-//!   the data is read; and decmpfs compression where the image uses it.
+//!   the data is read; and decmpfs files ([`decmpfs`]), LZBITMAP's
+//!   included ([`lzbitmap`]).
 //!
 //! Nothing is read ahead: the medium is read a block at a time as the
 //! structures are walked, a bounded number of B-tree nodes kept.
@@ -40,7 +41,9 @@
 //! ([`fs::xfields`]).
 
 pub mod btree;
+pub mod decmpfs;
 pub mod fs;
+pub mod lzbitmap;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -64,6 +67,9 @@ pub enum Error {
     Integrity(String),
     /// What this reader does not implement.
     Unsupported(String),
+    /// A compressed file's data decmpfs's fetch refuses, with the error it
+    /// returns.
+    Decmpfs { errno: i32, why: String },
 }
 
 impl std::fmt::Display for Error {
@@ -73,6 +79,7 @@ impl std::fmt::Display for Error {
             Error::Malformed(s) => write!(f, "malformed: {s}"),
             Error::Integrity(s) => write!(f, "integrity: {s}"),
             Error::Unsupported(s) => write!(f, "not implemented: {s}"),
+            Error::Decmpfs { errno, why } => write!(f, "decmpfs: {why} (errno {errno})"),
         }
     }
 }

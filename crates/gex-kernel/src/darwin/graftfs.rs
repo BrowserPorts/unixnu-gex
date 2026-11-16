@@ -177,6 +177,13 @@ fn errno_of(e: &apfsread::Error, what: &str) -> Errno {
             super::note_unimplemented(format!("APFS's error for {what} in a cryptex graft: {e}"));
             Errno::EIO
         }
+        apfsread::Error::Decmpfs { errno, why } => {
+            // decmpfs_read_compressed zero-fills the UPL a failed fetch was
+            // to fill and answers with its copy's result; a pagein
+            // returns the fetch's error.
+            super::note_unimplemented(format!("APFS's {what} in a cryptex graft of a compressed file whose decmpfs fetch fails ({why}, errno {errno})"));
+            Errno::EIO
+        }
     }
 }
 
@@ -452,6 +459,18 @@ impl FileSystem for GraftMount {
             return Err(Errno::EROFS);
         }
         let ino = self.0.resolve(path, true)?;
+        if ino.kind() == afs::mode::S_IFREG && ino.compressed() {
+            // apfs_vnop_open checks a compressed file opened to read
+            // (decmpfs_validate_compressed_file, 0xfffffff0066901d8).
+            match self.0.vol.decmpfs_validate(&ino) {
+                Ok(()) => {}
+                Err(apfsread::Error::Decmpfs { errno, why }) => {
+                    super::note_unimplemented(format!("APFS's open of {path}, whose decmpfs validation fails ({why}): the conditions on apfs_vnop_open's way to it are not traced; answered with its errno {errno}"));
+                    return Err(super::errno::errno_of(errno));
+                }
+                Err(e) => return Err(errno_of(&e, "open")),
+            }
+        }
         Ok(Arc::new(GraftHandle { fs: Arc::clone(&self.0), ino }))
     }
     fn metadata(&self, path: &str) -> Result<Metadata, Errno> {
@@ -862,5 +881,15 @@ mod tests {
         assert!(!String::from_utf8_lossy(&names[..n]).contains("decmpfs"));
         let mut page = vec![0u8; cmd.size as usize];
         assert_eq!(m.open(ctx, 0, 0).unwrap().read_at(0, &mut page).unwrap(), cmd.size);
+        // An LZBITMAP subcache, opened (validated) and read across a
+        // chunk's end.
+        let linkedit = "System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64.34.dyldlinkedit";
+        assert_eq!(m.metadata(linkedit).unwrap().size, 27_410_432);
+        let h = m.open(linkedit, 0, 0).unwrap();
+        assert_eq!(h.read_at(0, &mut b).unwrap(), 16);
+        assert_eq!(&b, b"dyld_v1   arm64\0");
+        let mut across = vec![0u8; 100];
+        assert_eq!(h.read_at(0x10000 - 50, &mut across).unwrap(), 100);
+        assert_eq!(h.read_at(27_410_432 - 10, &mut across).unwrap(), 10);
     }
 }

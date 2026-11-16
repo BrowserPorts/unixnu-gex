@@ -766,9 +766,13 @@ is the reference (search `crates/gex-kernel/src/` for
   recorded in its image's file-system-owned attributes
   (`com.apple.fs.graft-*`, which no attribute call reads or lists), and a
   later graft of the image reuses a recorded range that is still valid.
-  Files compressed with LZBITMAP (decmpfs type 14, most of
-  the SystemOS cryptex's compressed files), which has no published
-  specification, are reported where they are read, as are an
+  Compressed files are read as AppleFSCompressionTypeZlib's decmpfs
+  chunks are fetched: uncompressed (types 9, 10) and LZBITMAP (types 13,
+  14; the SystemOS cryptex's linkedit and symbols subcaches among them),
+  decoded as the kernel's own decoder does, the format having no
+  published specification, with a sealed volume's expanded bytes checked
+  against the data hashes kept under the resource fork's stream; zlib,
+  LZVN and LZFSE files are reported where they are read, as are an
   ungraft and the grafts a booted system's Preboot volume has. A mount of the
   Preboot volume has the files the restore leaves there (its root and
   `Cryptexes`), dated when it is first mounted, which stands in for the

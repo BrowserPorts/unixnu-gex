@@ -211,7 +211,7 @@ pub enum Fs {
 
 /// `MNT_RDONLY`, `MNT_NOSUID`, `MNT_LOCAL`, `MNT_ROOTFS`, `MNT_DOVOLFS`,
 /// `MNT_DONTBROWSE`, `MNT_JOURNALED`, `MNT_MULTILABEL`, `MNT_NOATIME`,
-/// `MNT_CPROTECT`.
+/// `MNT_SNAPSHOT`, `MNT_CPROTECT`.
 const MNT_RDONLY: u32 = 0x1;
 pub(crate) const MNT_NOSUID: u32 = 0x8;
 const MNT_LOCAL: u32 = 0x1000;
@@ -221,6 +221,7 @@ const MNT_DONTBROWSE: u32 = 0x10_0000;
 const MNT_JOURNALED: u32 = 0x80_0000;
 const MNT_MULTILABEL: u32 = 0x400_0000;
 const MNT_NOATIME: u32 = 0x1000_0000;
+const MNT_SNAPSHOT: u32 = 0x4000_0000;
 const MNT_CPROTECT: u32 = 0x80;
 
 /// The root's flags, as mounting it leaves them:
@@ -241,11 +242,18 @@ const MNT_CPROTECT: u32 = 0x80;
 ///   (0xfffffff0066cd3c4), not the System's.
 /// - No `MNT_NOSUID`: on a `SECURE_KERNEL` without `CONFIG_MNT_SUID` (the
 ///   iOS release configuration) `mount_common` sets it on every mount it
-///   makes or updates, but `vfs_mountroot` does not go through it. No
-///   `MNT_SNAPSHOT`: APFS sets it only on a snapshot mount on a covered
-///   directory (0xfffffff0066ccecc), not on the root it mounts from its
-///   sealed snapshot.
-const ROOT_FLAGS: u32 = MNT_RDONLY | MNT_LOCAL | MNT_ROOTFS | MNT_DOVOLFS | MNT_JOURNALED | MNT_NOATIME | if super::storage::SYSTEM_UNENCRYPTED { 0 } else { MNT_CPROTECT };
+///   makes or updates, but `vfs_mountroot` does not go through it.
+/// - `MNT_SNAPSHOT`: `handle_snapshot_mount` (0xfffffff0066cc5e8), which
+///   mounts the root from the System volume's sealed snapshot, sets it on
+///   every mount it makes, past the root hash's authentication and the
+///   filesystem id (0xfffffff0066ccecc, before the volume's mount body at
+///   0xfffffff0066cd1b4); the covered vnode, none for the root, only goes
+///   to `mac_mount_check_snapshot_mount`. Neither APFS (its
+///   `vfs_clearflags` calls clear `MNT_STRICTATIME`, `MNT_IGNORE_OWNERSHIP`
+///   and `MNT_LOCAL`) nor an update's `mount_common` clears it.
+///   libignition reads it as a sealed boot (an unset one is its "livefs
+///   boot").
+const ROOT_FLAGS: u32 = MNT_RDONLY | MNT_LOCAL | MNT_ROOTFS | MNT_DOVOLFS | MNT_JOURNALED | MNT_NOATIME | MNT_SNAPSHOT | if super::storage::SYSTEM_UNENCRYPTED { 0 } else { MNT_CPROTECT };
 
 /// The root's flags on a system launchd has booted: launchd's boot task
 /// mount-phase-1 runs `/sbin/mount -P 1`, whose entry for "/" in the

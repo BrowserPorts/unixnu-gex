@@ -108,9 +108,10 @@ int main(void) {
     fail |= same("statfs /", &u, &w, 303);
     // The root's flags: the kernel's (read-only, the root, local, from
     // APFS's vfsconf entry) and APFS's (no access times, journaled, volfs
-    // paths), with no content protection on the System volume; and
-    // nosuid, which mount -P 1's update of it gives it on a booted system.
-    unsigned long rootflags = MNT_RDONLY | MNT_LOCAL | MNT_ROOTFS | MNT_DOVOLFS | MNT_JOURNALED | MNT_NOATIME | MNT_NOSUID;
+    // paths, mounted from the sealed snapshot), with no content protection
+    // on the System volume; and nosuid, which mount -P 1's update of it
+    // gives it on a booted system.
+    unsigned long rootflags = MNT_RDONLY | MNT_LOCAL | MNT_ROOTFS | MNT_DOVOLFS | MNT_JOURNALED | MNT_NOATIME | MNT_SNAPSHOT | MNT_NOSUID;
     fail |= w.f_flags != rootflags ? bad("root f_flags", w.f_flags, rootflags) : 0;
 
     fill(&u);

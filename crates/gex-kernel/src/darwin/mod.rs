@@ -63,6 +63,7 @@ pub mod ioctl;
 pub mod filesec;
 pub mod fixedcalls;
 pub mod graft;
+pub mod graftfs;
 pub mod clonefile;
 pub mod pathconf;
 pub mod itimer;

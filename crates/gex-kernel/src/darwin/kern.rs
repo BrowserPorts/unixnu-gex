@@ -420,10 +420,14 @@ pub fn boot_state() -> BootState {
 
 /// The volume the preboot cryptexes are on: what `vnode_lookup` of
 /// `/private/preboot/Cryptexes` finds the mount of, for the shared region's
-/// check of where a cache is (devices without SIP). This root has the OS
-/// cryptex at `/System/Cryptexes/OS`, the mount above standing for the
-/// Preboot volume's graft of it, and no `/private/preboot/Cryptexes`.
+/// check of where a cache is (devices without SIP): the Preboot volume's
+/// mount once one covers it; before that, the OS cryptex's mount at
+/// `/System/Cryptexes/OS`, standing for the booted system's graft of it.
 pub fn preboot_cryptex_volume() -> Option<&'static str> {
+    let m = mount_of("/private/preboot/Cryptexes");
+    if is_preboot(m) {
+        return Some(m.on);
+    }
     mounts().into_iter().find(|m| m.on == "/System/Cryptexes/OS").map(|m| m.on)
 }
 

@@ -746,9 +746,19 @@ is the reference (search `crates/gex-kernel/src/` for
   does (the certificate chain to its DDI root, the signature, the
   certificate's and the chip's constraints against `/chosen`, the payload's
   digest, the cryptex1 boot nonce hash against the measured one); its
-  other chips, APFS's mount of the container in the image with the
-  authentication of its root hash, and the grafts a booted system's
-  Preboot volume has are reported. A mount of the
+  other chips are reported. APFS then mounts the image's container (a raw
+  APFS container, read as Apple's File System Reference defines it, a
+  block at a time, each sealed node and data segment checked against its
+  hash), authenticates its sealed volume's root hash against the
+  evaluated payload (EAUTH, or the kernel's panic with libignition's
+  `PANIC_ON_AUTHFAIL`), and serves the volume at the graft directory with
+  the host's inode numbers and the graft's own device; the Preboot
+  volume's next object identifier, where those numbers start, stands in
+  until measured. Files compressed with LZBITMAP (decmpfs type 14, most of
+  the SystemOS cryptex's compressed files), which has no published
+  specification, are reported where they are read, as are the attribute
+  record a graft leaves on its image on a writable Preboot volume, an
+  ungraft, and the grafts a booted system's Preboot volume has. A mount of the
   Preboot volume has the files the restore leaves there (its root and
   `Cryptexes`), dated when it is first mounted, which stands in for the
   restore's time; the files the device's personalized tickets make (the

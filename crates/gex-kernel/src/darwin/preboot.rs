@@ -203,6 +203,17 @@ pub fn cryptex1_boot_nonce_hash() -> Result<Vec<u8>, String> {
         .collect()
 }
 
+/// How the host's files are read, if the host reads them.
+pub fn host() -> Option<Host> {
+    sources().host
+}
+
+/// What stands in for the Preboot volume's next object identifier
+/// (`apfs_next_obj_id`), where a graft's range of its inode numbers starts:
+/// the next inode number of the volume's files here. A reported shortcut
+/// (storage::unmeasured).
+pub const NEXT_OBJ_ID_STAND_IN: &str = "the Preboot volume's apfs_next_obj_id, where a cryptex graft's inode numbers start (stand-in: the next inode number of the volume's files as this kernel numbers them; measure `stat -f %i` of /private/preboot/Cryptexes/OS/System on the device and its graft's jobj_id range in the kernel log, \"Graft ino %llu, jobj_id range %llu+%llu\")";
+
 fn sources() -> &'static Sources {
     static NONE: OnceLock<Sources> = OnceLock::new();
     SOURCES.get().unwrap_or_else(|| NONE.get_or_init(Sources::default))
@@ -384,12 +395,19 @@ fn lay_cryptex1(fs: &crate::vfs::tmpfs::TmpFs, s: &Sources, t: &[super::iokit::N
     Ok(())
 }
 
+/// The volume's files once made ([`volume`]).
+static VOLUME: OnceLock<Result<Arc<crate::vfs::tmpfs::TmpFs>, String>> = OnceLock::new();
+
+/// The volume's files, if its first mount has made them.
+pub fn made() -> Option<Arc<crate::vfs::tmpfs::TmpFs>> {
+    VOLUME.get().and_then(|r| r.as_ref().ok()).cloned()
+}
+
 /// The volume's files, made at its first mount and kept for the system's
 /// life, as the device keeps them: the directories of [`DIRS`] and the
 /// Cryptex1, each with its attributes' record (what a file made later gets
 /// too). `system` reads a file of the system volume.
 pub fn volume(system: SystemFile<'_>) -> Result<Arc<crate::vfs::tmpfs::TmpFs>, String> {
-    static VOLUME: OnceLock<Result<Arc<crate::vfs::tmpfs::TmpFs>, String>> = OnceLock::new();
     VOLUME
         .get_or_init(|| {
             let fs = crate::vfs::tmpfs::TmpFs::new();

@@ -1,0 +1,772 @@
+//! A cryptex graft as APFS makes and serves it (apfs.kext 2236.140.6 of
+//! iPad7,1 21H461, `apfs_graft` at 0xfffffff00668611c and the vnode
+//! operations' graft cases): the container in the image mounted from the
+//! image file's own blocks, its sealed volume's root hash authenticated
+//! against the payload AppleImage4 evaluated ([`authenticate_root_hash`]),
+//! and the volume's files served at the graft directory ([`GraftFs`]),
+//! with the host volume's inode numbers and a device of the graft's own.
+//!
+//! A graft adds no mount: its vnodes are on the host volume's mount (the
+//! graft's `fs + 0x370` is the host's), so `statfs` of a grafted file
+//! answers for the Preboot volume; `stat`'s device is the graft's
+//! (`apfs_vnop_getattr`'s `va_fsid` takes the graft's `fs + 0x3a8` for a
+//! vnode of a graft, 0xfffffff00668e0f4).
+
+use super::apfsread::{self, fs as afs, Container, IntegrityMeta, Medium, Volume};
+use crate::errno::Errno;
+use crate::vfs::{DirEntry, FileHandle, FileSystem, FileType, Metadata, Times, XattrOp};
+use std::sync::{Arc, Mutex};
+
+/// The image's bytes as APFS reads them: through the graft's blockmap, the
+/// image file's own blocks on the host volume (0xfffffff0067227fc), not
+/// the file's cached pages. A Preboot file the restore copied from the
+/// host is read where the host has it; another, through its handle.
+pub enum ImageMedium {
+    Host { url: String, size: u64, read: crate::vfs::tmpfs::LazyFetch },
+    Handle { handle: Arc<dyn FileHandle>, size: u64 },
+}
+
+impl Medium for ImageMedium {
+    fn size(&self) -> u64 {
+        match self {
+            ImageMedium::Host { size, .. } | ImageMedium::Handle { size, .. } => *size,
+        }
+    }
+    fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<(), String> {
+        let end = off.checked_add(buf.len() as u64).ok_or("an offset past the end")?;
+        if end > self.size() {
+            return Err(format!("bytes {off}..{end} past the image's {} bytes", self.size()));
+        }
+        match self {
+            ImageMedium::Host { url, read, .. } => {
+                if read(url, off, buf) {
+                    Ok(())
+                } else {
+                    Err(format!("{url}: not readable at {off}"))
+                }
+            }
+            ImageMedium::Handle { handle, .. } => {
+                let mut done = 0;
+                while done < buf.len() {
+                    let n = handle.read_at(off + done as u64, &mut buf[done..]).map_err(|e| format!("{e:?}"))? as usize;
+                    if n == 0 {
+                        return Err(format!("the image ends at {}", off + done as u64));
+                    }
+                    done += n;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// `validate_on_disk_root_hash`'s payload: the evaluated `cssy`/`casy`
+/// IM4P's data, exactly 0xd0 bytes: `u32` version, `u32` (not read),
+/// `u32` hash type, `u32` hash size, then three 64-byte root hashes, for
+/// containers of 4 KiB, 8 KiB and 16 KiB blocks (`authapfs_select_root_hash`,
+/// 0xfffffff006643424: +0x10, +0x50 for 0x2000, +0x90 for 0x4000).
+pub const ROOT_HASH_PAYLOAD_SIZE: usize = 0xd0;
+
+/// The root hash of `payload` for a container of `block_size`-byte blocks.
+pub fn select_root_hash(payload: &[u8], block_size: u32) -> &[u8] {
+    let at = match block_size {
+        0x2000 => 0x50,
+        0x4000 => 0x90,
+        _ => 0x10,
+    };
+    &payload[at..]
+}
+
+/// `validate_on_disk_root_hash` (in `authenticate_root_hash`,
+/// 0xfffffff0066cdcac..0xfffffff0066cde48): the payload's size, then its
+/// version, hash type and hash size against the integrity metadata's,
+/// then the hash; each mismatch is EAUTH, with what APFS logs.
+pub fn validate_on_disk_root_hash(im: &IntegrityMeta, payload: &[u8], block_size: u32) -> Result<(), String> {
+    let u32_at = |o: usize| u32::from_le_bytes(payload[o..o + 4].try_into().unwrap());
+    if payload.len() != ROOT_HASH_PAYLOAD_SIZE {
+        return Err(format!("root_hash size mismatch, expected {} but got {}", payload.len(), im.hash_type.size()));
+    }
+    if u32_at(0) != im.version {
+        return Err(format!("invalid root_hash header - payload version <{}> != on-disk version <{}>", u32_at(0), im.version));
+    }
+    if u32_at(8) != im.hash_type.code() {
+        return Err(format!("invalid root_hash header - payload hash type <{}> != on-disk hash type <{}>", u32_at(8), im.hash_type.code()));
+    }
+    let size = u32_at(0xc);
+    if size as usize != im.hash_type.size() {
+        return Err(format!("invalid root_hash header - payload hash size <{size}> != on-disk hash size <{}>", im.hash_type.size()));
+    }
+    let hash = &select_root_hash(payload, block_size)[..size as usize];
+    if hash != &im.root_hash[..] {
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        return Err(format!("root_hash mismatch, expected {} but got {}", hex(&im.root_hash), hex(hash)));
+    }
+    Ok(())
+}
+
+/// What `authenticate_root_hash` decides.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Auth {
+    Ok,
+    /// EAUTH (80), and what APFS logs.
+    Eauth(String),
+    /// The kernel panics with this message.
+    Panic(String),
+}
+
+/// `authenticate_root_hash` (0xfffffff0066cdaec) of a graft (volume type 4,
+/// or 5 for `FSCTL_GRAFT_STRICT_AUTH`, both of the types it authenticates
+/// whatever the mount): whether authentication is required
+/// (`is_root_hash_authentication_required`, [`authentication_required`]);
+/// a broken seal (`authapfs_seal_is_broken_full`: `APFS_SEAL_BROKEN`);
+/// no authenticated payload (the evaluation failed: "could not authenticate
+/// personalized root hash"); then [`validate_on_disk_root_hash`]. Each
+/// failure is EAUTH when required (success when not), and the kernel's
+/// panic when required with `FSCTL_GRAFT_PANIC_ON_AUTHFAIL`.
+pub fn authenticate_root_hash(required: bool, panic_on_authfail: bool, im: &IntegrityMeta, payload: Option<&[u8]>, status: i32, block_size: u32, case_insensitive: bool) -> Auth {
+    let fail = |log: String, panic: String| {
+        if required && panic_on_authfail {
+            Auth::Panic(panic)
+        } else if required {
+            Auth::Eauth(log)
+        } else {
+            Auth::Ok
+        }
+    };
+    if im.seal_broken() {
+        return fail("volume seal is broken".into(), "volume seal is broken".into());
+    }
+    let Some(payload) = payload.filter(|p| !p.is_empty()) else {
+        return fail("could not authenticate personalized root hash, skipping verification".into(), format!("could not authenticate personalized root hash! ({status}) (0x0, 0)"));
+    };
+    match validate_on_disk_root_hash(im, payload, block_size) {
+        Ok(()) => Auth::Ok,
+        Err(why) => {
+            // The panic names the error: EAUTH's string. A case-insensitive
+            // volume's panics as "APFSX".
+            let prefix = if case_insensitive { "APFSX: " } else { "" };
+            fail(format!("validate_on_disk_root_hash failed with error: Authentication error (80): {why}"), format!("{prefix}could not validate root hash Authentication error (80)"))
+        }
+    }
+}
+
+/// `is_root_hash_authentication_required_ios` (0xfffffff0066cd968): always,
+/// but for a Recovery volume (role 4) booted with the `arp0` boot-arg
+/// (NeRD), whose boot-args are not modelled (`None`: reported).
+pub fn authentication_required(role: u16) -> Option<bool> {
+    const APFS_VOL_ROLE_RECOVERY: u16 = 0x0004;
+    if role == APFS_VOL_ROLE_RECOVERY {
+        return None;
+    }
+    Some(true)
+}
+
+/// The kernel's errno of a read failure in a graft, and the gap to report
+/// where this reader does not implement what the image holds.
+fn errno_of(e: &apfsread::Error, what: &str) -> Errno {
+    match e {
+        apfsread::Error::Unsupported(u) => {
+            super::note_unimplemented(format!("APFS's {what} in a cryptex graft: {u}"));
+            Errno::EIO
+        }
+        apfsread::Error::Integrity(i) => {
+            super::note_unimplemented(format!("APFS's error for {what} in a cryptex graft whose sealed data does not match its hashes ({i})"));
+            Errno::EIO
+        }
+        apfsread::Error::Io(_) | apfsread::Error::Malformed(_) => {
+            super::note_unimplemented(format!("APFS's error for {what} in a cryptex graft: {e}"));
+            Errno::EIO
+        }
+    }
+}
+
+/// `VNODE_ATTR` flags the graft's vnodes answer (`apfs_vnop_getattr`'s
+/// `va_flags`, 0xfffffff00668e134): the inode's BSD flags, the top two
+/// bits cleared, or the top one alone for a compressed file.
+pub fn va_flags(bsd_flags: u32) -> u32 {
+    bsd_flags & if bsd_flags & afs::UF_COMPRESSED != 0 { 0x7fff_ffff } else { 0x3fff_ffff }
+}
+
+/// The graft's volume, served at the graft directory: the image's files
+/// under the host's inode numbers (an object `n` of the image is the host's
+/// `base + n`, the image's root the graft directory's own,
+/// 0xfffffff00668de64..0xfffffff00668de88 and 0xfffffff00668e270) and the
+/// graft's device.
+pub struct GraftFs {
+    pub vol: Volume,
+    /// The first of the host volume's object identifiers the graft holds
+    /// (the graft state's +0x20), and how many (+0x28).
+    pub base: u64,
+    pub len: u64,
+    /// The graft directory's inode number, and its parent's.
+    pub dir_ino: u64,
+    pub dir_parent_ino: u64,
+    /// The graft's device (its `fs + 0x3a8`).
+    pub devt: u32,
+}
+
+impl GraftFs {
+    /// The host's inode number of image object `oid`.
+    pub fn ino_of(&self, oid: u64) -> u64 {
+        match oid {
+            afs::ROOT_DIR_INO_NUM => self.dir_ino,
+            afs::ROOT_DIR_PARENT => self.dir_parent_ino,
+            o => self.base + o,
+        }
+    }
+
+    /// The image object an inode number names, if it is the graft's.
+    pub fn oid_of(&self, ino: u64) -> Option<u64> {
+        if ino == self.dir_ino {
+            return Some(afs::ROOT_DIR_INO_NUM);
+        }
+        ino.checked_sub(self.base).filter(|o| *o < self.len && *o > afs::ROOT_DIR_INO_NUM)
+    }
+
+    /// The inode `rel` names (relative to the graft's root), the final
+    /// link followed with `follow`. A link among the directories, or at
+    /// the end, is followed where its target is inside the graft.
+    fn resolve(&self, rel: &str, follow: bool) -> Result<afs::Inode, Errno> {
+        let mut parts: Vec<String> = rel.split('/').filter(|p| !p.is_empty() && *p != ".").map(str::to_string).collect();
+        let mut hops = 0;
+        'again: loop {
+            let mut stack: Vec<afs::Inode> = Vec::new();
+            let mut cur = self.inode(afs::ROOT_DIR_INO_NUM)?;
+            for (i, p) in parts.iter().enumerate() {
+                if p == ".." {
+                    if let Some(up) = stack.pop() {
+                        cur = up;
+                    }
+                    continue;
+                }
+                if !cur.is_dir() {
+                    return Err(Errno::ENOTDIR);
+                }
+                let e = self.vol.lookup(cur.oid, p).map_err(|e| errno_of(&e, "lookup"))?.ok_or(Errno::ENOENT)?;
+                let next = self.inode(e.file_id)?;
+                let last = i + 1 == parts.len();
+                if next.kind() == afs::mode::S_IFLNK && (!last || follow) {
+                    hops += 1;
+                    if hops > 32 {
+                        return Err(Errno::ELOOP);
+                    }
+                    let target = self.vol.symlink_target(&next).map_err(|e| errno_of(&e, "readlink"))?;
+                    if target.starts_with('/') {
+                        super::note_unimplemented(format!("a link in a cryptex graft to {target}, outside the graft"));
+                        return Err(Errno::ENOENT);
+                    }
+                    let mut base: Vec<String> = parts[..i].to_vec();
+                    base.extend(target.split('/').filter(|p| !p.is_empty() && *p != ".").map(str::to_string));
+                    base.extend(parts[i + 1..].iter().cloned());
+                    parts = base;
+                    continue 'again;
+                }
+                stack.push(std::mem::replace(&mut cur, next));
+            }
+            return Ok(cur);
+        }
+    }
+
+    fn inode(&self, oid: u64) -> Result<afs::Inode, Errno> {
+        self.vol.inode(oid).map_err(|e| errno_of(&e, "inode read"))?.ok_or_else(|| {
+            super::note_unimplemented(format!("APFS's error for a directory entry of a cryptex graft naming the missing inode {oid:#x}"));
+            Errno::EIO
+        })
+    }
+
+    /// What `stat` says of an inode ([`va_flags`] aside): its type and
+    /// permissions, size, inode number, times, links.
+    pub fn metadata_of(&self, ino: &afs::Inode) -> Result<Metadata, Errno> {
+        let file_type = match ino.kind() {
+            afs::mode::S_IFREG => FileType::Regular,
+            afs::mode::S_IFDIR => FileType::Directory,
+            afs::mode::S_IFLNK => FileType::Symlink,
+            afs::mode::S_IFIFO => FileType::Fifo,
+            afs::mode::S_IFSOCK => FileType::Socket,
+            k => {
+                super::note_unimplemented(format!("a cryptex graft's inode {:#x} of type {k:#o} (a device node: its rdev)", ino.oid));
+                return Err(Errno::EIO);
+            }
+        };
+        let size = self.vol.file_size(ino).map_err(|e| errno_of(&e, "getattr"))?;
+        let nlink = if ino.is_dir() {
+            // 0xfffffff00669f2d8: a directory's children and two, unless
+            // the volume keeps its links another way.
+            if self.vol.sb.incompat & 0x200 != 0 || self.vol.sb.ro_compat & 0x2 != 0 {
+                super::note_unimplemented(format!("a cryptex graft directory's link count on a volume with features {:#x}/{:#x}", self.vol.sb.incompat, self.vol.sb.ro_compat));
+                return Err(Errno::EIO);
+            }
+            (i64::from(ino.nchildren_or_nlink) + 2) as u32
+        } else {
+            ino.nchildren_or_nlink as u32
+        };
+        let t = |ns: u64| ((ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as u32);
+        let (m, mn) = t(ino.mod_time);
+        let (a, an) = t(ino.access_time);
+        let (c, cn) = t(ino.change_time);
+        Ok(Metadata {
+            file_type,
+            size,
+            mode: u32::from(ino.mode) & 0o7777,
+            ino: self.ino_of(ino.oid),
+            mtime: m,
+            nlink,
+            rdev: 0,
+            times: Times { mtime_ns: mn, atime: a, atime_ns: an, ctime: c, ctime_ns: cn },
+        })
+    }
+
+    /// The record of an inode's owner, group, mode and flags
+    /// ([`super::vattr::RECORD`]): the image's.
+    pub fn owned_of(ino: &afs::Inode) -> super::vattr::Owned {
+        super::vattr::Owned { uid: ino.owner, gid: ino.group, mode: u32::from(ino.mode) & 0o7777, flags: va_flags(ino.bsd_flags) }
+    }
+
+    /// An inode's extended attributes a caller sees: decmpfs hides a
+    /// compressed file's own (`decmpfs_hides_xattr`: `com.apple.decmpfs`
+    /// and the resource fork).
+    fn visible_xattrs(&self, ino: &afs::Inode) -> Result<Vec<afs::Xattr>, Errno> {
+        let all = self.vol.xattrs(ino.oid).map_err(|e| errno_of(&e, "listxattr"))?;
+        Ok(all.into_iter().filter(|x| !(ino.compressed() && (x.name == afs::DECMPFS_XATTR_NAME || x.name == afs::RESOURCEFORK_NAME))).collect())
+    }
+
+    fn xattr_op(&self, ino: &afs::Inode, op: XattrOp<'_>) -> Result<usize, Errno> {
+        fn out(buf: &mut [u8], bytes: &[u8]) -> Result<usize, Errno> {
+            if buf.is_empty() {
+                return Ok(bytes.len());
+            }
+            if buf.len() < bytes.len() {
+                return Err(Errno::ERANGE);
+            }
+            buf[..bytes.len()].copy_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        match op {
+            XattrOp::Get { name, buf } if name == super::vattr::RECORD => out(buf, Self::owned_of(ino).record().as_bytes()),
+            XattrOp::Get { name, buf } => {
+                let Some(name) = name.strip_prefix("user.") else { return Err(Errno::ENODATA) };
+                let x = self.visible_xattrs(ino)?.into_iter().find(|x| x.name == name).ok_or(Errno::ENODATA)?;
+                let v = self.vol.xattr_value(&x).map_err(|e| errno_of(&e, "getxattr"))?;
+                out(buf, &v)
+            }
+            XattrOp::List { buf } => {
+                let mut all = Vec::new();
+                for x in self.visible_xattrs(ino)? {
+                    all.extend_from_slice(b"user.");
+                    all.extend_from_slice(x.name.as_bytes());
+                    all.push(0);
+                }
+                out(buf, &all)
+            }
+            XattrOp::Set { .. } | XattrOp::Remove { .. } => {
+                super::note_unimplemented("APFS's error for a change to an extended attribute of a cryptex graft's file (its read-only sealed volume)".to_string());
+                Err(Errno::EROFS)
+            }
+        }
+    }
+
+    fn entries(&self, dir: &afs::Inode) -> Result<Vec<DirEntry>, Errno> {
+        let mut out = vec![
+            DirEntry { name: ".".into(), file_type: FileType::Directory, ino: self.ino_of(dir.oid) },
+            DirEntry { name: "..".into(), file_type: FileType::Directory, ino: self.ino_of(dir.parent_id) },
+        ];
+        for e in self.vol.dir_entries(dir.oid).map_err(|e| errno_of(&e, "readdir"))? {
+            let file_type = match e.dtype {
+                8 => FileType::Regular,
+                4 => FileType::Directory,
+                10 => FileType::Symlink,
+                1 => FileType::Fifo,
+                12 => FileType::Socket,
+                2 => FileType::CharDevice,
+                6 => FileType::BlockDevice,
+                t => {
+                    super::note_unimplemented(format!("a cryptex graft's directory entry {:?} of type {t}", e.name));
+                    return Err(Errno::EIO);
+                }
+            };
+            out.push(DirEntry { name: e.name, file_type, ino: self.ino_of(e.file_id) });
+        }
+        Ok(out)
+    }
+}
+
+/// An open file or directory of a graft.
+pub struct GraftHandle {
+    fs: Arc<GraftFs>,
+    ino: afs::Inode,
+}
+
+impl std::fmt::Debug for GraftHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "GraftHandle({:#x})", self.ino.oid)
+    }
+}
+
+impl FileHandle for GraftHandle {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> crate::errno::SysResult {
+        match self.ino.kind() {
+            afs::mode::S_IFDIR => Err(Errno::EISDIR),
+            afs::mode::S_IFREG => self.fs.vol.read_file(&self.ino, offset, buf).map(|n| n as u64).map_err(|e| errno_of(&e, "read")),
+            _ => Err(Errno::EINVAL),
+        }
+    }
+    fn write_at(&self, _offset: u64, _buf: &[u8]) -> crate::errno::SysResult {
+        Err(Errno::EBADF)
+    }
+    fn metadata(&self) -> Result<Metadata, Errno> {
+        self.fs.metadata_of(&self.ino)
+    }
+    fn read_dir(&self) -> Result<Vec<DirEntry>, Errno> {
+        if !self.ino.is_dir() {
+            return Err(Errno::ENOTDIR);
+        }
+        self.fs.entries(&self.ino)
+    }
+    fn xattr(&self, op: XattrOp<'_>) -> Option<Result<usize, Errno>> {
+        Some(self.fs.xattr_op(&self.ino, op))
+    }
+    fn chmod(&self, _mode: u32) -> Option<Result<(), Errno>> {
+        super::note_unimplemented("APFS's error for a chmod of a cryptex graft's file (its read-only sealed volume)".to_string());
+        Some(Err(Errno::EROFS))
+    }
+}
+
+/// The graft as a filesystem of the namespace, mounted on the graft
+/// directory's path.
+pub struct GraftMount(pub Arc<GraftFs>);
+
+impl FileSystem for GraftMount {
+    fn fs_type(&self) -> &'static str {
+        "apfs"
+    }
+    fn open(&self, path: &str, flags: u64, _mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
+        if flags & crate::fs::oflags::O_CREAT != 0 || crate::vfs::writes(flags) {
+            let ino = self.0.resolve(path, true);
+            if ino.is_err() && flags & crate::fs::oflags::O_CREAT == 0 {
+                return Err(ino.err().unwrap());
+            }
+            if ino.as_ref().is_ok_and(|i| i.is_dir()) {
+                return Err(Errno::EISDIR);
+            }
+            super::note_unimplemented(format!("APFS's error for an open of {path} in a cryptex graft to write (its read-only sealed volume)"));
+            return Err(Errno::EROFS);
+        }
+        let ino = self.0.resolve(path, true)?;
+        Ok(Arc::new(GraftHandle { fs: Arc::clone(&self.0), ino }))
+    }
+    fn metadata(&self, path: &str) -> Result<Metadata, Errno> {
+        let ino = self.0.resolve(path, true)?;
+        self.0.metadata_of(&ino)
+    }
+    fn metadata_nofollow(&self, path: &str) -> Result<Metadata, Errno> {
+        let ino = self.0.resolve(path, false)?;
+        self.0.metadata_of(&ino)
+    }
+    fn read_link(&self, path: &str) -> Result<String, Errno> {
+        let ino = self.0.resolve(path, false)?;
+        if ino.kind() != afs::mode::S_IFLNK {
+            return Err(Errno::EINVAL);
+        }
+        self.0.vol.symlink_target(&ino).map_err(|e| errno_of(&e, "readlink"))
+    }
+    fn xattr(&self, path: &str, op: XattrOp<'_>) -> Result<usize, Errno> {
+        let ino = self.0.resolve(path, false)?;
+        self.0.xattr_op(&ino, op)
+    }
+    fn chmod(&self, path: &str, _mode: u32) -> Result<(), Errno> {
+        self.0.resolve(path, true)?;
+        super::note_unimplemented(format!("APFS's error for a chmod of {path} in a cryptex graft (its read-only sealed volume)"));
+        Err(Errno::EROFS)
+    }
+    fn set_mtime(&self, path: &str, _secs: i64) -> Result<(), Errno> {
+        self.0.resolve(path, true)?;
+        super::note_unimplemented(format!("APFS's error for a change of the times of {path} in a cryptex graft (its read-only sealed volume)"));
+        Err(Errno::EROFS)
+    }
+    fn path_of_ino(&self, ino: u64) -> Option<String> {
+        let oid = self.0.oid_of(ino)?;
+        let p = self.0.vol.path_of(oid).ok().flatten()?;
+        Some(p.trim_start_matches('/').to_string())
+    }
+}
+
+/// A graft made: what APFS keeps of it (`apfs_graft_state_t`, 0x50 bytes,
+/// and the graft's fs).
+pub struct Graft {
+    /// The host volume's slot in the container, and its device.
+    pub host_volume: u32,
+    pub host_devt: u32,
+    /// The image file (canonical path, inode number) and the graft
+    /// directory (canonical path, inode number).
+    pub file_path: String,
+    pub file_ino: u64,
+    pub dir_path: String,
+    pub dir_ino: u64,
+    /// `FSCTL_GRAFT_*`.
+    pub flags: u64,
+    pub fs: Arc<GraftFs>,
+}
+
+/// The grafts made, in the order they were (APFS keeps each host volume's
+/// in its `fs + 0x2228` list, sorted by range: the order here is not
+/// asked of it).
+static GRAFTS: Mutex<Vec<Arc<Graft>>> = Mutex::new(Vec::new());
+
+/// Each host volume's graft device counter (its `fs + 0x2224`) and the
+/// identifiers a read-only host has handed out to grafts (`fs + 0x2240`).
+static COUNTERS: Mutex<Vec<(u32, u8, u64)>> = Mutex::new(Vec::new());
+
+/// `MAX_GRAFTS`: `apfs_graft`'s limit of grafts on a volume (EBUSY at it).
+pub const MAX_GRAFTS: usize = 255;
+
+/// Every graft made.
+pub fn grafts() -> Vec<Arc<Graft>> {
+    GRAFTS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// The grafts on host volume `volume`.
+pub fn grafts_on(volume: u32) -> Vec<Arc<Graft>> {
+    grafts().into_iter().filter(|g| g.host_volume == volume).collect()
+}
+
+fn within(path: &str, at: &str) -> bool {
+    path == at || path.strip_prefix(at).is_some_and(|r| r.starts_with('/'))
+}
+
+/// The graft canonical path `path` is in (the graft directory itself
+/// included).
+pub fn graft_at(path: &str) -> Option<Arc<Graft>> {
+    grafts().into_iter().filter(|g| within(path, &g.dir_path)).max_by_key(|g| g.dir_path.len())
+}
+
+/// The device `stat` gives a vnode at canonical path `path` in a graft.
+pub fn devt_at(path: &str) -> Option<u32> {
+    graft_at(path).map(|g| g.fs.devt)
+}
+
+/// A graft's device (0xfffffff0066876fc): the host's, its second byte the
+/// host's next graft number (1 to 255, 0 skipped), tried once for each
+/// graft the host has and once more, skipping a number a graft has; EBUSY
+/// when every try is taken. Returns the device and the counter left.
+pub fn graft_devt(host_devt: u32, counter: u8, taken: &[u32]) -> (Option<u32>, u8) {
+    let mut c = counter;
+    let mut dev = 0;
+    for _ in 0..=taken.len() {
+        c = if c == 0xff { 1 } else { c + 1 };
+        dev = (host_devt & 0xff00_ffff) | (u32::from(c) << 16);
+        if !taken.contains(&dev) {
+            return (Some(dev), c);
+        }
+    }
+    let _ = dev;
+    (None, c)
+}
+
+/// `allocate_graft_jobj_range` (0xfffffff00668747c)'s check of a range of
+/// `len` after the host's next object identifier `next`: ERANGE when it
+/// overflows or passes `0x0fffffff00000000`.
+pub fn jobj_range_ok(next: u64, len: u64) -> Result<(), i32> {
+    match next.checked_add(len) {
+        Some(end) if end < 0x0fff_ffff_0000_0001 => Ok(()),
+        _ => Err(34),
+    }
+}
+
+/// The host volume's graft counters: its device counter and what a
+/// read-only mount has handed out.
+pub fn counters(volume: u32) -> (u8, u64) {
+    let g = COUNTERS.lock().unwrap_or_else(|e| e.into_inner());
+    g.iter().find(|c| c.0 == volume).map_or((0, 0), |c| (c.1, c.2))
+}
+
+fn set_counters(volume: u32, devc: u8, handed: u64) {
+    let mut g = COUNTERS.lock().unwrap_or_else(|e| e.into_inner());
+    match g.iter_mut().find(|c| c.0 == volume) {
+        Some(c) => (c.1, c.2) = (devc, handed),
+        None => g.push((volume, devc, handed)),
+    }
+}
+
+/// Record a graft made, with the host volume's counters as it left them.
+pub fn add(g: Graft, devc: u8, handed: u64) -> Arc<Graft> {
+    set_counters(g.host_volume, devc, handed);
+    let g = Arc::new(g);
+    GRAFTS.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::clone(&g));
+    g
+}
+
+/// Open the container in an image and its volume at fs index 0
+/// (`apfs_graft`'s nx mount, 0xfffffff006738928, and apfs mount,
+/// 0xfffffff006716274): none at index 0 is ENOENT.
+pub fn mount_image(medium: Arc<dyn Medium>) -> Result<Result<Volume, i32>, apfsread::Error> {
+    let c = Arc::new(Container::open(medium)?);
+    match c.volume(0)? {
+        Some(v) => Ok(Ok(v)),
+        None => Ok(Err(2)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use apfsread::HashType;
+
+    fn im(version: u32, hash: Vec<u8>) -> IntegrityMeta {
+        IntegrityMeta { version, flags: 0, hash_type: HashType::Sha256, broken_xid: 0, root_hash: hash }
+    }
+
+    fn payload(version: u32, t: u32, size: u32, at: usize, hash: &[u8]) -> Vec<u8> {
+        let mut p = vec![0u8; ROOT_HASH_PAYLOAD_SIZE];
+        p[0..4].copy_from_slice(&version.to_le_bytes());
+        p[8..12].copy_from_slice(&t.to_le_bytes());
+        p[12..16].copy_from_slice(&size.to_le_bytes());
+        p[at..at + hash.len()].copy_from_slice(hash);
+        p
+    }
+
+    /// The header first (version, type, size), then the hash of the
+    /// container's block size.
+    #[test]
+    fn the_payload_is_checked_in_its_order() {
+        let h = vec![7u8; 32];
+        let m = im(2, h.clone());
+        assert_eq!(validate_on_disk_root_hash(&m, &payload(2, 1, 32, 0x10, &h), 4096), Ok(()));
+        assert!(validate_on_disk_root_hash(&m, &payload(2, 1, 32, 0x10, &h)[..0xcf], 4096).unwrap_err().contains("size mismatch"));
+        assert!(validate_on_disk_root_hash(&m, &payload(1, 1, 32, 0x10, &h), 4096).unwrap_err().contains("payload version <1>"));
+        assert!(validate_on_disk_root_hash(&m, &payload(2, 3, 32, 0x10, &h), 4096).unwrap_err().contains("hash type <3>"));
+        assert!(validate_on_disk_root_hash(&m, &payload(2, 1, 48, 0x10, &h), 4096).unwrap_err().contains("hash size <48>"));
+        assert!(validate_on_disk_root_hash(&m, &payload(2, 1, 32, 0x10, &[8u8; 32]), 4096).unwrap_err().contains("root_hash mismatch"));
+        // 8 KiB and 16 KiB containers read their own slots.
+        assert_eq!(validate_on_disk_root_hash(&m, &payload(2, 1, 32, 0x50, &h), 0x2000), Ok(()));
+        assert_eq!(validate_on_disk_root_hash(&m, &payload(2, 1, 32, 0x90, &h), 0x4000), Ok(()));
+        assert!(validate_on_disk_root_hash(&m, &payload(2, 1, 32, 0x50, &h), 4096).is_err());
+    }
+
+    /// libignition's 0x2d asks for a panic on failure; without it the
+    /// failure is EAUTH; a volume that needs none passes.
+    #[test]
+    fn a_failure_panics_or_is_eauth() {
+        let h = vec![7u8; 32];
+        let m = im(2, h.clone());
+        let good = payload(2, 1, 32, 0x10, &h);
+        assert_eq!(authenticate_root_hash(true, true, &m, Some(&good), 0, 4096, false), Auth::Ok);
+        assert!(matches!(authenticate_root_hash(true, true, &m, None, 79, 4096, false), Auth::Panic(p) if p.contains("could not authenticate personalized root hash! (79)")));
+        assert!(matches!(authenticate_root_hash(true, false, &m, None, 79, 4096, false), Auth::Eauth(_)));
+        assert_eq!(authenticate_root_hash(false, true, &m, None, 79, 4096, false), Auth::Ok);
+        let bad = payload(2, 1, 32, 0x10, &[8u8; 32]);
+        assert!(matches!(authenticate_root_hash(true, true, &m, Some(&bad), 0, 4096, false), Auth::Panic(p) if p == "could not validate root hash Authentication error (80)"));
+        assert!(matches!(authenticate_root_hash(true, false, &m, Some(&bad), 0, 4096, false), Auth::Eauth(_)));
+        let mut broken = m.clone();
+        broken.flags = apfsread::APFS_SEAL_BROKEN;
+        assert!(matches!(authenticate_root_hash(true, false, &broken, Some(&good), 0, 4096, false), Auth::Eauth(e) if e.contains("seal is broken")));
+    }
+
+    #[test]
+    fn graft_devices_take_the_hosts_next_number() {
+        let host = 0x0100_0005;
+        assert_eq!(graft_devt(host, 0, &[]), (Some(0x0101_0005), 1));
+        assert_eq!(graft_devt(host, 1, &[0x0101_0005]), (Some(0x0102_0005), 2));
+        // Past 255 the number starts over at 1, skipping 0 and what is taken.
+        assert_eq!(graft_devt(host, 0xff, &[]), (Some(0x0101_0005), 1));
+        assert_eq!(graft_devt(host, 0xfe, &[0x01ff_0005]), (Some(0x0101_0005), 1));
+        assert_eq!(graft_devt(host, 0, &[0x0101_0005]), (Some(0x0102_0005), 2));
+        assert_eq!(graft_devt(0x01ab_0005, 0, &[]), (Some(0x0101_0005), 1));
+    }
+
+    #[test]
+    fn graft_ranges_stay_below_the_system_identifiers() {
+        assert_eq!(jobj_range_ok(0x1000, 0x2000), Ok(()));
+        assert_eq!(jobj_range_ok(0x0fff_fff0_0000_0000, 0x1_0000_0000), Ok(()));
+        assert_eq!(jobj_range_ok(0x0fff_fff0_0000_0000, 0xf_0000_0001), Err(34));
+        assert_eq!(jobj_range_ok(u64::MAX, 1), Err(34));
+        // The range may end at 0x0fffffff00000000, not past it.
+        assert_eq!(jobj_range_ok(0x0fff_fffe_ffff_ffff, 1), Ok(()));
+        assert_eq!(jobj_range_ok(0x0fff_ffff_0000_0000, 1), Err(34));
+    }
+
+    #[test]
+    fn flags_keep_their_low_bits() {
+        assert_eq!(va_flags(0xffff_ffff), 0x7fff_ffff);
+        assert_eq!(va_flags(0xffff_ffdf), 0x3fff_ffdf);
+        assert_eq!(va_flags(0x20), 0x20);
+        assert_eq!(va_flags(0), 0);
+    }
+
+    fn os_image() -> (Volume, Vec<u8>) {
+        let dir = std::env::var("GEX_DARWIN_RESTORE").expect("GEX_DARWIN_RESTORE");
+        let f = std::fs::File::open(format!("{dir}/044-76034-038.dmg")).unwrap();
+        let n = f.metadata().unwrap().len();
+        let v = mount_image(Arc::new(super::super::apfsread::tests_support::HostFile(f, n))).unwrap().unwrap();
+        let im4p = std::fs::read(format!("{dir}/Firmware/044-76034-038.dmg.root_hash")).unwrap();
+        (v, im4p)
+    }
+
+    /// The SystemOS cryptex's sealed volume against the IPSW's
+    /// os.dmg.root_hash payload (the IM4P's data, which is what a ticket's
+    /// evaluation authenticates): the root hash validates, and a payload
+    /// with one bit changed does not.
+    #[test]
+    #[ignore = "needs GEX_DARWIN_RESTORE's 044-76034-038.dmg and its root_hash (21H461)"]
+    fn the_os_cryptex_root_hash_validates() {
+        let (v, im4p) = os_image();
+        let p = super::super::image4::init_as_payload(&im4p).unwrap().data.unwrap().to_vec();
+        assert_eq!(p.len(), ROOT_HASH_PAYLOAD_SIZE);
+        let m = v.integrity().unwrap().unwrap();
+        let bs = v.container.block_size();
+        assert_eq!(validate_on_disk_root_hash(&m, &p, bs), Ok(()));
+        assert_eq!(authenticate_root_hash(true, true, &m, Some(&p), 0, bs, false), Auth::Ok);
+        let mut bad = p.clone();
+        bad[0x20] ^= 1;
+        assert!(matches!(authenticate_root_hash(true, true, &m, Some(&bad), 0, bs, false), Auth::Panic(_)));
+        // The root hash is the SHA-256 of the file-system tree's root node.
+        assert_eq!(m.root_hash, HashType::Sha256.digest(&v.container.read_raw(v.omap.lookup(&v.container, v.sb.root_tree_oid, v.container.xid()).unwrap().unwrap().paddr).unwrap()));
+    }
+
+    /// The graft's files as the namespace sees them: the shared cache's
+    /// header read, owners and modes from the image, inode numbers in the
+    /// host's range, a listing with the dots, links followed.
+    #[test]
+    #[ignore = "needs GEX_DARWIN_RESTORE's 044-76034-038.dmg (21H461)"]
+    fn the_graft_serves_the_images_files() {
+        let (vol, _) = os_image();
+        let len = vol.sb.next_obj_id;
+        let g = Arc::new(GraftFs { vol, base: 1000, len, dir_ino: 20, dir_parent_ino: 19, devt: 0x0101_0005 });
+        let m = GraftMount(Arc::clone(&g));
+        let root = m.metadata("").unwrap();
+        assert_eq!((root.ino, root.file_type), (20, FileType::Directory));
+        let path = "System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64";
+        let md = m.metadata(path).unwrap();
+        assert!(md.ino > 1000 && md.ino < 1000 + len);
+        assert_eq!(md.mode, 0o755);
+        let h = m.open(path, 0, 0).unwrap();
+        let mut b = [0u8; 16];
+        assert_eq!(h.read_at(0, &mut b).unwrap(), 16);
+        assert_eq!(&b, b"dyld_v1   arm64\0");
+        let mut rec = [0u8; 64];
+        let n = m.xattr(path, XattrOp::Get { name: super::super::vattr::RECORD, buf: &mut rec }).unwrap();
+        assert_eq!(super::super::vattr::Owned::parse(&rec[..n]).unwrap(), super::super::vattr::Owned { uid: 0, gid: 80, mode: 0o755, flags: 0 });
+        let list = m.open("System/Library/Caches/com.apple.dyld", 0, 0).unwrap().read_dir().unwrap();
+        assert_eq!(&list[0].name, ".");
+        assert_eq!(&list[1].name, "..");
+        assert!(list.iter().any(|e| e.name == "dyld_shared_cache_arm64" && e.ino == md.ino));
+        assert_eq!(m.path_of_ino(md.ino).as_deref(), Some(path));
+        assert_eq!(m.read_link("usr/lib/libstdc++.dylib").unwrap(), "libstdc++.6.dylib");
+        let lib = m.metadata("usr/lib/libstdc++.dylib").unwrap();
+        let real = m.metadata("usr/lib/libstdc++.6.0.9.dylib").unwrap();
+        assert_eq!((lib.ino, lib.size, lib.file_type), (real.ino, real.size, FileType::Regular));
+        assert_eq!(m.metadata_nofollow("usr/lib/libstdc++.dylib").unwrap().file_type, FileType::Symlink);
+        assert_eq!(m.metadata("no/such").unwrap_err(), Errno::ENOENT);
+        assert_eq!(m.metadata(&format!("{path}/x")).unwrap_err(), Errno::ENOTDIR);
+        assert_eq!(m.open(path, crate::fs::oflags::O_RDWR, 0).unwrap_err(), Errno::EROFS);
+        // A compressed file's size is its decmpfs size, and its own
+        // attributes are hidden.
+        let ctx = "System/Library/PrivateFrameworks/WebCore.framework/ContentFilterBlockedPage.html";
+        let cmd = m.metadata(ctx).unwrap();
+        assert!(cmd.size > 0);
+        let mut names = vec![0u8; 256];
+        let n = m.xattr(ctx, XattrOp::List { buf: &mut names }).unwrap();
+        assert!(!String::from_utf8_lossy(&names[..n]).contains("decmpfs"));
+        let mut page = vec![0u8; cmd.size as usize];
+        assert_eq!(m.open(ctx, 0, 0).unwrap().read_at(0, &mut page).unwrap(), cmd.size);
+    }
+}

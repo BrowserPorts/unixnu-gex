@@ -1307,6 +1307,31 @@ impl TmpFs {
         persist::late_laid(&mut inner, &path, ino);
     }
 
+    /// Where a lazy file's bytes are ([`TmpFs::add_lazy`]) and its size,
+    /// while it is one (not yet made an ordinary file by a write).
+    pub fn lazy_source(&self, path: &str) -> Option<(String, u64)> {
+        let path = path.trim_start_matches('/');
+        let inner = self.inner.lock().unwrap();
+        match inner.nodes.get(path) {
+            Some(Node::File(f)) => f.lazy.lock().unwrap().as_ref().map(|l| (l.url.clone(), l.size)),
+            _ => None,
+        }
+    }
+
+    /// Take `n` inode numbers from the ones files will be made with: the
+    /// first of them (the next one a file would have had).
+    pub fn take_inos(&self, n: u64) -> u64 {
+        let mut inner = self.inner.lock().unwrap();
+        let first = inner.next_ino;
+        inner.next_ino = first.saturating_add(n);
+        first
+    }
+
+    /// The inode number the next file made takes.
+    pub fn next_ino(&self) -> u64 {
+        self.inner.lock().unwrap().next_ino
+    }
+
     /// Every file the program has made or changed since the root was seeded
     /// (`FileNode::written`), by path with its leading `/`, sorted.
     pub fn written(&self) -> Vec<String> {

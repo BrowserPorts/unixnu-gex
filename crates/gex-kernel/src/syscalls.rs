@@ -4088,8 +4088,10 @@ impl PathIo<'_> {
         if self.darwin {
             let mut st = st.clone();
             let on = |p: &str| mnt.unwrap_or_else(|| crate::darwin::kern::mount_of(p));
+            // (a cryptex graft's vnode is on its host's mount, with the
+            // graft's own device: crate::darwin::graftfs)
             st.dev = match at {
-                Some(p) if p.starts_with('/') && md.file_type != crate::vfs::FileType::Socket => on(p).fsid as u32 as u64,
+                Some(p) if p.starts_with('/') && md.file_type != crate::vfs::FileType::Socket => crate::darwin::graftfs::devt_at(p).unwrap_or(on(p).fsid as u32) as u64,
                 _ => 0,
             };
             if let Some(p) = at {

@@ -16,6 +16,7 @@ use gex_abi::ctx;
 pub mod aio;
 pub mod amfi;
 pub mod apfs;
+pub mod apfsread;
 pub mod applematch;
 pub mod attrcall;
 pub mod attrlist;

@@ -104,6 +104,10 @@ impl Kernel {
     fn darwin_xattr_op(&self, target: &Target, op: XattrOp<'_>) -> Result<usize, Errno> {
         match target {
             Target::Path(p, follow) => self.path_io().ns.xattr(p, *follow, op),
+            // An O_SYMLINK descriptor's vnode is the link itself, whose
+            // attributes the calls reach as any other's (a link is one of
+            // XATTR_VNODE_SUPPORTED's types); its handle names the link.
+            Target::File(f) if f.handle.metadata().is_ok_and(|md| md.file_type == crate::vfs::FileType::Symlink) => self.path_io().ns.xattr(&f.path, false, op),
             Target::File(f) => f.handle.xattr(op).unwrap_or(Err(Errno::EOPNOTSUPP)),
         }
     }

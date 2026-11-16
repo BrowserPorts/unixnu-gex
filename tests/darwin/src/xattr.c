@@ -1,7 +1,7 @@
 // Extended attributes: set, get, list and remove, by path and descriptor;
 // size queries, what a missing attribute gets, CREATE and REPLACE, a name
-// too long, the attributes a task needs an entitlement for, and what a
-// descriptor that is not a file gets.
+// too long, the attributes a task needs an entitlement for, a link's own
+// descriptor (O_SYMLINK), and what a descriptor that is not a file gets.
 
 #include <errno.h>
 #include <fcntl.h>
@@ -67,6 +67,23 @@ int main(void) {
     if (removexattr(path, "org.gex.one", 0) != -1 || errno != ENOATTR) return bad("removing it again", errno, ENOATTR);
     if (fremovexattr(fd, "org.gex.two", 0) != 0) return bad("fremovexattr", errno, 0);
     if ((n = listxattr(path, names, sizeof names, 0)) != 0) return bad("nothing left", n, 0);
+
+    // A descriptor O_SYMLINK opens on a link is the link's own: its
+    // attributes, not its target's.
+    char link[sizeof path + 2];
+    snprintf(link, sizeof link, "%s.l", path);
+    unlink(link);
+    if (symlink(path, link) != 0) return bad("symlink", errno, 0);
+    if (setxattr(path, "org.gex.target", "t", 1, 0, 0) != 0) return bad("the target's attribute", errno, 0);
+    int lfd = open(link, O_RDONLY | O_SYMLINK);
+    if (lfd < 0) return bad("open O_SYMLINK", errno, 0);
+    errno = 0;
+    if (fgetxattr(lfd, "org.gex.target", buf, sizeof buf, 0, 0) != -1 || errno != ENOATTR) return bad("the link's descriptor", errno, ENOATTR);
+    if ((n = flistxattr(lfd, names, sizeof names, 0)) != 0) return bad("the link's names", n, 0);
+    if ((n = fgetxattr(fd, "org.gex.target", buf, sizeof buf, 0, 0)) != 1) return bad("the target's descriptor", n, 1);
+    close(lfd);
+    unlink(link);
+    removexattr(path, "org.gex.target", 0);
 
     // What is not a vnode.
     int ends[2];

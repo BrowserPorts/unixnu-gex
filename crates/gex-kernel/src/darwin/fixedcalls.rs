@@ -59,10 +59,6 @@ impl Kernel {
                 let ok = self.darwin_entitled("com.apple.private.ip-domain-table");
                 gated(self, ok, "tracker_action")
             }
-            sys::GRAFTDMG | sys::UNGRAFTDMG => {
-                let ok = self.darwin_entitled("com.apple.private.vfs.graftdmg");
-                gated(self, ok, "graftdmg and ungraftdmg")
-            }
             sys::RECORD_SYSTEM_EVENT => {
                 let ok = self.darwin_entitled("com.apple.private.record_system_event");
                 gated(self, ok, "record_system_event")

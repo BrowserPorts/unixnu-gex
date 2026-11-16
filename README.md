@@ -730,7 +730,11 @@ is the reference (search `crates/gex-kernel/src/` for
   (spaceman) after the restore and first boot. Volumes have the UUIDs newfs_apfs gives their roles; the System
   volume has the system image's, as ASR's restore of it, whether ASR keeps
   it not yet traced. The OS cryptex is still a mount of its own at
-  `/System/Cryptexes/OS` rather than Preboot's graft of it. A mount of the
+  `/System/Cryptexes/OS` rather than Preboot's graft of it. `graftdmg` and
+  `ungraftdmg` make XNU's and APFS's checks; AppleImage4's evaluation of a
+  graft's payload against its manifest, and APFS's mount of the container
+  in the image with the authentication of its root hash, are reported, as
+  are the grafts a booted system's Preboot volume has. A mount of the
   Preboot volume has the files the restore leaves there (its root and
   `Cryptexes`), dated when it is first mounted, which stands in for the
   restore's time; the files the device's personalized tickets make (the

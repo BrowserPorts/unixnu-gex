@@ -41,6 +41,10 @@
 //!
 //! libignition takes the ECID (0x12, the Cryptex1 ticket's name), the level
 //! (0x2e) and the version (0x32) from it.
+//!
+//! The kext's evaluation of a firmware payload against its manifest, which
+//! APFS asks for a cryptex's graft ([`super::graft`]), is not implemented:
+//! it is reported ([`crate::syscalls::Kernel::darwin_img4_firmware_execute`]).
 
 use std::sync::Mutex;
 
@@ -165,6 +169,30 @@ pub fn set_ignition_blob(b: [u8; IGNITION_BLOB_SIZE]) {
 /// read: the IPSW's device tree has them zero or does not have them, and
 /// they stand in until measured. A reported shortcut (storage::unmeasured).
 pub const CHOSEN_STAND_IN: &str = "the /chosen values iBoot fills in (stand-in: the IPSW device tree's, chip-id, board-id, unique-chip-id, certificate-production-status, certificate-security-mode, effective-production-status-ap and effective-security-mode-ap zero, and no security-domain, chip-epoch, esdm-fuses or manifest-properties love: an ignition blob and a Cryptex1 ticket name of ECID 0; measure IODeviceTree:/chosen on the device, `ioreg -p IODeviceTree -n chosen -l`)";
+
+impl crate::syscalls::Kernel {
+    /// AppleImage4's evaluation of a payload against its Image4 manifest,
+    /// as `validate_payload_and_manifest` asks it for a graft:
+    /// `img4_firmware_new` (0xfffffff005a8e8f0) of the payload with its
+    /// type and `sel`'s flags, `img4_firmware_attach_manifest`
+    /// (0xfffffff005a8eb14), `img4_firmware_execute` (0xfffffff005a8edac)
+    /// for `sel`'s chip, with the nonce when `sel` gives one, whose
+    /// `root_hash_execution_cb` (0xfffffff006680dc8) leaves the status, 0
+    /// with the authenticated payload; -1 when it is not called. The status
+    /// is returned; `None` while the evaluation is not implemented
+    /// (reported).
+    pub(crate) fn darwin_img4_firmware_execute(&mut self, sel: super::graft::Selection, fourcc: u32, payload: &[u8], manifest: &[u8]) -> Option<Result<Vec<u8>, i32>> {
+        let cc: String = fourcc.to_be_bytes().iter().map(|&b| if b.is_ascii_graphic() { b as char } else { '?' }).collect();
+        self.darwin_unimplemented(format!(
+            "Image4 evaluation of a '{cc}' payload ({} bytes) against its manifest ({} bytes) for {} (img4_firmware_execute, firmware flags {:#x})",
+            payload.len(),
+            manifest.len(),
+            sel.chip.describe(),
+            sel.firmware_flags
+        ));
+        None
+    }
+}
 
 #[cfg(test)]
 mod tests {

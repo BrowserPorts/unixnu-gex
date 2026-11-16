@@ -27,6 +27,7 @@ pub mod ptmx;
 pub mod ctty;
 pub mod devfs;
 pub mod apfsmount;
+pub mod plist;
 pub mod preboot;
 pub mod dkopen;
 pub mod tty;
@@ -140,8 +141,9 @@ pub struct SandboxProfiles {
 /// the static trust cache (`load_static_trust_cache`; one that does not
 /// load is the kernel's panic), without which there are no trust caches;
 /// the Sandbox kext's profiles; and the sealed volumes' owners, modes and
-/// flags, by volume ([`volattrs::Vol`]). Once per system.
-pub fn boot(trust_cache: Option<&[u8]>, sandbox: SandboxProfiles, device_tree: Option<&[u8]>, volume_attrs: Vec<(volattrs::Vol, Vec<u8>)>) -> Result<(), String> {
+/// flags, by volume ([`volattrs::Vol`]); and where the restore's Cryptex1
+/// comes from ([`preboot::Sources`]). Once per system.
+pub fn boot(trust_cache: Option<&[u8]>, sandbox: SandboxProfiles, device_tree: Option<&[u8]>, volume_attrs: Vec<(volattrs::Vol, Vec<u8>)>, cryptex1: preboot::Sources) -> Result<(), String> {
     if let Some(t) = device_tree {
         iokit::set_tree(t)?;
     }
@@ -152,6 +154,7 @@ pub fn boot(trust_cache: Option<&[u8]>, sandbox: SandboxProfiles, device_tree: O
     for (vol, spec) in volume_attrs {
         volattrs::set(vol, spec)?;
     }
+    preboot::set_sources(cryptex1)?;
     let m = match trust_cache {
         Some(b) => Some(trustcache::load_bundle(b).map_err(|e| format!("failed to load static trust cache module: 0 ({e:?})"))?),
         None => None,

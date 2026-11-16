@@ -67,6 +67,10 @@ pub fn run(mut ra: RunArgs, bytes: &[u8]) -> Result<ExitCode> {
     // The test embedder's panel: the frames the framebuffer presents,
     // recorded into this directory.
     ra.opts.darwin_frames = std::env::var_os("GEX_DARWIN_FRAMES").map(PathBuf::from);
+    // The Preboot volume's Cryptex1: the IPSW's files the restore installs
+    // it from, and its ticket's source (a file, or web-device).
+    ra.opts.darwin_restore = std::env::var_os("GEX_DARWIN_RESTORE").map(PathBuf::from);
+    ra.opts.darwin_cryptex1_ticket = std::env::var("GEX_DARWIN_CRYPTEX1_TICKET").ok();
     // Its commpage is folded to its alias at the top of the memory in
     // everything translated for it, which needs the addresses its code
     // builds in registers seen as the constants they are; and its tables

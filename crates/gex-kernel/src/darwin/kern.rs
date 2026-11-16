@@ -472,7 +472,9 @@ pub fn unmodelled_files(mnt: &Mount) -> Option<String> {
 /// The mount with files not modelled that canonical path `path` is
 /// below (or, with `at_root`, at the root of: a listing of it), with what
 /// is not. On the Preboot volume: a path through one of its root's
-/// entries the tickets make, and a listing of its root.
+/// entries the AP ticket makes, the Cryptex1 ticket or `cryptex1` when they
+/// have no source, and a listing of its root or of a directory holding
+/// such a file (`at_root` with a directory below it).
 pub fn unmodelled_files_at(path: &str, at_root: bool) -> Option<String> {
     unmodelled_files_on(mount_of(path), path, at_root)
 }
@@ -488,7 +490,7 @@ pub fn unmodelled_files_on(mnt: &Mount, path: &str, at_root: bool) -> Option<Str
             return Some(super::preboot::root_listing());
         }
         let rel = path[mnt.on.trim_end_matches('/').len()..].trim_start_matches('/');
-        return super::preboot::unmodelled(rel.split('/').next().unwrap_or(""));
+        return super::preboot::unmodelled(rel, at_root);
     }
     unmodelled_files(mnt)
 }

@@ -257,6 +257,13 @@ pub struct RunOptions {
     /// directory (`GEX_DARWIN_FRAMES`, [`darwin_frames`]): the test
     /// embedder's panel.
     pub darwin_frames: Option<std::path::PathBuf>,
+    /// The restore's source of the Preboot volume's Cryptex1
+    /// (`GEX_DARWIN_RESTORE`): a directory holding the IPSW's
+    /// `BuildManifest.plist` and its files at their paths in the IPSW.
+    pub darwin_restore: Option<std::path::PathBuf>,
+    /// The Cryptex1 ticket's source (`GEX_DARWIN_CRYPTEX1_TICKET`): the
+    /// device's own ticket file, or `web-device`.
+    pub darwin_cryptex1_ticket: Option<String>,
     /// Run ahead-of-time code only (`aot_only`): an ejected Windows
     /// program's runtime, with no tier-1 module and no run-time translator.
     pub aot_only: bool,
@@ -279,6 +286,8 @@ impl Default for RunOptions {
             darwin_dylinker: None,
             darwin_boot: None,
             darwin_frames: None,
+            darwin_restore: None,
+            darwin_cryptex1_ticket: None,
             args: Vec::new(),
             env: Vec::new(),
             trace: false,
@@ -1345,7 +1354,19 @@ fn run_process(
                 volume_attrs.push((vol, spec));
             }
         }
-        gex_kernel::darwin::boot(tc.as_deref(), sandbox, device_tree.as_deref(), volume_attrs).map_err(|e| anyhow!("the boot payload: {e}"))?;
+        // Where the restore's Cryptex1 comes from, read from the host's
+        // files.
+        use gex_kernel::darwin::preboot::{Host, Sources, Ticket};
+        let cryptex1 = Sources {
+            restore: opts.darwin_restore.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            ticket: match opts.darwin_cryptex1_ticket.as_deref() {
+                None | Some("") => Ticket::Unset,
+                Some("web-device") => Ticket::WebDevice,
+                Some(path) => Ticket::File(path.to_string()),
+            },
+            host: Some(Host { size: darwin_host_size, read: darwin_host_read }),
+        };
+        gex_kernel::darwin::boot(tc.as_deref(), sandbox, device_tree.as_deref(), volume_attrs, cryptex1).map_err(|e| anyhow!("the boot payload: {e}"))?;
         // launchd, the kernel's first process, starts with the kernel's
         // mounts alone and mounts the other volumes itself; another
         // program runs on a system launchd has booted.
@@ -8763,4 +8784,16 @@ pub(crate) fn note_wine32_image(base: u64, size: u64, path: &str) {
 fn wine32_image_at(pc: u64) -> Option<(String, u64)> {
     let g = WINE32_IMAGES.lock().unwrap_or_else(|e| e.into_inner());
     g.iter().find(|&&(b, e, _)| b <= pc && pc < e).map(|(b, _, n)| (n.clone(), pc - b))
+}
+
+/// A host file's size, for the Darwin kernel's copies of the restore's
+/// files: `None` for what is not a readable file.
+fn darwin_host_size(path: &str) -> Option<u64> {
+    std::fs::metadata(path).ok().filter(|m| m.is_file()).map(|m| m.len())
+}
+
+/// A host file's bytes at `offset`, all of `into` or false.
+fn darwin_host_read(path: &str, offset: u64, into: &mut [u8]) -> bool {
+    use std::os::unix::fs::FileExt;
+    std::fs::File::open(path).and_then(|f| f.read_exact_at(into, offset)).is_ok()
 }

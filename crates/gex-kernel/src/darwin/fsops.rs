@@ -693,14 +693,17 @@ impl Kernel {
         // them (super::preboot); no other volume's are modelled, and a
         // path below its mount is reported (kern::unmodelled_files_at).
         let files = match super::storage::volume(mounted.volume).map(|v| v.role) {
-            Some(super::storage::role::PREBOOT) => match super::preboot::volume() {
-                Ok(fs) => Some(fs),
-                Err(why) => {
-                    self.darwin_unimplemented(why);
-                    self.darwin_mount_close(node.minor, &given);
-                    return Err(Errno::EIO);
+            Some(super::storage::role::PREBOOT) => {
+                let made = super::preboot::volume(&|p| self.darwin_system_file(p));
+                match made {
+                    Ok(fs) => Some(fs),
+                    Err(why) => {
+                        self.darwin_unimplemented(why);
+                        self.darwin_mount_close(node.minor, &given);
+                        return Err(Errno::EIO);
+                    }
                 }
-            },
+            }
             _ => None,
         };
         // The covered directory's mountedhere, mount_generation, checkdirs
@@ -724,6 +727,19 @@ impl Kernel {
         // build, whose configuration has no CONFIG_KDP_INTERACTIVE_DEBUGGING):
         // no kernel core file is opened.
         Ok(0)
+    }
+
+    /// A file of the system volume at `path`, its bytes and attributes,
+    /// as `copyfile` reads them; `None` when the volume has none there.
+    fn darwin_system_file(&self, path: &str) -> Result<Option<(Vec<u8>, super::vattr::Owned)>, String> {
+        let md = match self.vfs.metadata(path) {
+            Ok(md) => md,
+            Err(crate::errno::Errno::ENOENT) => return Ok(None),
+            Err(e) => return Err(format!("{path}: {e:?}")),
+        };
+        let owned = super::vattr::of(&self.vfs, path, &md, None)?;
+        let bytes = self.read_file(path).ok_or_else(|| format!("{path}: not readable"))?;
+        Ok(Some((bytes, owned)))
     }
 
     /// mount_common's failure after the device's open: VNOP_CLOSE of the

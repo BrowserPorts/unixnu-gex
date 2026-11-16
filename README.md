@@ -475,6 +475,8 @@ What gexc sets up:
 | `GEX_DARWIN_STRICT=1` | strict mode (above) |
 | `GEX_DARWIN_CACHE` | the shared cache's main file, when it is not at the root's cryptex path |
 | `GEX_DARWIN_FRAMES` | a directory the frames the framebuffer presents are recorded into, one file each (`hosts/native/src/darwin_frames.rs`) |
+| `GEX_DARWIN_RESTORE` | the files the restore installs the Preboot volume's Cryptex1 (`/private/preboot/cryptex1/current`) from: a directory holding the IPSW's `BuildManifest.plist` and the build identity's `Cryptex1,` components at their paths in the IPSW (the two cryptex images and their `Firmware/*.root_hash` and `Firmware/*.trustcache`), each checked against its digest at the volume's first mount. Without it, looking in `cryptex1` is reported |
+| `GEX_DARWIN_CRYPTEX1_TICKET` | the Cryptex1 ticket's source: a file, the device's own `cryptex1/current/apticket.<target>.<ECID>.im4m` copied from its Preboot volume, or `web-device`, the web device's own platform (not implemented). Without a file, looking up the ticket is reported |
 | environment | without `--env` or `--host-env`, `PATH=/usr/bin:/bin` and `HOME=/var/mobile` |
 | identity | the host user's ids, or `--uid`; `/sbin/launchd` runs as root and pid 1, and any other program as a child of a pid 1 that is the kernel's own |
 | memory | always a 64-bit guest memory (`--mem32` is refused): Darwin images live above 4 GiB |

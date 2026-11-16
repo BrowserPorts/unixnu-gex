@@ -74,11 +74,17 @@ int main(void) {
     pthread_join(t, NULL);
     if (!after_read) return bad("the thread once resumed", after_read, 1);
 
-    // Itself, until another resumes it.
+    // Itself, until another resumes it. Until it has, its count is 0 and
+    // a resume is KERN_FAILURE, so resume until one takes.
     pthread_create(&t, NULL, self_suspender, NULL);
+    th = pthread_mach_thread_np(t);
     usleep(200000);
-    if (after_self) return bad("a thread that suspended itself", after_self, 0);
-    thread_resume(pthread_mach_thread_np(t));
+    for (;;) {
+        if (after_self) return bad("a thread that suspended itself", after_self, 0);
+        if ((kr = thread_resume(th)) != KERN_FAILURE) break;
+        usleep(1000);
+    }
+    if (kr) return bad("resuming it", kr, 0);
     pthread_join(t, NULL);
     if (!after_self) return bad("it, resumed", after_self, 1);
     printf("threadsuspend ok\n");

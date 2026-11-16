@@ -161,6 +161,10 @@ pub struct MountState {
     /// read-only or of a read-only container (0xfffffff0067155e0); none
     /// for a mount that is not APFS's.
     pub apfs_ro: Option<bool>,
+    /// `mnt_vfsstat`'s counts as `vfs_update_vfsstat` (or the mount) last
+    /// left them: `f_blocks`, `f_bfree`, `f_bavail`, `f_files`, `f_ffree`;
+    /// none before it was first refreshed.
+    pub stat: Option<[u64; 5]>,
 }
 
 /// `MNT_LUNMOUNT`, `MNT_LMOUNT` (`mount_internal.h`).
@@ -169,7 +173,7 @@ pub const MNT_LMOUNT: u32 = 0x80;
 
 impl Mount {
     pub fn new(on: &'static str, from: From, fsid: u64, flags: u32, fs: Fs, vol: Option<super::volattrs::Vol>, owner: u32, apfs_ro: Option<bool>) -> Mount {
-        Mount { on, from, fsid, fs, vol, owner, state: std::sync::Mutex::new(MountState { flags, lflag: 0, from_name: None, apfs_ro }) }
+        Mount { on, from, fsid, fs, vol, owner, state: std::sync::Mutex::new(MountState { flags, lflag: 0, from_name: None, apfs_ro, stat: None }) }
     }
 
     /// `mnt_flag`.
@@ -294,12 +298,20 @@ fn boot_mounts() -> [Mount; 3] {
         BootState::Kernel => ROOT_FLAGS,
         BootState::Booted => ROOT_FLAGS_BOOTED,
     };
-    [
+    let mounts = [
         Mount::new("/", From::Snapshot(0), ROOT_FSID as u64, root_flags, Fs::Apfs, Some(super::volattrs::Vol::System), 0, Some(true)),
         Mount::new("/dev", From::Devfs, DEVFS_FSID as u64, MNT_LOCAL | MNT_DONTBROWSE | MNT_MULTILABEL, Fs::Devfs, None, 0, None),
         Mount::new("/System/Cryptexes/OS", From::OsCryptex, super::CACHE_FS_ID, MNT_RDONLY | MNT_DONTBROWSE, Fs::Apfs, Some(super::volattrs::Vol::OsCryptex), 0, Some(true)),
-    ]
+    ];
+    // devfs_mount's devfs_statfs left devfs's counts as they were at its
+    // mount in bsd_init ([`DEVFS_STAT_STAND_IN`]).
+    refresh_stat(&mounts[1]);
+    mounts
 }
+
+/// devfs's counts as its mount at boot left them in `mnt_vfsstat`, which a
+/// getfsstat that does not refresh reports.
+pub const DEVFS_STAT_STAND_IN: &str = "devfs's statfs counts as its mount at boot left them (stand-in: its counts when the mount list is first read; measure getfsstat(MNT_NOWAIT) on the device before anything statfs's /dev)";
 
 /// The mount list (`mountlist`): the boot's mounts, then each one mounted
 /// since, in the order they were (`mount_list_add` puts a new mount at the
@@ -513,6 +525,24 @@ pub fn fs_name(mnt: &Mount) -> &'static [u8] {
     }
 }
 
+/// `vfs_update_vfsstat`: the mount's counts asked of its filesystem anew
+/// and kept.
+fn refresh_stat(mnt: &Mount) -> Counts {
+    let c = counts(mnt);
+    mnt.state().stat = Some([c.blocks, c.bfree, c.bavail, c.files, c.ffree]);
+    c
+}
+
+/// A mount's counts as `mnt_vfsstat` has them: refreshed first with
+/// `refresh` (or when they never were), else as they were last.
+fn stat_counts(mnt: &Mount, refresh: bool) -> Counts {
+    let cached = mnt.state().stat;
+    match cached {
+        Some([blocks, bfree, bavail, files, ffree]) if !refresh => Counts { blocks, bfree, bavail, files, ffree, ..counts(mnt) },
+        _ => refresh_stat(mnt),
+    }
+}
+
 fn counts(mnt: &Mount) -> Counts {
     match mnt.fs {
         Fs::Apfs => {
@@ -590,9 +620,24 @@ pub fn covered_mount(mnt: &Mount) -> &'static Mount {
         .unwrap_or(l[0])
 }
 
-/// One `struct statfs64` for `mnt`.
-pub fn statfs64(mnt: &Mount) -> Vec<u8> {
-    let c = counts(mnt);
+/// `MNT_WAIT`, `MNT_NOWAIT`, `MNT_DWAIT` (`sys/mount.h`).
+pub const MNT_WAIT: u32 = 1;
+pub const MNT_NOWAIT: u32 = 2;
+pub const MNT_DWAIT: u32 = 4;
+
+/// Whether `getfsstat` and `getfsstat64` with `flags` refresh a mount's
+/// counts before copying them out (`getfsstat_callback`): unless
+/// `MNT_NOWAIT` is asked without `MNT_WAIT` or `MNT_DWAIT` (both of which
+/// override it, MNT_DWAIT as MNT_WAIT), and not while it is being
+/// unmounted.
+pub fn getfsstat_refreshes(mnt: &Mount, flags: u32) -> bool {
+    (flags & MNT_NOWAIT == 0 || flags & (MNT_WAIT | MNT_DWAIT) != 0) && mnt.state().lflag & MNT_LUNMOUNT == 0
+}
+
+/// One `struct statfs64` for `mnt`, its counts refreshed first with
+/// `refresh`.
+pub fn statfs64(mnt: &Mount, refresh: bool) -> Vec<u8> {
+    let c = stat_counts(mnt, refresh);
     let from = mount_from(mnt);
     let mut b = vec![0u8; STATFS64_SIZE];
     let mut put = |o: usize, v: &[u8]| b[o..o + v.len()].copy_from_slice(v);
@@ -625,8 +670,8 @@ const MNAMELEN_INO32: usize = 90;
 /// One `struct user64_statfs` for `mnt` (`munge_statfs`): the counts as
 /// longs, the type beside the subtype, and the names cut to fit, as
 /// `strlcpy` cuts them.
-pub fn statfs_ino32(mnt: &Mount) -> [u8; STATFS_SIZE] {
-    let c = counts(mnt);
+pub fn statfs_ino32(mnt: &Mount, refresh: bool) -> [u8; STATFS_SIZE] {
+    let c = stat_counts(mnt, refresh);
     let from = mount_from(mnt);
     let mut b = [0u8; STATFS_SIZE];
     let mut put = |o: usize, v: &[u8]| b[o..o + v.len()].copy_from_slice(v);
@@ -1030,7 +1075,7 @@ impl Kernel {
             sys::FACCESSAT => res(self.darwin_faccessat(m, a)),
             sys::SIGACTION => res(self.darwin_sigaction(m, a[0], a[1], a[2])),
             sys::SIGALTSTACK => res(self.darwin_sigaltstack(m, a[0], a[1])),
-            sys::GETFSSTAT64 => res(self.darwin_getfsstat(m, a[0], a[1])),
+            sys::GETFSSTAT64 => res(self.darwin_getfsstat(m, a[0], a[1], a[2] as u32)),
             sys::SHM_OPEN => res(self.darwin_shm_open(m, a)),
             sys::SHM_UNLINK => res(self.darwin_shm_unlink(m, a)),
             // An object takes one size and has no read or write; a mapping
@@ -1116,8 +1161,8 @@ impl Kernel {
             sys::FSTATFS64 => res(self.darwin_statfs(m, None, a[0], a[1])),
             sys::STATFS => res(self.darwin_statfs_ino32(m, Some(a[0]), 0, a[1])),
             sys::FSTATFS => res(self.darwin_statfs_ino32(m, None, a[0], a[1])),
-            sys::GETFSSTAT => res(self.darwin_getfsstat_ino32(m, a[0], a[1], 0, 0)),
-            sys::MAC_GETFSSTAT => res(self.darwin_getfsstat_ino32(m, a[0], a[1], a[2], a[3])),
+            sys::GETFSSTAT => res(self.darwin_getfsstat_ino32(m, a[0], a[1], 0, 0, a[2] as u32)),
+            sys::MAC_GETFSSTAT => res(self.darwin_getfsstat_ino32(m, a[0], a[1], a[2], a[3], a[4] as u32)),
             sys::SYSCTL => res(self.darwin_sysctl(m, a)),
             sys::SYSCTLBYNAME => res(self.darwin_sysctlbyname(m, a)),
             // dup3 refuses to copy a descriptor onto itself; dup2 checks it
@@ -1534,15 +1579,18 @@ impl Kernel {
     }
 
     /// `getfsstat64(buf, bufsize, flags)`: the mounts, or how many there
-    /// are when `buf` is null.
-    fn darwin_getfsstat(&mut self, m: &mut GuestMem<'_>, buf: u64, size: u64) -> Result<u64, Errno> {
+    /// are when `buf` is null. Each mount copied out has its counts
+    /// refreshed first ([`getfsstat_refreshes`]); `mac_mount_check_stat`
+    /// has no hook in Sandbox (slot 90 is null) or AMFI.
+    fn darwin_getfsstat(&mut self, m: &mut GuestMem<'_>, buf: u64, size: u64, flags: u32) -> Result<u64, Errno> {
         let mounts = mounts();
         if buf == 0 {
             return Ok(mounts.len() as u64);
         }
         let n = (size as usize / STATFS64_SIZE).min(mounts.len());
         for (i, mnt) in mounts.iter().take(n).enumerate() {
-            m.write(buf + (i * STATFS64_SIZE) as u64, &statfs64(mnt))?;
+            let refresh = getfsstat_refreshes(mnt, flags);
+            m.write(buf + (i * STATFS64_SIZE) as u64, &statfs64(mnt, refresh))?;
         }
         Ok(n as u64)
     }
@@ -1574,7 +1622,7 @@ impl Kernel {
     /// `statfs64(path, buf)` or `fstatfs64(fd, buf)`.
     fn darwin_statfs(&mut self, m: &mut GuestMem<'_>, path: Option<u64>, fd: u64, buf: u64) -> Result<u64, Errno> {
         let mnt = self.darwin_statfs_mount(m, path, fd)?;
-        m.write(buf, &statfs64(mnt))?;
+        m.write(buf, &statfs64(mnt, true))?;
         Ok(0)
     }
 
@@ -1582,7 +1630,7 @@ impl Kernel {
     /// struct of 32-bit inodes, but for its last reserved fields.
     fn darwin_statfs_ino32(&mut self, m: &mut GuestMem<'_>, path: Option<u64>, fd: u64, buf: u64) -> Result<u64, Errno> {
         let mnt = self.darwin_statfs_mount(m, path, fd)?;
-        m.write(buf, &statfs_ino32(mnt)[..STATFS_PARTIAL])?;
+        m.write(buf, &statfs_ino32(mnt, true)[..STATFS_PARTIAL])?;
         Ok(0)
     }
 
@@ -1590,7 +1638,7 @@ impl Kernel {
     /// with no labels: a whole struct of 32-bit inodes for each mount there
     /// is room for, and the count of them all with no buffer. A mount's MAC
     /// label is reported.
-    fn darwin_getfsstat_ino32(&mut self, m: &mut GuestMem<'_>, buf: u64, bufsize: u64, mac: u64, macsize: u64) -> Result<u64, Errno> {
+    fn darwin_getfsstat_ino32(&mut self, m: &mut GuestMem<'_>, buf: u64, bufsize: u64, mac: u64, macsize: u64, flags: u32) -> Result<u64, Errno> {
         let (bufsize, macsize) = (bufsize as u32, macsize as u32);
         if bufsize > i32::MAX as u32 || macsize > i32::MAX as u32 {
             return Err(Errno::EINVAL);
@@ -1612,7 +1660,7 @@ impl Kernel {
         }
         let n = maxcount.min(mounts.len());
         for (i, mnt) in mounts.iter().take(n).enumerate() {
-            m.write(buf + (i * STATFS_SIZE) as u64, &statfs_ino32(mnt))?;
+            m.write(buf + (i * STATFS_SIZE) as u64, &statfs_ino32(mnt, getfsstat_refreshes(mnt, flags)))?;
         }
         Ok(n as u64)
     }
@@ -2420,6 +2468,26 @@ mod tests {
         assert_eq!(mask_from_linux(l), d);
     }
 
+    /// getfsstat's flags: MNT_NOWAIT alone keeps a mount's counts as they
+    /// were; MNT_WAIT and MNT_DWAIT override it; a mount being unmounted
+    /// is not refreshed.
+    #[test]
+    fn getfsstat_flags_choose_a_refresh() {
+        let m = Mount::new("/x", From::Devfs, 0, 0, Fs::Devfs, None, 0, None);
+        assert!(getfsstat_refreshes(&m, 0));
+        assert!(!getfsstat_refreshes(&m, MNT_NOWAIT));
+        assert!(getfsstat_refreshes(&m, MNT_NOWAIT | MNT_WAIT));
+        assert!(getfsstat_refreshes(&m, MNT_NOWAIT | MNT_DWAIT));
+        assert!(getfsstat_refreshes(&m, MNT_DWAIT));
+        m.state().stat = Some([1, 2, 3, 4, 5]);
+        let c = stat_counts(&m, false);
+        assert_eq!((c.blocks, c.bfree, c.bavail, c.files, c.ffree), (1, 2, 3, 4, 5));
+        m.state().lflag |= MNT_LUNMOUNT;
+        assert!(!getfsstat_refreshes(&m, MNT_WAIT));
+    }
+
+    /// The root, mounted from the System volume's sealed snapshot with no
+    /// virtual device: its device's path after the snapshot's name, and
     /// the first fsid `vfs_getnewfsid` gives an APFS mount.
     #[test]
     fn the_root_is_named_for_its_snapshot() {

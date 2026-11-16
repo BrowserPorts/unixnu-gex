@@ -291,6 +291,7 @@ pub fn unmeasured() -> Option<String> {
     gaps.push(format!("whether the System volume is unencrypted (stand-in {SYSTEM_UNENCRYPTED}, no MNT_CPROTECT on /; measure {SYSTEM_UNENCRYPTED_MEASUREMENT})"));
     gaps.push(format!("whether the Preboot volume is unencrypted (stand-in {PREBOOT_UNENCRYPTED}, no MNT_CPROTECT on its mount; measure {PREBOOT_UNENCRYPTED_MEASUREMENT})"));
     gaps.push(super::preboot::TIMES_STAND_IN.to_string());
+    gaps.push(super::kern::DEVFS_STAT_STAND_IN.to_string());
     gaps.push(format!("whether iBoot's /chosen boot-uuid or apfs-preboot-uuid names the System volume (stand-in {BOOT_UUID_MATCHES}: the root mounted from its snapshot by name, with a new fsid; measure {BOOT_UUID_MEASUREMENT})"));
     gaps.push(format!("whether the volumes' IOMedia are writable (stand-in {VOLUMES_WRITABLE}; measure {VOLUMES_WRITABLE_MEASUREMENT})"));
     gaps.push(format!("whether disk0 is write-protected (stand-in writable: {DISK_WRITABLE}; measure {DISK_WRITABLE_MEASUREMENT})"));

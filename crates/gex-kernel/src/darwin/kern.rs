@@ -91,6 +91,7 @@ mod amfi_call {
     pub const DYLD_POLICY_FOR_PID: u64 = 91;
     pub const CHECK_TRUST_CACHE: u64 = 95;
     pub const GET_LOCAL_SIGNING_PRIVATE_KEY: u64 = 97;
+    pub const LOAD_TRUST_CACHE: u64 = 101;
 }
 
 /// The Sandbox policy's `__mac_syscall` calls: `sandbox_init` of a builtin
@@ -2234,7 +2235,7 @@ impl Kernel {
         const EINVAL: i32 = 22;
         let fault = |_| 14;
         match call {
-            amfi_call::DYLD_POLICY_SELF | amfi_call::DYLD_POLICY_FOR_PID | amfi_call::CHECK_TRUST_CACHE if arg == 0 => Err(EINVAL),
+            amfi_call::DYLD_POLICY_SELF | amfi_call::DYLD_POLICY_FOR_PID | amfi_call::CHECK_TRUST_CACHE | amfi_call::LOAD_TRUST_CACHE if arg == 0 => Err(EINVAL),
             // {flags, &output}: the caller's policy.
             amfi_call::DYLD_POLICY_SELF => {
                 let out = m.read_u64(arg + 8).map_err(fault)?;
@@ -2276,12 +2277,142 @@ impl Kernel {
             }
             // Not on this platform.
             amfi_call::GET_LOCAL_SIGNING_PRIVATE_KEY => Err(1),
-            98..=102 => {
-                self.darwin_unimplemented(format!("AMFI __mac_syscall {call} (local signing, trust cache loading, launch constraints)"));
+            amfi_call::LOAD_TRUST_CACHE => self.darwin_amfi_load_trust_cache(m, arg),
+            98..=100 | 102 => {
+                self.darwin_unimplemented(format!("AMFI __mac_syscall {call} (local signing, launch constraints)"));
                 Err(EINVAL)
             }
             _ => Err(78),
         }
+    }
+
+    /// AMFI's `_load_trust_cache` (0xfffffff005ab7550): the request copied
+    /// in, {u8 type, the IM4P's address and u32 length at 8 and 0x10, the
+    /// manifest's at 0x18 and 0x20, the auxiliary manifest's at 0x28 and
+    /// 0x30}; an IM4P is required (EINVAL with none or of length 0), a
+    /// manifest or auxiliary manifest of a nonzero length needs its address
+    /// (EINVAL); each is copied in, then loaded
+    /// ([`Kernel::darwin_load_trust_cache`]) and the load's
+    /// `kern_return_t` made an errno ([`super::trustcache::amfi_errno`]).
+    fn darwin_amfi_load_trust_cache(&mut self, m: &mut GuestMem<'_>, arg: u64) -> Result<(), i32> {
+        const EINVAL: i32 = 22;
+        let fault = |_| 14;
+        let req = m.read(arg, 0x38).map_err(fault)?.to_vec();
+        let q = |o: usize| u64::from_le_bytes(req[o..o + 8].try_into().unwrap());
+        let w = |o: usize| u64::from(u32::from_le_bytes(req[o..o + 4].try_into().unwrap()));
+        let ty = req[0];
+        let (payload_at, payload_len) = (q(8), w(0x10));
+        if payload_at == 0 || payload_len == 0 {
+            return Err(EINVAL);
+        }
+        let payload = m.read(payload_at, payload_len as usize).map_err(fault)?.to_vec();
+        let mut copy = |at: u64, len: u64| -> Result<Vec<u8>, i32> {
+            match (at, len) {
+                (_, 0) => Ok(Vec::new()),
+                (0, _) => Err(EINVAL),
+                _ => Ok(m.read(at, len as usize).map_err(fault)?.to_vec()),
+            }
+        };
+        let manifest = copy(q(0x18), w(0x20))?;
+        let aux = copy(q(0x28), w(0x30))?;
+        match self.darwin_load_trust_cache(ty, &payload, &manifest, &aux) {
+            Some(k) => match super::trustcache::amfi_errno(k) {
+                0 => Ok(()),
+                e => Err(e),
+            },
+            None => Err(EINVAL),
+        }
+    }
+
+    /// AMFI's `loadTrustCacheWithType` (0xfffffff005aad464): a cache whose
+    /// UUID the runtime has already is loaded
+    /// ([`super::trustcache::is_duplicate_img4`]); a type other than the
+    /// Cryptex1 boot and preboot ones needs the device unlocked, asked of
+    /// AppleKeyStore (`deviceUnlocked`, 0xfffffff005aab7f0), which is not
+    /// implemented (reported); then the kernel's
+    /// [`Kernel::darwin_load_trust_cache_with_type`], whose duplicate
+    /// (KERN_ALREADY_IN_SET) is success too. `None` where it is stopped
+    /// (reported).
+    fn darwin_load_trust_cache(&mut self, ty: u8, payload: &[u8], manifest: &[u8], aux: &[u8]) -> Option<i32> {
+        use super::trustcache::{kr, tc_type};
+        match super::trustcache::is_duplicate_img4(payload) {
+            Ok(true) => return Some(kr::SUCCESS),
+            Ok(false) => {}
+            Err(why) => {
+                self.darwin_unimplemented(why);
+                return None;
+            }
+        }
+        if !(tc_type::CRYPTEX1_BOOT_OS..=tc_type::CRYPTEX1_PREBOOT_APP).contains(&ty) {
+            self.darwin_unimplemented(format!("loadTrustCacheWithType of a trust cache of type {ty:#x}: whether AMFI's system state allows it (its flag at 0xfffffff006cfc3d8, AppleKeyStore's lock state through deviceUnlocked, 0xfffffff005aab7f0)"));
+            return None;
+        }
+        match self.darwin_load_trust_cache_with_type(ty, payload, manifest, aux)? {
+            kr::ALREADY_IN_SET => Some(kr::SUCCESS),
+            k => Some(k),
+        }
+    }
+
+    /// `load_trust_cache_with_type` (bsd/kern/kern_trustcache.c 745-880,
+    /// 0xfffffff007662e1c): an object with no external manifest is an
+    /// Image4 object whose payload and manifest AppleImage4 takes out
+    /// (`img4_get_payload`, `img4_get_manifest`), which is not implemented
+    /// (reported); the type checked; the caller's
+    /// `com.apple.private.pmap.load-trust-cache` entitlement must allow
+    /// the type's value (`IOCurrentTaskHasStringEntitlement`, DENIED); a
+    /// second Cryptex1 boot cache of a type is DENIED; then, with no PPL or
+    /// TXM on this chip, `xnu_load_trust_cache`: AMFI's `trustCacheLoad`,
+    /// the IM4P evaluated against the manifest for the type's chip
+    /// ([`Kernel::darwin_trust_cache_img4`]) and its module loaded
+    /// ([`super::trustcache::load_module`]); its duplicate is
+    /// KERN_ALREADY_IN_SET, any other error KERN_FAILURE. The auxiliary
+    /// manifest is ignored (497-499).
+    fn darwin_load_trust_cache_with_type(&mut self, ty: u8, payload: &[u8], manifest: &[u8], _aux: &[u8]) -> Option<i32> {
+        use super::trustcache::{self as tc, kr};
+        if manifest.is_empty() {
+            self.darwin_unimplemented(format!("load_trust_cache_with_type of an Image4 object of type {ty:#x} with no external manifest (img4_get_payload and img4_get_manifest)"));
+            return None;
+        }
+        if let Err(k) = tc::check_type(ty) {
+            return Some(k);
+        }
+        let (fourcc, value) = tc::config(ty)?;
+        let allowed = self.dtask.codesign.as_ref().is_some_and(|c| c.ents.string_allowed(tc::LOAD_ENTITLEMENT.as_bytes(), value.as_bytes()));
+        if !allowed || tc::boot_type_loaded(ty) {
+            return Some(kr::DENIED);
+        }
+        let authenticated = self.darwin_trust_cache_img4(ty, fourcc, payload, manifest)?;
+        match tc::load_module(ty, authenticated) {
+            Ok(()) => {
+                tc::mark_loaded(ty);
+                Some(kr::SUCCESS)
+            }
+            Err(tc::LoadError::Duplicate) => Some(kr::ALREADY_IN_SET),
+            Err(tc::LoadError::Failed(_)) => Some(kr::FAILURE),
+        }
+    }
+
+    /// libTrustCache's Image4 evaluation of a cache of type `ty`
+    /// (0x...bb060): its type's chip (`TCTypeConfig`'s first function:
+    /// `CHIP_CRYPTEX1_BOOT_AP`, 0xfffffff005a93908, for the Cryptex1 boot
+    /// types; 0xfffffff005a93920 for the preboot app type), no nonce
+    /// (types 0xd to 0xf are in the nonce-free set, 0xcffc0f), firmware
+    /// flags from the type's third function (0 for these), the type's 4CC;
+    /// `img4_firmware_new`, `attach_manifest`, `execute`
+    /// ([`Kernel::darwin_img4_firmware_execute`]), whose callback
+    /// (0x...bb2f8) leaves the authenticated payload or the status.
+    fn darwin_trust_cache_img4(&mut self, ty: u8, fourcc: u32, payload: &[u8], manifest: &[u8]) -> Option<Result<Vec<u8>, i32>> {
+        use super::graft::{Chip, Selection};
+        use super::trustcache::tc_type;
+        let chip = match ty {
+            tc_type::CRYPTEX1_BOOT_OS | tc_type::CRYPTEX1_BOOT_APP => Chip::Cryptex1BootAp,
+            tc_type::CRYPTEX1_PREBOOT_APP => Chip::ApPlus148,
+            _ => {
+                self.darwin_unimplemented(format!("trustCacheLoad's Image4 chip and nonce for a trust cache of type {ty:#x}"));
+                return None;
+            }
+        };
+        self.darwin_img4_firmware_execute(Selection { chip, pdi_nonce: false, firmware_flags: 0 }, fourcc, payload, manifest)
     }
 
     /// Sandbox's `sandbox_check` (`0x...a15fcc`): whether the target process

@@ -46,6 +46,27 @@ impl Entitlements {
     pub fn present(&self, key: &[u8]) -> bool {
         self.get(key).is_some()
     }
+
+    /// The query `IOTaskHasStringEntitlement` makes through AMFI
+    /// (`amfi_OSEntitlements_queryEntitlementStringWithProc`,
+    /// 0xfffffff005ab1c1c): `SelectKey` then `StringValueAllowed`
+    /// (CoreEntitlements' `der_vm_execute_string_value_allowed`,
+    /// 0xfffffff005ac302c) of `value`.
+    pub fn string_allowed(&self, key: &[u8], value: &[u8]) -> bool {
+        self.get(key).is_some_and(|v| string_value_allowed(v, value))
+    }
+}
+
+/// CoreEntitlements' `StringValueAllowed` of `value` on an entitlement's
+/// value (0xfffffff005ac3674..0xfffffff005ac3a5c): a string equal to it, or
+/// one ending in `*` whose part before it begins it (a lone `*` allows any
+/// value); an array whose elements, each taken so in its order, allow it.
+fn string_value_allowed(v: &Ent, value: &[u8]) -> bool {
+    match v {
+        Ent::String(s) => s == value || s.strip_suffix(b"*").is_some_and(|prefix| value.starts_with(prefix)),
+        Ent::Array(items) => items.iter().any(|e| string_value_allowed(e, value)),
+        _ => false,
+    }
 }
 
 /// DER's tag classes and the universal tags entitlements use.
@@ -815,6 +836,34 @@ pub fn end_offset(cd: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `IOTaskHasStringEntitlement`'s query: the string itself, a prefix
+    /// ending in `*`, or an array holding either.
+    #[test]
+    fn a_string_entitlement_allows_its_value() {
+        let s = |v: &str| Ent::String(v.as_bytes().to_vec());
+        let e = Entitlements(vec![
+            (b"tc".to_vec(), Ent::Array(vec![s("cryptex1.boot.os"), s("cryptex1.boot.app"), s("cryptex1.safari-downlevel")])),
+            (b"one".to_vec(), s("cryptex1.boot.os")),
+            (b"wild".to_vec(), s("cryptex1.*")),
+            (b"any".to_vec(), s("*")),
+            (b"nested".to_vec(), Ent::Array(vec![Ent::Bool(true), Ent::Array(vec![s("personalized.ddi")])])),
+            (b"flag".to_vec(), Ent::Bool(true)),
+        ]);
+        assert!(e.string_allowed(b"tc", b"cryptex1.boot.os"));
+        assert!(e.string_allowed(b"tc", b"cryptex1.boot.app"));
+        assert!(!e.string_allowed(b"tc", b"cryptex1.preboot.os"));
+        assert!(!e.string_allowed(b"tc", b"cryptex1.boot"));
+        assert!(e.string_allowed(b"one", b"cryptex1.boot.os"));
+        assert!(!e.string_allowed(b"one", b"cryptex1.boot.os2"));
+        assert!(e.string_allowed(b"wild", b"cryptex1.preboot.app"));
+        assert!(e.string_allowed(b"wild", b"cryptex1."));
+        assert!(!e.string_allowed(b"wild", b"cryptex1"));
+        assert!(e.string_allowed(b"any", b"global.pdi"));
+        assert!(e.string_allowed(b"nested", b"personalized.ddi"));
+        assert!(!e.string_allowed(b"flag", b"cryptex1.boot.os"));
+        assert!(!e.string_allowed(b"absent", b"cryptex1.boot.os"));
+    }
 
     #[test]
     fn der_entitlements_read_as_coreentitlements_reads_them() {

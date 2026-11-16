@@ -149,7 +149,12 @@ subsystem, most naming in their header the XNU source they port:
   (`launchcon.rs`), with the lightweight code requirements they are
   written in and the CoreEntitlements objects those are (`lwcr.rs`);
   embedded code signatures and entitlements (`codesign.rs`); trust caches
-  (`trustcache.rs`); Sandbox's
+  (`trustcache.rs`): the static one, and those AMFI loads at run time
+  (`__mac_syscall` 101, as libignition loads a cryptex's) for a caller
+  whose `com.apple.private.pmap.load-trust-cache` entitlement allows the
+  type, once for each Cryptex1 boot type, after AppleImage4 evaluates
+  their IM4P against the cryptex's ticket; a type that needs
+  AppleKeyStore's unlock state is reported. Sandbox's
   compiled profiles and their evaluation (`sandbox.rs`), the sandboxes a
   process gets from its exec or `sandbox_init` (`sandboxes.rs`), and
   AppleMatch, the regular expression engine those profiles use

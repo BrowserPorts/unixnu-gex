@@ -21,7 +21,7 @@ for p in hello-static bsd-carry commpage exclusive-pair aes; do
         -Wl,-e,_start -o "$OUT/$p" "$HERE/src/$p.c"
 done
 
-for p in hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate thinfo tasksuspend portrefs crosstask spawnports taskname taskreg procfind debugport excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit xpc-anon sbxinit sbxexec sbxkill hostspecial sbxmask sbxnet sbxpriv sbxfile layout launchcon shregion console overlay owners apfsroles disknodes fmount mntupdate fsstatwait ignition graftdmg; do
+for p in hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate thinfo tasksuspend portrefs crosstask spawnports taskname taskreg procfind debugport excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit xpc-anon sbxinit sbxexec sbxkill hostspecial sbxmask sbxnet sbxpriv sbxfile layout launchcon shregion console overlay owners apfsroles disknodes fmount mntupdate fsstatwait ignition graftdmg tcload; do
     cc -O2 -o "$OUT/$p" "$HERE/src/$p.c"
 done
 cc -O2 -framework CoreFoundation -o "$OUT/cfrunloop" "$HERE/src/cfrunloop.c"
@@ -77,6 +77,8 @@ cc -O2 -framework IOKit -framework CoreFoundation -o "$OUT/accelr" "$HERE/src/ac
 cc -O2 -o "$OUT/overlayexe" "$HERE/src/hello.c"
 # graftdmg's copy without its entitlement.
 cc -O2 -o "$OUT/graftnoent" "$HERE/src/graftdmg.c"
+# tcload's copy without its entitlement.
+cc -O2 -o "$OUT/tcloadnoent" "$HERE/src/tcload.c"
 # amfi's: a program in no trust cache, and one holding get-task-allow.
 cc -O2 -o "$OUT/untrusted" "$HERE/src/hello.c"
 cc -O2 -o "$OUT/gta" "$HERE/src/hello.c"
@@ -150,6 +152,8 @@ codesign -s - -f --entitlements "$HERE/src/ignition.entitlements" "$OUT/ignition
 # graftdmg grafts and ungrafts, which its entitlement allows, keeping the
 # volume mounted as launchd may.
 codesign -s - -f --entitlements "$HERE/src/graftdmg.entitlements" "$OUT/graftdmg" 2>/dev/null
+# tcload loads a SystemOS cryptex trust cache, which its entitlement allows.
+codesign -s - -f --entitlements "$HERE/src/tcload.entitlements" "$OUT/tcload" 2>/dev/null
 # atmflag sets the ATM diagnostic flag, which its entitlement allows.
 codesign -s - -f --entitlements "$HERE/src/atmflag.entitlements" "$OUT/atmflag" 2>/dev/null
 # hostspecial sets the telemetry port, which launchd's event monitor may.

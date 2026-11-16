@@ -483,6 +483,19 @@ pub fn target_name_of(t: &[Node]) -> Option<Vec<u8>> {
     Some(name)
 }
 
+/// A property of tree `t`'s node at `path` (`IODeviceTree:/chosen`), as
+/// `getProperty` gives it: `None` when the node or the property is not
+/// there.
+pub fn dt_prop<'a>(t: &'a [Node], path: &str, name: &str) -> Option<&'a [u8]> {
+    let at = from_path(t, path).ok()??;
+    t[at as usize].props.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_slice())
+}
+
+/// Whether tree `t` has a node at `path`.
+pub fn dt_has(t: &[Node], path: &str) -> bool {
+    matches!(from_path(t, path), Ok(Some(_)))
+}
+
 /// A value in a matching dictionary.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DictValue {

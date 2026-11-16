@@ -114,6 +114,12 @@ int main(void) {
     len = sizeof buf;
     if (sysctlbyname("hw.target", buf, &len, NULL, 0) != 0 || strcmp(buf, "J120AP") != 0 || len != 7) return bad("hw.target", (long)len, 7);
 
+    // AppleImage4's ignition blob is for an entitled task or init alone,
+    // its size too.
+    errno = 0;
+    len = 0;
+    if (sysctlbyname("security.mac.img4.ignition_blob", NULL, &len, NULL, 0) != -1 || errno != EPERM) return bad("the ignition blob, unentitled", errno, EPERM);
+
     // The name of a node that does not exist.
     errno = 0;
     len = sizeof buf;

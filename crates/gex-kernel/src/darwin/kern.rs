@@ -1791,6 +1791,7 @@ impl Kernel {
                 }
                 None => Err(Errno::EINVAL),
             },
+            "security.mac.img4.ignition_blob" => self.darwin_sysctl_ignition_blob(m, req),
             "kern.dyld_flags" => self.darwin_sysctl_dyld_flags(m, req),
             "kern.progressoptions" | "kern.consoleoptions" => self.darwin_sysctl_progressoptions(m, node.path, req),
             "vm.loadavg" => self.darwin_sysctl_loadavg(m, req),
@@ -1872,6 +1873,30 @@ impl Kernel {
         let new = req.io_string(m, &name, sysctl::MAXHOSTNAMELEN, true)?;
         if let Some(v) = new {
             sysctl::set_hostname(v);
+        }
+        Ok(())
+    }
+
+    /// AppleImage4's `security.mac.img4.ignition_blob` (0xfffffff005a948ec):
+    /// for a task with its entitlement or the init process, else EPERM;
+    /// then `sysctl_handle_opaque` of the blob (its 0x84 bytes out, and a
+    /// new value of as many in, which the node's ANYBODY write lets such a
+    /// caller give). A blob the kext's start could not make is its panic.
+    fn darwin_sysctl_ignition_blob(&mut self, m: &mut GuestMem<'_>, req: &mut SysctlReq) -> Result<(), Errno> {
+        if !self.darwin_task_entitled(super::img4::IGNITION_BLOB_ENTITLEMENT) && self.pid != 1 {
+            return Err(Errno::EPERM);
+        }
+        let blob = match super::img4::ignition_blob() {
+            Ok(b) => b,
+            Err(why) => {
+                self.darwin_unimplemented(why);
+                return Err(Errno::EIO);
+            }
+        };
+        req.out(m, &blob)?;
+        if req.new != 0 {
+            let b = req.input(m, blob.len())?;
+            super::img4::set_ignition_blob(b.try_into().expect("the blob's size"));
         }
         Ok(())
     }

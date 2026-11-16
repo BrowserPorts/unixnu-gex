@@ -213,8 +213,29 @@ pub struct Node {
 
 /// What a kext registers, not in the kernel's own list.
 static KEXT_NODES: &[Node] = &[
-    Node { path: "security.mac.amfi", number: 100, kind: ctl::RD | ctl::WR | 0x00e0_0000 | ctl::TYPE_NODE, fmt: "N", handler: false },
-    Node { path: "security.mac.amfi.developer_mode_status", number: 100, kind: ctl::RD | 0x00e0_0000 | 2, fmt: "I", handler: true },
+    // The security.mac children the kexts add, OID_AUTO each: one past the
+    // highest of the kernel's own (100 to 116) and of those registered
+    // before. AppleImage4's start registers its nodes (the lists at
+    // 0xfffffff006cf6b88, then 0xfffffff006cf6bb0, in their order) before
+    // AMFI's, which links it (OSBundleLibraries) and registers its own
+    // after its MAC policy (0xfffffff005aae84c); Sandbox, which links AMFI,
+    // and AppleSEPCredentialManager, a driver matched later, come after.
+    Node { path: "security.mac.image4", number: 117, kind: 0xa0c0_0001, fmt: "N", handler: false },
+    Node { path: "security.mac.img4", number: 118, kind: 0xa0c0_0001, fmt: "N", handler: false },
+    Node { path: "security.mac.image4.kmod", number: 100, kind: 0xa0c0_0001, fmt: "N", handler: false },
+    Node { path: "security.mac.image4.nonce", number: 101, kind: 0xa0c0_0001, fmt: "N", handler: false },
+    Node { path: "security.mac.image4.image", number: 102, kind: 0xa0c0_0001, fmt: "N", handler: false },
+    Node { path: "security.mac.image4.kmod.copy_version", number: 100, kind: 0xf5c0_0005, fmt: "-", handler: true },
+    Node { path: "security.mac.image4.nonce.copy_hash", number: 100, kind: 0xf5c0_0005, fmt: "-", handler: true },
+    Node { path: "security.mac.image4.nonce.peek_hash", number: 101, kind: 0xf5c0_0005, fmt: "-", handler: true },
+    Node { path: "security.mac.image4.nonce.roll", number: 102, kind: 0xf5c0_0005, fmt: "-", handler: true },
+    Node { path: "security.mac.image4.nonce.generate_proposal", number: 103, kind: 0xf5c0_0005, fmt: "-", handler: true },
+    Node { path: "security.mac.image4.image.activate", number: 100, kind: 0xf5c0_0005, fmt: "-", handler: true },
+    Node { path: "security.mac.image4.image.copy_active", number: 101, kind: 0xf5c0_0005, fmt: "-", handler: true },
+    Node { path: "security.mac.img4.ignition_blob", number: 100, kind: 0xf5c0_0005, fmt: "-", handler: true },
+    Node { path: "security.mac.img4.ignition_failure_blob", number: 101, kind: 0xf5c0_0005, fmt: "-", handler: true },
+    Node { path: "security.mac.amfi", number: 119, kind: 0x8040_0001, fmt: "N", handler: false },
+    Node { path: "security.mac.amfi.developer_mode_status", number: 100, kind: 0x83c0_0002, fmt: "I", handler: true },
     // apfs.kext's (sysctl_oid structs from 0xfffffff007b2d4c0), registered
     // in its list's order (0xfffffff006f2b578: edt_fstab first, the node
     // itself last), each OID_AUTO number one past its siblings' highest.
@@ -422,6 +443,8 @@ mod tests {
         assert_eq!(tail, &[7]);
         assert_eq!(name_of(&[1, 14, 1, 7]), "kern.proc.pid.7");
         assert_eq!(oid_fmt(&[1, 2]).unwrap().1, "A");
+        assert_eq!(name2oid("security.mac.img4.ignition_blob"), Ok(vec![103, 101, 118, 100]));
+        assert_eq!(name2oid("security.mac.amfi"), Ok(vec![103, 101, 119]));
         let after = next(&[1, 2]).unwrap();
         assert!(after.as_slice() > &[1i32, 2][..]);
     }
@@ -430,6 +453,7 @@ mod tests {
     fn the_paths_are_unique_and_the_values_are_of_nodes() {
         let t = tree();
         assert_eq!(t.by_path.len(), t.nodes.len());
+        assert_eq!(t.by_oid.len(), t.nodes.len(), "two nodes with the same numbers");
         for (_, n) in &t.nodes {
             if value(n.path).is_some() {
                 assert_ne!(n.kind & ctl::TYPE, ctl::TYPE_NODE, "{} is a directory", n.path);

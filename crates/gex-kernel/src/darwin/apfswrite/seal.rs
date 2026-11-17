@@ -802,6 +802,13 @@ mod tests {
         let c = Arc::new(Container::open(Arc::new(crate::darwin::udif::PartitionMedium { image: u, index: p })).unwrap());
         let v = c.volume(0).unwrap().unwrap();
         let digest = read_digests(&std::fs::read(&db).unwrap()).unwrap();
+        // The same digests as the IPSW's mtree carries them
+        // (GEX_TEST_MTREE), read in process.
+        if let Ok(mtree) = std::env::var("GEX_TEST_MTREE") {
+            let archive = crate::darwin::aar::mtree_payload(&std::fs::read(&mtree).unwrap()).unwrap();
+            let db = crate::darwin::aar::file(&archive, "digest.db").unwrap();
+            assert!(read_digests(db).unwrap() == digest);
+        }
         let (recs, extents) = sealed_records(&v, T_SPEC, &digest).unwrap();
         assert!(!extents.is_empty());
         let (_, h) = build(recs).unwrap();

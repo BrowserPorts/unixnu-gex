@@ -399,7 +399,11 @@ pub fn decode(src: &[u8], dst: &mut [u8]) -> Result<usize, Error> {
                 }
                 check_header(&h)?;
                 at += header_size;
-                out = lzfse_block(&h, src, at, dst, out)?;
+                let (end, full) = lzfse_block(&h, src, at, dst, out)?;
+                if full {
+                    return err("a block's output overruns the destination");
+                }
+                out = end;
                 at += lit_bytes + lmd_bytes;
             }
             _ => return err(format!("block magic {magic:#010x}")),
@@ -407,9 +411,161 @@ pub fn decode(src: &[u8], dst: &mut [u8]) -> Result<usize, Error> {
     }
 }
 
+/// `lzfse_decode_buffer`: as much of the stream as `dst` holds. The bytes
+/// written at the end-of-stream block; all of `dst` when it fills first
+/// (`LZFSE_STATUS_DST_FULL`, also what an LZVN block that stops short of
+/// its end reports); 0 for a stream that is malformed or ends early.
+pub fn decode_buffer(src: &[u8], dst: &mut [u8]) -> usize {
+    let mut at = 0usize;
+    let mut out = 0usize;
+    loop {
+        let Ok(magic) = load4(src, at) else { return 0 };
+        match magic {
+            ENDOFSTREAM_BLOCK_MAGIC => return out,
+            UNCOMPRESSED_BLOCK_MAGIC => {
+                let Ok(n) = load4(src, at + 4) else { return 0 };
+                at += 8;
+                let mut n = n as usize;
+                // Copied in pieces bounded by the source and the
+                // destination; the source's end is checked first.
+                while n > 0 {
+                    if at >= src.len() {
+                        return 0;
+                    }
+                    if out >= dst.len() {
+                        return dst.len();
+                    }
+                    let c = n.min(src.len() - at).min(dst.len() - out);
+                    dst[out..out + c].copy_from_slice(&src[at..at + c]);
+                    at += c;
+                    out += c;
+                    n -= c;
+                }
+            }
+            COMPRESSEDLZVN_BLOCK_MAGIC => {
+                let (Ok(n_raw), Ok(n_payload)) = (load4(src, at + 4), load4(src, at + 8)) else { return 0 };
+                let (n_raw, n_payload) = (n_raw as usize, n_payload as usize);
+                at += 12;
+                if n_payload > 0 && at >= src.len() {
+                    return 0;
+                }
+                let payload = &src[at..src.len().min(at + n_payload)];
+                let to = dst.len().min(out + n_raw);
+                let r = lzvn_run(payload, dst, out, to);
+                let (src_used, dst_used) = (r.src_used, r.dst_at - out);
+                let (payload_left, raw_left) = (n_payload - src_used, n_raw - dst_used);
+                at += src_used;
+                out += dst_used;
+                if payload_left == 0 && raw_left == 0 && r.end_of_stream {
+                    continue;
+                }
+                if payload_left == 0 || raw_left == 0 || r.end_of_stream {
+                    return 0;
+                }
+                return dst.len();
+            }
+            COMPRESSEDV1_BLOCK_MAGIC | COMPRESSEDV2_BLOCK_MAGIC => {
+                let header = if magic == COMPRESSEDV2_BLOCK_MAGIC {
+                    if src.len() < at + 32 {
+                        return 0;
+                    }
+                    let size = field(u64::from_le_bytes(src[at + 24..at + 32].try_into().unwrap()), 0, 32) as usize;
+                    if size < 32 {
+                        return 0;
+                    }
+                    let Some(hb) = src.get(at..at + size) else { return 0 };
+                    header_v2(hb).map(|h| (h, size))
+                } else {
+                    let Some(hb) = src.get(at..at + V1_HEADER_SIZE) else { return 0 };
+                    Ok((header_v1(hb), V1_HEADER_SIZE))
+                };
+                let Ok((h, header_size)) = header else { return 0 };
+                let (lit_bytes, lmd_bytes) = (h.n_literal_payload_bytes as usize, h.n_lmd_payload_bytes as usize);
+                if at + header_size + lit_bytes + lmd_bytes > src.len() || check_header(&h).is_err() {
+                    return 0;
+                }
+                at += header_size;
+                match lzfse_block(&h, src, at, dst, out) {
+                    Ok((_, true)) => return dst.len(),
+                    Ok((end, false)) => out = end,
+                    Err(_) => return 0,
+                }
+                at += lit_bytes + lmd_bytes;
+            }
+            _ => return 0,
+        }
+    }
+}
+
+/// The raw LZVN decoder the kernel's decmpfs decompressor uses for its
+/// LZVN scheme (algorithm 0x900 of its `compression_decode_buffer`,
+/// 0xfffffff006b20440): a stream with no block header, decoded into `dst`.
+/// Each opcode is fetched only while at least 8 source bytes remain from
+/// it (checked before the opcode's literal and match are copied); the
+/// distance starts at 0, and a match at distance 0 or reaching before the
+/// output fails. It gives the bytes written at the end-of-stream opcode,
+/// all of `dst` once a literal or match reaches its end (the copy stops
+/// there), and 0 for an empty
+/// destination, an undefined opcode, a bad distance, or a source that runs
+/// out.
+pub fn lzvn_decode_buffer(src: &[u8], dst: &mut [u8]) -> usize {
+    if dst.is_empty() {
+        return 0;
+    }
+    let (mut sp, mut dp, mut d) = (0usize, 0usize, 0usize);
+    let e = |v: u8, lsb: u32, w: u32| ((u32::from(v) >> lsb) & ((1 << w) - 1)) as usize;
+    loop {
+        if sp + 8 > src.len() {
+            return 0;
+        }
+        let opc = src[sp];
+        let b1 = usize::from(src[sp + 1]);
+        let b12 = usize::from(u16::from_le_bytes([src[sp + 1], src[sp + 2]]));
+        // (opcode length, literal length, match length, distance)
+        let (ol, l, m, nd) = match opc {
+            6 => return dp,
+            14 | 22 => (1, 0, 0, d),
+            30 | 38 | 46 | 54 | 62 | 112..=127 | 208..=223 => return 0,
+            224 => (2, b1 + 16, 0, d),
+            225..=239 => (1, e(opc, 0, 4), 0, d),
+            240 => (2, 0, b1 + 16, d),
+            241..=255 => (1, 0, e(opc, 0, 4), d),
+            160..=191 => (3, e(opc, 3, 2), ((e(opc, 0, 3) << 2) | (b12 & 3)) + 3, b12 >> 2),
+            _ if opc & 7 == 7 => (3, e(opc, 6, 2), e(opc, 3, 3) + 3, b12),
+            _ if opc & 7 == 6 => (1, e(opc, 6, 2), e(opc, 3, 3) + 3, d),
+            _ => (2, e(opc, 6, 2), e(opc, 3, 3) + 3, (e(opc, 0, 3) << 8) | b1),
+        };
+        let lit = sp + ol;
+        sp = lit + l;
+        if sp + 8 > src.len() {
+            return 0;
+        }
+        d = nd;
+        let n = l.min(dst.len() - dp);
+        dst[dp..dp + n].copy_from_slice(&src[lit..lit + n]);
+        dp += n;
+        // Filling the destination ends the decode at once.
+        if l > 0 && dp == dst.len() {
+            return dst.len();
+        }
+        if m == 0 {
+            continue;
+        }
+        if d > dp || d == 0 {
+            return 0;
+        }
+        let n = m.min(dst.len() - dp);
+        dp = copy_match(dst, dp, d, n);
+        if dp == dst.len() {
+            return dst.len();
+        }
+    }
+}
+
 /// One LZFSE block whose literal payload starts at `at`: its output from
-/// `out`, and where that ends.
-fn lzfse_block(h: &Header, src: &[u8], at: usize, dst: &mut [u8], out: usize) -> Result<usize, Error> {
+/// `out`, where that ends, and whether it stopped there because `dst` is
+/// full (`LZFSE_STATUS_DST_FULL`).
+fn lzfse_block(h: &Header, src: &[u8], at: usize, dst: &mut [u8], out: usize) -> Result<(usize, bool), Error> {
     let (l_freq, rest) = h.freq.split_at(L_SYMBOLS);
     let (m_freq, rest) = rest.split_at(M_SYMBOLS);
     let (d_freq, lit_freq) = rest.split_at(D_SYMBOLS);
@@ -462,19 +618,28 @@ fn lzfse_block(h: &Header, src: &[u8], at: usize, dst: &mut [u8], out: usize) ->
         if (d as u32) as usize > out + l {
             return err("a match distance reaches before the output");
         }
+        let dd = d as usize;
         if out + l + m > dst.len() {
-            return err("a block's output overruns the destination");
+            // The careful path at the destination's end: the literal, then
+            // the match, each as much as fits (`DestinationBufferIsFull`).
+            let n = l.min(dst.len() - out);
+            dst[out..out + n].copy_from_slice(&literals[lit..lit + n]);
+            out += n;
+            let n = m.min(dst.len() - out);
+            for i in 0..n {
+                dst[out + i] = dst[out + i - dd];
+            }
+            return Ok((out + n, true));
         }
         dst[out..out + l].copy_from_slice(&literals[lit..lit + l]);
         out += l;
         lit += l;
-        let dd = d as usize;
         for i in 0..m {
             dst[out + i] = dst[out + i - dd];
         }
         out += m;
     }
-    Ok(out)
+    Ok((out, false))
 }
 
 /// Where an LZVN run stopped.
@@ -644,6 +809,43 @@ fn copy_match(dst: &mut [u8], dp: usize, d: usize, n: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    /// Streams the host's encoder made (GEX_TEST_LZFSE_DIR: `cN.lzfse`
+    /// beside `cN.raw`, from `compression_tool -encode -a lzfse`) decode to
+    /// their input, whole or cut short; the LZVN payloads of their `bvxn`
+    /// blocks decode alone as the kernel's raw LZVN decoder takes them.
+    #[test]
+    fn host_encoded_streams() {
+        let Ok(dir) = std::env::var("GEX_TEST_LZFSE_DIR") else { return };
+        let mut n = 0;
+        for e in std::fs::read_dir(&dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.extension().and_then(|x| x.to_str()) != Some("lzfse") {
+                continue;
+            }
+            let src = std::fs::read(&p).unwrap();
+            let raw = std::fs::read(p.with_extension("raw")).unwrap();
+            let mut out = vec![0u8; raw.len()];
+            assert_eq!(decode_buffer(&src, &mut out), raw.len(), "{p:?}");
+            assert!(out == raw, "{p:?}");
+            let mut short = vec![0u8; raw.len() / 2];
+            assert_eq!(decode_buffer(&src, &mut short), raw.len() / 2, "{p:?}");
+            assert!(short[..] == raw[..raw.len() / 2], "{p:?}");
+            if u32::from_le_bytes(src[..4].try_into().unwrap()) == COMPRESSEDLZVN_BLOCK_MAGIC {
+                let n_payload = u32::from_le_bytes(src[8..12].try_into().unwrap()) as usize;
+                let payload = &src[12..12 + n_payload];
+                let mut out = vec![0u8; raw.len() + 64];
+                assert_eq!(lzvn_decode_buffer(payload, &mut out), raw.len(), "{p:?}");
+                assert!(out[..raw.len()] == raw[..], "{p:?}");
+                let mut short = vec![0u8; raw.len() - 1];
+                assert_eq!(lzvn_decode_buffer(payload, &mut short), raw.len() - 1, "{p:?}");
+                assert!(short[..] == raw[..raw.len() - 1], "{p:?}");
+                assert_eq!(lzvn_decode_buffer(&payload[..payload.len() - 1], &mut out), 0, "{p:?}");
+            }
+            n += 1;
+        }
+        assert!(n > 0);
+    }
+
     use super::*;
 
     #[test]

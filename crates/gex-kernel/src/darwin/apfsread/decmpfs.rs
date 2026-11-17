@@ -114,7 +114,20 @@ pub fn chunk(scheme: u32, data: &[u8], cap: usize) -> Result<Vec<u8>> {
                 Err(e @ lzbitmap::Error::Undefined(_)) => Err(Error::Unsupported(e.to_string())),
             }
         }
-        scheme::ZLIB | scheme::LZVN | scheme::LZFSE => Err(Error::Unsupported(format!("decoding a chunk of compression scheme {scheme:#x} (zlib, LZVN or LZFSE)"))),
+        // The whole chunk through its `compression_decode_buffer`
+        // (0xfffffff006b28f10): algorithm 0x900 for LZVN, 0x801 for LZFSE
+        // (0xfffffff006b2a598, 0xfffffff006b2a6a8); no bytes is "decode
+        // failed", EINVAL (0xfffffff006b2a874).
+        scheme::LZVN | scheme::LZFSE => {
+            let mut out = vec![0u8; cap];
+            let n = if scheme == scheme::LZVN { crate::darwin::lzfse::lzvn_decode_buffer(data, &mut out) } else { crate::darwin::lzfse::decode_buffer(data, &mut out) };
+            if n == 0 {
+                return fetch_error(EINVAL, format!("decode failed for compression scheme {scheme:#x}"));
+            }
+            out.truncate(n);
+            Ok(out)
+        }
+        scheme::ZLIB => Err(Error::Unsupported(format!("decoding a chunk of compression scheme {scheme:#x} (zlib)"))),
         _ => fetch_error(EINVAL, format!("a chunk of compression scheme {scheme:#x} without its marker byte")),
     }
 }
@@ -287,6 +300,96 @@ mod tests {
         assert_eq!(chunk(scheme::LZBITMAP, s, 16).unwrap(), b"abc");
         assert!(matches!(chunk(scheme::LZBITMAP, b"ZBM\x00\x06\x00\x00\x00\x00\x00", 16), Err(Error::Decmpfs { errno: EINVAL, .. })));
         assert!(matches!(chunk(scheme::LZBITMAP, b"ZBQ\x00", 16), Err(Error::Decmpfs { errno: EINVAL, .. })));
-        assert!(matches!(chunk(scheme::LZFSE, b"bvx2", 16), Err(Error::Unsupported(_))));
+        // A truncated LZFSE stream: no bytes, "decode failed".
+        assert!(matches!(chunk(scheme::LZFSE, b"bvx2", 16), Err(Error::Decmpfs { errno: EINVAL, .. })));
+        assert!(matches!(chunk(scheme::ZLIB, b"\x78\x9c", 16), Err(Error::Unsupported(_))));
+    }
+
+    /// An LZVN chunk: no block header; literals, a match, end of stream;
+    /// cut where the destination ends.
+    #[test]
+    fn lzvn_chunks() {
+        // sml_l "abc" (0xe3), sml_m 4 at no distance yet: refused; then a
+        // sml_d of 1 literal, 3 matched at distance 1, and eos.
+        let eos = [6u8, 0, 0, 0, 0, 0, 0, 0];
+        let mut s = vec![0xe3, b'a', b'b', b'c'];
+        // sml_d: L=1 (bits 6-7), M-3=0 (bits 3-5), D=1 (bits 0-2 high, next low).
+        s.extend([0x40, 0x01, b'd']);
+        s.extend(eos);
+        assert_eq!(chunk(scheme::LZVN, &s, 64).unwrap(), b"abcdddd");
+        // Cut to the room there is.
+        assert_eq!(chunk(scheme::LZVN, &s, 5).unwrap(), b"abcdd");
+        // A match before any distance, and a stream with no end.
+        let mut bad = vec![0xf4];
+        bad.extend(eos);
+        assert!(matches!(chunk(scheme::LZVN, &bad, 64), Err(Error::Decmpfs { errno: EINVAL, .. })));
+        assert!(matches!(chunk(scheme::LZVN, &s[..s.len() - 1], 64), Err(Error::Decmpfs { errno: EINVAL, .. })));
+    }
+
+    /// An LZFSE chunk: an uncompressed block, then the end; a destination
+    /// shorter than the stream takes its first bytes.
+    #[test]
+    fn lzfse_chunks() {
+        let mut s = b"bvx-".to_vec();
+        s.extend(5u32.to_le_bytes());
+        s.extend(b"hello");
+        s.extend(b"bvx$");
+        assert_eq!(chunk(scheme::LZFSE, &s, 64).unwrap(), b"hello");
+        assert_eq!(chunk(scheme::LZFSE, &s, 3).unwrap(), b"hel");
+        assert!(matches!(chunk(scheme::LZFSE, &s[..s.len() - 4], 64), Err(Error::Decmpfs { errno: EINVAL, .. })));
+    }
+
+    /// Every file of decmpfs types 7, 8, 11 and 12 on the first volume of
+    /// each image (UDIF or a raw container) in GEX_TEST_DECMPFS_IMAGES
+    /// (colon-separated) reads
+    /// back as the host reads the same image mounted at the matching entry
+    /// of GEX_TEST_DECMPFS_MNTS.
+    #[test]
+    fn image_files_of_lzvn_and_lzfse_types() {
+        use std::sync::Arc;
+        let (Ok(imgs), Ok(mnts)) = (std::env::var("GEX_TEST_DECMPFS_IMAGES"), std::env::var("GEX_TEST_DECMPFS_MNTS")) else { return };
+        for (img, mnt) in imgs.split(':').zip(mnts.split(':')) {
+            let f = std::fs::File::open(img).unwrap();
+            let size = f.metadata().unwrap().len();
+            let file = Arc::new(crate::darwin::apfsread::tests_support::HostFile(f, size));
+            let mut tail = [0u8; 4];
+            crate::darwin::apfsread::Medium::read_at(file.as_ref(), size - 512, &mut tail).unwrap();
+            // A UDIF image (its "koly" trailer) or a raw container.
+            let medium: Arc<dyn crate::darwin::apfsread::Medium> = if &tail == b"koly" {
+                let u = Arc::new(crate::darwin::udif::Udif::open(file).unwrap());
+                let p = u.partition("Apple_APFS").unwrap();
+                Arc::new(crate::darwin::udif::PartitionMedium { image: u, index: p })
+            } else {
+                file
+            };
+            let c = Arc::new(crate::darwin::apfsread::Container::open(medium).unwrap());
+            let v = c.volume(0).unwrap().unwrap();
+            let mut oids = Vec::new();
+            v.fs_tree
+                .walk(&v.container, &mut |k, _| {
+                    let (oid, t) = super::super::fs::key_header(k)?;
+                    if t == 4 && k.len() >= 12 && k[10..k.len() - 1] == *b"com.apple.decmpfs" {
+                        oids.push(oid);
+                    }
+                    Ok(true)
+                })
+                .unwrap();
+            let mut seen = std::collections::BTreeMap::<u32, usize>::new();
+            for oid in oids {
+                let ino = v.inode(oid).unwrap().unwrap();
+                let (h, _) = v.decmpfs(&ino).unwrap();
+                *seen.entry(h.kind).or_default() += 1;
+                if ![7, 8, 11, 12].contains(&h.kind) {
+                    continue;
+                }
+                let path = v.path_of(oid).unwrap().unwrap();
+                let want = std::fs::read(format!("{mnt}{path}")).unwrap();
+                let mut got = vec![0u8; want.len()];
+                let n = v.read_file(&ino, 0, &mut got).unwrap();
+                assert_eq!(n, want.len(), "{img}: {path}");
+                assert!(got == want, "{img}: {path} (type {})", h.kind);
+            }
+            eprintln!("{img}: decmpfs types {seen:?}");
+        }
     }
 }

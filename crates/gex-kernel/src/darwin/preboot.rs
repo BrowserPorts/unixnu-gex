@@ -17,7 +17,10 @@
 //!   build identities have no exclave component. Each is the maker's (root)
 //!   and its directory's group (wheel).
 //! - `active` (0x100056fa8): `open_dprotected_np(O_WRONLY | O_CREAT |
-//!   O_TRUNC, class 0, 0644)` (0x100047ab0), holding the AP ticket's hash
+//!   O_TRUNC, class -1, 0644)` (0x100047ab0, given its class by the caller
+//!   at 0x100057078): `PROTECTION_CLASS_DEFAULT`, for which XNU's
+//!   `openat_dprotected_internal` sets no class, so APFS gives the file the
+//!   volume's default, class C (K 0x6737260). It holds the AP ticket's hash
 //!   in hexadecimal capitals (0x100065728) by `/chosen`'s
 //!   `crypto-hash-method` (sha2-384: 96 digits).
 //! - The directory named by that hash (`"%s/%@"`, 0x10004bf94), which the

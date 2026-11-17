@@ -806,7 +806,9 @@ is the reference (search `crates/gex-kernel/src/` for
   first, until `sysctl.name2oid` of it on the device measures it. APFS's `fsctl`s
   other than `APFSIOC_GET_DEV_BY_ROLE` and the virtual-interface query
   are reported.
-- **Sockets.** Interface `ioctl`s know only `lo0`. An inet6 socket's
+- **Sockets.** Interface `ioctl`s know only `lo0`. `udp_recvspace`
+  follows the mbuf pool that the device's memory size sets: 4 GiB stands
+  in until `sysctl hw.memsize` on the device measures it. An inet6 socket's
   protocol calls (binding, connecting, sending, receiving, its name,
   `shutdown`, `fstat`, the `IPPROTO_IPV6` and protocol-level options),
   raw and ICMPv6 sockets, and IPv6 addresses whose routes, on-link

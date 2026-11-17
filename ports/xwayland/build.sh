@@ -117,15 +117,17 @@ say() { printf '\n== %s\n' "$*"; }
 # -- the host's X protocol headers, staged ----------------------------------
 #
 # xproto and its two dozen siblings are header-only: no code, no architecture.
-# Their .pc files point into /usr/include, which a cross build must not read
-# (it also holds native pixman, wayland and zlib), so the headers are copied
-# and the .pc files re-pointed at the copy.
+# They are host-tools.sh's (GEX_XWL_HOST_TOOLS: xorgproto at its tag), copied
+# into the prefix and their .pc files re-pointed at the copy, so the build
+# reads no header of the build machine's. input-event-codes.h is the pinned
+# Linux headers' (toolchain/linux-headers.sh).
 say "staging the X protocol headers"
-[ -d "$PREFIX/include/X11" ] || cp -r /usr/include/X11 "$PREFIX/include/"
-# And the host tools' newer protocol headers over the distro's.
-[ -z "$HT" ] || [ ! -d "$HT/include/X11" ] || cp -r "$HT/include/X11/." "$PREFIX/include/X11/"
+[ -n "$HT" ] && [ -f "$HT/include/X11/Xproto.h" ] || {
+    echo "no X protocol headers: GEX_XWL_HOST_TOOLS (ports/xwayland/host-tools.sh)"; exit 1; }
+mkdir -p "$PREFIX/include/X11"
+cp -r "$HT/include/X11/." "$PREFIX/include/X11/"
 mkdir -p "$PREFIX/include/linux"
-cp /usr/include/linux/input-event-codes.h "$PREFIX/include/linux/"
+cp "$("$HERE/../../toolchain/linux-headers.sh")/linux/input-event-codes.h" "$PREFIX/include/linux/"
 for p in xproto randrproto renderproto xextproto inputproto kbproto fontsproto \
          fixesproto damageproto xcmiscproto bigreqsproto presentproto videoproto \
          compositeproto recordproto scrnsaverproto resourceproto dri3proto \
@@ -294,7 +296,9 @@ python3 "$HERE/patch.py" sources "$SRC/wayland" "$SRC/xserver"
 
 say "zlib"
 clone zlib https://github.com/madler/zlib.git
-(cd "$SRC/zlib" && emconfigure ./configure --prefix="$PREFIX" --static > "$OUT/log-zlib.txt" 2>&1 \
+# CHOST: zlib's configure takes the build machine's uname otherwise, and on
+# macOS archives with Apple's libtool, which drops every wasm object.
+(cd "$SRC/zlib" && CHOST=wasm32-unknown-emscripten emconfigure ./configure --prefix="$PREFIX" --static > "$OUT/log-zlib.txt" 2>&1 \
     && emmake make -j"$(nproc)" install >> "$OUT/log-zlib.txt" 2>&1)
 
 say "pixman"
@@ -656,6 +660,9 @@ say "the keymap, compiled by the host's xkbcomp"
 # the server's loader at it. `-nokeymap` then keeps the server from trying to
 # use the one the compositor sends over Wayland.
 command -v xkbcomp >/dev/null 2>&1 || { echo "need xkbcomp (xorg-xkbcomp)"; exit 1; }
+# compiled from the pinned xkeyboard-config data (toolchain/pins' XKB_DATA)
+# alone: `-I` with no directory drops xkbcomp's own default path
+XKB_DATA=$("$HERE/../../toolchain/debian-package.sh" XKB_DATA)
 mkdir -p "$OUT/xkb"
 cat > "$OUT/xkb/gex.xkb" <<'EOF'
 xkb_keymap {
@@ -666,7 +673,7 @@ xkb_keymap {
     xkb_geometry  { include "pc(pc105)"             };
 };
 EOF
-xkbcomp -xkm "$OUT/xkb/gex.xkb" "$OUT/xkb/gex.xkm" > "$OUT/log-xkb.txt" 2>&1 || {
+xkbcomp -I -I"$XKB_DATA/usr/share/X11/xkb" -xkm "$OUT/xkb/gex.xkb" "$OUT/xkb/gex.xkm" > "$OUT/log-xkb.txt" 2>&1 || {
     echo "xkbcomp failed:"; cat "$OUT/log-xkb.txt"; exit 1; }
 printf '  %-28s %9d bytes\n' "gex.xkm" "$(stat -c%s "$OUT/xkb/gex.xkm")"
 
@@ -775,7 +782,7 @@ for n in xserver wayland pixman libxcvt libxtrans libXau libfontenc libXfont2 li
     [ -n "$f" ] || { echo "no licence file in $SRC/$n" >&2; exit 1; }
     cp "$f" "$PUB/licenses/$n"
 done
-XKB_COPYRIGHT=${GEX_XKB_COPYRIGHT:-/usr/share/doc/xkb-data/copyright}
+XKB_COPYRIGHT=${GEX_XKB_COPYRIGHT:-$XKB_DATA/usr/share/doc/xkb-data/copyright}
 [ -f "$XKB_COPYRIGHT" ] || { echo "no $XKB_COPYRIGHT (xkeyboard-config's licence; GEX_XKB_COPYRIGHT names one)" >&2; exit 1; }
 cp "$XKB_COPYRIGHT" "$PUB/licenses/xkeyboard-config"
 

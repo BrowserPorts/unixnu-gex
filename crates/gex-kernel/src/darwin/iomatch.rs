@@ -199,7 +199,7 @@ fn equal(a: V<'_>, b: V<'_>) -> bool {
 /// class's `getProperty` override: `Err` for one that may be the device's
 /// but is not here.
 fn copy_property(t: &[Node], i: u32, name: &str) -> Result<Option<Prop>, String> {
-    if let Some(what) = super::storagestack::property_override(t, i, name) {
+    if let Some(what) = super::storagestack::property_override(t, i, name).or_else(|| super::platform::property_override(t, i, name)) {
         return Err(what);
     }
     let n = &t[i as usize];

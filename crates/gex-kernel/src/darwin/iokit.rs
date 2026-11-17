@@ -450,7 +450,7 @@ pub fn service_prop<'a>(n: &'a Node, name: &str) -> Option<&'a Prop> {
 /// ([`property_unknown`]).
 pub fn lookup(t: &[Node], i: u32, name: &str) -> Result<Option<Vec<u8>>, String> {
     let Some(node) = t.get(i as usize) else { return Ok(None) };
-    if let Some(what) = super::storagestack::property_override(t, i, name) {
+    if let Some(what) = super::storagestack::property_override(t, i, name).or_else(|| super::platform::property_override(t, i, name)) {
         return Err(what);
     }
     if let Some(p) = live_prop(t, i, name) {
@@ -1651,6 +1651,11 @@ mod tests {
         assert_eq!(super::super::storagestack::pci_config(&t, s3e, 0x08), Ok(0x0180_0200));
         // The DT plane keeps the configured flag on apcie.
         assert_eq!(p(2, "IOPCIConfigured"), Some(Prop::Bool(true)));
+        // The DART's keys are s3e's alone (it has an iommu-parent); the
+        // mapper's ID is the mapper's. The root's clock is the bus clock.
+        assert!(lookup(&t, s3e, "IOPCIDeviceMapperPageSize").is_err());
+        assert_eq!((lookup(&t, port, "IOPCIDeviceMapperPageSize"), lookup(&t, port, "IOMapperID")), (Ok(None), Ok(None)));
+        assert!(lookup(&t, 0, "clock-frequency").is_err());
         // The root complex's legend: link states, events, energy, for
         // port 0.
         let rc = t.iter().position(|n| n.class == "AppleT8011PCIe").unwrap() as u32;

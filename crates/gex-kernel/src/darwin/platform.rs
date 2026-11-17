@@ -6,12 +6,15 @@
 //! Root                    IORegistryEntry
 //!   J120AP                IOPlatformExpertDevice (the device tree's root)
 //!     AppleARMPE          the platform expert
+//!       IOPMrootDomain    the root power domain (`super::iopower`)
+//!       cpu0 .. cpus ..   IOPlatformDevice nubs of /cpus's children and of
+//!                         the root's children, arm-io among them
 //!       arm-io            IOPlatformDevice, a nub of the device tree's arm-io
 //!         AppleT8011IO    arm-io's driver
-//!           sgx           AppleARMIODevice, a nub of arm-io's sgx
-//!             (the GPU's accelerator, `super::accel`)
-//!           disp0         AppleARMIODevice, a nub of arm-io's disp0
-//!             (the display's framebuffer, `super::iomfb`)
+//!           ...           AppleARMIODevice, a nub of each of arm-io's children:
+//!           sgx           (the GPU's accelerator, `super::accel`)
+//!           disp0         (the display's framebuffer, `super::iomfb`)
+//!           apcie         (the PCIe root complex, `super::storagestack`)
 //! ```
 //!
 //! - The platform expert. `AppleARMPE` (com.apple.driver.AppleARMPlatform)
@@ -59,9 +62,10 @@
 //!   none).
 //! - `IOProbeScore`, a 32-bit number of the probe's score (`probeCandidates`).
 //!
-//! What each driver's start then sets is its own and not modelled: such a
-//! property is reported when read. So are these drivers' other nubs and
-//! clients, which are their children in the `IOService` plane.
+//! What the drivers' starts set is in [`add`]; what the drivers matched on
+//! the nubs set on them is not modelled, and is reported when read. So are
+//! the platform expert's other children (IOSystemStateNotification, the
+//! PCIe MSI controller) and the drivers' clients.
 //!
 //! The resources nub. `IOService::initialize` makes `IOResources` (its
 //! `resources()`, inlined at 0xfffffff0077c8ec0, keeps it in gIOResources,
@@ -152,6 +156,14 @@ pub fn superclasses(class: &str) -> &'static [&'static str] {
 /// publishing its nubs (0xfffffff006c41910).
 pub fn registers(class: &str) -> Option<bool> {
     matches!(class, PE | ARM_IO).then_some(true)
+}
+
+/// A property of entry `i` the platform's drivers changed in a way not
+/// modelled: the root's clock-frequency, which `IOPlatformExpert::start`
+/// (0xfffffff00780b1dc) replaces in place with the bus clock, the running
+/// CPU's bus-frequency, which iBoot fills in the device tree.
+pub fn property_override(t: &[Node], i: u32, name: &str) -> Option<String> {
+    (i == 0 && name == "clock-frequency" && t.iter().any(|n| n.class == PE)).then(|| "the root's clock-frequency (the bus clock: cpu0's bus-frequency, which iBoot fills)".to_string())
 }
 
 /// Whether `class` is one of the drivers here, whose children in the

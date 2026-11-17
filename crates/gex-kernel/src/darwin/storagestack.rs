@@ -347,8 +347,15 @@ fn add_pcie(t: &mut Vec<Node>, io: u32) -> Option<u32> {
     set(&mut n.service_props, super::iopower::KEY, super::iopower::pci_function());
     set(&mut n.service_props, "IOPCIResourced", Prop::Bool(true));
     if let Table::Lacks(l) = &mut n.table {
-        l.push(("IOInterruptControllers", "the MSI vectors the controller's driver allocates (ApplePCIEMSIController)"));
-        l.push(("IOInterruptSpecifiers", "the MSI vectors the controller's driver allocates (ApplePCIEMSIController)"));
+        l.push(("IOInterruptControllers", "the MSI vectors the controller's driver allocates (ApplePCIEMSIController): how many IONVMeFamily asks for, and the function's MSI capability, are not traced"));
+        l.push(("IOInterruptSpecifiers", "the MSI vectors the controller's driver allocates (ApplePCIEMSIController): how many IONVMeFamily asks for, and the function's MSI capability, are not traced"));
+        // `IOPCIBridge::getNubResources` (0xfffffff0064ca150) gives a nub
+        // whose iommu-parent is a DART mapper its window, from the DART's
+        // retrieveVMLimits (0xfffffff005f29334, not followed), and the
+        // mapper's page size; pci-bridge0 has no iommu-parent.
+        l.push(("IOPCIDeviceMemoryMapBase", "the DART's retrieveVMLimits, not followed"));
+        l.push(("IOPCIDeviceMemoryMapSize", "the DART's retrieveVMLimits, not followed"));
+        l.push(("IOPCIDeviceMapperPageSize", "the DART mapper's getPageSize, not followed"));
     }
     // The personality "AppleEmbeddedNVMeController" (IONVMeFamily). Its
     // score: the personality has none, and `pciMatchNub` adds 1000 for an
@@ -877,7 +884,6 @@ fn add_pci_nub(t: &mut Vec<Node>, entry: u32, bridge: u32, dt_parent: u32, locat
         ("assigned-addresses", "the BARs' addresses, the bridge's allocation over the device's sizes"),
         ("ranges", "the bridge windows, the configurator's allocation over the device's sizes"),
         ("IODeviceMemory", "the BARs' ranges, from the allocation"),
-        ("IOMapperID", "what the DART mapper and the platform's IOPCIDeviceChanged handler set, not followed"),
     ]));
     n.props = e.props.clone();
     // The entry's own table: what was set on it before (a root port's

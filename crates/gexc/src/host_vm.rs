@@ -9,6 +9,32 @@ pub fn install() {
     gex_kernel::set_host_vm(advise);
     gex_kernel::set_host_map_file(map_file);
     gex_kernel::set_host_pages(pages);
+    #[cfg(target_os = "macos")]
+    gex_kernel::set_host_remap(remap);
+}
+
+/// `mach_vm_remap` of the host's own pages at `src` over `dst`, in place of
+/// what was there: shared, or (`copy`) a copy made on write, as the host's
+/// VM makes either (`vm_map_remap`).
+#[cfg(target_os = "macos")]
+fn remap(dst: usize, src: usize, len: usize, copy: bool) -> bool {
+    extern "C" {
+        fn mach_vm_remap(target: libc::c_uint, address: *mut u64, size: u64, mask: u64, flags: libc::c_int, src_task: libc::c_uint, src_address: u64, copy: libc::c_int, cur: *mut libc::c_int, max: *mut libc::c_int, inheritance: libc::c_uint) -> libc::c_int;
+    }
+    const VM_FLAGS_FIXED: libc::c_int = 0;
+    const VM_FLAGS_OVERWRITE: libc::c_int = 0x4000;
+    const VM_INHERIT_DEFAULT: libc::c_uint = 1;
+    let page = page();
+    if dst % page != 0 || src % page != 0 || len % page != 0 || len == 0 {
+        return false;
+    }
+    let mut at = dst as u64;
+    let (mut cur, mut max) = (0, 0);
+    // SAFETY: both ranges are guest memory, which the host maps readable
+    // and writable for the life of the process; the new mapping takes the
+    // place of `dst`'s with the same protection.
+    let kr = unsafe { mach_vm_remap(mach_task_self_, &mut at, len as u64, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self_, src as u64, libc::c_int::from(copy), &mut cur, &mut max, VM_INHERIT_DEFAULT) };
+    kr == 0 && at == dst as u64
 }
 
 #[cfg(target_os = "macos")]

@@ -457,15 +457,70 @@ pub struct Perms {
     /// ([`MemoryMap::withhold`]), by page: a kernel object's pages whose
     /// first store it wants to see (an IOSurface view's).
     withheld: std::collections::BTreeMap<u64, u8>,
+    /// The pages the task's pmap has not entered although they are mapped
+    /// ([`MemoryMap::set_unentered`]), as runs of pages `first -> end`:
+    /// their bytes go without every bit, so the first access faults to the
+    /// kernel, which enters the page (`vm_fault`'s `pmap_enter`).
+    unentered: std::collections::BTreeMap<u64, u64>,
+    /// [`Self::unentered`] with each run's mapping protection, as the
+    /// calls' copies check it, made again after a change.
+    unentered_view: Option<std::sync::Arc<Vec<(u64, u64, u8)>>>,
 }
 
 impl Clone for Perms {
     /// A copy of the map is another memory's (a fork's child's), whose
     /// table holds nothing yet: all of it is to be written. What a kernel
-    /// object withheld is that object's, in the memory it watches.
+    /// object withheld is that object's, in the memory it watches; what
+    /// this pmap has not entered is its own (the child's pmap is a new one).
     fn clone(&self) -> Perms {
-        Perms { shown: self.shown.clone(), dirty: vec![(0, gex_abi::LIMIT64)], withheld: Default::default() }
+        Perms { shown: self.shown.clone(), dirty: vec![(0, gex_abi::LIMIT64)], ..Perms::default() }
     }
+}
+
+impl Default for Perms {
+    fn default() -> Perms {
+        Perms { shown: Vec::new(), dirty: vec![(0, gex_abi::LIMIT64)], withheld: Default::default(), unentered: Default::default(), unentered_view: None }
+    }
+}
+
+/// Runs of pages `first -> end` (disjoint, not touching): `[s, e)` added.
+fn runs_add(runs: &mut std::collections::BTreeMap<u64, u64>, mut s: u64, mut e: u64) {
+    if s >= e {
+        return;
+    }
+    // Every run that meets or touches [s, e) joins it.
+    let first = runs.range(..=s).next_back().filter(|(_, &re)| re >= s).map_or(s, |(&rs, _)| rs);
+    let joined: Vec<(u64, u64)> = runs.range(first..=e).map(|(&a, &b)| (a, b)).collect();
+    for (a, b) in joined {
+        runs.remove(&a);
+        s = s.min(a);
+        e = e.max(b);
+    }
+    runs.insert(s, e);
+}
+
+/// Runs of pages: `[s, e)` taken out; whether any was there.
+fn runs_remove(runs: &mut std::collections::BTreeMap<u64, u64>, s: u64, e: u64) -> bool {
+    if s >= e {
+        return false;
+    }
+    let first = runs.range(..s).next_back().filter(|(_, &re)| re > s).map_or(s, |(&rs, _)| rs);
+    let hit: Vec<(u64, u64)> = runs.range(first..e).map(|(&a, &b)| (a, b)).collect();
+    for &(a, b) in &hit {
+        runs.remove(&a);
+        if a < s {
+            runs.insert(a, s);
+        }
+        if b > e {
+            runs.insert(e, b);
+        }
+    }
+    !hit.is_empty()
+}
+
+/// Whether page `p` is in a run.
+fn runs_have(runs: &std::collections::BTreeMap<u64, u64>, p: u64) -> bool {
+    runs.range(..=p).next_back().is_some_and(|(_, &e)| p < e)
 }
 
 impl Perms {
@@ -490,6 +545,20 @@ impl Perms {
             }
         }
         self.shown = now;
+        // What is no longer mapped is no page of the pmap's to enter.
+        if !self.unentered.is_empty() {
+            let mapped: Vec<(u64, u64)> = self.shown.iter().map(|&(s, e, _)| (s >> gex_abi::PERM_PAGE_SHIFT, (e + gex_abi::PERM_PAGE - 1) >> gex_abi::PERM_PAGE_SHIFT)).collect();
+            let runs: Vec<(u64, u64)> = self.unentered.iter().map(|(&a, &b)| (a, b)).collect();
+            let mut kept = std::collections::BTreeMap::new();
+            for (a, b) in runs {
+                let i = mapped.partition_point(|&(_, me)| me <= a);
+                for &(ms, me) in mapped[i..].iter().take_while(|&&(ms, _)| ms < b) {
+                    runs_add(&mut kept, a.max(ms), b.min(me));
+                }
+            }
+            self.unentered = kept;
+        }
+        self.unentered_view = None;
     }
 
     /// The table's bytes for what has changed: each run's first page and
@@ -537,7 +606,8 @@ impl Perms {
                     .map(|i| {
                         let p = ps + i as u64;
                         if covered[i] == PERM_PAGE && p >= floor && p < PERM_TABLE_BYTES {
-                            acc[i] & !self.withheld.get(&p).copied().unwrap_or(0)
+                            let unentered = if runs_have(&self.unentered, p) { perm::READ | perm::WRITE | perm::EXEC } else { 0 };
+                            acc[i] & !self.withheld.get(&p).copied().unwrap_or(0) & !unentered
                         } else {
                             0
                         }
@@ -786,8 +856,75 @@ impl MemoryMap {
     /// Darwin process's, before it maps anything. All of it is to be
     /// written.
     pub fn keep_perms(&mut self) {
-        self.perms = Some(Perms { shown: Vec::new(), dirty: vec![(0, gex_abi::LIMIT64)], withheld: Default::default() });
+        self.perms = Some(Perms::default());
         self.publish();
+    }
+
+    /// The pages of `[start, end)` (page aligned) are mapped and not
+    /// entered in the task's pmap: the first access to each, the program's
+    /// or a call's copy, faults to the kernel ([`Self::enter_page`]). The
+    /// map keeps none for a process with no table.
+    pub fn set_unentered(&mut self, start: u64, end: u64) {
+        if let Some(p) = &mut self.perms {
+            runs_add(&mut p.unentered, start >> gex_abi::PERM_PAGE_SHIFT, (end + gex_abi::PERM_PAGE - 1) >> gex_abi::PERM_PAGE_SHIFT);
+            p.unentered_view = None;
+            p.dirty.push((start, end));
+        }
+    }
+
+    /// The pages of `[start, end)` are no longer waiting to be entered (the
+    /// pmap's entries there removed, or the pages entered).
+    pub fn clear_unentered(&mut self, start: u64, end: u64) {
+        if let Some(p) = &mut self.perms {
+            if runs_remove(&mut p.unentered, start >> gex_abi::PERM_PAGE_SHIFT, (end + gex_abi::PERM_PAGE - 1) >> gex_abi::PERM_PAGE_SHIFT) {
+                p.unentered_view = None;
+                p.dirty.push((start, end));
+            }
+        }
+    }
+
+    /// `pmap_enter` of page `page` (by [`gex_abi::PERM_PAGE`]) on its first
+    /// access: whether it was one not entered, now entered.
+    pub fn enter_page(&mut self, page: u64) -> bool {
+        let Some(p) = &mut self.perms else { return false };
+        if !runs_remove(&mut p.unentered, page, page + 1) {
+            return false;
+        }
+        p.unentered_view = None;
+        p.dirty.push((page << gex_abi::PERM_PAGE_SHIFT, (page + 1) << gex_abi::PERM_PAGE_SHIFT));
+        true
+    }
+
+    /// Whether page `page` is mapped and not entered.
+    pub fn is_unentered(&self, page: u64) -> bool {
+        self.perms.as_ref().is_some_and(|p| runs_have(&p.unentered, page))
+    }
+
+    /// The runs of pages not entered, `[first, end)` by page, with what
+    /// their mappings allow: for the calls' copies (`crate::SoftPages`).
+    pub fn unentered_runs(&mut self) -> std::sync::Arc<Vec<(u64, u64, u8)>> {
+        let Some(p) = &mut self.perms else { return Default::default() };
+        if let Some(v) = &p.unentered_view {
+            return std::sync::Arc::clone(v);
+        }
+        let mut out = Vec::new();
+        for (&a, &b) in &p.unentered {
+            let i = p.shown.partition_point(|&(_, e, _)| e <= a << gex_abi::PERM_PAGE_SHIFT);
+            for &(s, e, prot) in p.shown[i..].iter().take_while(|&&(s, _, _)| s < b << gex_abi::PERM_PAGE_SHIFT) {
+                let (ps, pe) = ((s >> gex_abi::PERM_PAGE_SHIFT).max(a), ((e + gex_abi::PERM_PAGE - 1) >> gex_abi::PERM_PAGE_SHIFT).min(b));
+                if ps < pe {
+                    out.push((ps, pe, (prot & 7) as u8));
+                }
+            }
+        }
+        let v = std::sync::Arc::new(out);
+        p.unentered_view = Some(std::sync::Arc::clone(&v));
+        v
+    }
+
+    /// The runs of pages not entered, by address, `[start, end)`.
+    pub fn unentered_ranges(&self) -> Vec<(u64, u64)> {
+        self.perms.as_ref().map_or_else(Vec::new, |p| p.unentered.iter().map(|(&a, &b)| (a << gex_abi::PERM_PAGE_SHIFT, b << gex_abi::PERM_PAGE_SHIFT)).collect())
     }
 
     /// Take `bits` (of [`gex_abi::perm`]'s protection bits) from the
@@ -866,6 +1003,8 @@ impl MemoryMap {
         fresh.perms = self.perms.take();
         if let Some(p) = &mut fresh.perms {
             p.withheld.clear();
+            p.unentered.clear();
+            p.unentered_view = None;
         }
         *self = fresh;
         self.publish();
@@ -2213,6 +2352,43 @@ mod tests {
         m.forget_code(at, at + 0x1000);
         let code: Vec<_> = m.vmas().iter().map(|v| (v.start, v.code.clone())).collect();
         assert_eq!(code, vec![(at, None), (at + 0x1000, Some(("/lib/x.so".into(), 0x1000)))]);
+    }
+
+    /// A page not entered goes without every bit in the protection table
+    /// until it is entered; what is unmapped is forgotten.
+    #[test]
+    fn unentered_pages_are_withheld_until_entered() {
+        use gex_abi::{perm, PERM_PAGE, PERM_PAGE_SHIFT};
+        let mut m = MemoryMap::new(0x100_0000);
+        m.set_page(PERM_PAGE);
+        m.set_high_arena(gex_abi::DARWIN_GUEST_FLOOR, gex_abi::LIMIT64);
+        m.keep_perms();
+        let at = gex_abi::DARWIN_GUEST_FLOOR + 0x1000_0000;
+        let anon = flags::PRIVATE | flags::ANONYMOUS | flags::FIXED;
+        m.mmap(at, 4 * PERM_PAGE, prot::READ | prot::WRITE, anon, "").unwrap();
+        m.set_unentered(at + PERM_PAGE, at + 3 * PERM_PAGE);
+        let byte = |m: &mut MemoryMap, p: u64| {
+            let w = m.take_perm_writes();
+            let mut out = None;
+            for (first, bytes) in w {
+                if p >= first && p < first + bytes.len() as u64 {
+                    out = Some(bytes[(p - first) as usize] & 0xf);
+                }
+            }
+            out
+        };
+        let p0 = at >> PERM_PAGE_SHIFT;
+        let _ = byte(&mut m, p0);
+        m.set_unentered(at + PERM_PAGE, at + 3 * PERM_PAGE);
+        assert_eq!(byte(&mut m, p0 + 1), Some(perm::MAPPED));
+        assert!(m.is_unentered(p0 + 2) && !m.is_unentered(p0) && !m.is_unentered(p0 + 3));
+        assert_eq!(*m.unentered_runs(), vec![(p0 + 1, p0 + 3, (prot::READ | prot::WRITE) as u8)]);
+        assert!(m.enter_page(p0 + 1));
+        assert!(!m.enter_page(p0 + 1), "once");
+        assert_eq!(byte(&mut m, p0 + 1), Some(perm::MAPPED | perm::READ | perm::WRITE));
+        assert_eq!(m.unentered_ranges(), vec![(at + 2 * PERM_PAGE, at + 3 * PERM_PAGE)]);
+        m.unmap(at, 4 * PERM_PAGE).unwrap();
+        assert!(m.unentered_ranges().is_empty(), "unmapped, no page to enter");
     }
 
     /// A refused large mapping explains what holds the space, once, without

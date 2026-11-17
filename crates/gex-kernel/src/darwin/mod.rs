@@ -125,6 +125,7 @@ pub mod triage;
 pub mod trustcache;
 pub mod vconsole;
 pub mod vm;
+pub mod vmshare;
 pub mod coalition;
 pub mod importance;
 pub mod voucher;
@@ -464,16 +465,33 @@ impl crate::syscalls::Kernel {
     }
 
     /// The pages of this process's protection table a kernel object
-    /// watches for stores ([`crate::SoftPages`]): a call's copies may write
-    /// them, noted for the object. None when it watches none.
+    /// watches for stores, and those its pmap has not entered
+    /// ([`crate::SoftPages`]): a call's copies may write the one and reach
+    /// the other, noted for the object and the pmap. None when there are
+    /// neither.
     pub(crate) fn darwin_soft_pages(&mut self) -> Option<std::sync::Arc<crate::SoftPages>> {
-        let pages = self.mem.lock().withheld_write_pages()?;
-        Some(std::sync::Arc::new(crate::SoftPages { pages, written: Default::default() }))
+        let mut mm = self.mem.lock();
+        let pages = mm.withheld_write_pages().unwrap_or_default();
+        let unentered = mm.unentered_runs();
+        if pages.is_empty() && unentered.is_empty() {
+            return None;
+        }
+        Some(std::sync::Arc::new(crate::SoftPages { pages, written: Default::default(), unentered, touched: Default::default() }))
     }
 
     /// The watched pages a call's copies wrote, told to the objects that
-    /// watch them.
+    /// watch them; the pages not entered they reached, entered.
     pub(crate) fn darwin_soft_written(&mut self, m: &mut GuestMem<'_>, soft: &crate::SoftPages) {
+        // The pages not entered that a copy reached: its fault entered them.
+        let touched = std::mem::take(&mut *soft.touched.lock().unwrap_or_else(|e| e.into_inner()));
+        if !touched.is_empty() {
+            let mut mm = self.mem.lock();
+            for p in touched {
+                mm.enter_page(p);
+            }
+            drop(mm);
+            self.darwin_flush_perms(m);
+        }
         let mut pages = std::mem::take(&mut *soft.written.lock().unwrap_or_else(|e| e.into_inner()));
         if pages.is_empty() {
             return;

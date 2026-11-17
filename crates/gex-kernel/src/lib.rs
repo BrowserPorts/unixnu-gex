@@ -106,12 +106,34 @@ pub struct GuestMem<'a> {
 /// object watches for their first store. The program's own store faults to
 /// the kernel; a call's `copyout` to one is let through, as the mapping
 /// allows it, and the page is noted here for the object to learn of.
+///
+/// Also the pages the task's pmap has not entered yet
+/// ([`mem::MemoryMap::set_unentered`]), whose bytes go without every bit: a
+/// call's copy to or from one is let through as its mapping allows it, as
+/// `copyin` and `copyout` fault the page in, and the page is noted for the
+/// kernel to enter.
 #[derive(Debug, Default)]
 pub struct SoftPages {
     /// The pages (by [`gex_abi::PERM_PAGE`]) that go without the write bit.
     pub pages: Vec<u64>,
     /// The pages of them a checked copy wrote.
     pub written: std::sync::Mutex<Vec<u64>>,
+    /// The runs of pages not entered, `[first, end)` by page, sorted, with
+    /// what their mapping allows (`gex_abi::perm` bits).
+    pub unentered: std::sync::Arc<Vec<(u64, u64, u8)>>,
+    /// The pages of them a checked copy read or wrote.
+    pub touched: std::sync::Mutex<Vec<u64>>,
+}
+
+impl SoftPages {
+    /// Whether page `p` is one not entered whose mapping allows `need`.
+    fn unentered_allows(&self, p: u64, need: u8) -> bool {
+        let i = self.unentered.partition_point(|&(s, _, _)| s <= p);
+        i > 0 && {
+            let (_, e, prot) = self.unentered[i - 1];
+            p < e && prot & need == need
+        }
+    }
 }
 
 impl<'a> GuestMem<'a> {
@@ -176,6 +198,11 @@ impl<'a> GuestMem<'a> {
                     soft.written.lock().unwrap_or_else(|e| e.into_inner()).push(p);
                     true
                 }
+                // A page not entered: the copy's fault enters it.
+                Some(soft) if b & gex_abi::perm::MAPPED != 0 && soft.unentered_allows(p, need) => {
+                    soft.touched.lock().unwrap_or_else(|e| e.into_inner()).push(p);
+                    true
+                }
                 _ => false,
             }
         })
@@ -193,8 +220,14 @@ impl<'a> GuestMem<'a> {
         let mut at = start;
         while at < end {
             let p = at as u64 >> gex_abi::PERM_PAGE_SHIFT;
-            if !self.perm_byte(p).is_some_and(|b| b & gex_abi::perm::READ != 0) {
-                return at;
+            let b = self.perm_byte(p).unwrap_or(0);
+            if b & gex_abi::perm::READ == 0 {
+                match &self.soft {
+                    Some(soft) if b & gex_abi::perm::MAPPED != 0 && soft.unentered_allows(p, gex_abi::perm::READ) => {
+                        soft.touched.lock().unwrap_or_else(|e| e.into_inner()).push(p);
+                    }
+                    _ => return at,
+                }
             }
             at = (at & !(page - 1)) + page;
         }
@@ -567,6 +600,23 @@ static HOST_PAGES: std::sync::OnceLock<fn(usize, usize, usize, &mut [u8]) -> boo
 /// fills one [`page_state`] byte per `page` bytes, true when it could.
 pub fn set_host_pages(f: fn(usize, usize, usize, &mut [u8]) -> bool) {
     let _ = HOST_PAGES.set(f);
+}
+
+static HOST_REMAP: std::sync::OnceLock<fn(usize, usize, usize, bool) -> bool> = std::sync::OnceLock::new();
+
+/// Install the host's mapping of its own pages elsewhere:
+/// `f(dst, src, len, copy)` maps the `len` bytes of pages at host address
+/// `src` at `dst` in their place, shared, or (`copy`) a copy of them made
+/// on write, true when it did. A host whose memory holds no pages of its
+/// own to share (the browser's) installs none.
+pub fn set_host_remap(f: fn(usize, usize, usize, bool) -> bool) {
+    let _ = HOST_REMAP.set(f);
+}
+
+/// The host's [`set_host_remap`] mapping, between any two host addresses
+/// of guest memory (one process's or two); false where it has none.
+pub fn host_remap(dst: usize, src: usize, len: usize, copy: bool) -> bool {
+    HOST_REMAP.get().is_some_and(|f| f(dst, src, len, copy))
 }
 
 static HOST_MAP_FILE: std::sync::OnceLock<fn(usize, usize, i32, u64) -> bool> = std::sync::OnceLock::new();

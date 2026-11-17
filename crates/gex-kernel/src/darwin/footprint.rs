@@ -342,7 +342,12 @@ impl Pmap {
     /// mapping); `twigs` are twig tables the map has without a page of its
     /// own under them (the commpage's, the shared region's nest). False
     /// when the host cannot say.
-    pub fn look(&mut self, ranges: &[(u64, u64)], twigs: &[u64], states: &mut dyn FnMut(u64, u64, &mut [u8]) -> bool) -> bool {
+    ///
+    /// The pages of `unentered` (sorted, disjoint) are mapped and not
+    /// entered yet: what the host holds of them is another mapping's (a
+    /// page shared, or copied on write, with it), so they hold nothing here
+    /// until their first access enters them.
+    pub fn look(&mut self, ranges: &[(u64, u64)], twigs: &[u64], unentered: &[(u64, u64)], states: &mut dyn FnMut(u64, u64, &mut [u8]) -> bool) -> bool {
         let mut chunks: std::collections::BTreeMap<u64, Box<[u64; CHUNK_WORDS]>> = std::collections::BTreeMap::new();
         let mut out = vec![0u8; CHUNK_PAGES as usize];
         for &(s, e) in ranges {
@@ -352,6 +357,7 @@ impl Pmap {
                 if !states(at, n as u64, &mut out[..n]) {
                     return false;
                 }
+                hide_unentered(unentered, at, &mut out[..n]);
                 let old = self.chunks.get(&c);
                 // Nothing held there and nothing on the host: nothing to keep.
                 if old.is_none() && out[..n].iter().all(|&st| st == 0) {
@@ -440,6 +446,17 @@ impl Pmap {
     }
 }
 
+/// The states of the pages from `at` in `out` with those of `unentered`'s
+/// pages cleared: the host's pages there are not this pmap's.
+fn hide_unentered(unentered: &[(u64, u64)], at: u64, out: &mut [u8]) {
+    let end = at + ((out.len() as u64) << PAGE_SHIFT);
+    let i = unentered.partition_point(|&(_, e)| e <= at);
+    for &(s, e) in unentered[i..].iter().take_while(|&&(s, _)| s < end) {
+        let (a, b) = (((s.max(at) - at) >> PAGE_SHIFT) as usize, ((e.min(end) - at) >> PAGE_SHIFT) as usize);
+        out[a..b].fill(0);
+    }
+}
+
 /// What a kernel operation releases of the pages of its range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Release {
@@ -522,7 +539,8 @@ impl Meter {
     pub fn measure(&self, pm: &mut Pmap, mm: &crate::mem::Mm, m: &mut GuestMem<'_>) -> Option<i64> {
         let ranges = self.ranges(mm);
         let twigs = self.fixed_twigs();
-        let ok = pm.look(&ranges, &twigs, &mut |at, n, out| m.page_states(at, n * PAGE, PAGE, out).unwrap_or(false));
+        let unentered = mm.lock().unentered_ranges();
+        let ok = pm.look(&ranges, &twigs, &unentered, &mut |at, n, out| m.page_states(at, n * PAGE, PAGE, out).unwrap_or(false));
         ok.then(|| pm.balance())
     }
 
@@ -535,6 +553,7 @@ impl Meter {
             return true;
         }
         let ranges: Vec<(u64, u64)> = self.ranges(mm).into_iter().filter(|&(rs, re)| rs < e && re > s).map(|(rs, re)| (rs.max(s), re.min(e))).collect();
+        let unentered = mm.lock().unentered_ranges();
         let mut out = vec![0u8; CHUNK_PAGES as usize];
         for (rs, re) in ranges {
             for (c, i0, i1) in by_chunk(rs, re) {
@@ -543,6 +562,7 @@ impl Meter {
                 if !m.page_states(at, n as u64 * PAGE, PAGE, &mut out[..n]).unwrap_or(false) {
                     return true;
                 }
+                hide_unentered(&unentered, at, &mut out[..n]);
                 if out[..n].iter().any(|&st| matches!((Held::None.looked(st), own_only), (Held::Own, _) | (Held::Reusable | Held::File, false))) {
                     return true;
                 }
@@ -595,11 +615,20 @@ impl Kernel {
         if self.dtask.footprint_releasing || s >= e {
             return op(self, m);
         }
+        // pmap_remove takes the range's entries, and with them what was
+        // waiting to be entered there.
+        let cleared = |k: &mut Kernel| {
+            if how == Release::Remove {
+                k.mem.lock().clear_unentered(s, e);
+            }
+        };
         let rusage = std::sync::Arc::clone(&self.dtask.rusage);
         let mut pm = rusage.meter.lock();
         if !rusage.meter.releases(&pm, &self.mem, m, s, e, how) {
             drop(pm);
-            return op(self, m);
+            let r = op(self, m);
+            cleared(self);
+            return r;
         }
         let before = rusage.meter.measure(&mut pm, &self.mem, m);
         let mut crossings = Vec::new();
@@ -609,6 +638,7 @@ impl Kernel {
         self.dtask.footprint_releasing = true;
         let r = op(self, m);
         self.dtask.footprint_releasing = false;
+        cleared(self);
         match how {
             Release::Remove => pm.remove(s, e),
             Release::Reusable => pm.made_reusable(s, e),
@@ -909,17 +939,17 @@ mod tests {
         // A file's page in another leaf table's 32 MB.
         st.insert(BASE + (1 << L3_SHIFT), ps::PRESENT | ps::EXTERNAL);
         let mut pm = Pmap::default();
-        assert!(pm.look(&[(BASE, BASE + (2 << L3_SHIFT))], &[0], &mut host(&st)));
+        assert!(pm.look(&[(BASE, BASE + (2 << L3_SHIFT))], &[0], &[], &mut host(&st)));
         assert_eq!(pm.balance(), 2 * PAGE as i64 + FIXED + 2 * PAGE as i64);
         assert_eq!((pm.held(BASE + 2 * PAGE), pm.held(BASE + (1 << L3_SHIFT))), (Held::Reusable, Held::File));
         // The host reclaims a clean page of the task's and evicts the
         // file's: the device modelled keeps both, and the tables.
         st.remove(&BASE);
         st.remove(&(BASE + (1 << L3_SHIFT)));
-        assert!(pm.look(&[(BASE, BASE + (2 << L3_SHIFT))], &[0], &mut host(&st)));
+        assert!(pm.look(&[(BASE, BASE + (2 << L3_SHIFT))], &[0], &[], &mut host(&st)));
         assert_eq!(pm.balance(), 2 * PAGE as i64 + FIXED + 2 * PAGE as i64);
         // A page out of every range is the map's no more.
-        assert!(pm.look(&[(BASE + PAGE, BASE + (2 << L3_SHIFT))], &[0], &mut host(&st)));
+        assert!(pm.look(&[(BASE + PAGE, BASE + (2 << L3_SHIFT))], &[0], &[], &mut host(&st)));
         assert_eq!(pm.held(BASE), Held::None);
         assert_eq!(pm.balance(), PAGE as i64 + FIXED + 2 * PAGE as i64);
     }
@@ -932,7 +962,7 @@ mod tests {
         }
         st.insert(BASE + (1 << L3_SHIFT), ps::PRESENT);
         let mut pm = Pmap::default();
-        assert!(pm.look(&[(BASE, BASE + (2 << L3_SHIFT))], &[], &mut host(&st)));
+        assert!(pm.look(&[(BASE, BASE + (2 << L3_SHIFT))], &[], &[], &mut host(&st)));
         assert_eq!(pm.balance(), 5 * PAGE as i64 + FIXED + 2 * PAGE as i64);
         // Part of the first table's pages: it stays.
         pm.remove(BASE, BASE + 2 * PAGE);
@@ -950,14 +980,14 @@ mod tests {
             st.insert(BASE + i * PAGE, ps::PRESENT);
         }
         let mut pm = Pmap::default();
-        assert!(pm.look(&[(BASE, BASE + 4 * PAGE)], &[], &mut host(&st)));
+        assert!(pm.look(&[(BASE, BASE + 4 * PAGE)], &[], &[], &mut host(&st)));
         pm.made_reusable(BASE, BASE + 2 * PAGE);
         assert_eq!(pm.balance(), PAGE as i64 + FIXED + PAGE as i64);
         assert!(!pm.holds(BASE, BASE + 2 * PAGE, true) && pm.holds(BASE, BASE + 2 * PAGE, false));
         // The host reclaims one of them; the reuse finds both still entered.
         st.remove(&BASE);
         st.insert(BASE + PAGE, ps::PRESENT | ps::REUSABLE);
-        assert!(pm.look(&[(BASE, BASE + 4 * PAGE)], &[], &mut host(&st)));
+        assert!(pm.look(&[(BASE, BASE + 4 * PAGE)], &[], &[], &mut host(&st)));
         pm.reused(BASE, BASE + 4 * PAGE);
         assert_eq!(pm.balance(), 3 * PAGE as i64 + FIXED + PAGE as i64);
     }
@@ -971,7 +1001,7 @@ mod tests {
         let mut pm = Pmap::default();
         let mut l = Ledger::default();
         let range = [(BASE, BASE + 2 * N * PAGE)];
-        assert!(pm.look(&range, &[0], &mut host(&st)));
+        assert!(pm.look(&range, &[0], &[], &mut host(&st)));
         l.balance_is(pm.balance());
         let empty = pm.balance();
         for i in 0..N {
@@ -979,12 +1009,12 @@ mod tests {
         }
         // A look on the thread calls; then the host reclaims some clean ones
         // before the operation, which looks again first.
-        assert!(pm.look(&range, &[0], &mut host(&st)));
+        assert!(pm.look(&range, &[0], &[], &mut host(&st)));
         l.balance_is(pm.balance());
         for i in 0..N / 4 {
             st.remove(&(BASE + i * PAGE));
         }
-        assert!(pm.look(&range, &[0], &mut host(&st)));
+        assert!(pm.look(&range, &[0], &[], &mut host(&st)));
         l.balance_is(pm.balance());
         // The unmap: the host's pages go with the mapping.
         st.clear();
@@ -997,10 +1027,30 @@ mod tests {
         for i in 0..N / 2 {
             st.insert(BASE + i * PAGE, ps::PRESENT);
         }
-        assert!(pm.look(&range, &[0], &mut host(&st)));
+        assert!(pm.look(&range, &[0], &[], &mut host(&st)));
         l.observe(pm.balance());
         assert_eq!(l.get_interval_max(false), empty + (N / 2 * PAGE) as i64 + PAGE as i64);
         assert_eq!(l.lifetime_max, empty + (N * PAGE) as i64 + PAGE as i64);
+    }
+
+    #[test]
+    fn pages_not_entered_hold_nothing_until_their_first_access() {
+        // A fork's child: every page the parent had is the host's in the
+        // child's memory too (a copy on write), none entered in its pmap.
+        let mut st = std::collections::BTreeMap::new();
+        for i in 0..8 {
+            st.insert(BASE + i * PAGE, ps::PRESENT);
+        }
+        let range = [(BASE, BASE + 8 * PAGE)];
+        let mut pm = Pmap::default();
+        let mut unentered = vec![(BASE, BASE + 8 * PAGE)];
+        assert!(pm.look(&range, &[0], &unentered, &mut host(&st)));
+        assert_eq!(pm.balance(), FIXED, "only the twig the map always has");
+        // Two pages touched (entered): those count, with their leaf table.
+        unentered = vec![(BASE, BASE + 2 * PAGE), (BASE + 3 * PAGE, BASE + 7 * PAGE)];
+        assert!(pm.look(&range, &[0], &unentered, &mut host(&st)));
+        assert_eq!(pm.balance(), FIXED + 2 * PAGE as i64 + PAGE as i64);
+        assert_eq!((pm.held(BASE + 2 * PAGE), pm.held(BASE + 7 * PAGE), pm.held(BASE)), (Held::Own, Held::Own, Held::None));
     }
 
     #[test]
@@ -1012,7 +1062,7 @@ mod tests {
         st.insert(BASE + 3 * PAGE, ps::PRESENT | ps::EXTERNAL);
         let range = [(BASE, BASE + 8 * PAGE)];
         let mut pm = Pmap::default();
-        assert!(pm.look(&range, &[], &mut host(&st)));
+        assert!(pm.look(&range, &[], &[], &mut host(&st)));
         assert_eq!(pm.pages(), Pages { resident: 4, internal: 2, external: 1, reusable: 1 });
         pm.made_reusable(BASE, BASE + PAGE);
         assert_eq!(pm.pages(), Pages { resident: 4, internal: 1, external: 1, reusable: 2 });

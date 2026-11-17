@@ -697,7 +697,9 @@ impl Kernel {
         let wired = std::sync::Arc::clone(&self.dtask.rusage.wired);
         self.dtask.vm.set_wire_gauge(wired);
         // The new task's pmap is empty; its map's submaps are its meter's.
+        // Its ledger is new, the bank's entries in it too.
         self.dtask.rusage.meter.reset();
+        *self.dtask.rusage.bank.lock().unwrap_or_else(|e| e.into_inner()) = std::sync::Arc::default();
         let submaps = std::sync::Arc::clone(&self.dtask.rusage.meter.submaps);
         self.dtask.vm.set_submap_gauge(submaps);
         // task_bank_init, the image in place.

@@ -39,8 +39,10 @@
 //! for another process, at its end for `p_ru`), the peaks held across
 //! every release of its pages ([`super::footprint`]); the fork's start
 //! (`ps_start`), an ended process's end and `p_ru`; the reaped children's
-//! sums (`ri_child`); and the bank's bills where no account bills or
-//! charges the task. What needs counters that are not kept is given as 0
+//! sums (`ri_child`); and the bank's CPU time bills (the time the threads
+//! that adopted an account's voucher ran, rolled up into the holder's and
+//! merchant's ledgers as the account goes). What needs counters that are
+//! not kept is given as 0
 //! and reported: the wakeups a thread call's signal or message to another
 //! task made, wakeups in the platform-idle state (every processor idle at
 //! the interrupt), VM page-ins (the guest's page faults are the host's,
@@ -49,8 +51,9 @@
 //! logical writes (the UBC's copies, write faults on shared file pages,
 //! AppleAPFS's own), the CPMU's instructions (XNU's own among them) and
 //! cycles, CLPC's energy, the footprint where the host keeps no view of
-//! the process's memory (the browser's), and bank bills once an account
-//! exists.
+//! the process's memory (the browser's), a bill while a thread that has
+//! it runs (the device credits it at quantum ends), and the bills' energy
+//! (CLPC's).
 
 use crate::syscalls::Kernel;
 use crate::GuestMem;
@@ -126,14 +129,14 @@ const UNKEPT: [(usize, &str, &str); 24] = [
     (ri::DISKIO_BYTESREAD, "ri_diskio_bytesread", "task_io_stats at spec_strategy: the reads that miss the buffer cache and the UBC"),
     (ri::DISKIO_BYTESWRITTEN, "ri_diskio_byteswritten", "task_io_stats at spec_strategy: the writes that reach the disk"),
     (ri::CPU_TIME_QOS, "ri_cpu_time_qos_*", "per-thread clocks on the host"),
-    (ri::BILLED_SYSTEM_TIME, "ri_billed_system_time", "the bank accounts' bills"),
-    (ri::SERVICED_SYSTEM_TIME, "ri_serviced_system_time", "the bank accounts' bills"),
+    (ri::BILLED_SYSTEM_TIME, "ri_billed_system_time", "a bill one of whose adopting threads runs at the read (the device credits it at quantum ends), or whose time could not be read"),
+    (ri::SERVICED_SYSTEM_TIME, "ri_serviced_system_time", "a bill one of whose adopting threads runs at the read (the device credits it at quantum ends), or whose time could not be read"),
     (ri::LOGICAL_WRITES, "ri_logical_writes", "the logical_writes ledger: cluster_write's copies into the UBC, the first write faults on shared file pages, AppleAPFS's own"),
     (ri::LIFETIME_MAX_PHYS_FOOTPRINT, "ri_lifetime_max_phys_footprint", "a look at the process's pages, which the host keeps no view of"),
     (ri::INSTRUCTIONS, "ri_instructions", "the CPMU's instruction counts, XNU's own on the thread's behalf among them"),
     (ri::CYCLES, "ri_cycles", "the CPMU's cycle counts"),
-    (ri::BILLED_ENERGY, "ri_billed_energy", "the bank accounts' bills"),
-    (ri::SERVICED_ENERGY, "ri_serviced_energy", "the bank accounts' bills"),
+    (ri::BILLED_ENERGY, "ri_billed_energy", "CLPC's energy estimates of the bills' time"),
+    (ri::SERVICED_ENERGY, "ri_serviced_energy", "CLPC's energy estimates of the bills' time"),
     (ri::INTERVAL_MAX_PHYS_FOOTPRINT, "ri_interval_max_phys_footprint", "a look at the process's pages, which the host keeps no view of"),
     (ri::RUNNABLE_TIME, "ri_runnable_time", "per-thread clocks on the host"),
     (ri::ENERGY_NJ, "ri_energy_nj", "CLPC's energy estimates"),
@@ -209,6 +212,40 @@ impl Child {
     }
 }
 
+/// The bank's entries of a task's ledger (`cpu_time_billed_to_me`,
+/// `cpu_time_billed_to_others`), in Mach time units: the bills of its
+/// accounts rolled up as each account goes (`bank_rollup_chit_to_tasks`).
+/// A new task (an exec's) has a new ledger.
+#[derive(Debug, Default)]
+pub struct BankLedger {
+    pub to_me: AtomicU64,
+    pub to_others: AtomicU64,
+    /// A rolled-up bill held time not kept (a thread's time unread).
+    pub unkept: AtomicBool,
+    /// A bill has been rolled up into it: its energy entries hold CLPC's
+    /// estimates of that time.
+    pub credited: AtomicBool,
+}
+
+/// The bank's figures of a task (`bank_billed_balance_safe`,
+/// `bank_serviced_balance_safe`): its billed and serviced CPU time, none
+/// where a bill is not known; whether its bills hold any credit (and so
+/// energy).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Bills {
+    pub billed: Option<u64>,
+    pub serviced: Option<u64>,
+    pub energy: bool,
+}
+
+impl Bills {
+    /// A task ledger's own entries, for a task with no bank context.
+    pub fn of_ledger(l: &BankLedger) -> Bills {
+        let known = !l.unkept.load(Ordering::Acquire);
+        Bills { billed: known.then(|| l.to_me.load(Ordering::Acquire)), serviced: known.then(|| l.to_others.load(Ordering::Acquire)), energy: l.credited.load(Ordering::Acquire) }
+    }
+}
+
 /// What a process's `proc_pid_rusage` reads that its record does not
 /// otherwise carry, shared by the process and its readers.
 #[derive(Debug, Default)]
@@ -218,9 +255,12 @@ pub struct Shared {
     pub start_abstime: AtomicU64,
     /// The `wired_mem` ledger: what the map's user wirings hold.
     pub wired: Arc<AtomicU64>,
-    /// A bank account has had the task as its holder or its merchant, so
-    /// its bills may hold time and energy for or against it.
-    pub billing: AtomicBool,
+    /// The task's ledger's bank entries (`bt_ledger` of its bank context).
+    pub bank: Mutex<Arc<BankLedger>>,
+    /// Its bank figures as `proc_exit` gathers them, its bank context still
+    /// there (`task_bank_reset` is the task's deallocation's): made as the
+    /// task ends.
+    pub exit_bills: Mutex<Option<Bills>>,
     /// The `interrupt_wakeups` ledger: its threads made runnable from
     /// interrupt context (`thread_unblock`'s `aticontext`: a wait's
     /// deadline timer), or by a thread-call thread the delayed timer woke
@@ -389,7 +429,8 @@ pub struct Input {
     pub footprint_peaks: Option<(u64, u64)>,
     pub start_abstime: u64,
     pub child: Child,
-    pub billing: bool,
+    /// The bank's figures; none where no bank state can be read.
+    pub bills: Option<Bills>,
     /// `cpu_time_eqos_stats` (`fill_task_qos_rusage`), by `THREAD_QOS_*`, in
     /// Mach time units; none without the host's clocks.
     pub qos: Option<[u64; 7]>,
@@ -463,10 +504,17 @@ pub fn gather(i: &Input) -> Record {
     w[ri::CHILD_PAGEINS] = c.pageins;
     w[ri::CHILD_ELAPSED_ABSTIME] = c.elapsed_abstime;
     unkept |= c.unkept;
-    if i.billing {
-        for f in [ri::BILLED_SYSTEM_TIME, ri::SERVICED_SYSTEM_TIME, ri::BILLED_ENERGY, ri::SERVICED_ENERGY] {
-            unkept |= 1 << f;
+    let b = i.bills.unwrap_or_default();
+    for (f, v) in [(ri::BILLED_SYSTEM_TIME, b.billed), (ri::SERVICED_SYSTEM_TIME, b.serviced)] {
+        match v.filter(|_| i.bills.is_some()) {
+            Some(t) => w[f] = t,
+            None => unkept |= 1 << f,
         }
+    }
+    // The bills' energy is CLPC's estimate of their time: 0 only where
+    // nothing was ever credited to them.
+    if i.bills.is_none_or(|b| b.energy) {
+        unkept |= (1 << ri::BILLED_ENERGY) | (1 << ri::SERVICED_ENERGY);
     }
     match i.runnable {
         Some(r) => w[ri::RUNNABLE_TIME] = r,
@@ -505,7 +553,7 @@ fn input(procs: &crate::proc::ProcTable, pid: i32, p: &super::procinfo::Public) 
         footprint_peaks: None,
         start_abstime: s.start_abstime.load(Ordering::Acquire),
         child: s.child(),
-        billing: s.billing.load(Ordering::Acquire),
+        bills: None,
         qos,
         interrupt_wkups: (!s.wkups_unkept.load(Ordering::Acquire)).then(|| s.interrupt_wkups.load(Ordering::Acquire)),
         exit_abstime: None,
@@ -538,6 +586,7 @@ pub fn footprint_from_outside(procs: &crate::proc::ProcTable, pid: i32, p: &supe
 pub fn proc_exit(procs: &crate::proc::ProcTable, pid: i32, p: &super::procinfo::Public) {
     let mut i = input(procs, pid, p);
     i.footprint_peaks = footprint_from_outside(procs, pid, p).map(|(_, peaks)| peaks);
+    i.bills = *p.rusage.exit_bills.lock().unwrap_or_else(|e| e.into_inner());
     i.exit_abstime = Some(super::mach::absolute_time());
     let r = gather(&i);
     *p.rusage.exit.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
@@ -592,6 +641,7 @@ impl Kernel {
                     i.footprint = Some(fp);
                     i.footprint_peaks = Some(peaks);
                 }
+                i.bills = Some(self.darwin_bank_bills(pid, target.uniqueid, &target.rusage));
                 gather(&i)
             }
         };
@@ -664,7 +714,7 @@ mod tests {
     }
 
     fn live() -> Input {
-        Input { uuid: [7; 16], time_ns: Some(1_000_000), runnable: Some(48_000), wired: 0x8000, footprint: Some(0x40000), start_abstime: 1000, ..Input::default() }
+        Input { uuid: [7; 16], time_ns: Some(1_000_000), runnable: Some(48_000), wired: 0x8000, footprint: Some(0x40000), start_abstime: 1000, bills: Some(Bills { billed: Some(0), serviced: Some(0), energy: false }), ..Input::default() }
     }
 
     #[test]
@@ -691,15 +741,17 @@ mod tests {
     }
 
     #[test]
-    fn a_billing_task_and_another_process_footprint_are_not_kept() {
+    fn bills_with_credits_keep_their_time_not_their_energy() {
         let mut i = live();
-        i.billing = true;
+        i.bills = Some(Bills { billed: Some(240), serviced: None, energy: true });
         i.footprint = None;
         let r = gather(&i);
+        assert_eq!(r.w[ri::BILLED_SYSTEM_TIME], 240);
         let all = r.unkept_within(SIZES[6]).join(" ");
-        for n in ["ri_billed_system_time", "ri_serviced_system_time", "ri_billed_energy", "ri_serviced_energy", "ri_phys_footprint"] {
+        for n in ["ri_serviced_system_time", "ri_billed_energy", "ri_serviced_energy", "ri_phys_footprint"] {
             assert!(all.contains(n), "{n}");
         }
+        assert!(!all.contains("ri_billed_system_time"));
         // Kept peaks fill their fields.
         i.footprint_peaks = Some((0x90000, 0x50000));
         let r = gather(&i);

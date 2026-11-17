@@ -314,6 +314,11 @@ impl Kernel {
         self.procs.set_exited(self.pid);
         // coalitions_remove_task, launchd told of those it emptied.
         self.darwin_coalitions_task_end();
+        // proc_exit's gathering of its bank figures, its bank context still
+        // there: a bill one of its threads still had as its bank ledger is
+        // not known (the exiting thread's last stretch is credited after).
+        let bills = self.darwin_bank_bills(self.pid, self.dtask.uniqueid, &std::sync::Arc::clone(&self.dtask.rusage));
+        *self.dtask.rusage.exit_bills.lock().unwrap_or_else(|e| e.into_inner()) = Some(bills);
         // Its threads' vouchers, its importance (ipc_importance_disconnect_task)
         // and its bank context (task_bank_reset).
         self.darwin_threads_vouchers_release();
@@ -553,6 +558,8 @@ impl Kernel {
             t.offcpu = off;
         }
         if off {
+            // thread_dispatch: the time it ran goes to its bank ledger.
+            self.darwin_bank_credit(tid);
             self.darwin_pending_replies(m, tid);
         }
     }

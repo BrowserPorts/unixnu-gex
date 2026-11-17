@@ -680,6 +680,11 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// The Darwin disk node's open file this is, if it is one.
+    fn darwin_disk(&self) -> Option<&crate::darwin::disknode::DiskDev> {
+        None
+    }
+
     /// A short description of this handle's state, for a diagnostic: the
     /// buffer behind a descriptor -- empty, full, which way it points -- that
     /// the fd number and path cannot show.

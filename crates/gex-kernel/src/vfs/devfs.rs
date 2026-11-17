@@ -139,7 +139,8 @@ fn darwin_open(n: &'static crate::darwin::devfs::Node) -> Arc<dyn FileHandle> {
         Kind::Null => Device::Null,
         Kind::Zero => Device::Zero,
         Kind::Random => Device::Random,
-        Kind::Unmodelled(_) | Kind::Disk { .. } => return Arc::new(UnmodelledDev(n)),
+        Kind::Unmodelled(_) => return Arc::new(UnmodelledDev(n)),
+        Kind::Disk { .. } => return Arc::new(crate::darwin::disknode::DiskDev::new(n)),
         Kind::Terminal => unreachable!("a lookup of a terminal node gives the terminal layer's vnode"),
     };
     Arc::new(DevHandle { device, darwin: Some(n) })

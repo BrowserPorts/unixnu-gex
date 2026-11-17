@@ -356,6 +356,24 @@ impl Kernel {
                 console_termios(data);
                 Ok(())
             }
+            // vn_ioctl of a disk's vnode: FIODTYPE its switch's d_type, a
+            // process's DKIOCSETBLOCKSIZE refused, the rest the device's
+            // (spec_ioctl to dkioctl, or the APFS BSD clients' ioctl).
+            Kind::Vnode(FileType::CharDevice | FileType::BlockDevice) if let Some(n) = file.handle.darwin_disk().map(|d| d.node) => match com {
+                cmd::FIODTYPE => {
+                    put_int(data, super::disknode::D_DISK);
+                    Ok(())
+                }
+                super::disknode::dkioc::SETBLOCKSIZE => Err(Errno::EPERM),
+                _ => match super::disknode::ioctl(n, com, data) {
+                    super::disknode::Answer::Done => Ok(()),
+                    super::disknode::Answer::Err(e) => Err(e),
+                    super::disknode::Answer::Unmodelled(what) => {
+                        self.darwin_unimplemented(what);
+                        Err(Errno::EOPNOTSUPP)
+                    }
+                },
+            },
             Kind::Vnode(FileType::Fifo | FileType::CharDevice) => {
                 self.darwin_unimplemented(format!("ioctl {com:#x} on {} (a device's or fifofs's VNOP_IOCTL)", file.path));
                 Err(Errno::EOPNOTSUPP)

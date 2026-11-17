@@ -32,6 +32,7 @@ pub mod apfsmount;
 pub mod plist;
 pub mod preboot;
 pub mod dkopen;
+pub mod disknode;
 pub mod tty;
 pub mod ttydev;
 pub mod km;

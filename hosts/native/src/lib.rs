@@ -262,6 +262,11 @@ pub struct RunOptions {
     /// (`GEX_DARWIN_RESTORE`): a directory holding the IPSW's
     /// `BuildManifest.plist` and its files at their paths in the IPSW.
     pub darwin_restore: Option<std::path::PathBuf>,
+    /// The device's disk0 as its restore made it (`GEX_DARWIN_DISK0`,
+    /// `gexc darwin-disk0`'s file, with what its build lacks in the file
+    /// beside it named `.missing`): what the disk nodes serve. The guest
+    /// writes to it as to the device's disk.
+    pub darwin_disk0: Option<std::path::PathBuf>,
     /// The Cryptex1 ticket's source (`GEX_DARWIN_CRYPTEX1_TICKET`): the
     /// device's own ticket file, or `web-device`.
     pub darwin_cryptex1_ticket: Option<String>,
@@ -291,6 +296,7 @@ impl Default for RunOptions {
             darwin_boot: None,
             darwin_frames: None,
             darwin_restore: None,
+            darwin_disk0: None,
             darwin_cryptex1_ticket: None,
             darwin_cryptex1_nonce_hash: None,
             args: Vec::new(),
@@ -1383,6 +1389,20 @@ fn run_process(
             host: Some(Host { size: darwin_host_size, read: darwin_host_read, sha384: Some(darwin_host_sha384) }),
         };
         gex_kernel::darwin::boot(tc.as_deref(), sandbox, device_tree.as_deref(), volume_attrs, cryptex1).map_err(|e| anyhow!("the boot payload: {e}"))?;
+        // The disk nodes' image.
+        if let Some(path) = &opts.darwin_disk0 {
+            let f = std::fs::OpenOptions::new().read(true).write(true).open(path).map_err(|e| anyhow!("opening {}: {e}", path.display()))?;
+            let size = f.metadata().map_err(|e| anyhow!("{}: {e}", path.display()))?.len();
+            let mut missing_path = path.clone().into_os_string();
+            missing_path.push(".missing");
+            let missing = match std::fs::read_to_string(&missing_path) {
+                Ok(s) => s.lines().filter(|l| !l.is_empty()).map(str::to_string).collect(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                Err(e) => return Err(anyhow!("reading {}: {e}", std::path::Path::new(&missing_path).display())),
+            };
+            let sink: std::sync::Arc<dyn gex_kernel::darwin::apfswrite::Sink> = std::sync::Arc::new(gex_kernel::darwin::apfswrite::HostFile(f, size));
+            gex_kernel::darwin::disknode::install(sink, missing).map_err(|e| anyhow!("{}: {e}", path.display()))?;
+        }
         // The panel: the test embedder's recorder when asked for.
         if let Some(dir) = &opts.darwin_frames {
             std::fs::create_dir_all(dir).map_err(|e| anyhow!("making {}: {e}", dir.display()))?;

@@ -24,7 +24,7 @@
 //!    cryptex1 boot nonce hash ('cnch') must carry the device's current
 //!    one, else ESTALE.
 //!
-//! ECANCELED, an object's violated constraint, becomes ENOEXEC
+//! EBADEXEC, an object's violated constraint, becomes ENOEXEC
 //! (0xfffffff005a8ef94). On success the authenticated payload is the IM4P's
 //! data (`Img4DecodeGetPayload`, 0xfffffff005aa4a0c).
 //!
@@ -65,7 +65,8 @@ pub mod e {
     pub const EFTYPE: i32 = 79;
     pub const EAUTH: i32 = 80;
     pub const EOVERFLOW: i32 = 84;
-    pub const ECANCELED: i32 = 85;
+    /// An object's violated constraint (`EBADEXEC`).
+    pub const EBADEXEC: i32 = 85;
 }
 
 /// A libDER return code as the kext's errno (0xfffffff005a8f818, its table
@@ -952,12 +953,12 @@ impl Eval<'_> {
     /// 0xfffffff005a9d650: `p` imposed on the chip's environment: the
     /// manifest's value against the device's under the descriptor's
     /// operator. A violation is EACCES for the manifest's properties and
-    /// ECANCELED for an object's; a value of the wrong type or encoding is
+    /// EBADEXEC for an object's; a value of the wrong type or encoding is
     /// libDER's error as an errno; the device's error is the error.
     fn impose(&mut self, desc: &Desc, p: &Property<'_>) -> R<()> {
         let violation = match desc.container {
             0 => e::EACCES,
-            1 => e::ECANCELED,
+            1 => e::EBADEXEC,
             _ => return Ok(()),
         };
         if !constrainable(desc) {
@@ -1405,7 +1406,7 @@ pub fn execute(fourcc: u32, payload: &[u8], manifest: &[u8], env: &dyn Environme
             Some(d) => Outcome::Authenticated(d.to_vec()),
             None => Outcome::Panic("Img4DecodeGetPayload: the payload has no data".into()),
         },
-        e::ECANCELED => Outcome::Status(e::ENOEXEC),
+        e::EBADEXEC => Outcome::Status(e::ENOEXEC),
         s => Outcome::Status(s),
     }
 }
@@ -1788,10 +1789,10 @@ mod tests {
         assert_eq!(ev.properties(&[prop("DGST", octets(&sha384(&raw))), prop("EPRO", boolean(true)), prop("ESEC", boolean(true))].concat(), 1), Ok(()));
         let mut ev = eval(&f, &p);
         assert_eq!(ev.properties(&prop("DGST", octets(&[0; 48])), 1), Err(Fail::Code(dr::DECODE_ERROR)));
-        assert_eq!(ev.error, Some(e::ECANCELED));
+        assert_eq!(ev.error, Some(e::EBADEXEC));
         let mut ev = eval(&f, &p);
         assert_eq!(ev.properties(&prop("ESEC", boolean(false)), 1), Err(Fail::Code(dr::DECODE_ERROR)));
-        assert_eq!(ev.error, Some(e::ECANCELED));
+        assert_eq!(ev.error, Some(e::EBADEXEC));
     }
 
     #[test]

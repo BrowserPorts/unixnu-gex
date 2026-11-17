@@ -45,9 +45,11 @@ pub enum Prop {
 pub fn superclasses(class: &str) -> &'static [&'static str] {
     match class {
         "AppleAPFSVolume" => &["AppleAPFSVolume", "IOMedia", "IOStorage", "IOService", "IORegistryEntry"],
-        "AppleAPFSContainerScheme" => &["AppleAPFSContainerScheme", "IOPartitionScheme", "IOStorage", "IOService", "IORegistryEntry"],
+        // The metaclasses' parents (AppleAPFS's constructors): the scheme
+        // is an IOStorage, the container an IOPartitionScheme.
+        "AppleAPFSContainerScheme" => &["AppleAPFSContainerScheme", "IOStorage", "IOService", "IORegistryEntry"],
         "AppleAPFSMedia" => &["AppleAPFSMedia", "IOMedia", "IOStorage", "IOService", "IORegistryEntry"],
-        "AppleAPFSContainer" => &["AppleAPFSContainer", "IOStorage", "IOService", "IORegistryEntry"],
+        "AppleAPFSContainer" => &["AppleAPFSContainer", "IOPartitionScheme", "IOStorage", "IOService", "IORegistryEntry"],
         "IOMedia" => &["IOMedia", "IOStorage", "IOService", "IORegistryEntry"],
         "IOPlatformExpertDevice" => &["IOPlatformExpertDevice", "IOService", "IORegistryEntry"],
         "IORegistryEntry" => &["IORegistryEntry"],
@@ -268,7 +270,7 @@ pub(crate) fn add_volumes(t: &mut Vec<Node>) {
         let minor = super::storage::media_by_name(&name).map_or(0, |(_, minor)| minor);
         let unit = if m == Media::Partition { super::storage::units().main } else { super::storage::units().container };
         vec![
-            ("BSD Name".to_string(), Prop::Str(name)),
+            ("BSD Name".to_string(), Prop::Sym(name)),
             ("BSD Unit".to_string(), Prop::Num(u64::from(unit), 32)),
             ("BSD Major".to_string(), Prop::Num(u64::from(super::storage::DISK_MAJOR), 32)),
             ("BSD Minor".to_string(), Prop::Num(u64::from(minor), 32)),
@@ -284,26 +286,93 @@ pub(crate) fn add_volumes(t: &mut Vec<Node>) {
         kernel_only: false,
         nub: None,
     };
+    // IOMedia::init's keys as each medium's maker gives them (0xfffffff005977630:
+    // Content and Content Hint as OSSymbols, the flags as OSBooleans), less
+    // the sizes and Open, which are not modelled.
+    let medium = |hint: &str, leaf: bool, whole: bool, writable: bool| {
+        vec![
+            ("Content".to_string(), Prop::Sym(hint.to_string())),
+            ("Leaf".to_string(), Prop::Bool(leaf)),
+            ("Content Hint".to_string(), Prop::Sym(hint.to_string())),
+            ("Ejectable".to_string(), Prop::Bool(false)),
+            ("Removable".to_string(), Prop::Bool(false)),
+            ("Whole".to_string(), Prop::Bool(whole)),
+            ("Writable".to_string(), Prop::Bool(writable)),
+        ]
+    };
+    let with = |mut a: Vec<(String, Prop)>, b: Vec<(String, Prop)>| {
+        a.extend(b);
+        a
+    };
     let store = t.len() as u32;
-    t.push(service("Container", "IOMedia", None, named(Media::Partition)));
+    // The GPT partition: the scheme it holds has no Content Mask, so its
+    // Content stays its hint; not a leaf once the scheme attaches.
+    t.push(service("Container", "IOMedia", None, with(medium(CONTAINER_PARTITION_HINT, false, false, super::storage::disk_writable()), named(Media::Partition))));
     let scheme = t.len() as u32;
     t.push(service("AppleAPFSContainerScheme", "AppleAPFSContainerScheme", Some(store), Vec::new()));
     t[store as usize].children.push(scheme);
     let media = t.len() as u32;
-    t.push(service("AppleAPFSMedia", "AppleAPFSMedia", Some(scheme), named(Media::Container)));
+    // AppleAPFSMedia::init (0xfffffff006682168): whole, writable as the
+    // partition is; not a leaf once AppleAPFSContainer (IOMatchCategory
+    // IOStorage) attaches.
+    t.push(service("AppleAPFSMedia", "AppleAPFSMedia", Some(scheme), with(medium(APFS_CONTAINER_HINT, false, true, super::storage::disk_writable()), named(Media::Container))));
     t[scheme as usize].children.push(media);
     let container = t.len() as u32;
     t.push(service("AppleAPFSContainer", "AppleAPFSContainer", Some(media), Vec::new()));
     t[media as usize].children.push(container);
     for v in super::storage::VOLUMES {
-        let mut service_props = named(Media::Volume(v.index));
-        service_props.push(("FullName".to_string(), Prop::Str(v.name.to_string())));
-        // The volume's role by name (each volume here is named for its role).
-        service_props.push(("Role".to_string(), Prop::Strs(vec![v.name.to_string()])));
+        let mut service_props = with(medium(APFS_VOLUME_HINT, true, false, super::storage::volume_writable()), named(Media::Volume(v.index)));
+        service_props.push(("FullName".to_string(), Prop::Sym(v.name.to_string())));
+        service_props.push(("RoleValue".to_string(), Prop::Num(u64::from(v.role), 32)));
+        if let Some(r) = apfs_role_name(v.role) {
+            service_props.push(("Role".to_string(), Prop::Strs(vec![r.to_string()])));
+        }
         let id = t.len() as u32;
         t.push(service(v.name, "AppleAPFSVolume", Some(container), service_props));
         t[container as usize].children.push(id);
     }
+}
+
+/// The GPT partition type of an APFS container, the AppleAPFSMedia's
+/// content, and an APFS volume's.
+const CONTAINER_PARTITION_HINT: &str = "7C3457EF-0000-11AA-AA11-00306543ECAC";
+const APFS_CONTAINER_HINT: &str = "EF57347C-0000-11AA-AA11-00306543ECAC";
+const APFS_VOLUME_HINT: &str = "41504653-0000-11AA-AA11-00306543ECAC";
+
+/// What entry `i`'s whole property table lacks of the device's, for
+/// `io_registry_entry_get_properties_bin_buf`; none when the entry has
+/// only what is modelled ([`property_unknown`] of no name).
+pub fn properties_missing(t: &[Node], i: u32) -> Option<String> {
+    let n = t.get(i as usize)?;
+    if !property_unknown(t, i, "") {
+        return None;
+    }
+    Some(match n.class {
+        "AppleAPFSMedia" => "Physical Block Size, Logical Block Size and Preferred Block Size (min(nx_block_size, 4096)), IOStorageFeatures (the NVMe device's dictionary), EncryptionBlockSize (disk0's preferred block size), Open, Size (the partition's) and UUID (the container's nx_uuid)".to_string(),
+        "AppleAPFSVolume" => "the IOMedia sizes, Open, UUID, CaseSensitive, FormattedBy, IncompatibleFeatures, VolGroupUUID, the encryption keys, autodiskmount, Sealed, Status and Statistics (AppleAPFSVolume::init's, from the volume superblock)".to_string(),
+        "IOMedia" if n.name == "Container" => "Base, Size, Preferred Block Size, Open, Partition ID, UUID, GPT Attributes and TierType (IOGUIDPartitionScheme's and AppleAPFSContainerScheme's)".to_string(),
+        _ => "the properties its drivers set".to_string(),
+    })
+}
+
+/// Entry `i`'s properties in its table's order, the device tree's first
+/// (a kernel-only entry's as empty data), then its service's, the live
+/// values in place of their keys.
+pub fn properties(t: &[Node], i: u32) -> Vec<(String, Prop)> {
+    let Some(n) = t.get(i as usize) else { return Vec::new() };
+    let mut out: Vec<(String, Prop)> = n.props.iter().map(|(k, v)| (k.clone(), Prop::Data(if n.kernel_only { Vec::new() } else { v.clone() }))).collect();
+    for (k, v) in &n.service_props {
+        match out.iter_mut().find(|(o, _)| o == k) {
+            Some(slot) => slot.1 = v.clone(),
+            None => out.push((k.clone(), v.clone())),
+        }
+    }
+    for (k, v) in out.iter_mut() {
+        if let Some(l) = live_prop(t, i, k) {
+            *v = l;
+        }
+    }
+    out
 }
 
 /// Whether a property entry `i` lacks may yet be one the device's entry
@@ -315,14 +384,18 @@ pub(crate) fn add_volumes(t: &mut Vec<Node>) {
 /// - IOResources has the resources kexts and user space publish besides
 ///   those modelled ([`super::platform`]), and IOResourceMatched.
 /// - Every other entry has properties its drivers set that are not
-///   modelled. The exception is `IOClassNameOverride` on the entries from
-///   the platform expert device to the GPU and to the display. In the
-///   kernelcache, only IOSkywalkFamily sets it, on its own objects
-///   (0xfffffff00593be08); the kernel only reads it (`skipKey`,
-///   0xfffffff007816644). On the display's framebuffer and its nub, so are
+///   modelled. The exception is `IOClassNameOverride`, which no entry here
+///   has: in the kernelcache only IOSkywalkFamily sets it, on its own
+///   objects ("IO80211Controller", 0xfffffff00593be08), and the kernel only
+///   names it among the keys IODTNVRAM's `skipKey` passes over
+///   (0xfffffff007816644). IOKit.framework asks for it whenever
+///   `io_object_conforms_to` says no. On the display's framebuffer and its nub, so are
 ///   the names no driver sets there ([`super::iomfb::property_absent`]).
 pub fn property_unknown(t: &[Node], i: u32, name: &str) -> bool {
     let Some(n) = t.get(i as usize) else { return false };
+    if name == "IOClassNameOverride" {
+        return false;
+    }
     if i as usize + 1 == t.len() {
         return root_has(name);
     }
@@ -336,8 +409,7 @@ pub fn property_unknown(t: &[Node], i: u32, name: &str) -> bool {
     if display && super::iomfb::property_absent(t, i, name) {
         return false;
     }
-    let on_gpu_path = i == 0 || n.nub.is_some() || super::platform::is_driver(n.class) || n.class == super::accel::CLASS || n.class == super::iomfb::CLASS;
-    !(on_gpu_path && name == "IOClassNameOverride")
+    true
 }
 
 /// A property entry `i`'s driver keeps and may change while it runs,
@@ -437,12 +509,41 @@ pub fn conforms(t: &[Node], i: u32, class: &str) -> Result<bool, String> {
     }
 }
 
-/// `IORegistryEntry::getLocation`: of a volume, its slot in the container.
+/// `IORegistryEntry::getLocation`: of a volume, `"%d"` of its slot plus
+/// one (`AppleAPFSVolume::init`'s `setLocation`, 0xfffffff00666d684); of
+/// the GPT partition, its partition number (`IOGUIDPartitionScheme`'s
+/// `"%d"` of the entry's index plus one: the first).
 pub fn location(n: &Node) -> Option<String> {
-    if n.class != "AppleAPFSVolume" {
-        return None;
+    match n.class {
+        "AppleAPFSVolume" => super::storage::VOLUMES.iter().find(|v| v.name == n.name).map(|v| (v.index + 1).to_string()),
+        "IOMedia" if n.name == "Container" => Some("1".to_string()),
+        _ => None,
     }
-    super::storage::VOLUMES.iter().find(|v| v.name == n.name).map(|v| v.index.to_string())
+}
+
+/// `AppleAPFSVolume::init`'s name for a role (its "Role" array's one
+/// string); none for a role it has no name for, whose key it removes.
+pub fn apfs_role_name(role: u16) -> Option<&'static str> {
+    Some(match role {
+        0x1 => "System",
+        0x2 => "User",
+        0x4 => "Recovery",
+        0x8 => "VM",
+        0x10 => "Preboot",
+        0x20 => "Installer",
+        0x40 => "Data",
+        0x80 => "Baseband data",
+        0xc0 => "Update",
+        0x100 => "xART",
+        0x140 => "Hardware",
+        0x180 => "Backup",
+        0x1c0 => "SideCar",
+        0x200 => "Internal",
+        0x240 => "Enterprise data",
+        0x280 => "iDiags",
+        0x2c0 => "Exclaves",
+        _ => return None,
+    })
 }
 
 /// The role of the volume at slot `index` in the container.
@@ -1412,6 +1513,33 @@ impl crate::syscalls::Kernel {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_apfs_entries_are_as_appleapfs_makes_them() {
+        use super::*;
+        let mut t = Vec::new();
+        add_volumes(&mut t);
+        let find = |name: &str| t.iter().position(|n| n.name == name).unwrap() as u32;
+        let media = find("AppleAPFSMedia");
+        // No storage entry has IOClassNameOverride; other names may be the
+        // drivers'.
+        assert!(!property_unknown(&t, media, "IOClassNameOverride"));
+        assert!(property_unknown(&t, media, "IOStorageFeatures"));
+        assert!(superclasses("AppleAPFSContainer").contains(&"IOPartitionScheme"));
+        assert!(!superclasses("AppleAPFSContainerScheme").contains(&"IOPartitionScheme"));
+        // A volume's location is its slot plus one; its role by name.
+        let system = &t[find("System") as usize];
+        assert_eq!(location(system).as_deref(), Some("1"));
+        assert_eq!(location(&t[find("Container") as usize]).as_deref(), Some("1"));
+        assert!(system.service_props.contains(&("Role".to_string(), Prop::Strs(vec!["System".to_string()]))));
+        assert_eq!(apfs_role_name(0x140), Some("Hardware"));
+        assert_eq!(apfs_role_name(0x3), None);
+        // The medium's table in IOMedia::init's order, then the BSD keys.
+        let keys: Vec<String> = properties(&t, media).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(&keys[..3], &["Content", "Leaf", "Content Hint"]);
+        assert!(keys.iter().any(|k| k == "BSD Name"));
+        assert!(properties_missing(&t, media).unwrap().contains("IOStorageFeatures"));
+    }
+
     #[test]
     fn async_result_sizes_follow_the_kernel_structure() {
         // One argument: 24 + 208 - 15 * 8 = 112 bytes, as

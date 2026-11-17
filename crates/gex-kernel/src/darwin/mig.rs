@@ -423,6 +423,44 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
                 r
             }
         }
+        // io_registry_entry_get_properties_bin_buf(entry, buf, bufsize) ->
+        // properties, bufsize: the entry's whole table in OSSerializeBinary,
+        // into `buf` when it fits, else out of line. Sandbox's filter
+        // (mac_iokit_check_filter_properties' editor) drops each key its
+        // iokit-get-properties check refuses.
+        (Kobject::IoEntry(i), 2888) => {
+            let (Some(buf), Some(bufsize)) = (arg64(req, 0), arg64(req, 2)) else { return bad() };
+            let t = super::iokit::tree();
+            if t.get(*i as usize).is_none() {
+                return bad();
+            }
+            let mut props = super::iokit::properties(t, *i);
+            let entry = super::iokit::sb_entry(*i);
+            let nvram = super::iokit::is_nvram(*i);
+            props.retain(|(name, _)| k.darwin_mac_check_iokit_get_property(entry.clone(), nvram, name.as_bytes()) == 0);
+            let bin = super::iokit::serialize_prop(&super::iokit::Prop::Dict(props));
+            let mut out = NDR_RECORD.to_vec();
+            let mut r = if buf != 0 && bin.len() as u64 <= bufsize {
+                if let Err(r) = k.darwin_vm_copy_overwrite(buf, &bin) {
+                    return r;
+                }
+                out.extend_from_slice(&(bin.len() as u64).to_le_bytes());
+                out.extend_from_slice(&0u32.to_le_bytes());
+                let mut r = Reply::ok(out);
+                r.ports.push(PortOut::Ool(Vec::new()));
+                r
+            } else {
+                out.extend_from_slice(&0u64.to_le_bytes());
+                out.extend_from_slice(&(bin.len() as u32).to_le_bytes());
+                let mut r = Reply::ok(out);
+                r.ports.push(PortOut::Ool(bin));
+                r
+            };
+            if let Some(missing) = super::iokit::properties_missing(t, *i) {
+                r.unimplemented = Some(format!("io_registry_entry_get_properties_bin_buf of {}: {missing} not modelled", super::iokit::name(t, *i)));
+            }
+            r
+        }
         // io_service_get_matching_services_bin(main_port, matching, cnt) ->
         // existing: an iterator of what the dictionary matches.
         (Kobject::IoMain, 2881) => {

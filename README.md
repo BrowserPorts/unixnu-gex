@@ -679,7 +679,13 @@ is the reference (search `crates/gex-kernel/src/` for
   - those drivers' other nubs and clients;
   - device tree entries no driver here made a nub of, as `IOService`
     entries;
-  - properties those drivers set in their start or probe;
+  - properties those drivers set in their start or probe, and an entry's
+    whole table (`io_registry_entry_get_properties_bin_buf`) where it
+    lacks them: the APFS media have IOMedia's flags, content and BSD
+    keys, and the volumes their names, roles and locations, but not the
+    sizes, UUIDs, open state, the NVMe device's storage features or what
+    the superblocks give; `IOClassNameOverride`, which only
+    IOSkywalkFamily sets, is missing everywhere;
   - IOGPU selectors and traps that make IOGPU objects, and AGXG9G's own
     selectors;
   - the framebuffer's user client selectors other than the swap's (begin,

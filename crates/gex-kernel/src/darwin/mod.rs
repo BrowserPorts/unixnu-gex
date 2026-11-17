@@ -13,6 +13,7 @@ use crate::errno::Errno;
 use crate::GuestMem;
 use gex_abi::ctx;
 
+pub mod aar;
 pub mod aio;
 pub mod amfi;
 pub mod apfs;

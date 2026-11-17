@@ -727,7 +727,7 @@ impl Reply {
                         const VIRTUAL_COPY: u8 = 1;
                         b.extend_from_slice(&[0u8; 16]);
                         b[off + 11] = MACH_MSG_OOL_DESCRIPTOR;
-                        descs.push(Desc::Ool { off, data, copy: VIRTUAL_COPY });
+                        descs.push(Desc::Ool { off, data, copy: VIRTUAL_COPY, addr: 0 });
                         continue;
                     }
                     // MIG's template: deallocate FALSE, MACH_MSG_PHYSICAL_COPY.

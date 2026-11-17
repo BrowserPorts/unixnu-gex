@@ -825,7 +825,7 @@ impl Kernel {
                     if dealloc != 0 && len != 0 && !(u64::from(len) > OOL_SIZE_SMALL && copy == PHYSICAL_COPY && dealloc == 0) {
                         let _ = self.darwin_vm_deallocate(m, addr, u64::from(len));
                     }
-                    Desc::Ool { off, data, copy }
+                    Desc::Ool { off, data, copy, addr }
                 }
                 dtype::OOL_PORTS => {
                     let (addr, dealloc, copy, disp, count) = (rd64(b, off), b[off + 8], b[off + 9], u32::from(b[off + 10]), rd32(b, off + 12));
@@ -1336,7 +1336,7 @@ impl Kernel {
                     body[off + 10] = disp as u8;
                     body[off + 12..off + 16].copy_from_slice(&name.to_le_bytes());
                 }
-                Desc::Ool { off, data, copy } => {
+                Desc::Ool { off, data, copy, .. } => {
                     let (addr, size) = if data.is_empty() {
                         (0, 0)
                     } else {

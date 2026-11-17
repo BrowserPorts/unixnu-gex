@@ -1338,22 +1338,31 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
         (Kobject::Task, 4806 | 3807) => {
             const ADDRESS: usize = 4 + 16 + NDR;
             match (req.body.get(ADDRESS..ADDRESS + 8), req.descs.first()) {
-                (Some(a), Some(Desc::Ool { data, .. })) => {
+                (Some(a), Some(Desc::Ool { data, addr, .. })) => {
                     let address = u64::from_le_bytes(a.try_into().unwrap());
-                    k.darwin_vm_copy_overwrite(address, data).map_or_else(|r| r, |()| Reply::ok(Vec::new()))
+                    k.darwin_vm_copy_overwrite_from(address, data, Some(*addr)).map_or_else(|r| r, |()| Reply::ok(Vec::new()))
                 }
                 _ => bad(),
             }
         }
         // mach_vm_copy and vm_copy.
         (Kobject::Task, 4807 | 3808) => match (arg64(req, 0), arg64(req, 2), arg64(req, 4)) {
-            (Some(src), Some(size), Some(dst)) => k.darwin_vm_copyin(src, size).and_then(|d| k.darwin_vm_copy_overwrite(dst, &d)).map_or_else(|r| r, |()| Reply::ok(Vec::new())),
+            (Some(src), Some(size), Some(dst)) => k.darwin_vm_copyin(src, size).and_then(|d| k.darwin_vm_copy_overwrite_from(dst, &d, Some(src))).map_or_else(|r| r, |()| Reply::ok(Vec::new())),
             _ => bad(),
         },
         // mach_vm_read_overwrite and vm_read_overwrite: into this task's
         // memory at `data`.
         (Kobject::Task, 4808 | 3809) => match (arg64(req, 0), arg64(req, 2), arg64(req, 4)) {
-            (Some(address), Some(size), Some(data)) => k.darwin_vm_copyin(address, size).and_then(|b| k.darwin_vm_copy_overwrite(data, &b)).map_or_else(|r| r, |()| Reply::ok(size.to_le_bytes().to_vec())),
+            (Some(address), Some(size), Some(data)) => {
+                // The copy goes to the caller's map (current_map()), which
+                // is this task's only when the caller is.
+                if req.sender.audit[5] as i32 != k.pid {
+                    let mut r = Reply::err(KERN_FAILURE);
+                    r.unimplemented = Some("mach_vm_read_overwrite of another task's memory (the copy is made into the caller's map, which is the caller's kernel's)".into());
+                    return r;
+                }
+                k.darwin_vm_copyin(address, size).and_then(|b| k.darwin_vm_copy_overwrite_from(data, &b, Some(address))).map_or_else(|r| r, |()| Reply::ok(size.to_le_bytes().to_vec()))
+            }
             _ => bad(),
         },
         // mach_vm_msync and vm_msync.

@@ -755,6 +755,10 @@ struct Emitter<'a> {
     /// Counts down to the next re-entry through the dispatcher, inside a
     /// fused loop. See [`Self::emit_loop_safepoint`].
     reenter_local: Option<u32>,
+    /// Which registers a fused loop's body writes: each starts in a local
+    /// holding the context's value, so a fault anywhere in the body can
+    /// store it ([`Self::flush_fault`]).
+    loop_writes: std::collections::HashSet<GuestReg, std::hash::BuildHasherDefault<FastHasher>>,
     /// Set while emitting a member of a region.
     region: Option<RegionState>,
     /// Which registers the region writes, and so has to store on the way out.
@@ -849,6 +853,7 @@ impl<'a> Emitter<'a> {
             regs: FastMap::default(),
             loop_depth: None,
             reenter_local: None,
+            loop_writes: Default::default(),
             region: None,
             region_writes: Default::default(),
             func_regs: None,
@@ -1129,9 +1134,19 @@ impl<'a> Emitter<'a> {
         // A block whose only successor is itself becomes a real wasm loop, so
         // its guest registers stay in locals across the back-edge. Sound only
         // if every register the body reads is loaded *before* the loop, or a
-        // second iteration reads a context the first did not write back.
+        // second iteration reads a context the first did not write back. The
+        // registers it writes are loaded too: a fault in a later pass round
+        // the loop leaves with the context as the last pass left it, which
+        // only those locals hold ([`Self::flush_fault`]).
         if self.can_fuse_self_loop(block) {
             let mut reads = live_in_registers(block);
+            let writes = registers_read_and_written(block).1;
+            for &w in &writes {
+                if !reads.contains(&w) {
+                    reads.push(w);
+                }
+            }
+            self.loop_writes = writes.into_iter().collect();
             reads.sort_by_key(|r| Self::reg_offset(*r));
             for r in reads {
                 self.reg_local(r);
@@ -1157,6 +1172,7 @@ impl<'a> Emitter<'a> {
             self.f.end();
             self.loop_depth = None;
             self.reenter_local = None;
+            self.loop_writes.clear();
         }
     }
 
@@ -1406,6 +1422,37 @@ impl<'a> Emitter<'a> {
         self.flush_inner(true);
     }
 
+    /// The flush of a path that leaves the code where it stands (a fault,
+    /// a trap, a safepoint's slow path), conditionally: the context must
+    /// then hold the state as of this point. Inside a fused loop or a
+    /// region that is more than what is dirty here: dirtiness follows the
+    /// order the body was emitted in, but a register the loop writes after
+    /// this point was written by the pass before, and that value is only in
+    /// its local. Every register the loop writes is stored as well.
+    fn flush_fault(&mut self) {
+        let mut extra: Vec<GuestReg> = Vec::new();
+        if self.loop_depth.is_some() {
+            extra.extend(self.loop_writes.iter().copied());
+        }
+        if self.region.is_some() {
+            extra.extend(self.region_writes.iter().copied());
+        }
+        extra.retain(|r| self.regs.get(r).is_some_and(|c| !c.dirty));
+        extra.sort_by_key(|r| Self::reg_offset(*r));
+        extra.dedup();
+        for r in &extra {
+            if let Some(c) = self.regs.get_mut(r) {
+                c.dirty = true;
+            }
+        }
+        self.flush_inner(true);
+        for r in &extra {
+            if let Some(c) = self.regs.get_mut(r) {
+                c.dirty = false;
+            }
+        }
+    }
+
     fn flush_inner(&mut self, keep_dirty: bool) {
         let mut dirty: Vec<(GuestReg, u32)> = self
             .regs
@@ -1630,7 +1677,7 @@ impl<'a> Emitter<'a> {
             self.f.byte(0x72); // i32.or
             self.f.if_void();
         }
-        self.flush_conditional();
+        self.flush_fault();
         self.store_pc(pc);
         self.f.local_get(self.ctx_local);
         self.f.i64_const(pc as i64);
@@ -1957,7 +2004,7 @@ impl<'a> Emitter<'a> {
         let resumable = self.func_regs.is_some() && self.resumable_pc != 0;
         let pc = if resumable { self.stmt_pc.unwrap_or(self.block_start) } else { self.block_start };
         if resumable {
-            self.flush_conditional();
+            self.flush_fault();
         }
         let t = self.scratch_i64;
         self.f.local_get(self.ctx_local);
@@ -2068,7 +2115,7 @@ impl<'a> Emitter<'a> {
                 // stay dirty for the path that carries on.
                 self.push(*cond);
                 self.f.if_void();
-                self.flush_conditional();
+                self.flush_fault();
                 self.store_pc(*pc);
                 self.f.local_get(self.ctx_local);
                 self.f.i64_const((*pc | self.resumable_pc) as i64);
@@ -2604,7 +2651,7 @@ impl<'a> Emitter<'a> {
         self.f.addr_const(gex_abi::GUEST_FLOOR);
         self.f.addr_lt_u();
         self.f.if_void();
-        self.flush_conditional();
+        self.flush_fault();
         self.store_pc(self.block_start);
         self.f.local_get(self.ctx_local);
         self.f.i64_const(self.block_start as i64);
@@ -5353,10 +5400,11 @@ impl<'a> Emitter<'a> {
         self.f.i32_const(0);
         self.f.byte(0x4c); // i32.le_s
         self.f.if_void();
-        // Inside a fused loop the registers live only in locals, so the slow
-        // path -- which may deliver a signal and unwind -- must write them back.
-        if self.loop_depth.is_some() {
-            self.flush_conditional();
+        // Inside a fused loop or a region the registers live only in
+        // locals, so the slow path -- which may deliver a signal and
+        // unwind -- must write them back.
+        if self.loop_depth.is_some() || self.region.is_some() {
+            self.flush_fault();
         }
         self.f.local_get(self.ctx_local);
         self.f.i64_const(pc as i64);

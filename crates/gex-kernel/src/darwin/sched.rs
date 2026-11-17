@@ -274,6 +274,21 @@ impl Sched {
         s.ended.insert(pid);
     }
 
+    /// `ml_get_power_state`'s platform-idle answer at an interrupt
+    /// (`cpu_idle_count == real_ncpus`, arm64 `machine_routines.c:1606`):
+    /// every processor is in `machine_idle`, which is when no thread is on
+    /// one. A processor runs a thread while any is in `TH_RUN` here (a
+    /// Darwin thread on its CPU, or a thread call running): `real_ncpus`
+    /// (J120's three) only bounds how many run at once, and the idle count
+    /// reaches it only when none does. `except_tid` and `except_callouts`
+    /// are what the interrupt itself made runnable, not yet running then.
+    /// The device's own kernel threads that gex does not run (its other
+    /// thread calls, IOKit work loops) are taken to be idle.
+    pub fn processors_idle(&self, except_tid: Option<i32>, except_callouts: u32) -> bool {
+        let s = self.lock();
+        s.callouts.saturating_sub(except_callouts) == 0 && !s.threads.iter().any(|(&tid, t)| t.state == RunState::Run && Some(tid) != except_tid)
+    }
+
     /// One of the kernel's thread calls starts (`run`) or finishes running.
     pub fn callout(&self, run: bool) {
         let mut s = self.lock();
@@ -416,6 +431,31 @@ fn compute_averunnable(ldavg: &mut [u32; 3], nrun: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn processors_are_idle_only_when_nothing_runs() {
+        let s = Sched::default();
+        assert!(s.processors_idle(None, 0));
+        // A thread waiting keeps no processor; one running does, unless it
+        // is the one the interrupt woke.
+        s.set_state(1, 10, RunState::Wait);
+        s.set_state(1, 11, RunState::Run);
+        assert!(!s.processors_idle(None, 0));
+        assert!(s.processors_idle(Some(11), 0));
+        s.set_state(1, 11, RunState::Unint);
+        assert!(s.processors_idle(None, 0));
+        // A thread call running: its own interrupt's is left out.
+        s.callout(true);
+        assert!(!s.processors_idle(None, 0) && s.processors_idle(None, 1));
+        s.callout(true);
+        assert!(!s.processors_idle(None, 1));
+        s.callout(false);
+        s.callout(false);
+        // A process gone takes its threads with it.
+        s.set_state(2, 20, RunState::Run);
+        s.task_gone(2);
+        assert!(s.processors_idle(None, 0));
+    }
 
     #[test]
     fn constants() {

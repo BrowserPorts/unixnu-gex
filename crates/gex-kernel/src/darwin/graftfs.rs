@@ -509,6 +509,9 @@ impl FileHandle for GraftHandle {
         use std::os::fd::AsRawFd;
         self.host_file().map(|f| f.as_raw_fd())
     }
+    fn host_id(&self) -> Option<(u64, u64, u64)> {
+        self.host_file().and_then(|f| f.metadata().ok()).map(|md| crate::vfs::host_id_of(&md))
+    }
     fn read_dir(&self) -> Result<Vec<DirEntry>, Errno> {
         if !self.ino.is_dir() {
             return Err(Errno::ENOTDIR);

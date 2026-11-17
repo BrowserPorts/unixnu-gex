@@ -850,15 +850,15 @@ is the reference (search `crates/gex-kernel/src/` for
   pmap's and compressor's ledgers in `TASK_VM_INFO` (resident, internal,
   external, reusable and compressed sizes and their peaks, the footprint's
   peak, decompressions, swap-ins), and `proc_pid_rusage`'s fields that
-  need them: the interrupt wakeups that a thread call's signal or message
-  to another task made, wakeups in the platform-idle state,
-  page-ins, resident pages, disk I/O, logical
-  writes, the CPMU's instructions and cycles, CLPC's energy, another live
-  process's footprint, the footprint's peaks, and the bank's bills once an
-  account names the process (its time and that time by each thread's
-  effective QoS, its other wakeups from interrupt context, runnable time,
-  wirings, own
-  footprint, start, end and reaped children's sums are kept). On a host
+  need them: the interrupt and platform-idle wakeups that a thread call's
+  signal or message to another task made, page-ins, disk I/O, logical
+  writes, the CPMU's instructions and cycles, and a bank bill while a
+  thread that adopted it runs (its time and that time by each thread's
+  effective QoS, its other wakeups from interrupt context and the
+  platform-idle ones among them, runnable time, wirings, resident pages,
+  footprint and its peaks, another process's, the bank's bills, start, end
+  and reaped children's sums are kept; the energy fields are 0, as T8011's
+  kernel, with no energy counter, leaves them). On a host
   without per-thread clocks, the virtual timers, `RLIMIT_CPU`, the CPU
   monitor, the workqueue's quantum and `getrusage`'s and
   `proc_pid_rusage`'s times are reported; on one that cannot say which

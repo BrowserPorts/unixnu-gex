@@ -44,10 +44,13 @@ pub(super) fn routine(k: &mut Kernel, obj: &Kobject, id: i32, req: &Kmsg) -> Opt
         (Kobject::TaskRead | Kobject::TaskInspect | Kobject::TaskName, 3825 | 4817 | 3816) => Reply::err(kr::INVALID_ARGUMENT as i32),
         // mach_memory_entry_purgable_control(entry, control, &state).
         (Kobject::NamedEntry(id), 4900) => match (super::mig::arg(req, 0), super::mig::arg(req, 1), super::vmentry::get(*id)) {
-            (Some(control), Some(state), Some(e)) => match k.darwin_entry_purgable_control(&e, control as u32, state) {
-                0 => Reply::ok(state.to_le_bytes().to_vec()),
-                r => Reply::err(r as i32),
-            },
+            (Some(control), Some(state), Some(e)) => {
+                let mut st = state;
+                match k.darwin_entry_purgable_control(&e, control as u32, &mut st) {
+                    0 => Reply::ok(st.to_le_bytes().to_vec()),
+                    r => Reply::err(r as i32),
+                }
+            }
             (Some(_), Some(_), None) => Reply::err(kr::INVALID_ARGUMENT as i32),
             _ => Reply::err(MIG_BAD_ARGUMENTS),
         },
@@ -58,10 +61,15 @@ pub(super) fn routine(k: &mut Kernel, obj: &Kobject, id: i32, req: &Kmsg) -> Opt
             _ => Reply::err(MIG_BAD_ARGUMENTS),
         },
         // mach_memory_entry_ownership(entry, owner, ledger_tag, ledger_flags).
-        (Kobject::NamedEntry(_), 4902) => {
-            let mut r = Reply::err(kr::FAILURE as i32);
-            r.unimplemented = Some("mach_memory_entry_ownership (an object's owner and its tag ledgers)".into());
-            r
+        (Kobject::NamedEntry(id), 4902) => {
+            let owner = match req.descs.first() {
+                Some(super::ipc::msg::Desc::Port { right, .. }) => *right,
+                _ => return Some(Reply::err(MIG_BAD_ARGUMENTS)),
+            };
+            match (super::mig::arg(req, 0), super::mig::arg(req, 1)) {
+                (Some(tag), Some(flags)) => Reply::err(k.darwin_entry_ownership(*id, owner, tag as i32, flags as i32) as i32),
+                _ => Reply::err(MIG_BAD_ARGUMENTS),
+            }
         }
         _ => return None,
     })
@@ -69,9 +77,14 @@ pub(super) fn routine(k: &mut Kernel, obj: &Kobject, id: i32, req: &Kmsg) -> Opt
 
 /// The named entry a port is (`mach_memory_entry_from_port`), if any.
 fn entry_of(k: &mut Kernel, right: Option<Carried>) -> Option<super::vmentry::NamedEntry> {
+    entry_and_port(k, right).map(|(_, _, e)| e)
+}
+
+/// The named entry a port is, with its id and the port.
+fn entry_and_port(k: &mut Kernel, right: Option<Carried>) -> Option<(u64, super::ipc::ObjId, super::vmentry::NamedEntry)> {
     let Some(Carried::Port(p)) = right else { return None };
     match k.ipc().port(p).kobject {
-        Some(Kobject::NamedEntry(id)) => super::vmentry::get(id),
+        Some(Kobject::NamedEntry(id)) => super::vmentry::get(id).map(|e| (id, p, e)),
         _ => None,
     }
 }
@@ -82,9 +95,10 @@ fn make_memory_entry(k: &mut Kernel, req: &Kmsg) -> Reply {
     let (Some(size), Some(offset), Some(permission)) = (word64(req, 0), word64(req, 2), word(req, 4)) else { return Reply::err(MIG_BAD_ARGUMENTS) };
     let Some(super::ipc::msg::Desc::Port { right, disp, .. }) = req.descs.first() else { return Reply::err(MIG_BAD_ARGUMENTS) };
     let (right, disp) = (*right, *disp);
-    let parent = entry_of(k, right);
+    let parent = entry_and_port(k, right);
+    let parent_port = parent.as_ref().map(|&(_, p, _)| p);
     let mut size = size;
-    let made = match k.darwin_own_memory(|k, m| k.darwin_make_memory_entry(m, &mut size, offset, permission, parent)) {
+    let made = match k.darwin_own_memory(|k, m| k.darwin_make_memory_entry(m, &mut size, offset, permission, parent.map(|(id, _, e)| (id, e)))) {
         Ok(r) => r,
         Err(reply) => return reply,
     };
@@ -104,6 +118,15 @@ fn make_memory_entry(k: &mut Kernel, req: &Kmsg) -> Reply {
             ipc.port_mut(port).owner = 0;
             ipc.make_send(port);
             ipc.port_mut(port).nsrequest_kobject = true;
+            let mut r = Reply::port(Carried::Port(port));
+            r.out = out;
+            r
+        }
+        // The parent's port again, a send right more
+        // (ipc_port_copy_send_any).
+        super::vmentry::Made::Reuse(_) => {
+            let Some(port) = parent_port else { return Reply::err(kr::FAILURE as i32) };
+            k.ipc().copy_send(port);
             let mut r = Reply::port(Carried::Port(port));
             r.out = out;
             r

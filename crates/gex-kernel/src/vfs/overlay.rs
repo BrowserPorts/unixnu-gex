@@ -936,6 +936,9 @@ impl FileHandle for OwnHandle {
     fn host_fd(&self) -> Option<i32> {
         self.inner.host_fd()
     }
+    fn host_id(&self) -> Option<(u64, u64, u64)> {
+        self.inner.host_id()
+    }
     fn vn_close(&self) {
         self.inner.vn_close()
     }
@@ -1038,6 +1041,9 @@ impl FileHandle for MergedDir {
     }
     fn host_fd(&self) -> Option<i32> {
         self.inner.host_fd()
+    }
+    fn host_id(&self) -> Option<(u64, u64, u64)> {
+        self.inner.host_id()
     }
     fn vn_close(&self) {
         self.inner.vn_close()

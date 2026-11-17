@@ -149,6 +149,40 @@ fn unmetered(what: &str) -> String {
     format!("thread_info {what} of a fixed-priority or realtime thread (whether the failsafe has demoted it to timesharing: its computation between blocks is not metered here)")
 }
 
+impl Kernel {
+    /// `thread_quantum_init`'s quantum for thread `t`, in Mach time units:
+    /// a realtime thread's computation, else its clutch bucket's
+    /// (`sched_clutch_thread_quantum_us`, an embedded kernel's: 10 ms for
+    /// fixed priority and foreground, 8 ms user-initiated, 6 ms default,
+    /// 4 ms utility, 2 ms background), the bucket from its base priority
+    /// (`sched_clutch_update_thread_bucket`; a kernel promotion, which
+    /// would use `sched_pri`, is not kept here).
+    pub(crate) fn darwin_thread_quantum(&self, t: i32) -> u64 {
+        use super::taskpolicy::pri::MAXPRI_THROTTLE;
+        let m = mode(self, t);
+        if m == Mode::FixedOrRealtime {
+            if let Some(rt) = self.dtask.threads.map.get(&t).and_then(|th| th.realtime) {
+                return u64::from(rt.computation);
+            }
+        }
+        let p = i32::from(self.darwin_thread_base_pri(t));
+        let us = if m == Mode::FixedOrRealtime && p >= 47 {
+            10_000
+        } else if p > 37 {
+            10_000
+        } else if p > 31 {
+            8_000
+        } else if p > 20 {
+            6_000
+        } else if p > MAXPRI_THROTTLE {
+            4_000
+        } else {
+            2_000
+        };
+        super::mach::ns_to_abs(us * 1_000)
+    }
+}
+
 /// Thread `t`'s `sched_mode`: a workqueue thread's from the policy
 /// `thread_set_workq_pri` gave it (`convert_policy_to_sched_mode`; none
 /// yet is the template's timesharing), a realtime thread's, a fixed one's

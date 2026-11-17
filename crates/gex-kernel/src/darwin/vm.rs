@@ -132,11 +132,18 @@ pub struct Attrs {
     /// `wired_count` and `user_wired_count`.
     pub wired: u16,
     pub user_wired: u16,
+    /// `VME_OBJECT`: the object it maps ([`super::vmobject`]), 0 for the
+    /// task's own anonymous memory, which no one else names.
+    pub obj: u64,
+    /// `!use_pmap`: its object (purgeable or ledger-tagged) has ledgers of
+    /// its own, and a page the pmap enters here is alternate accounting,
+    /// not the task's footprint.
+    pub alt: bool,
 }
 
 impl Default for Attrs {
     fn default() -> Attrs {
-        Attrs { kind: kind::ANON, max: PROT_ALL, alias: 0, inherit: inherit::DEFAULT, behavior: behavior::DEFAULT, zero_wired: false, no_cache: false, cow: false, jit: false, shared: false, wired: 0, user_wired: 0 }
+        Attrs { kind: kind::ANON, max: PROT_ALL, alias: 0, inherit: inherit::DEFAULT, behavior: behavior::DEFAULT, zero_wired: false, no_cache: false, cow: false, jit: false, shared: false, wired: 0, user_wired: 0, obj: 0, alt: false }
     }
 }
 
@@ -158,16 +165,39 @@ pub struct EntryInfo {
     pub offset: u64,
 }
 
-/// A task's map entries, by start.
-#[derive(Debug, Default)]
+/// A task's map entries, by start: the task's own, and other tasks'
+/// kernels' for one operation at a time (a remap from this map, a file's
+/// change of size), through [`Entries::shared`].
+///
+/// An entry that names an object ([`Attrs::obj`]) holds a reference to it
+/// ([`super::vmobject`]) for as long as it is in the map.
 pub struct Entries {
-    ranges: BTreeMap<u64, Entry>,
+    map: std::sync::Arc<crate::sync::Mutex<Map>>,
     /// `jit_entry_exists`: the map has had its JIT region (it stays set
     /// once the region is unmapped).
     pub jit_entry_exists: bool,
     /// `user_wire_limit`, none being the unlimited one a new map starts
-    /// with, and `user_wire_size`.
+    /// with.
     pub user_wire_limit: Option<u64>,
+}
+
+impl Default for Entries {
+    fn default() -> Entries {
+        Entries::of(Map::default(), None)
+    }
+}
+
+impl std::fmt::Debug for Entries {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Entries")
+    }
+}
+
+/// The entries themselves, as [`Entries`] shares them.
+#[derive(Debug, Default)]
+pub struct Map {
+    ranges: BTreeMap<u64, Entry>,
+    /// `user_wire_size`.
     user_wire_size: u64,
     /// Where the task's `wired_mem` ledger is read by others: the bytes
     /// the user's wirings hold, kept as `user_wire_size` changes.
@@ -175,12 +205,37 @@ pub struct Entries {
     /// Where the map's submap entries (the shared region's) are read by
     /// the task's footprint meter, its own and other processes'.
     submap_gauge: Option<std::sync::Arc<std::sync::Mutex<Vec<(u64, u64)>>>>,
+    /// And its entries with `use_pmap` off.
+    alt_gauge: Option<std::sync::Arc<std::sync::Mutex<Vec<(u64, u64)>>>>,
+}
+
+impl Drop for Map {
+    /// The map's end (`vm_map_destroy`): each entry's reference given back.
+    fn drop(&mut self) {
+        for (_, e) in std::mem::take(&mut self.ranges) {
+            super::vmobject::release(e.attrs.obj);
+        }
+    }
 }
 
 impl Entries {
+    fn of(map: Map, user_wire_limit: Option<u64>) -> Entries {
+        Entries { map: std::sync::Arc::new(crate::sync::Mutex::ranked(map, crate::sync::rank::ENTRIES)), jit_entry_exists: false, user_wire_limit }
+    }
+
     /// A new image's map, with `vm_map_set_user_wire_limit`'s limit.
     pub fn with_user_wire_limit(limit: u64) -> Entries {
-        Entries { user_wire_limit: Some(limit), ..Entries::default() }
+        Entries::of(Map::default(), Some(limit))
+    }
+
+    /// The entries, held for one operation.
+    pub fn lock(&self) -> crate::sync::MutexGuard<'_, Map> {
+        self.map.lock()
+    }
+
+    /// The entries as another task's kernel reaches them.
+    pub fn shared(&self) -> std::sync::Arc<crate::sync::Mutex<Map>> {
+        std::sync::Arc::clone(&self.map)
     }
 
     /// The task's `wired_mem` ledger, which this map's wirings now keep
@@ -188,15 +243,132 @@ impl Entries {
     /// `pte_set_wired` credits to it, and an unwiring or the entry's
     /// removal debits them).
     pub fn set_wire_gauge(&mut self, gauge: std::sync::Arc<std::sync::atomic::AtomicU64>) {
-        gauge.store(self.user_wire_size, std::sync::atomic::Ordering::Release);
-        self.wired_gauge = Some(gauge);
+        let mut m = self.lock();
+        gauge.store(m.user_wire_size, std::sync::atomic::Ordering::Release);
+        m.wired_gauge = Some(gauge);
     }
 
     /// The task's footprint meter's view of the submaps, which this map's
     /// entries now keep.
     pub fn set_submap_gauge(&mut self, gauge: std::sync::Arc<std::sync::Mutex<Vec<(u64, u64)>>>) {
-        self.submap_gauge = Some(gauge);
-        self.submaps_changed();
+        let mut m = self.lock();
+        m.submap_gauge = Some(gauge);
+        m.submaps_changed();
+    }
+
+    /// The task's footprint meter's view of the entries with `use_pmap`
+    /// off, which this map's entries now keep.
+    pub fn set_alt_gauge(&mut self, gauge: std::sync::Arc<std::sync::Mutex<Vec<(u64, u64)>>>) {
+        let mut m = self.lock();
+        m.alt_gauge = Some(gauge);
+        m.alt_changed();
+    }
+
+    /// See [`Map::clip`].
+    pub fn clip(&mut self, at: u64) {
+        self.lock().clip(at)
+    }
+
+    /// See [`Map::clip_range`].
+    pub fn clip_range(&mut self, start: u64, end: u64) {
+        self.lock().clip_range(start, end)
+    }
+
+    /// See [`Map::clear`].
+    pub fn clear(&mut self, start: u64, end: u64) {
+        self.lock().clear(start, end)
+    }
+
+    /// See [`Map::enter`].
+    pub fn enter(&mut self, start: u64, end: u64, attrs: Attrs, offset: u64) {
+        self.lock().enter(start, end, attrs, offset)
+    }
+
+    /// See [`Map::enter_anon`].
+    pub fn enter_anon(&mut self, start: u64, end: u64, attrs: Attrs, prev_same_prot: bool) {
+        self.lock().enter_anon(start, end, attrs, prev_same_prot)
+    }
+
+    /// See [`Map::update`].
+    pub fn update(&mut self, start: u64, end: u64, f: impl Fn(&mut Attrs)) {
+        self.lock().update(start, end, f)
+    }
+
+    /// See [`Map::update_whole`].
+    pub fn update_whole(&mut self, start: u64, end: u64, f: impl Fn(&mut Attrs)) {
+        self.lock().update_whole(start, end, f)
+    }
+
+    /// See [`Map::wire`]; the map's limit is `user_wire_limit`.
+    pub fn wire(&mut self, start: u64, end: u64) -> u64 {
+        let limit = self.user_wire_limit;
+        self.lock().wire(start, end, limit)
+    }
+
+    /// See [`Map::unwire`].
+    pub fn unwire(&mut self, start: u64, end: u64) -> u64 {
+        self.lock().unwire(start, end)
+    }
+
+    /// See [`Map::pieces`].
+    pub fn pieces(&self, start: u64, end: u64) -> Vec<(u64, u64, Attrs)> {
+        self.lock().pieces(start, end)
+    }
+
+    /// See [`Map::size_and_count`].
+    pub fn size_and_count(&self) -> (u64, u32) {
+        self.lock().size_and_count()
+    }
+
+    /// See [`Map::submaps`].
+    pub fn submaps(&self, start: u64, end: u64) -> Vec<(u64, u64)> {
+        self.lock().submaps(start, end)
+    }
+
+    /// See [`Map::at_or_after`].
+    pub fn at_or_after(&self, addr: u64) -> Option<EntryInfo> {
+        self.lock().at_or_after(addr)
+    }
+
+    /// See [`Map::fork`].
+    pub fn fork(&mut self, mapped: &[(u64, u64)]) {
+        self.lock().fork(mapped)
+    }
+
+    /// See [`Map::inherited_jit`].
+    pub fn inherited_jit(&self) -> Vec<(u64, u64)> {
+        self.lock().inherited_jit()
+    }
+
+    /// The child's entries from a map [`Entries::fork`] has marked: those
+    /// inherited by copy or share; one not inherited is absent.
+    pub fn inherited(&self) -> Entries {
+        Entries::of(self.lock().inherited(), self.user_wire_limit)
+    }
+}
+
+impl Map {
+    /// Entry `e` at `start`, holding a reference to its object; what was
+    /// there before gives its own back.
+    fn put(&mut self, start: u64, e: Entry) {
+        super::vmobject::reference(e.attrs.obj);
+        if let Some(old) = self.ranges.insert(start, e) {
+            super::vmobject::release(old.attrs.obj);
+        }
+    }
+
+    /// The entry at `start` taken out, its reference given back.
+    fn take(&mut self, start: u64) -> Option<Entry> {
+        let e = self.ranges.remove(&start)?;
+        super::vmobject::release(e.attrs.obj);
+        Some(e)
+    }
+
+    /// The entries with `use_pmap` off, told to their gauge.
+    fn alt_changed(&self) {
+        if let Some(g) = &self.alt_gauge {
+            *g.lock().unwrap_or_else(|e| e.into_inner()) = self.ranges.iter().filter(|(_, e)| e.attrs.alt).map(|(&s, e)| (s, e.end)).collect();
+        }
     }
 
     /// The submap entries, told to the gauge.
@@ -214,12 +386,12 @@ impl Entries {
     }
 
     /// `vm_map_clip_start`: no entry crosses `at`; the upper half's offset
-    /// moves with it.
+    /// moves with it, and it holds a reference of its own to the object.
     pub fn clip(&mut self, at: u64) {
         let Some((&s, &entry)) = self.ranges.range(..at).next_back() else { return };
         if entry.end > at {
-            self.ranges.insert(s, Entry { end: at, ..entry });
-            self.ranges.insert(at, Entry { offset: entry.offset + (at - s), ..entry });
+            self.put(s, Entry { end: at, ..entry });
+            self.put(at, Entry { offset: entry.offset + (at - s), ..entry });
         }
     }
 
@@ -236,18 +408,22 @@ impl Entries {
         }
         self.clip_range(start, end);
         let inside: Vec<u64> = self.ranges.range(start..end).map(|(&s, _)| s).collect();
-        let mut submap = false;
+        let (mut submap, mut alt) = (false, false);
         for s in inside {
-            if let Some(e) = self.ranges.remove(&s) {
+            if let Some(e) = self.take(s) {
                 if e.attrs.user_wired > 0 {
                     self.user_wire_size -= e.end - s;
                 }
                 submap |= e.attrs.kind == kind::SUBMAP;
+                alt |= e.attrs.alt;
             }
         }
         self.wire_size_changed();
         if submap {
             self.submaps_changed();
+        }
+        if alt {
+            self.alt_changed();
         }
     }
 
@@ -255,9 +431,12 @@ impl Entries {
     pub fn enter(&mut self, start: u64, end: u64, attrs: Attrs, offset: u64) {
         self.clear(start, end);
         if start < end {
-            self.ranges.insert(start, Entry { end, attrs, offset });
+            self.put(start, Entry { end, attrs, offset });
             if attrs.kind == kind::SUBMAP {
                 self.submaps_changed();
+            }
+            if attrs.alt {
+                self.alt_changed();
             }
         }
     }
@@ -275,12 +454,12 @@ impl Entries {
         let chunked = size > ANON_CHUNK_SIZE && attrs.max != 0;
         let first_end = if chunked { start + ANON_CHUNK_SIZE } else { end };
         if !self.coalesce(start, first_end, attrs, prev_same_prot) {
-            self.ranges.insert(start, Entry { end: first_end, attrs, offset: 0 });
+            self.put(start, Entry { end: first_end, attrs, offset: 0 });
         }
         let mut at = first_end;
         while at < end {
             let e = if end - at > ANON_CHUNK_SIZE { at + ANON_CHUNK_SIZE } else { end };
-            self.ranges.insert(at, Entry { end: e, attrs, offset: 0 });
+            self.put(at, Entry { end: e, attrs, offset: 0 });
             at = e;
         }
     }
@@ -291,7 +470,7 @@ impl Entries {
     /// [`ANON_CHUNK_SIZE`]). The object must be its entry's alone
     /// (`vm_object_coalesce`): none since a fork left it shared.
     fn coalesce(&mut self, start: u64, end: u64, attrs: Attrs, prev_same_prot: bool) -> bool {
-        if attrs.alias != tag::REALLOC || attrs.jit || !prev_same_prot {
+        if attrs.alias != tag::REALLOC || attrs.jit || !prev_same_prot || attrs.obj != 0 {
             return false;
         }
         let Some((&s, prev)) = self.ranges.range_mut(..start).next_back() else { return false };
@@ -299,6 +478,7 @@ impl Entries {
         let joins = prev.end == start
             && !p.shared
             && p.kind == kind::ANON
+            && p.obj == 0
             && !p.cow
             && p.behavior == behavior::DEFAULT
             && p.max == attrs.max
@@ -314,17 +494,30 @@ impl Entries {
         joins
     }
 
-    /// Change each entry of `[start, end)` by `f`, clipped to it.
+    /// Change each entry of `[start, end)` by `f`, clipped to it. An entry
+    /// `f` gives another object holds a reference to the new one instead.
     pub fn update(&mut self, start: u64, end: u64, f: impl Fn(&mut Attrs)) {
         self.clip_range(start, end);
-        let mut submap = false;
+        let (mut submap, mut alt) = (false, false);
+        let mut objs = Vec::new();
         for (_, e) in self.ranges.range_mut(start..end) {
-            let was = e.attrs.kind == kind::SUBMAP;
+            let (was, obj, was_alt) = (e.attrs.kind == kind::SUBMAP, e.attrs.obj, e.attrs.alt);
             f(&mut e.attrs);
             submap |= was != (e.attrs.kind == kind::SUBMAP);
+            alt |= was_alt != e.attrs.alt;
+            if obj != e.attrs.obj {
+                objs.push((obj, e.attrs.obj));
+            }
+        }
+        for (old, new) in objs {
+            super::vmobject::reference(new);
+            super::vmobject::release(old);
         }
         if submap {
             self.submaps_changed();
+        }
+        if alt {
+            self.alt_changed();
         }
     }
 
@@ -334,8 +527,9 @@ impl Entries {
         let first = self.ranges.range(..=start).next_back().filter(|(_, e)| e.end > start).map_or(start, |(&s, _)| s);
         let mut submap = false;
         for (_, e) in self.ranges.range_mut(first..end) {
-            let was = e.attrs.kind == kind::SUBMAP;
+            let (was, obj) = (e.attrs.kind == kind::SUBMAP, e.attrs.obj);
             f(&mut e.attrs);
+            assert_eq!(obj, e.attrs.obj, "update_whole changes no entry's object");
             submap |= was != (e.attrs.kind == kind::SUBMAP);
         }
         if submap {
@@ -345,8 +539,9 @@ impl Entries {
 
     /// `vm_map_wire_nested` for the user, access unstated (`mlock`): every
     /// entry in `[start, end)` gets a wiring (`add_wire_counts`), the ones
-    /// before a hole or a limit none. The kernel's return code.
-    pub fn wire(&mut self, start: u64, end: u64) -> u64 {
+    /// before a hole or a limit none, `user_wire_limit` being the map's
+    /// limit. The kernel's return code.
+    pub fn wire(&mut self, start: u64, end: u64, user_wire_limit: Option<u64>) -> u64 {
         if start == end {
             return kr::SUCCESS;
         }
@@ -361,7 +556,7 @@ impl Entries {
             let size = e.end - s;
             let next = e.end;
             if e.attrs.user_wired == 0 {
-                let limit = self.user_wire_limit.unwrap_or(u64::MAX).min(PER_TASK_USER_WIRE_LIMIT);
+                let limit = user_wire_limit.unwrap_or(u64::MAX).min(PER_TASK_USER_WIRE_LIMIT);
                 if size + self.user_wire_size > limit {
                     rc = kr::RESOURCE_SHORTAGE;
                     break;
@@ -416,6 +611,12 @@ impl Entries {
     /// The pieces of `[start, end)` and the attributes of each: the default
     /// ones for what no entry covers.
     pub fn pieces(&self, start: u64, end: u64) -> Vec<(u64, u64, Attrs)> {
+        self.pieces_at(start, end).into_iter().map(|(s, e, a, _)| (s, e, a)).collect()
+    }
+
+    /// [`Map::pieces`] with each piece's offset in its object
+    /// (`VME_OFFSET` moved to the piece's start; 0 where no entry is).
+    pub fn pieces_at(&self, start: u64, end: u64) -> Vec<(u64, u64, Attrs, u64)> {
         let mut out = Vec::new();
         if start >= end {
             return out;
@@ -423,15 +624,15 @@ impl Entries {
         let mut at = start;
         let first = self.ranges.range(..=start).next_back().filter(|(_, e)| e.end > start).map_or(start, |(&s, _)| s);
         for (&s, e) in self.ranges.range(first..end) {
-            let (s, stop) = (s.max(start), e.end.min(end));
-            if s > at {
-                out.push((at, s, Attrs::default()));
+            let (ps, stop) = (s.max(start), e.end.min(end));
+            if ps > at {
+                out.push((at, ps, Attrs::default(), 0));
             }
-            out.push((s, stop, e.attrs));
+            out.push((ps, stop, e.attrs, e.offset + (ps - s)));
             at = stop;
         }
         if at < end {
-            out.push((at, end, Attrs::default()));
+            out.push((at, end, Attrs::default(), 0));
         }
         out
     }
@@ -450,6 +651,47 @@ impl Entries {
         }
         let first = self.ranges.range(..=start).next_back().filter(|(_, e)| e.end > start).map_or(start, |(&s, _)| s);
         self.ranges.range(first..end).filter(|(_, e)| e.attrs.kind == kind::SUBMAP && e.end > start).map(|(&s, e)| (s.max(start), e.end.min(end))).collect()
+    }
+
+    /// The entries of `[start, end)` given object `obj` (a reference each),
+    /// their offsets running from `offset` at `start`: an object made for
+    /// them (`vm_map_copy_extract`'s for an entry that had none), which
+    /// they then share.
+    pub fn set_object(&mut self, start: u64, end: u64, obj: u64, offset: u64) {
+        self.clip_range(start, end);
+        let starts: Vec<u64> = self.ranges.range(start..end).map(|(&s, _)| s).collect();
+        for s in starts {
+            if let Some(e) = self.ranges.get(&s).copied() {
+                let attrs = Attrs { obj, cow: false, shared: true, ..e.attrs };
+                self.put(s, Entry { attrs, offset: offset + (s - start), ..e });
+            }
+        }
+        self.alt_changed();
+    }
+
+    /// The entries in `[start, end)`, clipped to it, each with its offset in
+    /// its object: what [`Map::restore`] puts back.
+    pub fn snapshot(&self, start: u64, end: u64) -> Vec<(u64, u64, Attrs, u64)> {
+        let first = self.ranges.range(..=start).next_back().filter(|(_, e)| e.end > start).map_or(start, |(&s, _)| s);
+        self.ranges.range(first..end).filter(|(_, e)| e.end > start).map(|(&s, e)| (s.max(start), e.end.min(end), e.attrs, e.offset + (s.max(start) - s))).collect()
+    }
+
+    /// The entries of a [`Map::snapshot`] again (a mapping that failed
+    /// after taking their place: `vm_map_enter`'s restore of what it
+    /// zapped).
+    pub fn restore(&mut self, snap: Vec<(u64, u64, Attrs, u64)>) {
+        for (s, e, a, off) in snap {
+            self.enter(s, e, a, off);
+        }
+    }
+
+    /// The entries that name object `obj`: each one's range and its offset
+    /// in the object at its start.
+    pub fn of_object(&self, obj: u64) -> Vec<(u64, u64, Attrs, u64)> {
+        if obj == 0 {
+            return Vec::new();
+        }
+        self.ranges.iter().filter(|(_, e)| e.attrs.obj == obj).map(|(&s, e)| (s, e.end, e.attrs, e.offset)).collect()
     }
 
     /// `vm_map_lookup_entry` then `vme_next`: the entry at `addr`, or the
@@ -479,10 +721,11 @@ impl Entries {
         self.ranges.iter().filter(|(_, e)| e.attrs.jit && e.attrs.inherit != inherit::NONE).map(|(&s, e)| (s, e.end)).collect()
     }
 
-    /// The child's entries from a map [`Entries::fork`] has marked: those
-    /// inherited by copy or share; one not inherited is absent.
-    pub fn inherited(&self) -> Entries {
-        let mut child = Entries { user_wire_limit: self.user_wire_limit, ..Entries::default() };
+    /// The child's entries from a map [`Map::fork`] has marked: those
+    /// inherited by copy or share, each with its reference to its object;
+    /// one not inherited is absent.
+    pub fn inherited(&self) -> Map {
+        let mut child = Map::default();
         for (&s, &entry) in &self.ranges {
             let mut a = entry.attrs;
             if a.inherit != inherit::NONE {
@@ -496,7 +739,7 @@ impl Entries {
                     a.jit = false;
                     a.max &= !4;
                 }
-                child.ranges.insert(s, Entry { attrs: a, ..entry });
+                child.put(s, Entry { attrs: a, ..entry });
             }
         }
         child

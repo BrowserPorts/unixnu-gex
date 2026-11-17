@@ -3,7 +3,8 @@
 // structure's size and no more. This process's record: its executable's
 // UUID, its time (recount's, in Mach time units: the getrusage time, all
 // of it user time, no system time), its fork's start (ps_start, with
-// p_start), no end, its runnable time (at least its time), its own
+// p_start), no end, its runnable time (once it has blocked, at least the
+// time it ran before; never more than its life), its own
 // footprint, what its wirings hold (mlock's pages, until munlock), and the
 // zero fields of this kernel: the flags (no ptrauth), the performance
 // cluster's figures (no AMP), the secure times and what follows them. A
@@ -15,12 +16,16 @@
 // added twice (at the child's exit and at the system's reap). The time by
 // effective QoS: a thread's time goes to the QoS it ran at (utility, then
 // background), and the seven sum to the task's time. Each sleep that its
-// deadline timer ends is a wakeup from interrupt context. The footprint's
+// deadline timer ends is a wakeup from interrupt context, and a
+// platform-idle one when no thread was on a processor then (none while a
+// thread of its own spins); the energy fields are 0 (no energy counter on
+// this SoC). The footprint's
 // peaks: pages touched then unmapped are in the lifetime peak, the
 // footprint after is below it, and TASK_VM_INFO's ledger peak is the same
 // ledger's; an interval reset begins the interval's peak at the footprint
-// then. Another process's footprint, read from outside it, and its peak
-// after it unmapped what it touched. The fields
+// then. The resident size holds the pages touched until they are
+// unmapped. Another process's footprint and resident size, read from
+// outside it, and its peak after it unmapped what it touched. The fields
 // the kernel does not keep are reported, so a strict run stops at a
 // call that copies one ("stop").
 
@@ -30,6 +35,8 @@
 #include <pthread.h>
 #include <pthread/qos.h>
 #include <signal.h>
+#include <stdatomic.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -51,6 +58,16 @@ static int bad(const char *what, long got, long want) {
 
 static volatile uint64_t sink;
 
+// A thread that keeps a processor until told to stop.
+static atomic_bool spinning_stop, spinning_started;
+
+static void *spinning(void *arg) {
+    (void)arg;
+    atomic_store(&spinning_started, true);
+    while (!atomic_load(&spinning_stop)) sink++;
+    return NULL;
+}
+
 static void spin(uint64_t ns) {
     uint64_t until = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) + ns;
     while (clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) < until) {
@@ -70,12 +87,13 @@ static uint64_t usage_ns(void) {
     return (uint64_t)ru.ru_utime.tv_sec * 1000000000u + (uint64_t)ru.ru_utime.tv_usec * 1000u;
 }
 
-// The record's fields this kernel leaves 0.
+// The record's fields this kernel leaves 0 (energy among them: no
+// energy counter on this SoC).
 static int zeros(const struct rusage_info_v6 *r, const char *whose) {
     const uint64_t *after = &r->ri_neural_footprint;
     for (int i = 0; i < 12; i++)
         if (after[i]) return bad(whose, (long)after[i], 0);
-    if (r->ri_system_time || r->ri_flags || r->ri_user_ptime || r->ri_system_ptime || r->ri_pinstructions || r->ri_pcycles || r->ri_penergy_nj || r->ri_secure_time_in_system || r->ri_secure_ptime_in_system)
+    if (r->ri_system_time || r->ri_flags || r->ri_user_ptime || r->ri_system_ptime || r->ri_pinstructions || r->ri_pcycles || r->ri_penergy_nj || r->ri_secure_time_in_system || r->ri_secure_ptime_in_system || r->ri_energy_nj || r->ri_billed_energy || r->ri_serviced_energy)
         return bad(whose, 1, 0);
     return 0;
 }
@@ -105,8 +123,14 @@ static int peaks(void) {
     if (f0.ri_lifetime_max_phys_footprint < f0.ri_phys_footprint || f0.ri_interval_max_phys_footprint < f0.ri_phys_footprint) return bad("the peaks against the footprint", (long)f0.ri_lifetime_max_phys_footprint, (long)f0.ri_phys_footprint);
     char *p = touch(SPAN);
     if (!p) return bad("mmap", errno, 0);
+    // The resident size (the pmap's phys_mem): the pages touched are in it
+    // until their unmap.
+    struct rusage_info_v6 ft;
+    if (proc_pid_rusage(getpid(), RUSAGE_INFO_V4, &ft) != 0) return bad("V4", errno, 0);
+    if (ft.ri_resident_size < f0.ri_resident_size + SPAN) return bad("the resident size over what was touched", (long)ft.ri_resident_size, (long)(f0.ri_resident_size + SPAN));
     munmap(p, SPAN);
     if (proc_pid_rusage(getpid(), RUSAGE_INFO_V4, &f1) != 0) return bad("V4", errno, 0);
+    if (f1.ri_resident_size + SPAN / 2 > ft.ri_resident_size) return bad("the resident size after the unmap", (long)f1.ri_resident_size, (long)(ft.ri_resident_size - SPAN));
     if (f1.ri_lifetime_max_phys_footprint < f0.ri_phys_footprint + SPAN) return bad("the lifetime peak over what was touched", (long)f1.ri_lifetime_max_phys_footprint, (long)(f0.ri_phys_footprint + SPAN));
     if (f1.ri_interval_max_phys_footprint < f0.ri_phys_footprint + SPAN) return bad("the interval peak over what was touched", (long)f1.ri_interval_max_phys_footprint, (long)(f0.ri_phys_footprint + SPAN));
     if (f1.ri_phys_footprint + SPAN / 2 > f1.ri_lifetime_max_phys_footprint) return bad("the footprint after the unmap", (long)f1.ri_phys_footprint, (long)(f1.ri_lifetime_max_phys_footprint - SPAN));
@@ -153,6 +177,7 @@ static int other(void) {
     read(up[0], &x, 1);
     if (proc_pid_rusage(c, RUSAGE_INFO_V4, &a) != 0) return bad("another process", errno, 0);
     if (a.ri_phys_footprint < SPAN || a.ri_lifetime_max_phys_footprint < a.ri_phys_footprint) return bad("another process's footprint", (long)a.ri_phys_footprint, (long)SPAN);
+    if (a.ri_resident_size < SPAN) return bad("another process's resident size", (long)a.ri_resident_size, (long)SPAN);
     write(down[1], &x, 1);
     read(up[0], &x, 1);
     if (proc_pid_rusage(c, RUSAGE_INFO_V4, &b) != 0) return bad("another process", errno, 0);
@@ -170,6 +195,11 @@ int main(int argc, char **argv) {
         proc_pid_rusage(getpid(), RUSAGE_INFO_V0, &r);
         return 0;
     }
+    // The calendar and Mach clocks read together near its start, for
+    // p_start and ps_start below.
+    struct timeval tv0;
+    gettimeofday(&tv0, NULL);
+    uint64_t abs0 = mach_absolute_time();
     if (proc_pid_rusage(getpid(), 7, &r) != -1 || errno != EINVAL) return bad("flavor 7", errno, EINVAL);
     if (proc_pid_rusage(99999, RUSAGE_INFO_V6, &r) != -1 || errno != ESRCH) return bad("no such process", errno, ESRCH);
 
@@ -184,22 +214,31 @@ int main(int argc, char **argv) {
     uint64_t before = usage_ns();
     if (proc_pid_rusage(getpid(), RUSAGE_INFO_V6, &r) != 0) return bad("V6", errno, 0);
     uint64_t after = usage_ns(), now = mach_absolute_time();
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
     struct { uint8_t uuid[16]; uint64_t uniqueid, puniqueid; int32_t idversion; uint32_t r2; uint64_t r3, r4; } u;
     if (proc_pidinfo(getpid(), 17, 0, &u, sizeof u) != sizeof u || memcmp(u.uuid, r.ri_uuid, 16)) return bad("its UUID", errno, 0);
     uint64_t t = ns_of(r.ri_user_time);
     if (t + 1000 < before || t > after + 1000) return bad("its time (ms)", (long)(t / 1000000), (long)(before / 1000000));
     if (zeros(&r, "a zero field")) return 1;
     if (r.ri_proc_exit_abstime != 0 || r.ri_proc_start_abstime == 0 || r.ri_proc_start_abstime >= now) return bad("its start and end", (long)r.ri_proc_exit_abstime, 0);
-    // p_start was read with ps_start (the calendar clock may be slewed
-    // against the Mach clock meanwhile: 0.2% of the time since).
+    // p_start was read with ps_start: from them to the clocks read near
+    // its start, the calendar clock may be slewed against the Mach clock
+    // by adjtime (ntp_update_second: 5000 PPM while more than a second
+    // off) and the NTP frequency (MAXFREQ, 500 PPM).
     struct { uint32_t f[30]; uint64_t start_sec, start_usec; } b;
     if (proc_pidinfo(getpid(), 3, 0, &b, 136) != 136) return bad("its BSD info", errno, 0);
-    int64_t wall = ((int64_t)tv.tv_sec - (int64_t)b.start_sec) * 1000000 + ((int64_t)tv.tv_usec - (int64_t)b.start_usec);
-    int64_t mach = (int64_t)(ns_of(now - r.ri_proc_start_abstime) / 1000);
-    if (llabs(wall - mach) > 20000 + mach / 500) return bad("its start against p_start (us)", (long)mach, (long)wall);
-    if (r.ri_runnable_time < r.ri_user_time) return bad("its runnable time", (long)r.ri_runnable_time, (long)r.ri_user_time);
+    int64_t wall = ((int64_t)tv0.tv_sec - (int64_t)b.start_sec) * 1000000 + ((int64_t)tv0.tv_usec - (int64_t)b.start_usec);
+    int64_t mach = (int64_t)(ns_of(abs0 - r.ri_proc_start_abstime) / 1000);
+    if (llabs(wall - mach) > 20000 + mach * 5500 / 1000000) return bad("its start against p_start (us)", (long)mach, (long)wall);
+    // Its runnable time: the runnable timer leaves out the stretch since its
+    // last update (a dispatch, a quantum's end), so it may trail the time
+    // now; once the thread blocks the timer has its whole stretch, at least
+    // the time it ran (no other thread runs here).
+    struct rusage_info_v6 b0, b1;
+    proc_pid_rusage(getpid(), RUSAGE_INFO_V4, &b0);
+    usleep(1000);
+    proc_pid_rusage(getpid(), RUSAGE_INFO_V4, &b1);
+    if (b1.ri_runnable_time < b0.ri_user_time || b1.ri_runnable_time < r.ri_runnable_time) return bad("its runnable time, past a block", (long)b1.ri_runnable_time, (long)b0.ri_user_time);
+    if (ns_of(b1.ri_runnable_time) > ns_of(mach_absolute_time() - r.ri_proc_start_abstime)) return bad("its runnable time, against its life", (long)b1.ri_runnable_time, 0);
     if (r.ri_phys_footprint == 0) return bad("its footprint", 0, 1);
     if (r.ri_child_user_time || r.ri_child_elapsed_abstime || r.ri_billed_system_time || r.ri_serviced_system_time || r.ri_billed_energy || r.ri_serviced_energy) return bad("no children, no bank bills", 1, 0);
 
@@ -226,6 +265,26 @@ int main(int argc, char **argv) {
     for (int i = 0; i < 5; i++) usleep(2000);
     proc_pid_rusage(getpid(), RUSAGE_INFO_V0, &w1);
     if (w1.ri_interrupt_wkups - w0.ri_interrupt_wkups < 5) return bad("interrupt wakeups of five sleeps", (long)(w1.ri_interrupt_wkups - w0.ri_interrupt_wkups), 5);
+    // Platform-idle wakeups are interrupt wakeups made while every
+    // processor was idle: never more than those, and (nothing else runs
+    // here) the sleeps of a process with no other thread on a processor
+    // end in that state.
+    uint64_t idle = w1.ri_pkg_idle_wkups - w0.ri_pkg_idle_wkups;
+    if (idle > w1.ri_interrupt_wkups - w0.ri_interrupt_wkups) return bad("platform-idle wakeups over the interrupt wakeups", (long)idle, (long)(w1.ri_interrupt_wkups - w0.ri_interrupt_wkups));
+    if (idle < 5) return bad("platform-idle wakeups of five sleeps alone", (long)idle, 5);
+    // A thread of its own spinning on a processor meanwhile: no sleep
+    // ends with every processor idle.
+    struct rusage_info_v6 s0, s1;
+    pthread_t spinner;
+    if (pthread_create(&spinner, NULL, spinning, NULL) != 0) return bad("pthread_create", errno, 0);
+    while (!atomic_load(&spinning_started)) ;
+    proc_pid_rusage(getpid(), RUSAGE_INFO_V0, &s0);
+    for (int i = 0; i < 5; i++) usleep(2000);
+    proc_pid_rusage(getpid(), RUSAGE_INFO_V0, &s1);
+    atomic_store(&spinning_stop, true);
+    pthread_join(spinner, NULL);
+    if (s1.ri_interrupt_wkups - s0.ri_interrupt_wkups < 5) return bad("interrupt wakeups of five sleeps beside a spinning thread", (long)(s1.ri_interrupt_wkups - s0.ri_interrupt_wkups), 5);
+    if (s1.ri_pkg_idle_wkups != s0.ri_pkg_idle_wkups) return bad("platform-idle wakeups beside a spinning thread", (long)(s1.ri_pkg_idle_wkups - s0.ri_pkg_idle_wkups), 0);
 
     // Wirings: three 16 KiB pages, then none.
     uint64_t wired0 = r.ri_wired_size;

@@ -11334,7 +11334,10 @@ impl Kernel {
         // written as the kernel's own (no copyout check).
         self.mem.shared_maps().catch_up(m);
         if self.darwin {
-            self.signals.thread().cpu.enter();
+            let q = self.darwin_thread_quantum(self.tid);
+            let t = self.signals.thread();
+            t.cpu.set_quantum(q);
+            t.cpu.enter();
         }
         // A Darwin call's copies of the program's memory are checked as
         // copyin and copyout check them, against the map as it stands (a

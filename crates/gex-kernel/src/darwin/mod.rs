@@ -138,6 +138,9 @@ pub mod vm;
 pub mod vmshare;
 mod vmmig;
 pub mod vmentry;
+pub mod vmobject;
+pub mod ubc;
+pub mod purgeable;
 pub mod coalition;
 pub mod importance;
 pub mod voucher;
@@ -248,6 +251,10 @@ pub struct Task {
     /// The task whose request to one of this task's kernel objects is
     /// being served (0: this task's own).
     pub kcaller: ipc::TaskKey,
+    /// While this task's own kernel serves its `mach_vm_read_overwrite` of
+    /// another task's map (whose copy is made into this map, the caller's
+    /// `current_map()`): that task's process.
+    pub read_from: Option<i32>,
     /// The send rights the next child task inherits (`ipc_task_init`):
     /// its special ports by kind, its registered ports, and its exception
     /// actions.
@@ -265,10 +272,13 @@ pub struct Task {
     pub workq_wake: Vec<i32>,
     /// A thread call is running (`THREAD_TAG_CALLOUT` with
     /// `callout_woken_from_icontext`): the threads it wakes are interrupt
-    /// wakeups. And the workqueue threads it woke whose wake is yet to be
-    /// done.
+    /// wakeups; with `callout_woken_from_platform_idle` (every processor
+    /// idle at the timer interrupt that woke it), platform-idle wakeups
+    /// too. And the workqueue threads it woke whose wake is yet to be
+    /// done, each with that platform-idle state.
     pub in_callout: bool,
-    pub callout_woken: std::collections::HashSet<i32>,
+    pub callout_pidle: bool,
+    pub callout_woken: std::collections::HashMap<i32, bool>,
     pub workq_creator_pending: Option<u32>,
     /// Every thread request: the workqueue's (`workq_kernreturn`'s) and
     /// the kqueues' (`kqwq_request`, `kqwl_request`).
@@ -437,6 +447,7 @@ impl Task {
     pub fn with_wire_ledger(mut self) -> Task {
         self.vm.set_wire_gauge(std::sync::Arc::clone(&self.rusage.wired));
         self.vm.set_submap_gauge(std::sync::Arc::clone(&self.rusage.meter.submaps));
+        self.vm.set_alt_gauge(std::sync::Arc::clone(&self.rusage.meter.alt));
         self
     }
 }
@@ -485,10 +496,11 @@ impl crate::syscalls::Kernel {
         let mut mm = self.mem.lock();
         let pages = mm.withheld_write_pages().unwrap_or_default();
         let unentered = mm.unentered_runs();
-        if pages.is_empty() && unentered.is_empty() {
+        let copying = mm.copy_pending_runs();
+        if pages.is_empty() && unentered.is_empty() && copying.is_empty() {
             return None;
         }
-        Some(std::sync::Arc::new(crate::SoftPages { pages, written: Default::default(), unentered, touched: Default::default() }))
+        Some(std::sync::Arc::new(crate::SoftPages { pages, written: Default::default(), unentered, touched: Default::default(), copying, copied: Default::default() }))
     }
 
     /// The watched pages a call's copies wrote, told to the objects that
@@ -496,10 +508,15 @@ impl crate::syscalls::Kernel {
     pub(crate) fn darwin_soft_written(&mut self, m: &mut GuestMem<'_>, soft: &crate::SoftPages) {
         // The pages not entered that a copy reached: its fault entered them.
         let touched = std::mem::take(&mut *soft.touched.lock().unwrap_or_else(|e| e.into_inner()));
-        if !touched.is_empty() {
+        let copied = std::mem::take(&mut *soft.copied.lock().unwrap_or_else(|e| e.into_inner()));
+        if !touched.is_empty() || !copied.is_empty() {
             let mut mm = self.mem.lock();
             for p in touched {
                 mm.enter_page(p);
+            }
+            // A write's fault on a file's page copied it.
+            for p in copied {
+                mm.copied(p);
             }
             drop(mm);
             self.darwin_flush_perms(m);

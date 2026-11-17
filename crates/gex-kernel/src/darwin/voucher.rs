@@ -326,7 +326,9 @@ struct BankTask {
 /// billed to: its bill (`ba_bill`), whose CPU time the merchant's threads
 /// that adopt it credit (`bank_swap_thread_bank_ledger`, `thread_dispatch`)
 /// and which goes to the holder's and merchant's ledgers as the account
-/// goes. The bill's energy (CLPC's estimate) is not kept.
+/// goes. Its energy is 0 on this kernel: the only credit to the bank's
+/// energy entry is `recount_current_thread_energy_nj`'s delta, which
+/// T8011's kernel (no `RECOUNT_ENERGY`) never makes ([`super::rusage`]).
 #[derive(Debug)]
 struct BankAccount {
     refs: u32,
@@ -342,9 +344,6 @@ struct BankAccount {
     /// A thread's time could not be credited (the host has no per-thread
     /// clocks).
     bill_unkept: bool,
-    /// Credits have been made to it (its energy entry has CLPC's
-    /// estimates).
-    credited: bool,
     /// The threads that have it as their bank ledger (`t_bankledger`).
     adopters: Vec<i32>,
 }
@@ -1246,7 +1245,7 @@ impl Kernel {
         }
         let vt = self.vt();
         let h = vt.alloc_handle();
-        vt.bank.insert(h, BankElem::Account(BankAccount { refs: 1, made: 1, merchant, holder, secureoriginator: so, proximateprocess: pp, thread_group: tg, so_persona: persona, bill: 0, bill_unkept: false, credited: false, adopters: Vec::new() }));
+        vt.bank.insert(h, BankElem::Account(BankAccount { refs: 1, made: 1, merchant, holder, secureoriginator: so, proximateprocess: pp, thread_group: tg, so_persona: persona, bill: 0, bill_unkept: false, adopters: Vec::new() }));
         self.bank_task(holder).to_pay.push(h);
         self.bank_task(merchant).to_charge.push(h);
         for t in [holder, merchant, so, pp] {
@@ -1266,7 +1265,7 @@ impl Kernel {
         acc.refs -= 1;
         assert!(acc.refs == 0, "Releasing a non zero ref bank account");
         let (holder, merchant, so, pp) = (acc.holder, acc.merchant, acc.secureoriginator, acc.proximateprocess);
-        let (bill, unkept, credited) = (acc.bill, acc.bill_unkept, acc.credited);
+        let (bill, unkept) = (acc.bill, acc.bill_unkept);
         // bank_rollup_chit_to_tasks: the bill to the holder's ledger and the
         // merchant's, unless they are the same ledger (or both gone).
         let (hl, ml) = (self.bank_task(holder).ledger.clone(), self.bank_task(merchant).ledger.clone());
@@ -1281,7 +1280,6 @@ impl Kernel {
                 let Some(l) = l else { continue };
                 if me { l.to_me.fetch_add(bill, AcqRel) } else { l.to_others.fetch_add(bill, AcqRel) };
                 l.unkept.fetch_or(unkept, AcqRel);
-                l.credited.fetch_or(credited, AcqRel);
             }
         }
         self.bank_task(holder).to_pay.retain(|&a| a != h);
@@ -1339,7 +1337,6 @@ impl Kernel {
             t.bank_deduct = now;
         }
         let Some(BankElem::Account(a)) = ledger.and_then(|h| self.vt().bank.get_mut(&h)) else { return };
-        a.credited = true;
         match (now, deduct) {
             (Some(n), Some(d)) => a.bill = a.bill.wrapping_add(super::rusage::mach_of_ns(n.saturating_sub(d))),
             _ => a.bill_unkept = true,
@@ -1388,14 +1385,13 @@ impl Kernel {
         let Some((to_pay, to_charge)) = ctx else { return Bills::of_ledger(&own) };
         let mut b = Bills::of_ledger(&own);
         let bill = |k: &mut Kernel, h: u64| match k.vt().bank.get(&h) {
-            Some(BankElem::Account(a)) => Some((a.bill, a.bill_unkept, a.credited, a.adopters.clone())),
+            Some(BankElem::Account(a)) => Some((a.bill, a.bill_unkept, a.adopters.clone())),
             _ => None,
         };
         for (accounts, billed) in [(to_pay, true), (to_charge, false)] {
             for h in accounts {
-                let Some((v, unkept, credited, adopters)) = bill(self, h) else { continue };
+                let Some((v, unkept, adopters)) = bill(self, h) else { continue };
                 let running = adopters.iter().any(|&t| !matches!(self.procs.sched.state(t), Some(super::sched::RunState::Wait | super::sched::RunState::Unint)));
-                b.energy |= credited || !adopters.is_empty();
                 let total = if billed { &mut b.billed } else { &mut b.serviced };
                 *total = if unkept || running { None } else { total.map(|t| t.wrapping_add(v)) };
             }

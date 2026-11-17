@@ -13,6 +13,72 @@ pub fn install() {
     gex_kernel::set_host_remap(remap);
     #[cfg(target_os = "macos")]
     gex_kernel::set_host_hold(hold, unhold);
+    #[cfg(target_os = "macos")]
+    gex_kernel::set_host_map_shared(map_shared);
+    #[cfg(target_os = "macos")]
+    gex_kernel::set_host_msync(msync);
+    #[cfg(target_os = "macos")]
+    gex_kernel::set_host_purgeable(hold_purgeable, purge);
+}
+
+/// Fresh purgeable zero pages anywhere in the host's address space
+/// (`mach_vm_allocate` with VM_FLAGS_PURGABLE): nonvolatile, so the host
+/// never empties them on its own.
+#[cfg(target_os = "macos")]
+fn hold_purgeable(len: usize) -> Option<usize> {
+    const VM_FLAGS_ANYWHERE: libc::c_int = 1;
+    const VM_FLAGS_PURGABLE: libc::c_int = 2;
+    if len == 0 || len % page() != 0 {
+        return None;
+    }
+    let mut at = 0u64;
+    // SAFETY: the kernel picks a free range and maps it; nothing else is
+    // touched.
+    let kr = unsafe { mach_vm_allocate(mach_task_self_, &mut at, len as u64, VM_FLAGS_ANYWHERE | VM_FLAGS_PURGABLE) };
+    (kr == 0).then_some(at as usize)
+}
+
+/// [`hold_purgeable`]'s pages emptied: the host's object made empty, then
+/// nonvolatile again.
+#[cfg(target_os = "macos")]
+fn purge(at: usize, _len: usize) -> bool {
+    extern "C" {
+        fn mach_vm_purgable_control(target: libc::c_uint, address: u64, control: libc::c_int, state: *mut libc::c_int) -> libc::c_int;
+    }
+    const SET_STATE: libc::c_int = 0;
+    let (mut empty, mut nonvolatile) = (2, 0);
+    // SAFETY: `at` is a purgeable range `hold_purgeable` allocated.
+    unsafe { mach_vm_purgable_control(mach_task_self_, at as u64, SET_STATE, &mut empty) == 0 && mach_vm_purgable_control(mach_task_self_, at as u64, SET_STATE, &mut nonvolatile) == 0 }
+}
+
+/// A shared mapping of `fd` (open for writing) from `offset` over the
+/// guest's pages at `at`: the host's object for the file, which every other
+/// mapping of it and the host's reads and writes of it share, readable and
+/// writable as the guest's memory is. None lies wholly past the file's end
+/// (the caller maps only what the file holds).
+#[cfg(target_os = "macos")]
+fn map_shared(at: usize, len: usize, fd: i32, offset: u64) -> bool {
+    let page = page();
+    if at % page != 0 || len % page != 0 || len == 0 || offset % page as u64 != 0 {
+        return false;
+    }
+    let Ok(off) = libc::off_t::try_from(offset) else { return false };
+    // SAFETY: `at..at + len` is guest memory, mapped for the life of the
+    // process; the file's pages replace what the guest mapped there.
+    let p = unsafe { libc::mmap(at as *mut libc::c_void, len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_FIXED | libc::MAP_SHARED, fd, off) };
+    p as usize == at
+}
+
+/// `mach_vm_msync` of the host's mapping at `at`: the host's own
+/// `vm_map_msync`, of the same objects the guest's mapping names.
+#[cfg(target_os = "macos")]
+fn msync(at: usize, len: usize, flags: u32) -> bool {
+    extern "C" {
+        fn mach_vm_msync(target: libc::c_uint, address: u64, size: u64, flags: libc::c_uint) -> libc::c_int;
+    }
+    // SAFETY: the range is guest memory; msync only writes back or drops
+    // the pages of the objects mapped there.
+    unsafe { mach_vm_msync(mach_task_self_, at as u64, len as u64, flags) == 0 }
 }
 
 #[cfg(target_os = "macos")]

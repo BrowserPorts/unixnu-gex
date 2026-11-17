@@ -45,12 +45,42 @@ struct Inner {
     /// and the state it interrupted.
     paused: u32,
     resumes: State,
-    /// Its `runnable_timer`, in Mach time units: the time it has been
-    /// runnable (running, or ready to run), every stretch from its start or
-    /// a wakeup to its next block. The Mach time when the state last
-    /// changed.
+    /// Its `runnable_timer` (Mach time units): `all_bits`, what
+    /// `timer_grab` reads, and `tstamp`, where the timer last started or
+    /// was updated. The timer starts at a wakeup (`thread_unblock`), is
+    /// updated as the thread is dispatched (`thread_invoke`) and at each
+    /// quantum's end (`thread_quantum_expire`), and stops as it blocks
+    /// (`thread_dispatch`): what it holds never includes the stretch since
+    /// the last of those.
     runnable: u64,
-    last_abs: u64,
+    tstamp: u64,
+    /// When its current quantum began (its dispatch, or the last quantum's
+    /// end), and the quantum (`thread_quantum_init`'s, Mach time units),
+    /// 0 until the kernel sets one ([`ThreadCpu::set_quantum`]).
+    quantum_start: u64,
+    quantum: u64,
+    /// When the host's own work on it began ([`ThreadCpu::pause`]): no
+    /// time of the device's, so its timer and quantum skip it.
+    host_since: u64,
+}
+
+impl Inner {
+    /// The quantum ends that have passed by `now` while it ran
+    /// (`thread_quantum_expire`: `timer_update` of the runnable timer at
+    /// each, and a new quantum from there). The device runs nothing else
+    /// on its processor meanwhile in this model, so each quantum runs out.
+    fn expire(&mut self, now: u64) {
+        if self.quantum == 0 || !matches!(self.state, State::User | State::Kernel) {
+            return;
+        }
+        let n = now.saturating_sub(self.quantum_start) / self.quantum;
+        if n > 0 {
+            let end = self.quantum_start + n * self.quantum;
+            self.runnable += end.saturating_sub(self.tstamp);
+            self.tstamp = end;
+            self.quantum_start = end;
+        }
+    }
 }
 
 /// One guest thread's processor time.
@@ -94,12 +124,30 @@ impl ThreadCpu {
             State::Kernel => i.sys += now.saturating_sub(i.last),
             State::Blocked | State::Host | State::Ended => {}
         }
-        if matches!(i.state, State::User | State::Kernel) {
-            i.runnable += abs.saturating_sub(i.last_abs);
+        let running = |s: State| matches!(s, State::User | State::Kernel);
+        i.expire(abs);
+        match (i.state, next) {
+            // A wakeup (or the first run) and its dispatch: the timer
+            // starts, a quantum begins.
+            (State::Unstarted | State::Blocked, n) if running(n) => {
+                i.tstamp = abs;
+                i.quantum_start = abs;
+            }
+            // A block, or its end: the timer stops at its dispatch off.
+            (s, State::Blocked | State::Ended) if running(s) => {
+                i.runnable += abs.saturating_sub(i.tstamp);
+            }
+            // The host's work begins: its time is skipped.
+            (s, State::Host) if running(s) => i.host_since = abs,
+            (State::Host, n) if running(n) => {
+                let d = abs.saturating_sub(i.host_since);
+                i.tstamp += d;
+                i.quantum_start += d;
+            }
+            _ => {}
         }
         if i.state != State::Ended {
             i.last = now;
-            i.last_abs = abs;
             i.state = next;
         }
     }
@@ -177,18 +225,24 @@ impl ThreadCpu {
     }
 
     /// Its runnable time so far (`timer_grab(&thread->runnable_timer)`),
-    /// in Mach time units: a running thread's current stretch with it. The
-    /// host translating its code is no time of the device's, and its wait
-    /// in a blocked call is not runnable time. None without the host's
-    /// clocks.
+    /// in Mach time units: what the timer holds, the quantum ends passed
+    /// by now with it, never the stretch since the last of its updates.
+    /// The host translating its code is no time of the device's, and its
+    /// wait in a blocked call is not runnable time. None without the
+    /// host's clocks.
     pub fn runnable(&self) -> Option<u64> {
         crate::darwin::workq::host_clocks()?;
-        let i = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        let mut r = i.runnable;
-        if matches!(i.state, State::User | State::Kernel) {
-            r += crate::darwin::mach::absolute_time().saturating_sub(i.last_abs);
-        }
-        Some(r)
+        let mut i = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        i.expire(crate::darwin::mach::absolute_time());
+        Some(i.runnable)
+    }
+
+    /// The quantum its next quantum end comes after (`thread_quantum_init`,
+    /// Mach time units), the quantum ends so far taken at the old one.
+    pub fn set_quantum(&self, q: u64) {
+        let mut i = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        i.expire(crate::darwin::mach::absolute_time());
+        i.quantum = q;
     }
 
     /// Its time out of the kernel and in it so far, in nanoseconds: a

@@ -54,6 +54,9 @@ pub struct Public {
     pub live: Arc<super::kinfo::Live>,
     /// What `proc_pid_rusage` reads of it beyond the rest.
     pub rusage: Arc<super::rusage::Shared>,
+    /// Its map's entries, while it lives, for another task's operation on
+    /// its map (a file's change of size reaching its mappings).
+    pub vm: Option<Arc<crate::sync::Mutex<super::vm::Map>>>,
 }
 
 impl Public {
@@ -87,6 +90,7 @@ impl Public {
             p_name: Default::default(),
             live: Default::default(),
             rusage: super::rusage::Shared::new(0),
+            vm: None,
         }
     }
 }
@@ -325,11 +329,13 @@ impl Kernel {
             p_name: self.dtask.p_name,
             live: Arc::clone(&self.dtask.live),
             rusage: Arc::clone(&self.dtask.rusage),
+            vm: Some(self.dtask.vm.shared()),
         }
     }
 
     /// Publish this process's record for the others.
     pub fn darwin_publish(&mut self) {
+        self.dtask.rusage.meter.owner().set_pid(self.pid);
         self.darwin_live_sigmasks();
         self.darwin_live_realtimer();
         let r: Arc<dyn std::any::Any + Send + Sync> = Arc::new(self.darwin_public_now());

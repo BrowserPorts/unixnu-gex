@@ -185,7 +185,7 @@ pub(crate) mod vmf {
     /// `VM_FLAGS_USER_REMAP`.
     pub const USER_REMAP: u64 = ANYWHERE | RANDOM_ADDR | OVERWRITE | RETURN_DATA_ADDR | RESILIENT_CODESIGN | RESILIENT_MEDIA;
     /// What this kernel's VM does not do yet.
-    pub const UNDONE: u64 = PURGABLE | CHUNK_4GB | PERMANENT | TPRO;
+    pub const UNDONE: u64 = CHUNK_4GB | PERMANENT | TPRO;
 }
 
 /// `VM_PROT_*`.
@@ -370,8 +370,20 @@ impl Kernel {
                 if !self.darwin_name_is_task(w(0)) {
                     return Some(kr2::SEND_INVALID_DEST);
                 }
-                let Ok(state) = m.read_u32(a[3]) else { return Some(kr2::MEMORY_ERROR) };
-                self.vm_purgable_control(a[1], a[2] as u32 as u64, state as i32)
+                // mach_copyin's and mach_copyout's failure is their EFAULT.
+                const EFAULT: u64 = 14;
+                let Ok(state) = m.read_u32(a[3]) else { return Some(EFAULT) };
+                let control = a[2] as u32 as u64;
+                // mach_vm_purgable_control: not the kernel's control.
+                if control == purgable::SET_STATE_FROM_KERNEL {
+                    return Some(kr::INVALID_ARGUMENT);
+                }
+                let mut state = state as i32;
+                let rv = self.vm_purgable_control(m, a[1], control, &mut state);
+                if rv == kr::SUCCESS && m.write_u32(a[3], state as u32).is_err() {
+                    return Some(EFAULT);
+                }
+                rv
             }
             trap::TASK_DYLD_PROCESS_INFO_NOTIFY_GET => self.dyld_process_info_notify_get(m, a[0], a[1]),
             trap::MACH_PORT_ALLOCATE => {
@@ -962,6 +974,9 @@ impl Kernel {
     /// searches from `*addr` (`vm_map_locate_space`'s hint).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn darwin_vm_enter_anon_object(&mut self, m: &mut GuestMem<'_>, addr: &mut u64, size: u64, mask: u64, flags: u64, cur: u64, max: u64, inherit: u8) -> u64 {
+        if flags & vmf::PURGABLE != 0 && size != 0 {
+            return self.darwin_vm_enter_purgeable(m, addr, size, mask, flags, cur, max, inherit);
+        }
         use crate::mem::flags as mf;
         if size == 0 {
             *addr = 0;
@@ -1353,6 +1368,59 @@ impl Kernel {
         self.darwin_own_memory(|_, m| m.read(addr, size as usize).map(<[u8]>::to_vec))?.map_err(|_| Reply::err(KERN_INVALID_ADDRESS))
     }
 
+    /// `vm_map_copyin` of process `pid`'s map (another task's) at `addr`:
+    /// its memory map held while the range is checked as this task's is
+    /// and the bytes copied. A copy small enough for a kernel buffer
+    /// (`msg_ool_size_small`) is that map's `copyin`, whose faults enter
+    /// the pages it reads in that map's pmap; a page whose object has none
+    /// to give (a file's past its end) fails it. A larger copy is a copy on
+    /// write of the entries, which enters nothing.
+    pub(crate) fn darwin_vm_copyin_other(&mut self, pid: i32, addr: u64, size: u64) -> Result<Vec<u8>, super::kobject::Reply> {
+        use super::kobject::Reply;
+        const KERN_INVALID_ADDRESS: i32 = 1;
+        const KERN_PROTECTION_FAILURE: i32 = 2;
+        const MSG_OOL_SIZE_SMALL: u64 = 32 << 10;
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+        let end = addr.checked_add(size).ok_or_else(|| Reply::err(KERN_INVALID_ADDRESS))?;
+        let Ok(peer) = self.procs.vm(pid) else { return Err(Reply::err(KERN_INVALID_ADDRESS)) };
+        let mut out: Result<Vec<u8>, Reply> = Err(Reply::err(KERN_INVALID_ADDRESS));
+        peer.mem.with_guest(&mut |g| {
+            let mut mm = peer.mm.lock();
+            let (first, stop) = (addr & !PAGE_MASK, (end + PAGE_MASK) & !PAGE_MASK);
+            let mut at = first;
+            while at < stop {
+                let Some(v) = mm.vma_at(at) else {
+                    out = Err(Reply::err(KERN_INVALID_ADDRESS));
+                    return;
+                };
+                if v.prot & crate::mem::prot::READ == 0 {
+                    out = Err(Reply::err(KERN_PROTECTION_FAILURE));
+                    return;
+                }
+                at = v.end;
+            }
+            let small = size <= MSG_OOL_SIZE_SMALL;
+            if small && (first..stop).step_by((PAGE_MASK + 1) as usize).any(|p| mm.is_absent(p >> gex_abi::PERM_PAGE_SHIFT)) {
+                out = Err(Reply::err(KERN_INVALID_ADDRESS));
+                return;
+            }
+            out = g.kernel().read(addr, size as usize).map(<[u8]>::to_vec).map_err(|_| Reply::err(KERN_INVALID_ADDRESS));
+            if small {
+                let mut p = first;
+                while p < stop {
+                    mm.enter_page(p >> gex_abi::PERM_PAGE_SHIFT);
+                    p += PAGE_MASK + 1;
+                }
+                for (page, bytes) in mm.take_perm_writes() {
+                    let _ = g.kernel().write(gex_abi::PERM_TABLE64 + page, &bytes);
+                }
+            }
+        });
+        out
+    }
+
     /// A routine's `copyout` of `data` to this task's `dst`: the range must
     /// be mapped (KERN_INVALID_ADDRESS) and writable
     /// (KERN_PROTECTION_FAILURE); the pages it writes are entered.
@@ -1617,26 +1685,89 @@ impl Kernel {
         kr::SUCCESS
     }
 
-    /// `mach_vm_purgable_control` and `vm_map_purgable_control`: no memory
-    /// here is purgeable (`VM_FLAGS_PURGABLE` is reported as not done), so
-    /// a mapped address is `VM_PURGABLE_DENY`.
-    fn vm_purgable_control(&mut self, address: u64, control: u64, state: i32) -> u64 {
+    /// `vm_map_enter` of a purgeable anonymous object (VM_FLAGS_PURGABLE):
+    /// the range made as anonymous memory is, then the object made
+    /// nonvolatile and owned by this task, its pages the host's purgeable
+    /// memory over the range, and the entry's `use_pmap` off (the object's
+    /// own ledgers bill its pages).
+    #[allow(clippy::too_many_arguments)]
+    fn darwin_vm_enter_purgeable(&mut self, m: &mut GuestMem<'_>, addr: &mut u64, size: u64, mask: u64, flags: u64, cur: u64, max: u64, inherit: u8) -> u64 {
+        /// `ANON_MAX_SIZE` of a 16 KiB-page kernel.
+        const ANON_MAX_SIZE: u64 = 0xFFFF_FFFF << 14;
+        let Some(len) = size.checked_add(PAGE_MASK).map(|s| s & !PAGE_MASK).filter(|&l| l != 0) else { return kr::INVALID_ARGUMENT };
+        if len > ANON_MAX_SIZE {
+            return kr::INVALID_ARGUMENT;
+        }
+        let mut at = *addr;
+        let k = self.darwin_vm_enter_anon_object(m, &mut at, len, mask, flags & !vmf::PURGABLE, cur, max, inherit);
+        if k != kr::SUCCESS {
+            return k;
+        }
+        let k = self.darwin_purgeable_over(m, at, len);
+        if k == kr::SUCCESS {
+            *addr = at;
+        }
+        k
+    }
+
+    /// The anonymous memory just entered at `[at, at + len)` made a new
+    /// purgeable object, nonvolatile and owned by this task, its entry's
+    /// `use_pmap` off; on failure the range is gone again.
+    pub(crate) fn darwin_purgeable_over(&mut self, m: &mut GuestMem<'_>, at: u64, len: u64) -> u64 {
+        let obj = match self.darwin_owned_object(len, super::purgeable::Purg::nonvolatile()) {
+            Ok(o) => o,
+            Err(k) => {
+                let _ = self.darwin_vm_deallocate(m, at, len);
+                return k;
+            }
+        };
+        let hold = super::vmobject::with(obj, |o| o.hold.clone()).flatten();
+        if !hold.is_some_and(|h| m.remap_from(at, h.addr, len, false).unwrap_or(false)) {
+            let _ = self.darwin_vm_deallocate(m, at, len);
+            super::vmobject::release(obj);
+            self.darwin_unimplemented("a purgeable object's mapping on a host that cannot map its pages twice".into());
+            return kr::FAILURE;
+        }
+        self.dtask.vm.update(at, at + len, |a| {
+            a.obj = obj;
+            a.alt = true;
+        });
+        super::vmobject::release(obj);
+        self.mem.lock().set_unentered(at, at + len);
+        self.darwin_flush_perms(m);
+        kr::SUCCESS
+    }
+
+    /// `mach_vm_purgable_control` and `vm_map_purgable_control`: PURGE_ALL
+    /// empties every volatile object; else the object of the entry at the
+    /// address, which must allow writing (but to read the state) and be
+    /// purgeable.
+    pub(crate) fn vm_purgable_control(&mut self, m: &mut GuestMem<'_>, address: u64, control: u64, state: &mut i32) -> u64 {
         use purgable::*;
         if !matches!(control, SET_STATE | GET_STATE | PURGE_ALL | SET_STATE_FROM_KERNEL) {
             return kr::INVALID_ARGUMENT;
         }
         if control == PURGE_ALL {
+            self.darwin_purge_all();
             return kr::SUCCESS;
         }
-        if (control == SET_STATE || control == SET_STATE_FROM_KERNEL) && (state & !ALL_MASKS != 0 || (state & STATE_MASK) > STATE_MASK) {
+        if (control == SET_STATE || control == SET_STATE_FROM_KERNEL) && (*state & !ALL_MASKS != 0 || (*state & STATE_MASK) > STATE_MASK) {
             return kr::INVALID_ARGUMENT;
         }
-        let mm = self.mem.lock();
-        let Some(v) = mm.vma_at(address) else { return kr::INVALID_ADDRESS };
-        if v.prot & 2 == 0 && control != GET_STATE {
+        let address = address & !PAGE_MASK;
+        let Some(prot) = self.mem.lock().vma_at(address).map(|v| v.prot) else { return kr::INVALID_ADDRESS };
+        let Some(e) = self.dtask.vm.at_or_after(address).filter(|e| e.start <= address) else { return kr::INVALID_ADDRESS };
+        if e.attrs.kind == super::vm::kind::SUBMAP {
+            return kr::INVALID_ADDRESS;
+        }
+        if prot & 2 == 0 && control != GET_STATE {
             return kr2::PROTECTION_FAILURE;
         }
-        kr::INVALID_ARGUMENT
+        let purgeable = super::vmobject::with(e.attrs.obj, |o| o.purg.as_ref().is_some_and(|p| p.state != super::purgeable::state::DENY)).unwrap_or(false);
+        if !purgeable {
+            return kr::INVALID_ARGUMENT;
+        }
+        self.darwin_object_purgable_control(m, e.attrs.obj, control as u32, state)
     }
 
     /// Run canonical call `n` from inside a Darwin call.

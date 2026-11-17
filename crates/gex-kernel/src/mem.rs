@@ -465,6 +465,19 @@ pub struct Perms {
     /// [`Self::unentered`] with each run's mapping protection, as the
     /// calls' copies check it, made again after a change.
     unentered_view: Option<std::sync::Arc<Vec<(u64, u64, u8)>>>,
+    /// The pages mapped whose object has no page to give
+    /// ([`MemoryMap::set_absent`]): a file's past its end. Their bytes go
+    /// without every bit, and no copy reaches them: an access faults to
+    /// the kernel, which answers it as the pager does.
+    absent: std::collections::BTreeMap<u64, u64>,
+    /// The pages of a file's private mapping that are the file's still
+    /// (not written since), as runs: their bytes go without the write bit,
+    /// as the pmap enters such a page read-only until a write copies it
+    /// ([`MemoryMap::copied`]).
+    copy_pending: std::collections::BTreeMap<u64, u64>,
+    /// [`Self::copy_pending`] as the calls' copies check it, made again
+    /// after a change.
+    copy_view: Option<std::sync::Arc<Vec<(u64, u64)>>>,
 }
 
 impl Clone for Perms {
@@ -473,13 +486,15 @@ impl Clone for Perms {
     /// object withheld is that object's, in the memory it watches; what
     /// this pmap has not entered is its own (the child's pmap is a new one).
     fn clone(&self) -> Perms {
-        Perms { shown: self.shown.clone(), dirty: vec![(0, gex_abi::LIMIT64)], ..Perms::default() }
+        // What is absent is its object's: the child's mappings of the same
+        // objects lack the same pages.
+        Perms { shown: self.shown.clone(), dirty: vec![(0, gex_abi::LIMIT64)], absent: self.absent.clone(), copy_pending: self.copy_pending.clone(), ..Perms::default() }
     }
 }
 
 impl Default for Perms {
     fn default() -> Perms {
-        Perms { shown: Vec::new(), dirty: vec![(0, gex_abi::LIMIT64)], withheld: Default::default(), unentered: Default::default(), unentered_view: None }
+        Perms { shown: Vec::new(), dirty: vec![(0, gex_abi::LIMIT64)], withheld: Default::default(), unentered: Default::default(), unentered_view: None, absent: Default::default(), copy_pending: Default::default(), copy_view: None }
     }
 }
 
@@ -545,18 +560,34 @@ impl Perms {
             }
         }
         self.shown = now;
-        // What is no longer mapped is no page of the pmap's to enter.
-        if !self.unentered.is_empty() {
+        // What is no longer mapped is no page of the pmap's to enter, nor
+        // an object's page to be absent.
+        if !self.unentered.is_empty() || !self.absent.is_empty() {
             let mapped: Vec<(u64, u64)> = self.shown.iter().map(|&(s, e, _)| (s >> gex_abi::PERM_PAGE_SHIFT, (e + gex_abi::PERM_PAGE - 1) >> gex_abi::PERM_PAGE_SHIFT)).collect();
-            let runs: Vec<(u64, u64)> = self.unentered.iter().map(|(&a, &b)| (a, b)).collect();
+            let keep = |runs: &std::collections::BTreeMap<u64, u64>| {
+                let mut kept = std::collections::BTreeMap::new();
+                for (&a, &b) in runs {
+                    let i = mapped.partition_point(|&(_, me)| me <= a);
+                    for &(ms, me) in mapped[i..].iter().take_while(|&&(ms, _)| ms < b) {
+                        runs_add(&mut kept, a.max(ms), b.min(me));
+                    }
+                }
+                kept
+            };
+            self.unentered = keep(&self.unentered);
+            self.absent = keep(&self.absent);
+        }
+        if !self.copy_pending.is_empty() {
+            let mapped: Vec<(u64, u64)> = self.shown.iter().map(|&(s, e, _)| (s >> gex_abi::PERM_PAGE_SHIFT, (e + gex_abi::PERM_PAGE - 1) >> gex_abi::PERM_PAGE_SHIFT)).collect();
             let mut kept = std::collections::BTreeMap::new();
-            for (a, b) in runs {
+            for (&a, &b) in &self.copy_pending {
                 let i = mapped.partition_point(|&(_, me)| me <= a);
                 for &(ms, me) in mapped[i..].iter().take_while(|&&(ms, _)| ms < b) {
                     runs_add(&mut kept, a.max(ms), b.min(me));
                 }
             }
-            self.unentered = kept;
+            self.copy_pending = kept;
+            self.copy_view = None;
         }
         self.unentered_view = None;
     }
@@ -606,8 +637,9 @@ impl Perms {
                     .map(|i| {
                         let p = ps + i as u64;
                         if covered[i] == PERM_PAGE && p >= floor && p < PERM_TABLE_BYTES {
-                            let unentered = if runs_have(&self.unentered, p) { perm::READ | perm::WRITE | perm::EXEC } else { 0 };
-                            acc[i] & !self.withheld.get(&p).copied().unwrap_or(0) & !unentered
+                            let unentered = if runs_have(&self.unentered, p) || runs_have(&self.absent, p) { perm::READ | perm::WRITE | perm::EXEC } else { 0 };
+                            let pending = if runs_have(&self.copy_pending, p) { perm::WRITE } else { 0 };
+                            acc[i] & !self.withheld.get(&p).copied().unwrap_or(0) & !unentered & !pending
                         } else {
                             0
                         }
@@ -866,7 +898,13 @@ impl MemoryMap {
     /// map keeps none for a process with no table.
     pub fn set_unentered(&mut self, start: u64, end: u64) {
         if let Some(p) = &mut self.perms {
-            runs_add(&mut p.unentered, start >> gex_abi::PERM_PAGE_SHIFT, (end + gex_abi::PERM_PAGE - 1) >> gex_abi::PERM_PAGE_SHIFT);
+            let (a, b) = (start >> gex_abi::PERM_PAGE_SHIFT, (end + gex_abi::PERM_PAGE - 1) >> gex_abi::PERM_PAGE_SHIFT);
+            runs_add(&mut p.unentered, a, b);
+            // An absent page is none to enter.
+            let absent: Vec<(u64, u64)> = p.absent.range(..b).filter(|(_, &e)| e > a).map(|(&s, &e)| (s, e)).collect();
+            for (s, e) in absent {
+                runs_remove(&mut p.unentered, s, e);
+            }
             p.unentered_view = None;
             p.dirty.push((start, end));
         }
@@ -920,6 +958,87 @@ impl MemoryMap {
         let v = std::sync::Arc::new(out);
         p.unentered_view = Some(std::sync::Arc::clone(&v));
         v
+    }
+
+    /// The pages of `[start, end)` (page aligned) are mapped and their
+    /// object has none to give (a file's past its end): an access to one
+    /// faults to the kernel, a call's copy fails, and the pmap enters
+    /// nothing there. They are not waiting to be entered.
+    pub fn set_absent(&mut self, start: u64, end: u64) {
+        if let Some(p) = &mut self.perms {
+            // Only what is mapped: what is not is no object's.
+            let i = p.shown.partition_point(|&(_, e, _)| e <= start);
+            let mapped: Vec<(u64, u64)> = p.shown[i..].iter().take_while(|&&(s, _, _)| s < end).map(|&(s, e, _)| (s.max(start), e.min(end))).collect();
+            for (s, e) in mapped {
+                let (a, b) = (s >> gex_abi::PERM_PAGE_SHIFT, (e + gex_abi::PERM_PAGE - 1) >> gex_abi::PERM_PAGE_SHIFT);
+                runs_add(&mut p.absent, a, b);
+                if runs_remove(&mut p.unentered, a, b) {
+                    p.unentered_view = None;
+                }
+                p.dirty.push((s, e));
+            }
+        }
+    }
+
+    /// The pages of `[start, end)` are no longer absent (their object has
+    /// them again, or the mapping is gone): whether any was.
+    pub fn clear_absent(&mut self, start: u64, end: u64) -> bool {
+        let Some(p) = &mut self.perms else { return false };
+        let hit = runs_remove(&mut p.absent, start >> gex_abi::PERM_PAGE_SHIFT, (end + gex_abi::PERM_PAGE - 1) >> gex_abi::PERM_PAGE_SHIFT);
+        if hit {
+            p.dirty.push((start, end));
+        }
+        hit
+    }
+
+    /// The pages of `[start, end)` are a file's private mapping's still:
+    /// entered without write, so the first write faults to the kernel,
+    /// which copies the page (`vm_fault`'s copy-on-write).
+    pub fn set_copy_pending(&mut self, start: u64, end: u64) {
+        if let Some(p) = &mut self.perms {
+            runs_add(&mut p.copy_pending, start >> gex_abi::PERM_PAGE_SHIFT, (end + gex_abi::PERM_PAGE - 1) >> gex_abi::PERM_PAGE_SHIFT);
+            p.copy_view = None;
+            p.dirty.push((start, end));
+        }
+    }
+
+    /// Page `page` (by [`gex_abi::PERM_PAGE`]) written: the mapping's own
+    /// copy from now on. Whether it was the file's still.
+    pub fn copied(&mut self, page: u64) -> bool {
+        let Some(p) = &mut self.perms else { return false };
+        if !runs_remove(&mut p.copy_pending, page, page + 1) {
+            return false;
+        }
+        p.copy_view = None;
+        p.dirty.push((page << gex_abi::PERM_PAGE_SHIFT, (page + 1) << gex_abi::PERM_PAGE_SHIFT));
+        true
+    }
+
+    /// Whether page `page` is a private mapping's that is the file's still.
+    pub fn is_copy_pending(&self, page: u64) -> bool {
+        self.perms.as_ref().is_some_and(|p| runs_have(&p.copy_pending, page))
+    }
+
+    /// The runs of pages the file's still, `[first, end)` by page, for the
+    /// calls' copies (`crate::SoftPages`).
+    pub fn copy_pending_runs(&mut self) -> std::sync::Arc<Vec<(u64, u64)>> {
+        let Some(p) = &mut self.perms else { return Default::default() };
+        if let Some(v) = &p.copy_view {
+            return std::sync::Arc::clone(v);
+        }
+        let v = std::sync::Arc::new(p.copy_pending.iter().map(|(&a, &b)| (a, b)).collect::<Vec<_>>());
+        p.copy_view = Some(std::sync::Arc::clone(&v));
+        v
+    }
+
+    /// Whether page `page` (by [`gex_abi::PERM_PAGE`]) is absent.
+    pub fn is_absent(&self, page: u64) -> bool {
+        self.perms.as_ref().is_some_and(|p| runs_have(&p.absent, page))
+    }
+
+    /// The runs of absent pages, by address, `[start, end)`.
+    pub fn absent_ranges(&self) -> Vec<(u64, u64)> {
+        self.perms.as_ref().map_or_else(Vec::new, |p| p.absent.iter().map(|(&a, &b)| (a << gex_abi::PERM_PAGE_SHIFT, b << gex_abi::PERM_PAGE_SHIFT)).collect())
     }
 
     /// The runs of pages not entered, by address, `[start, end)`.

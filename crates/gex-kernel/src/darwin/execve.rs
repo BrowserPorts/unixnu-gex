@@ -702,6 +702,8 @@ impl Kernel {
         *self.dtask.rusage.bank.lock().unwrap_or_else(|e| e.into_inner()) = std::sync::Arc::default();
         let submaps = std::sync::Arc::clone(&self.dtask.rusage.meter.submaps);
         self.dtask.vm.set_submap_gauge(submaps);
+        let alt = std::sync::Arc::clone(&self.dtask.rusage.meter.alt);
+        self.dtask.vm.set_alt_gauge(alt);
         // task_bank_init, the image in place.
         self.darwin_task_bank_init();
         // The new task takes the old one's coalitions and roles (a spawn's

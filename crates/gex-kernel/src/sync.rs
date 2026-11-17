@@ -57,6 +57,9 @@ pub mod rank {
     pub const KERNEL: u8 = 1;
     pub const JIT: u8 = 2;
     pub const MM: u8 = 3;
+    /// A Darwin task's map entries (`darwin::vm::Entries`), taken after
+    /// its memory map's lock when both are held.
+    pub const ENTRIES: u8 = 4;
 }
 
 /// About to take a lock of rank `r`: in a debug build (or with
@@ -178,6 +181,12 @@ impl<T> Mutex<T> {
 
     pub fn into_inner(self) -> T {
         self.inner.into_inner().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl<T> std::fmt::Debug for Mutex<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Mutex")
     }
 }
 

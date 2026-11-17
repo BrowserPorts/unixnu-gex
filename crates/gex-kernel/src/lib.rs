@@ -124,6 +124,12 @@ pub struct SoftPages {
     pub unentered: std::sync::Arc<Vec<(u64, u64, u8)>>,
     /// The pages of them a checked copy read or wrote.
     pub touched: std::sync::Mutex<Vec<u64>>,
+    /// The runs of pages of a file's private mapping that are the file's
+    /// still, `[first, end)` by page, sorted: a copy's write to one is let
+    /// through, as its fault copies the page, and noted.
+    pub copying: std::sync::Arc<Vec<(u64, u64)>>,
+    /// The pages of them a checked copy wrote.
+    pub copied: std::sync::Mutex<Vec<u64>>,
 }
 
 impl SoftPages {
@@ -199,9 +205,24 @@ impl<'a> GuestMem<'a> {
                     soft.written.lock().unwrap_or_else(|e| e.into_inner()).push(p);
                     true
                 }
-                // A page not entered: the copy's fault enters it.
+                // A file's page a private mapping has not written: the
+                // copy's fault copies it.
+                Some(soft) if need == gex_abi::perm::WRITE && b & gex_abi::perm::MAPPED != 0 && b & gex_abi::perm::READ != 0 && {
+                    let i = soft.copying.partition_point(|&(s, _)| s <= p);
+                    i > 0 && p < soft.copying[i - 1].1
+                } => {
+                    soft.copied.lock().unwrap_or_else(|e| e.into_inner()).push(p);
+                    true
+                }
+                // A page not entered: the copy's fault enters it (and a
+                // write's copies it, where it is a file's a private
+                // mapping has not written).
                 Some(soft) if b & gex_abi::perm::MAPPED != 0 && soft.unentered_allows(p, need) => {
                     soft.touched.lock().unwrap_or_else(|e| e.into_inner()).push(p);
+                    let i = soft.copying.partition_point(|&(s, _)| s <= p);
+                    if need == gex_abi::perm::WRITE && i > 0 && p < soft.copying[i - 1].1 {
+                        soft.copied.lock().unwrap_or_else(|e| e.into_inner()).push(p);
+                    }
                     true
                 }
                 _ => false,
@@ -406,6 +427,25 @@ impl<'a> GuestMem<'a> {
         let r = self.range(addr, usize::try_from(len).map_err(|_| Errno::EFAULT)?)?;
         let Some(base) = self.host_base() else { return Ok(false) };
         Ok(HOST_MAP_FILE.get().is_some_and(|f| f(base + r.start, r.len(), fd, offset)))
+    }
+
+    /// Map `len` bytes of the host file `fd` (open for writing) from
+    /// `offset` over the guest's pages at `addr`, shared
+    /// ([`set_host_map_shared`]): the pages are the file's own, a store to
+    /// them the file's at once; whether the host did.
+    pub fn map_file_shared(&mut self, addr: u64, len: u64, fd: i32, offset: u64) -> Result<bool, Errno> {
+        let r = self.range(addr, usize::try_from(len).map_err(|_| Errno::EFAULT)?)?;
+        let Some(base) = self.host_base() else { return Ok(false) };
+        Ok(HOST_MAP_SHARED.get().is_some_and(|f| f(base + r.start, r.len(), fd, offset)))
+    }
+
+    /// `vm_map_msync` of the host's mapping of `len` bytes at `addr` with
+    /// `vm_sync_t` flags `flags` ([`set_host_msync`]); whether the host
+    /// did.
+    pub fn host_msync(&mut self, addr: u64, len: u64, flags: u32) -> Result<bool, Errno> {
+        let r = self.range(addr, usize::try_from(len).map_err(|_| Errno::EFAULT)?)?;
+        let Some(base) = self.host_base() else { return Ok(false) };
+        Ok(HOST_MSYNC.get().is_some_and(|f| f(base + r.start, r.len(), flags)))
     }
 
     /// The host address of `len` bytes of guest memory at `addr`; `None`
@@ -656,6 +696,34 @@ pub fn host_unhold(addr: usize, len: usize) {
     }
 }
 
+static HOST_PURGEABLE: std::sync::OnceLock<(fn(usize) -> Option<usize>, fn(usize, usize) -> bool)> = std::sync::OnceLock::new();
+
+/// Install the host's purgeable memory apart from any task's: `hold(len)`
+/// gives `len` bytes of fresh zero pages that are the host's purgeable
+/// memory (given back with [`set_host_hold`]'s `unhold`), never emptied by
+/// the host on its own; `purge(addr, len)` empties them, every mapping of
+/// them seeing fresh zero pages after, true when it did.
+pub fn set_host_purgeable(hold: fn(usize) -> Option<usize>, purge: fn(usize, usize) -> bool) {
+    let _ = HOST_PURGEABLE.set((hold, purge));
+}
+
+/// [`set_host_purgeable`]'s `hold`; none on a host without it.
+pub fn host_hold_purgeable(len: usize) -> Option<usize> {
+    HOST_PURGEABLE.get().and_then(|(hold, _)| hold(len))
+}
+
+/// [`set_host_purgeable`]'s `purge`.
+pub fn host_purge(addr: usize, len: usize) -> bool {
+    HOST_PURGEABLE.get().is_some_and(|(_, purge)| purge(addr, len))
+}
+
+/// The state of each `page`-byte page of `len` bytes at host address
+/// `addr` (memory the host holds, [`set_host_hold`]) into `out`, as
+/// [`GuestMem::page_states`] gives a guest memory's.
+pub fn host_page_states(addr: usize, len: usize, page: usize, out: &mut [u8]) -> bool {
+    HOST_PAGES.get().is_some_and(|f| f(addr, len, page, out))
+}
+
 /// Whether the host can map its pages twice ([`set_host_remap`]).
 pub fn host_can_remap() -> bool {
     HOST_REMAP.get().is_some()
@@ -668,6 +736,32 @@ pub fn host_remap(dst: usize, src: usize, len: usize, copy: bool) -> bool {
 }
 
 static HOST_MAP_FILE: std::sync::OnceLock<fn(usize, usize, i32, u64) -> bool> = std::sync::OnceLock::new();
+
+static HOST_MAP_SHARED: std::sync::OnceLock<fn(usize, usize, i32, u64) -> bool> = std::sync::OnceLock::new();
+
+/// Install the host's shared file mapping over guest pages:
+/// `f(host_address, len, fd, offset)` maps the file's own pages there,
+/// readable and writable (`fd` is open for writing): the host's object for
+/// the file, which its reads and writes of the file go through too; true
+/// when it did. A host that has none (the browser's) installs none, and a
+/// guest's shared mapping of a file there is not the file's pages.
+pub fn set_host_map_shared(f: fn(usize, usize, i32, u64) -> bool) {
+    let _ = HOST_MAP_SHARED.set(f);
+}
+
+/// Whether the host can map a file's own pages ([`set_host_map_shared`]).
+pub fn host_can_map_shared() -> bool {
+    HOST_MAP_SHARED.get().is_some()
+}
+
+static HOST_MSYNC: std::sync::OnceLock<fn(usize, usize, u32) -> bool> = std::sync::OnceLock::new();
+
+/// Install the host's `vm_map_msync` of its own mappings:
+/// `f(host_address, len, vm_sync_flags)`, true when it was made. The host
+/// whose file mappings these are is the one that writes their pages back.
+pub fn set_host_msync(f: fn(usize, usize, u32) -> bool) {
+    let _ = HOST_MSYNC.set(f);
+}
 
 /// Install the host's private file mapping over guest pages:
 /// `f(host_address, len, fd, offset)`, true when it mapped them.

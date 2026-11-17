@@ -268,38 +268,34 @@ fn add_pcie(t: &mut Vec<Node>, io: u32) -> Option<u32> {
     props.push(key("IOUserClientClass", sym("AppleEmbeddedPCIEUserClient")));
     props.push(key(&format!("IOFunctionParent{:08X}", 0xa5), Prop::Data(Vec::new())));
     let rc = push(t, service(T8011_PCIE, T8011_PCIE, Some(apcie), props, Table::Lacks(vec![("what AppleEmbeddedPCIE::configure sets", "not followed")])));
-    // apcie as the bridge configured it.
+    // apcie as the host bridge's configuration left it: three address
+    // cells and two size cells (as its device tree entry has them), and
+    // configured (`bridgeConstructDeviceTree`).
     t[apcie as usize].service_props.push(key("IOPCIConfigured", Prop::Bool(true)));
     // Each root port's entry gains its port object (`_buildPortProperties`,
     // 0xfffffff00661858c), which serializes as its class's note.
-    let port_object = || key("AppleEmbeddedPCIEPort", string("AppleT8011PCIePort is not serializable"));
     for name in ["pci-bridge0", "pci-bridge2"] {
         if let Some(e) = super::platform::child(t, apcie, name, &[]) {
             t[e as usize].service_props.push(port_object());
         }
     }
-    // The root port's nub: as a bridge (class 0x0604, header type 1) it
-    // takes the generic name and the bridge's DriverKit entitlements,
-    // three address cells and two size cells, and is configured; attached
-    // to the host bridge, its port gives it its interrupt
+    // The root port's nub, then (its secondary bus's dtBridge) three
+    // address cells, two size cells and configured; published, its port
+    // gives it its interrupt when it attaches to the host bridge
     // (0xfffffff006627154: "apcie-0", the provider's name and the port).
-    let port = add_pci_nub(t, bridge0, rc, apcie, "0");
+    let f = pci_facts();
+    let port = add_pci_nub(t, bridge0, rc, apcie, "0", &f.root_port, &format!("0:0:0(1:{})", f.root_port_subordinate));
     let p = &mut t[port as usize];
-    p.service_props.push(port_object());
     for (k, v) in [
-        ("IOName", sym("pci-bridge")),
-        ("IOServiceDEXTEntitlements", Prop::Array(vec![Prop::Strs(vec!["com.apple.developer.driverkit.transport.pci".to_string(), "com.apple.developer.driverkit.transport.pci.bridge".to_string()])])),
         ("#address-cells", Prop::Data(3u32.to_le_bytes().to_vec())),
         ("#size-cells", Prop::Data(2u32.to_le_bytes().to_vec())),
         ("IOPCIConfigured", Prop::Bool(true)),
-        ("IOInterruptControllers", Prop::Array(vec![sym("apcie-0")])),
-        ("IOInterruptSpecifiers", Prop::Array(vec![Prop::Data(vec![0; 8])])),
     ] {
-        p.service_props.push(key(k, v));
+        set(&mut p.service_props, k, v);
     }
-    if let Table::Lacks(l) = &mut p.table {
-        l.retain(|(k, _)| !matches!(*k, "IOName" | "IOServiceDEXTEntitlements" | "IOPCIConfigured" | "IOInterruptControllers" | "IOInterruptSpecifiers" | "class-code"));
-        l.push(("class-code", "the device's configuration space"));
+    publish_nub(p, &f.root_port);
+    for (k, v) in [("IOInterruptControllers", Prop::Array(vec![sym("apcie-0")])), ("IOInterruptSpecifiers", Prop::Array(vec![Prop::Data(vec![0; 8])])), ("IOPCIResourced", Prop::Bool(true))] {
+        set(&mut p.service_props, k, v);
     }
     // The personality "ApplePCIEHostBridge", by bundle AppleT8011PCIe:
     // matched by the nub's compatible; its probe keeps the score
@@ -307,10 +303,13 @@ fn add_pcie(t: &mut Vec<Node>, io: u32) -> Option<u32> {
     let mut props = driver("com.apple.driver.AppleT8011PCIe", HOST_BRIDGE, PCI_DEVICE, Some("apcie-bridge"), "IODefaultMatchCategory", 5000, vec![key("IONameMatch", string("apcie-bridge"))]);
     props.push(key("IOPCIPowerOnProbe", Prop::Bool(true)));
     let host = push(t, service("IOPP", HOST_BRIDGE, Some(port), props, Table::Complete));
-    let nvme = add_pci_nub(t, s3e, host, port, "0");
-    t[nvme as usize].service_props.push(key("IOServiceDEXTEntitlements", Prop::Array(vec![Prop::Strs(vec!["com.apple.developer.driverkit.transport.pci".to_string()])])));
-    if let Table::Lacks(l) = &mut t[nvme as usize].table {
-        l.retain(|(k, _)| *k != "IOServiceDEXTEntitlements");
+    let nvme = add_pci_nub(t, s3e, host, port, "0", &f.nvme, "1:0:0");
+    let n = &mut t[nvme as usize];
+    publish_nub(n, &f.nvme);
+    set(&mut n.service_props, "IOPCIResourced", Prop::Bool(true));
+    if let Table::Lacks(l) = &mut n.table {
+        l.push(("IOInterruptControllers", "the MSI vectors the controller's driver allocates (ApplePCIEMSIController)"));
+        l.push(("IOInterruptSpecifiers", "the MSI vectors the controller's driver allocates (ApplePCIEMSIController)"));
     }
     // The personality "AppleEmbeddedNVMeController" (IONVMeFamily), and
     // what its start sets of the controller's own: its panic action, its
@@ -350,37 +349,182 @@ fn add_pcie(t: &mut Vec<Node>, io: u32) -> Option<u32> {
     Some(push(t, service(CONTROLLER, CONTROLLER, Some(nvme), props, Table::Lacks(lacks))))
 }
 
-/// The `IOPCIDevice` a bridge publishes for device tree entry `entry`: the
-/// entry's properties copied, named after it, at `location`, below
-/// `bridge` in the `IOService` plane and below `dt_parent` in the
-/// `IODeviceTree` plane. What IOPCIFamily adds from the device's
-/// configuration space is not modelled.
-fn add_pci_nub(t: &mut Vec<Node>, entry: u32, bridge: u32, dt_parent: u32, location: &str) -> u32 {
+/// A root port's entry's port object (`_buildPortProperties`), which
+/// serializes as its class's note (`OSObject::serialize`).
+fn port_object() -> (String, Prop) {
+    key("AppleEmbeddedPCIEPort", string("AppleT8011PCIePort is not serializable"))
+}
+
+/// `setProperty`: a key's value replaced where it is, else the pair
+/// appended.
+fn set(props: &mut Vec<(String, Prop)>, k: &str, v: Prop) {
+    match props.iter_mut().find(|(o, _)| o == k) {
+        Some(slot) => slot.1 = v,
+        None => props.push(key(k, v)),
+    }
+}
+
+/// What IOPCIFamily reads of a PCI function's configuration space and
+/// publishes (`constructProperties`, `checkProperties`): its IDs and
+/// revision, the dword at 0x2c (a function's subsystem IDs; a bridge's
+/// prefetchable base's upper half), and its PCI Express capability's
+/// capabilities, link capabilities and link status registers. The class
+/// code is not here: each function's is known ([`ROOT_PORT_CLASS`],
+/// [`NVME_CLASS`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PciFunction {
+    pub vendor: u16,
+    pub device: u16,
+    pub revision: u8,
+    pub dword_2c: u32,
+    pub express_caps: u16,
+    pub link_caps: u32,
+    pub link_status: u16,
+}
+
+/// The configuration space of the root port and of the NAND's controller,
+/// and the subordinate bus number IOPCIFamily gave the root port.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PciFacts {
+    pub root_port: PciFunction,
+    pub nvme: PciFunction,
+    pub root_port_subordinate: u8,
+}
+
+/// The device's, once measured (with the measurement cited).
+pub const PCI_DEVICE_FACTS: Option<PciFacts> = None;
+
+/// What measures [`PCI_DEVICE_FACTS`].
+pub const PCI_MEASUREMENT: &str = "the vendor-id, device-id, revision-id, subsystem-vendor-id, subsystem-id, pcidebug, IOPCIExpressCapabilities, IOPCIExpressLinkCapabilities and IOPCIExpressLinkStatus of the IOPCIDevice entries pci-bridge0 and s3e (a sysdiagnose's ioreg IOService plane)";
+
+/// A root port's class code: a PCI-to-PCI bridge (base class 06h,
+/// subclass 04h, interface 00h), which the PCI Express Base Specification
+/// requires of every Root Port's Type 1 header.
+pub const ROOT_PORT_CLASS: u32 = 0x06_04_00;
+
+/// The NAND controller's class code: the one its driver's personality
+/// matched (`IOPCIClassMatch` "0x01800200&0xffffff00", the class register
+/// under the mask: base class 01h, subclass 80h, interface 02h).
+pub const NVME_CLASS: u32 = 0x01_80_02;
+
+/// What stands in for [`PCI_DEVICE_FACTS`] while it is unset. The
+/// controller's IDs are the ones its driver's `IOPCIMatch` names
+/// (0x2002106b: vendor 0x106b, device 0x2002), which it may instead match
+/// on the subsystem IDs; it has none here. The root port's IDs and
+/// revision, and both revisions, are zero. Both PCI Express capabilities
+/// are version 2 (as every device of the 2.0 specification on has), the
+/// root port's of type 4 (Root Port) with no slot, the controller's of
+/// type 0 (Endpoint); both links up at 8 GT/s (the root port's device tree
+/// `maximum-link-speed`, 3) and one lane wide. The root port's prefetchable
+/// window is below 4 GiB, and its subordinate bus its secondary. A
+/// reported shortcut (`unmeasured`), not the device's.
+pub const STAND_IN_PCI: PciFacts = PciFacts {
+    root_port: PciFunction { vendor: 0, device: 0, revision: 0, dword_2c: 0, express_caps: 0x0042, link_caps: 0x13, link_status: 0x13 },
+    nvme: PciFunction { vendor: 0x106b, device: 0x2002, revision: 0, dword_2c: 0, express_caps: 0x0002, link_caps: 0x13, link_status: 0x13 },
+    root_port_subordinate: 1,
+};
+
+/// The PCI facts in force: the device's, or the stand-in.
+pub fn pci_facts() -> PciFacts {
+    PCI_DEVICE_FACTS.unwrap_or(STAND_IN_PCI)
+}
+
+/// The facts here still unset, as lines for gexc's report at start.
+pub fn unmeasured() -> Vec<String> {
+    let mut gaps = Vec::new();
+    if PCI_DEVICE_FACTS.is_none() {
+        gaps.push(format!("the PCIe functions' configuration space (stand-in: the NAND controller 106b:2002, the root port 0:0, revisions 0, no subsystem IDs, PCIe capability version 2, links at 8 GT/s x1, root port subordinate bus 1; measure {PCI_MEASUREMENT})"));
+    }
+    gaps
+}
+
+/// The `IOPCIDevice` a bridge publishes for device tree entry `entry`
+/// (`bridgeConstructDeviceTree`, 0xfffffff0064d9540): initialized with a
+/// copy of the entry's table, attached below `dt_parent` in the
+/// `IODeviceTree` plane and named after the entry; it keeps the entry as
+/// IOPCIDeviceDeviceTreeEntry (an IOService, which serializes as its
+/// class's note), then takes each key of `constructProperties` it lacks
+/// (and pcidebug, reg, assigned-addresses and ranges always): pcidebug
+/// (`"%u:%u:%u"` of its bus, device and function, and a bridge's
+/// `"(%u:%u)"` secondary and subordinate buses), reg, assigned-addresses,
+/// ranges, its IDs, revision and class code as 32-bit data, its subsystem
+/// IDs if the dword at 0x2c is nonzero, compatible (the subsystem's
+/// `"pci%x,%x"` if they differ from the IDs, the IDs', `"pciclass,%06x"`
+/// and the entry's name), IOName (the class's generic name, else the IDs'
+/// compatible name) and name, and IOPCIExpressLinkCapabilities. Its
+/// location in the service plane is `"%X"` of its device number
+/// (`publishNub`).
+fn add_pci_nub(t: &mut Vec<Node>, entry: u32, bridge: u32, dt_parent: u32, location: &str, f: &PciFunction, pcidebug: &str) -> u32 {
     let e = &t[entry as usize];
+    let class = if e.name == "s3e" { NVME_CLASS } else { ROOT_PORT_CLASS };
     let mut n = service(&e.name, PCI_DEVICE, Some(bridge), Vec::new(), Table::Lacks(vec![
-        ("vendor-id", "the device's configuration space"),
-        ("device-id", "the device's configuration space"),
-        ("revision-id", "the device's configuration space"),
-        ("class-code", "the device's configuration space"),
-        ("subsystem-vendor-id", "the device's configuration space"),
-        ("subsystem-id", "the device's configuration space"),
-        ("assigned-addresses", "the bridge's resource allocation"),
-        ("pcidebug", "the bus numbers the bridge assigned"),
-        ("IOName", "IOPCIFamily's name of the device's class or IDs"),
-        ("compatible", "IOPCIFamily's names of the device's IDs"),
-        ("IOPCIExpressLinkCapabilities", "the device's configuration space"),
-        ("IOPCIExpressLinkStatus", "the device's configuration space"),
-        ("IOPCIExpressCapabilities", "the device's configuration space"),
-        ("IOPCIDeviceDeviceTreeEntry", "the device tree entry, an object"),
-        ("IOServiceDEXTEntitlements", "not modelled"),
-        ("IOInterruptControllers", "the port's interrupt controller"),
-        ("IOInterruptSpecifiers", "the port's interrupt"),
-        ("IOPCIResourced", "set once its driver asks for resources"),
-        ("IOPCIConfigured", "not modelled"),
+        ("reg", "the functions' BAR sizes, the device's"),
+        ("assigned-addresses", "the BARs' addresses, the bridge's allocation over the device's sizes"),
+        ("ranges", "the bridge windows, the configurator's allocation over the device's sizes"),
+        ("IODeviceMemory", "the BARs' ranges, from the allocation"),
+        ("IOMapperID", "what the DART mapper and the platform's IOPCIDeviceChanged handler set, not followed"),
     ]));
     n.props = e.props.clone();
+    // The entry's own table: what was set on it before (a root port's
+    // port object), after its device tree properties.
+    n.service_props = e.service_props.clone();
     n.dt = Some(DtLink { parent: dt_parent, name: e.name.clone(), location: location.to_string() });
+    let data32 = |v: u32| Prop::Data(v.to_le_bytes().to_vec());
+    let has = |k: &str| e.props.iter().any(|(pk, _)| pk == k && pk != super::iokit::DT_UNIT_KEY) || e.service_props.iter().any(|(pk, _)| pk == k);
+    let mut add: Vec<(String, Prop)> = vec![key("pcidebug", Prop::Str(pcidebug.to_string()))];
+    add.push(key("vendor-id", data32(u32::from(f.vendor))));
+    add.push(key("device-id", data32(u32::from(f.device))));
+    add.push(key("revision-id", data32(u32::from(f.revision))));
+    add.push(key("class-code", data32(class)));
+    let (sv, sp) = (f.dword_2c & 0xffff, f.dword_2c >> 16);
+    if f.dword_2c != 0 {
+        add.push(key("subsystem-vendor-id", data32(sv)));
+        add.push(key("subsystem-id", data32(sp)));
+    }
+    // snprintf into sizeof("pcivvvv,pppp") and sizeof("pciclass,cccccc").
+    let clip = |s: String, n: usize| s.chars().take(n - 1).collect::<String>();
+    let mut compat: Vec<String> = Vec::new();
+    if (sv != 0 || sp != 0) && (sv != u32::from(f.vendor) || sp != u32::from(f.device)) {
+        compat.push(clip(format!("pci{sv:x},{sp:x}"), 13));
+    }
+    let ids = clip(format!("pci{:x},{:x}", f.vendor, f.device), 13);
+    compat.push(ids.clone());
+    compat.push(clip(format!("pciclass,{class:06x}"), 16));
+    compat.push(e.name.chars().take(30).collect());
+    let generic = [("display", 0xff_ffff, 0x00_0100), ("scsi", 0xff_ff00, 0x01_0000), ("ethernet", 0xff_ff00, 0x02_0000), ("display", 0xff_0000, 0x03_0000), ("pci-bridge", 0xff_ff00, 0x06_0400)].iter().find(|g| class & g.1 == g.2).map(|g| g.0.to_string());
+    let name = generic.unwrap_or(ids);
+    let mut cb = Vec::new();
+    for c in &compat {
+        cb.extend_from_slice(c.as_bytes());
+        cb.push(0);
+    }
+    add.push(key("compatible", Prop::Data(cb)));
+    add.push(key("IOName", Prop::Sym(name.clone())));
+    add.push(key("name", Prop::Data([name.as_bytes(), b"\0"].concat())));
+    add.push(key("IOPCIExpressLinkCapabilities", Prop::Num(u64::from(f.link_caps), 32)));
+    n.service_props.push(key("IOPCIDeviceDeviceTreeEntry", string("IOService is not serializable")));
+    for (k, v) in add {
+        if k == "pcidebug" || !has(&k) {
+            n.service_props.push((k, v));
+        }
+    }
     push(t, n)
+}
+
+/// What `publishNub` and `checkProperties` add to a PCI nub: its DriverKit
+/// entitlements (a function's transport, and a bridge's too), then its PCI
+/// Express capabilities, link status and link capabilities as 32-bit
+/// numbers (the last replacing `constructProperties`'), and a slot's
+/// status and capabilities when it has one (none here).
+fn publish_nub(n: &mut Node, f: &PciFunction) {
+    let mut ents = vec!["com.apple.developer.driverkit.transport.pci".to_string()];
+    if n.service_props.iter().any(|(k, v)| k == "class-code" && *v == Prop::Data(ROOT_PORT_CLASS.to_le_bytes().to_vec())) {
+        ents.push("com.apple.developer.driverkit.transport.pci.bridge".to_string());
+    }
+    set(&mut n.service_props, "IOServiceDEXTEntitlements", Prop::Array(vec![Prop::Strs(ents)]));
+    set(&mut n.service_props, "IOPCIExpressCapabilities", Prop::Num(u64::from(f.express_caps), 32));
+    set(&mut n.service_props, "IOPCIExpressLinkStatus", Prop::Num(u64::from(f.link_status), 32));
+    set(&mut n.service_props, "IOPCIExpressLinkCapabilities", Prop::Num(u64::from(f.link_caps), 32));
 }
 
 /// The storage below the controller (its entry, if the PCIe path is
@@ -573,9 +717,31 @@ pub fn property_override(t: &[Node], i: u32, name: &str) -> Option<String> {
 }
 
 /// The configuration register at `reg` (a dword's offset) of the PCI nub
-/// `i`, as IOPCIFamily saved it (`savedConfig`), which is not modelled.
+/// `i`, as IOPCIFamily saved it (`savedConfig`) and `checkProperties`
+/// rewrote it from the nub's properties: the IDs, the class code and
+/// revision, and the subsystem IDs when both are nonzero (else the dword
+/// read at 0x2c).
 pub fn pci_config(t: &[Node], i: u32, reg: u8) -> Result<u32, String> {
-    Err(format!("the configuration register {reg:#04x} of {}", t[i as usize].name))
+    let n = &t[i as usize];
+    let f = pci_facts();
+    let func = match n.name.as_str() {
+        "s3e" => f.nvme,
+        "pci-bridge0" => f.root_port,
+        _ => return Err(format!("the configuration space of {}", n.name)),
+    };
+    let word = |k: &str| match super::iokit::service_prop(n, k) {
+        Some(Prop::Data(d)) if d.len() >= 4 => u32::from_le_bytes(d[..4].try_into().unwrap()),
+        _ => 0,
+    };
+    Ok(match reg {
+        0x00 => word("device-id") << 16 | word("vendor-id"),
+        0x08 => word("class-code") << 8 | word("revision-id"),
+        0x2c => {
+            let (sv, sp) = (word("subsystem-vendor-id"), word("subsystem-id"));
+            if sv != 0 && sp != 0 { sp << 16 | sv } else { func.dword_2c }
+        }
+        _ => return Err(format!("the configuration register {reg:#04x} of {}", n.name)),
+    })
 }
 
 /// `IORegistryEntry::getLocation`: what the drivers gave their objects
@@ -613,3 +779,4 @@ pub fn live_prop(t: &[Node], i: u32, name: &str) -> Option<Prop> {
     let level = super::dkopen::media_opens(m)?.level;
     Some(Prop::Bool(level != super::dkopen::access::NONE))
 }
+

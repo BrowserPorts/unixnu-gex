@@ -1569,6 +1569,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_pci_nubs_publish_their_configuration() {
+        let mut b = Vec::new();
+        node(&mut b, "device-tree", &[("compatible", b"J120AP\0iPad7,1\0AppleARM\0")], 1);
+        node(&mut b, "arm-io", &[("compatible", b"arm-io,t8011\0")], 1);
+        node(&mut b, "apcie", &[("compatible", b"apcie,t8011\0"), ("#address-cells", &3u32.to_le_bytes())], 1);
+        node(&mut b, "pci-bridge0", &[("compatible", b"apcie-bridge\0"), ("AAPL,unit-string", b"00000000"), ("#address-cells", &1u32.to_le_bytes()), ("#size-cells", &0u32.to_le_bytes())], 1);
+        node(&mut b, "s3e", &[("AAPL,unit-string", b"00000000"), ("reg", &0x10u32.to_le_bytes())], 0);
+        let mut t = parse(&b).unwrap();
+        let io = super::super::platform::add(&mut t).unwrap();
+        super::super::storagestack::add(&mut t, Some(io));
+        add_root(&mut t);
+        let nub = |name: &str| t.iter().position(|n| n.name == name && n.class == super::super::storagestack::PCI_DEVICE).unwrap() as u32;
+        let (port, s3e) = (nub("pci-bridge0"), nub("s3e"));
+        // A device tree entry's unit string is its location, not a property.
+        assert_eq!(location(&t[3]).as_deref(), Some("00000000"));
+        assert!(properties(&t, 3).iter().all(|(k, _)| k != DT_UNIT_KEY));
+        assert_eq!(lookup(&t, s3e, DT_UNIT_KEY), Ok(None));
+        let p = |i: u32, k: &str| properties(&t, i).into_iter().find(|(pk, _)| pk == k).map(|(_, v)| v);
+        // The root port keeps its device tree compatible and name; its
+        // IOName is its class's; its cells are the bridge's.
+        assert_eq!(p(port, "compatible"), Some(Prop::Data(b"apcie-bridge\0".to_vec())));
+        assert_eq!(p(port, "IOName"), Some(Prop::Sym("pci-bridge".to_string())));
+        assert_eq!(p(port, "#address-cells"), Some(Prop::Data(3u32.to_le_bytes().to_vec())));
+        assert_eq!(p(port, "class-code"), Some(Prop::Data(0x060400u32.to_le_bytes().to_vec())));
+        assert!(matches!(p(port, "IOServiceDEXTEntitlements"), Some(Prop::Array(a)) if a == vec![Prop::Strs(vec!["com.apple.developer.driverkit.transport.pci".to_string(), "com.apple.developer.driverkit.transport.pci.bridge".to_string()])]));
+        // The controller's compatible and IOName are its IDs'.
+        let f = super::super::storagestack::pci_facts().nvme;
+        let ids = format!("pci{:x},{:x}", f.vendor, f.device);
+        assert_eq!(p(s3e, "compatible"), Some(Prop::Data(format!("{ids}\0pciclass,018002\0s3e\0").into_bytes())));
+        assert_eq!(p(s3e, "IOName"), Some(Prop::Sym(ids)));
+        assert_eq!(p(s3e, "pcidebug"), Some(Prop::Str("1:0:0".to_string())));
+        assert_eq!(super::super::storagestack::pci_config(&t, s3e, 0x08), Ok(0x0180_0200));
+        // The DT plane keeps the configured flag on apcie.
+        assert_eq!(p(2, "IOPCIConfigured"), Some(Prop::Bool(true)));
+    }
+
     /// device-tree { chosen { memory-map }, arm-io }, under the root.
     fn small_tree() -> Vec<Node> {
         let mut b = Vec::new();

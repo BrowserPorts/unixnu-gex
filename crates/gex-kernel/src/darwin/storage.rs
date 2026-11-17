@@ -393,6 +393,7 @@ pub fn unmeasured() -> Option<String> {
     if DEVICE.gpt.is_none() {
         gaps.push(format!("disk0's GPT GUIDs and layout (stand-in: unmeasured GUIDs, the partition over all usable blocks; measure {GPT_MEASUREMENT})"));
     }
+    gaps.extend(super::storagestack::unmeasured());
     if DEVICE.container_uuid.is_none() {
         gaps.push(format!("the container's nx_uuid (stand-in 00000000-0000-4000-8000-000000000003; measure {CONTAINER_UUID_MEASUREMENT})"));
     }

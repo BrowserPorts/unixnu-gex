@@ -1387,6 +1387,9 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             _ => bad(),
         },
         (o, id) => {
+            if let Some(r) = super::vmmig::routine(k, o, id, req) {
+                return r;
+            }
             let mut r = Reply::err(MIG_BAD_ID);
             r.unimplemented = Some(format!("MIG routine {id} on {o:?}"));
             r

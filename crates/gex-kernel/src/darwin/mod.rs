@@ -126,6 +126,7 @@ pub mod trustcache;
 pub mod vconsole;
 pub mod vm;
 pub mod vmshare;
+mod vmmig;
 pub mod coalition;
 pub mod importance;
 pub mod voucher;

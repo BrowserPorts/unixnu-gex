@@ -407,6 +407,24 @@ impl<'a> GuestMem<'a> {
         Ok(HOST_MAP_FILE.get().is_some_and(|f| f(base + r.start, r.len(), fd, offset)))
     }
 
+    /// The host address of `len` bytes of guest memory at `addr`; `None`
+    /// outside the memory or where it is no host allocation.
+    pub fn host_addr(&mut self, addr: u64, len: u64) -> Option<usize> {
+        let r = self.range(addr, usize::try_from(len).ok()?).ok()?;
+        Some(self.host_base()? + r.start)
+    }
+
+    /// The host's mapping of the pages at host address `src` over `len`
+    /// bytes of this memory at `addr` (both page aligned), replacing what
+    /// was there ([`set_host_remap`]): shared with `src` (`copy` false), so
+    /// that a write through either is seen through both, or a copy of them
+    /// on write; whether the host did.
+    pub fn remap_from(&mut self, addr: u64, src: usize, len: u64, copy: bool) -> Result<bool, Errno> {
+        let r = self.range(addr, usize::try_from(len).map_err(|_| Errno::EFAULT)?)?;
+        let Some(base) = self.host_base() else { return Ok(false) };
+        Ok(len != 0 && host_remap(base + r.start, src, r.len(), copy))
+    }
+
     /// The state of each `page`-byte page of `len` bytes at `addr`
     /// ([`page_state`]), as the host keeps it, into `out`; whether the host
     /// could say ([`set_host_pages`]).
@@ -611,6 +629,11 @@ static HOST_REMAP: std::sync::OnceLock<fn(usize, usize, usize, bool) -> bool> = 
 /// own to share (the browser's) installs none.
 pub fn set_host_remap(f: fn(usize, usize, usize, bool) -> bool) {
     let _ = HOST_REMAP.set(f);
+}
+
+/// Whether the host can map its pages twice ([`set_host_remap`]).
+pub fn host_can_remap() -> bool {
+    HOST_REMAP.get().is_some()
 }
 
 /// The host's [`set_host_remap`] mapping, between any two host addresses

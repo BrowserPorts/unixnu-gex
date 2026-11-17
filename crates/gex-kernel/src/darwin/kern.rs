@@ -1340,7 +1340,9 @@ impl Kernel {
     fn darwin_fcntl_other(&mut self, fd: i32, c: u32) -> Result<u64, Errno> {
         const IOC_VOID: u32 = 0x2000_0000;
         const IOC_INOUT: u32 = 0xc000_0000;
-        const SERVED: &[u32] = &[40, 41, 43, 49, 52, 53, 54, 55, 56, 57, 58, 60, 65, 66, 68, 69, 70, 71, 72, 75, 77, 78, 79, 80, 81, 82, 84, 90, 91, 92, 93, 94, 95, 96, 99, 100, 102, 104, 105, 106, 107, 108, 109, 110, 111];
+        const F_FREEZE_FS: u32 = 53;
+        const F_THAW_FS: u32 = 54;
+        const SERVED: &[u32] = &[40, 41, 43, 49, 52, 55, 56, 57, 58, 60, 65, 66, 68, 69, 70, 71, 72, 75, 77, 78, 79, 80, 81, 82, 84, 90, 91, 92, 93, 94, 95, 96, 99, 100, 102, 104, 105, 106, 107, 108, 109, 110, 111];
         if SERVED.contains(&c) {
             self.darwin_unimplemented(format!("fcntl {c} (bsd/sys/fcntl.h)"));
             return Err(Errno::EINVAL);
@@ -1358,6 +1360,19 @@ impl Kernel {
         }
         if let Some(r) = self.darwin_tty_vnop_ioctl(fd, c) {
             return r;
+        }
+        // APFS's VNOP_IOCTL ([`super::fsfreeze`]).
+        let mnt = super::kern::mount_of_file(&file);
+        if matches!(c, F_FREEZE_FS | F_THAW_FS) && mnt.fs == Fs::Apfs {
+            let procs = std::sync::Arc::clone(&self.procs);
+            return match super::fsfreeze::ioctl(mnt, c == F_THAW_FS, self.pid, self.dtask.cred.uid, &|p| procs.alive(p)) {
+                Ok(()) => Ok(0),
+                Err(super::fsfreeze::Refused::Errno(e)) => Err(e),
+                Err(super::fsfreeze::Refused::Unmodelled(why)) => {
+                    self.darwin_unimplemented(why);
+                    Err(Errno::EINTR)
+                }
+            };
         }
         if file.is_tty() {
             self.darwin_unimplemented(format!("fcntl {c} of a terminal that is not a Darwin one"));

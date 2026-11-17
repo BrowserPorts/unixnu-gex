@@ -195,6 +195,29 @@ impl Kernel {
                 // FIOGETOWN is _IOR: the answer goes out.
                 m.write(udata, &v.to_le_bytes())?;
             }
+            // dkioctl's DKIOCUNMAP: its extents copied in (one allocation
+            // for them all, the 8 on the stack when they fit), checked for a
+            // count whose size overflows 32 bits.
+            super::disknode::dkioc::UNMAP if let Some(n) = file.handle.darwin_disk().map(|d| d.node) => {
+                let (extents, count, options) = (u64::from_le_bytes(data[..8].try_into().unwrap()), u32::from_le_bytes(data[8..12].try_into().unwrap()), u32::from_le_bytes(data[12..16].try_into().unwrap()));
+                if extents == 0 {
+                    return Err(Errno::EINVAL);
+                }
+                if count > u32::MAX / 16 {
+                    return Err(Errno::EOVERFLOW);
+                }
+                if count > 0 {
+                    let bytes = m.read(extents, count as usize * 16)?.to_vec();
+                    match super::disknode::unmap_batch(n, &bytes, options) {
+                        super::disknode::Answer::Done => {}
+                        super::disknode::Answer::Err(e) => return Err(e),
+                        super::disknode::Answer::Unmodelled(what) => {
+                            self.darwin_unimplemented(what);
+                            return Err(Errno::EOPNOTSUPP);
+                        }
+                    }
+                }
+            }
             _ => {
                 self.darwin_fo_ioctl(&file, com, &mut data)?;
                 if com & IOC_OUT != 0 && size != 0 {

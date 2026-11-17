@@ -23,6 +23,15 @@
 #define DKIOCGETFEATURES _IOR('d', 76, uint32_t)
 #define DKIOCISSOLIDSTATE _IOR('d', 79, uint32_t)
 #define DKIOCGETAPFSFLAVOUR _IOR('d', 91, uint32_t)
+#define DKIOCSYNCHRONIZECACHE _IO('d', 22)
+typedef struct { uint64_t offset, length; uint32_t options; uint8_t reserved[4]; } dk_synchronize_t;
+#define DKIOCSYNCHRONIZE _IOW('d', 22, dk_synchronize_t)
+typedef struct { uint64_t offset, length; } dk_extent_t;
+typedef struct { dk_extent_t *extents; uint32_t extentsCount, options; } dk_unmap_t;
+#define DKIOCUNMAP _IOW('d', 31, dk_unmap_t)
+typedef struct { uint64_t offset, length; uint8_t provisionType, reserved[7]; } dk_provision_extent_t;
+typedef struct { uint64_t offset, length, options; uint32_t reserved, extentsCount; dk_provision_extent_t *extents; } dk_provision_status_t;
+#define DKIOCGETPROVISIONSTATUS _IOWR('d', 79, dk_provision_status_t)
 #define DK_FEATURE_BARRIER 0x2
 #define DK_FEATURE_PRIORITY 0x4
 #define DK_FEATURE_UNMAP 0x10
@@ -76,6 +85,46 @@ int main(void) {
     if (memcmp(buf + 32, "NXSB", 4)) return bad("the container's magic", buf[32], 'N');
     if (pread(p, buf + 4096, 4096, 0) != 4096 || memcmp(buf, buf + 4096, 4096)) return bad("the partition's block 0", errno, 0);
     if (pread(d0, buf + 4096, 4096, pfirst * 4096) != 4096 || memcmp(buf, buf + 4096, 4096)) return bad("disk0's block 6", errno, 0);
+    // Synchronize: disk0's goes to the driver, which refuses a reserved
+    // option; the container's passes on only after a write, so with
+    // nothing written any option succeeds; reserved bytes are refused.
+    if (ioctl(d0, DKIOCSYNCHRONIZECACHE)) return bad("synchronizing disk0's cache", errno, 0);
+    dk_synchronize_t sy = {0, 4096, 0, {0}};
+    if (ioctl(d0, DKIOCSYNCHRONIZE, &sy)) return bad("synchronizing disk0", errno, 0);
+    sy.options = 1;
+    if (ioctl(d0, DKIOCSYNCHRONIZE, &sy) == 0 || errno != EINVAL) return bad("a reserved synchronize option", errno, EINVAL);
+    if (ioctl(c, DKIOCSYNCHRONIZE, &sy)) return bad("synchronizing a clean container", errno, 0);
+    sy.options = 0;
+    sy.reserved[3] = 1;
+    if (ioctl(c, DKIOCSYNCHRONIZE, &sy) == 0 || errno != EINVAL) return bad("synchronize's reserved bytes", errno, EINVAL);
+    sy.reserved[3] = 0;
+    sy.offset = blocks * 4096;
+    if (ioctl(d0, DKIOCSYNCHRONIZE, &sy) == 0 || errno != EINVAL) return bad("synchronizing past the end", errno, EINVAL);
+    // No provisioning status anywhere, after the range and count checks.
+    dk_provision_extent_t pe[4];
+    dk_provision_status_t ps = {0, 0, 0, 0, 4, pe};
+    if (ioctl(d0, DKIOCGETPROVISIONSTATUS, &ps) == 0 || errno != ENOTSUP) return bad("disk0's provision status", errno, ENOTSUP);
+    if (ioctl(c, DKIOCGETPROVISIONSTATUS, &ps) == 0 || errno != ENOTSUP) return bad("the container's provision status", errno, ENOTSUP);
+    ps.extentsCount = 0;
+    if (ioctl(d0, DKIOCGETPROVISIONSTATUS, &ps) == 0 || errno != EINVAL) return bad("a provision status of no extents", errno, EINVAL);
+    ps.extentsCount = 4;
+    ps.options = 1;
+    if (ioctl(d0, DKIOCGETPROVISIONSTATUS, &ps) == 0 || errno != EINVAL) return bad("a provision status option", errno, EINVAL);
+    // Unmap: no extents array, none, and one with no whole block.
+    dk_extent_t ex = {4097, 100};
+    dk_unmap_t um = {NULL, 1, 0};
+    if (ioctl(d0, DKIOCUNMAP, &um) == 0 || errno != EINVAL) return bad("unmapping no array", errno, EINVAL);
+    um.extents = &ex;
+    um.extentsCount = 0;
+    if (ioctl(d0, DKIOCUNMAP, &um)) return bad("unmapping nothing", errno, 0);
+    um.extentsCount = 1;
+    if (ioctl(d0, DKIOCUNMAP, &um)) return bad("unmapping less than a block", errno, 0);
+    um.options = 2;
+    if (ioctl(d0, DKIOCUNMAP, &um) == 0 || errno != EINVAL) return bad("a reserved unmap option", errno, EINVAL);
+    ex.offset = blocks * 4096;
+    um.options = 0;
+    if (ioctl(d0, DKIOCUNMAP, &um) == 0 || errno != EINVAL) return bad("unmapping past the end", errno, EINVAL);
+
     // A writer of the mounted container: refused.
     if (open("/dev/rdisk1", O_RDWR) >= 0 || errno != EBUSY) return bad("a writer of the container", errno, EBUSY);
 

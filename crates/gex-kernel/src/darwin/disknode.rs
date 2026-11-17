@@ -223,7 +223,7 @@ fn request(d: &Disk, m: Media, at: u64, io: Io<'_>) -> Result<(), Errno> {
         Io::Write(b) => d.sink.write_at(at, b),
     };
     if write && m == Media::Container {
-        SCHEME_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+        SCHEME_DIRTY.fetch_or(3, std::sync::atomic::Ordering::AcqRel);
     }
     let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let moved = if r.is_ok() { len } else { 0 };
@@ -235,8 +235,8 @@ fn request(d: &Disk, m: Media, at: u64, io: Io<'_>) -> Result<(), Errno> {
 }
 
 /// The container scheme's dirty bits (its +0xe0, ORed with 3 by each write
-/// it passes down).
-static SCHEME_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// it passes down, cleared by the synchronize that passes on).
+static SCHEME_DIRTY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// `PAGE_SIZE` on the device (16 KiB pages: the boot's memory size is
 /// over 1 GiB).
@@ -444,6 +444,142 @@ impl crate::vfs::FileHandle for DiskDev {
             // reported at the open.
             let _ = super::dkopen::dkclose(self.node.minor, self.block());
         }
+    }
+}
+
+/// `kIOStorageSynchronizeOptionReserved`, `kIOStorageUnmapOptionReserved`.
+const SYNCHRONIZE_RESERVED: u32 = 0xffff_fffd;
+const UNMAP_RESERVED: u32 = 0xffff_fffe;
+/// `kIOStorageSynchronizeOptionBarrier`.
+const SYNCHRONIZE_BARRIER: u32 = 0x2;
+const ENOTSUP: i32 = 45;
+
+/// What a storage request down the stack answers: an errno, or what is
+/// not modelled.
+enum Down {
+    Errno(i32),
+    Unmodelled(String),
+}
+
+/// `IOMedia`'s checks of a synchronize or unmap of medium `g` (it is open:
+/// the node's minor holds it, and the media under it are held by their
+/// clients): writable (`kIOReturnLockedWrite`, EACCES), formatted
+/// (`kIOReturnUnformattedMedia`, ENXIO), and each extent within it
+/// (`kIOReturnBadArgument`, EINVAL).
+fn media_checks(g: Geometry, extents: &[(u64, u64)]) -> Result<(), Down> {
+    if !storage::disk_writable() {
+        return Err(Down::Errno(EACCES));
+    }
+    if g.size == 0 || g.block == 0 {
+        return Err(Down::Errno(ENXIO));
+    }
+    if extents.iter().any(|&(start, count)| g.size < start || g.size - start < count) {
+        return Err(Down::Errno(EINVAL));
+    }
+    Ok(())
+}
+
+/// A key of `IOStorageFeatures` the container scheme copied from its
+/// provider at its start (0xfffffff006682bac..0xfffffff006682c74: Unmap
+/// to its +0x108, Barrier to its +0x10c).
+fn scheme_feature(key: &str) -> Result<bool, Down> {
+    match property_up("disk0s1", "IOStorageFeatures") {
+        Ok(p) => Ok(matches!(dict_get(&p, key), Some(super::iokit::Prop::Bool(true)))),
+        Err(why) => Err(Down::Unmodelled(why)),
+    }
+}
+
+/// `synchronize(byteStart, byteCount, options)` of medium `m` down its
+/// stack: `IOMedia::synchronize`'s checks at each medium; the container
+/// scheme's (0xfffffff006683d90) passes on only if a write set the dirty
+/// bits it clears (3, or 1 for a barrier when its device has Barrier),
+/// else succeeds; `IOBlockStorageDriver::synchronize` refuses a reserved
+/// option and passes the blocks to NS_01's `doSynchronize`, which succeeds
+/// (the image's bytes are written already).
+fn synchronize(m: Media, start: u64, count: u64, options: u32) -> Result<(), Down> {
+    let geo = |m: Media| geometry(m).map_err(Down::Unmodelled);
+    media_checks(geo(m)?, &[(start, count)])?;
+    if matches!(m, Media::Volume(_) | Media::Container) {
+        if let Media::Volume(_) = m {
+            // AppleAPFSContainer (IOPartitionScheme::synchronize) to the
+            // container's medium, at the same offset.
+            media_checks(geo(Media::Container)?, &[(start, count)])?;
+        }
+        let mask = if options & SYNCHRONIZE_BARRIER != 0 && scheme_feature("Barrier")? { 1 } else { 3 };
+        let old = SCHEME_DIRTY.fetch_and(!mask, std::sync::atomic::Ordering::AcqRel);
+        if old & mask == 0 {
+            return Ok(());
+        }
+        // The scheme's provider: the partition's medium, the same offset.
+        media_checks(geo(Media::Partition)?, &[(start, count)])?;
+        let base = geo(Media::Partition)?.base;
+        media_checks(geo(Media::Whole)?, &[(start + base, count)])?;
+    } else if m == Media::Partition {
+        let base = geo(Media::Partition)?.base;
+        media_checks(geo(Media::Whole)?, &[(start + base, count)])?;
+    }
+    if options & SYNCHRONIZE_RESERVED != 0 {
+        return Err(Down::Errno(EINVAL));
+    }
+    Ok(())
+}
+
+/// `unmap(extents, options)` of medium `m` down its stack: `IOMedia::unmap`'s
+/// checks at each medium (and the base added); a volume's container
+/// (0xfffffff00666b378) drops the extents with bit 63 of their start set;
+/// the container scheme (0xfffffff006683af8) passes them on only when its
+/// device has Unmap, else succeeds; `IOBlockStorageDriver::unmap` refuses a
+/// reserved option, rounds each extent inward to whole blocks and drops the
+/// empty ones, and gives the rest to NS_01's `doUnmap` (a Dataset
+/// Management deallocate), what the controller then reads back for those
+/// blocks not being measured.
+fn unmap(m: Media, extents: &[(u64, u64)], options: u32) -> Result<(), Down> {
+    let geo = |m: Media| geometry(m).map_err(Down::Unmodelled);
+    media_checks(geo(m)?, extents)?;
+    let mut ext: Vec<(u64, u64)> = extents.to_vec();
+    if matches!(m, Media::Volume(_) | Media::Container) {
+        if let Media::Volume(_) = m {
+            ext.retain(|&(start, _)| start & (1 << 63) == 0);
+            media_checks(geo(Media::Container)?, &ext)?;
+        }
+        if !scheme_feature("Unmap")? {
+            return Ok(());
+        }
+        media_checks(geo(Media::Partition)?, &ext)?;
+    }
+    if matches!(m, Media::Volume(_) | Media::Container | Media::Partition) {
+        let base = geo(Media::Partition)?.base;
+        for e in &mut ext {
+            e.0 += base;
+        }
+        media_checks(geo(Media::Whole)?, &ext)?;
+    }
+    if options & UNMAP_RESERVED != 0 {
+        return Err(Down::Errno(EINVAL));
+    }
+    let bs = u64::from(storage::nvme().block_size);
+    let blocks: Vec<(u64, u64)> = ext.iter().filter_map(|&(start, count)| {
+        let (first, end) = (start.div_ceil(bs), (start + count) / bs);
+        (end > first).then_some((first, end - first))
+    }).collect();
+    if blocks.is_empty() {
+        return Ok(());
+    }
+    Err(Down::Unmodelled(format!("DKIOCUNMAP of {} block extents of disk0 (NS_01's doUnmap: what the controller reads back for deallocated blocks is not measured)", blocks.len())))
+}
+
+/// `DKIOCUNMAP`'s extents in a batch: `dk_extent_t` {offset, length}.
+pub fn unmap_batch(n: &Node, extents: &[u8], options: u32) -> Answer {
+    let Ok(m) = media_of(n) else { return Answer::Err(Errno::EBADF) };
+    let ext: Vec<(u64, u64)> = extents.chunks_exact(16).map(|c| (u64::from_le_bytes(c[..8].try_into().unwrap()), u64::from_le_bytes(c[8..].try_into().unwrap()))).collect();
+    down(unmap(m, &ext, options))
+}
+
+fn down(r: Result<(), Down>) -> Answer {
+    match r {
+        Ok(()) => Answer::Done,
+        Err(Down::Errno(n)) => Answer::Err(e(n)),
+        Err(Down::Unmodelled(why)) => Answer::Unmodelled(why),
     }
 }
 
@@ -697,7 +833,35 @@ pub fn ioctl(n: &'static Node, com: u64, data: &mut [u8]) -> Answer {
         SETSTATIC if block => Answer::Err(Errno::ENOTTY),
         SETSTATIC => Answer::Unmodelled("_DKIOCSETSTATIC: the static-content option a character node's later I/O passes down".into()),
         SETBLOCKSIZE | LOCKPHYSICALEXTENTS | GETPHYSICALEXTENT | UNLOCKPHYSICALEXTENTS | SETTIER if !block => Answer::Err(Errno::ENOTTY),
-        SYNCHRONIZE | SYNCHRONIZECACHE | UNMAP | GETPROVISIONSTATUS | GETERRORDESCRIPTION | EJECT | FORMAT | GETFORMATCAPACITIES | REQUESTIDLE | GETFIRMWAREPATH | SETBLOCKSIZE | LOCKPHYSICALEXTENTS | GETPHYSICALEXTENT | UNLOCKPHYSICALEXTENTS | SETTIER => Answer::Unmodelled(format!("ioctl {com:#x} on /dev/{} (dkioctl: what the storage stack under it does)", n.name)),
+        // dkioctl: synchronize(0, 0, 0), or the request's after its
+        // reserved bytes (20 to 23) are checked.
+        SYNCHRONIZECACHE => down(synchronize(m, 0, 0, 0)),
+        SYNCHRONIZE => {
+            if data[20..24].iter().any(|&b| b != 0) {
+                return Answer::Err(e(EINVAL));
+            }
+            let (off, len, opt) = (u64::from_le_bytes(data[..8].try_into().unwrap()), u64::from_le_bytes(data[8..16].try_into().unwrap()), u32::from_le_bytes(data[16..20].try_into().unwrap()));
+            down(synchronize(m, off, len, opt))
+        }
+        // The count cut to a page of extents; IOMedia::getProvisionStatus's
+        // checks (options, as the 32-bit IOStorageGetProvisionStatusOptions,
+        // the range, a count of 0), then every provider's answer is
+        // kIOReturnUnsupported: NS_01's doGetProvisionStatus is
+        // IOBlockStorageDevice's (0xfffffff00596f08c), the container scheme's
+        // IOStorage's (0xfffffff00597dc64).
+        GETPROVISIONSTATUS => {
+            let (off, len) = (u64::from_le_bytes(data[..8].try_into().unwrap()), u64::from_le_bytes(data[8..16].try_into().unwrap()));
+            let options = u32::from_le_bytes(data[16..20].try_into().unwrap());
+            let count = u32::from_le_bytes(data[28..32].try_into().unwrap()).min((PAGE_SIZE / 24) as u32);
+            data[28..32].copy_from_slice(&count.to_le_bytes());
+            if options != 0 || g.size < off || g.size - off < len || count == 0 {
+                return Answer::Err(e(EINVAL));
+            }
+            Answer::Err(e(ENOTSUP))
+        }
+        // Its extents are copied in by the caller ([`unmap_batch`]).
+        UNMAP => Answer::Unmodelled("DKIOCUNMAP without its extents".into()),
+        GETERRORDESCRIPTION | EJECT | FORMAT | GETFORMATCAPACITIES | REQUESTIDLE | GETFIRMWAREPATH | SETBLOCKSIZE | LOCKPHYSICALEXTENTS | GETPHYSICALEXTENT | UNLOCKPHYSICALEXTENTS | SETTIER => Answer::Unmodelled(format!("ioctl {com:#x} on /dev/{} (dkioctl: what the storage stack under it does)", n.name)),
         _ => Answer::Err(Errno::ENOTTY),
     }
 }
@@ -771,7 +935,7 @@ mod tests {
         assert_eq!(delta(&before, "scheme Bytes (Read)"), 8192);
         assert_eq!(delta(&before, "scheme Operations (Write)"), 1);
         assert_eq!(delta(&before, "scheme Bytes (Write)"), 4096);
-        assert!(SCHEME_DIRTY.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(SCHEME_DIRTY.load(std::sync::atomic::Ordering::Acquire) & 3, 3);
     }
 
     #[test]

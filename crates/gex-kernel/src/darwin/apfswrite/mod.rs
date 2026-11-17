@@ -12,8 +12,10 @@
 //! on a mounted container ([`tx`]). The GPT is MediaKit's ([`gpt`]); the
 //! restore's steps are [`restore`]'s.
 
+pub mod btree;
 pub mod container;
 pub mod gpt;
+pub mod node;
 pub mod restore;
 pub mod seal;
 pub mod tx;

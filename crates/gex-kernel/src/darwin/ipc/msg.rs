@@ -157,8 +157,9 @@ pub enum Desc {
     /// A port right, or a name that is not one (null or dead) carried as
     /// it is.
     Port { off: usize, right: Option<Carried>, raw: u32, disp: u32 },
-    /// Out-of-line memory, copied at send.
-    Ool { off: usize, data: Vec<u8>, copy: u8 },
+    /// Out-of-line memory, copied at send from the sender's `addr` (the
+    /// copy's offset, `vm_map_copy`'s `offset`).
+    Ool { off: usize, data: Vec<u8>, copy: u8, addr: u64 },
     /// An array of rights.
     OolPorts { off: usize, rights: Vec<(Option<Carried>, u32)>, disp: u32, copy: u8 },
     /// A receive right with its guard (`MACH_MSG_GUARDED_PORT_DESCRIPTOR`).

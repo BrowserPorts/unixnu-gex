@@ -935,6 +935,20 @@ impl Kernel {
     /// it, the bit given back, and the instruction runs again: no fault,
     /// signal 0. The access may begin on the page before.
     pub fn darwin_access_fault(&mut self, m: &mut GuestMem<'_>, pc: u64, addr: u64, write: bool) -> (Delivery, u32) {
+        // vm_fault of a page the pmap has not entered, whose mapping allows
+        // the access: pmap_enter, and the access is made again.
+        if addr >= gex_abi::DARWIN_GUEST_FLOOR {
+            let page = addr >> gex_abi::PERM_PAGE_SHIFT;
+            let entered = {
+                let mut mm = self.mem.lock();
+                let need = if write { crate::mem::prot::WRITE } else { crate::mem::prot::READ };
+                mm.is_unentered(page) && mm.vma_at(addr).is_some_and(|v| v.prot & need != 0) && mm.enter_page(page)
+            };
+            if entered {
+                self.darwin_flush_perms(m);
+                return (Delivery::Resume(pc), 0);
+            }
+        }
         if write {
             let page = addr >> gex_abi::PERM_PAGE_SHIFT;
             if super::iosurface::note_store(self, m, page) || super::iosurface::note_store(self, m, page + 1) {

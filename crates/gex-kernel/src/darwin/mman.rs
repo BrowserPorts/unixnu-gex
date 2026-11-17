@@ -599,7 +599,7 @@ impl Kernel {
     /// for gex's private file mappings (copies made at the mapping) means
     /// none, since their pages are the vnode object's or a shadow's.
     fn darwin_kills(p: &Piece) -> bool {
-        matches!(p.attrs.kind, kind::ANON | kind::SHM) && !p.attrs.cow
+        matches!(p.attrs.kind, kind::ANON | kind::SHM | kind::OBJECT) && !p.attrs.cow
     }
 
     /// `vm_map_range_overflows` for a 16 KiB page map.
@@ -761,7 +761,7 @@ impl Kernel {
             if p.attrs.kind == kind::SUBMAP || p.prot & prot::READ as u8 == 0 {
                 continue;
             }
-            if matches!(p.attrs.kind, kind::ANON | kind::SHM) && p.prot & prot::WRITE as u8 != 0 {
+            if matches!(p.attrs.kind, kind::ANON | kind::SHM | kind::OBJECT) && p.prot & prot::WRITE as u8 != 0 {
                 self.darwin_host_advise(m, p, p.start, p.end, HostAdvice::WillNeed);
             }
         }

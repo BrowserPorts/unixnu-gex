@@ -3228,6 +3228,14 @@ fn publish_vm(k: &Kernel, memory: &gex_mem::GuestMemory) {
     k.procs.set_vm(k.pid, Some(Arc::new(vm)));
 }
 
+/// The parts of `[start, end)` of the forking process's map that may hold
+/// something other than zeros (`MemoryMap::dirty_parts`).
+fn parent_mem_clean(cx: &SpawnContext, start: u64, end: u64) -> Vec<(u64, u64)> {
+    let k = cx.kernel.lock().unwrap_or_else(|e| e.into_inner());
+    let mm = k.mem.lock();
+    mm.dirty_parts(start, end)
+}
+
 fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkRequest, inside: bool) -> Result<()> {
     let pid = req.pid;
     if let Some(aot) = store.as_context().data().spawn.as_ref().and_then(|s| s.opts.aot.clone()) {
@@ -3262,13 +3270,21 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
     // code has safepoints only where gexcc put polls, so a thread computing
     // without system calls would never stop.
     let paused = (!inside).then(|| cx.gate.pause());
-    let (mut child_kernel, regions, ctx_addr) = {
+    let (mut child_kernel, regions, plan, ctx_addr) = {
         let k = cx.kernel.lock().unwrap_or_else(|e| e.into_inner());
+        // A Darwin parent's map by its entries' inheritance (vm_map_fork):
+        // what the host can, it shares or copies on write; the rest is
+        // copied below.
+        let plan = if k.darwin { k.darwin_fork_plan() } else { Vec::new() };
         // What the parent has mapped, less what it is known to hold only
         // zeros (its reservations): the child's memory is zero already.
         let regions: Vec<(u64, u64)> = {
             let mm = k.mem.lock();
-            mm.vmas().iter().flat_map(|v| mm.dirty_parts(v.start, v.end)).collect()
+            mm.vmas()
+                .iter()
+                .filter(|v| !plan.iter().any(|r| r.start < v.end && v.start < r.end))
+                .flat_map(|v| mm.dirty_parts(v.start, v.end))
+                .collect()
         };
         if std::env::var_os("GEX_FORK_VMAS").is_some() {
             for v in k.mem.lock().vmas().iter().filter(|v| v.end - v.start >= 16 << 20) {
@@ -3291,7 +3307,7 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
             child.darwin_ipc_leave();
             child.darwin_publish();
         }
-        (child, regions, store.as_context().data().thread.ctx_addr)
+        (child, regions, plan, store.as_context().data().thread.ctx_addr)
     };
 
     // A program with shared libraries gets its own function table and link
@@ -3344,6 +3360,31 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
                 copied += sparse.copy(src, dst, a, b);
             }
         }
+        // A Darwin parent's inherited ranges: the host's pages shared, or
+        // copied on write, into the child's memory; where the host cannot,
+        // a copy (which for a shared range is reported).
+        let mut unshared = Vec::new();
+        for r in plan.iter().filter(|r| r.how != gex_kernel::darwin::vmshare::Inherit::None) {
+            let (a, b) = (r.start as usize, (r.end as usize).min(src.len()));
+            if a >= b {
+                continue;
+            }
+            let copy = r.how == gex_kernel::darwin::vmshare::Inherit::Copy;
+            let (sp, dp) = (src.as_ptr() as usize, dst.as_ptr() as usize);
+            if gex_kernel::host_remap(dp + a, sp + a, b - a, copy) {
+                continue;
+            }
+            if !copy {
+                unshared.push((r.start, r.end));
+            }
+            let parts = parent_mem_clean(&cx, r.start, r.end);
+            for (pa, pb) in parts {
+                let (pa, pb) = (pa as usize, (pb as usize).min(src.len()));
+                if pa < pb {
+                    copied += sparse.copy(src, dst, pa, pb);
+                }
+            }
+        }
         // `fork` returns zero in the child, and a clone that named a stack
         // starts on it. A Darwin child has its own pid in x0 and 1 in x1
         // (`thread_set_child`).
@@ -3362,6 +3403,10 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         }
         // A monitor is per-thread; the child's starts clear.
         let _ = gm.write_u64(ctx_addr + ctx::MON_SIZE as u64, 0);
+        if child_kernel.darwin {
+            child_kernel.darwin_fork_child_vm(&mut gm, &plan);
+            child_kernel.darwin_fork_unshared(&unshared);
+        }
     }
     drop(paused);
     publish_vm(&child_kernel, &child_mem);

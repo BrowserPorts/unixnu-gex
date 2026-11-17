@@ -184,11 +184,39 @@ pub struct Jetsam {
     pub ledgers: HashMap<i32, super::footprint::Ledger>,
     /// `memorystatus_hwm_candidates`: a task is past a soft limit.
     pub hwm_candidates: bool,
+    /// The freezer's state that user space sets: the candidate lists
+    /// (`memorystatus_global_freeze_list`, `memorystatus_global_demote_list`),
+    /// the probabilities of use (`memorystatus_global_probabilities_table`)
+    /// and dasd's trial identifiers.
+    pub freezer: Freezer,
 }
+
+/// What `memorystatus_control` gives the freezer (`kern_memorystatus_freeze.c`).
+#[derive(Debug, Default)]
+pub struct Freezer {
+    /// Each list's `memorystatus_properties_freeze_entry_v1`s, as copied in.
+    pub freeze_list: Vec<[u8; FREEZE_ENTRY_SIZE]>,
+    pub demote_list: Vec<[u8; FREEZE_ENTRY_SIZE]>,
+    /// `proc_name` (at most `MAXCOMLEN` bytes) and `use_probability`.
+    pub probabilities: Vec<(Vec<u8>, i32)>,
+    /// `dasd_trial_identifiers`.
+    pub trial_identifiers: Option<[u8; TRIAL_IDENTIFIERS_SIZE]>,
+}
+
+/// `sizeof(memorystatus_properties_freeze_entry_v1)`: version, pid,
+/// priority, a `2 * MAXCOMLEN + 1` name and three bytes of padding.
+pub const FREEZE_ENTRY_SIZE: usize = 48;
+/// `sizeof(memorystatus_freezer_trial_identifiers_v1)`: version, two
+/// `uuid_string_t`s, deployment_id.
+pub const TRIAL_IDENTIFIERS_SIZE: usize = 84;
+/// `sizeof(global_frozen_procs_t)`: the count, then
+/// `FREEZER_CONTROL_GET_PROCS_MAX_COUNT` (`FREEZE_PROCESSES_MAX` 20, twice)
+/// pid and `proc_name_t` (`2 * MAXCOMLEN + 1`) pairs of 40 bytes each.
+pub const GLOBAL_FROZEN_PROCS_SIZE: usize = 8 + 40 * 40;
 
 impl Default for Jetsam {
     fn default() -> Jetsam {
-        Jetsam { procs: HashMap::new(), buckets: vec![VecDeque::new(); BUCKETS], list_count: 0, demotions_sysprocs: 0, demotions_apps: 0, demotion_deadline: 0, dirty_count: 0, lenient: false, listeners: Vec::new(), effects: Effects::default(), ledgers: HashMap::new(), hwm_candidates: false }
+        Jetsam { procs: HashMap::new(), buckets: vec![VecDeque::new(); BUCKETS], list_count: 0, demotions_sysprocs: 0, demotions_apps: 0, demotion_deadline: 0, dirty_count: 0, lenient: false, listeners: Vec::new(), effects: Effects::default(), ledgers: HashMap::new(), hwm_candidates: false, freezer: Freezer::default() }
     }
 }
 
@@ -1131,6 +1159,12 @@ const GRP_SET_PRIORITY: u32 = 0x8;
 const GRP_SET_PROBABILITY: u32 = 0x10;
 const GRP_SET_FREEZE_PRIORITY: u32 = 0x100;
 const GRP_SET_DEMOTE_PRIORITY: u32 = 0x200;
+/// `FREEZER_CONTROL_*`.
+const FREEZER_CONTROL_GET_PROCS: u32 = 2;
+const FREEZER_CONTROL_SET_DASD_TRIAL_IDENTIFIERS: u32 = 3;
+const FREEZER_CONTROL_RESET_STATE: u32 = 4;
+/// `MAXCOMLEN`.
+const MAXCOMLEN: usize = 16;
 /// `MEMORYSTATUS_MPE_VERSION_1`, and the entry's size (56 bytes, aligned).
 const MPE_VERSION_1: i32 = 1;
 const MPE_VERSION_1_SIZE: usize = 56;
@@ -1345,9 +1379,49 @@ impl crate::syscalls::Kernel {
                     let entries: Vec<(i32, i32)> = (0..count).map(|i| (w(i * MPE_VERSION_1_SIZE + 4), w(i * MPE_VERSION_1_SIZE + 8))).collect();
                     let range = self.jetsam_entitled_range();
                     self.procs.jetsam().group_set_priority(&entries, range).map(|_| 0)
-                } else if f & (GRP_SET_PROBABILITY | GRP_SET_FREEZE_PRIORITY | GRP_SET_DEMOTE_PRIORITY) != 0 {
-                    self.darwin_unimplemented("memorystatus group probabilities and freezer lists (the freezer)".into());
-                    Err(Errno::EINVAL)
+                } else if f & GRP_SET_PROBABILITY == GRP_SET_PROBABILITY {
+                    // memorystatus_cmd_grp_set_probabilities.
+                    if buffer == 0 || size == 0 {
+                        return Err(Errno::EINVAL);
+                    }
+                    let count = size as usize / MPE_VERSION_1_SIZE;
+                    if count == 0 {
+                        return Err(Errno::EINVAL);
+                    }
+                    let b = m.read(buffer, size as usize)?.to_vec();
+                    let w = |o: usize| i32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+                    if w(0) != MPE_VERSION_1 || size as usize % MPE_VERSION_1_SIZE != 0 {
+                        return Err(Errno::EINVAL);
+                    }
+                    // use_probability (offset 12) is 0 or 1; proc_name at 32.
+                    if (0..count).any(|i| w(i * MPE_VERSION_1_SIZE + 12) > 1) {
+                        return Err(Errno::EINVAL);
+                    }
+                    let table = (0..count)
+                        .map(|i| {
+                            let e = &b[i * MPE_VERSION_1_SIZE..(i + 1) * MPE_VERSION_1_SIZE];
+                            let name = &e[32..32 + MAXCOMLEN];
+                            let len = name.iter().position(|&c| c == 0).unwrap_or(MAXCOMLEN);
+                            (name[..len].to_vec(), w(i * MPE_VERSION_1_SIZE + 12))
+                        })
+                        .collect();
+                    self.procs.jetsam().freezer.probabilities = table;
+                    Ok(0)
+                } else if f & (GRP_SET_FREEZE_PRIORITY | GRP_SET_DEMOTE_PRIORITY) != 0 {
+                    // set_freezer_candidate_list (a release kernel checks no
+                    // entry's version or order).
+                    if buffer == 0 || size == 0 || size as usize % FREEZE_ENTRY_SIZE != 0 {
+                        return Err(Errno::EINVAL);
+                    }
+                    let b = m.read(buffer, size as usize)?.to_vec();
+                    let list: Vec<[u8; FREEZE_ENTRY_SIZE]> = b.chunks(FREEZE_ENTRY_SIZE).map(|c| c.try_into().unwrap()).collect();
+                    let mut j = self.procs.jetsam();
+                    if f & GRP_SET_FREEZE_PRIORITY == GRP_SET_FREEZE_PRIORITY {
+                        j.freezer.freeze_list = list;
+                    } else {
+                        j.freezer.demote_list = list;
+                    }
+                    Ok(0)
                 } else {
                     Err(Errno::EINVAL)
                 }
@@ -1425,7 +1499,42 @@ impl crate::syscalls::Kernel {
             // memorystatus_swap_all_apps: this device's tree sets no
             // kern.swap_all_apps, so app swap is not supported.
             cmd::MARK_PROCESS_COALITION_SWAPPABLE | cmd::GET_PROCESS_COALITION_IS_SWAPPABLE => Err(Errno::EOPNOTSUPP),
-            cmd::GET_JETSAM_SNAPSHOT | cmd::GET_PRESSURE_STATUS | cmd::GET_MEMLIMIT_EXCESS | cmd::FREEZER_CONTROL => {
+            // memorystatus_freezer_control. The device's freezer swaps
+            // (VM_CONFIG_FREEZER_SWAP_IS_ACTIVE: its tree's kern.vm_compressor
+            // is VM_PAGER_COMPRESSOR_NO_SWAP_PLUS_FREEZER_COMPRESSOR_WITH_SWAP),
+            // but it freezes only while the available pages are at most
+            // memorystatus_freeze_threshold (half of them), which the device
+            // modelled, whose pressure level stays normal, never reaches: no
+            // process is ever frozen.
+            cmd::FREEZER_CONTROL => match flags {
+                FREEZER_CONTROL_GET_PROCS => {
+                    if (size as usize) < GLOBAL_FROZEN_PROCS_SIZE {
+                        return Err(Errno::EINVAL);
+                    }
+                    // gfp_num_frozen 0, no entry.
+                    m.write(buffer, &[0u8; GLOBAL_FROZEN_PROCS_SIZE])?;
+                    Ok(GLOBAL_FROZEN_PROCS_SIZE as u64)
+                }
+                FREEZER_CONTROL_SET_DASD_TRIAL_IDENTIFIERS => {
+                    if size as usize != TRIAL_IDENTIFIERS_SIZE {
+                        return Err(Errno::EINVAL);
+                    }
+                    let b: [u8; TRIAL_IDENTIFIERS_SIZE] = m.read(buffer, TRIAL_IDENTIFIERS_SIZE)?.try_into().unwrap();
+                    if i32::from_le_bytes(b[..4].try_into().unwrap()) != 1 {
+                        return Err(Errno::EINVAL);
+                    }
+                    self.procs.jetsam().freezer.trial_identifiers = Some(b);
+                    Ok(0)
+                }
+                // kill_all_frozen_processes finds none; the processes'
+                // considered and skip reasons, which nothing set, are
+                // cleared, and a new interval begins (its budget is the
+                // storage's, which only the freezer's own accounting reads).
+                FREEZER_CONTROL_RESET_STATE => Ok(0),
+                // FREEZER_CONTROL_GET_STATUS is a development kernel's.
+                _ => Err(Errno::EOPNOTSUPP),
+            },
+            cmd::GET_JETSAM_SNAPSHOT | cmd::GET_PRESSURE_STATUS | cmd::GET_MEMLIMIT_EXCESS => {
                 self.darwin_unimplemented(format!("memorystatus_control command {command} (the memory model: footprints, pressure, the freezer)"));
                 Err(Errno::EINVAL)
             }

@@ -250,8 +250,23 @@ pub struct Pmap {
     chunks: std::collections::BTreeMap<u64, Box<[u64; CHUNK_WORDS]>>,
     /// Pages held as [`Held::Own`].
     own: u64,
+    /// Pages held as [`Held::Reusable`] and as [`Held::File`].
+    reusable: u64,
+    file: u64,
     leaves: std::collections::BTreeSet<u64>,
     twigs: std::collections::BTreeSet<u64>,
+    /// The pmap's ledgers' lifetime peaks, in pages.
+    pub peaks: Pages,
+}
+
+/// The pages a pmap's ledgers count (`pmap_enter`'s credits): `phys_mem`
+/// (every page entered), `internal`, `external` and `reusable`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Pages {
+    pub resident: u64,
+    pub internal: u64,
+    pub external: u64,
+    pub reusable: u64,
 }
 
 /// The pages of `[s, e)` (page aligned) by chunk: the chunk, and the first
@@ -275,6 +290,14 @@ fn own_in(w: u64) -> u64 {
     u64::from((w & LOW & !(w >> 1)).count_ones())
 }
 
+fn reusable_in(w: u64) -> u64 {
+    u64::from(((w >> 1) & LOW & !w).count_ones())
+}
+
+fn file_in(w: u64) -> u64 {
+    u64::from((w & (w >> 1) & LOW).count_ones())
+}
+
 fn get(words: &[u64; CHUNK_WORDS], i: usize) -> Held {
     Held::of(words[i / 32] >> ((i % 32) * 2))
 }
@@ -291,6 +314,21 @@ impl Pmap {
         self.chunks.get(&(p / CHUNK_PAGES)).map_or(Held::None, |c| get(c, (p % CHUNK_PAGES) as usize))
     }
 
+    /// What its ledgers count now.
+    pub fn pages(&self) -> Pages {
+        Pages { resident: self.own + self.reusable + self.file, internal: self.own, external: self.file, reusable: self.reusable }
+    }
+
+    /// The peaks raised to what the ledgers count now (`LF_TRACKING_MAX`).
+    fn track(&mut self) {
+        let n = self.pages();
+        let p = &mut self.peaks;
+        p.resident = p.resident.max(n.resident);
+        p.internal = p.internal.max(n.internal);
+        p.external = p.external.max(n.external);
+        p.reusable = p.reusable.max(n.reusable);
+    }
+
     /// The `phys_footprint` it makes: its own pages, the root table, the
     /// leaf and twig tables.
     pub fn balance(&self) -> i64 {
@@ -304,7 +342,12 @@ impl Pmap {
     /// mapping); `twigs` are twig tables the map has without a page of its
     /// own under them (the commpage's, the shared region's nest). False
     /// when the host cannot say.
-    pub fn look(&mut self, ranges: &[(u64, u64)], twigs: &[u64], states: &mut dyn FnMut(u64, u64, &mut [u8]) -> bool) -> bool {
+    ///
+    /// The pages of `unentered` (sorted, disjoint) are mapped and not
+    /// entered yet: what the host holds of them is another mapping's (a
+    /// page shared, or copied on write, with it), so they hold nothing here
+    /// until their first access enters them.
+    pub fn look(&mut self, ranges: &[(u64, u64)], twigs: &[u64], unentered: &[(u64, u64)], states: &mut dyn FnMut(u64, u64, &mut [u8]) -> bool) -> bool {
         let mut chunks: std::collections::BTreeMap<u64, Box<[u64; CHUNK_WORDS]>> = std::collections::BTreeMap::new();
         let mut out = vec![0u8; CHUNK_PAGES as usize];
         for &(s, e) in ranges {
@@ -314,6 +357,7 @@ impl Pmap {
                 if !states(at, n as u64, &mut out[..n]) {
                     return false;
                 }
+                hide_unentered(unentered, at, &mut out[..n]);
                 let old = self.chunks.get(&c);
                 // Nothing held there and nothing on the host: nothing to keep.
                 if old.is_none() && out[..n].iter().all(|&st| st == 0) {
@@ -334,9 +378,11 @@ impl Pmap {
             }
         }
         chunks.retain(|_, w| w.iter().any(|&x| x != 0));
-        self.own = chunks.values().map(|w| w.iter().map(|&x| own_in(x)).sum::<u64>()).sum();
+        let count = |f: fn(u64) -> u64| chunks.values().map(|w| w.iter().map(|&x| f(x)).sum::<u64>()).sum::<u64>();
+        (self.own, self.reusable, self.file) = (count(own_in), count(reusable_in), count(file_in));
         self.chunks = chunks;
         self.twigs.extend(twigs.iter().copied());
+        self.track();
         true
     }
 
@@ -353,7 +399,9 @@ impl Pmap {
             for i in i0..i1 {
                 let (was, now) = (get(w, i), f(get(w, i)));
                 if was != now {
-                    self.own = self.own + u64::from(now == Held::Own) - u64::from(was == Held::Own);
+                    for (n, h) in [(&mut self.own, Held::Own), (&mut self.reusable, Held::Reusable), (&mut self.file, Held::File)] {
+                        *n = *n + u64::from(now == h) - u64::from(was == h);
+                    }
                     put(w, i, now);
                 }
             }
@@ -361,6 +409,7 @@ impl Pmap {
                 self.chunks.remove(&c);
             }
         }
+        self.track();
     }
 
     /// `pmap_remove` of `[s, e)` (`vm_map_delete`, an overwrite): its
@@ -394,6 +443,17 @@ impl Pmap {
     /// own again (`vm_object_reuse_pages`, `PMAP_OPTIONS_CLEAR_REUSABLE`).
     pub fn reused(&mut self, s: u64, e: u64) {
         self.change(s, e, |h| if h == Held::Reusable { Held::Own } else { h });
+    }
+}
+
+/// The states of the pages from `at` in `out` with those of `unentered`'s
+/// pages cleared: the host's pages there are not this pmap's.
+fn hide_unentered(unentered: &[(u64, u64)], at: u64, out: &mut [u8]) {
+    let end = at + ((out.len() as u64) << PAGE_SHIFT);
+    let i = unentered.partition_point(|&(_, e)| e <= at);
+    for &(s, e) in unentered[i..].iter().take_while(|&&(s, _)| s < end) {
+        let (a, b) = (((s.max(at) - at) >> PAGE_SHIFT) as usize, ((e.min(end) - at) >> PAGE_SHIFT) as usize);
+        out[a..b].fill(0);
     }
 }
 
@@ -479,7 +539,8 @@ impl Meter {
     pub fn measure(&self, pm: &mut Pmap, mm: &crate::mem::Mm, m: &mut GuestMem<'_>) -> Option<i64> {
         let ranges = self.ranges(mm);
         let twigs = self.fixed_twigs();
-        let ok = pm.look(&ranges, &twigs, &mut |at, n, out| m.page_states(at, n * PAGE, PAGE, out).unwrap_or(false));
+        let unentered = mm.lock().unentered_ranges();
+        let ok = pm.look(&ranges, &twigs, &unentered, &mut |at, n, out| m.page_states(at, n * PAGE, PAGE, out).unwrap_or(false));
         ok.then(|| pm.balance())
     }
 
@@ -492,6 +553,7 @@ impl Meter {
             return true;
         }
         let ranges: Vec<(u64, u64)> = self.ranges(mm).into_iter().filter(|&(rs, re)| rs < e && re > s).map(|(rs, re)| (rs.max(s), re.min(e))).collect();
+        let unentered = mm.lock().unentered_ranges();
         let mut out = vec![0u8; CHUNK_PAGES as usize];
         for (rs, re) in ranges {
             for (c, i0, i1) in by_chunk(rs, re) {
@@ -500,6 +562,7 @@ impl Meter {
                 if !m.page_states(at, n as u64 * PAGE, PAGE, &mut out[..n]).unwrap_or(false) {
                     return true;
                 }
+                hide_unentered(&unentered, at, &mut out[..n]);
                 if out[..n].iter().any(|&st| matches!((Held::None.looked(st), own_only), (Held::Own, _) | (Held::Reusable | Held::File, false))) {
                     return true;
                 }
@@ -552,11 +615,20 @@ impl Kernel {
         if self.dtask.footprint_releasing || s >= e {
             return op(self, m);
         }
+        // pmap_remove takes the range's entries, and with them what was
+        // waiting to be entered there.
+        let cleared = |k: &mut Kernel| {
+            if how == Release::Remove {
+                k.mem.lock().clear_unentered(s, e);
+            }
+        };
         let rusage = std::sync::Arc::clone(&self.dtask.rusage);
         let mut pm = rusage.meter.lock();
         if !rusage.meter.releases(&pm, &self.mem, m, s, e, how) {
             drop(pm);
-            return op(self, m);
+            let r = op(self, m);
+            cleared(self);
+            return r;
         }
         let before = rusage.meter.measure(&mut pm, &self.mem, m);
         let mut crossings = Vec::new();
@@ -566,6 +638,7 @@ impl Kernel {
         self.dtask.footprint_releasing = true;
         let r = op(self, m);
         self.dtask.footprint_releasing = false;
+        cleared(self);
         match how {
             Release::Remove => pm.remove(s, e),
             Release::Reusable => pm.made_reusable(s, e),
@@ -703,20 +776,20 @@ impl Kernel {
     /// `task_info(TASK_VM_INFO)` and `TASK_VM_INFO_PURGEABLE` of this task
     /// (`task.c`), with the caller's count checked and fixed as XNU does
     /// (an iOS 12 SDK's larger count is taken as rev2's): the map's size,
-    /// entries, page and bounds; the purgeable volatile sizes (none: no
-    /// purgeable memory is made here); its `phys_footprint` ledger's
-    /// balance (`get_task_phys_footprint`, the task's pages looked at now)
-    /// and lifetime peak (`ledger_get_lifetime_max`), and what its memory
-    /// limit leaves (`memorystatus_available_memory_internal`); the
-    /// purgeable and owned-memory ledgers (none: neither purgeable memory
-    /// nor ownership changes are made here). What needs the pmap's other
-    /// ledgers and the compressor's, which are not kept (resident, internal,
-    /// external, reusable and compressed sizes and peaks, decompressions,
-    /// swap-ins), is reported and given as 0.
+    /// entries, page and bounds; the pmap's ledgers from one look at the
+    /// task's pages (`phys_mem` as the resident size, `internal`,
+    /// `external`, `reusable`, each with its lifetime peak); its
+    /// `phys_footprint` ledger's balance (`get_task_phys_footprint`) and
+    /// lifetime peak (`ledger_get_lifetime_max`), and what its memory limit
+    /// leaves (`memorystatus_available_memory_internal`). The device
+    /// modelled runs no pageout (its pressure level stays normal), so its
+    /// compressor holds nothing of the task's and nothing is swapped: the
+    /// compressed sizes, their peak and lifetime, the decompressions and
+    /// the swap-ins are 0, as are the purgeable volatile sizes and the
+    /// purgeable and tag ledgers (no purgeable memory is made here).
     pub(crate) fn darwin_task_vm_info(&mut self, m: &mut GuestMem<'_>, count: u32) -> super::kobject::Reply {
         use super::kobject::Reply;
         const KERN_INVALID_ARGUMENT: i32 = 4;
-        const TASK_VM_INFO_PURGEABLE: i32 = 23;
         // TASK_VM_INFO_REV*_COUNT: natural_t of the packed structure.
         const REV0: u32 = 36;
         const REV1: u32 = 38;
@@ -740,19 +813,22 @@ impl Kernel {
         put(&mut out, 0, size);
         out[8..12].copy_from_slice(&entries.to_le_bytes());
         out[12..16].copy_from_slice(&((super::mach::PAGE_MASK + 1) as u32).to_le_bytes());
-        let mut unkept = vec!["resident_size", "resident_size_peak", "internal", "internal_peak", "external", "external_peak", "reusable", "reusable_peak", "compressed", "compressed_peak", "compressed_lifetime"];
-        // device and device_peak (32, 40) are 0, and so are the purgeable
-        // volatile sizes (96-112), TASK_VM_INFO_PURGEABLE's
-        // vm_map_query_volatile finding no purgeable object.
-        let _ = TASK_VM_INFO_PURGEABLE;
+        // One look: the ledgers as the pmap holds them now.
+        let footprint = self.darwin_footprint_now(m);
+        let (now, peaks) = {
+            let pm = self.dtask.rusage.meter.lock();
+            (pm.pages(), pm.peaks)
+        };
+        let Some(footprint) = footprint else {
+            self.darwin_unimplemented("task_info TASK_VM_INFO on a host that cannot say which pages are a task's".into());
+            return Reply::err(5);
+        };
+        for (at, pages) in [(16, now.resident), (24, peaks.resident), (48, now.internal), (56, peaks.internal), (64, now.external), (72, peaks.external), (80, now.reusable), (88, peaks.reusable)] {
+            put(&mut out, at, pages * PAGE);
+        }
         let mut n = REV0;
-        let footprint = if original >= REV1 { self.darwin_footprint_now(m) } else { None };
-        let peak = self.procs.jetsam().ledgers.get(&self.pid).map(|l| l.lifetime_max);
         if original >= REV1 {
-            match footprint {
-                Some(f) => put(&mut out, 144, f as u64),
-                None => unkept.push("phys_footprint (the host cannot say which pages are the task's)"),
-            }
+            put(&mut out, 144, footprint as u64);
             n = REV1;
         }
         if original >= REV2 {
@@ -763,28 +839,20 @@ impl Kernel {
         if original >= REV3 {
             // ledger_phys_footprint_peak; the purgeable and tag ledgers
             // after it are 0.
-            match (footprint, peak) {
-                (Some(_), Some(p)) => put(&mut out, 168, p as u64),
-                _ => unkept.push("ledger_phys_footprint_peak"),
-            }
+            let peak = self.procs.jetsam().ledgers.get(&self.pid).map_or(footprint, |l| l.lifetime_max);
+            put(&mut out, 168, peak as u64);
             n = REV3;
         }
         if original >= REV4 {
-            match footprint {
-                Some(f) => put(&mut out, 336, self.procs.jetsam().available_memory(self.pid, f as u64)),
-                None => unkept.push("limit_bytes_remaining"),
-            }
+            put(&mut out, 336, self.procs.jetsam().available_memory(self.pid, footprint as u64));
             n = REV4;
         }
         if original >= REV5 {
-            unkept.push("decompressions");
             n = REV5;
         }
         if original >= REV6 {
-            unkept.push("ledger_swapins");
             n = REV6;
         }
-        self.darwin_unimplemented(format!("task_info TASK_VM_INFO's {}: the pmap's and the compressor's ledgers are not kept (given as 0)", unkept.join(", ")));
         // task_info_out, CountInOut: the count, then that many words.
         let mut reply = n.to_le_bytes().to_vec();
         reply.extend_from_slice(&out[..n as usize * 4]);
@@ -871,17 +939,17 @@ mod tests {
         // A file's page in another leaf table's 32 MB.
         st.insert(BASE + (1 << L3_SHIFT), ps::PRESENT | ps::EXTERNAL);
         let mut pm = Pmap::default();
-        assert!(pm.look(&[(BASE, BASE + (2 << L3_SHIFT))], &[0], &mut host(&st)));
+        assert!(pm.look(&[(BASE, BASE + (2 << L3_SHIFT))], &[0], &[], &mut host(&st)));
         assert_eq!(pm.balance(), 2 * PAGE as i64 + FIXED + 2 * PAGE as i64);
         assert_eq!((pm.held(BASE + 2 * PAGE), pm.held(BASE + (1 << L3_SHIFT))), (Held::Reusable, Held::File));
         // The host reclaims a clean page of the task's and evicts the
         // file's: the device modelled keeps both, and the tables.
         st.remove(&BASE);
         st.remove(&(BASE + (1 << L3_SHIFT)));
-        assert!(pm.look(&[(BASE, BASE + (2 << L3_SHIFT))], &[0], &mut host(&st)));
+        assert!(pm.look(&[(BASE, BASE + (2 << L3_SHIFT))], &[0], &[], &mut host(&st)));
         assert_eq!(pm.balance(), 2 * PAGE as i64 + FIXED + 2 * PAGE as i64);
         // A page out of every range is the map's no more.
-        assert!(pm.look(&[(BASE + PAGE, BASE + (2 << L3_SHIFT))], &[0], &mut host(&st)));
+        assert!(pm.look(&[(BASE + PAGE, BASE + (2 << L3_SHIFT))], &[0], &[], &mut host(&st)));
         assert_eq!(pm.held(BASE), Held::None);
         assert_eq!(pm.balance(), PAGE as i64 + FIXED + 2 * PAGE as i64);
     }
@@ -894,7 +962,7 @@ mod tests {
         }
         st.insert(BASE + (1 << L3_SHIFT), ps::PRESENT);
         let mut pm = Pmap::default();
-        assert!(pm.look(&[(BASE, BASE + (2 << L3_SHIFT))], &[], &mut host(&st)));
+        assert!(pm.look(&[(BASE, BASE + (2 << L3_SHIFT))], &[], &[], &mut host(&st)));
         assert_eq!(pm.balance(), 5 * PAGE as i64 + FIXED + 2 * PAGE as i64);
         // Part of the first table's pages: it stays.
         pm.remove(BASE, BASE + 2 * PAGE);
@@ -912,14 +980,14 @@ mod tests {
             st.insert(BASE + i * PAGE, ps::PRESENT);
         }
         let mut pm = Pmap::default();
-        assert!(pm.look(&[(BASE, BASE + 4 * PAGE)], &[], &mut host(&st)));
+        assert!(pm.look(&[(BASE, BASE + 4 * PAGE)], &[], &[], &mut host(&st)));
         pm.made_reusable(BASE, BASE + 2 * PAGE);
         assert_eq!(pm.balance(), PAGE as i64 + FIXED + PAGE as i64);
         assert!(!pm.holds(BASE, BASE + 2 * PAGE, true) && pm.holds(BASE, BASE + 2 * PAGE, false));
         // The host reclaims one of them; the reuse finds both still entered.
         st.remove(&BASE);
         st.insert(BASE + PAGE, ps::PRESENT | ps::REUSABLE);
-        assert!(pm.look(&[(BASE, BASE + 4 * PAGE)], &[], &mut host(&st)));
+        assert!(pm.look(&[(BASE, BASE + 4 * PAGE)], &[], &[], &mut host(&st)));
         pm.reused(BASE, BASE + 4 * PAGE);
         assert_eq!(pm.balance(), 3 * PAGE as i64 + FIXED + PAGE as i64);
     }
@@ -933,7 +1001,7 @@ mod tests {
         let mut pm = Pmap::default();
         let mut l = Ledger::default();
         let range = [(BASE, BASE + 2 * N * PAGE)];
-        assert!(pm.look(&range, &[0], &mut host(&st)));
+        assert!(pm.look(&range, &[0], &[], &mut host(&st)));
         l.balance_is(pm.balance());
         let empty = pm.balance();
         for i in 0..N {
@@ -941,12 +1009,12 @@ mod tests {
         }
         // A look on the thread calls; then the host reclaims some clean ones
         // before the operation, which looks again first.
-        assert!(pm.look(&range, &[0], &mut host(&st)));
+        assert!(pm.look(&range, &[0], &[], &mut host(&st)));
         l.balance_is(pm.balance());
         for i in 0..N / 4 {
             st.remove(&(BASE + i * PAGE));
         }
-        assert!(pm.look(&range, &[0], &mut host(&st)));
+        assert!(pm.look(&range, &[0], &[], &mut host(&st)));
         l.balance_is(pm.balance());
         // The unmap: the host's pages go with the mapping.
         st.clear();
@@ -959,10 +1027,48 @@ mod tests {
         for i in 0..N / 2 {
             st.insert(BASE + i * PAGE, ps::PRESENT);
         }
-        assert!(pm.look(&range, &[0], &mut host(&st)));
+        assert!(pm.look(&range, &[0], &[], &mut host(&st)));
         l.observe(pm.balance());
         assert_eq!(l.get_interval_max(false), empty + (N / 2 * PAGE) as i64 + PAGE as i64);
         assert_eq!(l.lifetime_max, empty + (N * PAGE) as i64 + PAGE as i64);
+    }
+
+    #[test]
+    fn pages_not_entered_hold_nothing_until_their_first_access() {
+        // A fork's child: every page the parent had is the host's in the
+        // child's memory too (a copy on write), none entered in its pmap.
+        let mut st = std::collections::BTreeMap::new();
+        for i in 0..8 {
+            st.insert(BASE + i * PAGE, ps::PRESENT);
+        }
+        let range = [(BASE, BASE + 8 * PAGE)];
+        let mut pm = Pmap::default();
+        let mut unentered = vec![(BASE, BASE + 8 * PAGE)];
+        assert!(pm.look(&range, &[0], &unentered, &mut host(&st)));
+        assert_eq!(pm.balance(), FIXED, "only the twig the map always has");
+        // Two pages touched (entered): those count, with their leaf table.
+        unentered = vec![(BASE, BASE + 2 * PAGE), (BASE + 3 * PAGE, BASE + 7 * PAGE)];
+        assert!(pm.look(&range, &[0], &unentered, &mut host(&st)));
+        assert_eq!(pm.balance(), FIXED + 2 * PAGE as i64 + PAGE as i64);
+        assert_eq!((pm.held(BASE + 2 * PAGE), pm.held(BASE + 7 * PAGE), pm.held(BASE)), (Held::Own, Held::Own, Held::None));
+    }
+
+    #[test]
+    fn the_pmap_ledgers_count_each_kind_of_page_and_keep_their_peaks() {
+        let mut st = std::collections::BTreeMap::new();
+        st.insert(BASE, ps::PRESENT);
+        st.insert(BASE + PAGE, ps::PRESENT);
+        st.insert(BASE + 2 * PAGE, ps::PRESENT | ps::REUSABLE);
+        st.insert(BASE + 3 * PAGE, ps::PRESENT | ps::EXTERNAL);
+        let range = [(BASE, BASE + 8 * PAGE)];
+        let mut pm = Pmap::default();
+        assert!(pm.look(&range, &[], &[], &mut host(&st)));
+        assert_eq!(pm.pages(), Pages { resident: 4, internal: 2, external: 1, reusable: 1 });
+        pm.made_reusable(BASE, BASE + PAGE);
+        assert_eq!(pm.pages(), Pages { resident: 4, internal: 1, external: 1, reusable: 2 });
+        pm.remove(BASE, BASE + 4 * PAGE);
+        assert_eq!(pm.pages(), Pages::default());
+        assert_eq!(pm.peaks, Pages { resident: 4, internal: 2, external: 1, reusable: 2 });
     }
 
     #[test]

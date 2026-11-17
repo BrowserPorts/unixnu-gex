@@ -61,6 +61,9 @@ pub mod kind {
     pub const SHM: u8 = 3;
     /// The shared region: a submap.
     pub const SUBMAP: u8 = 4;
+    /// A named memory entry's object, internal and shared through the
+    /// entry (`true_share`).
+    pub const OBJECT: u8 = 5;
 }
 
 /// `MACH_VM_MAX_ADDRESS` on iOS, `VM_MAX_ADDRESS` here.

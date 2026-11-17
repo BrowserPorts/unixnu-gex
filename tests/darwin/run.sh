@@ -459,6 +459,11 @@ hello from /var/tmp/gex-exec-fat with 1 argument" 0
     fdinfo) check_root fdinfo "fdinfo ok" 0 ;;
     setattr) check_root setattr "setattr ok" 0 ;;
     vmcopy) check_root vmcopy "vmcopy ok" 0 ;;
+    vmshare) check_root vmshare "vmshare ok" 0 ;;
+    remap) check_root remap "remap ok" 0 ;;
+    vmwrite) check_root vmwrite "vmwrite ok" 0 ;;
+    freezer) check_root freezer "freezer ok" 0 ;;
+    ment) check_root ment "ment ok" 0 ;;
     sockevent) check_root sockevent "sockevent ok" 0 ;;
     thcwd) check_root thcwd "thcwd ok" 0 ;;
     clone) check_root clone "clone ok" 0 ;;
@@ -590,7 +595,7 @@ if [ "$named" -gt 0 ]; then
         run "$p"
     done
 else
-    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate thinfo tasksuspend portrefs crosstask spawnports taskname taskreg procfind debugport excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl iokit storagereg ioreg accel accelr metalwire metal iosurface iosurfacex iosurfacesplash iosurfacexpreboard iogpudev iomfb iomfbmain xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit sbxinit sbxexec sbxkill hostspecial sbxmask sbxnet sbxiokit sbxpriv sbxfile sbxscrub cfrunloop xpc-anon layout overlay stackfb launchcon shregion console owners apfsroles disknodes diskio fsfreeze fmount mntupdate fsstatwait ignition graftdmg tcload inet6 rusage; do
+    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate thinfo tasksuspend portrefs crosstask spawnports taskname taskreg procfind debugport excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl iokit storagereg ioreg accel accelr metalwire metal iosurface iosurfacex iosurfacesplash iosurfacexpreboard iogpudev iomfb iomfbmain xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit sbxinit sbxexec sbxkill hostspecial sbxmask sbxnet sbxiokit sbxpriv sbxfile sbxscrub cfrunloop xpc-anon layout overlay stackfb launchcon shregion console owners apfsroles disknodes diskio fsfreeze fmount mntupdate fsstatwait ignition graftdmg tcload inet6 rusage vmshare remap vmwrite freezer ment; do
         run "$p"
     done
 fi

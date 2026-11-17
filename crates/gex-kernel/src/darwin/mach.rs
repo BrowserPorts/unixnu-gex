@@ -165,7 +165,7 @@ pub(crate) fn abs_to_instant(abs: u64) -> Instant {
 }
 
 /// `VM_FLAGS_*` and the masks the traps check them against.
-mod vmf {
+pub(crate) mod vmf {
     pub const ANYWHERE: u64 = 0x1;
     pub const PURGABLE: u64 = 0x2;
     pub const CHUNK_4GB: u64 = 0x4;
@@ -180,6 +180,10 @@ mod vmf {
     pub const ALIAS_MASK: u64 = 0xff00_0000;
     pub const USER_ALLOCATE: u64 = ANYWHERE | PURGABLE | CHUNK_4GB | RANDOM_ADDR | NO_CACHE | PERMANENT | OVERWRITE | SUPERPAGE_MASK | TPRO | ALIAS_MASK;
     pub const USER_MAP: u64 = USER_ALLOCATE | RETURN_4K_DATA_ADDR | RETURN_DATA_ADDR;
+    pub const RESILIENT_CODESIGN: u64 = 0x20_0000;
+    pub const RESILIENT_MEDIA: u64 = 0x40_0000;
+    /// `VM_FLAGS_USER_REMAP`.
+    pub const USER_REMAP: u64 = ANYWHERE | RANDOM_ADDR | OVERWRITE | RETURN_DATA_ADDR | RESILIENT_CODESIGN | RESILIENT_MEDIA;
     /// What this kernel's VM does not do yet.
     pub const UNDONE: u64 = PURGABLE | CHUNK_4GB | PERMANENT | TPRO;
 }
@@ -340,7 +344,7 @@ impl Kernel {
                 }
                 // An executable mapping is readable.
                 let cur = if cur & prot::EXECUTE != 0 { cur | prot::READ } else { cur };
-                match self.vm_allocate(m, &mut addr, a[2], a[3], flags & !(vmf::RETURN_DATA_ADDR | vmf::RETURN_4K_DATA_ADDR), cur) {
+                match self.darwin_vm_enter_anon_object(m, &mut addr, a[2], a[3], flags & !(vmf::RETURN_DATA_ADDR | vmf::RETURN_4K_DATA_ADDR), cur, prot::ALL, super::vm::inherit::DEFAULT) {
                     kr::SUCCESS => {
                         if m.write_u64(a[1], addr).is_ok() { kr::SUCCESS } else { kr2::MEMORY_ERROR }
                     }
@@ -942,10 +946,23 @@ impl Kernel {
     /// `*addr` (fixed) or anywhere, aligned to `mask + 1`, with the user
     /// tag in the flags' top byte.
     fn vm_allocate(&mut self, m: &mut GuestMem<'_>, addr: &mut u64, size: u64, mask: u64, flags: u64, cur: u64) -> u64 {
-        use crate::mem::flags as mf;
         if flags & !vmf::USER_ALLOCATE != 0 {
             return kr::INVALID_ARGUMENT;
         }
+        // mach_vm_allocate: anywhere from the map's minimum.
+        if flags & vmf::ANYWHERE != 0 {
+            *addr = 0;
+        }
+        self.darwin_vm_enter_anon_object(m, addr, size, mask, flags, cur, prot::ALL, super::vm::inherit::DEFAULT)
+    }
+
+    /// `vm_map_enter` of anonymous memory (no object yet) with protection
+    /// `cur`, maximum `max` and inheritance `inherit`, `flags` already
+    /// checked against what the caller may pass. An anywhere request
+    /// searches from `*addr` (`vm_map_locate_space`'s hint).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn darwin_vm_enter_anon_object(&mut self, m: &mut GuestMem<'_>, addr: &mut u64, size: u64, mask: u64, flags: u64, cur: u64, max: u64, inherit: u8) -> u64 {
+        use crate::mem::flags as mf;
         if size == 0 {
             *addr = 0;
             return kr::SUCCESS;
@@ -966,7 +983,7 @@ impl Kernel {
         let cur = if cur & prot::WRITE != 0 && cur & prot::EXECUTE != 0 { cur & !prot::EXECUTE } else { cur };
         let p = (cur & prot::ALL) as u64;
         let linux_prot = (p & 1) | (p & 2) | (p & 4);
-        let attrs = super::vm::Attrs { alias: (flags >> 24) as u8, no_cache: flags & vmf::NO_CACHE != 0, ..Default::default() };
+        let attrs = super::vm::Attrs { alias: (flags >> 24) as u8, no_cache: flags & vmf::NO_CACHE != 0, max: (max & prot::ALL) as u8, inherit, ..Default::default() };
         if fixed {
             // vm_map_enter: the address meets the mask, then it is within
             // bounds.
@@ -1024,9 +1041,8 @@ impl Kernel {
                 Err(_) => kr::NO_SPACE,
             };
         }
-        // Anywhere: from the map's minimum (mach_vm_allocate's hint), the
-        // first fit.
-        let start = match self.darwin_locate_space(0, len, mask) {
+        // Anywhere: from the hint, the first fit.
+        let start = match self.darwin_locate_space(*addr & !PAGE_MASK, len, mask) {
             Ok(s) => s,
             Err(k) => return k,
         };
@@ -1337,10 +1353,18 @@ impl Kernel {
         self.darwin_own_memory(|_, m| m.read(addr, size as usize).map(<[u8]>::to_vec))?.map_err(|_| Reply::err(KERN_INVALID_ADDRESS))
     }
 
-    /// `vm_map_copy_overwrite` of this task's map at `dst`: the range must
+    /// A routine's `copyout` of `data` to this task's `dst`: the range must
     /// be mapped (KERN_INVALID_ADDRESS) and writable
-    /// (KERN_PROTECTION_FAILURE).
+    /// (KERN_PROTECTION_FAILURE); the pages it writes are entered.
     pub(crate) fn darwin_vm_copy_overwrite(&mut self, dst: u64, data: &[u8]) -> Result<(), super::kobject::Reply> {
+        self.darwin_vm_copy_overwrite_from(dst, data, None)
+    }
+
+    /// `vm_map_copy_overwrite` of this task's map at `dst` with `data`, the
+    /// copy `vm_map_copyin` made of the bytes at `src` (its `offset`), or
+    /// (none) a kernel's `copyout`: the range must be mapped
+    /// (KERN_INVALID_ADDRESS) and writable (KERN_PROTECTION_FAILURE).
+    pub(crate) fn darwin_vm_copy_overwrite_from(&mut self, dst: u64, data: &[u8], src: Option<u64>) -> Result<(), super::kobject::Reply> {
         use super::kobject::Reply;
         const KERN_INVALID_ADDRESS: i32 = 1;
         const KERN_PROTECTION_FAILURE: i32 = 2;
@@ -1362,10 +1386,91 @@ impl Kernel {
                 at = v.end;
             }
         }
-        self.darwin_own_memory(|_, m| m.write(dst, data))?.map_err(|_| Reply::err(KERN_INVALID_ADDRESS))?;
+        self.darwin_own_memory(|k, m| k.darwin_overwrite(m, dst, data, src))?.map_err(|_| Reply::err(KERN_INVALID_ADDRESS))?;
         if code {
             self.map_io().retire_code_why(dst, end - dst, "vm_write", crate::mem::prot::EXEC);
         }
+        Ok(())
+    }
+
+    /// The pages `vm_map_copy_overwrite` writes, and what the pmap holds of
+    /// them after. A copy of at most `msg_ool_size_small` (32 KiB on arm64)
+    /// is a kernel buffer, which `copyout` writes, entering the pages it
+    /// faults on. A larger one is a list of the source's entries: where it
+    /// and the destination are page aligned (all of it, or past a head and
+    /// before a tail when both start at the same place in a page and it is
+    /// at least `VM_MAP_COPY_OVERWRITE_OPTIMIZATION_THRESHOLD_PAGES` long),
+    /// an entry the task alone maps of anonymous memory or a private file
+    /// copy, or one waiting to be copied, takes the copy's object in place
+    /// of its own (`vm_map_copy_overwrite_aligned`): its pages leave the
+    /// pmap and come back as they are touched. Elsewhere the bytes are
+    /// copied into the destination's object (`vm_fault_copy`), which enters
+    /// no page that was not entered.
+    fn darwin_overwrite(&mut self, m: &mut GuestMem<'_>, dst: u64, data: &[u8], src: Option<u64>) -> Result<(), Errno> {
+        use super::vm::kind;
+        const MSG_OOL_SIZE_SMALL: u64 = 32 << 10;
+        const THRESHOLD_PAGES: u64 = 3;
+        let len = data.len() as u64;
+        let page = PAGE_MASK + 1;
+        let round = |a: u64| (a + PAGE_MASK) & !PAGE_MASK;
+        let Some(src) = src.filter(|_| len > MSG_OOL_SIZE_SMALL) else {
+            m.write(dst, data)?;
+            self.mem.lock().clear_unentered(dst & !PAGE_MASK, round(dst + len));
+            self.darwin_flush_perms(m);
+            return Ok(());
+        };
+        // What the task touched so far is held before anything changes.
+        let _ = self.darwin_footprint_now(m);
+        let middle = if dst & PAGE_MASK == 0 && src & PAGE_MASK == 0 && len & PAGE_MASK == 0 {
+            Some((dst, dst + len))
+        } else if len >= THRESHOLD_PAGES * page && dst & PAGE_MASK == src & PAGE_MASK {
+            let head = if dst & PAGE_MASK != 0 { (page - (src & PAGE_MASK)).min(len) } else { 0 };
+            let tail = if (src + len) & PAGE_MASK != 0 { ((src + len) & PAGE_MASK).min(len) } else { 0 };
+            (head + tail < len).then(|| (dst + head, dst + len - tail))
+        } else {
+            None
+        };
+        let bytes = |s: u64, e: u64| &data[(s - dst) as usize..(e - dst) as usize];
+        // vm_fault_copy: the pages not entered stay so.
+        let physical = |k: &mut Kernel, m: &mut GuestMem<'_>, s: u64, e: u64| -> Result<(), Errno> {
+            if s >= e {
+                return Ok(());
+            }
+            m.write(s, bytes(s, e))?;
+            let rusage = std::sync::Arc::clone(&k.dtask.rusage);
+            let pm = rusage.meter.lock();
+            let mut mm = k.mem.lock();
+            let mut at = s & !PAGE_MASK;
+            while at < e {
+                if pm.held(at) == super::footprint::Held::None && !mm.is_unentered(at >> gex_abi::PERM_PAGE_SHIFT) {
+                    mm.set_unentered(at, at + page);
+                }
+                at += page;
+            }
+            Ok(())
+        };
+        let Some((ms, me)) = middle else {
+            physical(self, m, dst, dst + len)?;
+            self.darwin_flush_perms(m);
+            return Ok(());
+        };
+        physical(self, m, dst, ms)?;
+        for (ps, pe, a) in self.dtask.vm.pieces(ms, me) {
+            let replace = a.kind != kind::SUBMAP && ((!a.shared && matches!(a.kind, kind::ANON | kind::FILE_PRIVATE)) || a.cow);
+            if !replace {
+                physical(self, m, ps, pe)?;
+                continue;
+            }
+            self.darwin_footprint_release(m, ps, pe, super::footprint::Release::Remove, |_, m| m.write(ps, bytes(ps, pe)))?;
+            self.mem.lock().set_unentered(ps, pe);
+            self.dtask.vm.update(ps, pe, |a| {
+                if a.kind == kind::ANON {
+                    a.cow = true;
+                }
+            });
+        }
+        physical(self, m, me, dst + len)?;
+        self.darwin_flush_perms(m);
         Ok(())
     }
 
@@ -1454,19 +1559,30 @@ impl Kernel {
             return kr::INVALID_ADDRESS;
         }
         if copy {
-            // vm_map_remap in place, copy on write: the range's entries
-            // become this task's own memory, with write access allowed,
-            // their file-backed pages no longer written back. The shared
-            // region's entry is cut around the copy.
-            self.mem.lock().log.shared_maps.cut(s, e - s);
-            self.dtask.vm.clip_range(s, e);
-            self.dtask.vm.update(s, e, |a| {
-                a.kind = super::vm::kind::ANON;
-                a.max |= prot::WRITE as u8;
-                a.cow = false;
-                a.jit = false;
-                a.shared = false;
-            });
+            // vm_map_remap in place, copy on write (vmkf_remap_prot_copy):
+            // the range's entries become copies of what they map, with
+            // write access allowed, their pages entered again only as they
+            // are touched.
+            if s >= self.darwin_map_max() {
+                return kr::INVALID_ADDRESS;
+            }
+            let mut r = super::vmshare::Remap {
+                target: s,
+                size: e - s,
+                mask: 0,
+                flags: vmf::OVERWRITE,
+                src: super::vmshare::Source::Same,
+                src_addr: s,
+                copy: true,
+                cur: 0,
+                max: new & prot::ALL,
+                inherit: u32::from(super::vm::inherit::DEFAULT),
+                prot_copy: true,
+            };
+            let k = self.darwin_vm_remap(m, &mut r);
+            if k != kr::SUCCESS {
+                return k;
+            }
         }
         let new = new & prot::ALL;
         let pieces = self.dtask.vm.pieces(s, e);

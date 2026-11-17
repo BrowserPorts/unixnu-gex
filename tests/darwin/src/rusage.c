@@ -27,7 +27,8 @@
 // unmapped. Another process's footprint and resident size, read from
 // outside it, and its peak after it unmapped what it touched. The fields
 // the kernel does not keep are reported, so a strict run stops at a
-// call that copies one ("stop": V2's, whose disk I/O is not kept).
+// call that copies one ("stop": V0's after the real timer's signal, the
+// wakeups a thread call's signal made not followed).
 //
 // Instructions and cycles (recount's PMC1 and PMC0): a loop of a known
 // count retires exactly that many more instructions for twice as many
@@ -41,8 +42,21 @@
 // Page-ins: the first touch of each page of a file's mapping that no pmap
 // has mapped is one; a page a read brought in, or another process mapped
 // first, is none; a reaped child's are its parent's ri_child_pageins.
+//
+// Disk I/O (task_io_stats, what spec_strategy sees the task's threads
+// issue): written pages reach the disk at fsync (at least their bytes),
+// an fsync with nothing dirty writes no data, a small write waits in the
+// cache (none written) while an O_SYNC one is written at once; pages
+// dropped from the cache (msync's invalidation) are read again, by read
+// and by a fault, at least a page each. Logical writes (the
+// logical_writes ledger): a page a write dirties counts at least its
+// bytes; the first store fault on a shared mapping's page counts the page
+// exactly (a load's fault enters a page no store has entered read only, so
+// a store after it faults and counts the same), a store again nothing, and
+// a shrinking file's dirty pages are taken back. A fork's child starts with none of either.
 
 #include <errno.h>
+#include <fcntl.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
@@ -288,6 +302,101 @@ static int page_ins(void) {
     return 0;
 }
 
+static struct rusage_info_v6 io_now(void) {
+    struct rusage_info_v6 r;
+    proc_pid_rusage(getpid(), RUSAGE_INFO_V4, &r);
+    return r;
+}
+
+// Disk I/O and logical writes of this process.
+static int disk_io(void) {
+    enum { P = 16384 };
+    char path[] = "/private/var/tmp/rusage-io.XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0) return bad("a file to write", errno, 0);
+    unlink(path);
+    static char buf[4 * P];
+    memset(buf, 7, sizeof buf);
+    // Four pages written: dirty in the cache, at least their bytes
+    // logical writes, nothing on the disk yet; then fsync writes them.
+    struct rusage_info_v6 a = io_now();
+    if (pwrite(fd, buf, sizeof buf, 0) != (ssize_t)sizeof buf) return bad("pwrite", errno, 0);
+    struct rusage_info_v6 b = io_now();
+    if (b.ri_logical_writes - a.ri_logical_writes < sizeof buf) return bad("logical writes of four new pages", (long)(b.ri_logical_writes - a.ri_logical_writes), (long)sizeof buf);
+    if (b.ri_diskio_byteswritten != a.ri_diskio_byteswritten) return bad("bytes written by a write to the cache", (long)(b.ri_diskio_byteswritten - a.ri_diskio_byteswritten), 0);
+    if (fsync(fd) != 0) return bad("fsync", errno, 0);
+    struct rusage_info_v6 c = io_now();
+    if (c.ri_diskio_byteswritten - b.ri_diskio_byteswritten < sizeof buf) return bad("bytes written by an fsync of four pages", (long)(c.ri_diskio_byteswritten - b.ri_diskio_byteswritten), (long)sizeof buf);
+    // Nothing dirty: an fsync writes no data.
+    fsync(fd);
+    struct rusage_info_v6 d = io_now();
+    if (d.ri_diskio_byteswritten != c.ri_diskio_byteswritten) return bad("bytes written by an fsync of clean pages", (long)(d.ri_diskio_byteswritten - c.ri_diskio_byteswritten), 0);
+    // The pages dropped from the cache: a read of one reads it from the
+    // disk, and so does a fault on another.
+    char *map = mmap(NULL, sizeof buf, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED) return bad("mmap", errno, 0);
+    if (msync(map, sizeof buf, MS_INVALIDATE | MS_SYNC) != 0) return bad("msync", errno, 0);
+    struct rusage_info_v6 e = io_now();
+    if (pread(fd, buf, P, 0) != P) return bad("pread", errno, 0);
+    struct rusage_info_v6 f = io_now();
+    if (f.ri_diskio_bytesread - e.ri_diskio_bytesread < P) return bad("bytes read by a read of a page not in the cache", (long)(f.ri_diskio_bytesread - e.ri_diskio_bytesread), P);
+    (void)*(volatile char *)(map + 3 * P);
+    struct rusage_info_v6 g = io_now();
+    if (g.ri_diskio_bytesread - f.ri_diskio_bytesread < P) return bad("bytes read by a fault on a page not in the cache", (long)(g.ri_diskio_bytesread - f.ri_diskio_bytesread), P);
+    munmap(map, sizeof buf);
+    // An O_SYNC write is written at once.
+    int fl = fcntl(fd, F_GETFL);
+    fcntl(fd, F_SETFL, fl | O_SYNC);
+    struct rusage_info_v6 h = io_now();
+    if (pwrite(fd, buf, P, 8 * P) != P) return bad("an O_SYNC pwrite", errno, 0);
+    struct rusage_info_v6 i = io_now();
+    fcntl(fd, F_SETFL, fl);
+    if (i.ri_diskio_byteswritten - h.ri_diskio_byteswritten < P) return bad("bytes written by an O_SYNC write", (long)(i.ri_diskio_byteswritten - h.ri_diskio_byteswritten), P);
+    close(fd);
+
+    // Store faults on a shared mapping of a file no write has touched:
+    // the first on a page is a page's logical write, after a load on it
+    // or not; a store on a page stored to before, none.
+    char path2[] = "/private/var/tmp/rusage-lw.XXXXXX";
+    fd = mkstemp(path2);
+    if (fd < 0 || ftruncate(fd, 4 * P) != 0) return bad("a file to map", errno, 0);
+    unlink(path2);
+    volatile char *w = mmap(NULL, 4 * P, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (w == MAP_FAILED) return bad("mmap", errno, 0);
+    struct rusage_info_v6 j = io_now();
+    w[0] = 1;
+    struct rusage_info_v6 k = io_now();
+    (void)w[P];
+    w[P] = 1;
+    w[0] = 2;
+    struct rusage_info_v6 l = io_now();
+    munmap((void *)w, 4 * P);
+    if (k.ri_logical_writes - j.ri_logical_writes != P) return bad("logical writes of a first store fault", (long)(k.ri_logical_writes - j.ri_logical_writes), P);
+    if (l.ri_logical_writes - k.ri_logical_writes != P) return bad("logical writes of a store after a load, and one again", (long)(l.ri_logical_writes - k.ri_logical_writes), P);
+    // Dirty pages a truncation discards are taken back.
+    if (pwrite(fd, buf, 2 * P, 0) != 2 * P) return bad("pwrite", errno, 0);
+    struct rusage_info_v6 t0 = io_now();
+    ftruncate(fd, 0);
+    struct rusage_info_v6 t1 = io_now();
+    close(fd);
+    if ((int64_t)(t1.ri_logical_writes - t0.ri_logical_writes) >= 0) return bad("logical writes after dirty pages are truncated away", (long)(int64_t)(t1.ri_logical_writes - t0.ri_logical_writes), -2 * P);
+    // A fork's child: none of either.
+    int pp[2];
+    pipe(pp);
+    pid_t ch = fork();
+    if (ch == 0) {
+        struct rusage_info_v6 r = io_now();
+        uint64_t v[3] = { r.ri_diskio_bytesread, r.ri_diskio_byteswritten, r.ri_logical_writes };
+        write(pp[1], v, sizeof v);
+        _exit(0);
+    }
+    uint64_t v[3] = { 1, 1, 1 };
+    read(pp[0], v, sizeof v);
+    waitpid(ch, NULL, 0);
+    if (v[0] || v[1] || v[2]) return bad("a fork's child's disk I/O and logical writes at its start", (long)(v[0] + v[1] + v[2]), 0);
+    return 0;
+}
+
 int proc_rlimit_control(pid_t pid, int flavor, void *arg);
 #ifndef RLIMIT_FOOTPRINT_INTERVAL
 #define RLIMIT_FOOTPRINT_INTERVAL 4
@@ -385,9 +494,16 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (argc > 1 && strcmp(argv[1], "stop") == 0) {
+        // A wakeup a thread call's signal made (the real timer's) is not
+        // followed: V0's wakeup counts are not kept after it.
         printf("rusage stop\n");
         fflush(stdout);
-        proc_pid_rusage(getpid(), RUSAGE_INFO_V2, &r);
+        struct sigaction sa = { .sa_handler = on_alarm };
+        sigaction(SIGALRM, &sa, NULL);
+        struct itimerval it = { { 0, 0 }, { 0, 1000 } };
+        setitimer(ITIMER_REAL, &it, NULL);
+        while (!handled) sink++;
+        proc_pid_rusage(getpid(), RUSAGE_INFO_V0, &r);
         return 0;
     }
     // The calendar and Mach clocks read together near its start, for
@@ -555,7 +671,7 @@ int main(int argc, char **argv) {
     }
     // The footprint's peaks, after the child sums above (another process
     // read here is reaped, and its time added to them).
-    if (peaks() || other() || instructions() || page_ins()) return 1;
+    if (peaks() || other() || instructions() || page_ins() || disk_io()) return 1;
     printf("rusage ok\n");
     return 0;
 }

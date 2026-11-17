@@ -57,14 +57,13 @@
 //! (`ps_start`), an ended process's end and `p_ru`; the reaped children's
 //! sums (`ri_child`); and the bank's CPU time bills (the time the threads
 //! that adopted an account's voucher ran, rolled up into the holder's and
-//! merchant's ledgers as the account goes). What needs counters that are
-//! not kept is given as 0
+//! merchant's ledgers as the account goes); the page-ins, the disk I/O
+//! and the logical writes the device's page cache and cluster layer make
+//! of the task's faults, reads, writes, syncs and truncations
+//! ([`super::pagecache`], [`super::cluster`]). What needs counters that
+//! are not kept is given as 0
 //! and reported: the wakeups a thread call's signal or message to another
-//! task made, VM page-ins (the device's page cache, and the first faults on
-//! the shared cache's pages and on code, which are not seen), disk I/O
-//! (which reads and writes reach `spec_strategy` through the buffer cache,
-//! the UBC and APFS), logical writes (the UBC's copies, first write faults
-//! on vnode pages, AppleAPFS's metadata objects), the CPMU's instructions
+//! task made, the CPMU's instructions
 //! (XNU's own among them) and cycles (at CLPC's frequencies), the footprint
 //! where the host keeps no view of the process's memory (the browser's),
 //! and a bill while a thread that has it runs (the device credits it at
@@ -130,7 +129,7 @@ pub mod ri {
 }
 
 /// Each field that can go unkept: its name, and what it needs.
-const UNKEPT: [(usize, &str, &str); 20] = [
+const UNKEPT: [(usize, &str, &str); 17] = [
     (ri::USER_TIME, "ri_user_time", "per-thread clocks on the host"),
     (ri::PKG_IDLE_WKUPS, "ri_pkg_idle_wkups", "the platform_idle_wakeups ledger: what a signal a thread call posted woke, or a thread call's message to another task's port"),
     (ri::INTERRUPT_WKUPS, "ri_interrupt_wkups", "the interrupt_wakeups ledger: what a signal a thread call posted woke, or a thread call's message to another task's port"),
@@ -140,12 +139,9 @@ const UNKEPT: [(usize, &str, &str); 20] = [
     (ri::CHILD_INTERRUPT_WKUPS, "ri_child_interrupt_wkups", "the reaped children's interrupt wakeups"),
     (ri::CHILD_PAGEINS, "ri_child_pageins", "the reaped children's page-ins"),
     (ri::CHILD_USER_TIME, "ri_child_user_time", "the reaped children's times on a host without per-thread clocks"),
-    (ri::DISKIO_BYTESREAD, "ri_diskio_bytesread", "task_io_stats at spec_strategy (its one caller of thread_update_io_stats): the reads that miss the buffer cache and the UBC, cluster read-ahead and APFS's own metadata reads, by the thread that issues them"),
-    (ri::DISKIO_BYTESWRITTEN, "ri_diskio_byteswritten", "task_io_stats at spec_strategy: the writes that reach the disk, by the thread that issues them (write-behind, APFS's flushes)"),
     (ri::CPU_TIME_QOS, "ri_cpu_time_qos_*", "per-thread clocks on the host"),
     (ri::BILLED_SYSTEM_TIME, "ri_billed_system_time", "a bill one of whose adopting threads runs at the read (the device credits it at quantum ends), or whose time could not be read"),
     (ri::SERVICED_SYSTEM_TIME, "ri_serviced_system_time", "a bill one of whose adopting threads runs at the read (the device credits it at quantum ends), or whose time could not be read"),
-    (ri::LOGICAL_WRITES, "ri_logical_writes", "the logical_writes ledger: cluster_write's copies into the UBC and direct writes, the first write fault on each vnode page, dirty pages discarded, and AppleAPFS's obj_dirty (once per metadata object a transaction first dirties)"),
     (ri::LIFETIME_MAX_PHYS_FOOTPRINT, "ri_lifetime_max_phys_footprint", "a look at the process's pages, which the host keeps no view of"),
     (ri::INSTRUCTIONS, "ri_instructions", "PMC1 at every switch and quantum expiry (recount_snapshot): the instructions the translator counts in each thread's context (none where the function tier runs, or where the host keeps no view of the process's memory)"),
     (ri::CYCLES, "ri_cycles", "PMC0 over the threads' on-core time: per-thread clocks on the host"),
@@ -289,6 +285,14 @@ pub struct Shared {
     /// ([`super::pagecache::fault`]). An exec's task takes the old one's
     /// (`task_rollup_accounting_info`).
     pub pageins: AtomicU64,
+    /// `task_io_stats`' `disk_reads.size` and `total_io.size`: the bytes
+    /// `spec_strategy` saw its threads read, and read and write
+    /// ([`super::pagecache::charge`]). An exec's task takes the old one's.
+    pub disk_read: AtomicU64,
+    pub disk_total: AtomicU64,
+    /// The `logical_writes` ledger's balance (credits less debits); an
+    /// exec's task takes the old one's (`ledger_rollup_entry`).
+    pub logical_writes: std::sync::atomic::AtomicI64,
     child: Mutex<Child>,
     /// `p_ru->ri`: what `proc_exit` gathered.
     exit: Mutex<Option<Record>>,
@@ -306,6 +310,20 @@ impl Shared {
         self.interrupt_wkups.fetch_add(1, Ordering::AcqRel);
         if pidle {
             self.pkg_idle_wkups.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// `thread_update_io_stats` and `task_update_logical_writes` of one
+    /// operation of its threads'.
+    pub fn io_add(&self, io: super::pagecache::Io) {
+        if io.read != 0 {
+            self.disk_read.fetch_add(io.read, Ordering::AcqRel);
+        }
+        if io.read + io.written != 0 {
+            self.disk_total.fetch_add(io.read + io.written, Ordering::AcqRel);
+        }
+        if io.logical != 0 {
+            self.logical_writes.fetch_add(io.logical, Ordering::AcqRel);
         }
     }
 
@@ -472,6 +490,11 @@ pub struct Input {
     pub instructions: Option<u64>,
     /// `counter_load(&task->pageins)`.
     pub pageins: u64,
+    /// `fill_task_io_rusage`'s `disk_reads.size` and `total_io.size`.
+    pub disk_read: u64,
+    pub disk_total: u64,
+    /// `get_task_logical_writes(task, false)`: the ledger's balance.
+    pub logical_writes: i64,
 }
 
 /// recount's CPMU figures (`CONFIG_PERVASIVE_CPI`): `ri_instructions` and
@@ -594,9 +617,9 @@ pub fn gather(i: &Input) -> Record {
             mark(ri::PKG_IDLE_WKUPS);
         }
     }
-    for f in [ri::DISKIO_BYTESREAD, ri::DISKIO_BYTESWRITTEN, ri::LOGICAL_WRITES] {
-        mark(f);
-    }
+    w[ri::DISKIO_BYTESREAD] = i.disk_read;
+    w[ri::DISKIO_BYTESWRITTEN] = i.disk_total.wrapping_sub(i.disk_read);
+    w[ri::LOGICAL_WRITES] = i.logical_writes as u64;
     w[ri::PAGEINS] = i.pageins;
     match i.instructions {
         Some(n) => w[ri::INSTRUCTIONS] = n,
@@ -698,6 +721,9 @@ fn input(procs: &crate::proc::ProcTable, pid: i32, p: &super::procinfo::Public) 
         exit_abstime: None,
         instructions: None,
         pageins: s.pageins.load(Ordering::Acquire),
+        disk_read: s.disk_read.load(Ordering::Acquire),
+        disk_total: s.disk_total.load(Ordering::Acquire),
+        logical_writes: s.logical_writes.load(Ordering::Acquire),
     }
 }
 
@@ -946,14 +972,20 @@ mod tests {
         // Not looked at: the resident size too.
         let blind = gather(&Input { resident: None, ..live() });
         assert!(blind.unkept_within(SIZES[0])[2].starts_with("ri_resident_size"));
-        // V1 adds nothing unkept while no child was reaped; V2 the disk's.
+        // V1 adds nothing unkept while no child was reaped; nor V2: the
+        // disk's I/O is the task's counters.
         assert_eq!(r.unkept_within(SIZES[1]).len(), 2);
-        assert_eq!(r.unkept_within(SIZES[2]).len(), 4);
+        assert_eq!(r.unkept_within(SIZES[2]).len(), 2);
         // V3: the QoS times, once; the bank's bills are kept.
-        assert_eq!(r.unkept_within(SIZES[3]).len(), 5);
-        // V4: the logical writes, the peaks (not looked at) and the
-        // instructions (not counted here); the cycles come with the time.
-        assert_eq!(r.unkept_within(SIZES[6]).len(), 5 + 4);
+        assert_eq!(r.unkept_within(SIZES[3]).len(), 3);
+        // V4: the peaks (not looked at) and the instructions (not counted
+        // here); the logical writes are the ledger's, the cycles come with
+        // the time.
+        assert_eq!(r.unkept_within(SIZES[6]).len(), 3 + 3);
+        // The disk I/O and logical writes: the task's sums, the written
+        // bytes all but the read ones, the ledger's balance as it is.
+        let io = gather(&Input { disk_read: 100, disk_total: 350, logical_writes: -16384, ..live() });
+        assert_eq!((io.w[ri::DISKIO_BYTESREAD], io.w[ri::DISKIO_BYTESWRITTEN], io.w[ri::LOGICAL_WRITES] as i64), (100, 250, -16384));
         // The page-ins are the task's counter.
         assert_eq!(gather(&Input { pageins: 7, ..live() }).w[ri::PAGEINS], 7);
     }
@@ -1044,7 +1076,7 @@ mod tests {
         let r = gather(&i);
         assert_eq!(&r.w[ri::CPU_TIME_QOS..ri::CPU_TIME_QOS + 7], &[1, 2, 3, 4, 5, 6, 7]);
         assert!(!r.unkept_within(SIZES[3]).join(" ").contains("ri_cpu_time_qos"));
-        assert_eq!(r.unkept_within(SIZES[3]).len(), 4);
+        assert_eq!(r.unkept_within(SIZES[3]).len(), 2);
     }
 
     #[test]

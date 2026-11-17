@@ -51,6 +51,10 @@ pub struct OpenFile {
     fg_count: std::sync::atomic::AtomicU32,
     /// Its `vn_closefile` has run.
     darwin_closed: std::sync::atomic::AtomicBool,
+    /// A Darwin system's file opened for writing whose open its vnode's
+    /// write count holds ([`crate::darwin::pagecache::open_writer`]),
+    /// until its last descriptor closes.
+    darwin_writer: std::sync::atomic::AtomicBool,
     /// How many mounts the Darwin mount list had when this was opened: the
     /// mount its vnode is on is among them (`crate::darwin::kern::mount_of_seen`),
     /// not one mounted on its path since.
@@ -74,6 +78,13 @@ pub struct OpenFile {
     /// which file a description is, so a second `open` of a file finds the
     /// first one's shared mappings ([`OpenFile::same_file`]). Read once.
     ino: OnceLock<u64>,
+}
+
+/// What a write meets before it is made ([`OpenFile::cache_before_write`]).
+#[derive(Clone, Copy, Debug)]
+struct WriteBefore {
+    size: u64,
+    ends: [(u64, u64); 2],
 }
 
 /// An open file in flight in a unix socket's message (`unp_internalize`'s
@@ -145,7 +156,22 @@ impl Drop for OpenFile {
 impl OpenFile {
     /// `fg_ref`: another descriptor, file port or message in flight holds it.
     pub fn fg_retain(&self) {
-        self.fg_count.fetch_add(1, Ordering::AcqRel);
+        if self.fg_count.fetch_add(1, Ordering::AcqRel) == 0 {
+            self.note_writer();
+        }
+    }
+
+    /// A Darwin system's regular file open for writing taking its first
+    /// hold: `vn_open`'s count of its vnode's writers.
+    fn note_writer(&self) {
+        if !self.writable || !crate::darwin::pagecache::on() || self.handle.is_stream() || self.darwin_writer.load(Ordering::Acquire) {
+            return;
+        }
+        if let Some(key) = self.handle.host_id() {
+            if !self.darwin_writer.swap(true, Ordering::AcqRel) {
+                crate::darwin::pagecache::open_writer(key);
+            }
+        }
     }
 
     /// `fg_ref` through a descriptor still open: another hold, unless its
@@ -178,6 +204,15 @@ impl OpenFile {
     pub fn fg_closed(&self) {
         if self.darwin_lock_key.get().is_some() && !self.darwin_closed.swap(true, Ordering::AcqRel) {
             crate::darwin::lockf::last_close(self);
+        }
+        // vn_close: the filesystem's close (APFS pushes a written file's
+        // last writer's clusters), then the write count's drop.
+        if crate::darwin::pagecache::on() && !self.handle.is_stream() {
+            if let Some(key) = self.handle.host_id() {
+                let writer = self.darwin_writer.swap(false, Ordering::AcqRel);
+                let size = self.handle.metadata().map_or(0, |m| m.size);
+                crate::darwin::pagecache::charge(crate::darwin::pagecache::close(key, size, writer));
+            }
         }
         self.handle.vn_close();
     }
@@ -236,6 +271,7 @@ impl OpenFile {
             darwin_sockopt: Mutex::new(None),
             fg_count: std::sync::atomic::AtomicU32::new(0),
             darwin_closed: std::sync::atomic::AtomicBool::new(false),
+            darwin_writer: std::sync::atomic::AtomicBool::new(false),
             darwin_mounts_seen: crate::darwin::kern::mount_count(),
         })
     }
@@ -269,6 +305,7 @@ impl OpenFile {
             darwin_sockopt: Mutex::new(None),
             fg_count: std::sync::atomic::AtomicU32::new(0),
             darwin_closed: std::sync::atomic::AtomicBool::new(false),
+            darwin_writer: std::sync::atomic::AtomicBool::new(false),
             darwin_mounts_seen: crate::darwin::kern::mount_count(),
         })
     }
@@ -354,7 +391,7 @@ impl OpenFile {
         let n = self.handle.read_at(off, buf)?;
         if !self.handle.is_stream() {
             self.offset.fetch_add(n, Ordering::Relaxed);
-            self.through_cache(off, n);
+            self.cache_read(off, n);
         }
         Ok(n)
     }
@@ -376,10 +413,11 @@ impl OpenFile {
         } else {
             self.offset.load(Ordering::Relaxed)
         };
+        let before = self.cache_before_write(off, buf.len() as u64);
         let n = self.handle.write_at(off, buf)?;
         if !self.handle.is_stream() {
             self.offset.store(off + n, Ordering::Relaxed);
-            self.through_cache(off, n);
+            self.cache_write(off, n, before);
         }
         Ok(n)
     }
@@ -389,7 +427,7 @@ impl OpenFile {
             return Err(Errno::EBADF);
         }
         let n = self.handle.read_at(offset, buf)?;
-        self.through_cache(offset, n);
+        self.cache_read(offset, n);
         Ok(n)
     }
 
@@ -397,20 +435,82 @@ impl OpenFile {
         if !self.writable {
             return Err(Errno::EBADF);
         }
+        let before = self.cache_before_write(offset, buf.len() as u64);
         let n = self.handle.write_at(offset, buf)?;
-        self.through_cache(offset, n);
+        self.cache_write(offset, n, before);
         Ok(n)
     }
 
-    /// A Darwin system's file pages that a `read` or `write` of `n` bytes
-    /// at `off` moved through its cache ([`crate::darwin::pagecache`]).
-    fn through_cache(&self, off: u64, n: u64) {
-        if n == 0 || !crate::darwin::pagecache::on() || self.handle.is_stream() {
+    /// A Darwin system's regular file, its pages kept
+    /// ([`crate::darwin::pagecache`]): the host file's key.
+    fn cache_key(&self) -> Option<crate::darwin::ubc::FileKey> {
+        if !crate::darwin::pagecache::on() || self.handle.is_stream() {
+            return None;
+        }
+        self.handle.host_id()
+    }
+
+    /// A `read` of `n` bytes at `off` through the cache (`vn_read`'s
+    /// `cluster_read`), charged to the running thread's task.
+    fn cache_read(&self, off: u64, n: u64) {
+        if n == 0 {
             return;
         }
-        if let Some(key) = self.handle.host_id() {
-            crate::darwin::pagecache::through_cache(key, off, n);
+        let Some(key) = self.cache_key() else { return };
+        let lflags = self.darwin_lflags.load(Ordering::Acquire);
+        use crate::darwin::ioctl::fflag;
+        if lflags & fflag::FNOCACHE != 0 {
+            crate::darwin::note_unimplemented("a read through F_NOCACHE (IO_NOCACHE: cluster_read_direct, its I/O and the pages it leaves)".into());
+            return;
         }
+        let size = self.handle.metadata().map_or(0, |m| m.size);
+        let fd = self.handle.host_fd();
+        let io = crate::darwin::pagecache::read(key, off, n, size, lflags & fflag::FNORDAHEAD != 0, &|a, b| crate::darwin::pagecache::backed(fd, a, b));
+        crate::darwin::pagecache::charge(io);
+    }
+
+    /// What a write of `len` bytes at `off` meets before it is made: the
+    /// file's size, and the data of the pages at its two ends (all a
+    /// `cluster_write_copy` may read first).
+    fn cache_before_write(&self, off: u64, len: u64) -> Option<WriteBefore> {
+        if len == 0 {
+            return None;
+        }
+        self.cache_key()?;
+        let size = self.handle.metadata().map_or(0, |m| m.size);
+        let fd = self.handle.host_fd();
+        let page = crate::darwin::pagecache::PAGE;
+        let first = off & !(page - 1);
+        let last = (off + len - 1) & !(page - 1);
+        let alloc = size.div_ceil(crate::darwin::cluster::DEVBLOCK) * crate::darwin::cluster::DEVBLOCK;
+        let ends = [first, last].map(|p| (p, crate::darwin::pagecache::backed(fd, p, (p + page).min(alloc.max(p)))));
+        Some(WriteBefore { size, ends })
+    }
+
+    /// A `write` of `n` bytes at `off` through the cache (`vn_write`'s
+    /// `VNOP_WRITE`: `apfs_vnop_write`'s `cluster_write`), charged to the
+    /// running thread's task.
+    fn cache_write(&self, off: u64, n: u64, before: Option<WriteBefore>) {
+        let (Some(key), Some(b)) = (self.cache_key(), before) else { return };
+        if n == 0 {
+            return;
+        }
+        let lflags = self.darwin_lflags.load(Ordering::Acquire);
+        use crate::darwin::ioctl::fflag;
+        if lflags & fflag::FNOCACHE != 0 && lflags & fflag::FNODIRECT == 0 {
+            crate::darwin::note_unimplemented("a write through F_NOCACHE (IO_NOCACHE: cluster_write_direct, its immediate logical writes and I/O)".into());
+            return;
+        }
+        // vn_write: IO_SYNC for O_SYNC and O_DSYNC alike.
+        let sync = self.flags() & 0x1000 != 0;
+        let fd = self.handle.host_fd();
+        let page = crate::darwin::pagecache::PAGE;
+        let backed = |a: u64, e: u64| match b.ends.iter().find(|&&(p, _)| a == p && e <= p + page) {
+            Some(&(_, d)) => d,
+            None => crate::darwin::pagecache::backed(fd, a, e),
+        };
+        let io = crate::darwin::pagecache::apfs_write(key, off, n, b.size, sync, lflags & fflag::FNOCACHE != 0, &backed);
+        crate::darwin::pagecache::charge(io);
     }
 
     pub fn seek(&self, offset: i64, whence: u32) -> SysResult {

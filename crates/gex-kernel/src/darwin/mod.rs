@@ -51,6 +51,7 @@ pub mod accel;
 pub mod iomfb;
 pub mod platform;
 pub mod pagecache;
+pub mod cluster;
 pub mod pe;
 pub mod vattr;
 pub mod vauth;

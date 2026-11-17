@@ -10456,9 +10456,11 @@ impl Kernel {
             }
         }
         self.switch_signals(t.tid);
-        // Where its instructions are counted, for readers of its task's.
+        // Where its instructions are counted, for readers of its task's;
+        // and the task its I/O is charged to (`current_thread()`'s).
         if self.darwin {
             self.signals.thread().set_ctx(t.ctx_addr);
+            crate::darwin::pagecache::set_task(&self.dtask.rusage);
         }
     }
 

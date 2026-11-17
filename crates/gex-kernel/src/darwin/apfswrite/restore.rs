@@ -60,6 +60,7 @@ pub fn stand_ins(os: bool) -> Vec<&'static str> {
     let mut v = vec![RUN_STAND_IN, HOST_UUID_STAND_IN, GIGALOCKER_STAND_IN, fsops::UNWRITTEN_STAND_IN, NSIH_STAND_IN];
     if os {
         v.push(fsops::FILE_INODE_STAND_IN);
+        v.push(super::tx::KEYS_STAND_IN);
     }
     v
 }
@@ -114,16 +115,17 @@ pub fn build_disk0_with(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() ->
     nx.set_solid_state(crate::darwin::storagestack::container_solid_state());
     nx.mount_rw()?;
     let kv = key_os_version(RESTORE_BUILD)?;
-    let add = |nx: &mut Nx<'_>, name: &str, role: u16, size_bytes: Option<u64>, now: &mut dyn FnMut() -> u64| -> Result<u64, String> {
+    let add_with = |nx: &mut Nx<'_>, name: &str, role: u16, size_bytes: Option<u64>, encrypted: bool, now: &mut dyn FnMut() -> u64| -> Result<u64, String> {
         let formatted = now();
         let root = now();
         let private = now();
         let modified = now();
-        let v = NewVolume { name: name.into(), role, encrypted: false, e_apfs: true, times: VolumeTimes { formatted, root, private, modified }, uid: 0, gid: 0, key_os_version: kv, size_bytes };
+        let v = NewVolume { name: name.into(), role, encrypted, e_apfs: true, times: VolumeTimes { formatted, root, private, modified }, uid: 0, gid: 0, key_os_version: kv, size_bytes };
         let oid = nx.create_volume(&v)?;
         nx.commit()?;
         Ok(oid)
     };
+    let add = |nx: &mut Nx<'_>, name: &str, role: u16, size_bytes: Option<u64>, now: &mut dyn FnMut() -> u64| add_with(nx, name, role, size_bytes, false, now);
     let slot = |nx: &Nx<'_>, oid: u64| nx.fs_oid.iter().position(|&o| o == oid).ok_or_else(|| format!("no volume {oid:#x}"));
     let o = add(&mut nx, "System", storage::role::SYSTEM, None, now)?;
     let system = slot(&nx, o)?;
@@ -189,10 +191,18 @@ pub fn build_disk0_with(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() ->
         nx.remount(Mode::Kernel)?;
         nx.reaper_run()?;
         after_invert_mounts(&mut nx, Volumes { system, xart, hardware, preboot, update }, now)?;
+        // 6. create_protected_filesystems (0x10002a54c): class D's key
+        // obliterated (effaceable storage only), then Data made encrypted
+        // (`newfs_apfs -A -D -o role=d -v Data -P`: the kernel's
+        // volumeCreate with the container keybag's entries,
+        // drafts/s16/re-protected.md; keys and ciphertext KEYS_STAND_IN).
+        add_with(&mut nx, "Data", storage::role::DATA, None, true, now)?;
+        missing.push("Data's read-write mount at /mnt2 (mount_apfs -R): its clone epoch, the pfkur thread's temporary inode in the private directory (its creation parameters and crypto not transcribed: drafts/s21/re-data.md UNSETTLED-1) and the fixup thread's transaction; then User (newfs_apfs -P) and its mount, and configure_data_volumes (usersession.kb, the user protection's and AKSVolumeMap's keybag rewrites and checkpoints, the User template copy and its AKS bootstrap)".into());
         missing.push("the System volume after apfs_invert and the reaping of its old trees: (once Data and User exist) the data-volume trees' removal (restored_external's fixup_var), /private/xarts, apfs_sealvolume to the signed root hash, and the com.apple.os.update- snapshot".into());
     }
-    // 6.
-    missing.push("the Data and User volumes (newfs_apfs -P: encrypted with keys the device's Secure Enclave makes)".into());
+    if os.is_none() {
+        missing.push("the Data and User volumes (newfs_apfs -P), made after apfs_invert".into());
+    }
     // 7.
     missing.push("the restore's later writes to Preboot (install_kernel_cache's boot objects, populate_preboot_volume, install_splat's cryptex1) and Data's contents".into());
     // The kernel's own counting of the checksums it sets (its kext has
@@ -956,6 +966,161 @@ mod tests {
             assert_eq!(a, b, "allocation {i} (paddr, got, roving)");
         }
         assert_eq!(zones_ours, zones_theirs);
+    }
+
+    /// The encrypted Data volume after the invert (GEX_TEST_UDIF,
+    /// GEX_TEST_SCRATCH, GEX_TEST_FSCK): its superblock as the kernel's
+    /// volumeCreate leaves it (drafts/s16/re-protected.md 2.1), the
+    /// container keybag's two entries; the device's and the host's
+    /// fsck_apfs with -M (their keybag read needs the device's crypto I/O,
+    /// drafts/s21/re-data.md 4), and the host's on a copy presenting Data
+    /// as unencrypted, which checks its trees.
+    #[test]
+    fn data_volume_is_made_as_the_kernel_makes_it() {
+        use crate::darwin::apfsread::{Container, Medium, Omap};
+        let (Ok(dmg), Ok(dir), Ok(fsck)) = (std::env::var("GEX_TEST_UDIF"), std::env::var("GEX_TEST_SCRATCH"), std::env::var("GEX_TEST_FSCK")) else { return };
+        let f = std::fs::File::open(&dmg).unwrap();
+        let len = f.metadata().unwrap().len();
+        let image = std::sync::Arc::new(crate::darwin::udif::Udif::open(std::sync::Arc::new(super::super::HostFile(f, len))).unwrap());
+        let partition = image.partition("Apple_APFS").unwrap();
+        let os = OsImage { image: std::sync::Arc::clone(&image), partition };
+        let size = storage::disk0_bytes();
+        let dir = std::path::Path::new(&dir);
+        let disk_path = dir.join(format!("gex-data-disk-{}", std::process::id()));
+        let ctr_path = dir.join(format!("gex-data-ctr-{}", std::process::id()));
+        let f = std::fs::OpenOptions::new().create(true).truncate(true).read(true).write(true).open(&disk_path).unwrap();
+        f.set_len(size).unwrap();
+        let disk = std::sync::Arc::new(super::super::HostFile(f, size));
+        let (base, psize) = storage::partition_extent();
+        let mut t = 1_700_000_000_000_000_000u64;
+        let mut now = move || {
+            t += 1000;
+            t
+        };
+        build_disk0(disk.clone(), &mut now, Some(&os)).unwrap();
+        disk.0.sync_all().unwrap();
+        copy_container(&disk_path, &ctr_path, base, psize);
+        let open = || std::sync::Arc::new(Container::open(std::sync::Arc::new(super::super::HostFile(std::fs::File::open(&ctr_path).unwrap(), psize))).unwrap());
+        let c = open();
+        let q = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+        let com = c.omap().unwrap();
+        let sb_paddr = com.lookup(&c, c.nx.fs_oid[1], c.xid()).unwrap().unwrap().paddr;
+        let sb = c.read_raw(sb_paddr).unwrap();
+        assert_eq!((q(&sb, 0x28), q(&sb, 0x30), q(&sb, 0x38), q(&sb, 0x108), q(&sb, 0x58)), (2, 0xc, 0x2c8, 0x100, 6));
+        assert_eq!(&sb[0x60..0x74], &[5, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 0xcd, 0x01, 0x48, 0x15, 1, 0, 0, 0][..]);
+        let pfkur = c.read_raw(q(&sb, 0x418)).unwrap();
+        assert_eq!((u32::from_le_bytes(pfkur[24..28].try_into().unwrap()), u32::from_le_bytes(pfkur[28..32].try_into().unwrap())), (0x4000_0002, 0x20));
+        // The volume's object map: one leaf, the root node's mapping (the
+        // reader refuses an encrypted mapping, so read it raw).
+        let raw = |blk: u64| {
+            let mut b = vec![0u8; 4096];
+            super::super::HostFile(std::fs::File::open(&ctr_path).unwrap(), psize).read_at(blk * 4096, &mut b).unwrap();
+            b
+        };
+        let vom = Omap::open(&c, q(&sb, 0x80)).unwrap();
+        let leaf = raw(vom.tree.root_oid);
+        assert_eq!(u32::from_le_bytes(leaf[0x24..0x28].try_into().unwrap()), 1);
+        let (ko, vo) = (u16::from_le_bytes([leaf[0x38], leaf[0x39]]) as usize, u16::from_le_bytes([leaf[0x3a], leaf[0x3b]]) as usize);
+        let toc_len = u16::from_le_bytes([leaf[0x2a], leaf[0x2b]]) as usize;
+        let kstart = 0x38 + toc_len;
+        assert_eq!(q(&leaf, kstart + ko), q(&sb, 0x88));
+        let vat = 4096 - 0x28 - vo;
+        let root_flags = u32::from_le_bytes(leaf[vat..vat + 4].try_into().unwrap());
+        struct Mapped {
+            paddr: u64,
+        }
+        let root = Mapped { paddr: q(&leaf, vat + 8) };
+        assert_eq!(root_flags, 4);
+        let rootb = raw(root.paddr);
+        assert_eq!(u32::from_le_bytes(rootb[24..28].try_into().unwrap()), 0x1000_0002);
+        // The keybag: its block from the checkpoint's nx_keylocker.
+        let mut nxb = vec![0u8; 4096];
+        let latest = (0..u64::from(c.nx.xp_desc_blocks & 0x7fff_ffff)).map(|i| {
+            let mut b = vec![0u8; 4096];
+            super::super::HostFile(std::fs::File::open(&ctr_path).unwrap(), psize).read_at((c.nx.xp_desc_base + i) * 4096, &mut b).unwrap();
+            (i, b)
+        }).filter(|(_, b)| &b[32..36] == b"NXSB").max_by_key(|(_, b)| q(b, 16)).unwrap();
+        nxb.copy_from_slice(&latest.1);
+        let (kb, kn) = (q(&nxb, 0x510), q(&nxb, 0x518));
+        assert_eq!(kn, 1);
+        let kbb = c.read_raw(kb).unwrap();
+        assert_eq!(u32::from_le_bytes(kbb[24..28].try_into().unwrap()), 0x6b65_7973);
+        assert_eq!((u16::from_le_bytes([kbb[0x22], kbb[0x23]]), u32::from_le_bytes(kbb[0x24..0x28].try_into().unwrap())), (2, 0x10 + 0x40 + 0x40));
+        assert_eq!((&kbb[0x30..0x40], u16::from_le_bytes([kbb[0x40], kbb[0x41]]), u16::from_le_bytes([kbb[0x80], kbb[0x81]])), (&sb[0xf0..0x100], 2, 10));
+        drop(c);
+        let run = |args: &[&str], tool: &str| std::process::Command::new(tool).args(args).arg(&ctr_path).output().unwrap();
+        let dev = run(&["-n", "-W", "-s", "-M"], &fsck);
+        let host = run(&["-n", "-s", "-M"], "/sbin/fsck_apfs");
+        // Data as unencrypted, for the host's fsck to check its trees: no
+        // keybag, fs_flags | 1, omap values without the crypto flags, the
+        // root node without OBJ_ENCRYPTED.
+        {
+            use std::os::unix::fs::FileExt;
+            let f = std::fs::OpenOptions::new().read(true).write(true).open(&ctr_path).unwrap();
+            let rw = |blk: u64, edit: &dyn Fn(&mut Vec<u8>)| {
+                let mut b = vec![0u8; 4096];
+                f.read_exact_at(&mut b, blk * 4096).unwrap();
+                edit(&mut b);
+                super::super::set_checksum(&mut b);
+                f.write_all_at(&b, blk * 4096).unwrap();
+            };
+            let nx_at = c_desc(&ctr_path, psize, latest.0);
+            for blk in [0, nx_at] {
+                rw(blk, &|b| b[0x510..0x520].fill(0));
+            }
+            // No VEK and no pfkur tree either (fsck pairs fs_flags 0x100
+            // with incompat 0x40); the pfkur tree's block is then left
+            // allocated with nothing naming it, as the keybag's is.
+            rw(sb_paddr, &|b| {
+                b[0x108] = 1;
+                b[0x109] = 0;
+                b[0x38] &= !0x40;
+                b[0x418..0x420].fill(0);
+            });
+            rw(root.paddr, &|b| {
+                let ty = u32::from_le_bytes(b[24..28].try_into().unwrap()) & !0x1000_0000;
+                b[24..28].copy_from_slice(&ty.to_le_bytes());
+            });
+            let c2 = open();
+            let vom2 = Omap::open(&c2, q(&sb, 0x80)).unwrap();
+            let leaf = vom2.tree.root_oid;
+            rw(leaf, &|b| {
+                let nk = u32::from_le_bytes(b[0x24..0x28].try_into().unwrap()) as usize;
+                for i in 0..nk {
+                    let vo = u16::from_le_bytes([b[0x38 + 4 * i + 2], b[0x38 + 4 * i + 3]]) as usize;
+                    let at = 4096 - 0x28 - vo;
+                    let fl = u32::from_le_bytes(b[at..at + 4].try_into().unwrap()) & !0x704;
+                    b[at..at + 4].copy_from_slice(&fl.to_le_bytes());
+                }
+            });
+        }
+        let host_trees = run(&["-n", "-s"], "/sbin/fsck_apfs");
+        if std::env::var("GEX_TEST_KEEP").is_err() {
+            let _ = std::fs::remove_file(&disk_path);
+            let _ = std::fs::remove_file(&ctr_path);
+        }
+        assert!(dev.status.success(), "device fsck -M: {}{}", String::from_utf8_lossy(&dev.stdout), String::from_utf8_lossy(&dev.stderr));
+        assert!(host.status.success(), "host fsck -M: {}{}", String::from_utf8_lossy(&host.stdout), String::from_utf8_lossy(&host.stderr));
+        let out = String::from_utf8_lossy(&host_trees.stdout).to_string() + &String::from_utf8_lossy(&host_trees.stderr);
+        assert!(out.contains("The volume /dev/rmgs2") || out.contains("Data"), "{out}");
+        assert!(!out.contains("skipping the fsroot tree"), "{out}");
+        // The keybag's and the pfkur tree's blocks are left allocated with
+        // nothing naming them.
+        // What the view itself makes fsck say: the crypto-state record and
+        // the sixth counted block (the pfkur tree's) of a volume it now
+        // takes as unencrypted, and the two unnamed blocks.
+        let view = |l: &str| l.contains("not a valid disk name") || l.contains("crypto state object (id 4") || l.contains("apfs_fs_alloc_count is not valid (expected 5, actual 6)") || l.contains("overallocation detected on Main device");
+        let bad: Vec<&str> = out.lines().filter(|l| (l.contains("error") || l.contains("warning")) && !view(l)).collect();
+        assert!(bad.is_empty(), "{out}");
+        assert_eq!(out.lines().filter(|l| l.starts_with("warning: overallocation detected")).count(), 2, "{out}");
+        assert!(out.contains("appears to be OK") && out.contains(&format!("{:x}+1", kb)), "{out}");
+    }
+
+    /// The checkpoint descriptor block `i`'s address in the container file.
+    fn c_desc(ctr: &std::path::Path, psize: u64, i: u64) -> u64 {
+        use crate::darwin::apfsread::Container;
+        let c = Container::open(std::sync::Arc::new(super::super::HostFile(std::fs::File::open(ctr).unwrap(), psize))).unwrap();
+        c.nx.xp_desc_base + i
     }
 
     #[test]

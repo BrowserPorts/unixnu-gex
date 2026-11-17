@@ -70,6 +70,28 @@ const SPACEMAN_FREE_QUEUE: u32 = 0x09;
 const BLOCKREFTREE: u32 = 0x0f;
 const SNAPMETATREE: u32 = 0x10;
 const FSTREE: u32 = 0x0e;
+/// A shared data volume's pfkur tree and a secondary file-system root.
+const PFKUR_TREE: u32 = 0x20;
+const SECONDARY_FS_ROOT: u32 = 0x24;
+/// `OBJ_ENCRYPTED`.
+const OBJ_ENCRYPTED: u32 = 0x1000_0000;
+/// The container keybag's object type ('keys').
+const OBJECT_TYPE_CONTAINER_KEYBAG: u32 = 0x6b65_7973;
+/// The wrapped keys' lengths AppleKeyStore returns: the volume keys asked
+/// for with 0x28 bytes, the shared volume's wrapped VEK of a length its
+/// FileVault services give (at most 0x210). KEYS_STAND_IN.
+const KEY_LEN: usize = 0x28;
+const WVEK_LEN: usize = 0x28;
+
+/// What the device's Secure Enclave and AppleKeyStore make for an
+/// encrypted volume: its wrapped keys, and the ciphertext the storage
+/// controller's inline AES gives the keybag block and the volume's
+/// encrypted objects.
+pub const KEYS_STAND_IN: &str = "the encrypted volumes' keys and ciphertext (device-only: AppleKeyStore's wrapped volume keys of 0x28 bytes, the shared data volume's wrapped VEK, the keybag wrapping key in effaceable storage, and the inline AES the storage controller applies to the container keybag and to Data's and User's encrypted objects) (stand-in: each wrapped key the bytes \"KEY-STAND-IN\" repeated, the wrapped VEK 0x28 bytes long, everything written in plaintext; measure the container keybag's entry lengths on the device)";
+
+fn key_stand_in(len: usize) -> Vec<u8> {
+    b"KEY-STAND-IN".iter().copied().cycle().take(len).collect()
+}
 /// `CHECKPOINT_MAP_LAST`.
 const CHECKPOINT_MAP_LAST: u32 = 1;
 /// `APFS_FS_UNENCRYPTED`.
@@ -181,6 +203,8 @@ pub struct Vol {
     pub oid: u64,
     omap: Omap,
     pub encrypted: bool,
+    /// `incompat` 0x100: the volume's objects use its secondary key.
+    pub secondary_key: bool,
     pub fs_tree: Tree,
     pub extentref: Tree,
     pub snapmeta: Tree,
@@ -262,6 +286,10 @@ pub struct Nx<'a> {
     /// When kept, every data allocation: the blocks asked for, where they
     /// went, how many, and the roving pointer after it.
     pub alloc_log: Option<Vec<(u64, u64, u64, u64)>>,
+    /// The container keybag (`nx_keylocker`, its block range) and its
+    /// entries in order: volume UUID, tag, key data.
+    keylocker: Option<(u64, u64)>,
+    keybag: Vec<([u8; 16], u16, Vec<u8>)>,
 }
 
 /// The container's reaper (`nx_reaper_phys_t`): its lists, and the entry
@@ -404,6 +432,8 @@ impl<'a> Nx<'a> {
             tx_ops: 0,
             solid_state: true,
             alloc_log: None,
+            keylocker: None,
+            keybag: Vec::new(),
         })
     }
 
@@ -1801,7 +1831,19 @@ impl<'a> Nx<'a> {
         om.phys = self.phys_modify(om.phys)?;
         let mut k = oid.to_le_bytes().to_vec();
         k.extend_from_slice(&self.xid.to_le_bytes());
-        let mut v = 0u32.to_le_bytes().to_vec();
+        // An encrypted volume's object (K:0xfffffff00674033c): 4, the
+        // secondary key's 0x100, a secondary-root node's 0x20.
+        let flags = match owner {
+            Owner::Volume(i) => match self.vols.get(&i) {
+                Some(vo) if vo.encrypted => {
+                    let sub = self.virt.get(&(owner, oid)).map_or(0, |o| u32a(&o.b, 28));
+                    4 | if vo.secondary_key { 0x100 } else { 0 } | if sub == SECONDARY_FS_ROOT { 0x20 } else { 0 }
+                }
+                _ => 0,
+            },
+            Owner::Container => 0,
+        };
+        let mut v = (flags as u32).to_le_bytes().to_vec();
         v.extend_from_slice(&(self.l.bs as u32).to_le_bytes());
         v.extend_from_slice(&paddr.to_le_bytes());
         let vol = match owner {
@@ -2104,6 +2146,10 @@ impl<'a> Nx<'a> {
         for (i, &o) in self.fs_oid.iter().enumerate() {
             sb.put64(0xb8 + 8 * i, o);
         }
+        if let Some((paddr, n)) = self.keylocker {
+            sb.put64(0x510, paddr);
+            sb.put64(0x518, n);
+        }
         sb.put64(0x4f0, 0);
         sb.put64(0x568, self.newest_mounted);
         Ok(sb)
@@ -2202,6 +2248,54 @@ impl<'a> Nx<'a> {
         sm
     }
 
+    /// `keybag_operation` (K:0xfffffff006657cc0) adding an entry to the
+    /// container keybag, in the open transaction: the entry replaces one
+    /// of the same volume and tag, else is appended (each `roundup16(len +
+    /// 0x18)` bytes); the keybag is rewritten whole to a new block, a data
+    /// allocation of `ceil((kl_nbytes + 0x20) / bs)` blocks with flags 8
+    /// (K:0xfffffff00665865c), the old block freed to the main free queue,
+    /// and written at once, outside the checkpoint (o_oid 0, its
+    /// transaction, type 'keys'; no counter is raised on this path);
+    /// `nx_keylocker` names it from the next checkpoint on.
+    fn keybag_add(&mut self, uuid: [u8; 16], tag: u16, key: Vec<u8>) -> Result<(), String> {
+        self.enter()?;
+        match self.keybag.iter_mut().find(|e| e.0 == uuid && e.1 == tag) {
+            Some(e) => e.2 = key,
+            None => self.keybag.push((uuid, tag, key)),
+        }
+        let bs = self.l.bs as usize;
+        let nbytes: usize = 0x10 + self.keybag.iter().map(|e| (e.2.len() + 0x18).div_ceil(16) * 16).sum::<usize>();
+        let n = (nbytes + 0x20).div_ceil(bs);
+        if n != 1 {
+            return Err("not implemented: a container keybag of more than one block".into());
+        }
+        let (paddr, got) = self.alloc_data(n as u64)?;
+        if got != n as u64 {
+            return Err("the container keybag's allocation given fewer blocks".into());
+        }
+        if let Some((old, on)) = self.keylocker {
+            self.free(old, on)?;
+        }
+        self.keylocker = Some((paddr, n as u64));
+        let mut b = vec![0u8; n * bs];
+        put_header(&mut b, 0, self.xid, OBJECT_TYPE_CONTAINER_KEYBAG, 0);
+        b.put16(0x20, 2);
+        b.put16(0x22, self.keybag.len() as u16);
+        b.put32(0x24, nbytes as u32);
+        let mut at = 0x30;
+        for (u, t, k) in &self.keybag {
+            b[at..at + 16].copy_from_slice(u);
+            b.put16(at + 16, *t);
+            b.put16(at + 18, k.len() as u16);
+            b[at + 0x18..at + 0x18 + k.len()].copy_from_slice(k);
+            at += (k.len() + 0x18).div_ceil(16) * 16;
+        }
+        set_checksum(&mut b);
+        self.sink.write_at(paddr * self.l.bs, &b)?;
+        // tx_leave(nx, tx, 0): the transaction joined stays open.
+        Ok(())
+    }
+
     /// `apfs_newfs`: a volume added (`newfs_apfs -A`), in its own
     /// transaction.
     pub fn create_volume(&mut self, v: &NewVolume) -> Result<u64, String> {
@@ -2217,10 +2311,34 @@ impl<'a> Nx<'a> {
         if self.fs_oid[index] != 0 {
             return Err(format!("existing file system (slot {index})"));
         }
-        if v.encrypted {
-            return Err("not implemented: an encrypted volume (its keys are the device's Secure Enclave's)".into());
+        // Data (the shared data volume) and User: what -P changes
+        // (drafts/s16/re-protected.md section 2: K 0xfffffff006672290 with
+        // the device tree's e-apfs).
+        let shared = v.encrypted && v.role == 0x40 && v.e_apfs;
+        let secondary = v.encrypted && !shared && v.role != 0x2c0 && v.e_apfs;
+        if v.encrypted && !(shared || (secondary && v.role == 0x2)) {
+            return Err(format!("not implemented: an encrypted volume of role {:#x}", v.role));
         }
         let vol_oid = self.new_oid();
+        let uuid = {
+            let mut u = *b"apfsuuid\0\0volum\0";
+            u[8..10].copy_from_slice(&v.role.to_be_bytes());
+            u[15] = index as u8;
+            u
+        };
+        if v.encrypted {
+            // apfs_meta_crypto_state_init (K:0xfffffff0067314f8): the
+            // volume's key (tag 2 with the restore's ramdisk boot), its
+            // secondary key (tag 0xd) or the shared volume's VEK (tag 10),
+            // each added to the container keybag in its own rewrite.
+            self.keybag_add(uuid, 2, key_stand_in(KEY_LEN))?;
+            if secondary {
+                self.keybag_add(uuid, 0xd, key_stand_in(KEY_LEN))?;
+            }
+            if shared {
+                self.keybag_add(uuid, 10, key_stand_in(WVEK_LEN))?;
+            }
+        }
         // The volume's object map and its tree, then its extent-reference
         // and snapshot trees.
         let mut o = vec![0u8; bs as usize];
@@ -2232,7 +2350,12 @@ impl<'a> Nx<'a> {
         self.phys_obj(omap)?.b.put64(0x30, omap_tree.root);
         let extentref = Tree::create(&mut PhysStore { nx: self, subtype: BLOCKREFTREE, class: 1, vol: None }, jtree_shape(bs, true), btree::cmp_jobj_hashed)?;
         let snapmeta = Tree::create(&mut PhysStore { nx: self, subtype: SNAPMETATREE, class: 1, vol: None }, jtree_shape(bs, true), btree::cmp_jobj_hashed)?;
-        self.vols.insert(index, Vol { oid: vol_oid, omap: Omap { phys: omap, tree: omap_tree }, encrypted: false, fs_tree: Tree { root: 0, shape: jtree_shape(bs, false), cmp: btree::cmp_jobj_hashed }, extentref, snapmeta });
+        // The shared volume's pfkur tree (K:0xfffffff006685648, kind 6):
+        // physical, fixed 8-byte keys and 0x18-byte values, empty (its
+        // comparator, K:0xfffffff00671c92c, is not transcribed: nothing
+        // here inserts into it, and the tree is kept by its root only).
+        let pfkur = if shared { Some(Tree::create(&mut PhysStore { nx: self, subtype: PFKUR_TREE, class: 1, vol: None }, Shape { bt_flags: tree_flags::PHYSICAL, node_size: bs as usize, key_size: 8, val_size: 0x18, hash_size: 0 }, btree::cmp_omap)?) } else { None };
+        self.vols.insert(index, Vol { oid: vol_oid, omap: Omap { phys: omap, tree: omap_tree }, encrypted: v.encrypted, secondary_key: secondary, fs_tree: Tree { root: 0, shape: jtree_shape(bs, false), cmp: btree::cmp_jobj_hashed }, extentref, snapmeta });
 
         // The root and private directories.
         let mut fs = VirtStore { nx: self, owner: Owner::Volume(index), subtype: FSTREE };
@@ -2240,9 +2363,26 @@ impl<'a> Nx<'a> {
         for (k, val) in initial_records(v) {
             fs_tree.insert(&mut fs, &k, Some(&val))?;
         }
+        if shared {
+            // The data software-crypto record (K:0xfffffff0066f7358): crypto
+            // identifier 4, one reference, a zeroed state.
+            let mut cv = 1u32.to_le_bytes().to_vec();
+            cv.resize(0x18, 0);
+            fs_tree.insert(&mut fs, &(4u64 | 7 << 60).to_le_bytes(), Some(&cv))?;
+        }
         let root_oid = fs_tree.root;
         self.precounted.insert((Owner::Volume(index), root_oid));
         self.vols.get_mut(&index).unwrap().fs_tree = fs_tree;
+        // A secondary-key volume's secondary file-system root: virtual,
+        // subtype 0x24, an empty leaf of the file-system tree's shape.
+        let secondary_root = if secondary {
+            let mut st = VirtStore { nx: self, owner: Owner::Volume(index), subtype: SECONDARY_FS_ROOT };
+            let t = Tree::create(&mut st, jtree_shape(bs, false), btree::cmp_jobj_hashed)?;
+            self.precounted.insert((Owner::Volume(index), t.root));
+            Some(t.root)
+        } else {
+            None
+        };
 
         let mut sb = vec![0u8; bs as usize];
         put_header(&mut sb, vol_oid, xid, otype::FS, 0);
@@ -2250,12 +2390,28 @@ impl<'a> Nx<'a> {
         sb.put32(0x24, index as u32);
         sb.put64(0x28, 0x2);
         let unwritten = v.e_apfs && ![0x1u16, 0x4, 0x8, 0x10, 0x20, 0x80, 0xc0, 0x100, 0x140, 0x280, 0x2c0].contains(&v.role);
-        sb.put64(0x38, 0x8 | if unwritten { 0x80 } else { 0 });
+        let mut incompat = 0x8 | if unwritten { 0x80 } else { 0 };
+        if shared {
+            incompat |= 0x40;
+        }
+        if secondary {
+            incompat |= 0x100;
+        }
+        if v.encrypted {
+            // Expanded records; clone mapping and attribution tags in
+            // ro_compat.
+            incompat |= 0x200;
+            sb.put64(0x30, 0xc);
+        }
+        sb.put64(0x38, incompat);
         // `fssize=` (-s): the reserve and the quota, in blocks rounded up;
         // the space manager's reserve grows by it and counts the blocks the
         // volume holds against it (`spaceman_fs_bounds_set`, 0x100049c60;
         // measured: a volume's 5 blocks, for reserves of more than 5).
-        let alloc = 5u64;
+        // The omap, its tree's root, the extent-reference and snapshot
+        // trees' roots, the file-system root, and the pfkur tree or the
+        // secondary root.
+        let alloc = if v.encrypted { 6u64 } else { 5 };
         if let Some(bytes) = v.size_bytes {
             let blocks = bytes.div_ceil(bs);
             if blocks < alloc {
@@ -2283,12 +2439,9 @@ impl<'a> Nx<'a> {
         sb.put64(0x90, extentref.root);
         sb.put64(0x98, snapmeta.root);
         sb.put64(0xb0, 0x10);
-        let mut uuid = *b"apfsuuid\0\0volum\0";
-        uuid[8..10].copy_from_slice(&v.role.to_be_bytes());
-        uuid[15] = index as u8;
         sb[0xf0..0x100].copy_from_slice(&uuid);
         sb.put64(0x100, v.times.modified);
-        sb.put64(0x108, APFS_FS_UNENCRYPTED);
+        sb.put64(0x108, if !v.encrypted { APFS_FS_UNENCRYPTED } else if shared { 0x100 } else { 0 });
         sb[0x110..0x110 + FORMATTED_BY.len()].copy_from_slice(FORMATTED_BY.as_bytes());
         sb.put64(0x130, v.times.formatted);
         sb.put64(0x138, xid);
@@ -2300,6 +2453,12 @@ impl<'a> Nx<'a> {
         sb.put64(0x420, xid);
         if [0u16, 2, 0x40, 0x240].contains(&v.role) {
             sb.put32(0x428, 0x10);
+        }
+        if let Some(t) = pfkur {
+            sb.put64(0x418, t.root);
+        }
+        if let Some(r) = secondary_root {
+            sb.put64(0x448, r);
         }
         sb.put32(0x42c, 2);
         sb.put32(0x450, 2);
@@ -2455,7 +2614,10 @@ impl Store for VirtStore<'_, '_> {
     }
     fn create(&mut self, n: Node) -> Result<u64, String> {
         let mut b = n.b;
-        b.put32(24, otype::BTREE);
+        // An encrypted volume's virtual objects carry OBJ_ENCRYPTED
+        // (obj_create, I:0x100037584).
+        let enc = matches!(self.owner, Owner::Volume(i) if self.nx.vols.get(&i).is_some_and(|v| v.encrypted));
+        b.put32(24, otype::BTREE | if enc { OBJ_ENCRYPTED } else { 0 });
         b.put32(28, self.subtype);
         Ok(self.nx.virt_create(self.owner, b))
     }

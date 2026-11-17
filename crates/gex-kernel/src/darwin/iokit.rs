@@ -314,7 +314,7 @@ pub fn properties_missing(t: &[Node], i: u32) -> Option<String> {
 /// values in place of their keys.
 pub fn properties(t: &[Node], i: u32) -> Vec<(String, Prop)> {
     let Some(n) = t.get(i as usize) else { return Vec::new() };
-    let mut out: Vec<(String, Prop)> = n.props.iter().map(|(k, v)| (k.clone(), Prop::Data(if n.kernel_only { Vec::new() } else { v.clone() }))).collect();
+    let mut out: Vec<(String, Prop)> = dt_table(n).map(|(k, v)| (k.clone(), Prop::Data(if n.kernel_only { Vec::new() } else { v.clone() }))).collect();
     for (k, v) in &n.service_props {
         match out.iter_mut().find(|(o, _)| o == k) {
             Some(slot) => slot.1 = v.clone(),
@@ -417,7 +417,7 @@ pub fn lookup(t: &[Node], i: u32, name: &str) -> Result<Option<Vec<u8>>, String>
     if let Some(p) = service_prop(node, name) {
         return Ok(Some(serialize_prop(p)));
     }
-    if let Some((_, value)) = node.props.iter().find(|(k, _)| *k == name) {
+    if let Some((_, value)) = dt_table(node).find(|(k, _)| *k == name) {
         return Ok(Some(serialize_data(if node.kernel_only { &[] } else { value })));
     }
     if let Table::Lacks(keys) = &node.table {
@@ -540,10 +540,35 @@ pub fn conforms(t: &[Node], i: u32, class: &str) -> Result<bool, String> {
     }
 }
 
-/// `IORegistryEntry::getLocation`: the location a driver gave the entry
-/// ([`super::storagestack::location`]).
+/// The device tree property `IODeviceTreeAlloc` makes an entry's location
+/// and takes out of its table (`MakeReferenceTable`).
+pub const DT_UNIT_KEY: &str = "AAPL,unit-string";
+
+/// A device tree entry's properties as its table has them: all but
+/// [`DT_UNIT_KEY`].
+pub fn dt_table(n: &Node) -> impl Iterator<Item = &(String, Vec<u8>)> {
+    n.props.iter().filter(|(k, _)| k != DT_UNIT_KEY)
+}
+
+/// `IORegistryEntry::getLocation`: a device tree entry's (and so a nub's
+/// made of it, which takes over its table) is what `MakeReferenceTable`
+/// set: its `AAPL,unit-string`, at most 31 characters, else `"%X"` of
+/// its `reg`'s first word, else none; a service's, what its driver gave
+/// it ([`super::storagestack::location`]).
 pub fn location(n: &Node) -> Option<String> {
-    super::storagestack::location(n)
+    if !n.class.is_empty() {
+        return super::storagestack::location(n);
+    }
+    if let Some((_, v)) = n.props.iter().find(|(k, _)| k == DT_UNIT_KEY) {
+        let v = &v[..v.len().min(31)];
+        let v = &v[..v.iter().position(|&c| c == 0).unwrap_or(v.len())];
+        return Some(String::from_utf8_lossy(v).into_owned());
+    }
+    let (_, reg) = n.props.iter().find(|(k, _)| k == "reg")?;
+    let mut w = [0u8; 4];
+    let k = reg.len().min(4);
+    w[..k].copy_from_slice(&reg[..k]);
+    Some(format!("{:X}", u32::from_le_bytes(w)))
 }
 
 /// `IORegistryEntry::getLocation(plane)`: the location the entry was given

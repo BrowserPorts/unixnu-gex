@@ -161,6 +161,11 @@ pub struct Metadata {
     /// Linux's `makedev` encoding. Zero where the node does not say; `stat`
     /// then reports a character device as a pseudo-terminal (136:0).
     pub rdev: u64,
+    /// `st_dev`: the host filesystem's device for a host file, so that two
+    /// files are one only when device and inode both match (every macOS
+    /// volume's root is inode 2, and Wine took /Volumes/X for /). Zero for
+    /// gex's own filesystems.
+    pub dev: u64,
     /// The other times and the nanoseconds, where the filesystem keeps
     /// them (the host's). All zero: every time is `mtime`, whole seconds.
     pub times: Times,
@@ -186,6 +191,7 @@ impl Metadata {
             mtime: 0,
             nlink: 1,
             rdev: 0,
+            dev: 0,
             times: Default::default(),
         }
     }
@@ -198,6 +204,7 @@ impl Metadata {
             mtime: 0,
             nlink: 2,
             rdev: 0,
+            dev: 0,
             times: Default::default(),
         }
     }
@@ -998,6 +1005,7 @@ pub trait FileSystem: Send + Sync {
                 mtime: 0,
                 nlink: 1,
                 rdev: 0,
+                dev: 0,
                 times: Default::default(),
             });
         }

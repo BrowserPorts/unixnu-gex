@@ -194,6 +194,7 @@ pub fn decode_meta(b: &[u8]) -> Metadata {
         mtime: u64at(24) as i64,
         nlink: u32at(32).max(1),
         rdev: 0,
+        dev: 0,
         times: super::Times {
             mtime_ns: u32at(36),
             atime: u64at(40) as i64,

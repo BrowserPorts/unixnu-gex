@@ -151,6 +151,7 @@ pub(crate) fn convert(md: &std::fs::Metadata) -> Metadata {
         mtime: md.mtime(),
         nlink: md.nlink() as u32,
         rdev: 0,
+        dev: md.dev(),
         times: super::Times {
             mtime_ns: md.mtime_nsec() as u32,
             atime: md.atime(),
@@ -1046,6 +1047,18 @@ pub mod host_xattr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_host_file_keeps_its_device() {
+        // Two volumes' roots share an inode on macOS (2); only the device
+        // tells them apart, as it tells a mount point from what it hides.
+        use std::os::unix::fs::MetadataExt;
+        let tmp = std::env::temp_dir();
+        for p in [std::path::Path::new("/"), tmp.as_path()] {
+            let host = std::fs::metadata(p).unwrap();
+            assert_eq!(convert(&host).dev, host.dev(), "{}", p.display());
+        }
+    }
 
     fn scratch() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("gex-hostfs-{}", std::process::id()));

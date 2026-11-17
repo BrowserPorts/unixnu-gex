@@ -829,10 +829,17 @@ is the reference (search `crates/gex-kernel/src/` for
   task-wide CPU limit, the wakeups monitor, workloop CPU limits, and the
   pmap's and compressor's ledgers in `TASK_VM_INFO` (resident, internal,
   external, reusable and compressed sizes and their peaks, the footprint's
-  peak, decompressions, swap-ins). On a host without per-thread clocks,
-  the virtual timers, `RLIMIT_CPU`, the CPU monitor, the workqueue's
-  quantum and `getrusage`'s times are reported; on one that cannot say
-  which pages are a task's, `phys_footprint` is.
+  peak, decompressions, swap-ins), and `proc_pid_rusage`'s fields that
+  need them: wakeups from interrupt context and the platform-idle state,
+  page-ins, resident pages, disk I/O, CPU time by effective QoS, logical
+  writes, the CPMU's instructions and cycles, CLPC's energy, another live
+  process's footprint, the footprint's peaks, and the bank's bills once an
+  account names the process (its time, runnable time, wirings, own
+  footprint, start, end and reaped children's sums are kept). On a host
+  without per-thread clocks, the virtual timers, `RLIMIT_CPU`, the CPU
+  monitor, the workqueue's quantum and `getrusage`'s and
+  `proc_pid_rusage`'s times are reported; on one that cannot say which
+  pages are a task's, `phys_footprint` is.
 - **Terminals.** Terminal `ioctl`s not handled, an `fcntl` that would sleep
   in the driver, calls that would wait for a revoke to finish, and parts of
   `revoke` itself. The console's window size (`km`'s, from the boot video

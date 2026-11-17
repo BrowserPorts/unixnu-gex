@@ -321,8 +321,9 @@ struct BankTask {
 
 /// `struct bank_account`: what a merchant task's work for a holder is
 /// billed to. The bill (`ba_bill`) and the ledgers it is rolled up into
-/// are not kept: nothing here reads them (proc_pid_rusage's billed and
-/// serviced times, ledger(2)), those calls being unimplemented.
+/// are not kept: proc_pid_rusage reports its billed and serviced figures
+/// as not kept for a process an account names, and ledger(2) is
+/// unimplemented.
 #[derive(Debug)]
 struct BankAccount {
     refs: u32,
@@ -1220,6 +1221,15 @@ impl Kernel {
         self.bank_task(merchant).to_charge.push(h);
         for t in [holder, merchant, so, pp] {
             self.bank_task(t).refs += 1;
+        }
+        // The holder's bills to pay and the merchant's to charge are what
+        // proc_pid_rusage's billed and serviced figures sum, which are not
+        // kept: each process is marked as having them.
+        for t in [holder, merchant] {
+            let (pid, unique_pid) = { let i = &self.bank_task(t).info; (i.pid, i.unique_pid) };
+            if let Some((p, _)) = self.darwin_public(pid).filter(|(p, _)| p.uniqueid == unique_pid) {
+                p.rusage.billing.store(true, std::sync::atomic::Ordering::Release);
+            }
         }
         h
     }

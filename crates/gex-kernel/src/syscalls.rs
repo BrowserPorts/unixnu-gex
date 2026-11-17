@@ -7000,10 +7000,14 @@ impl ThreadEnd<'_> {
     /// `pthread_join` waits on it). The id goes first, so a thread that has
     /// joined it no longer finds it in `/proc`.
     pub fn end(&self, m: &mut GuestMem<'_>, ctx_addr: u64, tid: i32) {
-        // Its processor time, final, to its task's (task->total_*_time).
+        // Its processor time and runnable time, final, to its task's
+        // (task->total_*_time, total_runnable_time).
         self.thread.cpu.end();
         if let (Some(times), Some(pid)) = (self.thread.cpu.times(), self.procs.task_owner(tid)) {
             self.procs.add_dead_cpu(pid, times);
+        }
+        if let (Some(runnable), Some(pid)) = (self.thread.cpu.runnable(), self.procs.task_owner(tid)) {
+            self.procs.add_dead_runnable(pid, runnable);
         }
         self.thread_fs.set(ctx_addr, None);
         self.threads.remove(tid);

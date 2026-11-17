@@ -685,12 +685,17 @@ impl Kernel {
                 old.live.acflag.fetch_and(!super::kinfo::ac::AFORK, std::sync::atomic::Ordering::Relaxed);
                 std::sync::Arc::clone(&old.live)
             },
+            // The proc's p_stats (its start, its reaped children's sums)
+            // stay; the new map's wirings are the ledger's from now on.
+            rusage: std::sync::Arc::clone(&old.rusage),
             pcaction: match spawn {
                 Some(sp) if sp.flags & super::spawn::flag::SETEXEC == 0 => old.pcaction,
                 _ => Default::default(),
             },
             ..Default::default()
         };
+        let wired = std::sync::Arc::clone(&self.dtask.rusage.wired);
+        self.dtask.vm.set_wire_gauge(wired);
         // task_bank_init, the image in place.
         self.darwin_task_bank_init();
         // The new task takes the old one's coalitions and roles (a spawn's

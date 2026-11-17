@@ -93,6 +93,7 @@ pub mod psem;
 pub mod psynch;
 pub mod reason;
 pub mod rlimit;
+pub mod rusage;
 pub mod sandbox;
 pub mod shregion;
 pub mod storage;
@@ -194,6 +195,9 @@ pub struct Task {
     pub pending_replies: Vec<kobject::PendingReply>,
     /// What other processes read of this one (`kern.proc`).
     pub live: std::sync::Arc<kinfo::Live>,
+    /// Its `proc_pid_rusage` state: the fork's start, the reaped
+    /// children's sums, the end's record, the wired ledger.
+    pub rusage: std::sync::Arc<rusage::Shared>,
     /// The real interval timer, and the virtual and profiling ones.
     pub realtimer: itimer::RealTimer,
     pub vtimers: [itimer::Itimerval; 2],
@@ -290,7 +294,7 @@ pub struct Task {
     pub start: (u64, u64),
     /// The ids and start time a fork chose for its child, for the child's
     /// task to take.
-    pub fork_ids: std::sync::Mutex<Option<(u64, i32, (u64, u64))>>,
+    pub fork_ids: std::sync::Mutex<Option<(u64, i32, (u64, u64), u64)>>,
     /// The process's credential (`p_ucred`'s POSIX part) and `P_SUGID`.
     pub cred: cred::Cred,
     pub sugid: bool,
@@ -399,9 +403,30 @@ pub struct Task {
 }
 
 impl Task {
-    /// A new process's task: it takes the next pidversion.
+    /// A new process's task: it takes the next pidversion, and its start
+    /// time (`microtime_with_abstime`).
     pub fn new_process() -> Task {
-        Task { pidversion: next_pidversion(), uniqueid: next_uniqueid(), start: procinfo::microtime(), ..Default::default() }
+        let (start, abs) = start_times();
+        Task { pidversion: next_pidversion(), uniqueid: next_uniqueid(), start, rusage: rusage::Shared::new(abs), ..Default::default() }.with_wire_ledger()
+    }
+
+    /// The map's wirings kept in the task's `wired_mem` ledger.
+    pub fn with_wire_ledger(mut self) -> Task {
+        self.vm.set_wire_gauge(std::sync::Arc::clone(&self.rusage.wired));
+        self
+    }
+}
+
+/// `microtime_with_abstime`: the calendar time (`p_start`) and the Mach
+/// time (`ps_start`) of a process's start, read together.
+pub fn start_times() -> ((u64, u64), u64) {
+    (procinfo::microtime(), mach::absolute_time())
+}
+
+impl Task {
+    /// A forked task's process ids and start, as its fork chose them.
+    pub fn forked_process(uniqueid: u64, pidversion: i32, start: (u64, u64), abs: u64) -> Task {
+        Task { uniqueid, pidversion, start, rusage: rusage::Shared::new(abs), ..Task::default() }
     }
 }
 

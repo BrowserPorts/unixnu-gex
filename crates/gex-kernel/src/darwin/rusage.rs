@@ -1,0 +1,512 @@
+//! `proc_pid_rusage` (`proc_info` call 9, `PROC_INFO_CALL_PIDRUSAGE`): a
+//! process's `rusage_info_v0` to `_v6`, as `proc_pid_rusage`
+//! (`proc_info.c`), `proc_get_rusage` and `gather_rusage_info`
+//! (`kern_resource.c`) make it from its task's ledgers and counters
+//! (`fill_task_rusage`, `fill_task_io_rusage`, `fill_task_qos_rusage`,
+//! `bank_*_balance_safe`, `bsd_kern.c`, `bank.c`) and its `p_stats`.
+//!
+//! What 21H461's kernel (arm64, not arm64e) compiles of it decides some
+//! fields (`gather_rusage_info` 0xfffffff00763b9cc, `fill_task_rusage`
+//! 0xfffffff00727c0b0, `task_power_info_locked` 0xfffffff00724ca9c):
+//!
+//! - `ri_system_time` is 0: recount's kernel time is the user time's
+//!   (MACH_RELEASE has no `PRECISE_USER_KERNEL_TIME`), and the power info
+//!   gives the sum as `total_user` and 0 as `total_system`.
+//! - `ri_flags` is 0: `RU_PROC_RUNS_RESLIDE` needs `ptrauth_calls`; the
+//!   jump table sends RUSAGE_INFO_V5 and V6 to V4's arm.
+//! - The performance cluster's figures (`ri_user_ptime`, `ri_system_ptime`,
+//!   `ri_pinstructions`, `ri_pcycles`, `ri_penergy_nj`) are 0: the kernel
+//!   is not built for AMP, and `recount_topo_matches_cpu_kind` matches no
+//!   track (0xfffffff007228c70).
+//! - `ri_secure_time_in_system` and `ri_secure_ptime_in_system` are 0:
+//!   no `RECOUNT_SECURE_METRICS`, so `task_power_info_locked` leaves them
+//!   as `fill_task_rusage` zeroed them.
+//! - CONFIG_PERVASIVE_CPI, CONFIG_PERVASIVE_ENERGY and
+//!   CONFIG_LEDGER_INTERVAL_MAX are in: the CPMU's instructions and
+//!   cycles, CLPC's energy estimates and the footprint's interval peak are
+//!   real figures there.
+//!
+//! What is kept here: the executable's UUID; recount's time of the task
+//! (its threads', the ended ones' with them), in Mach time units; each
+//! thread's runnable time; the map's user wirings (`wired_mem`); the
+//! caller's own `phys_footprint`, measured as the call is made; the fork's
+//! start (`ps_start`), an ended process's end and `p_ru`; the reaped
+//! children's sums (`ri_child`); and the bank's bills where no account
+//! bills or charges the task. What needs counters that are not kept is
+//! given as 0 and reported: wakeups from interrupt context and the
+//! platform-idle state, VM page-ins, the pmap's resident pages, disk I/O,
+//! CPU time by effective QoS, logical writes, the CPMU's instructions and
+//! cycles, CLPC's energy, another live process's footprint (only its own
+//! measurements are), the footprint's peaks (measurements see no peak
+//! between them), and bank bills once an account exists.
+
+use crate::syscalls::Kernel;
+use crate::GuestMem;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+/// `RUSAGE_INFO_V0` .. `RUSAGE_INFO_V6` (`RUSAGE_INFO_CURRENT`).
+pub const RUSAGE_INFO_CURRENT: u32 = 6;
+
+/// `sizeof(struct rusage_info_v0)` .. `_v6`: the kernel's table at
+/// 0xfffffff007022230.
+pub const SIZES: [usize; 7] = [96, 144, 160, 232, 296, 304, 464];
+
+/// `struct rusage_info_v6` in 64-bit words: the UUID's two, then each
+/// field's.
+pub const WORDS: usize = 58;
+
+/// The fields' word indices.
+pub mod ri {
+    pub const USER_TIME: usize = 2;
+    pub const SYSTEM_TIME: usize = 3;
+    pub const PKG_IDLE_WKUPS: usize = 4;
+    pub const INTERRUPT_WKUPS: usize = 5;
+    pub const PAGEINS: usize = 6;
+    pub const WIRED_SIZE: usize = 7;
+    pub const RESIDENT_SIZE: usize = 8;
+    pub const PHYS_FOOTPRINT: usize = 9;
+    pub const PROC_START_ABSTIME: usize = 10;
+    pub const PROC_EXIT_ABSTIME: usize = 11;
+    pub const CHILD_USER_TIME: usize = 12;
+    pub const CHILD_SYSTEM_TIME: usize = 13;
+    pub const CHILD_PKG_IDLE_WKUPS: usize = 14;
+    pub const CHILD_INTERRUPT_WKUPS: usize = 15;
+    pub const CHILD_PAGEINS: usize = 16;
+    pub const CHILD_ELAPSED_ABSTIME: usize = 17;
+    pub const DISKIO_BYTESREAD: usize = 18;
+    pub const DISKIO_BYTESWRITTEN: usize = 19;
+    /// `ri_cpu_time_qos_default` .. `_user_interactive`, by THREAD_QOS_*.
+    pub const CPU_TIME_QOS: usize = 20;
+    pub const BILLED_SYSTEM_TIME: usize = 27;
+    pub const SERVICED_SYSTEM_TIME: usize = 28;
+    pub const LOGICAL_WRITES: usize = 29;
+    pub const LIFETIME_MAX_PHYS_FOOTPRINT: usize = 30;
+    pub const INSTRUCTIONS: usize = 31;
+    pub const CYCLES: usize = 32;
+    pub const BILLED_ENERGY: usize = 33;
+    pub const SERVICED_ENERGY: usize = 34;
+    pub const INTERVAL_MAX_PHYS_FOOTPRINT: usize = 35;
+    pub const RUNNABLE_TIME: usize = 36;
+    pub const FLAGS: usize = 37;
+    pub const USER_PTIME: usize = 38;
+    pub const SYSTEM_PTIME: usize = 39;
+    pub const PINSTRUCTIONS: usize = 40;
+    pub const PCYCLES: usize = 41;
+    pub const ENERGY_NJ: usize = 42;
+    pub const PENERGY_NJ: usize = 43;
+    pub const SECURE_TIME_IN_SYSTEM: usize = 44;
+    pub const SECURE_PTIME_IN_SYSTEM: usize = 45;
+}
+
+/// Each field that can go unkept: its name, and what it needs.
+const UNKEPT: [(usize, &str, &str); 24] = [
+    (ri::USER_TIME, "ri_user_time", "per-thread clocks on the host"),
+    (ri::PKG_IDLE_WKUPS, "ri_pkg_idle_wkups", "the platform_idle_wakeups ledger: wakeups from interrupt context of an idle processor"),
+    (ri::INTERRUPT_WKUPS, "ri_interrupt_wkups", "the interrupt_wakeups ledger: wakeups from interrupt context"),
+    (ri::PAGEINS, "ri_pageins", "the task's VM page-ins"),
+    (ri::RESIDENT_SIZE, "ri_resident_size", "the pmap's phys_mem ledger"),
+    (ri::PHYS_FOOTPRINT, "ri_phys_footprint", "another process's footprint now (only its own measurements are kept)"),
+    (ri::CHILD_PKG_IDLE_WKUPS, "ri_child_pkg_idle_wkups", "the reaped children's platform-idle wakeups"),
+    (ri::CHILD_INTERRUPT_WKUPS, "ri_child_interrupt_wkups", "the reaped children's interrupt wakeups"),
+    (ri::CHILD_PAGEINS, "ri_child_pageins", "the reaped children's page-ins"),
+    (ri::CHILD_USER_TIME, "ri_child_user_time", "the reaped children's times on a host without per-thread clocks"),
+    (ri::DISKIO_BYTESREAD, "ri_diskio_bytesread", "task_io_stats: the disk's reads"),
+    (ri::DISKIO_BYTESWRITTEN, "ri_diskio_byteswritten", "task_io_stats: the disk's writes"),
+    (ri::CPU_TIME_QOS, "ri_cpu_time_qos_*", "cpu_time_eqos_stats: each thread's time by its effective QoS as it changes"),
+    (ri::BILLED_SYSTEM_TIME, "ri_billed_system_time", "the bank accounts' bills"),
+    (ri::SERVICED_SYSTEM_TIME, "ri_serviced_system_time", "the bank accounts' bills"),
+    (ri::LOGICAL_WRITES, "ri_logical_writes", "the logical_writes ledger"),
+    (ri::LIFETIME_MAX_PHYS_FOOTPRINT, "ri_lifetime_max_phys_footprint", "the footprint's peak between measurements"),
+    (ri::INSTRUCTIONS, "ri_instructions", "the CPMU's instruction counts"),
+    (ri::CYCLES, "ri_cycles", "the CPMU's cycle counts"),
+    (ri::BILLED_ENERGY, "ri_billed_energy", "the bank accounts' bills"),
+    (ri::SERVICED_ENERGY, "ri_serviced_energy", "the bank accounts' bills"),
+    (ri::INTERVAL_MAX_PHYS_FOOTPRINT, "ri_interval_max_phys_footprint", "the footprint's peak between measurements"),
+    (ri::RUNNABLE_TIME, "ri_runnable_time", "per-thread clocks on the host"),
+    (ri::ENERGY_NJ, "ri_energy_nj", "CLPC's energy estimates"),
+];
+
+/// The QoS fields, one bit each in an unkept mask.
+const QOS_FIELDS: std::ops::Range<usize> = ri::CPU_TIME_QOS..ri::CPU_TIME_QOS + 7;
+
+/// One process's `rusage_info_v6`, and which of its fields are not kept
+/// (a bit per word index).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Record {
+    pub w: [u64; WORDS],
+    pub unkept: u64,
+}
+
+impl Record {
+    /// The structure's bytes.
+    pub fn bytes(&self) -> Vec<u8> {
+        self.w.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    /// The fields within a flavor's `size` bytes that are not kept, by
+    /// name and need, each once.
+    pub fn unkept_within(&self, size: usize) -> Vec<String> {
+        let words = size / 8;
+        let mut out = Vec::new();
+        for (i, name, need) in UNKEPT {
+            let any = if i == ri::CPU_TIME_QOS { QOS_FIELDS.clone().any(|q| q < words && self.unkept & (1 << q) != 0) } else { i < words && self.unkept & (1 << i) != 0 };
+            if any {
+                out.push(format!("{name} ({need})"));
+            }
+        }
+        out
+    }
+}
+
+/// `p_stats->ri_child` (`struct rusage_info_child`): the reaped
+/// children's sums, and which are not kept.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Child {
+    pub user_time: u64,
+    pub system_time: u64,
+    pub pkg_idle_wkups: u64,
+    pub interrupt_wkups: u64,
+    pub pageins: u64,
+    pub elapsed_abstime: u64,
+    pub unkept: u64,
+}
+
+impl Child {
+    /// `update_rusage_info_child`: a reaped child's own figures and its
+    /// children's added.
+    pub fn add(&mut self, r: &Record) {
+        let w = &r.w;
+        self.user_time = self.user_time.wrapping_add(w[ri::USER_TIME].wrapping_add(w[ri::CHILD_USER_TIME]));
+        self.system_time = self.system_time.wrapping_add(w[ri::SYSTEM_TIME].wrapping_add(w[ri::CHILD_SYSTEM_TIME]));
+        self.pkg_idle_wkups = self.pkg_idle_wkups.wrapping_add(w[ri::PKG_IDLE_WKUPS].wrapping_add(w[ri::CHILD_PKG_IDLE_WKUPS]));
+        self.interrupt_wkups = self.interrupt_wkups.wrapping_add(w[ri::INTERRUPT_WKUPS].wrapping_add(w[ri::CHILD_INTERRUPT_WKUPS]));
+        self.pageins = self.pageins.wrapping_add(w[ri::PAGEINS].wrapping_add(w[ri::CHILD_PAGEINS]));
+        self.elapsed_abstime = self.elapsed_abstime.wrapping_add(w[ri::PROC_EXIT_ABSTIME].wrapping_sub(w[ri::PROC_START_ABSTIME]).wrapping_add(w[ri::CHILD_ELAPSED_ABSTIME]));
+        let gone = |own: usize, child: usize| r.unkept & ((1 << own) | (1 << child)) != 0;
+        for (own, child) in [
+            (ri::USER_TIME, ri::CHILD_USER_TIME),
+            (ri::PKG_IDLE_WKUPS, ri::CHILD_PKG_IDLE_WKUPS),
+            (ri::INTERRUPT_WKUPS, ri::CHILD_INTERRUPT_WKUPS),
+            (ri::PAGEINS, ri::CHILD_PAGEINS),
+        ] {
+            if gone(own, child) {
+                self.unkept |= 1 << child;
+            }
+        }
+    }
+}
+
+/// What a process's `proc_pid_rusage` reads that its record does not
+/// otherwise carry, shared by the process and its readers.
+#[derive(Debug, Default)]
+pub struct Shared {
+    /// `p_stats->ps_start`: the Mach time of its fork (`microtime_with_
+    /// abstime`, with `p_start`); an exec keeps it.
+    pub start_abstime: AtomicU64,
+    /// The `wired_mem` ledger: what the map's user wirings hold.
+    pub wired: Arc<AtomicU64>,
+    /// A bank account has had the task as its holder or its merchant, so
+    /// its bills may hold time and energy for or against it.
+    pub billing: AtomicBool,
+    child: Mutex<Child>,
+    /// `p_ru->ri`: what `proc_exit` gathered.
+    exit: Mutex<Option<Record>>,
+}
+
+impl Shared {
+    /// A new process's, forked at Mach time `start`.
+    pub fn new(start: u64) -> Arc<Shared> {
+        Arc::new(Shared { start_abstime: AtomicU64::new(start), ..Shared::default() })
+    }
+
+    pub fn child(&self) -> Child {
+        *self.child.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The record `proc_exit` left, once it has.
+    pub fn exited(&self) -> Option<Record> {
+        *self.exit.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// What [`gather`] makes a record from.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Input {
+    pub uuid: [u8; 16],
+    /// Recount's time of the task, in nanoseconds; none without the
+    /// host's clocks.
+    pub time_ns: Option<u64>,
+    /// Its threads' runnable time, the ended ones' with them, in Mach time
+    /// units; none without the host's clocks.
+    pub runnable: Option<u64>,
+    pub wired: u64,
+    /// The phys_footprint ledger's balance, where it is known now.
+    pub footprint: Option<u64>,
+    pub start_abstime: u64,
+    pub child: Child,
+    pub billing: bool,
+    /// `proc_exit`'s gathering at this Mach time: the map is gone, so
+    /// nothing is wired or resident, and the footprint is set to 0.
+    pub exit_abstime: Option<u64>,
+}
+
+/// Nanoseconds as Mach time units.
+pub fn mach_of_ns(ns: u64) -> u64 {
+    let (numer, denom) = super::mach::TIMEBASE;
+    (u128::from(ns) * u128::from(denom) / u128::from(numer)) as u64
+}
+
+/// `gather_rusage_info(p, ru, RUSAGE_INFO_CURRENT)`: every field, kept or
+/// marked. A flavor's copy takes the first of it.
+pub fn gather(i: &Input) -> Record {
+    let mut w = [0u64; WORDS];
+    let mut unkept = 0u64;
+    let mut mark = |f: usize| unkept |= 1 << f;
+    w[0] = u64::from_le_bytes(i.uuid[..8].try_into().unwrap());
+    w[1] = u64::from_le_bytes(i.uuid[8..].try_into().unwrap());
+    match i.time_ns {
+        Some(ns) => w[ri::USER_TIME] = mach_of_ns(ns),
+        None => mark(ri::USER_TIME),
+    }
+    for f in [ri::PKG_IDLE_WKUPS, ri::INTERRUPT_WKUPS, ri::PAGEINS, ri::DISKIO_BYTESREAD, ri::DISKIO_BYTESWRITTEN, ri::LOGICAL_WRITES, ri::LIFETIME_MAX_PHYS_FOOTPRINT, ri::INTERVAL_MAX_PHYS_FOOTPRINT, ri::INSTRUCTIONS, ri::CYCLES, ri::ENERGY_NJ] {
+        mark(f);
+    }
+    for f in QOS_FIELDS {
+        mark(f);
+    }
+    match i.exit_abstime {
+        Some(t) => w[ri::PROC_EXIT_ABSTIME] = t,
+        None => {
+            w[ri::WIRED_SIZE] = i.wired;
+            mark(ri::RESIDENT_SIZE);
+            match i.footprint {
+                Some(f) => w[ri::PHYS_FOOTPRINT] = f,
+                None => mark(ri::PHYS_FOOTPRINT),
+            }
+        }
+    }
+    w[ri::PROC_START_ABSTIME] = i.start_abstime;
+    let c = i.child;
+    w[ri::CHILD_USER_TIME] = c.user_time;
+    w[ri::CHILD_SYSTEM_TIME] = c.system_time;
+    w[ri::CHILD_PKG_IDLE_WKUPS] = c.pkg_idle_wkups;
+    w[ri::CHILD_INTERRUPT_WKUPS] = c.interrupt_wkups;
+    w[ri::CHILD_PAGEINS] = c.pageins;
+    w[ri::CHILD_ELAPSED_ABSTIME] = c.elapsed_abstime;
+    unkept |= c.unkept;
+    if i.billing {
+        for f in [ri::BILLED_SYSTEM_TIME, ri::SERVICED_SYSTEM_TIME, ri::BILLED_ENERGY, ri::SERVICED_ENERGY] {
+            unkept |= 1 << f;
+        }
+    }
+    match i.runnable {
+        Some(r) => w[ri::RUNNABLE_TIME] = r,
+        None => unkept |= 1 << ri::RUNNABLE_TIME,
+    }
+    Record { w, unkept }
+}
+
+/// The input of process `pid` from its record and the table: its time and
+/// runnable time, the ended threads' and the live ones'.
+fn times(procs: &crate::proc::ProcTable, pid: i32, p: &super::procinfo::Public) -> (Option<u64>, Option<u64>) {
+    if super::workq::host_clocks().is_none() {
+        return (None, None);
+    }
+    let (du, ds) = procs.dead_cpu(pid);
+    let dr = procs.dead_runnable(pid);
+    let Some(threads) = p.threads.as_ref() else { return (Some(du + ds), Some(dr)) };
+    let time = crate::cpu::live_times(threads).map(|v| v.iter().fold(du + ds, |a, &(u, s)| a + u + s));
+    let runnable = crate::cpu::live_runnable(threads).map(|r| r + dr);
+    (time, runnable)
+}
+
+fn input(procs: &crate::proc::ProcTable, pid: i32, p: &super::procinfo::Public) -> Input {
+    let (time_ns, runnable) = times(procs, pid, p);
+    let s = &p.rusage;
+    Input {
+        uuid: p.uuid,
+        time_ns,
+        runnable,
+        wired: s.wired.load(Ordering::Acquire),
+        footprint: None,
+        start_abstime: s.start_abstime.load(Ordering::Acquire),
+        child: s.child(),
+        billing: s.billing.load(Ordering::Acquire),
+        exit_abstime: None,
+    }
+}
+
+/// `proc_exit`'s stash of process `pid`'s usage in `p_ru`, before it
+/// becomes a zombie, for `proc_pid_rusage` to read.
+pub fn proc_exit(procs: &crate::proc::ProcTable, pid: i32, p: &super::procinfo::Public) {
+    let mut i = input(procs, pid, p);
+    i.exit_abstime = Some(super::mach::absolute_time());
+    let r = gather(&i);
+    *p.rusage.exit.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+}
+
+/// `reap_child_locked`'s `update_rusage_info_child` of a reaped child's
+/// `p_ru` into its parent's `ri_child` (whatever the parent's
+/// `P_NOCLDWAIT`); `times` is 2 for a parent with `P_NOCLDWAIT`, as
+/// `proc_exit` added it once already before the kernel reaped it. A child
+/// with no `p_ru` adds nothing ("lost p_ru").
+pub fn reaped(child: &super::procinfo::Public, parent: &super::procinfo::Public, times: u32) {
+    let Some(r) = child.rusage.exited() else { return };
+    let mut c = parent.rusage.child.lock().unwrap_or_else(|e| e.into_inner());
+    for _ in 0..times {
+        c.add(&r);
+    }
+}
+
+/// The record's copy size for a flavor; none for another.
+pub fn size_of(flavor: u32) -> Option<usize> {
+    SIZES.get(flavor as usize).copied()
+}
+
+impl Kernel {
+    /// `proc_pid_rusage(pid, flavor, buffer)`: `proc_find`, else
+    /// `proc_find_zombref`; the caller's right to look (`proc_security_
+    /// policy` with the same-user check); then `proc_get_rusage`: an
+    /// unknown flavor EINVAL, an ended process's `p_ru`, else the task's
+    /// usage now, its end left 0. Not-kept fields in the copy are reported.
+    pub(crate) fn darwin_proc_pid_rusage(&mut self, m: &mut GuestMem<'_>, pid: i32, flavor: u32, buf: u64) -> Result<u64, i32> {
+        const ESRCH: i32 = 3;
+        const EINVAL: i32 = 22;
+        const EFAULT: i32 = 14;
+        let target = if pid == 0 { Some((super::procinfo::Public::kernel(), false)) } else { self.darwin_public(pid) };
+        let Some((target, _zombie)) = target else { return Err(ESRCH) };
+        self.darwin_proc_info_policy(Some(&target), super::procinfo::call::PIDRUSAGE, true)?;
+        let Some(size) = size_of(flavor) else { return Err(EINVAL) };
+        if pid == 0 {
+            self.darwin_unimplemented("proc_pid_rusage of kernel_task (the kernel task's ledgers and recount totals)".into());
+            return Err(ESRCH);
+        }
+        let r = match target.rusage.exited() {
+            Some(r) => r,
+            None => {
+                let mut i = input(&self.procs, pid, &target);
+                if pid == self.pid {
+                    i.footprint = self.darwin_own_footprint(m);
+                }
+                gather(&i)
+            }
+        };
+        let unkept = r.unkept_within(size);
+        if !unkept.is_empty() {
+            self.darwin_unimplemented(format!("proc_pid_rusage flavor {flavor}: {}, not kept (given as 0)", unkept.join(", ")));
+        }
+        m.write(buf, &r.bytes()[..size]).map_err(|_| EFAULT)?;
+        Ok(0)
+    }
+
+    /// The caller's own `phys_footprint` ledger balance, measured now (a
+    /// measurement as its calls make them, the ledger told).
+    fn darwin_own_footprint(&mut self, m: &mut GuestMem<'_>) -> Option<u64> {
+        self.dtask.footprint_due = None;
+        self.darwin_footprint_tick(m)?;
+        self.procs.jetsam().ledgers.get(&self.pid).map(|l| l.balance as u64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_sizes_are_the_kernels_and_the_layout_its_offsets() {
+        assert_eq!(SIZES[6], WORDS * 8);
+        // fill_task_rusage's and gather_rusage_info's stores.
+        assert_eq!(ri::USER_TIME * 8, 0x10);
+        assert_eq!(ri::PAGEINS * 8, 0x30);
+        assert_eq!(ri::PHYS_FOOTPRINT * 8, 0x48);
+        assert_eq!(ri::PROC_START_ABSTIME * 8, 0x50);
+        assert_eq!(ri::PROC_EXIT_ABSTIME * 8, 0x58);
+        assert_eq!(ri::CHILD_USER_TIME * 8, 0x60);
+        assert_eq!(ri::DISKIO_BYTESREAD * 8, 0x90);
+        assert_eq!(ri::BILLED_SYSTEM_TIME * 8, 0xd8);
+        assert_eq!(ri::LOGICAL_WRITES * 8, 0xe8);
+        assert_eq!(ri::INSTRUCTIONS * 8, 0xf8);
+        assert_eq!(ri::BILLED_ENERGY * 8, 0x108);
+        assert_eq!(ri::INTERVAL_MAX_PHYS_FOOTPRINT * 8, 0x118);
+        assert_eq!(ri::RUNNABLE_TIME * 8, 0x120);
+        assert_eq!(ri::USER_PTIME * 8, 0x130);
+        assert_eq!(ri::ENERGY_NJ * 8, 0x150);
+        assert_eq!(ri::SECURE_TIME_IN_SYSTEM * 8, 0x160);
+        // Each flavor ends on a field the one before does not have.
+        assert_eq!(SIZES[0], (ri::PROC_EXIT_ABSTIME + 1) * 8);
+        assert_eq!(SIZES[1], (ri::CHILD_ELAPSED_ABSTIME + 1) * 8);
+        assert_eq!(SIZES[2], (ri::DISKIO_BYTESWRITTEN + 1) * 8);
+        assert_eq!(SIZES[3], (ri::SERVICED_SYSTEM_TIME + 1) * 8);
+        assert_eq!(SIZES[4], (ri::RUNNABLE_TIME + 1) * 8);
+        assert_eq!(SIZES[5], (ri::FLAGS + 1) * 8);
+        assert_eq!(size_of(7), None);
+    }
+
+    fn live() -> Input {
+        Input { uuid: [7; 16], time_ns: Some(1_000_000), runnable: Some(48_000), wired: 0x8000, footprint: Some(0x40000), start_abstime: 1000, ..Input::default() }
+    }
+
+    #[test]
+    fn a_live_task_keeps_its_times_and_marks_what_is_not_kept() {
+        let r = gather(&live());
+        assert_eq!(&r.bytes()[..16], &[7; 16]);
+        // 1 ms is 24000 ticks of the 24 MHz counter; no system time.
+        assert_eq!(r.w[ri::USER_TIME], 24_000);
+        assert_eq!(r.w[ri::SYSTEM_TIME], 0);
+        assert_eq!((r.w[ri::WIRED_SIZE], r.w[ri::PHYS_FOOTPRINT], r.w[ri::PROC_START_ABSTIME], r.w[ri::PROC_EXIT_ABSTIME]), (0x8000, 0x40000, 1000, 0));
+        assert_eq!(r.w[ri::RUNNABLE_TIME], 48_000);
+        for f in [ri::FLAGS, ri::USER_PTIME, ri::SYSTEM_PTIME, ri::PINSTRUCTIONS, ri::PCYCLES, ri::PENERGY_NJ, ri::SECURE_TIME_IN_SYSTEM, ri::SECURE_PTIME_IN_SYSTEM] {
+            assert_eq!((r.w[f], r.unkept & (1 << f)), (0, 0));
+        }
+        let v0 = r.unkept_within(SIZES[0]);
+        assert_eq!(v0.len(), 4, "{v0:?}");
+        assert!(v0[0].starts_with("ri_pkg_idle_wkups") && v0[3].starts_with("ri_resident_size"));
+        // V1 adds nothing unkept while no child was reaped; V2 the disk's.
+        assert_eq!(r.unkept_within(SIZES[1]).len(), 4);
+        assert_eq!(r.unkept_within(SIZES[2]).len(), 6);
+        // V3: the QoS times, once; the bank's bills are kept.
+        assert_eq!(r.unkept_within(SIZES[3]).len(), 7);
+        assert_eq!(r.unkept_within(SIZES[6]).len(), 7 + 6);
+    }
+
+    #[test]
+    fn a_billing_task_and_another_process_footprint_are_not_kept() {
+        let mut i = live();
+        i.billing = true;
+        i.footprint = None;
+        let r = gather(&i);
+        let all = r.unkept_within(SIZES[6]).join(" ");
+        for n in ["ri_billed_system_time", "ri_serviced_system_time", "ri_billed_energy", "ri_serviced_energy", "ri_phys_footprint"] {
+            assert!(all.contains(n), "{n}");
+        }
+    }
+
+    #[test]
+    fn an_exit_record_has_no_memory_and_its_end() {
+        let mut i = live();
+        i.exit_abstime = Some(5000);
+        let r = gather(&i);
+        assert_eq!((r.w[ri::WIRED_SIZE], r.w[ri::RESIDENT_SIZE], r.w[ri::PHYS_FOOTPRINT], r.w[ri::PROC_EXIT_ABSTIME]), (0, 0, 0, 5000));
+        assert_eq!(r.unkept & ((1 << ri::RESIDENT_SIZE) | (1 << ri::PHYS_FOOTPRINT)), 0);
+        assert_eq!(r.unkept_within(SIZES[0]).len(), 3);
+    }
+
+    #[test]
+    fn a_reaped_child_adds_its_own_and_its_childrens() {
+        let mut i = live();
+        i.exit_abstime = Some(5000);
+        i.child = Child { user_time: 10, system_time: 0, pkg_idle_wkups: 0, interrupt_wkups: 0, pageins: 0, elapsed_abstime: 100, unkept: 0 };
+        let r = gather(&i);
+        let mut c = Child::default();
+        c.add(&r);
+        c.add(&r);
+        assert_eq!((c.user_time, c.system_time, c.elapsed_abstime), (2 * (24_000 + 10), 0, 2 * (4000 + 100)));
+        // The child's wakeups and page-ins are not kept, so neither are
+        // the sums; its time is.
+        let mut p = live();
+        p.child = c;
+        let all = gather(&p).unkept_within(SIZES[1]).join(" ");
+        assert!(all.contains("ri_child_pageins") && all.contains("ri_child_interrupt_wkups") && !all.contains("ri_child_user_time"));
+    }
+}

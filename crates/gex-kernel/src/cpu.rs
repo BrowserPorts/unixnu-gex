@@ -45,6 +45,12 @@ struct Inner {
     /// and the state it interrupted.
     paused: u32,
     resumes: State,
+    /// Its `runnable_timer`, in Mach time units: the time it has been
+    /// runnable (running, or ready to run), every stretch from its start or
+    /// a wakeup to its next block. The Mach time when the state last
+    /// changed.
+    runnable: u64,
+    last_abs: u64,
 }
 
 /// One guest thread's processor time.
@@ -81,14 +87,19 @@ impl ThreadCpu {
     fn sample(&self, next: State) {
         let mut i = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let Some(now) = host_time(i.tid) else { return };
+        let abs = crate::darwin::mach::absolute_time();
         match i.state {
             State::Unstarted => {}
             State::User => i.user += now.saturating_sub(i.last),
             State::Kernel => i.sys += now.saturating_sub(i.last),
             State::Blocked | State::Host | State::Ended => {}
         }
+        if matches!(i.state, State::User | State::Kernel) {
+            i.runnable += abs.saturating_sub(i.last_abs);
+        }
         if i.state != State::Ended {
             i.last = now;
+            i.last_abs = abs;
             i.state = next;
         }
     }
@@ -165,6 +176,21 @@ impl ThreadCpu {
         Some((user + kernel, 0))
     }
 
+    /// Its runnable time so far (`timer_grab(&thread->runnable_timer)`),
+    /// in Mach time units: a running thread's current stretch with it. The
+    /// host translating its code is no time of the device's, and its wait
+    /// in a blocked call is not runnable time. None without the host's
+    /// clocks.
+    pub fn runnable(&self) -> Option<u64> {
+        crate::darwin::workq::host_clocks()?;
+        let i = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut r = i.runnable;
+        if matches!(i.state, State::User | State::Kernel) {
+            r += crate::darwin::mach::absolute_time().saturating_sub(i.last_abs);
+        }
+        Some(r)
+    }
+
     /// Its time out of the kernel and in it so far, in nanoseconds: a
     /// running thread's current stretch read from its host thread. None
     /// without the host's clocks.
@@ -218,6 +244,18 @@ pub(crate) fn calcru(dead: (u64, u64), live: &[(u64, u64)]) -> [(u64, u32); 2] {
         sys = tv_add(sys, microtime(s));
     }
     [tv_add(microtime(dead.0), user), tv_add(microtime(dead.1), sys)]
+}
+
+/// The runnable time of every thread of `threads` so far, in Mach time
+/// units, summed; None without the host's clocks.
+pub(crate) fn live_runnable(threads: &crate::signal::ThreadSigs) -> Option<u64> {
+    let mut sum = 0;
+    for tid in threads.tids() {
+        if let Some(t) = threads.get(tid) {
+            sum += t.cpu.runnable()?;
+        }
+    }
+    Some(sum)
 }
 
 /// Every thread's of `threads` user and system time so far, in

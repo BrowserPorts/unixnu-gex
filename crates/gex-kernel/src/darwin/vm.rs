@@ -165,12 +165,31 @@ pub struct Entries {
     /// with, and `user_wire_size`.
     pub user_wire_limit: Option<u64>,
     user_wire_size: u64,
+    /// Where the task's `wired_mem` ledger is read by others: the bytes
+    /// the user's wirings hold, kept as `user_wire_size` changes.
+    wired_gauge: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl Entries {
     /// A new image's map, with `vm_map_set_user_wire_limit`'s limit.
     pub fn with_user_wire_limit(limit: u64) -> Entries {
         Entries { user_wire_limit: Some(limit), ..Entries::default() }
+    }
+
+    /// The task's `wired_mem` ledger, which this map's wirings now keep
+    /// (a map's pmap is its task's: a wiring enters wired pages, which
+    /// `pte_set_wired` credits to it, and an unwiring or the entry's
+    /// removal debits them).
+    pub fn set_wire_gauge(&mut self, gauge: std::sync::Arc<std::sync::atomic::AtomicU64>) {
+        gauge.store(self.user_wire_size, std::sync::atomic::Ordering::Release);
+        self.wired_gauge = Some(gauge);
+    }
+
+    /// `user_wire_size`, told to the gauge.
+    fn wire_size_changed(&self) {
+        if let Some(g) = &self.wired_gauge {
+            g.store(self.user_wire_size, std::sync::atomic::Ordering::Release);
+        }
     }
 
     /// `vm_map_clip_start`: no entry crosses `at`; the upper half's offset
@@ -203,6 +222,7 @@ impl Entries {
                 }
             }
         }
+        self.wire_size_changed();
     }
 
     /// `[start, end)` becomes one new entry, as a new mapping over it does.
@@ -322,6 +342,7 @@ impl Entries {
         if rc != kr::SUCCESS {
             self.unwire(start, s);
         }
+        self.wire_size_changed();
         rc
     }
 
@@ -347,6 +368,7 @@ impl Entries {
             e.attrs.user_wired -= 1;
         }
         self.user_wire_size -= released;
+        self.wire_size_changed();
         kr::SUCCESS
     }
 
@@ -541,6 +563,30 @@ mod tests {
         assert!(c.at_or_after(0).unwrap().attrs.cow);
         assert!(c.at_or_after(K).unwrap().attrs.shared);
         assert!(e.at_or_after(K).unwrap().attrs.shared, "the parent's is shared too");
+    }
+
+    #[test]
+    fn the_wired_ledger_follows_the_users_wirings() {
+        let g = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut e = Entries::default();
+        e.set_wire_gauge(std::sync::Arc::clone(&g));
+        e.enter(0, 4 * K, Attrs::default(), 0);
+        let wired = || g.load(std::sync::atomic::Ordering::Acquire);
+        assert_eq!(e.wire(K, 3 * K), kr::SUCCESS);
+        assert_eq!(wired(), 2 * K);
+        // A second wiring of a page holds nothing more.
+        assert_eq!(e.wire(K, 2 * K), kr::SUCCESS);
+        assert_eq!(wired(), 2 * K);
+        assert_eq!(e.unwire(2 * K, 3 * K), kr::SUCCESS);
+        assert_eq!(wired(), K);
+        // Unmapping a wired entry releases it; a fork's child has none.
+        e.clear(0, 2 * K);
+        assert_eq!(wired(), 0);
+        assert_eq!(e.wire(3 * K, 4 * K), kr::SUCCESS);
+        let mut c = e.inherited();
+        let cg = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(7));
+        c.set_wire_gauge(std::sync::Arc::clone(&cg));
+        assert_eq!((wired(), cg.load(std::sync::atomic::Ordering::Acquire)), (K, 0));
     }
 
     #[test]

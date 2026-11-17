@@ -16,8 +16,9 @@
 # CACHE and MUSL64_SEED keep a value already set. TMPDIR and XDG_CACHE_HOME are always
 # the build folder's, since macOS sets TMPDIR to the internal disk.
 #
-# Homebrew: bash coreutils findutils gnu-sed gnu-tar grep gawk make libtool binutils bison
-# flock llvm@22 lld@22 wasm-tools xkbcomp. Python: GEX_BUILD/py, a venv with meson at
+# Homebrew: bash coreutils findutils gnu-sed gnu-tar grep gawk make libtool bison flock
+# llvm@22 lld@22 wasm-tools xkbcomp. GNU binutils stay off PATH: their ar writes archives
+# the host's linker rejects, and the guest toolchains bring their own. Python: GEX_BUILD/py, a venv with meson at
 # MESON_VERSION (wine/libs.pins), mako, pyyaml and packaging.
 
 gex_host_env() {
@@ -55,7 +56,7 @@ gex_host_env() {
     for d in coreutils findutils gnu-sed gnu-tar grep gawk make libtool; do
         GEX_PATH=$GEX_PATH:$hb/opt/$d/libexec/gnubin
     done
-    GEX_PATH=$GEX_PATH:$hb/opt/binutils/bin:$hb/opt/bison/bin:$GEX_MINGW:$hb/bin
+    GEX_PATH=$GEX_PATH:$hb/opt/bison/bin:$GEX_MINGW:$hb/bin
     GEX_BASH=$hb/bin/bash
 
     for d in $(echo "$GEX_PATH" | tr : ' '); do

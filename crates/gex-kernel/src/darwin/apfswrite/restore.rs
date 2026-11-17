@@ -138,6 +138,18 @@ pub fn build_disk0_with(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() ->
         fsops::chown(&mut nx, update, ino, uid, gid, now)?;
     }
     fsops::unmount(&mut nx, update, now)?;
+    // While asr writes (restore_asr starts it asynchronously), the steps
+    // after it in perform_main_os_prepare and perform_restore_installing
+    // run on the same container until await_asr_and_retry: init_gigalocker
+    // (xART mounted read-write, seputil's gigalocker file),
+    // init_permanent_update_volume (Update remounted, its directories'
+    // chown, its unmount), mount_filesystem (System renamed, Update
+    // mounted), fdr_restore_saved_data (System and Hardware mounted,
+    // Hardware's /FactoryData/System/Library/Caches/com.apple.factorydata),
+    // commit_sep_os (xART, the Preboot paths and their factorydata link),
+    // and await_asr_and_retry's unmount of everything (Update's forced).
+    // None is made yet: the container apfs_invert gets lacks them.
+    missing.push("the kernel operations restored_external runs while asr writes and before apfs_invert (init_gigalocker's xART mount and gigalocker file, init_permanent_update_volume's Update remount, chown and unmount, mount_filesystem, fdr_restore_saved_data's Hardware FactoryData directories, commit_sep_os's Preboot paths and link, the forced unmount of Update): the container before apfs_invert lacks them, so every placement from asr's on follows a state the device does not have".into());
     // 5. System mounted read-write at /mnt1 and asr's image file written
     // into it (restore_apfs_image_async, restored_external 0x10002d2a4),
     // then everything unmounted for the invert (0x100017488).

@@ -165,7 +165,11 @@ dist() { # dist <mp|sp>
     stage=$CACHE/public-$f
     say "page/${out##*/} ($f)"
     rm -rf "$stage" "$DEBUGDIR/$f"
-    cp -al "$HERE/public" "$stage"
+    # (its files, through page/public where that is a link, as a checkout
+    # whose build folders are on another volume has it: hard links where the
+    # stage is on their volume, else copies)
+    mkdir -p "$stage"
+    cp -al "$HERE/public/." "$stage/" 2>/dev/null || { rm -rf "$stage" && mkdir -p "$stage" && cp -a "$HERE/public/." "$stage/"; }
     # Only what this flavour's page loads (runtime.js: the shared shim, the
     # shared seed, gex_kernel.wasm), and only its own Mesa and Xwayland.
     rm -f "$stage"/gex/gex_kernel*.plain.wasm

@@ -541,6 +541,19 @@ fn add_bsd_client(t: &mut Vec<Node>, medium: u32, class: &'static str) {
     push(t, service(class, class, Some(medium), props, Table::Complete));
 }
 
+/// A property a class here answers from its `getProperty` override rather
+/// than its table, when that answer is not modelled: a namespace's
+/// WriteCacheState (IOBlockStorageDevice's override, 0xfffffff00596ee88,
+/// asks `getWriteCacheState`, slot 0x5b0, whose IONVMeBlockStorageDevice
+/// answer rests on flags at +0xb0 not traced).
+pub fn property_override(t: &[Node], i: u32, name: &str) -> Option<String> {
+    let n = t.get(i as usize)?;
+    if name == "WriteCacheState" && superclasses(n.class).contains(&"IOBlockStorageDevice") {
+        return Some(format!("{}'s WriteCacheState (getWriteCacheState, from flags not traced)", n.name));
+    }
+    None
+}
+
 /// `IORegistryEntry::getLocation`: what the drivers gave their objects
 /// (`setLocation`): a PCI nub's device number, a namespace's NSID
 /// (`"%x"`), the GPT partition's number (`"%d"`), a volume's slot plus

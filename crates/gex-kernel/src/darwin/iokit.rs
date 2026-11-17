@@ -411,6 +411,9 @@ pub fn service_prop<'a>(n: &'a Node, name: &str) -> Option<&'a Prop> {
 /// ([`property_unknown`]).
 pub fn lookup(t: &[Node], i: u32, name: &str) -> Result<Option<Vec<u8>>, String> {
     let Some(node) = t.get(i as usize) else { return Ok(None) };
+    if let Some(what) = super::storagestack::property_override(t, i, name) {
+        return Err(what);
+    }
     if let Some(p) = live_prop(t, i, name) {
         return Ok(Some(serialize_prop(&p)));
     }

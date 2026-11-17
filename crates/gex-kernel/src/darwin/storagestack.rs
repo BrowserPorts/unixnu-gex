@@ -313,10 +313,14 @@ fn add_pcie(t: &mut Vec<Node>, io: u32) -> Option<u32> {
     }
     // The personality "AppleEmbeddedNVMeController" (IONVMeFamily), and
     // what its start sets of the controller's own: its panic action, its
-    // NAND's status once its namespaces are up, and Identify Controller's
-    // strings as symbols (0xfffffff006a85d58).
+    // NAND's status once its namespaces are up, Identify Controller's
+    // strings as symbols (0xfffffff006a85d58), and its reporters' legend
+    // (AppleEmbeddedNVMeController's slot 0x850, 0xfffffff006a5dd18: a new
+    // legend of one state reporter). Its score: the personality has none,
+    // and `pciMatchNub` adds 1000 for an IOPCIMatch matched on the IDs or
+    // the subsystem's; neither class overrides `probe`.
     let n = super::storage::nvme();
-    let mut props = driver("com.apple.iokit.IONVMeFamily", CONTROLLER, PCI_DEVICE, None, "IODefaultMatchCategory", 0, vec![
+    let mut props = driver("com.apple.iokit.IONVMeFamily", CONTROLLER, PCI_DEVICE, None, "IODefaultMatchCategory", 1000, vec![
         key("IOPCIClassMatch", string("0x01800200&0xffffff00")),
         key("IOUserClientClass", string("AppleNVMeUpdateUC")),
         key("IOPCIMatch", string("0x2002106b")),
@@ -332,21 +336,59 @@ fn add_pcie(t: &mut Vec<Node>, io: u32) -> Option<u32> {
     props.push(key("Firmware Revision", sym(n.firmware)));
     props.push(key("IOPlatformPanicAction", num32(0)));
     props.push(key("AppleNANDStatus", sym("Ready")));
+    // IOStateReporter::with(this, kIOReportCategoryPower, 2 states, unit
+    // 0x0101000000000000): channel 'NVMe Pwr' "NVMe Power States", its
+    // states 'OFF' and 'ACTIVE'; in group "NVMe" with no subgroup.
+    props.push(key("IOReportLegend", Prop::Array(vec![legend_entry(&[(0x4e56_4d65_2050_7772, "NVMe Power States")], channel_type(2, 1 << 1, 2), 0x0101_0000_0000_0000, "NVMe", None)])));
+    props.push(key("IOReportLegendPublic", Prop::Bool(true)));
     let lacks = vec![
-        ("IOProbeScore", "the PCI match's score, not followed"),
-        ("IOCommandPoolSize", "CAP.MQES, the controller's"),
-        ("NVMe Revision Supported", "the VS register, the controller's"),
-        ("Controller Characteristics", "the NAND's vendor commands' answers"),
+        ("IOCommandPoolSize", "from CAP.MQES, the controller's register (IOControllerInit, 0xfffffff006a8316c)"),
+        ("NVMe Revision Supported", "\"%u.%u%u\" of the VS register, the controller's"),
+        ("Controller Characteristics", "the NAND's answers to the vendor commands (0xfffffff006a5c19c)"),
         ("IOPolledInterface", "the polled adapter object"),
-        ("IOReportLegend", "the controller's reporters"),
         ("chip-id", "the NAND's"),
+        ("chip-revision", "the NAND's"),
         ("IOMinimumSaturationByteCount", "not followed"),
         ("IOMaximumSwapWrite", "not followed"),
         ("VCParams", "not followed"),
+        ("NVMe Debug Data", "not followed"),
     ];
-    // Its score is the PCI match's, not followed: not the personality's.
-    props.retain(|(k, _)| k != "IOProbeScore");
     Some(push(t, service(CONTROLLER, CONTROLLER, Some(nvme), props, Table::Lacks(lacks))))
+}
+
+/// `IOReportChannelType` as `IOReporter::legendWith` stores it, a 64-bit
+/// number of its bytes: the report format, a reserved byte, the
+/// categories (16 bits), the elements per channel (16 bits) and the
+/// element index (0).
+fn channel_type(format: u8, categories: u16, nelements: u16) -> u64 {
+    u64::from(format) | u64::from(categories) << 16 | u64::from(nelements) << 32
+}
+
+/// A reporter's legend entry (`IOReporter::legendWith`, then
+/// `IOReportLegend::organizeLegend`): its channels, each an array of its
+/// ID and type (64-bit numbers) and name (a symbol); its unit; its group
+/// and subgroup names (symbols).
+fn legend_entry(channels: &[(u64, &str)], ty: u64, unit: u64, group: &str, subgroup: Option<&str>) -> Prop {
+    let chans = channels.iter().map(|&(id, name)| Prop::Array(vec![num64(id), num64(ty), sym(name)])).collect();
+    let mut e = vec![key("IOReportChannels", Prop::Array(chans)), key("IOReportChannelInfo", Prop::Dict(vec![key("IOReportChannelUnit", num64(unit))])), key("IOReportGroupName", sym(group))];
+    if let Some(sg) = subgroup {
+        e.push(key("IOReportSubGroupName", sym(sg)));
+    }
+    Prop::Dict(e)
+}
+
+/// A namespace's reporters' legend (0xfffffff006a95e10): two
+/// `IOSimpleReporter`s of kIOReportCategoryDebug and unit 0, in group
+/// "NVMe": "BW Limits", the four tiers' bandwidth scale factors, and "Time
+/// weighted throttle statistics", the time elapsed and the four tiers'
+/// throttle times.
+fn namespace_legend() -> Prop {
+    let ty = channel_type(1, 1 << 15, 1);
+    let tier = |n: u64, tail: u64| 0x5469_6572_2030_0000 | n << 16 | tail;
+    Prop::Array(vec![
+        legend_entry(&[(tier(0, 0x4257), "Tier0 BW Scale Factor"), (tier(1, 0x4257), "Tier1 BW Scale Factor"), (tier(2, 0x4257), "Tier2 BW Scale Factor"), (tier(3, 0x4257), "Tier3 BW Scale Factor")], ty, 0, "NVMe", Some("BW Limits")),
+        legend_entry(&[(0x546f_7420_5469_6d65, "Total time elapsed"), (tier(0, 0x2020), "Tier0 Throttle Time"), (tier(1, 0x2020), "Tier1 Throttle Time"), (tier(2, 0x2020), "Tier2 Throttle Time"), (tier(3, 0x2020), "Tier3 Throttle Time")], ty, 0, "NVMe", Some("Time weighted throttle statistics")),
+    ])
 }
 
 /// A root port's entry's port object (`_buildPortProperties`), which
@@ -432,6 +474,9 @@ pub fn pci_facts() -> PciFacts {
 /// The facts here still unset, as lines for gexc's report at start.
 pub fn unmeasured() -> Vec<String> {
     let mut gaps = Vec::new();
+    if CONTAINER_STATUS.is_none() {
+        gaps.push(format!("the AppleAPFSContainer's Status (stand-in {STAND_IN_CONTAINER_STATUS:?}; measure {CONTAINER_STATUS_MEASUREMENT})"));
+    }
     if PCI_DEVICE_FACTS.is_none() {
         gaps.push(format!("the PCIe functions' configuration space (stand-in: the NAND controller 106b:2002, the root port 0:0, revisions 0, no subsystem IDs, PCIe capability version 2, links at 8 GT/s x1, root port subordinate bus 1; measure {PCI_MEASUREMENT})"));
     }
@@ -553,6 +598,7 @@ fn add_storage(t: &mut Vec<Node>, controller: Option<u32>) {
         key("IOUnit", num32(1)),
         key("NamespaceUUID", num64(n.eui64)),
         key("NamespaceID", num32(1)),
+        key("IOReportLegend", namespace_legend()),
         key("IOReportLegendPublic", Prop::Bool(true)),
         key("IOMaximumSegmentCountRead", num32(256)),
         key("IOMaximumSegmentCountWrite", num32(256)),
@@ -580,10 +626,12 @@ fn add_storage(t: &mut Vec<Node>, controller: Option<u32>) {
         key("IOCFPlugInTypes", Prop::Dict(vec![key("AA0FA6F9-C2D6-457F-B10B-59A13253292F", string("NVMeSMARTLib.plugin"))])),
         key("NVMe SMART Capable", Prop::Bool(true)),
     ];
-    let ns = push(t, service("NS_01", BLOCK_DEVICE, controller, ns_props, Table::Lacks(vec![("IOReportLegend", "its reporters' legend, whose encoding is IOReporter's")])));
-    // IOBlockStorageDriver's personality; its init's statistics.
-    let props = driver("com.apple.iokit.IOStorageFamily", DRIVER, "IOBlockStorageDevice", None, "IODefaultMatchCategory", 0, vec![key("IOPropertyMatch", Prop::Dict(vec![key("device-type", string("Generic"))]))]);
-    let drv = push(t, service(DRIVER, DRIVER, Some(ns), props, Table::Lacks(vec![("Statistics", "the driver's counters, which each read and write of the disk moves")])));
+    let ns = push(t, service("NS_01", BLOCK_DEVICE, controller, ns_props, Table::Complete));
+    // IOBlockStorageDriver's personality; its init's statistics (live,
+    // [`stats`]).
+    let mut props = driver("com.apple.iokit.IOStorageFamily", DRIVER, "IOBlockStorageDevice", None, "IODefaultMatchCategory", 0, vec![key("IOPropertyMatch", Prop::Dict(vec![key("device-type", string("Generic"))]))]);
+    props.push(key("Statistics", stats::driver(1)));
+    let drv = push(t, service(DRIVER, DRIVER, Some(ns), props, Table::Complete));
     // disk0: its content the GPT scheme's Content Mask, no leaf; its icon
     // the internal one (the namespace's Physical Interconnect Location).
     let mut props = medium("GUID_partition_scheme", "", false, block, super::storage::disk0_bytes(), true, writable);
@@ -617,8 +665,9 @@ fn add_storage(t: &mut Vec<Node>, controller: Option<u32>) {
     // and APFSComposited (the container's nx_fusion_uuid null,
     // 0xfffffff0066824d4).
     let mut props = driver("com.apple.filesystems.apfs", APFS_SCHEME, "IOMedia", None, "IOStorage", 2000, vec![key("IOPropertyMatch", Prop::Array(vec![Prop::Dict(vec![key("Content Hint", string(CONTAINER_PARTITION_HINT))])]))]);
+    props.push(key("Statistics", stats::scheme()));
     props.push(key("APFSComposited", Prop::Bool(false)));
-    let scheme = push(t, service(APFS_SCHEME, APFS_SCHEME, Some(part), props, Table::Lacks(vec![("Statistics", "the scheme's counters, which each read and write of the container moves")])));
+    let scheme = push(t, service(APFS_SCHEME, APFS_SCHEME, Some(part), props, Table::Complete));
     // AppleAPFSMedia (the scheme's start, 0xfffffff0066829d4): its init's
     // dictionary first (AppleAPFSMedia::init, 0xfffffff006682168): the
     // block sizes, min(nx_block_size, 4096), one number under both keys,
@@ -638,13 +687,16 @@ fn add_storage(t: &mut Vec<Node>, controller: Option<u32>) {
     props.push(key("UUID", sym(&uuid_string(&super::storage::container_uuid()))));
     props.extend(bsd_keys(Media::Container));
     let media = push(t, service(APFS_MEDIA, APFS_MEDIA, Some(scheme), props, Table::Complete));
-    // AppleAPFSContainer: its personality; what its start sets (its
-    // statistics, Status) is run-time state.
-    let props = driver("com.apple.filesystems.apfs", APFS_CONTAINER, "IOMedia", None, "IOStorage", 1000, vec![
+    // AppleAPFSContainer: its personality, then what its start sets
+    // (0xfffffff00666ade4): its statistics (live, [`stats`]), then its
+    // Status.
+    let mut props = driver("com.apple.filesystems.apfs", APFS_CONTAINER, "IOMedia", None, "IOStorage", 1000, vec![
         key("IOPropertyMatch", Prop::Array(vec![Prop::Dict(vec![key("Content Hint", string(APFS_CONTAINER_HINT))])])),
         key("IOUserClientClass", string("AppleAPFSUserClient")),
     ]);
-    let container = push(t, service(APFS_CONTAINER, APFS_CONTAINER, Some(media), props, Table::Lacks(vec![("Statistics", "the container's counters"), ("Status", "the container's state")])));
+    props.push(key("Statistics", stats::container()));
+    props.push(key("Status", sym(container_status())));
+    let container = push(t, service(APFS_CONTAINER, APFS_CONTAINER, Some(media), props, Table::Complete));
     for v in super::storage::VOLUMES {
         let mut props = medium(APFS_VOLUME_HINT, APFS_VOLUME_HINT, true, apfs_block, 0, false, super::storage::volume_writable());
         props.retain(|(k, _)| k != "Preferred Block Size" && k != "Size");
@@ -767,11 +819,20 @@ fn media_of(n: &Node) -> Option<Media> {
     super::storage::media_by_name(name).map(|(m, _)| m)
 }
 
-/// A medium's live "Open": `IOMedia::handleOpen` sets it once it holds its
+/// A storage driver's live Statistics ([`stats`]), and a medium's live
+/// "Open": `IOMedia::handleOpen` sets it once it holds its
 /// provider open at some level and `handleClose` clears it once it holds
 /// none ([`super::dkopen`]'s levels).
 pub fn live_prop(t: &[Node], i: u32, name: &str) -> Option<Prop> {
     let n = t.get(i as usize)?;
+    if name == "Statistics" {
+        return match n.class {
+            DRIVER => stats::namespace_of(t, i).map(stats::driver),
+            APFS_SCHEME => Some(stats::scheme()),
+            APFS_CONTAINER => Some(stats::container()),
+            _ => None,
+        };
+    }
     if name != "Open" || !superclasses(n.class).contains(&"IOMedia") {
         return None;
     }
@@ -780,3 +841,164 @@ pub fn live_prop(t: &[Node], i: u32, name: &str) -> Option<Prop> {
     Some(Prop::Bool(level != super::dkopen::access::NONE))
 }
 
+/// What `AppleAPFSContainer`'s start sets as its Status (0xfffffff00666b0d0):
+/// "Online", or "Readonly" when the container's state has the flag at its
+/// +0x38 set (from the table at 0xfffffff006f297c0, which also names
+/// Offline, Pairing, Checking, Corrupt and Incompatible). Which the
+/// device's mounted container has is not traced: "Online" (the container
+/// writable, as its disk is) stands in, a reported shortcut
+/// ([`unmeasured`]).
+pub const STAND_IN_CONTAINER_STATUS: &str = "Online";
+
+/// The device's, once measured.
+pub const CONTAINER_STATUS: Option<&str> = None;
+
+/// What measures [`CONTAINER_STATUS`].
+pub const CONTAINER_STATUS_MEASUREMENT: &str = "the Status of the AppleAPFSContainer (a sysdiagnose's ioreg IOService plane)";
+
+fn container_status() -> &'static str {
+    CONTAINER_STATUS.unwrap_or(STAND_IN_CONTAINER_STATUS)
+}
+
+/// The storage's I/O counters, as the drivers keep them and publish them
+/// in their Statistics dictionaries, each a live view of these counts.
+/// The disk I/O that moves them goes through [`driver_transfer`],
+/// [`driver_retry`], [`driver_error`], [`scheme_transfer`] and
+/// [`container_count`]; until the disk nodes do I/O none moves, and every
+/// count is zero.
+pub mod stats {
+    use super::{key, num64, Node, Prop};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// IOBlockStorageDriver's statistics in the order its init adds them
+    /// to its dictionary (0xfffffff00596f408), each a 64-bit number.
+    pub const DRIVER_KEYS: [&str; 12] = [
+        "Bytes (Read)",
+        "Bytes (Write)",
+        "Errors (Read)",
+        "Errors (Write)",
+        "Latency Time (Read)",
+        "Latency Time (Write)",
+        "Operations (Read)",
+        "Operations (Write)",
+        "Retries (Read)",
+        "Retries (Write)",
+        "Total Time (Read)",
+        "Total Time (Write)",
+    ];
+
+    /// The counters of each namespace's storage driver (NSID 1 and 2).
+    static DRIVERS: [[AtomicU64; 12]; 2] = [const { [const { AtomicU64::new(0) }; 12] }; 2];
+
+    /// AppleAPFSContainerScheme's (0xfffffff006682418): APFSOSNumberAtomic
+    /// counters of 64 bits.
+    pub const SCHEME_KEYS: [&str; 4] = ["Bytes (Read)", "Bytes (Write)", "Operations (Read)", "Operations (Write)"];
+    static SCHEME: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+    /// AppleAPFSContainer's statistics: the names of its 86 counters
+    /// (0xfffffff006f284c0), of which its init (0xfffffff00666ae40) makes
+    /// all but the Fusion ones (4 to 54), each an APFSOSNumberAtomic of 64
+    /// bits, added to its dictionary in this order.
+    pub const CONTAINER_KEYS: [&str; 35] = [
+        "Read requests sent to block device",
+        "Bytes read from block device",
+        "Write requests sent to block device",
+        "Bytes written to block device",
+        "Object cache: Total number of queries",
+        "Object cache: Number of hits",
+        "Object cache: Number of evictions",
+        "Object cache: Number of reads",
+        "Object cache: Number of writes",
+        "Object cache: Number of full cache flushes",
+        "Object cache: Number of partial cache flushes",
+        "Object cache: Number of objects processed by partial cache flushes",
+        "Metadata: Number of bytes read",
+        "Metadata: Number of read errors",
+        "Metadata: Number of spaceman bitmap bytes read",
+        "Metadata: Number of bytes written",
+        "Metadata: Number of write errors",
+        "Metadata: Number of spaceman bitmap bytes written",
+        "Metadata: Number of bytes written to checkpoint area",
+        "FX defrag: Number of blocks reallocated",
+        "FX defrag: Number of file extents reallocated",
+        "FX defrag: Number of file extents skipped during relocation",
+        "FX defrag: Number of spaceman chunks chosen for data relocation",
+        "FX defrag: Number of times free extent defrag has run",
+        "FX defrag: Number of times free extent defrag has completed",
+        "FX defrag: Number of times free extent defrag has run aggressively",
+        "FX defrag: Number of times free extent defrag has completed aggressively",
+        "Number of transactions flushed",
+        "Number of transaction updates",
+        "Number of times device's cache flushed",
+        "Write burst: Total time",
+        "Write burst: Total number of bytes written",
+        "Write burst: Total number of I/Os",
+        "Write burst: Total time between bursts",
+        "Write burst: Burst count",
+    ];
+    static CONTAINER: [AtomicU64; 35] = [const { AtomicU64::new(0) }; 35];
+
+    fn dict(keys: &[&str], values: &[AtomicU64]) -> Prop {
+        Prop::Dict(keys.iter().zip(values).map(|(k, v)| key(k, num64(v.load(Ordering::Relaxed)))).collect())
+    }
+
+    /// The namespace (1 or 2) whose storage driver is entry `i`.
+    pub fn namespace_of(t: &[Node], i: u32) -> Option<u32> {
+        let ns = &t[t.get(i as usize)?.parent? as usize];
+        ns.name.strip_prefix("NS_")?.parse().ok()
+    }
+
+    /// The Statistics of namespace `nsid`'s storage driver.
+    pub fn driver(nsid: u32) -> Prop {
+        dict(&DRIVER_KEYS, &DRIVERS[(nsid as usize).saturating_sub(1).min(1)])
+    }
+
+    pub fn scheme() -> Prop {
+        dict(&SCHEME_KEYS, &SCHEME)
+    }
+
+    pub fn container() -> Prop {
+        dict(&CONTAINER_KEYS, &CONTAINER)
+    }
+
+    /// `IOBlockStorageDriver::addToBytesTransferred`: one transfer of
+    /// `bytes` through namespace `nsid`'s driver, its total and latent
+    /// times in nanoseconds.
+    pub fn driver_transfer(nsid: u32, bytes: u64, total_ns: u64, latent_ns: u64, write: bool) {
+        let d = &DRIVERS[(nsid as usize).saturating_sub(1).min(1)];
+        let w = usize::from(write);
+        d[6 + w].fetch_add(1, Ordering::Relaxed);
+        d[w].fetch_add(bytes, Ordering::Relaxed);
+        d[10 + w].fetch_add(total_ns, Ordering::Relaxed);
+        d[4 + w].fetch_add(latent_ns, Ordering::Relaxed);
+    }
+
+    /// `IOBlockStorageDriver::incrementRetries`.
+    pub fn driver_retry(nsid: u32, write: bool) {
+        DRIVERS[(nsid as usize).saturating_sub(1).min(1)][8 + usize::from(write)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `IOBlockStorageDriver::incrementErrors`.
+    pub fn driver_error(nsid: u32, write: bool) {
+        DRIVERS[(nsid as usize).saturating_sub(1).min(1)][2 + usize::from(write)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One transfer of `bytes` through the container scheme.
+    pub fn scheme_transfer(bytes: u64, write: bool) {
+        let w = usize::from(write);
+        SCHEME[w].fetch_add(bytes, Ordering::Relaxed);
+        SCHEME[2 + w].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Add `n` to the container's counter named `name` (one of
+    /// [`CONTAINER_KEYS`]); false for a name it does not keep.
+    pub fn container_count(name: &str, n: u64) -> bool {
+        match CONTAINER_KEYS.iter().position(|k| *k == name) {
+            Some(i) => {
+                CONTAINER[i].fetch_add(n, Ordering::Relaxed);
+                true
+            }
+            None => false,
+        }
+    }
+}

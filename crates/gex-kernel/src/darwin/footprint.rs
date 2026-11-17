@@ -250,8 +250,23 @@ pub struct Pmap {
     chunks: std::collections::BTreeMap<u64, Box<[u64; CHUNK_WORDS]>>,
     /// Pages held as [`Held::Own`].
     own: u64,
+    /// Pages held as [`Held::Reusable`] and as [`Held::File`].
+    reusable: u64,
+    file: u64,
     leaves: std::collections::BTreeSet<u64>,
     twigs: std::collections::BTreeSet<u64>,
+    /// The pmap's ledgers' lifetime peaks, in pages.
+    pub peaks: Pages,
+}
+
+/// The pages a pmap's ledgers count (`pmap_enter`'s credits): `phys_mem`
+/// (every page entered), `internal`, `external` and `reusable`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Pages {
+    pub resident: u64,
+    pub internal: u64,
+    pub external: u64,
+    pub reusable: u64,
 }
 
 /// The pages of `[s, e)` (page aligned) by chunk: the chunk, and the first
@@ -275,6 +290,14 @@ fn own_in(w: u64) -> u64 {
     u64::from((w & LOW & !(w >> 1)).count_ones())
 }
 
+fn reusable_in(w: u64) -> u64 {
+    u64::from(((w >> 1) & LOW & !w).count_ones())
+}
+
+fn file_in(w: u64) -> u64 {
+    u64::from((w & (w >> 1) & LOW).count_ones())
+}
+
 fn get(words: &[u64; CHUNK_WORDS], i: usize) -> Held {
     Held::of(words[i / 32] >> ((i % 32) * 2))
 }
@@ -289,6 +312,21 @@ impl Pmap {
     pub fn held(&self, addr: u64) -> Held {
         let p = addr >> PAGE_SHIFT;
         self.chunks.get(&(p / CHUNK_PAGES)).map_or(Held::None, |c| get(c, (p % CHUNK_PAGES) as usize))
+    }
+
+    /// What its ledgers count now.
+    pub fn pages(&self) -> Pages {
+        Pages { resident: self.own + self.reusable + self.file, internal: self.own, external: self.file, reusable: self.reusable }
+    }
+
+    /// The peaks raised to what the ledgers count now (`LF_TRACKING_MAX`).
+    fn track(&mut self) {
+        let n = self.pages();
+        let p = &mut self.peaks;
+        p.resident = p.resident.max(n.resident);
+        p.internal = p.internal.max(n.internal);
+        p.external = p.external.max(n.external);
+        p.reusable = p.reusable.max(n.reusable);
     }
 
     /// The `phys_footprint` it makes: its own pages, the root table, the
@@ -334,9 +372,11 @@ impl Pmap {
             }
         }
         chunks.retain(|_, w| w.iter().any(|&x| x != 0));
-        self.own = chunks.values().map(|w| w.iter().map(|&x| own_in(x)).sum::<u64>()).sum();
+        let count = |f: fn(u64) -> u64| chunks.values().map(|w| w.iter().map(|&x| f(x)).sum::<u64>()).sum::<u64>();
+        (self.own, self.reusable, self.file) = (count(own_in), count(reusable_in), count(file_in));
         self.chunks = chunks;
         self.twigs.extend(twigs.iter().copied());
+        self.track();
         true
     }
 
@@ -353,7 +393,9 @@ impl Pmap {
             for i in i0..i1 {
                 let (was, now) = (get(w, i), f(get(w, i)));
                 if was != now {
-                    self.own = self.own + u64::from(now == Held::Own) - u64::from(was == Held::Own);
+                    for (n, h) in [(&mut self.own, Held::Own), (&mut self.reusable, Held::Reusable), (&mut self.file, Held::File)] {
+                        *n = *n + u64::from(now == h) - u64::from(was == h);
+                    }
                     put(w, i, now);
                 }
             }
@@ -361,6 +403,7 @@ impl Pmap {
                 self.chunks.remove(&c);
             }
         }
+        self.track();
     }
 
     /// `pmap_remove` of `[s, e)` (`vm_map_delete`, an overwrite): its
@@ -703,20 +746,20 @@ impl Kernel {
     /// `task_info(TASK_VM_INFO)` and `TASK_VM_INFO_PURGEABLE` of this task
     /// (`task.c`), with the caller's count checked and fixed as XNU does
     /// (an iOS 12 SDK's larger count is taken as rev2's): the map's size,
-    /// entries, page and bounds; the purgeable volatile sizes (none: no
-    /// purgeable memory is made here); its `phys_footprint` ledger's
-    /// balance (`get_task_phys_footprint`, the task's pages looked at now)
-    /// and lifetime peak (`ledger_get_lifetime_max`), and what its memory
-    /// limit leaves (`memorystatus_available_memory_internal`); the
-    /// purgeable and owned-memory ledgers (none: neither purgeable memory
-    /// nor ownership changes are made here). What needs the pmap's other
-    /// ledgers and the compressor's, which are not kept (resident, internal,
-    /// external, reusable and compressed sizes and peaks, decompressions,
-    /// swap-ins), is reported and given as 0.
+    /// entries, page and bounds; the pmap's ledgers from one look at the
+    /// task's pages (`phys_mem` as the resident size, `internal`,
+    /// `external`, `reusable`, each with its lifetime peak); its
+    /// `phys_footprint` ledger's balance (`get_task_phys_footprint`) and
+    /// lifetime peak (`ledger_get_lifetime_max`), and what its memory limit
+    /// leaves (`memorystatus_available_memory_internal`). The device
+    /// modelled runs no pageout (its pressure level stays normal), so its
+    /// compressor holds nothing of the task's and nothing is swapped: the
+    /// compressed sizes, their peak and lifetime, the decompressions and
+    /// the swap-ins are 0, as are the purgeable volatile sizes and the
+    /// purgeable and tag ledgers (no purgeable memory is made here).
     pub(crate) fn darwin_task_vm_info(&mut self, m: &mut GuestMem<'_>, count: u32) -> super::kobject::Reply {
         use super::kobject::Reply;
         const KERN_INVALID_ARGUMENT: i32 = 4;
-        const TASK_VM_INFO_PURGEABLE: i32 = 23;
         // TASK_VM_INFO_REV*_COUNT: natural_t of the packed structure.
         const REV0: u32 = 36;
         const REV1: u32 = 38;
@@ -740,19 +783,22 @@ impl Kernel {
         put(&mut out, 0, size);
         out[8..12].copy_from_slice(&entries.to_le_bytes());
         out[12..16].copy_from_slice(&((super::mach::PAGE_MASK + 1) as u32).to_le_bytes());
-        let mut unkept = vec!["resident_size", "resident_size_peak", "internal", "internal_peak", "external", "external_peak", "reusable", "reusable_peak", "compressed", "compressed_peak", "compressed_lifetime"];
-        // device and device_peak (32, 40) are 0, and so are the purgeable
-        // volatile sizes (96-112), TASK_VM_INFO_PURGEABLE's
-        // vm_map_query_volatile finding no purgeable object.
-        let _ = TASK_VM_INFO_PURGEABLE;
+        // One look: the ledgers as the pmap holds them now.
+        let footprint = self.darwin_footprint_now(m);
+        let (now, peaks) = {
+            let pm = self.dtask.rusage.meter.lock();
+            (pm.pages(), pm.peaks)
+        };
+        let Some(footprint) = footprint else {
+            self.darwin_unimplemented("task_info TASK_VM_INFO on a host that cannot say which pages are a task's".into());
+            return Reply::err(5);
+        };
+        for (at, pages) in [(16, now.resident), (24, peaks.resident), (48, now.internal), (56, peaks.internal), (64, now.external), (72, peaks.external), (80, now.reusable), (88, peaks.reusable)] {
+            put(&mut out, at, pages * PAGE);
+        }
         let mut n = REV0;
-        let footprint = if original >= REV1 { self.darwin_footprint_now(m) } else { None };
-        let peak = self.procs.jetsam().ledgers.get(&self.pid).map(|l| l.lifetime_max);
         if original >= REV1 {
-            match footprint {
-                Some(f) => put(&mut out, 144, f as u64),
-                None => unkept.push("phys_footprint (the host cannot say which pages are the task's)"),
-            }
+            put(&mut out, 144, footprint as u64);
             n = REV1;
         }
         if original >= REV2 {
@@ -763,28 +809,20 @@ impl Kernel {
         if original >= REV3 {
             // ledger_phys_footprint_peak; the purgeable and tag ledgers
             // after it are 0.
-            match (footprint, peak) {
-                (Some(_), Some(p)) => put(&mut out, 168, p as u64),
-                _ => unkept.push("ledger_phys_footprint_peak"),
-            }
+            let peak = self.procs.jetsam().ledgers.get(&self.pid).map_or(footprint, |l| l.lifetime_max);
+            put(&mut out, 168, peak as u64);
             n = REV3;
         }
         if original >= REV4 {
-            match footprint {
-                Some(f) => put(&mut out, 336, self.procs.jetsam().available_memory(self.pid, f as u64)),
-                None => unkept.push("limit_bytes_remaining"),
-            }
+            put(&mut out, 336, self.procs.jetsam().available_memory(self.pid, footprint as u64));
             n = REV4;
         }
         if original >= REV5 {
-            unkept.push("decompressions");
             n = REV5;
         }
         if original >= REV6 {
-            unkept.push("ledger_swapins");
             n = REV6;
         }
-        self.darwin_unimplemented(format!("task_info TASK_VM_INFO's {}: the pmap's and the compressor's ledgers are not kept (given as 0)", unkept.join(", ")));
         // task_info_out, CountInOut: the count, then that many words.
         let mut reply = n.to_le_bytes().to_vec();
         reply.extend_from_slice(&out[..n as usize * 4]);
@@ -963,6 +1001,24 @@ mod tests {
         l.observe(pm.balance());
         assert_eq!(l.get_interval_max(false), empty + (N / 2 * PAGE) as i64 + PAGE as i64);
         assert_eq!(l.lifetime_max, empty + (N * PAGE) as i64 + PAGE as i64);
+    }
+
+    #[test]
+    fn the_pmap_ledgers_count_each_kind_of_page_and_keep_their_peaks() {
+        let mut st = std::collections::BTreeMap::new();
+        st.insert(BASE, ps::PRESENT);
+        st.insert(BASE + PAGE, ps::PRESENT);
+        st.insert(BASE + 2 * PAGE, ps::PRESENT | ps::REUSABLE);
+        st.insert(BASE + 3 * PAGE, ps::PRESENT | ps::EXTERNAL);
+        let range = [(BASE, BASE + 8 * PAGE)];
+        let mut pm = Pmap::default();
+        assert!(pm.look(&range, &[], &mut host(&st)));
+        assert_eq!(pm.pages(), Pages { resident: 4, internal: 2, external: 1, reusable: 1 });
+        pm.made_reusable(BASE, BASE + PAGE);
+        assert_eq!(pm.pages(), Pages { resident: 4, internal: 1, external: 1, reusable: 2 });
+        pm.remove(BASE, BASE + 4 * PAGE);
+        assert_eq!(pm.pages(), Pages::default());
+        assert_eq!(pm.peaks, Pages { resident: 4, internal: 2, external: 1, reusable: 2 });
     }
 
     #[test]

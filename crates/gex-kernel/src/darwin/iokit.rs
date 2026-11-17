@@ -1622,7 +1622,7 @@ mod tests {
         node(&mut b, "device-tree", &[("compatible", b"J120AP\0iPad7,1\0AppleARM\0")], 1);
         node(&mut b, "arm-io", &[("compatible", b"arm-io,t8011\0")], 1);
         node(&mut b, "apcie", &[("compatible", b"apcie,t8011\0"), ("#address-cells", &3u32.to_le_bytes())], 1);
-        node(&mut b, "pci-bridge0", &[("compatible", b"apcie-bridge\0"), ("AAPL,unit-string", b"00000000"), ("#address-cells", &1u32.to_le_bytes()), ("#size-cells", &0u32.to_le_bytes())], 1);
+        node(&mut b, "pci-bridge0", &[("compatible", b"apcie-bridge\0"), ("AAPL,unit-string", b"00000000"), ("#address-cells", &1u32.to_le_bytes()), ("#size-cells", &0u32.to_le_bytes()), ("apcie-port", &0u32.to_le_bytes())], 1);
         node(&mut b, "s3e", &[("AAPL,unit-string", b"00000000"), ("reg", &0x10u32.to_le_bytes())], 0);
         let mut t = parse(&b).unwrap();
         let io = super::super::platform::add(&mut t).unwrap();
@@ -1651,6 +1651,22 @@ mod tests {
         assert_eq!(super::super::storagestack::pci_config(&t, s3e, 0x08), Ok(0x0180_0200));
         // The DT plane keeps the configured flag on apcie.
         assert_eq!(p(2, "IOPCIConfigured"), Some(Prop::Bool(true)));
+        // The root complex's legend: link states, events, energy, for
+        // port 0.
+        let rc = t.iter().position(|n| n.class == "AppleT8011PCIe").unwrap() as u32;
+        let Some(Prop::Array(legend)) = p(rc, "IOReportLegend") else { panic!("no legend") };
+        let chans = |e: &Prop| match e {
+            Prop::Dict(d) => match &d[0].1 {
+                Prop::Array(c) => c.clone(),
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+        assert_eq!(legend.len(), 3);
+        assert_eq!(chans(&legend[0]), vec![Prop::Array(vec![Prop::Num(0x004c_5374_5072_7430, 64), Prop::Num(0x0004_0002_0002, 64), Prop::Sym("PCIe Port 0 Link States".to_string())])]);
+        let events = chans(&legend[1]);
+        assert_eq!(events.len(), 62);
+        assert_eq!(events[0], Prop::Array(vec![Prop::Num(0x4576_3030_5072_7430, 64), Prop::Num(0x0001_8000_0001, 64), Prop::Sym(format!("{:<39}", "Port 0 Enable Request"))]));
     }
 
     #[test]

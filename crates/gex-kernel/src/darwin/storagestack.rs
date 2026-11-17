@@ -286,19 +286,23 @@ fn add_pcie(t: &mut Vec<Node>, io: u32) -> Option<u32> {
     let s3e = super::platform::child(t, bridge0, "s3e", &[])?;
     // The personality "AppleT8011PCIe"; no probe of its own, and
     // IOPCIHostBridge's (0xfffffff0064c3dfc) leaves the score. Its start
-    // sets its user client class (0xfffffff0066183c8) and the function
-    // parent key AppleARMPlatform's helper makes of apcie's phandle
-    // (0xfffffff005988104), empty data.
+    // (AppleEmbeddedPCIE's, 0xfffffff0066175b4) sets its reporters' legend
+    // ([`pcie_legend`]), its user client class (0xfffffff0066183c8) and the
+    // function parent key AppleARMPlatform's helper makes of apcie's
+    // phandle (0xfffffff005988104), empty data; its `configure`
+    // (0xfffffff006619f34) sets nothing.
     let mut props = driver("com.apple.driver.AppleT8011PCIe", T8011_PCIE, super::platform::ARM_IO_DEVICE, Some("apcie,t8011"), "IODefaultMatchCategory", 0, vec![
         key("IONameMatch", string("apcie,t8011")),
         key("IOPlatformQuiesceAction", num64(4000)),
         key("IOPlatformActiveAction", num64(1500)),
     ]);
+    props.push(key("IOReportLegend", pcie_legend(t, apcie)));
+    props.push(key("IOReportLegendPublic", Prop::Bool(true)));
     props.push(key("IOUserClientClass", sym("AppleEmbeddedPCIEUserClient")));
     props.push(key(&super::platform::function_parent(t, apcie), Prop::Data(Vec::new())));
     // `IOPCIBridge::start`'s PMinit, after `configure`.
     props.push(key(super::iopower::KEY, super::iopower::pci_bridge()));
-    let rc = push(t, service(T8011_PCIE, T8011_PCIE, Some(apcie), props, Table::Lacks(vec![("what AppleEmbeddedPCIE::configure sets", "not followed")])));
+    let rc = push(t, service(T8011_PCIE, T8011_PCIE, Some(apcie), props, Table::Complete));
     // apcie as the host bridge's configuration left it: three address
     // cells and two size cells (as its device tree entry has them), and
     // configured (`bridgeConstructDeviceTree`).
@@ -603,6 +607,115 @@ pub fn stand_in_controller() -> ControllerFacts {
 pub fn controller_facts() -> ControllerFacts {
     CONTROLLER_DEVICE_FACTS.unwrap_or_else(stand_in_controller)
 }
+
+/// The root complex's reporters' legend (`_createReporters`,
+/// 0xfffffff0066187cc), for each of apcie's ports that has a port object
+/// (its children with "apcie-port"), in port order:
+/// - its link states, an `IOStateReporter` (kIOReportCategoryPower, 4
+///   states, unit 0x0100007900000000): channel "LStPrt" and the port's
+///   character, "PCIe Port <n> Link States";
+/// - its energy, an `IOSimpleReporter` (kIOReportCategoryPower, unit
+///   0x0300007900000000): "EngyPrt" and the character, "PCIe Port <n>
+///   Energy";
+/// - its events, an `IOSimpleReporter` (kIOReportCategoryDebug, unit 0):
+///   "Ev", the event's two digits, "Prt" and the character, named by the
+///   format table at 0xfffffff007b2c888 ([`PCIE_EVENTS`]).
+/// The legend holds them as link states (group "AppleEmbeddedPCIE",
+/// subgroup "Link States"), events (group "Link Events") and energy (group
+/// "Energy Model").
+fn pcie_legend(t: &[Node], apcie: u32) -> Prop {
+    let mut ports: Vec<u32> = t[apcie as usize].children.iter().filter_map(|&c| t[c as usize].props.iter().find(|(k, _)| k == "apcie-port").and_then(|(_, v)| v.get(..4)).map(|v| u32::from_le_bytes(v.try_into().unwrap()))).collect();
+    ports.sort_unstable();
+    let ch = |i: u32| u64::from(if i < 10 { b'0' + i as u8 } else { b'a' + (i - 10) as u8 });
+    let (mut states, mut energy, mut events) = (Vec::new(), Vec::new(), Vec::new());
+    for &i in &ports {
+        states.push((0x4c53_7450_7274 << 8 | ch(i), format!("PCIe Port {i} Link States")));
+        energy.push((0x456e_6779_5072_74 << 8 | ch(i), format!("PCIe Port {i} Energy")));
+        for (j, &(title, width)) in PCIE_EVENTS.iter().enumerate() {
+            let j = j as u64;
+            let id = 0x4576 << 48 | (0x30 + j / 10) << 40 | (0x30 + j % 10) << 32 | 0x5072_7400 | ch(i);
+            let format = format!("Port %u {title}");
+            events.push((id, format!("{:<width$}", format, width = width).replacen("%u", &i.to_string(), 1)));
+        }
+    }
+    let entry = |chans: &[(u64, String)], ty, unit, group, sub| {
+        let c: Vec<(u64, &str)> = chans.iter().map(|(id, n)| (*id, n.as_str())).collect();
+        legend_entry(&c, ty, unit, group, sub)
+    };
+    Prop::Array(vec![
+        entry(&states, channel_type(2, 1 << 1, 4), 0x0100_0079_0000_0000, "AppleEmbeddedPCIE", Some("Link States")),
+        entry(&events, channel_type(1, 1 << 15, 1), 0, "Link Events", None),
+        entry(&energy, channel_type(1, 1 << 1, 1), 0x0300_0079_0000_0000, "Energy Model", None),
+    ])
+}
+
+/// The root complex's port events' names (the format table at
+/// 0xfffffff007b2c888): each "Port %u " and its title, padded with spaces
+/// to the width given.
+const PCIE_EVENTS: [(&str, usize); 62] = [
+    ("Enable Request", 40),
+    ("Enable Complete", 40),
+    ("Disable Request", 40),
+    ("Disable Complete", 40),
+    ("Disable Hardware Off", 40),
+    ("Disable LTSSM Off", 40),
+    ("Suspend Request", 40),
+    ("Suspend Complete", 40),
+    ("Suspend Hardware Off", 40),
+    ("Suspend LTSSM Off", 40),
+    ("Deep Sleep Entry", 40),
+    ("Deep Sleep Exit", 40),
+    ("Link Up", 40),
+    ("Link Up Timeout", 40),
+    ("Unexpected Link Down", 40),
+    ("PMETO Timeout", 40),
+    ("Root Port Error Interrupt", 40),
+    ("Correctable Error Interrupt", 40),
+    ("Non-fatal Error Interrupt", 40),
+    ("Fatal Error Interrupt Error", 40),
+    ("AER EP Unc Data Link Protocol Error", 43),
+    ("AER EP Unc Surprise Down Error", 43),
+    ("AER EP Unc Poisoned TLP", 43),
+    ("AER EP Unc Flow Ctrl Protocol Error", 43),
+    ("AER EP Unc Completion Timeout", 43),
+    ("AER EP Unc Completer Abort", 43),
+    ("AER EP Unc Unexpected Completion", 43),
+    ("AER EP Unc Receiver Overflow", 43),
+    ("AER EP Unc Malformed TLP", 43),
+    ("AER EP Unc ECRC Error", 43),
+    ("AER EP Unc Unsupported Request", 43),
+    ("AER EP Unc Uncorrected Internal Err", 43),
+    ("AER EP Unc Atomic OP Egress Blocked", 43),
+    ("AER EP Unc TLP Prefix Blocked Error", 43),
+    ("AER EP Cor Receiver Error", 43),
+    ("AER EP Cor Bad TLP", 43),
+    ("AER EP Cor Bad DLLP", 43),
+    ("AER EP Cor REPLAY_NUM Rollover", 43),
+    ("AER EP Cor Retry Timer Timeout", 43),
+    ("AER EP Cor Advisory Non-Fatal Error", 43),
+    ("AER EP Cor Corrected Internal Error", 43),
+    ("AER RC Unc Data Link Protocol Error", 43),
+    ("AER RC Unc Surprise Down Error", 43),
+    ("AER RC Unc Poisoned TLP", 43),
+    ("AER RC Unc Flow Ctrl Protocol Error", 43),
+    ("AER RC Unc Completion Timeout", 43),
+    ("AER RC Unc Completer Abort", 43),
+    ("AER RC Unc Unexpected Completion", 43),
+    ("AER RC Unc Receiver Overflow", 43),
+    ("AER RC Unc Malformed TLP", 43),
+    ("AER RC Unc ECRC Error", 43),
+    ("AER RC Unc Unsupported Request", 43),
+    ("AER RC Unc Uncorrected Internal Err", 43),
+    ("AER RC Unc Atomic OP Egress Blocked", 43),
+    ("AER RC Unc TLP Prefix Blocked Error", 43),
+    ("AER RC Cor Receiver Error", 43),
+    ("AER RC Cor Bad TLP", 43),
+    ("AER RC Cor Bad DLLP", 43),
+    ("AER RC Cor REPLAY_NUM Rollover", 43),
+    ("AER RC Cor Retry Timer Timeout", 43),
+    ("AER RC Cor Advisory Non-Fatal Error", 43),
+    ("AER RC Cor Corrected Internal Error", 43),
+];
 
 /// `IOReportChannelType` as `IOReporter::legendWith` stores it, a 64-bit
 /// number of its bytes: the report format, a reserved byte, the

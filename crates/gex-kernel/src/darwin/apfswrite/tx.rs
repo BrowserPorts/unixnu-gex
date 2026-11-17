@@ -830,9 +830,11 @@ impl<'a> Nx<'a> {
     /// `spaceman_alloc` (I:0x100044290, K:0xfffffff0067535b0) of `count`
     /// data blocks with no hint and a count taken back (the kernel's
     /// `fs_make_hole_range_writable`, K:0xfffffff00670afbc): the free-extent
-    /// cache's best fit from the roving pointer, which then moves to the
-    /// allocation's end. Where they go and how many: fewer than asked when
-    /// nothing larger is free.
+    /// cache's best fit, its search given hint 0 (the hint spaceman_alloc
+    /// passes on every data allocation without flag 2, whether it started
+    /// from the roving pointer or a zone: measured), the roving pointer
+    /// then moved to the allocation's end. Where they go and how many:
+    /// fewer than asked when nothing larger is free.
     pub fn alloc_data(&mut self, count: u64) -> Result<(u64, u64), String> {
         if count == 0 {
             return Err("a data allocation of no blocks".into());
@@ -851,7 +853,7 @@ impl<'a> Nx<'a> {
         if f.total() != self.sm_free {
             return Err("not implemented: a data allocation with a free-extent cache that does not hold every free block (its rescan heuristic, I:0x10000db70)".into());
         }
-        let found = f.search(self.rove, count, fxc::flags::PARTIAL | fxc::flags::AVOID, &clip)?;
+        let found = f.search(0, count, fxc::flags::PARTIAL | fxc::flags::AVOID, &clip)?;
         let (start, got) = found.map_err(|_| "not implemented: a data allocation the free-extent cache cannot place (the chunk scan and the free queues' drain)".to_string())?;
         if got == 0 {
             return Err("not implemented: a data allocation the free-extent cache gives nothing for (the chunk scan)".into());

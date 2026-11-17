@@ -411,7 +411,7 @@ mod tests {
     }
 
     fn alloc(f: &mut Fxc, c: &Clip, rove: &mut u64, count: u64) -> Ext {
-        let e = f.search(*rove, count, flags::PARTIAL | flags::AVOID, c).unwrap().unwrap();
+        let e = f.search(0, count, flags::PARTIAL | flags::AVOID, c).unwrap().unwrap();
         f.remove(e.0, e.1);
         *rove = e.0 + e.1;
         e

@@ -58,6 +58,10 @@ pub(crate) struct Extracted {
     pub len: u64,
     pub prot: u64,
     pub attrs: Attrs,
+    /// `VME_OFFSET` of the new entry: its source's place in their object.
+    pub obj_off: u64,
+    /// The source entry's kind.
+    pub src_kind: u8,
 }
 
 /// How a fork's child gets one range of its parent's map.
@@ -284,9 +288,35 @@ impl Kernel {
         // pmap until touched.
         for x in &extracted {
             let (s, e) = (at + x.off, at + x.off + x.len);
-            self.dtask.vm.enter(s, e, x.attrs, 0);
+            self.dtask.vm.enter(s, e, x.attrs, x.obj_off);
         }
-        self.mem.lock().set_unentered(at, tend);
+        {
+            // A file's pages past its end are absent from the new entries
+            // as from their source; a copy's pages of a file are the file's
+            // until written (a private source's own copies are not).
+            let mut mm = self.mem.lock();
+            let (absent, pending) = (mm.absent_ranges(), mm.copy_pending_runs());
+            mm.set_unentered(at, tend);
+            for (s, e) in absent {
+                let (lo, hi) = (s.max(start), e.min(end));
+                if lo < hi {
+                    mm.set_absent(at + (lo - start), at + (hi - start));
+                }
+            }
+            for x in extracted.iter().filter(|x| a.copy && super::ubc::vnode(x.attrs.obj).is_some()) {
+                let (s, e) = (start + x.off, start + x.off + x.len);
+                if x.src_kind == kind::FILE_SHARED {
+                    mm.set_copy_pending(at + x.off, at + x.off + x.len);
+                    continue;
+                }
+                for &(ps, pe) in pending.iter() {
+                    let (lo, hi) = ((ps << gex_abi::PERM_PAGE_SHIFT).max(s), (pe << gex_abi::PERM_PAGE_SHIFT).min(e));
+                    if lo < hi {
+                        mm.set_copy_pending(at + (lo - start), at + (hi - start));
+                    }
+                }
+            }
+        }
         self.darwin_flush_perms(m);
         if a.flags & vmf::RESILIENT_CODESIGN != 0 {
             a.cur = prot::READ;
@@ -330,7 +360,8 @@ impl Kernel {
             if vs > at {
                 return Err(kr::INVALID_ADDRESS);
             }
-            for (ps, pe, attrs) in self.dtask.vm.pieces(vs, ve) {
+            let pieces = self.dtask.vm.lock().pieces_at(vs, ve);
+            for (ps, pe, attrs, obj_off) in pieces {
                 if attrs.kind == kind::SUBMAP {
                     self.darwin_unimplemented(format!("mach_vm_remap of the shared region's submap at {ps:#x} (its entries are the region's)"));
                     return Err(kr::FAILURE);
@@ -339,9 +370,19 @@ impl Kernel {
                 if cur & req_cur != req_cur || max & req_max != req_max {
                     return Err(KERN_PROTECTION_FAILURE);
                 }
-                if !a.copy && matches!(attrs.kind, kind::FILE_SHARED | kind::SHM) {
-                    self.darwin_unimplemented(format!("a shared remap of a shared mapping of a file or POSIX shared memory object at {ps:#x} (its pages are the mapping's copy, written back by it alone)"));
-                    return Err(kr::FAILURE);
+                // A private mapping's pages the file still holds, shared:
+                // a write through either would copy them for both
+                // (their shadow object), which pages kept per map cannot
+                // say.
+                if !a.copy && attrs.kind == kind::FILE_PRIVATE && super::ubc::vnode(attrs.obj).is_some() {
+                    let pending = {
+                        let mut mm = self.mem.lock();
+                        mm.copy_pending_runs().iter().any(|&(s, e)| (s << gex_abi::PERM_PAGE_SHIFT) < pe && (e << gex_abi::PERM_PAGE_SHIFT) > ps)
+                    };
+                    if pending {
+                        self.darwin_unimplemented(format!("a shared remap of a private file mapping's pages at {ps:#x} the file still holds (the copy a write makes is both mappings')"));
+                        return Err(kr::FAILURE);
+                    }
                 }
                 // vm_map_entry_copy: no wiring, not shared, and (an iOS map
                 // allows no JIT copy) a JIT region's copy loses execute.
@@ -382,7 +423,7 @@ impl Kernel {
                     p = prot::READ;
                     n.max = prot::READ as u8;
                 }
-                out.push(Extracted { off: ps - start, len: pe - ps, prot: p, attrs: n });
+                out.push(Extracted { off: ps - start, len: pe - ps, prot: p, attrs: n, obj_off, src_kind: attrs.kind });
             }
             at = at.max(ve);
         }

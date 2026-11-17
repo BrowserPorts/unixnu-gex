@@ -180,6 +180,7 @@ impl Kernel {
         // No code signing monitor on this device (vm_map_csm_allow_jit).
 
         let mut attrs = Attrs { inherit: if flags & SHARED != 0 { inherit::SHARE } else { inherit::DEFAULT }, no_cache: flags & NOCACHE != 0, ..Attrs::default() };
+        let mut file: Option<Arc<crate::file::OpenFile>> = None;
         let mut maxprot = prot::ALL as u8;
         let mapanon = flags & ANON != 0;
         let mut superpage = false;
@@ -210,7 +211,7 @@ impl Kernel {
             }
             let f = self.fds.get(fd)?;
             if Arc::clone(&f.handle).as_posix_shm().is_some() {
-                return self.darwin_pshm_mmap(m, a);
+                return self.darwin_shm_mmap(m, addr, size, u64::from(cur), flags, fd, file_pos, pageoff);
             }
             let ft = f.handle.metadata().map(|md| md.file_type).map_err(|_| Errno::EINVAL)?;
             match ft {
@@ -238,6 +239,7 @@ impl Kernel {
             }
             // mac_file_check_mmap of the vnode and the protection asked for.
             self.darwin_sb_mmap(&f, u64::from(cur))?;
+            file = Some(f);
         }
         if size == 0 {
             return Ok(0);
@@ -313,7 +315,25 @@ impl Kernel {
         }
 
         use crate::mem::flags as lf;
-        let mut l = (if flags & SHARED != 0 { lf::SHARED } else { lf::PRIVATE }) | lf::FIXED;
+        // A file's object: its vnode's, which every mapping of the file
+        // names, the host's file whose pages the mapping is (ubc_getobject).
+        let vnode = file.as_ref().filter(|f| f.handle.host_fd().is_some()).and_then(super::ubc::object_of);
+        if vnode.is_some() {
+            super::ubc::note_procs(&self.procs);
+        }
+        let release = |v: Option<u64>| {
+            if let Some(v) = v {
+                super::vmobject::release(v);
+            }
+        };
+        // A shared mapping is the file's own pages where the host can map
+        // them so; else it is a copy, written back at msync and munmap.
+        let own_pages = attrs.kind == kind::FILE_SHARED && vnode.is_some() && crate::host_can_map_shared();
+        if attrs.kind == kind::FILE_SHARED && !own_pages {
+            let path = file.as_ref().map_or(String::new(), |f| f.path.clone());
+            self.darwin_unimplemented(format!("a shared mapping of {path} where the host cannot map the file's own pages: a copy, written back at msync and munmap"));
+        }
+        let mut l = (if flags & SHARED != 0 && !own_pages { lf::SHARED } else { lf::PRIVATE }) | lf::FIXED;
         let (lfd, lpos) = if mapanon {
             l |= lf::ANONYMOUS;
             (u64::MAX, 0)
@@ -324,71 +344,68 @@ impl Kernel {
         // VM_FLAGS_OVERWRITE: vm_map_delete, its pmap_remove).
         let call = [addr, size, u64::from(cur), l, lfd, lpos];
         let mapped = if flags & FIXED != 0 {
-            self.darwin_footprint_release(m, addr & !PAGE_MASK, round(addr + size), super::footprint::Release::Remove, |k, m| k.canonical(m, nr::MMAP, call))
+            let (s, e) = (addr & !PAGE_MASK, round(addr + size));
+            self.darwin_footprint_release(m, s, e, super::footprint::Release::Remove, |k, m| {
+                // vm_map_delete first: the entries there go before their
+                // pages do, and come back if the mapping fails.
+                let old = k.dtask.vm.lock().snapshot(s, e);
+                k.dtask.vm.clear(s, e);
+                let r = k.canonical(m, nr::MMAP, call);
+                if r.is_err() {
+                    k.dtask.vm.lock().restore(old);
+                }
+                r
+            })
         } else {
             self.canonical(m, nr::MMAP, call)
         };
         let at = match mapped {
             Ok(at) => at,
-            Err(Errno::ENOMEM) => return Err(Errno::ENOMEM),
-            Err(Errno::EACCES) => return Err(Errno::EACCES),
-            Err(_) => return Err(Errno::EINVAL),
+            Err(e) => {
+                release(vnode);
+                return Err(match e {
+                    Errno::ENOMEM => Errno::ENOMEM,
+                    Errno::EACCES => Errno::EACCES,
+                    _ => Errno::EINVAL,
+                });
+            }
         };
+        // The file's pages: the host's mapping of its file, shared where
+        // the mapping is and the open can write (else a mapping that can
+        // never be written, which the host's private mapping shows as it
+        // is); none past the file's end, whose pages are absent; and none
+        // entered until touched.
+        let mut have = at + size;
+        if let (Some(obj), Some(f)) = (vnode, file.as_ref()) {
+            let fsize = f.handle.metadata().map_or(0, |md| md.size);
+            have = super::ubc::past_end(at, at + size, file_pos, fsize).unwrap_or(at + size);
+            if own_pages && f.writable && have > at {
+                let fd = f.handle.host_fd().unwrap_or(-1);
+                if !m.map_file_shared(at, have - at, fd, file_pos).unwrap_or(false) {
+                    self.darwin_unimplemented(format!("the host's shared mapping of {} at {at:#x}: a private one instead", f.path));
+                }
+            }
+            attrs.obj = obj;
+        }
         if attrs.kind == kind::ANON {
             let below = self.mem.lock().vma_at(at.wrapping_sub(1)).map(|v| u64::from(v.prot)) == Some(u64::from(cur));
             self.dtask.vm.enter_anon(at, at + size, attrs, below);
         } else {
             self.dtask.vm.enter(at, at + size, attrs, if mapanon { 0 } else { file_pos });
         }
+        if vnode.is_some() {
+            let mut mm = self.mem.lock();
+            mm.set_unentered(at, have);
+            mm.set_absent(have, at + size);
+            if attrs.kind == kind::FILE_PRIVATE {
+                mm.set_copy_pending(at, have);
+            }
+        }
+        release(vnode);
         if jit {
             self.dtask.vm.jit_entry_exists = true;
         }
         Ok(at + pageoff)
-    }
-
-    /// `pshm_mmap`: a POSIX shared memory object's own checks, then its
-    /// object mapped shared, at most read and write (no write where the
-    /// descriptor cannot).
-    fn darwin_pshm_mmap(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
-        self.darwin_shm_mmap_check(a)?;
-        // Every mapping of an object is its one memory object's pages; here
-        // a mapping is a copy, so a second one of the same object in this
-        // task (through any open of it) would not see the first's writes.
-        let obj = self.fds.get(a[4] as i32).ok().and_then(|f| Arc::clone(&f.handle).as_posix_shm());
-        if let Some(h) = obj {
-            let mapped = self.mem.lock().log.shared_maps.iter().any(|s| Arc::clone(&s.file.handle).as_posix_shm().is_some_and(|o| Arc::ptr_eq(&o.0, &h.0)));
-            if mapped {
-                self.darwin_unimplemented(format!("a second mapping of POSIX shared memory object {:?} (pages two mappings share)", h.0.name));
-                return Err(Errno::EINVAL);
-            }
-        }
-        let mut b = *a;
-        // MAP_FIXED replaces what is there, if it is removable.
-        let fixed = b[3] as u32 & map::FIXED != 0;
-        if fixed && self.darwin_region_delete_check(b[0] & !PAGE_MASK, round(b[0].wrapping_add(b[1]))) != kr::SUCCESS {
-            return Err(Errno::EACCES);
-        }
-        // Anywhere: vm_map_enter's search from the rounded hint.
-        if b[3] as u32 & map::FIXED == 0 {
-            b[0] = self.darwin_locate_space(round(b[0]), round(b[1]), 0).map_err(|_| Errno::ENOMEM)?;
-            b[3] |= u64::from(map::FIXED);
-        }
-        let n = super::bsd::translate(super::bsd::sys::MMAP, &mut b);
-        let at = if fixed {
-            self.darwin_footprint_release(m, b[0] & !PAGE_MASK, round(b[0].wrapping_add(b[1])), super::footprint::Release::Remove, |k, m| k.canonical(m, n, b))?
-        } else {
-            self.canonical(m, n, b)?
-        };
-        let file = self.fds.get(a[4] as i32).ok();
-        let writable = file.as_ref().is_some_and(|f| f.writable);
-        let max = if writable { prot::READ | prot::WRITE } else { prot::READ } as u8;
-        let end = round(at.saturating_add(a[1]));
-        self.dtask.vm.enter(at & !PAGE_MASK, end, Attrs { kind: kind::SHM, max, inherit: inherit::SHARE, ..Attrs::default() }, a[5] & !PAGE_MASK);
-        // The open's mapp_addr: where the mapping starts.
-        if let Some(h) = file.and_then(|f| Arc::clone(&f.handle).as_posix_shm()) {
-            h.set_mapp_addr(at & !PAGE_MASK);
-        }
-        Ok(at)
     }
 
     /// The task's map over `[start, end)`, piece by piece, holes left out.
@@ -706,6 +723,15 @@ impl Kernel {
             // The shared region's objects are every task's, its files'
             // pages never dirty.
             if p.attrs.kind == kind::SUBMAP {
+                continue;
+            }
+            // A file's pages are the host's file's: the host's vm_map_msync
+            // of them is the device's of its vnode object (written back,
+            // dropped, deactivated or killed as the device's would be).
+            if super::ubc::vnode(p.attrs.obj).is_some() {
+                if !m.host_msync(p.start, p.end - p.start, flags & !sync::CONTIGUOUS).unwrap_or(false) {
+                    self.darwin_unimplemented(format!("vm_map_msync {flags:#x} of a file's pages at {:#x} on a host that cannot sync its own mappings", p.start));
+                }
                 continue;
             }
             if flags & (sync::KILLPAGES | sync::DEACTIVATE) != 0 {

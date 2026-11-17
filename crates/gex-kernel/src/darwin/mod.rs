@@ -129,6 +129,7 @@ pub mod vmshare;
 mod vmmig;
 pub mod vmentry;
 pub mod vmobject;
+pub mod ubc;
 pub mod coalition;
 pub mod importance;
 pub mod voucher;
@@ -476,10 +477,11 @@ impl crate::syscalls::Kernel {
         let mut mm = self.mem.lock();
         let pages = mm.withheld_write_pages().unwrap_or_default();
         let unentered = mm.unentered_runs();
-        if pages.is_empty() && unentered.is_empty() {
+        let copying = mm.copy_pending_runs();
+        if pages.is_empty() && unentered.is_empty() && copying.is_empty() {
             return None;
         }
-        Some(std::sync::Arc::new(crate::SoftPages { pages, written: Default::default(), unentered, touched: Default::default() }))
+        Some(std::sync::Arc::new(crate::SoftPages { pages, written: Default::default(), unentered, touched: Default::default(), copying, copied: Default::default() }))
     }
 
     /// The watched pages a call's copies wrote, told to the objects that
@@ -487,10 +489,15 @@ impl crate::syscalls::Kernel {
     pub(crate) fn darwin_soft_written(&mut self, m: &mut GuestMem<'_>, soft: &crate::SoftPages) {
         // The pages not entered that a copy reached: its fault entered them.
         let touched = std::mem::take(&mut *soft.touched.lock().unwrap_or_else(|e| e.into_inner()));
-        if !touched.is_empty() {
+        let copied = std::mem::take(&mut *soft.copied.lock().unwrap_or_else(|e| e.into_inner()));
+        if !touched.is_empty() || !copied.is_empty() {
             let mut mm = self.mem.lock();
             for p in touched {
                 mm.enter_page(p);
+            }
+            // A write's fault on a file's page copied it.
+            for p in copied {
+                mm.copied(p);
             }
             drop(mm);
             self.darwin_flush_perms(m);

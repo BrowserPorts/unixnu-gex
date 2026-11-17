@@ -1133,6 +1133,7 @@ impl Kernel {
             }
             sys::STAT | sys::LSTAT | sys::FSTAT | sys::FSTATAT => res(self.darwin_stat_ino32(m, raw, a)),
             sys::FSTAT64 if self.darwin_pipe_of(a[0]).is_some() => res(self.darwin_pipe_stat(m, a[0], a[1])),
+            sys::FSTAT64 if self.darwin_shm_fd(a[0]) => res(self.darwin_shm_stat(m, a[0], a[1])),
             sys::FSTATAT64 => res(self.darwin_fstatat64(m, a)),
             sys::FACCESSAT => res(self.darwin_faccessat(m, a)),
             sys::SIGACTION => res(self.darwin_sigaction(m, a[0], a[1], a[2])),

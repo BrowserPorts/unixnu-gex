@@ -109,6 +109,25 @@ pub enum Made {
     Nothing,
 }
 
+/// `ubc_setsize`'s flush of object `obj`'s pages past `size` from what
+/// named entries hold of them: their holds' pages there are the host's
+/// fresh memory, no longer the file's.
+pub fn hold_pages_past(obj: u64, size: u64) {
+    let held: Vec<NamedEntry> = entries().lock().unwrap_or_else(|e| e.into_inner()).values().filter(|e| e.obj == obj).cloned().collect();
+    for e in held {
+        let cut = (size + PAGE_MASK) & !PAGE_MASK;
+        if e.offset + e.hold.len <= cut {
+            continue;
+        }
+        let from = cut.saturating_sub(e.offset);
+        let len = (e.hold.len - from) as usize;
+        if let Some(fresh) = crate::host_hold(len) {
+            crate::host_remap(e.hold.addr + from as usize, fresh, len, false);
+            crate::host_unhold(fresh, len);
+        }
+    }
+}
+
 impl Kernel {
     /// `mach_make_memory_entry_64(target, &size, offset, permission,
     /// parent)`: a new entry, and the size it names past its data's
@@ -201,6 +220,13 @@ impl Kernel {
             };
             let mut r = Remap { target: 0, size: map_size, mask: 0, flags: 0, src: Source::Same, src_addr: map_start, copy, cur, max, inherit: u32::from(inherit::SHARE), prot_copy: false };
             let pieces = self.darwin_remap_extract(map_start, map_size, &mut r)?;
+            // A file's pages named: the entry would hold the host file's
+            // pages under an object of its own, which no change of the
+            // file's size reaches.
+            if pieces.iter().any(|x| super::ubc::vnode(x.attrs.obj).is_some()) {
+                self.darwin_unimplemented("a named memory entry of a file's pages (the vnode's object named by the entry)".into());
+                return Err(kr::FAILURE);
+            }
             if copy {
                 // vm_map_copyin's PROTECTION_FAILURE for what cannot be read.
                 if pieces.iter().any(|x| x.prot & prot::READ == 0) {

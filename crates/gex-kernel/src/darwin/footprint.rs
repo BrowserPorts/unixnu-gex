@@ -432,6 +432,15 @@ impl Pmap {
         }
     }
 
+    /// `pmap_disconnect` of the pages of `[s, e)` (their object took them
+    /// away: a file's past its new end): their entries go, the tables
+    /// mapping them stay (`pmap_page_protect` only lowers their count).
+    pub fn disconnect(&mut self, s: u64, e: u64) {
+        if s < e {
+            self.change(s, e, |_| Held::None);
+        }
+    }
+
     /// `vm_map_reusable_pages` of `[s, e)`: the task's own pages there are
     /// reusable (`deactivate_pages_in_object` with `DEACTIVATE_REUSABLE`),
     /// still entered.
@@ -539,8 +548,33 @@ impl Meter {
     pub fn measure(&self, pm: &mut Pmap, mm: &crate::mem::Mm, m: &mut GuestMem<'_>) -> Option<i64> {
         let ranges = self.ranges(mm);
         let twigs = self.fixed_twigs();
-        let unentered = mm.lock().unentered_ranges();
-        let ok = pm.look(&ranges, &twigs, &unentered, &mut |at, n, out| m.page_states(at, n * PAGE, PAGE, out).unwrap_or(false));
+        // What is not entered, and what is absent (no object's page, the
+        // host's anonymous memory there), is no page of the pmap's.
+        let (unentered, pending) = {
+            let mut mm = mm.lock();
+            let mut u = mm.unentered_ranges();
+            u.extend(mm.absent_ranges());
+            u.sort_unstable();
+            (u, mm.copy_pending_runs())
+        };
+        // A private mapping's page it has not written is the file's,
+        // whatever the host made of it.
+        let ok = pm.look(&ranges, &twigs, &unentered, &mut |at, n, out| {
+            if !m.page_states(at, n * PAGE, PAGE, out).unwrap_or(false) {
+                return false;
+            }
+            let (first, end) = (at >> PAGE_SHIFT, (at >> PAGE_SHIFT) + n);
+            let i = pending.partition_point(|&(_, e)| e <= first);
+            for &(s, e) in pending[i..].iter().take_while(|&&(s, _)| s < end) {
+                for p in s.max(first)..e.min(end) {
+                    let st = &mut out[(p - first) as usize];
+                    if *st & (ps::PRESENT | ps::PAGED_OUT) != 0 {
+                        *st |= ps::EXTERNAL;
+                    }
+                }
+            }
+            true
+        });
         ok.then(|| pm.balance())
     }
 

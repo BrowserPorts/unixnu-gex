@@ -621,6 +621,22 @@ impl Map {
         self.ranges.range(first..end).filter(|(_, e)| e.attrs.kind == kind::SUBMAP && e.end > start).map(|(&s, e)| (s.max(start), e.end.min(end))).collect()
     }
 
+    /// The entries in `[start, end)`, clipped to it, each with its offset in
+    /// its object: what [`Map::restore`] puts back.
+    pub fn snapshot(&self, start: u64, end: u64) -> Vec<(u64, u64, Attrs, u64)> {
+        let first = self.ranges.range(..=start).next_back().filter(|(_, e)| e.end > start).map_or(start, |(&s, _)| s);
+        self.ranges.range(first..end).filter(|(_, e)| e.end > start).map(|(&s, e)| (s.max(start), e.end.min(end), e.attrs, e.offset + (s.max(start) - s))).collect()
+    }
+
+    /// The entries of a [`Map::snapshot`] again (a mapping that failed
+    /// after taking their place: `vm_map_enter`'s restore of what it
+    /// zapped).
+    pub fn restore(&mut self, snap: Vec<(u64, u64, Attrs, u64)>) {
+        for (s, e, a, off) in snap {
+            self.enter(s, e, a, off);
+        }
+    }
+
     /// The entries that name object `obj`: each one's range and its offset
     /// in the object at its start.
     pub fn of_object(&self, obj: u64) -> Vec<(u64, u64, Attrs, u64)> {

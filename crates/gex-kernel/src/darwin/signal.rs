@@ -938,13 +938,40 @@ impl Kernel {
         // vm_fault of a page the pmap has not entered, whose mapping allows
         // the access: pmap_enter, and the access is made again.
         if addr >= gex_abi::DARWIN_GUEST_FLOOR {
+            // (The access may begin on the page before.)
             let page = addr >> gex_abi::PERM_PAGE_SHIFT;
+            // The page it faulted on: the first, unless that one is
+            // entered and present, then the next.
+            let page = {
+                let mm = self.mem.lock();
+                if mm.is_absent(page) || mm.is_unentered(page) || mm.is_copy_pending(page) && write { page } else { page + 1 }
+            };
+            let at = (page << gex_abi::PERM_PAGE_SHIFT).max(addr);
+            if self.mem.lock().is_absent(page) {
+                return self.darwin_absent_fault(m, pc, at, write);
+            }
             let entered = {
                 let mut mm = self.mem.lock();
                 let need = if write { crate::mem::prot::WRITE } else { crate::mem::prot::READ };
-                mm.is_unentered(page) && mm.vma_at(addr).is_some_and(|v| v.prot & need != 0) && mm.enter_page(page)
+                mm.is_unentered(page) && mm.vma_at(at).is_some_and(|v| v.prot & need != 0) && mm.enter_page(page)
             };
             if entered {
+                self.darwin_flush_perms(m);
+                return (Delivery::Resume(pc), 0);
+            }
+        }
+        if write && addr >= gex_abi::DARWIN_GUEST_FLOOR {
+            // vm_fault's copy-on-write of a file's page a private mapping
+            // writes: its own copy from now on.
+            // (The access may begin on the page before.)
+            let page = addr >> gex_abi::PERM_PAGE_SHIFT;
+            let copied = {
+                let mut mm = self.mem.lock();
+                let p = if mm.is_copy_pending(page) { page } else { page + 1 };
+                let at = (p << gex_abi::PERM_PAGE_SHIFT).max(addr);
+                mm.is_copy_pending(p) && mm.vma_at(at).is_some_and(|v| v.prot & crate::mem::prot::WRITE != 0) && mm.copied(p)
+            };
+            if copied {
                 self.darwin_flush_perms(m);
                 return (Delivery::Resume(pc), 0);
             }
@@ -966,6 +993,27 @@ impl Kernel {
                 crate::signal::sig::SIGBUS
             }
         };
+        (self.raise_fault(m, l, pc, addr), l)
+    }
+
+    /// `vm_fault` of a page mapped from an object that had none to give
+    /// there (a file's past its end): the file's page if it has one now,
+    /// entered, and the access made again; else the pager's error,
+    /// KERN_MEMORY_ERROR, which `ux_exception` makes SIGBUS. An access the
+    /// mapping does not allow is KERN_PROTECTION_FAILURE, SIGBUS too.
+    fn darwin_absent_fault(&mut self, m: &mut GuestMem<'_>, pc: u64, addr: u64, write: bool) -> (Delivery, u32) {
+        let need = if write { crate::mem::prot::WRITE } else { crate::mem::prot::READ };
+        let allowed = self.mem.lock().vma_at(addr).is_some_and(|v| v.prot & need != 0);
+        if allowed {
+            if let Some(e) = self.dtask.vm.at_or_after(addr).filter(|e| e.start <= addr) {
+                let shared = e.attrs.kind == super::vm::kind::FILE_SHARED && !e.attrs.cow;
+                if super::ubc::fault(m, &self.mem, e.attrs.obj, e.start, e.end, e.offset, shared, addr) {
+                    self.darwin_flush_perms(m);
+                    return (Delivery::Resume(pc), 0);
+                }
+            }
+        }
+        let l = crate::signal::sig::SIGBUS;
         (self.raise_fault(m, l, pc, addr), l)
     }
 

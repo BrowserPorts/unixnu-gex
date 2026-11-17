@@ -33,6 +33,9 @@ impl Drop for Hold {
 pub enum Pager {
     /// None: anonymous memory, internal (`vm_object_allocate`).
     Anon,
+    /// A file's pages: its vnode's pager (`vnode_pager_setup`), the host's
+    /// file ([`super::ubc::Vnode`]).
+    Vnode(Arc<super::ubc::Vnode>),
 }
 
 /// A `vm_object`.
@@ -58,12 +61,14 @@ impl Object {
 #[derive(Debug, Default)]
 struct Table {
     objects: HashMap<u64, Object>,
+    /// The vnode objects by their host file (`ubc_info`'s one object).
+    files: HashMap<super::ubc::FileKey, u64>,
     next: u64,
 }
 
 fn table() -> &'static Mutex<Table> {
     static T: OnceLock<Mutex<Table>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new(Table { objects: HashMap::new(), next: 1 }))
+    T.get_or_init(|| Mutex::new(Table { objects: HashMap::new(), files: HashMap::new(), next: 1 }))
 }
 
 fn lock() -> std::sync::MutexGuard<'static, Table> {
@@ -78,6 +83,29 @@ pub fn allocate(size: u64, pager: Pager, hold: Option<Arc<Hold>>) -> u64 {
     t.next += 1;
     t.objects.insert(id, Object { refs: 1, size, pager, hold });
     id
+}
+
+/// The vnode object of host file `key` (`ubc_getobject`), made with the
+/// vnode `make` gives when the file has none, and a reference to it its
+/// caller holds.
+pub fn of_file(key: super::ubc::FileKey, make: impl FnOnce() -> Arc<super::ubc::Vnode>) -> u64 {
+    let mut t = lock();
+    if let Some(&id) = t.files.get(&key) {
+        if let Some(o) = t.objects.get_mut(&id) {
+            o.refs += 1;
+            return id;
+        }
+    }
+    let id = t.next;
+    t.next += 1;
+    t.objects.insert(id, Object { refs: 1, size: 0, pager: Pager::Vnode(make()), hold: None });
+    t.files.insert(key, id);
+    id
+}
+
+/// The vnode object of host file `key`, while some mapping names it.
+pub fn by_file(key: super::ubc::FileKey) -> Option<u64> {
+    lock().files.get(&key).copied()
 }
 
 /// `vm_object_reference`: one more holder of object `id` (none for 0, the
@@ -102,7 +130,11 @@ pub fn release(id: u64) {
         let o = t.objects.get_mut(&id).unwrap_or_else(|| panic!("vm_object_deallocate of object {id}, which is gone"));
         o.refs -= 1;
         if o.refs == 0 {
-            t.objects.remove(&id)
+            let o = t.objects.remove(&id);
+            if let Some(Object { pager: Pager::Vnode(v), .. }) = &o {
+                t.files.remove(&v.key);
+            }
+            o
         } else {
             None
         }

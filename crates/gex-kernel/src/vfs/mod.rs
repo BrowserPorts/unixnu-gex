@@ -753,6 +753,14 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// The host's file this handle reads, by its device, number and birth
+    /// (nanoseconds since the epoch, 0 where the host keeps none): what
+    /// every open of the same host file has the same of, and no other
+    /// file, even one made later with the number again.
+    fn host_id(&self) -> Option<(u64, u64, u64)> {
+        None
+    }
+
     /// Whether a mapping of this file is the device's own memory (an OSS
     /// DMA buffer) rather than a copy of its contents: fresh zeroed pages,
     /// never read from the file or written back to it, whose place the
@@ -804,6 +812,45 @@ impl FileHandle for PathHandle {
     fn metadata(&self) -> Result<Metadata, Errno> {
         Ok(self.0.clone())
     }
+}
+
+/// What is told of a host file's change of size: before it
+/// (`will(file, new_size)`) and after (`did(file, new_size)`), the file by
+/// [`FileHandle::host_id`]'s identity. The Darwin personality's mappings of
+/// a file follow it (`ubc_setsize`).
+type SizeWatch = (fn((u64, u64, u64), u64), fn((u64, u64, u64), u64));
+
+static SIZE_WATCH: std::sync::OnceLock<SizeWatch> = std::sync::OnceLock::new();
+
+/// Install the watch of host files' sizes ([`SizeWatch`]); once.
+pub fn set_size_watch(will: fn((u64, u64, u64), u64), did: fn((u64, u64, u64), u64)) {
+    let _ = SIZE_WATCH.set((will, did));
+}
+
+/// Whether a watch of sizes is installed.
+pub fn size_watched() -> bool {
+    SIZE_WATCH.get().is_some()
+}
+
+/// Host file `id` is about to be `size` bytes long.
+pub fn size_will_change(id: (u64, u64, u64), size: u64) {
+    if let Some((will, _)) = SIZE_WATCH.get() {
+        will(id, size);
+    }
+}
+
+/// Host file `id` is `size` bytes long now.
+pub fn size_did_change(id: (u64, u64, u64), size: u64) {
+    if let Some((_, did)) = SIZE_WATCH.get() {
+        did(id, size);
+    }
+}
+
+/// [`FileHandle::host_id`] of a host file's metadata.
+pub fn host_id_of(md: &std::fs::Metadata) -> (u64, u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    let birth = md.created().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos() as u64);
+    (md.dev(), md.ino(), birth)
 }
 
 static SYNC_ALL: std::sync::OnceLock<fn() -> Result<(), Errno>> = std::sync::OnceLock::new();

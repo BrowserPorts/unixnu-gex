@@ -184,6 +184,12 @@ impl<T> Mutex<T> {
     }
 }
 
+impl<T> std::fmt::Debug for Mutex<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Mutex")
+    }
+}
+
 pub struct MutexGuard<'a, T> {
     g: std::sync::MutexGuard<'a, T>,
     lock: &'a Mutex<T>,

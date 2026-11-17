@@ -291,6 +291,13 @@ impl FileHandle for HostHandle {
         Some(self.file.lock().unwrap_or_else(|e| e.into_inner()).as_raw_fd())
     }
 
+    fn host_id(&self) -> Option<(u64, u64, u64)> {
+        if self.stream {
+            return None;
+        }
+        self.file.lock().unwrap_or_else(|e| e.into_inner()).metadata().ok().map(|md| super::host_id_of(&md))
+    }
+
     fn xattr(&self, op: super::XattrOp<'_>) -> Option<Result<usize, Errno>> {
         use std::os::unix::io::AsRawFd;
         let f = self.file.lock().unwrap_or_else(|e| e.into_inner());
@@ -313,10 +320,21 @@ impl FileHandle for HostHandle {
     /// `ftruncate`. The trait default answers `EINVAL`; apt truncates a file to
     /// 0 before hashing a download and reported that as "Unable to truncate".
     fn truncate(&self, len: u64) -> Result<(), Errno> {
+        // What watches the file's size is told before and after, outside
+        // the file's lock (a mapping's fault reads its size).
+        let id = if super::size_watched() { self.file.lock().unwrap().metadata().ok().map(|md| super::host_id_of(&md)) } else { None };
+        if let Some(id) = id {
+            super::size_will_change(id, len);
+        }
         let f = self.file.lock().unwrap();
         let was = if crate::vnote::any() { f.metadata().map(|m| m.len()).ok() } else { None };
-        f.set_len(len).map_err(|e| Errno::from_io(&e))?;
+        let r = f.set_len(len).map_err(|e| Errno::from_io(&e));
+        let now = if id.is_some() { f.metadata().map(|m| m.len()).unwrap_or(len) } else { len };
         drop(f);
+        if let Some(id) = id {
+            super::size_did_change(id, now);
+        }
+        r?;
         self.note(crate::inotify::mask::MODIFY);
         // A size set is VNOP_SETATTR's; one that grows the file is also
         // ubc_setsize's NOTE_EXTEND.
@@ -343,10 +361,16 @@ impl FileHandle for HostHandle {
                 .map_err(|e| Errno::from_io(&e))?;
         }
         // The size before, for a write that grows the file: the
-        // filesystem's ubc_setsize posts NOTE_EXTEND.
-        let was = if !self.stream && crate::vnote::any() { f.metadata().map(|m| m.len()).ok() } else { None };
+        // filesystem's ubc_setsize posts NOTE_EXTEND, and the file's
+        // mappings learn of it.
+        let watched = !self.stream && super::size_watched();
+        let was = if !self.stream && (crate::vnote::any() || watched) { f.metadata().map(|m| m.len()).ok() } else { None };
         let n = f.write(buf).map(|n| n as u64).map_err(|e| Errno::from_io(&e))?;
+        let grown = if watched && was.is_some_and(|w| offset + n > w) { f.metadata().ok().map(|md| (super::host_id_of(&md), md.len())) } else { None };
         drop(f);
+        if let Some((id, len)) = grown {
+            super::size_did_change(id, len);
+        }
         self.note(crate::inotify::mask::MODIFY);
         let grew = was.is_some_and(|w| offset + n > w);
         self.vnote(crate::vnote::note::WRITE | if grew { crate::vnote::note::EXTEND } else { 0 });
@@ -592,7 +616,17 @@ impl FileSystem for HostFs {
             custom |= hostflag::O_NONBLOCK;
         }
         opts.custom_flags(custom);
-        let file = opts.open(&host).map_err(|e| Errno::from_io(&e))?;
+        // A truncation of a file there: told to what watches its size.
+        let truncating = if flags & oflags::O_TRUNC != 0 && super::size_watched() { std::fs::metadata(&host).ok().filter(|m| m.is_file() && m.len() != 0).map(|m| super::host_id_of(&m)) } else { None };
+        if let Some(id) = truncating {
+            super::size_will_change(id, 0);
+        }
+        let opened = opts.open(&host).map_err(|e| Errno::from_io(&e));
+        if let Some(id) = truncating {
+            let now = opened.as_ref().ok().and_then(|f| f.metadata().ok()).map_or(0, |m| m.len());
+            super::size_did_change(id, now);
+        }
+        let file = opened?;
         // A FIFO, socket or device has no offset: read and write it as is.
         let stream = file.metadata().is_ok_and(|m| !m.is_file());
         let h = HostHandle {

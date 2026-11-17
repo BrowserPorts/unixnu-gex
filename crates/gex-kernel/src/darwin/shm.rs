@@ -1,17 +1,17 @@
 //! POSIX shared memory: `shm_open` and `shm_unlink`, and what is done with
 //! the object they name (`bsd/kern/posix_shm.c`, xnu-10063.141.1).
 //!
-//! The names live in one table for the host process. An object is only
-//! the bytes behind a descriptor, kept in a [`MemFd`]: a `MAP_SHARED`
-//! mapping of it is the same eager copy a memfd's is, written back at
-//! `msync` and `munmap`, so two processes that map one see each other's
-//! writes only then.
+//! The names live in one table for the host process. An object's memory is
+//! the anonymous object `pshm_truncate` makes (`mach_make_memory_entry_64`
+//! with MAP_MEM_NAMED_CREATE), whose pages the host holds apart from every
+//! task ([`crate::host_hold`]); every mapping of the object, in any task,
+//! is the host's mapping of those pages ([`crate::host_remap`]), so a
+//! store through one is seen through all of them at once.
 
 use super::cred::Cred;
 use crate::errno::{Errno, SysResult};
 use crate::file::OpenFile;
 use crate::syscalls::Kernel;
-use crate::unix::MemFd;
 use crate::vfs::{FileHandle, FileType, Metadata};
 use crate::GuestMem;
 use std::collections::BTreeMap;
@@ -38,12 +38,9 @@ const O_EXCL: u32 = 0x800;
 /// `ALLPERMS`.
 const ALLPERMS: u32 = 0o7777;
 
-/// The page `ftruncate` rounds a size up to, and `mmap` bounds against.
-const PAGE: u64 = 4096;
-
-/// What the kernel can hold of one object: past this a size is refused as
-/// the address space for it is (`ENOMEM`).
-const MAX_SIZE: u64 = 1 << 32;
+/// The map's page (`vm_map_page_mask(current_map())`, iOS's 16 KiB), which
+/// `ftruncate` rounds a size up to and `mmap` bounds against.
+const PAGE: u64 = super::mach::PAGE_MASK + 1;
 
 /// A POSIX shared memory object (`pshm_info_t`).
 #[derive(Debug)]
@@ -54,37 +51,52 @@ pub struct Pshm {
     pub gid: u32,
     /// The process that made it.
     pub creator: i32,
-    /// `pshm_length`; `None` until `ftruncate` allocates it (`PSHM_ALLOCATED`).
-    length: Mutex<Option<u64>>,
-    store: MemFd,
+    /// `pshm_length`, and its memory object (`pshm_mobjs`, none for a
+    /// size of 0), whose reference it holds; `None` until `ftruncate`
+    /// allocates it (`PSHM_ALLOCATED`).
+    length: Mutex<Option<(u64, Option<u64>)>>,
+}
+
+impl Drop for Pshm {
+    /// `pshm_deref`'s last: the object's memory entry released.
+    fn drop(&mut self) {
+        if let Some((_, Some(obj))) = *self.length.get_mut().unwrap_or_else(|e| e.into_inner()) {
+            super::vmobject::release(obj);
+        }
+    }
 }
 
 impl Pshm {
     fn new(name: &str, mode: u32, uid: u32, gid: u32, creator: i32) -> Pshm {
-        Pshm { name: name.to_string(), mode, uid, gid, creator, length: Mutex::new(None), store: MemFd::new(name) }
+        Pshm { name: name.to_string(), mode, uid, gid, creator, length: Mutex::new(None) }
     }
 
     pub fn length(&self) -> u64 {
-        self.length.lock().unwrap().unwrap_or(0)
+        self.length.lock().unwrap().map_or(0, |(l, _)| l)
     }
 
     pub fn allocated(&self) -> bool {
         self.length.lock().unwrap().is_some()
     }
 
-    /// `pshm_truncate`: the one allocation an object gets. The size is
-    /// rounded up to a page; a second call, or one for a size too large for
-    /// the memory, fails.
-    pub fn allocate(&self, length: u64) -> Result<(), Errno> {
+    /// The memory object, once allocated with a size.
+    pub fn object(&self) -> Option<u64> {
+        self.length.lock().unwrap().and_then(|(_, o)| o)
+    }
+
+    /// `pshm_truncate`: the one allocation an object gets, its size rounded
+    /// up to the map's page, its memory one new anonymous object
+    /// (`ANON_MAX_SIZE` being past any size a host can hold) made with
+    /// `make`, which gives the object or the error. A second call fails.
+    pub fn allocate(&self, length: u64, make: impl FnOnce(u64) -> Result<u64, Errno>) -> Result<(), Errno> {
         let mut cur = self.length.lock().unwrap();
         if cur.is_some() {
             return Err(Errno::EINVAL);
         }
-        let total = length.checked_add(PAGE - 1).ok_or(Errno::ENOMEM)? & !(PAGE - 1);
-        if total > MAX_SIZE {
-            return Err(Errno::ENOMEM);
-        }
-        *cur = Some(total);
+        // vm_map_round_page of an off_t no larger than OFF_MAX.
+        let total = (length + PAGE - 1) & !(PAGE - 1);
+        let obj = if total == 0 { None } else { Some(make(total)?) };
+        *cur = Some((total, obj));
         Ok(())
     }
 }
@@ -181,12 +193,14 @@ impl FileHandle for PshmHandle {
         Some(self)
     }
 
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> SysResult {
-        self.0.store.read_at(offset, buf)
+    /// `fo_no_read`: [`Kernel::darwin_shm_io`] answers a read first.
+    fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> SysResult {
+        Err(Errno::ENXIO)
     }
 
-    fn write_at(&self, offset: u64, buf: &[u8]) -> SysResult {
-        self.0.store.write_at(offset, buf)
+    /// `fo_no_write`.
+    fn write_at(&self, _offset: u64, _buf: &[u8]) -> SysResult {
+        Err(Errno::ENXIO)
     }
 
     fn metadata(&self) -> Result<Metadata, Errno> {
@@ -202,8 +216,9 @@ impl FileHandle for PshmHandle {
         })
     }
 
-    fn truncate(&self, len: u64) -> Result<(), Errno> {
-        self.0.allocate(len)
+    /// What `ftruncate` reaches only through [`Kernel::darwin_shm_ftruncate`].
+    fn truncate(&self, _len: u64) -> Result<(), Errno> {
+        Err(Errno::EINVAL)
     }
 }
 
@@ -273,12 +288,6 @@ impl Kernel {
             }
             access(&p, fmode, &self.dtask.cred)?;
         }
-        if !made && p.creator != self.pid {
-            self.darwin_unimplemented(format!(
-                "shm_open {name:?}: the object is also held by process {}; their mappings of it agree only at msync and munmap",
-                p.creator
-            ));
-        }
         let handle: Arc<dyn FileHandle> = Arc::new(PshmHandle(p, AtomicU64::new(0)));
         let file = OpenFile::new(handle, format!("/shm:{name}"), file_flags(fmode), fmode & FREAD != 0, fmode & FWRITE != 0);
         // Close-on-exec, as `FP_CLOEXEC`.
@@ -305,46 +314,115 @@ impl Kernel {
         }
     }
 
-    /// `ftruncate(fd, length)` on an object (`pshm_truncate`).
+    /// `fstat` of an object (`pshm_stat`): its mode (the permission bits
+    /// alone), owner, group and size, the rest zero.
+    pub(crate) fn darwin_shm_stat(&mut self, m: &mut GuestMem<'_>, fd: u64, buf: u64) -> Result<u64, Errno> {
+        let f = self.fd_io().fds.get(fd as i32)?;
+        let Some(h) = Arc::clone(&f.handle).as_posix_shm() else { return Err(Errno::EBADF) };
+        let p = &h.0;
+        let st = crate::fs::Stat { mode: p.mode, uid: p.uid, gid: p.gid, size: p.length() as i64, ..Default::default() };
+        m.write(buf, &if self.darwin_stat_ino32 { st.encode_darwin_ino32() } else { st.encode_darwin() })?;
+        Ok(0)
+    }
+
+    /// `ftruncate(fd, length)` on an object (`pshm_truncate`): its memory
+    /// object made (`mach_make_memory_entry_64` with MAP_MEM_NAMED_CREATE
+    /// and VM_PROT_DEFAULT), its pages the host's, held apart from every
+    /// task.
     pub(crate) fn darwin_shm_ftruncate(&mut self, a: &[u64; 6]) -> Result<u64, Errno> {
         if (a[1] as i64) < 0 {
             return Err(Errno::EINVAL);
         }
         let f = self.fd_io().fds.get(a[0] as i32)?;
-        f.handle.truncate(a[1]).map(|_| 0)
+        let Some(h) = Arc::clone(&f.handle).as_posix_shm() else { return Err(Errno::EINVAL) };
+        let mut unheld = None;
+        let r = h.0.allocate(a[1], |total| {
+            let Some(addr) = usize::try_from(total).ok().and_then(crate::host_hold) else {
+                unheld = Some(total);
+                return Err(Errno::ENOMEM);
+            };
+            let hold = Arc::new(super::vmobject::Hold { addr, len: total });
+            Ok(super::vmobject::allocate(total, super::vmobject::Pager::Anon, Some(hold)))
+        });
+        if let Some(total) = unheld {
+            self.darwin_unimplemented(format!("a POSIX shared memory object of {total:#x} bytes on a host that holds no pages apart from a task's, or not so many"));
+        }
+        r.map(|_| 0)
     }
 
-    /// The checks `pshm_mmap` makes of a mapping of an object, before the
-    /// mapping is made the ordinary way: `Ok` to go on.
-    pub(crate) fn darwin_shm_mmap_check(&mut self, a: &[u64; 6]) -> Result<(), Errno> {
-        const MAP_SHARED: u64 = 1;
-        const PROT_WRITE: u64 = 2;
-        let f = self.fd_io().fds.get(a[4] as i32)?;
-        let Some(shm) = Arc::clone(&f.handle).as_posix_shm().map(|h| Arc::clone(&h.0)) else { return Ok(()) };
-        let (len, prot, flags, pos) = (a[1], a[2], a[3], a[5]);
-        // `mmap` has split a position off the page it is in and added it to
-        // the length before `pshm_mmap` sees either.
-        let pageoff = pos & (PAGE - 1);
-        let pos = pos - pageoff;
-        let size = len.checked_add(pageoff).ok_or(Errno::EINVAL)?;
-        let size = size.checked_add(PAGE - 1).ok_or(Errno::EINVAL)? & !(PAGE - 1);
+    /// `pshm_mmap` of `size` bytes (the length with the position's offset
+    /// in its page, rounded to pages) of the object open as `fd` from
+    /// `file_pos` (page aligned), at `addr` (fixed) or from it as a hint,
+    /// with protection `prot` and `flags`: the object's own checks, the
+    /// range reserved, then the object's pages mapped over it, shared and
+    /// inherited by share, at most read and write (no write where the
+    /// descriptor cannot). The mapping's address.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn darwin_shm_mmap(&mut self, m: &mut GuestMem<'_>, addr: u64, size: u64, prot: u64, flags: u32, fd: i32, file_pos: u64, pageoff: u64) -> Result<u64, Errno> {
+        use super::mach::{prot as vp, vmf};
+        const MAP_SHARED: u32 = 0x1;
+        const MAP_FIXED: u32 = 0x10;
         if size == 0 {
-            return Ok(());
+            return Ok(0);
         }
         if flags & MAP_SHARED == 0 {
             return Err(Errno::EINVAL);
         }
-        if !f.writable && prot & PROT_WRITE != 0 {
-            return Err(Errno::EPERM);
+        let f = self.fd_io().fds.get(fd)?;
+        let Some(h) = Arc::clone(&f.handle).as_posix_shm() else { return Err(Errno::EINVAL) };
+        let mut max = vp::READ | vp::WRITE;
+        if !f.writable {
+            if prot & vp::WRITE != 0 {
+                return Err(Errno::EPERM);
+            }
+            max &= !vp::WRITE;
         }
+        let shm = &h.0;
         if !shm.allocated() {
             return Err(Errno::EINVAL);
         }
-        let end = size.checked_add(pos).ok_or(Errno::EINVAL)?;
-        if size > shm.length() || end > shm.length() {
+        let pshm_size = shm.length();
+        if size > pshm_size || size.checked_add(file_pos).is_none_or(|e| e > pshm_size) {
             return Err(Errno::EINVAL);
         }
-        Ok(())
+        let Some(obj) = shm.object() else { return Err(Errno::EINVAL) };
+        let errno = |k: u64| match k {
+            1 | 3 => Errno::ENOMEM,
+            2 => Errno::EACCES,
+            _ => Errno::EINVAL,
+        };
+        // The whole range reserved first, none and not inherited.
+        let fixed = flags & MAP_FIXED != 0;
+        let mut at = if fixed { addr } else { (addr + super::mach::PAGE_MASK) & !super::mach::PAGE_MASK };
+        if fixed && at & super::mach::PAGE_MASK != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let vflags = if fixed { vmf::OVERWRITE } else { vmf::ANYWHERE };
+        let k = self.darwin_vm_enter_anon_object(m, &mut at, size, 0, vflags, 0, 0, super::vm::inherit::NONE);
+        if k != super::ipc::kr::SUCCESS {
+            return Err(errno(k));
+        }
+        // vm_map_enter_mem_object of the object over it: a protection
+        // beyond the most is cut to it, execute reads too.
+        let mut cur = prot & max;
+        if cur & vp::EXECUTE != 0 {
+            cur |= vp::READ;
+        }
+        let Some(hold) = super::vmobject::with(obj, |o| o.hold.clone()).flatten() else { return Err(Errno::EINVAL) };
+        if !m.remap_from(at, hold.addr + file_pos as usize, size, false).unwrap_or(false) {
+            self.darwin_unimplemented("a POSIX shared memory object's mapping on a host that cannot map its pages twice".into());
+            let _ = self.darwin_vm_deallocate(m, at, size);
+            return Err(Errno::EINVAL);
+        }
+        if self.canonical(m, crate::syscalls::nr::MPROTECT, [at, size, cur, 0, 0, 0]).is_err() {
+            let _ = self.darwin_vm_deallocate(m, at, size);
+            return Err(Errno::EINVAL);
+        }
+        let attrs = super::vm::Attrs { kind: super::vm::kind::SHM, max: max as u8, inherit: super::vm::inherit::SHARE, obj, ..super::vm::Attrs::default() };
+        self.dtask.vm.enter(at, at + size, attrs, file_pos);
+        self.mem.lock().set_unentered(at, at + size);
+        h.set_mapp_addr(at);
+        Ok(at + pageoff)
     }
 }
 
@@ -389,16 +467,17 @@ mod tests {
         let (a, _) = open(&n, "x", RW | O_CREAT, 0o600).unwrap();
         // not sized yet: O_TRUNC is fine
         open(&n, "x", RW | O_TRUNC, 0).unwrap();
-        a.allocate(100).unwrap();
-        assert_eq!(a.length(), 4096);
-        assert_eq!(a.allocate(100), Err(Errno::EINVAL));
+        let obj = |_| Ok(super::super::vmobject::allocate(PAGE, super::super::vmobject::Pager::Anon, None));
+        a.allocate(100, obj).unwrap();
+        assert_eq!(a.length(), 0x4000, "the map's page");
+        assert!(a.object().is_some());
+        assert_eq!(a.allocate(100, obj), Err(Errno::EINVAL));
         assert_eq!(open(&n, "x", RW | O_TRUNC, 0).unwrap_err(), Errno::EINVAL);
         let (b, _) = open(&n, "y", RW | O_CREAT, 0o600).unwrap();
-        assert_eq!(b.allocate(MAX_SIZE + 1), Err(Errno::ENOMEM));
-        assert_eq!(b.allocate(u64::MAX), Err(Errno::ENOMEM));
+        assert_eq!(b.allocate(1 << 40, |_| Err(Errno::ENOMEM)), Err(Errno::ENOMEM));
         assert!(!b.allocated());
-        b.allocate(0).unwrap();
-        assert_eq!(b.length(), 0);
+        b.allocate(0, obj).unwrap();
+        assert_eq!((b.length(), b.object()), (0, None));
     }
 
     #[test]
@@ -409,7 +488,7 @@ mod tests {
         assert_eq!(n.unlink("x", &Cred::of(501, 20)).unwrap_err(), Errno::ENOENT);
         assert_eq!(open(&n, "x", RW, 0).unwrap_err(), Errno::ENOENT);
         // the object is still there for whoever holds it
-        a.allocate(1).unwrap();
+        a.allocate(1, |_| Ok(super::super::vmobject::allocate(PAGE, super::super::vmobject::Pager::Anon, None))).unwrap();
         // a new one under the old name is another object
         let (b, made) = open(&n, "x", RW | O_CREAT, 0o600).unwrap();
         assert!(made && !Arc::ptr_eq(&a, &b));

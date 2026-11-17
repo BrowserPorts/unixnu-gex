@@ -14,6 +14,7 @@
 
 pub mod btree;
 pub mod container;
+pub mod fsops;
 pub mod gpt;
 pub mod node;
 pub mod restore;

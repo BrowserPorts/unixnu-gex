@@ -23,6 +23,7 @@
 //! empty.
 
 use super::container;
+use super::fsops;
 use super::gpt;
 use super::tx::{Mode, NewVolume, Nx, VolumeTimes};
 use super::{Sink, Window};
@@ -45,6 +46,13 @@ pub fn key_os_version(build: &str) -> Result<u32, String> {
     }
     Ok(major << 24 | u32::from(b[letter]) << 16 | num)
 }
+
+/// The facts of the restore's run that only the device has: what the
+/// kernel's clock read at each call, and which calls each of its
+/// transactions holds (on internal storage the kernel commits only when a
+/// sync, an unmount or a full transaction asks it to, K 0x675a6a0, so the
+/// grouping follows what else wrote to the container meanwhile).
+pub const RUN_STAND_IN: &str = "the erase restore's clock readings and transaction grouping on disk0 (stand-in: the clock of the machine building the image, and each call joining the open transaction until a sync, unmount or volume creation commits it, as with no other writer on the container; measure the device's disk0 after its erase restore)";
 
 /// The restore's build.
 pub const RESTORE_BUILD: &str = "21H461";
@@ -90,9 +98,28 @@ pub fn build_disk0(disk: &dyn Sink, now: &mut dyn FnMut() -> u64) -> Result<Miss
     add(&mut nx, "xART", storage::role::XART, Some(10_485_760), now)?;
     add(&mut nx, "Hardware", storage::role::HARDWARE, Some(6_291_456), now)?;
     add(&mut nx, "Preboot", storage::role::PREBOOT, None, now)?;
-    // 4. Update.
-    add(&mut nx, "Update", storage::role::UPDATE, None, now)?;
-    missing.push("the Update volume's directories (prepare_for_asr: /Controller, /Firmware, /db, /Hardware, /Hardware/Battery)".into());
+    // 4. Update, mounted at /mnt4 and given its directories
+    // (`_create_update_partition_folder_hierarchy`, 0x100020854: for each,
+    // mkdir, chmod and chown of the user's ids, under the umask 0 the
+    // restore set at its start), then unmounted.
+    let oid = add(&mut nx, "Update", storage::role::UPDATE, None, now)?;
+    let update = nx.fs_oid.iter().position(|&o| o == oid).ok_or("no Update volume")?;
+    fsops::mount_rw(&mut nx, update, now)?;
+    const ROOT_INO: u64 = 2;
+    const MOBILE: (u32, u32) = (501, 501);
+    for (path, mode, (uid, gid)) in [("Controller", 0o711, MOBILE), ("Firmware", 0o755, (0, 0)), ("db", 0o777, MOBILE), ("Hardware", 0o500, (0, 0)), ("Hardware/Battery", 0o700, (0, 0))] {
+        let (dir, name) = match path.rsplit_once('/') {
+            Some((d, n)) => (fsops::lookup(&mut nx, update, ROOT_INO, d)?.ok_or_else(|| format!("no /{d} on Update"))?, n),
+            None => (ROOT_INO, path),
+        };
+        let ino = match fsops::mkdir(&mut nx, update, dir, name, mode, 0, 0, now)? {
+            Ok(ino) => ino,
+            Err(_) => fsops::lookup(&mut nx, update, dir, name)?.ok_or("an existing directory not found")?,
+        };
+        fsops::chmod(&mut nx, update, ino, mode)?;
+        fsops::chown(&mut nx, update, ino, uid, gid, now)?;
+    }
+    fsops::unmount(&mut nx, update, now)?;
     // 5.
     missing.push("the System volume's content: ASR of 044-76040-038.dmg into /mnt1/apfs_invert_asr_img, apfs_invert, the data-volume trees' removal, apfs_sealvolume to the signed root hash, and the com.apple.os.update- snapshot".into());
     // 6.
@@ -150,6 +177,20 @@ mod tests {
             assert_eq!(vol.lookup(2, "nothing").unwrap().map(|e| e.name), None);
         }
         assert!(c.volume(1).unwrap().is_none(), "Data is not made yet");
+        // Update's directories, their owners and modes.
+        let u = c.volume(5).unwrap().unwrap();
+        let dir = |parent: u64, name: &str, mode: u16, uid: u32| {
+            let e = u.lookup(parent, name).unwrap().unwrap_or_else(|| panic!("no {name}"));
+            let i = u.inode(e.file_id).unwrap().unwrap();
+            assert!(i.is_dir());
+            assert_eq!((i.mode & 0o7777, i.owner, i.group), (mode, uid, uid), "{name}");
+            e.file_id
+        };
+        dir(2, "Controller", 0o711, 501);
+        dir(2, "Firmware", 0o755, 0);
+        dir(2, "db", 0o777, 501);
+        let hw = dir(2, "Hardware", 0o500, 0);
+        dir(hw, "Battery", 0o700, 0);
         let _ = std::fs::remove_file(&tmp);
     }
 

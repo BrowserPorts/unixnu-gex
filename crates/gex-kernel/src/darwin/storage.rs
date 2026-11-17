@@ -328,14 +328,28 @@ pub const PREBOOT_UNENCRYPTED: bool = true;
 /// What measures [`PREBOOT_UNENCRYPTED`].
 pub const PREBOOT_UNENCRYPTED_MEASUREMENT: &str = "`statfs(\"/private/preboot\")`'s f_flags on the device: MNT_CPROTECT (0x80) clear means unencrypted";
 
-/// Whether the volume at slot `index` is unencrypted (or one-key): the
-/// System's and Preboot's stand-ins; none for the others yet.
-pub fn volume_unencrypted(index: u32) -> Option<bool> {
-    match volume(index)?.role {
-        role::SYSTEM => Some(SYSTEM_UNENCRYPTED),
-        role::PREBOOT => Some(PREBOOT_UNENCRYPTED),
-        _ => None,
+/// `APFS_FS_UNENCRYPTED`, `APFS_FS_ONEKEY`.
+pub const APFS_FS_UNENCRYPTED: u64 = 0x1;
+pub const APFS_FS_ONEKEY: u64 = 0x8;
+
+/// The `apfs_fs_flags` of the volume at slot `index`: its superblock's in
+/// the disk0 image served ([`super::disknode`]); without an image, the
+/// System's and Preboot's stand-ins (unencrypted), none for the others.
+pub fn volume_fs_flags(index: u32) -> Result<Option<u64>, String> {
+    if super::disknode::installed() {
+        return super::disknode::volume_fs_flags(index);
     }
+    Ok(match volume(index).map(|v| v.role) {
+        Some(role::SYSTEM) if SYSTEM_UNENCRYPTED => Some(APFS_FS_UNENCRYPTED),
+        Some(role::PREBOOT) if PREBOOT_UNENCRYPTED => Some(APFS_FS_UNENCRYPTED),
+        _ => None,
+    })
+}
+
+/// Whether the volume at slot `index` has `APFS_FS_UNENCRYPTED` (none:
+/// not known, see [`volume_fs_flags`]).
+pub fn volume_unencrypted(index: u32) -> Option<bool> {
+    volume_fs_flags(index).ok().flatten().map(|f| f & APFS_FS_UNENCRYPTED != 0)
 }
 
 /// Whether a volume's IOMedia is writable: `AppleAPFSVolume::init` gives
@@ -388,8 +402,8 @@ pub fn unmeasured() -> Option<String> {
         gaps.push(format!("the disks' BSD minors (stand-in: the media's registration order; measure {MEDIA_ORDER_MEASUREMENT})"));
     }
     gaps.push(format!("vfs.generic.apfs's sysctl number (stand-in {}; measure {})", super::sysctl::APFS_NODE_STAND_IN, super::sysctl::APFS_NODE_MEASUREMENT));
-    gaps.push(format!("whether the System volume is unencrypted (stand-in {SYSTEM_UNENCRYPTED}, no MNT_CPROTECT on /; measure {SYSTEM_UNENCRYPTED_MEASUREMENT})"));
-    gaps.push(format!("whether the Preboot volume is unencrypted (stand-in {PREBOOT_UNENCRYPTED}, no MNT_CPROTECT on its mount; measure {PREBOOT_UNENCRYPTED_MEASUREMENT})"));
+    gaps.push(format!("whether the System volume is unencrypted without a disk0 image (stand-in {SYSTEM_UNENCRYPTED}, no MNT_CPROTECT on /; measure {SYSTEM_UNENCRYPTED_MEASUREMENT})"));
+    gaps.push(format!("whether the Preboot volume is unencrypted without a disk0 image (stand-in {PREBOOT_UNENCRYPTED}, no MNT_CPROTECT on its mount; measure {PREBOOT_UNENCRYPTED_MEASUREMENT})"));
     gaps.push(super::img4::CHOSEN_STAND_IN.to_string());
     gaps.push(super::preboot::TIMES_STAND_IN.to_string());
     gaps.push(super::preboot::FOUNDATION_MODE_STAND_IN.to_string());

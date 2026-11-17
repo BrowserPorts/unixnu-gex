@@ -11,11 +11,17 @@
 //! A file's type names a compression scheme and a chunking scheme (its
 //! table at 0xfffffff005873ae4, 12 bytes a type, read by
 //! 0xfffffff006b29fdc). The file is made of 64 KiB chunks: one, the
-//! attribute's bytes, for chunking 0x10000; for chunking 0x30000 as many as
-//! the size needs, the resource fork starting with one more 32-bit offset
-//! than chunks, chunk i the bytes from offset i to offset i + 1. A chunk
-//! whose first byte is the scheme's low byte holds the rest as they are;
-//! any other is the scheme's algorithm's (0xfffffff006b2a2ac).
+//! attribute's bytes, for chunking 0x10000; for the others as many as the
+//! size needs, in the resource fork. For chunking 0x30000 the fork starts
+//! with one more 32-bit offset than chunks, chunk i the bytes from offset i
+//! to offset i + 1. For chunking 0x20000 (zlib's type 4) the fork is a
+//! classic resource fork holding one `cmpf` resource: its 256-byte header,
+//! then the resource's big-endian length at 0x100 and its data, a 32-bit
+//! chunk count at 0x104 and for each chunk a 32-bit offset (from 0x104) and
+//! size, all little-endian; the fork ends with a fixed 50-byte resource
+//! map ([`RESOURCE_MAP`]). A chunk whose first byte is the scheme's low
+//! byte holds the rest as they are; any other is the scheme's algorithm's
+//! (0xfffffff006b2a2ac).
 //!
 //! A read is what `decmpfs_read_compressed` fetches: from the chunk
 //! holding its first byte (`adjust_fetch`: the 64 KiB boundary below it;
@@ -25,6 +31,7 @@
 use super::fs::{Decmpfs, Inode, Xattr, XattrData, RESOURCEFORK_NAME};
 use super::lzbitmap;
 use super::{Error, Le, Result, Volume};
+use crate::darwin::inflate;
 
 /// `EIO`, `EINVAL`, `ENOATTR`: the errors a fetch returns.
 pub const EIO: i32 = 5;
@@ -94,6 +101,23 @@ fn fetch_error<T>(errno: i32, why: impl Into<String>) -> Result<T> {
 /// The `com.apple.decmpfs` header's length.
 pub const HEADER: usize = 16;
 
+/// The resource map a chunking-0x20000 resource fork ends with, as
+/// `validate` compares it (0xfffffff005873ab0): its header copy left zero,
+/// the type list at 0x1c and the name list at 0x32; one type, `cmpf`, with
+/// one resource, ID 1, unnamed, its data at offset 0.
+pub const RESOURCE_MAP: [u8; 50] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x1c, 0, 0x32, 0, 0, b'c', b'm', b'p', b'f', 0, 0, 0, 0x0a, 0, 0x01, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+/// Where a chunking-0x20000 fork's chunk count is, the base its chunk
+/// offsets count from, and where its (offset, size) pairs start.
+const CMPF_COUNT: u64 = 0x104;
+const CMPF_TABLE: u64 = 0x108;
+/// What the fork holds besides the pairs: its header, the resource's
+/// length, the count and the map (`validate`'s least size, 0x13a more
+/// than the pairs).
+const CMPF_OVERHEAD: u64 = 0x13a;
+
 /// A chunk's bytes made into at most `cap` (0xfffffff006b2a4d0..): as they
 /// are after the scheme's marker byte, or through the scheme's algorithm,
 /// which gives no bytes when it fails.
@@ -127,7 +151,25 @@ pub fn chunk(scheme: u32, data: &[u8], cap: usize) -> Result<Vec<u8>> {
             out.truncate(n);
             Ok(out)
         }
-        scheme::ZLIB => Err(Error::Unsupported(format!("decoding a chunk of compression scheme {scheme:#x} (zlib)"))),
+        // An RFC 1950 stream (0xfffffff006b2a67c): at least 2 bytes, the
+        // first's low nibble 8 (CM, deflate), else "invalid zlib header"
+        // (0xfffffff006b2a844, EINVAL); the rest of the header is not
+        // checked. Past its 2 bytes, the raw DEFLATE data through
+        // algorithm 0x205, its Adler-32 trailer not read.
+        scheme::ZLIB => {
+            if data.len() < 2 || data[0] & 0xf != 8 {
+                return fetch_error(EINVAL, "invalid zlib header");
+            }
+            let mut out = vec![0u8; cap];
+            match inflate::decode_buffer(&data[2..], &mut out, inflate::Variant::Kernel) {
+                Ok(0) | Err(inflate::Error::Rejected(_)) => fetch_error(EINVAL, format!("decode failed for compression scheme {scheme:#x}")),
+                Ok(n) => {
+                    out.truncate(n);
+                    Ok(out)
+                }
+                Err(e @ inflate::Error::Undefined(_)) => Err(Error::Unsupported(e.to_string())),
+            }
+        }
         _ => fetch_error(EINVAL, format!("a chunk of compression scheme {scheme:#x} without its marker byte")),
     }
 }
@@ -167,7 +209,9 @@ impl Volume {
     /// The resource-fork types' `validate` (0xfffffff006b29704), which
     /// `decmpfs_validate_compressed_file` calls when APFS opens the file:
     /// for chunking 0x30000, a resource fork long enough for the offsets
-    /// whose last is its length.
+    /// whose last is its length; for chunking 0x20000, one long enough for
+    /// the pairs and the rest, ending with [`RESOURCE_MAP`] ("invalid
+    /// resource map"), whose count is the file's chunks ("expected size").
     pub fn decmpfs_validate(&self, ino: &Inode) -> Result<()> {
         let (h, _) = self.decmpfs(ino)?;
         let Some(k) = kind(h.kind) else {
@@ -186,6 +230,25 @@ impl Volume {
                 self.attribute_at(&rf, n * 4, &mut last)?;
                 if u64::from(u32::from_le_bytes(last)) != rf.len() {
                     return fetch_error(EINVAL, format!("a resource fork of {} bytes whose last offset is {}", rf.len(), u32::from_le_bytes(last)));
+                }
+                Ok(())
+            }
+            chunking::RESOURCE_MAP => {
+                let rf = self.resource_fork(ino)?;
+                let n = Self::chunks(k.chunking, h.uncompressed_size);
+                let min = n * 8 + CMPF_OVERHEAD;
+                if rf.len() < min {
+                    return fetch_error(EINVAL, format!("a resource fork of {} bytes, under the {min} its chunk table and map take", rf.len()));
+                }
+                let mut map = [0u8; RESOURCE_MAP.len()];
+                self.attribute_at(&rf, rf.len() - map.len() as u64, &mut map)?;
+                if map != RESOURCE_MAP {
+                    return fetch_error(EINVAL, "invalid resource map");
+                }
+                let mut count = [0u8; 4];
+                self.attribute_at(&rf, CMPF_COUNT, &mut count)?;
+                if u64::from(u32::from_le_bytes(count)) != n {
+                    return fetch_error(EINVAL, format!("expected size {n}, found {} (the fork's chunk count)", u32::from_le_bytes(count)));
                 }
                 Ok(())
             }
@@ -208,10 +271,10 @@ impl Volume {
         let chunks = Self::chunks(k.chunking, size);
         let (first, last) = match k.chunking {
             chunking::ATTRIBUTE => (0, (size - 1) / CHUNK),
-            chunking::OFFSETS => (off / CHUNK, (off + n as u64 - 1) / CHUNK),
+            chunking::OFFSETS | chunking::RESOURCE_MAP => (off / CHUNK, (off + n as u64 - 1) / CHUNK),
             c => return Err(Error::Unsupported(format!("reading the compressed file {:#x}: decmpfs chunking {c:#x}", ino.oid))),
         };
-        let rf = if k.chunking == chunking::OFFSETS { Some(self.resource_fork(ino)?) } else { None };
+        let rf = if k.chunking == chunking::ATTRIBUTE { None } else { Some(self.resource_fork(ino)?) };
         // On a sealed volume, the expanded bytes are checked against the
         // data hashes kept under the resource fork's stream (what
         // decmpfs's VNOP_VERIFY of a fetched UPL checks).
@@ -235,17 +298,31 @@ impl Volume {
                 }
                 Some(rf) => {
                     let mut o = [0u8; 8];
-                    self.attribute_at(rf, c * 4, &mut o)?;
-                    let (from, to) = (o.u32_at(0)?, o.u32_at(4)?);
-                    if to <= from {
-                        return fetch_error(EINVAL, format!("chunk {c}'s offsets out of order ({from}, {to})"));
-                    }
-                    let len = u64::from(to - from);
+                    let (at, len) = if k.chunking == chunking::OFFSETS {
+                        self.attribute_at(rf, c * 4, &mut o)?;
+                        let (from, to) = (o.u32_at(0)?, o.u32_at(4)?);
+                        if to <= from {
+                            return fetch_error(EINVAL, format!("chunk {c}'s offsets out of order ({from}, {to})"));
+                        }
+                        (u64::from(from), u64::from(to - from))
+                    } else {
+                        // Chunk c's offset (from 0x104) and size, unchecked
+                        // (0xfffffff006b2a464). A size of 0 reads nothing
+                        // into the buffer the fetch kept from an earlier
+                        // chunk (none: ENOMEM), whose first byte it then
+                        // reads.
+                        self.attribute_at(rf, CMPF_TABLE + c * 8, &mut o)?;
+                        let (from, len) = (o.u32_at(0)?, o.u32_at(4)?);
+                        if len == 0 {
+                            return Err(Error::Unsupported(format!("chunk {c} of {:#x}: a size of 0, which reads what the fetch's buffer held before", ino.oid)));
+                        }
+                        (CMPF_COUNT + u64::from(from), u64::from(len))
+                    };
                     if len > CHUNK_READ_MAX {
                         return Err(Error::Unsupported(format!("the kernel's allocation of a {len}-byte chunk of {:#x}", ino.oid)));
                     }
                     let mut d = vec![0u8; len as usize];
-                    self.attribute_at(rf, u64::from(from), &mut d)?;
+                    self.attribute_at(rf, at, &mut d)?;
                     d
                 }
             };
@@ -302,7 +379,26 @@ mod tests {
         assert!(matches!(chunk(scheme::LZBITMAP, b"ZBQ\x00", 16), Err(Error::Decmpfs { errno: EINVAL, .. })));
         // A truncated LZFSE stream: no bytes, "decode failed".
         assert!(matches!(chunk(scheme::LZFSE, b"bvx2", 16), Err(Error::Decmpfs { errno: EINVAL, .. })));
-        assert!(matches!(chunk(scheme::ZLIB, b"\x78\x9c", 16), Err(Error::Unsupported(_))));
+        assert!(matches!(chunk(scheme::ZLIB, b"\x78\x9c", 16), Err(Error::Decmpfs { errno: EINVAL, .. })));
+    }
+
+    /// A zlib chunk: its header's CM checked and the rest of it not, raw
+    /// DEFLATE after it, its Adler-32 trailer not read.
+    #[test]
+    fn zlib_chunks() {
+        let s = b"\x78\x9c\xcb\xc8\x04\x00\x01\x3b\x00\xd2";
+        assert_eq!(chunk(scheme::ZLIB, s, 16).unwrap(), b"hi");
+        assert_eq!(chunk(scheme::ZLIB, s, 1).unwrap(), b"h");
+        assert_eq!(chunk(scheme::ZLIB, &s[..6], 16).unwrap(), b"hi");
+        assert_eq!(chunk(scheme::ZLIB, &[b"\x08\x00", &s[2..]].concat(), 16).unwrap(), b"hi");
+        let einval = |d: &[u8]| matches!(chunk(scheme::ZLIB, d, 16), Err(Error::Decmpfs { errno: EINVAL, .. }));
+        assert!(einval(&[b"\x79\x9c", &s[2..]].concat()));
+        assert!(einval(b"\x78"));
+        // An empty stream gives no bytes: "decode failed".
+        assert!(einval(b"\x78\x9c\x03\x00\x00\x00\x00\x01"));
+        assert!(einval(&s[..4]));
+        // The marker byte: the rest as it is.
+        assert_eq!(chunk(scheme::ZLIB, b"\xffhi", 16).unwrap(), b"hi");
     }
 
     /// An LZVN chunk: no block header; literals, a match, end of stream;
@@ -339,26 +435,57 @@ mod tests {
         assert!(matches!(chunk(scheme::LZFSE, &s[..s.len() - 4], 64), Err(Error::Decmpfs { errno: EINVAL, .. })));
     }
 
-    /// Every file of decmpfs types 7, 8, 11 and 12 on the first volume of
-    /// each image (UDIF or a raw container) in GEX_TEST_DECMPFS_IMAGES
-    /// (colon-separated) reads
+    /// A partition of a raw disk image.
+    struct Part(std::sync::Arc<crate::darwin::apfsread::tests_support::HostFile>, u64, u64);
+
+    impl crate::darwin::apfsread::Medium for Part {
+        fn size(&self) -> u64 {
+            self.2
+        }
+        fn read_at(&self, off: u64, buf: &mut [u8]) -> std::result::Result<(), String> {
+            if off + buf.len() as u64 > self.2 {
+                return Err(format!("a read of {off}+{} past a {}-byte partition", buf.len(), self.2));
+            }
+            self.0.read_at(self.1 + off, buf)
+        }
+    }
+
+    /// Every file of decmpfs types 3, 4, 7, 8, 11 and 12 on the first
+    /// volume of each image (UDIF, a raw GPT disk with 512-byte sectors, or
+    /// a raw container) in GEX_TEST_DECMPFS_IMAGES (colon-separated) reads
     /// back as the host reads the same image mounted at the matching entry
-    /// of GEX_TEST_DECMPFS_MNTS.
+    /// of GEX_TEST_DECMPFS_MNTS, and passes `validate`. GEX_TEST_DECMPFS_TYPES
+    /// (comma-separated) narrows the types read.
     #[test]
-    fn image_files_of_lzvn_and_lzfse_types() {
+    fn image_files_of_zlib_lzvn_and_lzfse_types() {
         use std::sync::Arc;
         let (Ok(imgs), Ok(mnts)) = (std::env::var("GEX_TEST_DECMPFS_IMAGES"), std::env::var("GEX_TEST_DECMPFS_MNTS")) else { return };
+        let types: Vec<u32> = match std::env::var("GEX_TEST_DECMPFS_TYPES") {
+            Ok(t) => t.split(',').map(|x| x.parse().unwrap()).collect(),
+            Err(_) => vec![3, 4, 7, 8, 11, 12],
+        };
         for (img, mnt) in imgs.split(':').zip(mnts.split(':')) {
             let f = std::fs::File::open(img).unwrap();
             let size = f.metadata().unwrap().len();
             let file = Arc::new(crate::darwin::apfsread::tests_support::HostFile(f, size));
             let mut tail = [0u8; 4];
             crate::darwin::apfsread::Medium::read_at(file.as_ref(), size - 512, &mut tail).unwrap();
-            // A UDIF image (its "koly" trailer) or a raw container.
+            let mut gpt = [0u8; 92];
+            crate::darwin::apfsread::Medium::read_at(file.as_ref(), 512, &mut gpt).unwrap();
+            // A UDIF image (its "koly" trailer), a GPT disk (its Apple_APFS
+            // partition) or a raw container.
             let medium: Arc<dyn crate::darwin::apfsread::Medium> = if &tail == b"koly" {
                 let u = Arc::new(crate::darwin::udif::Udif::open(file).unwrap());
                 let p = u.partition("Apple_APFS").unwrap();
                 Arc::new(crate::darwin::udif::PartitionMedium { image: u, index: p })
+            } else if &gpt[..8] == b"EFI PART" {
+                const APFS: [u8; 16] = [0xef, 0x57, 0x34, 0x7c, 0, 0, 0xaa, 0x11, 0xaa, 0x11, 0, 0x30, 0x65, 0x43, 0xec, 0xac];
+                let (lba, count, esize) = (u64::from_le_bytes(gpt[72..80].try_into().unwrap()), u32::from_le_bytes(gpt[80..84].try_into().unwrap()), u32::from_le_bytes(gpt[84..88].try_into().unwrap()));
+                let mut table = vec![0u8; count as usize * esize as usize];
+                crate::darwin::apfsread::Medium::read_at(file.as_ref(), lba * 512, &mut table).unwrap();
+                let e = table.chunks(esize as usize).find(|e| e[..16] == APFS).unwrap();
+                let (first, last) = (u64::from_le_bytes(e[32..40].try_into().unwrap()), u64::from_le_bytes(e[40..48].try_into().unwrap()));
+                Arc::new(Part(file, first * 512, (last + 1 - first) * 512))
             } else {
                 file
             };
@@ -375,21 +502,26 @@ mod tests {
                 })
                 .unwrap();
             let mut seen = std::collections::BTreeMap::<u32, usize>::new();
+            let mut read = std::collections::BTreeMap::<u32, (usize, u64)>::new();
             for oid in oids {
                 let ino = v.inode(oid).unwrap().unwrap();
                 let (h, _) = v.decmpfs(&ino).unwrap();
                 *seen.entry(h.kind).or_default() += 1;
-                if ![7, 8, 11, 12].contains(&h.kind) {
+                if !types.contains(&h.kind) {
                     continue;
                 }
+                v.decmpfs_validate(&ino).unwrap();
                 let path = v.path_of(oid).unwrap().unwrap();
                 let want = std::fs::read(format!("{mnt}{path}")).unwrap();
                 let mut got = vec![0u8; want.len()];
                 let n = v.read_file(&ino, 0, &mut got).unwrap();
                 assert_eq!(n, want.len(), "{img}: {path}");
                 assert!(got == want, "{img}: {path} (type {})", h.kind);
+                let r = read.entry(h.kind).or_default();
+                r.0 += 1;
+                r.1 += n as u64;
             }
-            eprintln!("{img}: decmpfs types {seen:?}");
+            eprintln!("{img}: decmpfs types {seen:?}; read (files, bytes) {read:?}");
         }
     }
 }

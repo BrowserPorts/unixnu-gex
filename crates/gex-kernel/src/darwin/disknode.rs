@@ -104,6 +104,27 @@ fn volume_valid(d: &Disk, index: u32) -> Result<bool, String> {
     Ok(magic && slot && incompat & !0x3fb == 0)
 }
 
+/// The `apfs_fs_flags` of the volume in slot `index` of the container in
+/// the image (none for an empty slot); an error without an image.
+pub fn volume_fs_flags(index: u32) -> Result<Option<u64>, String> {
+    let d = DISK.get().ok_or("no disk0 image")?;
+    let (base, size) = storage::partition_extent();
+    let c = super::apfsread::Container::open(Arc::new(PartMedium(Arc::clone(&d.sink), base, size))).map_err(|e| e.to_string())?;
+    let Some(&oid) = c.nx.fs_oid.get(index as usize) else { return Ok(None) };
+    if oid == 0 {
+        return Ok(None);
+    }
+    let omap = c.omap().map_err(|e| e.to_string())?;
+    let Some(v) = omap.lookup(&c, oid, c.xid()).map_err(|e| e.to_string())? else { return Ok(None) };
+    let sb = c.read_raw(v.paddr).map_err(|e| e.to_string())?;
+    Ok(Some(u64::from_le_bytes(sb[0x108..0x110].try_into().unwrap())))
+}
+
+/// Whether a disk0 image is served.
+pub fn installed() -> bool {
+    DISK.get().is_some()
+}
+
 /// The partition's bytes as a medium of their own.
 struct PartMedium(Arc<dyn Sink>, u64, u64);
 

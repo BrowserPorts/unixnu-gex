@@ -46,6 +46,14 @@ crates/gex-kernel/src/darwin/lzfse.rs
     Copyright (c) 2015-2016, Apple Inc. All rights reserved. BSD-3-Clause
     (below).
 
+crates/gex-kernel/src/darwin/xz.rs
+    The branch/call/jump converters are ported from XZ Utils' liblzma
+    5.4.3 (src/liblzma/simple/*.c), and the LZMA, LZMA2 and .xz decoding
+    follows liblzma 5.4.3's (src/liblzma/lzma, lz, common), by Lasse
+    Collin, Igor Pavlov and the XZ Utils contributors. Public domain:
+    "This file has been put into the public domain. You can do whatever
+    you want with this file."
+
 The MIT licence of musl libc and of Emscripten's dlmalloc changes (each
 under its copyright line above):
 

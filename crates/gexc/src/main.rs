@@ -216,7 +216,7 @@ usage:
                                    different programs add up (--split DIR:
                                    one file per object instead of -o)
   gexc profile show [--top N] IN   summarise a profile
-  gexc darwin-disk0 <out>          write the web device's disk0 as its erase
+  gexc darwin-disk0 <out> [<dmg>]  write the web device's disk0 as its erase
                                    restore makes it (exit 2: steps missing)
   gexc webmetal-info               the WebGPU implementation the Darwin
                                    personality's GPU runs on (the `webmetal`

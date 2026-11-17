@@ -148,11 +148,14 @@ impl std::fmt::Display for OutOfMemory {
 
 impl std::error::Error for OutOfMemory {}
 
-/// A clang for one source, under [`clang_mem_mb`]'s limit.
+/// A clang for one source, under [`clang_mem_mb`]'s limit: on Linux its
+/// address space (`RLIMIT_AS`); XNU takes no memory limit (`setrlimit` of
+/// `RLIMIT_AS` or `RLIMIT_DATA` is `EINVAL`), so there [`run_clang`] holds it
+/// to its footprint instead.
 fn clang_command() -> Command {
     #[allow(unused_mut)]
     let mut cmd = Command::new(clang());
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     {
         let mb = clang_mem_mb();
         if mb != 0 {
@@ -178,9 +181,7 @@ fn clang_command() -> Command {
 /// memory under its limit is an [`OutOfMemory`].
 fn run_clang(cmd: &mut Command, src: &Path) -> Result<()> {
     let what = format!("clang on {}", src.display());
-    let out = cmd
-        .output()
-        .with_context(|| format!("running {what} ({:?}); is it installed?", cmd.get_program()))?;
+    let out = clang_output(cmd).with_context(|| format!("running {what} ({:?}); is it installed?", cmd.get_program()))?;
     if out.status.success() {
         return Ok(());
     }
@@ -197,6 +198,57 @@ fn run_clang(cmd: &mut Command, src: &Path) -> Result<()> {
     }
     let lines: Vec<&str> = err.lines().take(60).collect();
     bail!("{what} failed ({}):\n{}", out.status, lines.join("\n"));
+}
+
+#[cfg(not(target_os = "macos"))]
+fn clang_output(cmd: &mut Command) -> std::io::Result<std::process::Output> {
+    cmd.output()
+}
+
+/// The clang run with its physical footprint (`proc_pid_rusage`'s
+/// `ri_phys_footprint`, what XNU counts a process's memory as) held to
+/// [`clang_mem_mb`]: past it, killed (`SIGKILL`), which [`run_clang`] takes
+/// as running out. Looked at between `try_wait`s on this one thread, so the
+/// pid is the clang's (running, or not yet reaped) whenever it is signalled.
+#[cfg(target_os = "macos")]
+fn clang_output(cmd: &mut Command) -> std::io::Result<std::process::Output> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let limit = clang_mem_mb().saturating_mul(1 << 20);
+    if limit == 0 {
+        return cmd.output();
+    }
+    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let drain = |r: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut v = Vec::new();
+            if let Some(mut r) = r {
+                let _ = r.read_to_end(&mut v);
+            }
+            v
+        })
+    };
+    let stdout = drain(child.stdout.take().map(|r| Box::new(r) as Box<dyn Read + Send>));
+    let stderr = drain(child.stderr.take().map(|r| Box::new(r) as Box<dyn Read + Send>));
+    let pid = child.id() as libc::c_int;
+    let mut pause = std::time::Duration::from_millis(1);
+    let status = loop {
+        if let Some(s) = child.try_wait()? {
+            break s;
+        }
+        let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::uninit();
+        // SAFETY: a buffer of the flavor's size, filled by the call; `pid`
+        // is the child, not yet reaped.
+        let r = unsafe { libc::proc_pid_rusage(pid, libc::RUSAGE_INFO_V4, info.as_mut_ptr() as *mut libc::rusage_info_t) };
+        // SAFETY: filled by the call that just succeeded.
+        if r == 0 && unsafe { info.assume_init() }.ri_phys_footprint > limit {
+            let _ = child.kill();
+            break child.wait()?;
+        }
+        std::thread::sleep(pause);
+        pause = (pause * 2).min(std::time::Duration::from_millis(20));
+    };
+    Ok(std::process::Output { status, stdout: stdout.join().unwrap_or_default(), stderr: stderr.join().unwrap_or_default() })
 }
 
 fn run(cmd: &mut Command, what: &str) -> Result<()> {

@@ -1009,17 +1009,14 @@ pub mod host_xattr {
         match op {
             XattrOp::Get { name, buf } => {
                 xattr_name(name).map_err(not_user)?;
-                user_permission(&on, false)?;
                 calls(&on, XattrOp::Get { name, buf })
             }
             XattrOp::Set { name, value, flags } => {
                 xattr_name(name)?;
-                user_permission(&on, true)?;
                 calls(&on, XattrOp::Set { name, value, flags })
             }
             XattrOp::Remove { name } => {
                 xattr_name(name).map_err(not_user)?;
-                user_permission(&on, true)?;
                 calls(&on, XattrOp::Remove { name })
             }
             XattrOp::List { buf } => {
@@ -1043,28 +1040,6 @@ pub mod host_xattr {
                 Ok(mine.len())
             }
         }
-    }
-
-    /// Linux's `xattr_permission` for a `user.` name: only regular files
-    /// and directories carry one (a write elsewhere is `EPERM`, a read
-    /// `ENODATA`); in a sticky directory only its owner (or root) writes
-    /// one; and then the node's own permission, read or write. A Linux host
-    /// applies these itself; XNU applies none of them.
-    fn user_permission(on: &On<'_>, write: bool) -> Result<(), Errno> {
-        use std::os::unix::fs::MetadataExt;
-        let md = match on {
-            On::Path(p) => std::fs::symlink_metadata(p),
-            On::Fd(f) => f.metadata(),
-        }
-        .map_err(|e| Errno::from_io(&e))?;
-        if !md.is_file() && !md.is_dir() {
-            return Err(if write { Errno::EPERM } else { Errno::ENODATA });
-        }
-        let ids = super::host_ids();
-        if write && md.is_dir() && md.mode() & 0o1000 != 0 && ids.uid != 0 && md.uid() != ids.uid {
-            return Err(Errno::EPERM);
-        }
-        super::access_by(&md, if write { 2 } else { 4 })
     }
 }
 
@@ -1170,14 +1145,8 @@ mod tests {
 /// what has an execute bit. ACLs and read-only mounts are not seen.
 #[cfg(unix)]
 fn host_access(host: &std::path::Path, mode: u32) -> Result<(), Errno> {
-    let md = std::fs::metadata(host).map_err(|e| Errno::from_io(&e))?;
-    access_by(&md, mode)
-}
-
-/// [`host_access`] for a node already looked at.
-#[cfg(unix)]
-fn access_by(md: &std::fs::Metadata, mode: u32) -> Result<(), Errno> {
     use std::os::unix::fs::MetadataExt;
+    let md = std::fs::metadata(host).map_err(|e| Errno::from_io(&e))?;
     let mode = mode & 7;
     if mode == 0 {
         return Ok(());

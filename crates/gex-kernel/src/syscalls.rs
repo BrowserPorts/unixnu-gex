@@ -4563,8 +4563,32 @@ impl PathIo<'_> {
             String::from_utf8(raw).map_err(|_| Errno::EINVAL)?
         };
         let x = Xattr { kind, name: &name, flags: a[4] as u32, at: if kind == 2 { a[1] } else { a[2] }, size: if kind == 2 { a[2] } else { a[3] } };
+        // Linux's xattr_permission (fs/xattr.c), in the VFS above every
+        // filesystem, for a `user.` name: only regular files and directories
+        // carry one (a write elsewhere is EPERM, a read ENODATA), and then
+        // the node's own read or write permission. Its third rule, a sticky
+        // directory's `user.` names for its owner alone, never refuses here:
+        // every node is the guest's own (stat answers with its ids).
+        let user = kind != 2 && name.starts_with("user.");
+        let write = kind != 1;
+        let user_rules = |md: Result<crate::vfs::Metadata, Errno>, access: &dyn Fn(u32) -> Result<(), Errno>| -> Result<(), Errno> {
+            let md = md?;
+            if md.file_type != FileType::Regular && md.file_type != FileType::Directory {
+                return Err(if write { Errno::EPERM } else { Errno::ENODATA });
+            }
+            access(if write { 2 } else { 4 })
+        };
         if form == 2 {
             let f = self.map.fds.get(a[0] as i32)?;
+            if user {
+                // The node open, not the name it was opened under: its
+                // permission is asked by that name (what a filesystem
+                // answers access by) while the name is still this node's.
+                let md = f.handle.metadata();
+                let ino = md.as_ref().map(|m| m.ino).unwrap_or(0);
+                let named = !f.path.is_empty() && self.ns.metadata(&f.path).is_ok_and(|m| m.ino == ino);
+                user_rules(md, &|mode| if named { self.ns.access(&f.path, mode) } else { Ok(()) })?;
+            }
             if let Some(r) = x.run(m, |op| f.handle.xattr(op)) {
                 return r;
             }
@@ -4577,6 +4601,10 @@ impl PathIo<'_> {
             return x.run(m, |op| Some(self.ns.xattr(&f.path, true, op))).unwrap_or(Err(Errno::EOPNOTSUPP));
         }
         let path = self.at_path(m, AT_FDCWD, a[0])?;
+        if user {
+            let md = if form == 0 { self.ns.metadata(&path) } else { self.ns.metadata_nofollow(&path) };
+            user_rules(md, &|mode| self.ns.access(&path, mode))?;
+        }
         x.run(m, |op| Some(self.ns.xattr(&path, form == 0, op))).unwrap_or(Err(Errno::EOPNOTSUPP))
     }
 

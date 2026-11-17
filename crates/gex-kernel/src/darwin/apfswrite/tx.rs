@@ -259,6 +259,9 @@ pub struct Nx<'a> {
     /// Whether the device is solid state (DKIOCISSOLIDSTATE, a failed
     /// query counting as yes): the object cache's limit of changed objects.
     solid_state: bool,
+    /// When kept, every data allocation: the blocks asked for, where they
+    /// went, how many, and the roving pointer after it.
+    pub alloc_log: Option<Vec<(u64, u64, u64, u64)>>,
 }
 
 /// The container's reaper (`nx_reaper_phys_t`): its lists, and the entry
@@ -400,6 +403,7 @@ impl<'a> Nx<'a> {
             precounted: Default::default(),
             tx_ops: 0,
             solid_state: true,
+            alloc_log: None,
         })
     }
 
@@ -885,6 +889,14 @@ impl<'a> Nx<'a> {
     /// (I:0x100046580..0x100046c00). Where they go and how many: fewer
     /// than asked when nothing larger is free.
     pub fn alloc_data(&mut self, count: u64) -> Result<(u64, u64), String> {
+        let (start, got) = self.alloc_data_placed(count)?;
+        if let Some(log) = self.alloc_log.as_mut() {
+            log.push((count, start, got, self.rove));
+        }
+        Ok((start, got))
+    }
+
+    fn alloc_data_placed(&mut self, count: u64) -> Result<(u64, u64), String> {
         if count == 0 {
             return Err("a data allocation of no blocks".into());
         }
@@ -1508,6 +1520,19 @@ impl<'a> Nx<'a> {
         Ok(())
     }
 
+    /// `n` blocks allocated for volume `vol` (spaceman_modify_bits with an
+    /// owner, I:0x100047ae8..0x100047b28): its `fs_alloc_count` raised, and
+    /// the part of them within the volume's reserve counted in the space
+    /// manager's `sm_fs_reserve_alloc_count`.
+    pub fn vol_alloc_add(&mut self, vol: usize, n: u64) -> Result<(), String> {
+        let sb = self.vol_sb(vol)?;
+        let old = u64a(sb, 0x58);
+        let reserve = u64a(sb, 0x48);
+        sb.put64(0x58, old + n);
+        self.reserve.1 += n.min(reserve.saturating_sub(old));
+        Ok(())
+    }
+
     /// A volume's file data freed (`apfs_free_data_blocks` K 0x66f6fe8):
     /// `spaceman_free` of `n` blocks at `paddr` for volume `vol`, then its
     /// `total_blocks_freed` raised by them.
@@ -1863,8 +1888,16 @@ impl<'a> Nx<'a> {
                     let d = self.alloc_delta.remove(&i).unwrap_or(0);
                     if d != 0 {
                         let vo = self.virt.get_mut(&(owner, oid)).unwrap();
-                        let c = u64a(&vo.b, 0x58) as i64 + d;
+                        let old = u64a(&vo.b, 0x58);
+                        let reserve = u64a(&vo.b, 0x48);
+                        let c = old as i64 + d;
                         vo.b.put64(0x58, c as u64);
+                        if reserve != 0 {
+                            if d < 0 {
+                                return Err("not implemented: a volume with a reserve losing blocks (the space manager's reserve count, I:0x1000483c8)".into());
+                            }
+                            self.reserve.1 += (d as u64).min(reserve.saturating_sub(old));
+                        }
                     }
                 }
             }

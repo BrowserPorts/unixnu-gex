@@ -32,9 +32,8 @@ pub fn cmd(args: &[String]) -> Result<ExitCode> {
     if let Some(gaps) = storage::unmeasured() {
         eprintln!("gexc: {gaps}");
     }
-    eprintln!("gexc: {}", apfswrite::restore::RUN_STAND_IN);
-    if os.is_some() {
-        eprintln!("gexc: {}", apfswrite::fsops::FILE_INODE_STAND_IN);
+    for s in apfswrite::restore::stand_ins(os.is_some()) {
+        eprintln!("gexc: {s}");
     }
     // The kernel's clock: the time the restore runs.
     let mut now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);

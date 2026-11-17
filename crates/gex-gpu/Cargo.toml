@@ -15,5 +15,9 @@ gex-wayland.workspace = true
 wgpu = { version = "27", default-features = false, features = ["vulkan", "gles", "wgsl"] }
 pollster = "0.4"
 
+# macOS's own GPU API: wgpu's Vulkan there needs MoltenVK, and its GLES an EGL.
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { version = "27", default-features = false, features = ["metal", "wgsl"] }
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wgpu = { version = "27", default-features = false, features = ["webgpu", "wgsl"] }

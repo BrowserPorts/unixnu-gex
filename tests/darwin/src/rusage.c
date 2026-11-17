@@ -3,7 +3,8 @@
 // structure's size and no more. This process's record: its executable's
 // UUID, its time (recount's, in Mach time units: the getrusage time, all
 // of it user time, no system time), its fork's start (ps_start, with
-// p_start), no end, its runnable time (at least its time), its own
+// p_start), no end, its runnable time (once it has blocked, at least the
+// time it ran before; never more than its life), its own
 // footprint, what its wirings hold (mlock's pages, until munlock), and the
 // zero fields of this kernel: the flags (no ptrauth), the performance
 // cluster's figures (no AMP), the secure times and what follows them. A
@@ -212,7 +213,16 @@ int main(int argc, char **argv) {
     int64_t wall = ((int64_t)tv0.tv_sec - (int64_t)b.start_sec) * 1000000 + ((int64_t)tv0.tv_usec - (int64_t)b.start_usec);
     int64_t mach = (int64_t)(ns_of(abs0 - r.ri_proc_start_abstime) / 1000);
     if (llabs(wall - mach) > 20000 + mach * 5500 / 1000000) return bad("its start against p_start (us)", (long)mach, (long)wall);
-    if (r.ri_runnable_time < r.ri_user_time) return bad("its runnable time", (long)r.ri_runnable_time, (long)r.ri_user_time);
+    // Its runnable time: the runnable timer leaves out the stretch since its
+    // last update (a dispatch, a quantum's end), so it may trail the time
+    // now; once the thread blocks the timer has its whole stretch, at least
+    // the time it ran (no other thread runs here).
+    struct rusage_info_v6 b0, b1;
+    proc_pid_rusage(getpid(), RUSAGE_INFO_V4, &b0);
+    usleep(1000);
+    proc_pid_rusage(getpid(), RUSAGE_INFO_V4, &b1);
+    if (b1.ri_runnable_time < b0.ri_user_time || b1.ri_runnable_time < r.ri_runnable_time) return bad("its runnable time, past a block", (long)b1.ri_runnable_time, (long)b0.ri_user_time);
+    if (ns_of(b1.ri_runnable_time) > ns_of(mach_absolute_time() - r.ri_proc_start_abstime)) return bad("its runnable time, against its life", (long)b1.ri_runnable_time, 0);
     if (r.ri_phys_footprint == 0) return bad("its footprint", 0, 1);
     if (r.ri_child_user_time || r.ri_child_elapsed_abstime || r.ri_billed_system_time || r.ri_serviced_system_time || r.ri_billed_energy || r.ri_serviced_energy) return bad("no children, no bank bills", 1, 0);
 

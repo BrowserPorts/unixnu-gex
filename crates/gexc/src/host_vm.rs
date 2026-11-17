@@ -11,6 +11,39 @@ pub fn install() {
     gex_kernel::set_host_pages(pages);
     #[cfg(target_os = "macos")]
     gex_kernel::set_host_remap(remap);
+    #[cfg(target_os = "macos")]
+    gex_kernel::set_host_hold(hold, unhold);
+}
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn mach_vm_allocate(target: libc::c_uint, address: *mut u64, size: u64, flags: libc::c_int) -> libc::c_int;
+    fn mach_vm_deallocate(target: libc::c_uint, address: u64, size: u64) -> libc::c_int;
+}
+
+/// Fresh zero pages anywhere in the host's address space, outside every
+/// guest memory (`mach_vm_allocate` with VM_FLAGS_ANYWHERE).
+#[cfg(target_os = "macos")]
+fn hold(len: usize) -> Option<usize> {
+    const VM_FLAGS_ANYWHERE: libc::c_int = 1;
+    if len == 0 || len % page() != 0 {
+        return None;
+    }
+    let mut at = 0u64;
+    // SAFETY: the kernel picks a free range and maps it; nothing else is
+    // touched.
+    let kr = unsafe { mach_vm_allocate(mach_task_self_, &mut at, len as u64, VM_FLAGS_ANYWHERE) };
+    (kr == 0).then_some(at as usize)
+}
+
+/// What [`hold`] gave, given back.
+#[cfg(target_os = "macos")]
+fn unhold(at: usize, len: usize) {
+    // SAFETY: `at..at + len` is a range `hold` allocated, which no guest
+    // memory maps.
+    unsafe {
+        mach_vm_deallocate(mach_task_self_, at as u64, len as u64);
+    }
 }
 
 /// `mach_vm_remap` of the host's own pages at `src` over `dst`, in place of

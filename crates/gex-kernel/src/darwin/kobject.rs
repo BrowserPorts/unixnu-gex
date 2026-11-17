@@ -493,6 +493,8 @@ impl Kernel {
                 }
             }
             Some(Kobject::WorkInterval(id)) => super::workinterval::work_interval_no_senders(id),
+            // mach_memory_entry_no_senders: the entry and what it holds go.
+            Some(Kobject::NamedEntry(id)) => super::vmentry::no_senders(id),
             Some(Kobject::Eventlink(..)) => self.darwin_eventlink_no_senders(port),
             Some(Kobject::TaskRead | Kobject::TaskInspect | Kobject::ThreadRead(_) | Kobject::ThreadInspect(_)) => self.darwin_flavor_port_no_senders(port),
             other => self.darwin_unimplemented(format!("no-senders for kernel object {other:?}")),

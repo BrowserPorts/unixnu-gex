@@ -265,6 +265,9 @@ pub enum Kobject {
     WorkInterval(u64),
     /// IKOT_EVENTLINK: an end of an eventlink, by the eventlink's number.
     Eventlink(u64, u8),
+    /// IKOT_NAMED_ENTRY: a named memory entry, by its number
+    /// ([`super::vmentry`]).
+    NamedEntry(u64),
 }
 
 /// A port's reply semantics (`ip_reply_port_semantics`).

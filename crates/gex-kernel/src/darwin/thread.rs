@@ -811,12 +811,12 @@ impl Kernel {
     }
 
     /// Whether the word at `addr` is in memory another task may map too: a
-    /// shared file, a POSIX shared memory object, or an entry a fork shared
-    /// (`is_shared`). xnu meets waiters from other tasks there by the VM
+    /// shared file, a POSIX shared memory object, a named entry's object, or
+    /// an entry a fork shared (`is_shared`). xnu meets waiters from other tasks there by the VM
     /// object and offset; memory here is each task's own.
     pub(crate) fn darwin_cross_task_word(&self, addr: u64, size: u64) -> bool {
         use super::vm::kind;
-        self.dtask.vm.pieces(addr, addr.saturating_add(size)).iter().any(|(_, _, a)| a.kind == kind::FILE_SHARED || a.kind == kind::SHM || a.shared)
+        self.dtask.vm.pieces(addr, addr.saturating_add(size)).iter().any(|(_, _, a)| matches!(a.kind, kind::FILE_SHARED | kind::SHM | kind::OBJECT) || a.shared)
     }
 
     /// A `*_SHARED` ulock operation on a word other tasks may wait on too

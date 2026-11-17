@@ -631,6 +631,30 @@ pub fn set_host_remap(f: fn(usize, usize, usize, bool) -> bool) {
     let _ = HOST_REMAP.set(f);
 }
 
+static HOST_HOLD: std::sync::OnceLock<(fn(usize) -> Option<usize>, fn(usize, usize))> = std::sync::OnceLock::new();
+
+/// Install the host's own memory apart from any task's: `hold(len)` gives
+/// `len` bytes of fresh zero pages, readable and writable, at a host
+/// address no guest memory has; `unhold(addr, len)` gives them back. What
+/// a kernel object holds of pages no mapping may outlive (a named memory
+/// entry's) is kept there, and mapped into a task with
+/// [`set_host_remap`].
+pub fn set_host_hold(hold: fn(usize) -> Option<usize>, unhold: fn(usize, usize)) {
+    let _ = HOST_HOLD.set((hold, unhold));
+}
+
+/// [`set_host_hold`]'s `hold`; none on a host without it.
+pub fn host_hold(len: usize) -> Option<usize> {
+    HOST_HOLD.get().and_then(|(hold, _)| hold(len))
+}
+
+/// [`set_host_hold`]'s `unhold`.
+pub fn host_unhold(addr: usize, len: usize) {
+    if let Some((_, unhold)) = HOST_HOLD.get() {
+        unhold(addr, len);
+    }
+}
+
 /// Whether the host can map its pages twice ([`set_host_remap`]).
 pub fn host_can_remap() -> bool {
     HOST_REMAP.get().is_some()

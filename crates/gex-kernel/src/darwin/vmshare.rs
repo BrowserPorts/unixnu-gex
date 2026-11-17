@@ -53,11 +53,11 @@ pub struct Remap {
 /// One entry `vm_map_remap_extract` makes: its place relative to the
 /// range's start, its protection and its attributes.
 #[derive(Clone, Copy, Debug)]
-struct Extracted {
-    off: u64,
-    len: u64,
-    prot: u64,
-    attrs: Attrs,
+pub(crate) struct Extracted {
+    pub off: u64,
+    pub len: u64,
+    pub prot: u64,
+    pub attrs: Attrs,
 }
 
 /// How a fork's child gets one range of its parent's map.
@@ -299,7 +299,7 @@ impl Kernel {
     /// `vm_map_remap_extract` of `[start, start + size)` of this map: the
     /// new entries, or the error. The legacy call's strictest protections
     /// go back in `a.cur` and `a.max`.
-    fn darwin_remap_extract(&mut self, start: u64, size: u64, a: &mut Remap) -> Result<Vec<Extracted>, u64> {
+    pub(crate) fn darwin_remap_extract(&mut self, start: u64, size: u64, a: &mut Remap) -> Result<Vec<Extracted>, u64> {
         let end = start + size;
         let mut max_prot_for_prot_copy = 0;
         if a.copy && a.prot_copy {

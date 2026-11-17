@@ -11,12 +11,16 @@
 // gathered: its end after its start, nothing wired, resident or in its
 // footprint. Once reaped, its time and its elapsed time (end less start)
 // are its parent's ri_child sums; a parent with SA_NOCLDWAIT has them
-// added twice (at the child's exit and at the system's reap). The fields
+// added twice (at the child's exit and at the system's reap). The time by
+// effective QoS: a thread's time goes to the QoS it ran at (utility, then
+// background), and the seven sum to the task's time. The fields
 // the kernel does not keep are reported, so a strict run stops at a
 // call that copies one ("stop").
 
 #include <errno.h>
 #include <mach/mach_time.h>
+#include <pthread.h>
+#include <pthread/qos.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -108,6 +112,22 @@ int main(int argc, char **argv) {
     if (r.ri_runnable_time < r.ri_user_time) return bad("its runnable time", (long)r.ri_runnable_time, (long)r.ri_user_time);
     if (r.ri_phys_footprint == 0) return bad("its footprint", 0, 1);
     if (r.ri_child_user_time || r.ri_child_elapsed_abstime || r.ri_billed_system_time || r.ri_serviced_system_time || r.ri_billed_energy || r.ri_serviced_energy) return bad("no children, no bank bills", 1, 0);
+
+    // Time by effective QoS: 20 ms at utility, then 20 ms at background.
+    struct rusage_info_v6 q0, q1, q2;
+    if (pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0) != 0) return bad("utility", errno, 0);
+    proc_pid_rusage(getpid(), RUSAGE_INFO_V3, &q0);
+    spin(20000000);
+    proc_pid_rusage(getpid(), RUSAGE_INFO_V3, &q1);
+    if (pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0) != 0) return bad("background", errno, 0);
+    spin(20000000);
+    proc_pid_rusage(getpid(), RUSAGE_INFO_V3, &q2);
+    if (ns_of(q1.ri_cpu_time_qos_utility - q0.ri_cpu_time_qos_utility) < 20000000) return bad("utility time (us)", (long)(ns_of(q1.ri_cpu_time_qos_utility - q0.ri_cpu_time_qos_utility) / 1000), 20000);
+    if (ns_of(q2.ri_cpu_time_qos_background - q1.ri_cpu_time_qos_background) < 20000000) return bad("background time (us)", (long)(ns_of(q2.ri_cpu_time_qos_background - q1.ri_cpu_time_qos_background) / 1000), 20000);
+    if (ns_of(q2.ri_cpu_time_qos_utility - q1.ri_cpu_time_qos_utility) > 5000000) return bad("utility time while background (us)", (long)(ns_of(q2.ri_cpu_time_qos_utility - q1.ri_cpu_time_qos_utility) / 1000), 0);
+    uint64_t qsum = q2.ri_cpu_time_qos_default + q2.ri_cpu_time_qos_maintenance + q2.ri_cpu_time_qos_background + q2.ri_cpu_time_qos_utility + q2.ri_cpu_time_qos_legacy + q2.ri_cpu_time_qos_user_initiated + q2.ri_cpu_time_qos_user_interactive;
+    if (ns_of(qsum > q2.ri_user_time ? qsum - q2.ri_user_time : q2.ri_user_time - qsum) > 1000000) return bad("the QoS times' sum against the time (us)", (long)(ns_of(qsum) / 1000), (long)(ns_of(q2.ri_user_time) / 1000));
+    pthread_set_qos_class_self_np(QOS_CLASS_DEFAULT, 0);
 
     // Wirings: three 16 KiB pages, then none.
     uint64_t wired0 = r.ri_wired_size;

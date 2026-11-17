@@ -27,15 +27,17 @@
 //!   real figures there.
 //!
 //! What is kept here: the executable's UUID; recount's time of the task
-//! (its threads', the ended ones' with them), in Mach time units; each
-//! thread's runnable time; the map's user wirings (`wired_mem`); the
+//! (its threads', the ended ones' with them), in Mach time units; that
+//! time by each thread's effective QoS (`cpu_time_eqos_stats`, credited as
+//! a thread's QoS inputs or its task's policy change, as it ends and as it
+//! is read); each thread's runnable time; the map's user wirings (`wired_mem`); the
 //! caller's own `phys_footprint`, measured as the call is made; the fork's
 //! start (`ps_start`), an ended process's end and `p_ru`; the reaped
 //! children's sums (`ri_child`); and the bank's bills where no account
 //! bills or charges the task. What needs counters that are not kept is
 //! given as 0 and reported: wakeups from interrupt context and the
 //! platform-idle state, VM page-ins, the pmap's resident pages, disk I/O,
-//! CPU time by effective QoS, logical writes, the CPMU's instructions and
+//! logical writes, the CPMU's instructions and
 //! cycles, CLPC's energy, another live process's footprint (only its own
 //! measurements are), the footprint's peaks (measurements see no peak
 //! between them), and bank bills once an account exists.
@@ -113,7 +115,7 @@ const UNKEPT: [(usize, &str, &str); 24] = [
     (ri::CHILD_USER_TIME, "ri_child_user_time", "the reaped children's times on a host without per-thread clocks"),
     (ri::DISKIO_BYTESREAD, "ri_diskio_bytesread", "task_io_stats: the disk's reads"),
     (ri::DISKIO_BYTESWRITTEN, "ri_diskio_byteswritten", "task_io_stats: the disk's writes"),
-    (ri::CPU_TIME_QOS, "ri_cpu_time_qos_*", "cpu_time_eqos_stats: each thread's time by its effective QoS as it changes"),
+    (ri::CPU_TIME_QOS, "ri_cpu_time_qos_*", "per-thread clocks on the host"),
     (ri::BILLED_SYSTEM_TIME, "ri_billed_system_time", "the bank accounts' bills"),
     (ri::SERVICED_SYSTEM_TIME, "ri_serviced_system_time", "the bank accounts' bills"),
     (ri::LOGICAL_WRITES, "ri_logical_writes", "the logical_writes ledger"),
@@ -230,6 +232,122 @@ impl Shared {
     }
 }
 
+/// What decides a thread's effective QoS besides its task's policy: its
+/// requested QoS, the highest of its overrides, and the DARWIN_BG asked of
+/// the thread itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct QosInputs {
+    pub qos: u8,
+    pub overrides: u8,
+    pub darwinbg: bool,
+}
+
+/// A thread's share of its task's [`QosTime`]: what its effective QoS
+/// follows from, that QoS once it has been settled (`thep_qos`; before, it
+/// is what the inputs give under the task's policy), and its time when its
+/// time was last credited (`vtimer_qos_save`, in Mach time units).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct QosThread {
+    pub inputs: QosInputs,
+    eqos: Option<u8>,
+    save: u64,
+}
+
+fn eqos(i: QosInputs, task: &super::taskpolicy::Effective) -> u8 {
+    super::taskpolicy::thread_effective_qos(i.qos, 0, i.overrides, i.darwinbg, task).0
+}
+
+/// A thread's time so far in Mach time units, as recount gives it
+/// (`recount_thread_time_mach`); none without the host's clocks.
+fn thread_mach(t: &crate::signal::ThreadSig) -> Option<u64> {
+    t.cpu.times().map(|(user, sys)| mach_of_ns(user + sys))
+}
+
+/// `thread_update_qos_cpu_time_locked`: the thread's time since its last
+/// credit, `now` its time, to the effective QoS it has had.
+fn credit_at(stats: &mut [u64; 7], q: &mut QosThread, now: u64, task: &super::taskpolicy::Effective) {
+    let was = q.eqos.unwrap_or_else(|| eqos(q.inputs, task));
+    stats[usize::from(was)] = stats[usize::from(was)].wrapping_add(now.wrapping_sub(q.save));
+    q.save = now;
+}
+
+/// `task->cpu_time_eqos_stats`: the task's threads' time by their
+/// effective QoS, each thread's credited as its QoS is about to change, as
+/// it ends, and as the stats are read (`thread_update_qos_cpu_time`).
+#[derive(Debug, Default)]
+pub struct QosTime {
+    /// By `THREAD_QOS_*`, in Mach time units.
+    stats: Mutex<[u64; 7]>,
+    /// The task's threads, for a change of its policy to settle.
+    threads: Mutex<std::sync::Weak<crate::signal::ThreadSigs>>,
+    /// A thread's time could not be read: the host has no per-thread
+    /// clocks.
+    unread: AtomicBool,
+}
+
+impl QosTime {
+    /// The task's threads are these.
+    pub fn set_threads(&self, threads: &Arc<crate::signal::ThreadSigs>) {
+        *self.threads.lock().unwrap_or_else(|e| e.into_inner()) = Arc::downgrade(threads);
+    }
+
+    /// Credit thread `t`'s time since its last credit to the QoS it has
+    /// had, under the task's effective policy `task`.
+    fn credit(&self, stats: &mut [u64; 7], t: &crate::signal::ThreadSig, q: &mut QosThread, task: &super::taskpolicy::Effective) {
+        let Some(now) = thread_mach(t) else {
+            self.unread.store(true, Ordering::Release);
+            return;
+        };
+        credit_at(stats, q, now, task);
+    }
+
+    /// Thread `t`'s inputs changed to `inputs` (its task's policy being
+    /// `task`): its time so far goes to the QoS it had.
+    pub fn thread_changed(&self, t: &crate::signal::ThreadSig, inputs: QosInputs, task: &super::taskpolicy::Effective) {
+        let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+        let mut q = t.qos.lock().unwrap_or_else(|e| e.into_inner());
+        self.credit(&mut stats, t, &mut q, task);
+        q.inputs = inputs;
+        q.eqos = Some(eqos(inputs, task));
+    }
+
+    /// The task's effective policy changed from `before` to `after`: each
+    /// thread's time so far goes to the QoS it had.
+    pub fn task_changed(&self, before: &super::taskpolicy::Effective, after: &super::taskpolicy::Effective) {
+        let Some(threads) = self.threads.lock().unwrap_or_else(|e| e.into_inner()).upgrade() else { return };
+        let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+        for tid in threads.tids() {
+            let Some(t) = threads.get(tid) else { continue };
+            let mut q = t.qos.lock().unwrap_or_else(|e| e.into_inner());
+            self.credit(&mut stats, &t, &mut q, before);
+            q.eqos = Some(eqos(q.inputs, after));
+        }
+    }
+
+    /// Thread `t` ends: its last time goes to its QoS.
+    pub fn thread_ended(&self, t: &crate::signal::ThreadSig, task: &super::taskpolicy::Effective) {
+        let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+        let mut q = t.qos.lock().unwrap_or_else(|e| e.into_inner());
+        self.credit(&mut stats, t, &mut q, task);
+    }
+
+    /// `fill_task_qos_rusage`: each live thread's time credited, then the
+    /// stats; none without the host's clocks.
+    pub fn read(&self, task: &super::taskpolicy::Effective) -> Option<[u64; 7]> {
+        let threads = self.threads.lock().unwrap_or_else(|e| e.into_inner()).upgrade();
+        let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(threads) = threads {
+            for tid in threads.tids() {
+                let Some(t) = threads.get(tid) else { continue };
+                let mut q = t.qos.lock().unwrap_or_else(|e| e.into_inner());
+                self.credit(&mut stats, &t, &mut q, task);
+                q.eqos = Some(eqos(q.inputs, task));
+            }
+        }
+        (!self.unread.load(Ordering::Acquire)).then_some(*stats)
+    }
+}
+
 /// What [`gather`] makes a record from.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Input {
@@ -246,6 +364,9 @@ pub struct Input {
     pub start_abstime: u64,
     pub child: Child,
     pub billing: bool,
+    /// `cpu_time_eqos_stats` (`fill_task_qos_rusage`), by `THREAD_QOS_*`, in
+    /// Mach time units; none without the host's clocks.
+    pub qos: Option<[u64; 7]>,
     /// `proc_exit`'s gathering at this Mach time: the map is gone, so
     /// nothing is wired or resident, and the footprint is set to 0.
     pub exit_abstime: Option<u64>,
@@ -272,8 +393,13 @@ pub fn gather(i: &Input) -> Record {
     for f in [ri::PKG_IDLE_WKUPS, ri::INTERRUPT_WKUPS, ri::PAGEINS, ri::DISKIO_BYTESREAD, ri::DISKIO_BYTESWRITTEN, ri::LOGICAL_WRITES, ri::LIFETIME_MAX_PHYS_FOOTPRINT, ri::INTERVAL_MAX_PHYS_FOOTPRINT, ri::INSTRUCTIONS, ri::CYCLES, ri::ENERGY_NJ] {
         mark(f);
     }
-    for f in QOS_FIELDS {
-        mark(f);
+    match i.qos {
+        Some(q) => w[QOS_FIELDS].copy_from_slice(&q),
+        None => {
+            for f in QOS_FIELDS {
+                mark(f);
+            }
+        }
     }
     match i.exit_abstime {
         Some(t) => w[ri::PROC_EXIT_ABSTIME] = t,
@@ -323,6 +449,10 @@ fn times(procs: &crate::proc::ProcTable, pid: i32, p: &super::procinfo::Public) 
 
 fn input(procs: &crate::proc::ProcTable, pid: i32, p: &super::procinfo::Public) -> Input {
     let (time_ns, runnable) = times(procs, pid, p);
+    let qos = procs.task_policy(pid).and_then(|cell| {
+        let task = cell.lock().unwrap_or_else(|e| e.into_inner()).effective;
+        cell.qos_time.read(&task)
+    });
     let s = &p.rusage;
     Input {
         uuid: p.uuid,
@@ -333,6 +463,7 @@ fn input(procs: &crate::proc::ProcTable, pid: i32, p: &super::procinfo::Public) 
         start_abstime: s.start_abstime.load(Ordering::Acquire),
         child: s.child(),
         billing: s.billing.load(Ordering::Acquire),
+        qos,
         exit_abstime: None,
     }
 }
@@ -398,6 +529,24 @@ impl Kernel {
         }
         m.write(buf, &r.bytes()[..size]).map_err(|_| EFAULT)?;
         Ok(0)
+    }
+
+    /// Thread `tid`'s requested QoS, overrides or own DARWIN_BG may have
+    /// changed: its time so far goes to the effective QoS it had, and its
+    /// task's [`QosTime`] learns what it has now.
+    pub(crate) fn darwin_qos_note(&mut self, tid: i32) {
+        let Some(t) = self.thread_signals.get(tid) else { return };
+        let inputs = self.dtask.threads.map.get(&tid).map_or(QosInputs::default(), |d| QosInputs {
+            qos: d.policy.qos,
+            overrides: d.overrides.iter().map(|o| o.qos).max().unwrap_or(super::workq::qos::UNSPECIFIED),
+            darwinbg: d.policy.int_darwinbg || d.policy.ext_darwinbg,
+        });
+        if t.qos.lock().unwrap_or_else(|e| e.into_inner()).inputs == inputs {
+            return;
+        }
+        let Some(cell) = self.dtask.policy.clone().or_else(|| self.procs.task_policy(self.pid)) else { return };
+        let task = cell.lock().unwrap_or_else(|e| e.into_inner()).effective;
+        cell.qos_time.thread_changed(&t, inputs, &task);
     }
 
     /// The caller's own `phys_footprint` ledger balance, measured now (a
@@ -490,6 +639,46 @@ mod tests {
         assert_eq!((r.w[ri::WIRED_SIZE], r.w[ri::RESIDENT_SIZE], r.w[ri::PHYS_FOOTPRINT], r.w[ri::PROC_EXIT_ABSTIME]), (0, 0, 0, 5000));
         assert_eq!(r.unkept & ((1 << ri::RESIDENT_SIZE) | (1 << ri::PHYS_FOOTPRINT)), 0);
         assert_eq!(r.unkept_within(SIZES[0]).len(), 3);
+    }
+
+    #[test]
+    fn qos_time_goes_to_the_effective_qos_a_thread_had() {
+        use super::super::taskpolicy::Effective;
+        use super::super::workq::qos;
+        let mut stats = [0u64; 7];
+        let task = Effective::default();
+        let mut q = QosThread::default();
+        // A new thread with no QoS asked for runs at the default's.
+        credit_at(&mut stats, &mut q, 100, &task);
+        assert_eq!(stats[usize::from(qos::UNSPECIFIED)], 100);
+        // It asks for utility: what it ran before is the default's, what
+        // it runs after utility's.
+        credit_at(&mut stats, &mut q, 130, &task);
+        q.inputs.qos = qos::UTILITY;
+        q.eqos = Some(eqos(q.inputs, &task));
+        credit_at(&mut stats, &mut q, 200, &task);
+        assert_eq!((stats[usize::from(qos::UNSPECIFIED)], stats[usize::from(qos::UTILITY)]), (130, 70));
+        // Its task goes to the background: DARWIN_BG puts utility at
+        // background from then on.
+        let bg = Effective { darwinbg: true, ..task };
+        credit_at(&mut stats, &mut q, 260, &task);
+        q.eqos = Some(eqos(q.inputs, &bg));
+        credit_at(&mut stats, &mut q, 300, &bg);
+        assert_eq!((stats[usize::from(qos::UTILITY)], stats[usize::from(qos::BACKGROUND)]), (130, 40));
+        // An override above its QoS raises it; a clamp holds it under.
+        assert_eq!(eqos(QosInputs { qos: qos::UTILITY, overrides: qos::USER_INITIATED, darwinbg: false }, &task), qos::USER_INITIATED);
+        assert_eq!(eqos(QosInputs { qos: qos::USER_INITIATED, overrides: 0, darwinbg: false }, &Effective { qos_clamp: qos::UTILITY, ..task }), qos::UTILITY);
+        assert_eq!(stats.iter().sum::<u64>(), 300);
+    }
+
+    #[test]
+    fn kept_qos_times_fill_the_qos_fields() {
+        let mut i = live();
+        i.qos = Some([1, 2, 3, 4, 5, 6, 7]);
+        let r = gather(&i);
+        assert_eq!(&r.w[ri::CPU_TIME_QOS..ri::CPU_TIME_QOS + 7], &[1, 2, 3, 4, 5, 6, 7]);
+        assert!(!r.unkept_within(SIZES[3]).join(" ").contains("ri_cpu_time_qos"));
+        assert_eq!(r.unkept_within(SIZES[3]).len(), 6);
     }
 
     #[test]

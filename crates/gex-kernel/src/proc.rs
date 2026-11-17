@@ -1776,7 +1776,7 @@ impl ProcTable {
     }
 
     /// `pid`'s task policy, a zombie's too.
-    pub fn task_policy(&self, pid: i32) -> Option<Arc<Mutex<crate::darwin::taskpolicy::TaskPolicy>>> {
+    pub fn task_policy(&self, pid: i32) -> Option<Arc<crate::darwin::taskpolicy::PolicyCell>> {
         self.lock().procs.iter().find(|p| p.pid == pid).map(|p| Arc::clone(&p.child.policy))
     }
 

@@ -227,8 +227,10 @@ impl Kernel {
             me.policy.qos = super::workq::qos::UNSPECIFIED;
             me.policy.relpri = 0;
             stripped = true;
+            self.darwin_qos_note(self.tid);
         }
-        me.policy.int_darwinbg = prio == PRIO_DARWIN_BG;
+        self.darwin_me().policy.int_darwinbg = prio == PRIO_DARWIN_BG;
+        self.darwin_qos_note(self.tid);
         Ok(stripped)
     }
 

@@ -347,7 +347,7 @@ pub struct Task {
     pub dispatchqueue_label_offset: u64,
     /// The task's policy (app type, role, QoS clamp and what follows): its
     /// cell in the process table, once asked.
-    pub policy: Option<std::sync::Arc<std::sync::Mutex<taskpolicy::TaskPolicy>>>,
+    pub policy: Option<std::sync::Arc<taskpolicy::PolicyCell>>,
     /// What its map's entries keep beyond the host's mappings.
     pub vm: vm::Entries,
     /// Its map's highest address when an entitlement or a spawn raised it
@@ -507,6 +507,16 @@ impl crate::syscalls::Kernel {
             policy: self.dtask.policy.clone().or_else(|| self.procs.task_policy(self.pid)),
         };
         self.ipc().task_enable(link);
+        // The task's threads, whose time by effective QoS its policy's
+        // changes settle, and what each asked for.
+        if let Some(cell) = self.dtask.policy.clone().or_else(|| self.procs.task_policy(self.pid)) {
+            cell.qos_time.set_threads(&self.thread_signals);
+        }
+        let mut tids: Vec<i32> = self.dtask.threads.map.keys().copied().collect();
+        tids.push(self.tid);
+        for tid in tids {
+            self.darwin_qos_note(tid);
+        }
         if let Some((ports, adaptive)) = self.dtask.pending_watchports.take() {
             let ipc = self.ipc();
             let key = ipc.task;

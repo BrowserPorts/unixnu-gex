@@ -7003,6 +7003,12 @@ impl ThreadEnd<'_> {
         // Its processor time and runnable time, final, to its task's
         // (task->total_*_time, total_runnable_time).
         self.thread.cpu.end();
+        // Its last time to its effective QoS's (thread_terminate_self's
+        // thread_update_qos_cpu_time).
+        if let Some(cell) = self.procs.task_owner(tid).and_then(|pid| self.procs.task_policy(pid)) {
+            let task = cell.lock().unwrap_or_else(|e| e.into_inner()).effective;
+            cell.qos_time.thread_ended(self.thread, &task);
+        }
         if let (Some(times), Some(pid)) = (self.thread.cpu.times(), self.procs.task_owner(tid)) {
             self.procs.add_dead_cpu(pid, times);
         }
@@ -10329,7 +10335,7 @@ pub struct Child {
     pub job: Arc<Mutex<crate::proc::Job>>,
     /// A Darwin process's task policy, which other processes reach too
     /// (setpriority's).
-    pub policy: Arc<Mutex<crate::darwin::taskpolicy::TaskPolicy>>,
+    pub policy: Arc<crate::darwin::taskpolicy::PolicyCell>,
 }
 
 impl Child {
@@ -10340,7 +10346,7 @@ impl Child {
             done: Arc::new(std::sync::Condvar::new()),
             reaped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             job: Arc::new(Mutex::new(crate::proc::Job::default())),
-            policy: Arc::new(Mutex::new(crate::darwin::taskpolicy::TaskPolicy::default())),
+            policy: Arc::new(crate::darwin::taskpolicy::PolicyCell::default()),
         }
     }
 

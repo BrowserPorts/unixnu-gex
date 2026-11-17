@@ -627,6 +627,7 @@ impl Kernel {
         let p = &mut self.dtask.threads.map.entry(tid).or_default().policy;
         p.qos = q;
         p.relpri = 0;
+        self.darwin_qos_note(tid);
     }
 
     /// `thread_get_requested_qos`.
@@ -2666,6 +2667,7 @@ impl Kernel {
         let p = &mut self.dtask.threads.map.entry(tid).or_default().policy;
         p.qos = q;
         p.relpri = relpri;
+        self.darwin_qos_note(tid);
         Ok(())
     }
 
@@ -2691,6 +2693,7 @@ impl Kernel {
         if let Some(i) = i {
             ov[i].qos = if ov[i].qos == qos::UNSPECIFIED { q } else { ov[i].qos.max(q) };
         }
+        self.darwin_qos_note(tid);
     }
 
     /// `proc_thread_qos_remove_override_internal`.
@@ -2715,12 +2718,13 @@ impl Kernel {
                     i += 1;
                 }
                 if resource != RESOURCE_WILDCARD {
-                    return;
+                    break;
                 }
             } else {
                 i += 1;
             }
         }
+        self.darwin_qos_note(tid);
     }
 
     /// The context of thread `tid`.

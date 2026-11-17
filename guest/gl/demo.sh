@@ -33,11 +33,12 @@ for tool in "$GEXC" "$CC"; do
     [ -x "$tool" ] || { echo "missing $tool -- run: cargo build --release"; exit 1; }
 done
 [ -f "$MUSL" ] || { echo "missing the musl runtime at $MUSL"; exit 1; }
-# The GL headers have no architecture in them, so the host's serve for a cross
-# build. They are copied out rather than used in place so the host's libc
-# headers are not dragged in alongside them.
-[ -d /usr/include/GLES2 ] || {
-    echo "missing GLES2 headers -- apt-get install libgles2-mesa-dev libegl1-mesa-dev"
+# The GL headers have no architecture in them: Khronos's, as Mesa's tree (the
+# submodule, pinned) carries them. They are copied out so nothing else of its
+# include/ comes with them.
+GLINC="$ROOT/third_party/mesa/include"
+[ -d "$GLINC/GLES2" ] || {
+    echo "missing $GLINC -- git submodule update --init third_party/mesa"
     exit 1
 }
 
@@ -49,7 +50,7 @@ rm -rf "$WORK/root"
 mkdir -p "$WORK/root/lib" "$WORK/root/usr/lib" "$WORK/include"
 cp "$MUSL" "$WORK/root/lib/ld-musl-aarch64.so.1"
 cp --preserve=links "$WORK/driver/libGLESv2.so.2" "$WORK/driver/libEGL.so.1" "$WORK/root/usr/lib/"
-cp -r /usr/include/EGL /usr/include/GLES2 /usr/include/KHR "$WORK/include/" 2>/dev/null || true
+cp -r "$GLINC/EGL" "$GLINC/GLES2" "$GLINC/KHR" "$WORK/include/"
 
 echo "== building the gears for aarch64"
 "$CC" -O2 -o "$WORK/root/gears" \

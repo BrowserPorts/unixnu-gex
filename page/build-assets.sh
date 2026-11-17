@@ -120,6 +120,8 @@ for a in $("$ROOT/target/release/gexc" run "$BB" --list 2>/dev/null); do
     esac
     ln -sf busybox "$R/bin/$a"
 done
+# (a busybox gexc cannot run lists nothing: no rootfs without its shell)
+[ -e "$R/bin/sh" ] || { echo "busybox --list under gexc named no sh: $("$ROOT/target/release/gexc" run "$BB" --list 2>&1 | tail -3)" >&2; exit 1; }
 cat > "$R/etc/profile" <<'EOF'
 export PS1='\w \$ '
 export PATH=/bin:/usr/bin
@@ -152,16 +154,17 @@ done
 # gives the guest a canvas and the guest's libGLESv2 sends every call to it,
 # so what appears is drawn by the browser's own GPU stack.
 #
-# The GL headers have no architecture in them, so the host's serve for a
-# cross build; they are copied out rather than used in place so the host's
-# libc headers are not dragged in with them.
+# The GL headers have no architecture in them: Khronos's, as Mesa's tree
+# (the submodule, pinned) carries them, copied out so nothing else of its
+# include/ comes with them.
 CC="$TOOLCHAIN/bin/aarch64-linux-musl-gcc"
 MUSL="$TOOLCHAIN/aarch64-linux-musl/lib/libc.so"
-if [ -x "$CC" ] && [ -d /usr/include/GLES2 ]; then
+GLINC="$ROOT/third_party/mesa/include"
+if [ -x "$CC" ] && [ -d "$GLINC/GLES2" ]; then
     echo "building the gears and the guest's GL driver..."
     mkdir -p "$PUB/fs" "$WORK/glinc"
     "$ROOT/guest/gl/build.sh" "$WORK/gldriver" >/dev/null
-    cp -r /usr/include/EGL /usr/include/GLES2 /usr/include/KHR "$WORK/glinc/" 2>/dev/null || true
+    cp -r "$GLINC/EGL" "$GLINC/GLES2" "$GLINC/KHR" "$WORK/glinc/"
     "$CC" -O2 -o "$PUB/fs/gles-gears" "$ROOT/guest/gl/probes/gles-gears.c" \
         -I "$WORK/glinc" -L "$WORK/gldriver" -lEGL -lGLESv2 -lm
     "$CC" -O2 -o "$PUB/fs/gl44-uniform-probe" \
@@ -264,11 +267,11 @@ fi
 # x86_64 musl toolchain beside the aarch64 one (musl.cc's x86_64-linux-musl-cross).
 X86_TOOLCHAIN="${GEX_X86_TOOLCHAIN:-$HOME/.cache/gex/toolchains/x86_64-linux-musl-cross}"
 X86_CC="$X86_TOOLCHAIN/bin/x86_64-linux-musl-gcc"
-if [ -x "$X86_CC" ] && [ -d /usr/include/GLES2 ]; then
+if [ -x "$X86_CC" ] && [ -d "$GLINC/GLES2" ]; then
     echo "building the x86-64 gears and GL driver..."
     mkdir -p "$PUB/fs/x86" "$WORK/glinc"
     GEX_CC="$X86_CC" "$ROOT/guest/gl/build.sh" "$WORK/gldriver-x86" >/dev/null
-    cp -r /usr/include/EGL /usr/include/GLES2 /usr/include/KHR "$WORK/glinc/" 2>/dev/null || true
+    cp -r "$GLINC/EGL" "$GLINC/GLES2" "$GLINC/KHR" "$WORK/glinc/"
     "$X86_CC" -O2 -o "$PUB/fs/x86/gles-gears" "$ROOT/guest/gl/probes/gles-gears.c" \
         -I "$WORK/glinc" -L "$WORK/gldriver-x86" -lEGL -lGLESv2 -lm
     cp "$WORK/gldriver-x86/libGLESv2.so.2" "$WORK/gldriver-x86/libEGL.so.1" "$PUB/fs/x86/"

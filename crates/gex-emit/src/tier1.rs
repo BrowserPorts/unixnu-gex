@@ -262,15 +262,18 @@ fn t1_fold() -> bool {
 
 /// The emitter switches that change tier-1's bytes without showing in the
 /// translation options, for a cache key (GEX_INLINE_DISPATCH, GEX_T1_FOLD,
-/// GEX_NULL_GUARD, GEX_MXCSR):
+/// GEX_NULL_GUARD, GEX_MXCSR, and the runner's own: the commpage fold,
+/// the register-constant forwarding and folding through memory, the
+/// instruction count):
 /// natively they are read from the environment, which the module cache's key
 /// did not see, so a run with one set served its modules to runs without.
-pub fn knobs() -> u8 {
-    inline_dispatch() as u8 | (t1_fold() as u8) << 1 | (gex_abi::kuser_fold() as u8) << 2 | (null_guard_on() as u8) << 3
-        | (gex_ir::mxcsr_exact() as u8) << 4
-        | (gex_abi::commpage_fold() as u8) << 5
-        | (gex_ir::pass::forward_reg_consts() as u8) << 6
-        | (!gex_ir::pass::fold_through_memory() as u8) << 7
+pub fn knobs() -> u16 {
+    inline_dispatch() as u16 | (t1_fold() as u16) << 1 | (gex_abi::kuser_fold() as u16) << 2 | (null_guard_on() as u16) << 3
+        | (gex_ir::mxcsr_exact() as u16) << 4
+        | (gex_abi::commpage_fold() as u16) << 5
+        | (gex_ir::pass::forward_reg_consts() as u16) << 6
+        | (!gex_ir::pass::fold_through_memory() as u16) << 7
+        | (gex_abi::count_instructions() as u16) << 8
 }
 
 /// Whether the translators put the null guard (`gex_abi::NULL_GUARD`) on
@@ -796,6 +799,17 @@ struct Emitter<'a> {
     /// A bounds guard branched to the shared KUSER fault: the body still
     /// needs [`Self::close_kuser_fault`].
     kuser_fault: bool,
+    /// The guest instructions of the block being emitted (a region's
+    /// member, a fused loop's body): `start..end`, what its entry counts
+    /// ([`Self::emit_count_block`]) and a path that leaves it early
+    /// takes back ([`Self::emit_uncount_from`]).
+    cur_insns: (u64, u64),
+    /// Inside a fused loop or a region: the local the block entries add
+    /// their instructions to, written to the context's count (and zeroed)
+    /// wherever the registers are written back on the way out
+    /// ([`Self::emit_count_store`]). `None` elsewhere: an entry adds to the
+    /// context's count itself.
+    count_local: Option<u32>,
 }
 
 /// What a region member needs to know to branch to its neighbours.
@@ -866,6 +880,8 @@ impl<'a> Emitter<'a> {
             free_f32: Vec::new(),
             free_f64: Vec::new(),
             kuser_fault: false,
+            cur_insns: (block_start, block_start),
+            count_local: None,
         }
     }
 
@@ -941,6 +957,7 @@ impl<'a> Emitter<'a> {
         self.f.i32_const(loop_poll());
         self.f.local_set(counter);
         self.reenter_local = Some(counter);
+        self.begin_count_local();
 
         self.f.loop_void();
         for _ in 0..n {
@@ -972,12 +989,14 @@ impl<'a> Emitter<'a> {
                       // Every member either branches back to the table or leaves the
                       // function, so falling out of the loop cannot happen.
         self.f.unreachable();
+        self.count_local = None;
     }
 
     /// Write every register the region writes back to the context -- all of
     /// them, not the dirty ones, since dirtiness depends on emission order and
     /// the guest reaches the members in another. Costs stores only on exit.
     fn flush_region_exit(&mut self) {
+        self.emit_count_store();
         let mut all: Vec<(GuestReg, u32)> = self
             .regs
             .iter()
@@ -1054,6 +1073,7 @@ impl<'a> Emitter<'a> {
         self.value_xsel = vec![false; n];
         self.value_ty = vec![Ty::I64; n];
         let dying = dying_after(block);
+        self.emit_count_block(block);
         self.prof_entry(block);
         for (i, stmt) in block.stmts.iter().enumerate() {
             self.stmt(stmt, block);
@@ -1155,9 +1175,12 @@ impl<'a> Emitter<'a> {
             self.f.i32_const(loop_poll());
             self.f.local_set(counter);
             self.reenter_local = Some(counter);
+            self.begin_count_local();
             self.f.loop_void();
             self.loop_depth = Some(0);
         }
+        // Inside a fused loop's `loop`: every pass counts.
+        self.emit_count_block(block);
         self.prof_entry(block);
 
         for (i, stmt) in block.stmts.iter().enumerate() {
@@ -1173,6 +1196,7 @@ impl<'a> Emitter<'a> {
             self.loop_depth = None;
             self.reenter_local = None;
             self.loop_writes.clear();
+            self.count_local = None;
         }
     }
 
@@ -1454,6 +1478,7 @@ impl<'a> Emitter<'a> {
     }
 
     fn flush_inner(&mut self, keep_dirty: bool) {
+        self.emit_count_store();
         let mut dirty: Vec<(GuestReg, u32)> = self
             .regs
             .iter()
@@ -1553,6 +1578,109 @@ impl<'a> Emitter<'a> {
 
     /// Forget every cached register, forcing later reads to reload. Used
     /// after a host call that can rewrite guest state.
+    // -- the instruction count (`gex_abi::count_instructions`) ------------
+    //
+    // A block's entry counts all its instructions in the thread's context
+    // (`ctx::INSTRUCTIONS`): one add per block run, per pass round a fused
+    // loop and per member a region enters, none per instruction. Its
+    // instructions run in order to its terminator unless a path leaves it
+    // early, and every such path is one of these, which takes back what
+    // did not retire before it hands the thread to the host:
+    //
+    // - an access check's fault (`emit_mem_check`) and a trap
+    //   (`Stmt::Trap`): the faulting instruction and those after it; the
+    //   host resumes at that instruction (a first touch it resolves) or a
+    //   handler's frame does;
+    // - an undefined instruction (`Term::Illegal`, SIGILL at it) and a
+    //   breakpoint (`brk`'s host call: EXC_BREAKPOINT at it, the
+    //   exception's preferred return being the instruction itself): that
+    //   instruction, given back where the host returns;
+    // - an indirect branch's poll (`Term::Indirect`), whose slow path may
+    //   deliver a signal with the branch's own pc to resume at, where the
+    //   branch runs again: the branch, given back where it returns.
+    //
+    // A system call's `svc` retires (its exception returns past it), and a
+    // back edge's poll comes after its block has retired; a page check or
+    // a stale guard leaves before the entry counts. The function JIT
+    // (function mode) does not count: a runner that uses it leaves
+    // counting off.
+
+    /// Add `n` (a negative `n` takes back) to the thread's instruction
+    /// count, where it is counted.
+    fn emit_count(&mut self, n: i64) {
+        if n == 0 || !gex_abi::count_instructions() || self.func_regs.is_some() {
+            return;
+        }
+        self.ctx_base();
+        self.ctx_base();
+        self.f.load(0x29, 3, ctx::INSTRUCTIONS as u32); // i64.load
+        self.f.i64_const(n);
+        self.f.byte(0x7c); // i64.add
+        self.f.store(0x37, 3, ctx::INSTRUCTIONS as u32); // i64.store
+    }
+
+    /// The instructions in `from..to`.
+    fn insns(from: u64, to: u64) -> i64 {
+        (to.saturating_sub(from) >> gex_abi::INST_ALIGN_SHIFT) as i64
+    }
+
+    /// The entry of `block`, which now becomes the one being emitted: all
+    /// its instructions.
+    fn emit_count_block(&mut self, block: &Block) {
+        self.cur_insns = (block.start, block.end);
+        let n = Self::insns(block.start, block.end);
+        match self.count_local {
+            Some(l) if n != 0 => {
+                self.f.local_get(l);
+                self.f.i64_const(n);
+                self.f.byte(0x7c); // i64.add
+                self.f.local_set(l);
+            }
+            Some(_) => {}
+            None => self.emit_count(n),
+        }
+    }
+
+    /// A fused loop or a region begins: its entries count in a local, from
+    /// 0, until it ends.
+    fn begin_count_local(&mut self) {
+        if !gex_abi::count_instructions() || self.func_regs.is_some() {
+            return;
+        }
+        let l = self.f.add_local(ValType::I64);
+        self.f.i64_const(0);
+        self.f.local_set(l);
+        self.count_local = Some(l);
+    }
+
+    /// Inside a fused loop or a region, on a way out (the registers'
+    /// write-back, [`Self::flush_inner`], [`Self::flush_region_exit`]):
+    /// what its entries counted goes to the context's count, and the local
+    /// starts again from 0, for a path that comes back into the loop. A
+    /// path's taking back and giving back ([`Self::emit_uncount_from`])
+    /// is the context's own, after this.
+    fn emit_count_store(&mut self) {
+        let Some(l) = self.count_local else { return };
+        self.ctx_base();
+        self.ctx_base();
+        self.f.load(0x29, 3, ctx::INSTRUCTIONS as u32); // i64.load
+        self.f.local_get(l);
+        self.f.byte(0x7c); // i64.add
+        self.f.store(0x37, 3, ctx::INSTRUCTIONS as u32); // i64.store
+        self.f.i64_const(0);
+        self.f.local_set(l);
+    }
+
+    /// A path that leaves the block being emitted at `pc`, the instruction
+    /// there not retired: take back it and those after it, which the
+    /// entry counted. Returns what was taken back, for a path that may yet
+    /// go on to give it again.
+    fn emit_uncount_from(&mut self, pc: u64) -> i64 {
+        let n = Self::insns(pc.max(self.cur_insns.0), self.cur_insns.1);
+        self.emit_count(-n);
+        n
+    }
+
     fn invalidate(&mut self) {
         if let Some(used) = self.func_regs.take() {
             // Function mode: the locals are the function's, so reload them.
@@ -1679,6 +1807,7 @@ impl<'a> Emitter<'a> {
         }
         self.flush_fault();
         self.store_pc(pc);
+        self.emit_uncount_from(pc);
         self.f.local_get(self.ctx_local);
         self.f.i64_const(pc as i64);
         self.f.i32_const(if need & gex_abi::perm::WRITE != 0 { gex_abi::cache_op::PERM_WRITE } else { gex_abi::cache_op::PERM_READ });
@@ -2105,6 +2234,16 @@ impl<'a> Emitter<'a> {
             {
                 self.resumable_fault(*func, args, self.fault_next.unwrap());
             }
+            // A breakpoint or an undefined instruction raised in place: it
+            // has not retired, unless the host returns (a trace point).
+            Stmt::HostCall { func: func @ (HostFunc::Breakpoint | HostFunc::Illegal), args }
+                if args.first().and_then(|a| self.value_const.get(a.0 as usize).copied().flatten()).is_some() =>
+            {
+                let pc = self.value_const[args[0].0 as usize].unwrap();
+                let n = self.emit_uncount_from(pc);
+                self.host_call(*func, args, None, block);
+                self.emit_count(n);
+            }
             Stmt::HostCall { func, args } => {
                 self.host_call(*func, args, None, block);
             }
@@ -2117,6 +2256,7 @@ impl<'a> Emitter<'a> {
                 self.f.if_void();
                 self.flush_fault();
                 self.store_pc(*pc);
+                self.emit_uncount_from(*pc);
                 self.f.local_get(self.ctx_local);
                 self.f.i64_const((*pc | self.resumable_pc) as i64);
                 self.f.i32_const(*code);
@@ -5279,7 +5419,7 @@ impl<'a> Emitter<'a> {
                 if gex_abi::X86 {
                     self.emit_safepoint_no_flush_dynamic();
                 } else {
-                    self.emit_safepoint_no_flush(block.end - gex_abi::INST_ALIGN);
+                    self.emit_safepoint_no_flush(block.end - gex_abi::INST_ALIGN, 1);
                 }
                 self.emit_dispatch_tail_call();
             }
@@ -5299,10 +5439,14 @@ impl<'a> Emitter<'a> {
             Term::Illegal { raw, pc } => {
                 self.flush();
                 self.store_pc(pc);
+                // An instruction lifted as undefined is in the block's
+                // range, one that could not be fetched past it.
+                let unretired = self.emit_uncount_from(pc);
                 self.f.local_get(self.ctx_local);
                 self.f.i64_const((pc | gex_abi::ILLEGAL_RETURNS_PC) as i64);
                 self.f.i32_const(raw as i32);
                 self.f.call(self.cx.illegal);
+                self.emit_count(unretired);
                 // `illegal` raises SIGILL and does not return, except where
                 // the host ran the instruction as a call (the browser:
                 // 64-bit native Wine's system call entry, a `ud2`;
@@ -5327,9 +5471,13 @@ impl<'a> Emitter<'a> {
     /// Unlike [`Self::emit_safepoint`] this never flushes -- an indirect branch
     /// has flushed already and its target is in a local -- so it emits only the
     /// counter and the call.
-    fn emit_safepoint_no_flush(&mut self, pc: u64) {
+    ///
+    /// `unretired`: the instructions from `pc` to the block's end, which a
+    /// signal delivered at `pc` runs again: not retired while the host has
+    /// the thread, retired if it returns here.
+    fn emit_safepoint_no_flush(&mut self, pc: u64, unretired: i64) {
         let before = self.f.code.len();
-        self.emit_safepoint_no_flush_inner(pc);
+        self.emit_safepoint_no_flush_inner(pc, unretired);
         SAFEPOINT_BYTES.fetch_add(self.f.code.len() - before, Ordering::Relaxed);
     }
 
@@ -5355,7 +5503,7 @@ impl<'a> Emitter<'a> {
         SAFEPOINT_BYTES.fetch_add(self.f.code.len() - before, Ordering::Relaxed);
     }
 
-    fn emit_safepoint_no_flush_inner(&mut self, pc: u64) {
+    fn emit_safepoint_no_flush_inner(&mut self, pc: u64, unretired: i64) {
         self.ctx_base();
         self.ctx_base();
         self.f.load(0x28, 2, ctx::SAFEPOINT_COUNTER as u32);
@@ -5367,9 +5515,11 @@ impl<'a> Emitter<'a> {
         self.f.i32_const(0);
         self.f.byte(0x4c); // i32.le_s
         self.f.if_void();
+        self.emit_count(-unretired);
         self.f.local_get(self.ctx_local);
         self.f.i64_const(pc as i64);
         self.f.call(self.cx.safepoint);
+        self.emit_count(unretired);
         self.f.end();
     }
 

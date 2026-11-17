@@ -12,6 +12,45 @@ pub fn install() {
     set_host_xattr(call);
     gex_kernel::vfs::hostfs::host_swap::set_host_swap(swap);
     gex_kernel::vfs::hostfs::host_identity::set_host_identity(identity);
+    gex_kernel::darwin::pagecache::set_data_probe(data_in);
+}
+
+/// The bytes of `[a, b)` of the file open at `fd` that hold data
+/// (`SEEK_DATA`, `SEEK_HOLE`); none where the host cannot tell. The
+/// descriptor's offset is put back: gex reads and writes it positioned.
+fn data_in(fd: i32, a: u64, b: u64) -> Option<u64> {
+    // SAFETY: lseek on a descriptor the caller holds open.
+    unsafe {
+        let cur = libc::lseek(fd, 0, libc::SEEK_CUR);
+        if cur < 0 {
+            return None;
+        }
+        let mut n = 0u64;
+        let mut at = a;
+        let mut ok = true;
+        while at < b {
+            let d = libc::lseek(fd, at as libc::off_t, libc::SEEK_DATA);
+            if d < 0 {
+                // ENXIO: no data from here to the end.
+                ok = std::io::Error::last_os_error().raw_os_error() == Some(libc::ENXIO);
+                break;
+            }
+            let d = d as u64;
+            if d >= b {
+                break;
+            }
+            let h = libc::lseek(fd, d as libc::off_t, libc::SEEK_HOLE);
+            if h < 0 {
+                ok = false;
+                break;
+            }
+            let h = (h as u64).min(b);
+            n += h - d;
+            at = h;
+        }
+        libc::lseek(fd, cur, libc::SEEK_SET);
+        ok.then_some(n)
+    }
 }
 
 /// The effective user and group this process checks access as, and its

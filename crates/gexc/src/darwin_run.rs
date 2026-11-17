@@ -96,6 +96,13 @@ pub fn run(mut ra: RunArgs, bytes: &[u8]) -> Result<ExitCode> {
     // dyld rebases and binds its data after its code is translated: no
     // load may be folded to what memory held at translation.
     gex_ir::pass::set_fold_through_memory(false);
+    // Each thread's retired instructions are counted in its context, for
+    // the kernel's ri_instructions (recount's PMC1), by tier-1 code; the
+    // function tiers do not count, so where they run the kernel reports
+    // the field as not kept. GEX_NO_INSTRUCTION_COUNT=1 leaves it off too,
+    // to price the count.
+    let uncounted = std::env::var_os("GEX_NO_INSTRUCTION_COUNT").is_some_and(|v| v != "0");
+    gex_abi::set_count_instructions(!(ra.xlate.cgen || ra.xlate.fjit || ra.xlate.no_blocks || uncounted));
     ra.opts.jit = ra.jit;
     // Darwin images live above 4 GiB: always a 64-bit memory.
     if ra.mem64 == Some(false) {

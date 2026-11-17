@@ -623,6 +623,10 @@ pub struct ThreadSig {
     pub cpu: crate::cpu::ThreadCpu,
     /// A Darwin thread's part in its task's time by effective QoS.
     pub qos: std::sync::Mutex<crate::darwin::rusage::QosThread>,
+    /// The address of the thread's register context, where its retired
+    /// instructions are counted (`gex_abi::ctx::INSTRUCTIONS`); zero
+    /// before it is known.
+    ctx: AtomicU64,
 }
 
 impl std::fmt::Debug for ThreadSig {
@@ -650,7 +654,17 @@ impl ThreadSig {
             exit_reason: Mutex::new(None),
             cpu: crate::cpu::ThreadCpu::default(),
             qos: Default::default(),
+            ctx: AtomicU64::new(0),
         }
+    }
+
+    /// The address of the thread's context (zero before it is known).
+    pub fn ctx(&self) -> u64 {
+        self.ctx.load(Ordering::Acquire)
+    }
+
+    pub fn set_ctx(&self, ctx: u64) {
+        self.ctx.store(ctx, Ordering::Release);
     }
 
     /// A Darwin thread's `thread_id` (zero before it has one).

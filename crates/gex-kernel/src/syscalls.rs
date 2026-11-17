@@ -7048,6 +7048,16 @@ impl ThreadEnd<'_> {
         if let (Some(runnable), Some(pid)) = (self.thread.cpu.runnable(), self.procs.task_owner(tid)) {
             self.procs.add_dead_runnable(pid, runnable);
         }
+        // Its retired instructions (`recount_task_rollup_thread`'s, though
+        // the task's track has them already: it is what readers sum).
+        // No longer read from its context first: a reader between the two
+        // misses it rather than counting it twice.
+        if gex_abi::count_instructions() {
+            self.thread.set_ctx(0);
+            if let (Ok(n), Some(pid)) = (m.kernel().read_u64(ctx_addr + ctx::INSTRUCTIONS as u64), self.procs.task_owner(tid)) {
+                self.procs.add_dead_instructions(pid, n);
+            }
+        }
         self.thread_fs.set(ctx_addr, None);
         self.threads.remove(tid);
         self.procs.end_tid(tid);
@@ -7283,6 +7293,10 @@ impl ThreadMaker<'_> {
             k.write_u64(child + ctx::sp_slot(self.compat) as u64, child_stack)?;
             k.write_u64(child + ctx::MON_SIZE as u64, 0)?;
             k.write_u64(child + ctx::TID as u64, tid as u64)?;
+            // A new thread has retired nothing (`recount_thread_init`).
+            if gex_abi::count_instructions() {
+                k.write_u64(child + ctx::INSTRUCTIONS as u64, 0)?;
+            }
             if flags & clone_flags::SETTLS != 0 {
                 // A 32-bit thread's TLS descriptor is loaded into %gs, a 64-bit
                 // one's base into %fs.
@@ -10475,6 +10489,12 @@ impl Kernel {
             }
         }
         self.switch_signals(t.tid);
+        // Where its instructions are counted, for readers of its task's;
+        // and the task its I/O is charged to (`current_thread()`'s).
+        if self.darwin {
+            self.signals.thread().set_ctx(t.ctx_addr);
+            crate::darwin::pagecache::set_task(&self.dtask.rusage);
+        }
     }
 
     /// Make `tid`'s signal state the running one (see `thread_signals`).
@@ -11244,6 +11264,7 @@ impl Kernel {
         if let Some(t) = self.thread_signals.get(req.tid) {
             t.set_darwin_id(crate::darwin::next_thread_id());
             t.set_tsd(0);
+            t.set_ctx(req.ctx_addr);
         }
         let _ = m.kernel().write_u64(req.ctx_addr + ctx::TPIDRRO as u64, 0);
     }

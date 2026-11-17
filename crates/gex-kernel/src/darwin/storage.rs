@@ -412,6 +412,9 @@ pub fn unmeasured() -> Option<String> {
     gaps.push(super::kern::PREBOOT_BOOTED_FLAGS_STAND_IN.to_string());
     gaps.push(super::mig::machine::MEM_ACTUAL_STAND_IN.to_string());
     gaps.push(super::mig::machine::MEM_SIZE_STAND_IN.to_string());
+    gaps.push(super::rusage::EL1_STAND_IN.to_string());
+    gaps.push(super::rusage::DVFS_STAND_IN.to_string());
+    gaps.extend(super::pagecache::stand_ins());
     gaps.push(format!("whether iBoot's /chosen boot-uuid or apfs-preboot-uuid names the System volume (stand-in {BOOT_UUID_MATCHES}: the root mounted from its snapshot by name, with a new fsid; measure {BOOT_UUID_MEASUREMENT})"));
     if DEVICE.nvme.is_none() {
         let n = STAND_IN_NVME;

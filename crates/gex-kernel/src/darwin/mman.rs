@@ -738,6 +738,12 @@ impl Kernel {
             // of them is the device's of its vnode object (written back,
             // dropped, deactivated or killed as the device's would be).
             if super::ubc::vnode(p.attrs.obj).is_some() {
+                // The device's vm_object_update of the vnode's pages: what
+                // it writes, and the dirty pages an invalidation discards
+                // (not for KILLPAGES or DEACTIVATE, which only age them).
+                if flags & (sync::KILLPAGES | sync::DEACTIVATE) == 0 {
+                    self.darwin_msync_pages(p.start, p.end, write_back, flags & sync::INVALIDATE != 0);
+                }
                 if !m.host_msync(p.start, p.end - p.start, flags & !sync::CONTIGUOUS).unwrap_or(false) {
                     self.darwin_unimplemented(format!("vm_map_msync {flags:#x} of a file's pages at {:#x} on a host that cannot sync its own mappings", p.start));
                 }

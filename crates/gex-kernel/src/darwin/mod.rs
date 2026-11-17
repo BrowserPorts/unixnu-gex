@@ -56,6 +56,8 @@ pub mod osserialize;
 pub mod accel;
 pub mod iomfb;
 pub mod platform;
+pub mod pagecache;
+pub mod cluster;
 pub mod pe;
 pub mod vattr;
 pub mod vauth;
@@ -185,6 +187,9 @@ pub fn boot(trust_cache: Option<&[u8]>, sandbox: SandboxProfiles, device_tree: O
         None if !chosen.is_empty() => return Err("the web device's boot fills in /chosen, but the boot payload has no device tree".into()),
         None => {}
     }
+    // Its files' pages are kept as its VM keeps them, for the counts read
+    // off them.
+    pagecache::set_on();
     // The device facts that stand in until measured, once at start.
     if let Some(gaps) = storage::unmeasured() {
         eprintln!("[gex] Darwin: {gaps}");

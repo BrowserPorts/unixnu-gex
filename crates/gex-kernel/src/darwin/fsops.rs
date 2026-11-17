@@ -838,6 +838,7 @@ impl Kernel {
         if self.darwin_vnode_of(&file).is_none() {
             return Err(Errno::EOPNOTSUPP);
         }
+        super::pagecache::fsync(&file);
         let mapped: Vec<(u64, u64)> = self.mem.lock().log.shared_maps.iter().filter(|s| s.file.same_file(&file)).map(|s| (s.start, s.len)).collect();
         for (start, len) in mapped {
             self.map_io().flush_shared(m, start, len)?;

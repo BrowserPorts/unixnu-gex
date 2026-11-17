@@ -956,6 +956,11 @@ impl Kernel {
                 mm.is_unentered(page) && mm.vma_at(at).is_some_and(|v| v.prot & need != 0) && mm.enter_page(page)
             };
             if entered {
+                // A load's fault on a vnode page no store has entered:
+                // read only until a store faults on it again.
+                if self.darwin_file_page_fault(at, write) {
+                    self.mem.lock().set_copy_pending(page << gex_abi::PERM_PAGE_SHIFT, (page + 1) << gex_abi::PERM_PAGE_SHIFT);
+                }
                 self.darwin_flush_perms(m);
                 return (Delivery::Resume(pc), 0);
             }
@@ -969,9 +974,12 @@ impl Kernel {
                 let mut mm = self.mem.lock();
                 let p = if mm.is_copy_pending(page) { page } else { page + 1 };
                 let at = (p << gex_abi::PERM_PAGE_SHIFT).max(addr);
-                mm.is_copy_pending(p) && mm.vma_at(at).is_some_and(|v| v.prot & crate::mem::prot::WRITE != 0) && mm.copied(p)
+                (mm.is_copy_pending(p) && mm.vma_at(at).is_some_and(|v| v.prot & crate::mem::prot::WRITE != 0) && mm.copied(p)).then_some(at)
             };
-            if copied {
+            if let Some(at) = copied {
+                // A store's fault on a vnode page a load's fault entered
+                // read only (a private mapping's copies it instead).
+                self.darwin_file_page_fault(at, true);
                 self.darwin_flush_perms(m);
                 return (Delivery::Resume(pc), 0);
             }
@@ -1008,6 +1016,10 @@ impl Kernel {
             if let Some(e) = self.dtask.vm.at_or_after(addr).filter(|e| e.start <= addr) {
                 let shared = e.attrs.kind == super::vm::kind::FILE_SHARED && !e.attrs.cow;
                 if super::ubc::fault(m, &self.mem, e.attrs.obj, e.start, e.end, e.offset, shared, addr) {
+                    if self.darwin_file_page_fault(addr, write) {
+                        let page = addr & !(gex_abi::PERM_PAGE - 1);
+                        self.mem.lock().set_copy_pending(page, page + gex_abi::PERM_PAGE);
+                    }
                     self.darwin_flush_perms(m);
                     return (Delivery::Resume(pc), 0);
                 }

@@ -207,6 +207,14 @@ impl Kernel {
 
     /// The work queue run: each request done in order, then completed.
     fn darwin_aio_work(&mut self, m: &mut GuestMem<'_>) {
+        // aio_work_thread is the kernel's task's: its I/O is not the
+        // process's.
+        let task = super::pagecache::take_task();
+        self.darwin_aio_work_queue(m);
+        super::pagecache::restore_task(task);
+    }
+
+    fn darwin_aio_work_queue(&mut self, m: &mut GuestMem<'_>) {
         while let Some(mut e) = self.dtask.aio.active.pop_front() {
             let fd = e.cb.fildes as u64;
             let r = if e.flags & flag::READ != 0 {
@@ -215,6 +223,9 @@ impl Kernel {
                 self.darwin_aio_io(m, &e, true)
             } else if e.flags & (flag::FSYNC | flag::DSYNC) != 0 {
                 let call = if e.flags & flag::FSYNC != 0 { nr::FSYNC } else { nr::FDATASYNC };
+                if let Ok(f) = self.fds.get(fd as i32) {
+                    super::pagecache::fsync(&f);
+                }
                 self.canonical(m, call, [fd, 0, 0, 0, 0, 0]).map_err(|e| (e, -1))
             } else {
                 Err((Errno::EINVAL, 0))

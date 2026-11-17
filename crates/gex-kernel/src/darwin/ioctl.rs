@@ -487,6 +487,7 @@ impl Kernel {
             // The filesystem's sync, with its writes to the media: what is
             // here keeps no journal or cache of its own past its fsync.
             F_FULLFSYNC | F_BARRIERFSYNC => {
+                super::pagecache::fsync(&file);
                 self.canonical(m, nr::FSYNC, [fd as u64, 0, 0, 0, 0, 0])?;
             }
             // An advisory read: checked, and nothing to fetch ahead here.

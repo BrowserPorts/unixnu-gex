@@ -6,7 +6,8 @@
  * they are first asked for). argv[2], a count: the version's size read
  * that many times more, each an image mapping of the file made and closed
  * (one whose version cannot be read must leave the wineserver whole). Says
- * "done" at the end. */
+ * "done" at the end.
+ * gex-nt-libs: -lversion */
 #include <windows.h>
 #include <shellapi.h>
 #include <stdio.h>

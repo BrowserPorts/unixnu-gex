@@ -49,24 +49,14 @@ const KERN_PROTECTION_FAILURE: u64 = 2;
 const KERN_INVALID_VALUE: u64 = 18;
 const KERN_NOT_SUPPORTED: u64 = 46;
 
-/// Pages the host holds for entries ([`crate::host_hold`]), given back
-/// when the last entry naming them goes.
-#[derive(Debug)]
-pub struct Hold {
-    pub addr: usize,
-    pub len: u64,
-}
-
-impl Drop for Hold {
-    fn drop(&mut self) {
-        crate::host_unhold(self.addr, self.len as usize);
-    }
-}
+pub use super::vmobject::Hold;
 
 /// A `vm_named_entry`.
 #[derive(Clone, Debug)]
 pub struct NamedEntry {
-    /// Its object's pages (or its copy's), from `offset`.
+    /// Its object ([`super::vmobject`]), whose reference the entry holds
+    /// while it is, and the object's pages (or its copy's), from `offset`.
+    pub obj: u64,
     pub hold: Arc<Hold>,
     pub offset: u64,
     pub size: u64,
@@ -94,12 +84,17 @@ pub fn get(id: u64) -> Option<NamedEntry> {
     entries().lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned()
 }
 
-/// `mach_memory_entry_no_senders`: the entry goes, and with the last entry
-/// of its pages, the pages.
+/// `mach_memory_entry_no_senders`: the entry goes, and its reference to
+/// its object with it.
 pub fn no_senders(id: u64) {
-    entries().lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+    let gone = entries().lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+    if let Some(e) = gone {
+        super::vmobject::release(e.obj);
+    }
 }
 
+/// A new entry, which holds the reference to its object its maker gave
+/// it.
 fn insert(e: NamedEntry) -> u64 {
     let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     entries().lock().unwrap_or_else(|e| e.into_inner()).insert(id, e);
@@ -168,7 +163,9 @@ impl Kernel {
                 self.darwin_unimplemented("a named memory entry's object on a host that holds no pages apart from a task's".into());
                 return Err(kr::FAILURE);
             };
-            let e = NamedEntry { hold: Arc::new(Hold { addr, len: map_size }), offset: 0, size: map_size, data_offset: 0, protection: protections, is_copy: false, internal: true, needs_copy: false };
+            let hold = Arc::new(Hold { addr, len: map_size });
+            let obj = super::vmobject::allocate(map_size, super::vmobject::Pager::Anon, Some(Arc::clone(&hold)));
+            let e = NamedEntry { obj, hold, offset: 0, size: map_size, data_offset: 0, protection: protections, is_copy: false, internal: true, needs_copy: false };
             *size = e.size;
             return Ok(Made::New(insert(e)));
         }
@@ -240,7 +237,8 @@ impl Kernel {
                 }
             });
             let internal = pieces.iter().take_while(|x| x.off < map_size).all(|x| matches!(x.attrs.kind, kind::ANON | kind::SHM | kind::OBJECT));
-            let e = NamedEntry { hold, offset: 0, size: map_size, data_offset: offset_in_page, protection: protections, is_copy: copy || permission & VM_SHARE != 0, internal, needs_copy: copy };
+            let obj = super::vmobject::allocate(map_size, super::vmobject::Pager::Anon, Some(Arc::clone(&hold)));
+            let e = NamedEntry { obj, hold, offset: 0, size: map_size, data_offset: offset_in_page, protection: protections, is_copy: copy || permission & VM_SHARE != 0, internal, needs_copy: copy };
             *size = e.size - e.data_offset;
             return Ok(Made::New(insert(e)));
         }
@@ -278,7 +276,8 @@ impl Kernel {
         if protections & p.protection != protections {
             return Err(KERN_PROTECTION_FAILURE);
         }
-        let e = NamedEntry { hold: Arc::clone(&p.hold), offset: p.offset + map_start, size: map_size, data_offset: offset_in_page, protection: protections, is_copy: false, internal: p.internal, needs_copy: false };
+        super::vmobject::reference(p.obj);
+        let e = NamedEntry { obj: p.obj, hold: Arc::clone(&p.hold), offset: p.offset + map_start, size: map_size, data_offset: offset_in_page, protection: protections, is_copy: false, internal: p.internal, needs_copy: false };
         *size = e.size - e.data_offset;
         Ok(Made::New(insert(e)))
     }
@@ -330,11 +329,11 @@ impl Kernel {
             return kr::FAILURE;
         }
         let attrs = if copy {
-            Attrs { kind: kind::ANON, cow: true, max: max as u8, inherit, ..Attrs::default() }
+            Attrs { kind: kind::ANON, cow: true, max: max as u8, inherit, obj: e.obj, ..Attrs::default() }
         } else if e.internal {
-            Attrs { kind: kind::OBJECT, max: max as u8, inherit, ..Attrs::default() }
+            Attrs { kind: kind::OBJECT, max: max as u8, inherit, obj: e.obj, ..Attrs::default() }
         } else {
-            Attrs { kind: kind::FILE_PRIVATE, max: max as u8, inherit, ..Attrs::default() }
+            Attrs { kind: kind::FILE_PRIVATE, max: max as u8, inherit, obj: e.obj, ..Attrs::default() }
         };
         self.dtask.vm.enter(at, at + map_size, Attrs { alias: (flags >> 24) as u8, ..attrs }, obj_start);
         self.mem.lock().set_unentered(at, at + map_size);

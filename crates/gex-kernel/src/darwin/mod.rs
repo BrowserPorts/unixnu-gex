@@ -128,6 +128,7 @@ pub mod vm;
 pub mod vmshare;
 mod vmmig;
 pub mod vmentry;
+pub mod vmobject;
 pub mod coalition;
 pub mod importance;
 pub mod voucher;

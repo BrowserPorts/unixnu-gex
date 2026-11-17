@@ -57,6 +57,9 @@ pub mod rank {
     pub const KERNEL: u8 = 1;
     pub const JIT: u8 = 2;
     pub const MM: u8 = 3;
+    /// A Darwin task's map entries (`darwin::vm::Entries`), taken after
+    /// its memory map's lock when both are held.
+    pub const ENTRIES: u8 = 4;
 }
 
 /// About to take a lock of rank `r`: in a debug build (or with

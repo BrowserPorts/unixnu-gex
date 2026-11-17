@@ -21,9 +21,21 @@
 //! - `ri_secure_time_in_system` and `ri_secure_ptime_in_system` are 0:
 //!   no `RECOUNT_SECURE_METRICS`, so `task_power_info_locked` leaves them
 //!   as `fill_task_rusage` zeroed them.
-//! - CONFIG_PERVASIVE_CPI, CONFIG_PERVASIVE_ENERGY and
-//!   CONFIG_LEDGER_INTERVAL_MAX are in: the CPMU's instructions and
-//!   cycles, CLPC's energy estimates and the footprint's interval peak are
+//! - `ri_energy_nj`, `ri_billed_energy` and `ri_serviced_energy` are 0:
+//!   recount keeps energy only with `RECOUNT_ENERGY`, which is
+//!   `CONFIG_PERVASIVE_ENERGY` only where the SoC has a digital power
+//!   estimation counter (`HAS_CPU_DPE_COUNTER`, `recount.c:75`; H13 and
+//!   H14 only, not T8011's H9). The kernel's `kern.pervasive_energy`
+//!   (0xfffffff00714cae0, the same condition) is 0, and
+//!   `machine_switch_perfcontrol_context` (0xfffffff00733d35c) never reads
+//!   the CLPC callback's energy estimate. So `recount_add_energy` is
+//!   empty, `recount_current_thread_energy_nj` returns 0, and the bank's
+//!   energy entries, which only `bank_swap_thread_bank_ledger` credits
+//!   from that function's deltas (`bank.c:1980`), stay 0.
+//! - CONFIG_PERVASIVE_CPI and CONFIG_LEDGER_INTERVAL_MAX are in: the
+//!   CPMU's instructions and cycles (PMC1 and PMC0, read by
+//!   `recount_snapshot` 0xfffffff0072287f8 at every switch and quantum
+//!   expiry, counting EL0 and EL1) and the footprint's interval peak are
 //!   real figures there.
 //!
 //! What is kept here: the executable's UUID; recount's time of the task
@@ -50,10 +62,9 @@
 //! and the device's page cache is not modelled), disk I/O (which reads miss the buffer cache and the UBC),
 //! logical writes (the UBC's copies, write faults on shared file pages,
 //! AppleAPFS's own), the CPMU's instructions (XNU's own among them) and
-//! cycles, CLPC's energy, the footprint where the host keeps no view of
-//! the process's memory (the browser's), a bill while a thread that has
-//! it runs (the device credits it at quantum ends), and the bills' energy
-//! (CLPC's).
+//! cycles, the footprint where the host keeps no view of the process's
+//! memory (the browser's), and a bill while a thread that has it runs
+//! (the device credits it at quantum ends).
 
 use crate::syscalls::Kernel;
 use crate::GuestMem;
@@ -115,7 +126,7 @@ pub mod ri {
 }
 
 /// Each field that can go unkept: its name, and what it needs.
-const UNKEPT: [(usize, &str, &str); 24] = [
+const UNKEPT: [(usize, &str, &str); 21] = [
     (ri::USER_TIME, "ri_user_time", "per-thread clocks on the host"),
     (ri::PKG_IDLE_WKUPS, "ri_pkg_idle_wkups", "the platform_idle_wakeups ledger: whether every processor was idle at the interrupt (cpu_idle_count == real_ncpus), which the device's own kernel threads and interrupts decide"),
     (ri::INTERRUPT_WKUPS, "ri_interrupt_wkups", "the interrupt_wakeups ledger: what a signal a thread call posted woke, or a thread call's message to another task's port"),
@@ -135,11 +146,8 @@ const UNKEPT: [(usize, &str, &str); 24] = [
     (ri::LIFETIME_MAX_PHYS_FOOTPRINT, "ri_lifetime_max_phys_footprint", "a look at the process's pages, which the host keeps no view of"),
     (ri::INSTRUCTIONS, "ri_instructions", "the CPMU's instruction counts, XNU's own on the thread's behalf among them"),
     (ri::CYCLES, "ri_cycles", "the CPMU's cycle counts"),
-    (ri::BILLED_ENERGY, "ri_billed_energy", "CLPC's energy estimates of the bills' time"),
-    (ri::SERVICED_ENERGY, "ri_serviced_energy", "CLPC's energy estimates of the bills' time"),
     (ri::INTERVAL_MAX_PHYS_FOOTPRINT, "ri_interval_max_phys_footprint", "a look at the process's pages, which the host keeps no view of"),
     (ri::RUNNABLE_TIME, "ri_runnable_time", "per-thread clocks on the host"),
-    (ri::ENERGY_NJ, "ri_energy_nj", "CLPC's energy estimates"),
 ];
 
 /// The QoS fields, one bit each in an unkept mask.
@@ -222,27 +230,22 @@ pub struct BankLedger {
     pub to_others: AtomicU64,
     /// A rolled-up bill held time not kept (a thread's time unread).
     pub unkept: AtomicBool,
-    /// A bill has been rolled up into it: its energy entries hold CLPC's
-    /// estimates of that time.
-    pub credited: AtomicBool,
 }
 
 /// The bank's figures of a task (`bank_billed_balance_safe`,
 /// `bank_serviced_balance_safe`): its billed and serviced CPU time, none
-/// where a bill is not known; whether its bills hold any credit (and so
-/// energy).
+/// where a bill is not known. Their energy is 0 on this kernel.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Bills {
     pub billed: Option<u64>,
     pub serviced: Option<u64>,
-    pub energy: bool,
 }
 
 impl Bills {
     /// A task ledger's own entries, for a task with no bank context.
     pub fn of_ledger(l: &BankLedger) -> Bills {
         let known = !l.unkept.load(Ordering::Acquire);
-        Bills { billed: known.then(|| l.to_me.load(Ordering::Acquire)), serviced: known.then(|| l.to_others.load(Ordering::Acquire)), energy: l.credited.load(Ordering::Acquire) }
+        Bills { billed: known.then(|| l.to_me.load(Ordering::Acquire)), serviced: known.then(|| l.to_others.load(Ordering::Acquire)) }
     }
 }
 
@@ -465,7 +468,7 @@ pub fn gather(i: &Input) -> Record {
         Some(n) => w[ri::INTERRUPT_WKUPS] = n,
         None => mark(ri::INTERRUPT_WKUPS),
     }
-    for f in [ri::PKG_IDLE_WKUPS, ri::PAGEINS, ri::DISKIO_BYTESREAD, ri::DISKIO_BYTESWRITTEN, ri::LOGICAL_WRITES, ri::INSTRUCTIONS, ri::CYCLES, ri::ENERGY_NJ] {
+    for f in [ri::PKG_IDLE_WKUPS, ri::PAGEINS, ri::DISKIO_BYTESREAD, ri::DISKIO_BYTESWRITTEN, ri::LOGICAL_WRITES, ri::INSTRUCTIONS, ri::CYCLES] {
         mark(f);
     }
     match i.footprint_peaks {
@@ -515,11 +518,6 @@ pub fn gather(i: &Input) -> Record {
             Some(t) => w[f] = t,
             None => unkept |= 1 << f,
         }
-    }
-    // The bills' energy is CLPC's estimate of their time: 0 only where
-    // nothing was ever credited to them.
-    if i.bills.is_none_or(|b| b.energy) {
-        unkept |= (1 << ri::BILLED_ENERGY) | (1 << ri::SERVICED_ENERGY);
     }
     match i.runnable {
         Some(r) => w[ri::RUNNABLE_TIME] = r,
@@ -730,7 +728,7 @@ mod tests {
     }
 
     fn live() -> Input {
-        Input { uuid: [7; 16], time_ns: Some(1_000_000), runnable: Some(48_000), wired: 0x8000, footprint: Some(0x40000), resident: Some(0x6_0000), start_abstime: 1000, bills: Some(Bills { billed: Some(0), serviced: Some(0), energy: false }), ..Input::default() }
+        Input { uuid: [7; 16], time_ns: Some(1_000_000), runnable: Some(48_000), wired: 0x8000, footprint: Some(0x40000), resident: Some(0x6_0000), start_abstime: 1000, bills: Some(Bills { billed: Some(0), serviced: Some(0) }), ..Input::default() }
     }
 
     #[test]
@@ -757,21 +755,22 @@ mod tests {
         assert_eq!(r.unkept_within(SIZES[2]).len(), 5);
         // V3: the QoS times, once; the bank's bills are kept.
         assert_eq!(r.unkept_within(SIZES[3]).len(), 6);
-        assert_eq!(r.unkept_within(SIZES[6]).len(), 6 + 6);
+        assert_eq!(r.unkept_within(SIZES[6]).len(), 6 + 5);
     }
 
     #[test]
-    fn bills_with_credits_keep_their_time_not_their_energy() {
+    fn bills_keep_their_time_and_no_energy() {
         let mut i = live();
-        i.bills = Some(Bills { billed: Some(240), serviced: None, energy: true });
+        i.bills = Some(Bills { billed: Some(240), serviced: None });
         i.footprint = None;
         let r = gather(&i);
         assert_eq!(r.w[ri::BILLED_SYSTEM_TIME], 240);
         let all = r.unkept_within(SIZES[6]).join(" ");
-        for n in ["ri_serviced_system_time", "ri_billed_energy", "ri_serviced_energy", "ri_phys_footprint"] {
+        for n in ["ri_serviced_system_time", "ri_phys_footprint"] {
             assert!(all.contains(n), "{n}");
         }
-        assert!(!all.contains("ri_billed_system_time"));
+        assert!(!all.contains("ri_billed_system_time") && !all.contains("energy"));
+        assert_eq!((r.w[ri::ENERGY_NJ], r.w[ri::BILLED_ENERGY], r.w[ri::SERVICED_ENERGY]), (0, 0, 0));
         // Kept peaks fill their fields.
         i.footprint_peaks = Some((0x90000, 0x50000));
         let r = gather(&i);

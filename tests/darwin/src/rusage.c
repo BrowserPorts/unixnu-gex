@@ -16,7 +16,8 @@
 // added twice (at the child's exit and at the system's reap). The time by
 // effective QoS: a thread's time goes to the QoS it ran at (utility, then
 // background), and the seven sum to the task's time. Each sleep that its
-// deadline timer ends is a wakeup from interrupt context. The footprint's
+// deadline timer ends is a wakeup from interrupt context. The energy
+// fields are 0 (no energy counter on this SoC). The footprint's
 // peaks: pages touched then unmapped are in the lifetime peak, the
 // footprint after is below it, and TASK_VM_INFO's ledger peak is the same
 // ledger's; an interval reset begins the interval's peak at the footprint
@@ -72,12 +73,13 @@ static uint64_t usage_ns(void) {
     return (uint64_t)ru.ru_utime.tv_sec * 1000000000u + (uint64_t)ru.ru_utime.tv_usec * 1000u;
 }
 
-// The record's fields this kernel leaves 0.
+// The record's fields this kernel leaves 0 (energy among them: no
+// energy counter on this SoC).
 static int zeros(const struct rusage_info_v6 *r, const char *whose) {
     const uint64_t *after = &r->ri_neural_footprint;
     for (int i = 0; i < 12; i++)
         if (after[i]) return bad(whose, (long)after[i], 0);
-    if (r->ri_system_time || r->ri_flags || r->ri_user_ptime || r->ri_system_ptime || r->ri_pinstructions || r->ri_pcycles || r->ri_penergy_nj || r->ri_secure_time_in_system || r->ri_secure_ptime_in_system)
+    if (r->ri_system_time || r->ri_flags || r->ri_user_ptime || r->ri_system_ptime || r->ri_pinstructions || r->ri_pcycles || r->ri_penergy_nj || r->ri_secure_time_in_system || r->ri_secure_ptime_in_system || r->ri_energy_nj || r->ri_billed_energy || r->ri_serviced_energy)
         return bad(whose, 1, 0);
     return 0;
 }

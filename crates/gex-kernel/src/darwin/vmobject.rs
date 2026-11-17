@@ -53,6 +53,11 @@ pub struct Object {
     /// object ([`super::purgeable`]); none for any other (`VM_PURGABLE_DENY`,
     /// owned by no one).
     pub purg: Option<super::purgeable::Purg>,
+    /// The cache mode its pages are mapped with (`wimg_bits`), as the
+    /// `MAP_MEM_*` mode that set it: MAP_MEM_NOOP for the default. Only
+    /// the pmap's attributes for the pages follow it, which no guest
+    /// access can tell from the default here.
+    pub cache: u32,
 }
 
 impl Object {
@@ -85,7 +90,7 @@ pub fn allocate(size: u64, pager: Pager, hold: Option<Arc<Hold>>) -> u64 {
     let mut t = lock();
     let id = t.next;
     t.next += 1;
-    t.objects.insert(id, Object { refs: 1, size, pager, hold, purg: None });
+    t.objects.insert(id, Object { refs: 1, size, pager, hold, purg: None, cache: 0 });
     id
 }
 
@@ -116,7 +121,7 @@ pub fn of_file(key: super::ubc::FileKey, make: impl FnOnce() -> Arc<super::ubc::
     }
     let id = t.next;
     t.next += 1;
-    t.objects.insert(id, Object { refs: 1, size: 0, pager: Pager::Vnode(make()), hold: None, purg: None });
+    t.objects.insert(id, Object { refs: 1, size: 0, pager: Pager::Vnode(make()), hold: None, purg: None, cache: 0 });
     t.files.insert(key, id);
     id
 }

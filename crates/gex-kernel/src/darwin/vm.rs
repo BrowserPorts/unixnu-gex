@@ -653,6 +653,22 @@ impl Map {
         self.ranges.range(first..end).filter(|(_, e)| e.attrs.kind == kind::SUBMAP && e.end > start).map(|(&s, e)| (s.max(start), e.end.min(end))).collect()
     }
 
+    /// The entries of `[start, end)` given object `obj` (a reference each),
+    /// their offsets running from `offset` at `start`: an object made for
+    /// them (`vm_map_copy_extract`'s for an entry that had none), which
+    /// they then share.
+    pub fn set_object(&mut self, start: u64, end: u64, obj: u64, offset: u64) {
+        self.clip_range(start, end);
+        let starts: Vec<u64> = self.ranges.range(start..end).map(|(&s, _)| s).collect();
+        for s in starts {
+            if let Some(e) = self.ranges.get(&s).copied() {
+                let attrs = Attrs { obj, cow: false, shared: true, ..e.attrs };
+                self.put(s, Entry { attrs, offset: offset + (s - start), ..e });
+            }
+        }
+        self.alt_changed();
+    }
+
     /// The entries in `[start, end)`, clipped to it, each with its offset in
     /// its object: what [`Map::restore`] puts back.
     pub fn snapshot(&self, start: u64, end: u64) -> Vec<(u64, u64, Attrs, u64)> {

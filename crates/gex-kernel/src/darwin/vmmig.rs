@@ -77,9 +77,14 @@ pub(super) fn routine(k: &mut Kernel, obj: &Kobject, id: i32, req: &Kmsg) -> Opt
 
 /// The named entry a port is (`mach_memory_entry_from_port`), if any.
 fn entry_of(k: &mut Kernel, right: Option<Carried>) -> Option<super::vmentry::NamedEntry> {
+    entry_and_port(k, right).map(|(_, _, e)| e)
+}
+
+/// The named entry a port is, with its id and the port.
+fn entry_and_port(k: &mut Kernel, right: Option<Carried>) -> Option<(u64, super::ipc::ObjId, super::vmentry::NamedEntry)> {
     let Some(Carried::Port(p)) = right else { return None };
     match k.ipc().port(p).kobject {
-        Some(Kobject::NamedEntry(id)) => super::vmentry::get(id),
+        Some(Kobject::NamedEntry(id)) => super::vmentry::get(id).map(|e| (id, p, e)),
         _ => None,
     }
 }
@@ -90,9 +95,10 @@ fn make_memory_entry(k: &mut Kernel, req: &Kmsg) -> Reply {
     let (Some(size), Some(offset), Some(permission)) = (word64(req, 0), word64(req, 2), word(req, 4)) else { return Reply::err(MIG_BAD_ARGUMENTS) };
     let Some(super::ipc::msg::Desc::Port { right, disp, .. }) = req.descs.first() else { return Reply::err(MIG_BAD_ARGUMENTS) };
     let (right, disp) = (*right, *disp);
-    let parent = entry_of(k, right);
+    let parent = entry_and_port(k, right);
+    let parent_port = parent.as_ref().map(|&(_, p, _)| p);
     let mut size = size;
-    let made = match k.darwin_own_memory(|k, m| k.darwin_make_memory_entry(m, &mut size, offset, permission, parent)) {
+    let made = match k.darwin_own_memory(|k, m| k.darwin_make_memory_entry(m, &mut size, offset, permission, parent.map(|(id, _, e)| (id, e)))) {
         Ok(r) => r,
         Err(reply) => return reply,
     };
@@ -112,6 +118,15 @@ fn make_memory_entry(k: &mut Kernel, req: &Kmsg) -> Reply {
             ipc.port_mut(port).owner = 0;
             ipc.make_send(port);
             ipc.port_mut(port).nsrequest_kobject = true;
+            let mut r = Reply::port(Carried::Port(port));
+            r.out = out;
+            r
+        }
+        // The parent's port again, a send right more
+        // (ipc_port_copy_send_any).
+        super::vmentry::Made::Reuse(_) => {
+            let Some(port) = parent_port else { return Reply::err(kr::FAILURE as i32) };
+            k.ipc().copy_send(port);
             let mut r = Reply::port(Carried::Port(port));
             r.out = out;
             r

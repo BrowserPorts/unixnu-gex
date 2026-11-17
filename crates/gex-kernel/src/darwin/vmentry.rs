@@ -42,8 +42,9 @@ pub mod map_mem {
 
 /// `VM_PROT_IS_MASK`.
 pub const VM_PROT_IS_MASK: u32 = 0x40;
-/// `ANON_MAX_SIZE` on LP64.
-const ANON_MAX_SIZE: u64 = 0xFFFF_F000;
+/// `ANON_MAX_SIZE` of a 16 KiB-page kernel (`ANON_MAX_PAGES <<
+/// PAGE_SHIFT`, 0xFFFFFFFF pages: the compressor pager's page numbers).
+const ANON_MAX_SIZE: u64 = 0xFFFF_FFFF << 14;
 
 const KERN_PROTECTION_FAILURE: u64 = 2;
 const KERN_INVALID_VALUE: u64 = 18;
@@ -72,6 +73,8 @@ pub struct NamedEntry {
     pub needs_copy: bool,
     /// `is_fully_owned`: every object it names has an owner.
     pub fully_owned: bool,
+    /// `access`: the cache mode its maker asked for (`MAP_MEM_*`).
+    pub access: u32,
 }
 
 fn entries() -> &'static Mutex<HashMap<u64, NamedEntry>> {
@@ -97,6 +100,24 @@ pub fn no_senders(id: u64) {
 
 /// A new entry, which holds the reference to its object its maker gave
 /// it.
+/// `MAP_MEM_ONLY`'s change of entry `id`'s `access`.
+fn set_access(id: u64, access: u32) {
+    if let Some(e) = entries().lock().unwrap_or_else(|e| e.into_inner()).get_mut(&id) {
+        e.access = access;
+    }
+}
+
+/// `vm_prot_to_wimg` of `access` over `cache` (the object's): the mode it
+/// sets, or the one there for MAP_MEM_NOOP and an unknown one.
+fn cache_of(access: u32, cache: u32) -> u32 {
+    use map_mem::*;
+    match access {
+        COPYBACK => NOOP,
+        2..=9 => access,
+        _ => cache,
+    }
+}
+
 fn insert(e: NamedEntry) -> u64 {
     let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     entries().lock().unwrap_or_else(|e| e.into_inner()).insert(id, e);
@@ -107,6 +128,8 @@ fn insert(e: NamedEntry) -> u64 {
 /// parent's again.
 pub enum Made {
     New(u64),
+    /// MAP_MEM_NAMED_REUSE: the parent itself, a send right more.
+    Reuse(u64),
     /// `MAP_MEM_NAMED_CREATE` of no size: success, and no entry.
     Nothing,
 }
@@ -134,7 +157,11 @@ impl Kernel {
     /// `mach_make_memory_entry_64(target, &size, offset, permission,
     /// parent)`: a new entry, and the size it names past its data's
     /// offset.
-    pub(crate) fn darwin_make_memory_entry(&mut self, m: &mut GuestMem<'_>, size: &mut u64, offset: u64, permission: u32, parent: Option<NamedEntry>) -> Result<Made, u64> {
+    pub(crate) fn darwin_make_memory_entry(&mut self, m: &mut GuestMem<'_>, size: &mut u64, offset: u64, permission: u32, parent: Option<(u64, NamedEntry)>) -> Result<Made, u64> {
+        let (parent_id, parent) = match parent {
+            Some((id, e)) => (Some(id), Some(e)),
+            None => (None, None),
+        };
         use map_mem::*;
         if (permission & FLAGS_MASK) & !FLAGS_USER != 0 {
             return Err(KERN_INVALID_VALUE);
@@ -153,13 +180,26 @@ impl Kernel {
         let use_4k = permission & DATA_ADDR_4K != 0;
         let map_start = offset & !PAGE_MASK;
         let round = |a: u64| a.checked_add(PAGE_MASK).map(|v| v & !PAGE_MASK);
+        // MAP_MEM_ONLY: the parent object's cache mode changed, no entry
+        // made.
         if permission & ONLY != 0 {
-            self.darwin_unimplemented("mach_make_memory_entry_64 with MAP_MEM_ONLY (a parent object's cache mode)".into());
-            return Err(kr::FAILURE);
-        }
-        if access != NOOP && access != COPYBACK {
-            self.darwin_unimplemented(format!("a memory entry's cache mode {access} (an object's wimg bits)"));
-            return Err(kr::FAILURE);
+            let Some(map_end) = offset.checked_add(*size) else { return Err(kr::INVALID_ARGUMENT) };
+            let map_end = round(map_end).unwrap_or(0);
+            if map_end == 0 && *size != 0 {
+                return Err(kr::INVALID_ARGUMENT);
+            }
+            let (Some(pid), Some(p)) = (parent_id, parent.as_ref()) else { return Err(kr::INVALID_ARGUMENT) };
+            if use_data_addr || use_4k || p.is_copy {
+                return Err(kr::INVALID_ARGUMENT);
+            }
+            if access != p.access && p.protection & prot::WRITE as u32 == 0 {
+                return Err(kr::INVALID_RIGHT);
+            }
+            if access != NOOP {
+                set_access(pid, access);
+                super::vmobject::with(p.obj, |o| o.cache = cache_of(access, o.cache));
+            }
+            return Ok(Made::Nothing);
         }
         if permission & NAMED_CREATE != 0 {
             let Some(map_end) = offset.checked_add(*size).and_then(round) else { return Err(kr::INVALID_ARGUMENT) };
@@ -191,7 +231,8 @@ impl Kernel {
                     super::vmobject::release(obj);
                     return Err(kr::FAILURE);
                 };
-                let e = NamedEntry { obj, hold, offset: 0, size: map_size, data_offset: 0, protection: protections, is_copy: false, internal: true, needs_copy: false, fully_owned: true };
+                super::vmobject::with(obj, |o| o.cache = cache_of(access, o.cache));
+                let e = NamedEntry { obj, hold, offset: 0, size: map_size, data_offset: 0, protection: protections, is_copy: false, internal: true, needs_copy: false, fully_owned: true, access };
                 *size = e.size;
                 return Ok(Made::New(insert(e)));
             }
@@ -201,7 +242,8 @@ impl Kernel {
             };
             let hold = Arc::new(Hold { addr, len: map_size });
             let obj = super::vmobject::allocate(map_size, super::vmobject::Pager::Anon, Some(Arc::clone(&hold)));
-            let e = NamedEntry { obj, hold, offset: 0, size: map_size, data_offset: 0, protection: protections, is_copy: false, internal: true, needs_copy: false, fully_owned: false };
+            super::vmobject::with(obj, |o| o.cache = cache_of(access, o.cache));
+            let e = NamedEntry { obj, hold, offset: 0, size: map_size, data_offset: 0, protection: protections, is_copy: false, internal: true, needs_copy: false, fully_owned: false, access };
             *size = e.size;
             return Ok(Made::New(insert(e)));
         }
@@ -215,16 +257,12 @@ impl Kernel {
         };
         if permission & VM_COPY != 0 || permission & VM_SHARE != 0 || parent.is_none() || permission & NAMED_REUSE != 0 {
             let Some(map_end) = offset.checked_add(*size).and_then(round) else { return Err(kr::INVALID_ARGUMENT) };
-            let mut map_size = map_end - map_start;
+            let map_size = map_end - map_start;
             if map_size == 0 || map_end == 0 {
                 return Err(kr::INVALID_ARGUMENT);
             }
             let offset_in_page = data_offset(map_start);
             let copy = permission & VM_COPY != 0;
-            if !copy && permission & NAMED_REUSE != 0 && parent.is_some() {
-                self.darwin_unimplemented("MAP_MEM_NAMED_REUSE (whether the range is still its parent entry's object)".into());
-                return Err(kr::FAILURE);
-            }
             // vm_map_copyin of the range (a copy needs it readable), or
             // vm_map_copy_extract of it shared, its protections checked
             // (or, as a mask, narrowed) as the extract finds them.
@@ -255,9 +293,10 @@ impl Kernel {
                     return Err(KERN_PROTECTION_FAILURE);
                 }
             }
-            // The default: one object, the first entry's (vmkf_copy_single_object).
+            // The default: one object, the first entry's
+            // (vmkf_copy_single_object): the entry names it as it is.
             if !copy && permission & VM_SHARE == 0 {
-                map_size = pieces[0].len;
+                return self.darwin_entry_of_object(m, size, map_start, pieces[0], offset_in_page, protections, access, permission & NAMED_REUSE != 0, parent_id.zip(parent));
             }
             let Some(addr) = crate::host_hold(map_size as usize) else {
                 self.darwin_unimplemented("a named memory entry of a task's range on a host that holds no pages apart from a task's".into());
@@ -284,7 +323,7 @@ impl Kernel {
             // is_fully_owned: of a share's entries, each one's object has an
             // owner (a copy's objects are new).
             let fully_owned = !copy && pieces.iter().take_while(|x| x.off < map_size).all(|x| super::vmobject::with(x.attrs.obj, |o| o.purg.as_ref().is_some_and(|p| p.owner.is_some())).unwrap_or(false));
-            let e = NamedEntry { obj, hold, offset: 0, size: map_size, data_offset: offset_in_page, protection: protections, is_copy: copy || permission & VM_SHARE != 0, internal, needs_copy: copy, fully_owned };
+            let e = NamedEntry { obj, hold, offset: 0, size: map_size, data_offset: offset_in_page, protection: protections, is_copy: copy || permission & VM_SHARE != 0, internal, needs_copy: copy, fully_owned, access: 0 };
             *size = e.size - e.data_offset;
             return Ok(Made::New(insert(e)));
         }
@@ -323,7 +362,63 @@ impl Kernel {
             return Err(KERN_PROTECTION_FAILURE);
         }
         super::vmobject::reference(p.obj);
-        let e = NamedEntry { obj: p.obj, hold: Arc::clone(&p.hold), offset: p.offset + map_start, size: map_size, data_offset: offset_in_page, protection: protections, is_copy: false, internal: p.internal, needs_copy: false, fully_owned: p.fully_owned };
+        if access != NOOP {
+            super::vmobject::with(p.obj, |o| o.cache = cache_of(access, o.cache));
+        }
+        let e = NamedEntry { obj: p.obj, hold: Arc::clone(&p.hold), offset: p.offset + map_start, size: map_size, data_offset: offset_in_page, protection: protections, is_copy: false, internal: p.internal, needs_copy: false, fully_owned: p.fully_owned, access };
+        *size = e.size - e.data_offset;
+        Ok(Made::New(insert(e)))
+    }
+
+    /// The default entry of `[map_start, map_start + x.len)`, the first
+    /// source entry's piece `x`: its object, named (`is_object`): the
+    /// entry's own where it has one (a named entry's, a POSIX shared memory
+    /// object's, a purgeable one's), else one made now for the whole entry,
+    /// its pages the entry's, which the entry then names
+    /// (`vm_map_copy_extract`'s VME_OBJECT_SET, the copy-on-write a write
+    /// would make resolved first). With MAP_MEM_NAMED_REUSE, a parent that
+    /// names the same object at the same place and size is given back.
+    #[allow(clippy::too_many_arguments)]
+    fn darwin_entry_of_object(&mut self, m: &mut GuestMem<'_>, size: &mut u64, map_start: u64, x: super::vmshare::Extracted, offset_in_page: u64, protections: u32, access: u32, reuse: bool, parent: Option<(u64, NamedEntry)>) -> Result<Made, u64> {
+        let map_size = x.len;
+        let own = super::vmobject::with(x.attrs.obj, |o| o.hold.clone()).flatten().filter(|_| !x.attrs.cow);
+        let (obj, obj_off, hold) = match own {
+            Some(hold) => {
+                super::vmobject::reference(x.attrs.obj);
+                (x.attrs.obj, x.obj_off, hold)
+            }
+            None => {
+                let Some(e0) = self.dtask.vm.at_or_after(map_start).filter(|e| e.start <= map_start) else { return Err(kr::INVALID_ADDRESS) };
+                let len = e0.end - e0.start;
+                let Some(addr) = crate::host_hold(len as usize) else {
+                    self.darwin_unimplemented("a named memory entry of a task's range on a host that holds no pages apart from a task's".into());
+                    return Err(kr::FAILURE);
+                };
+                let hold = Arc::new(Hold { addr, len });
+                let Some(src) = m.host_addr(e0.start, len) else { return Err(kr::FAILURE) };
+                if !crate::host_remap(addr, src, len as usize, false) {
+                    self.darwin_unimplemented("a named memory entry of a task's range on a host that cannot map its pages twice".into());
+                    return Err(kr::FAILURE);
+                }
+                let obj = super::vmobject::allocate(len, super::vmobject::Pager::Anon, Some(Arc::clone(&hold)));
+                self.dtask.vm.lock().set_object(e0.start, e0.end, obj, 0);
+                (obj, map_start - e0.start, hold)
+            }
+        };
+        if reuse {
+            if let Some((pid, p)) = parent.filter(|(_, p)| !p.is_copy) {
+                if p.obj == obj && p.offset == obj_off && p.offset == 0 && p.size == map_size && p.data_offset == offset_in_page {
+                    super::vmobject::release(obj);
+                    *size = p.size - p.data_offset;
+                    return Ok(Made::Reuse(pid));
+                }
+            }
+        }
+        if access != map_mem::NOOP {
+            super::vmobject::with(obj, |o| o.cache = cache_of(access, o.cache));
+        }
+        let fully_owned = super::vmobject::with(obj, |o| o.purg.as_ref().is_some_and(|p| p.owner.is_some())).unwrap_or(false);
+        let e = NamedEntry { obj, hold, offset: obj_off, size: map_size, data_offset: offset_in_page, protection: protections, is_copy: false, internal: true, needs_copy: false, fully_owned, access };
         *size = e.size - e.data_offset;
         Ok(Made::New(insert(e)))
     }

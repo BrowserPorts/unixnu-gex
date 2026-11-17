@@ -46,6 +46,7 @@
 //! size, snapshots, chunk-info address blocks, Fusion.
 
 use super::btree::{self, Store, Tree};
+use super::fxc::{self, Fxc};
 use super::container::{Formatted, Layout, NX_CLEANLY_UNMOUNTED};
 use super::node::{tree_flags, Node, Shape};
 use super::{put_header, set_checksum, Put, Sink};
@@ -216,6 +217,10 @@ pub struct Nx<'a> {
     pub vols: BTreeMap<usize, Vol>,
     rw_mounted: bool,
     sb_copy: Vec<u8>,
+    /// The free-extent cache (built at the read-write mount) and the
+    /// roving data pointer (`sm + 0x3e0`, zero at each mount).
+    fxc: Option<Fxc>,
+    rove: u64,
 }
 
 fn u64a(b: &[u8], o: usize) -> u64 {
@@ -317,6 +322,8 @@ impl<'a> Nx<'a> {
             vols: BTreeMap::new(),
             rw_mounted: false,
             sb_copy,
+            fxc: None,
+            rove: 0,
         })
     }
 
@@ -373,6 +380,17 @@ impl<'a> Nx<'a> {
             self.classes[1] = Class { start: mid, end, cursor: mid, state: 0, enabled: true };
         }
         self.ip_cursor = 0;
+        // The roving pointer starts at zero (a zeroed space manager) and
+        // leaves the metazone (I:0x100007e8c); the free-extent cache is
+        // filled from the bitmaps (`spaceman_scan_free_blocks`,
+        // I:0x100043910, K:0xfffffff0067532c8).
+        self.rove = 0;
+        if let Some((start, _, end)) = self.l.metazone() {
+            if (start..end).contains(&self.rove) {
+                self.rove = if end == self.l.blocks { 0 } else { end };
+            }
+        }
+        self.fxc = Some(self.scan_free()?);
         self.wrote_checkpoint = false;
         self.rw_mounted = true;
         Ok(())
@@ -617,6 +635,7 @@ impl<'a> Nx<'a> {
             return Err("not implemented: draining the main free queue for a metadata allocation".into());
         };
         self.modify_bits(b, 1, true)?;
+        self.fxc_remove(b, 1);
         let end = if b + 1 >= self.l.blocks { 0 } else { b + 1 };
         let c = &mut self.classes[idx.min(2)];
         if c.start <= end && end < c.end {
@@ -640,6 +659,118 @@ impl<'a> Nx<'a> {
     /// One block of metadata from the upper metazone class.
     pub fn alloc_meta(&mut self) -> Result<u64, String> {
         self.alloc_meta_class(1)
+    }
+
+    fn fxc_remove(&mut self, b: u64, n: u64) {
+        if let Some(f) = self.fxc.as_mut() {
+            f.remove(b, n);
+        }
+    }
+
+    /// The free-extent cache filled from the bitmaps: every maximal free
+    /// run, a wholly free chunk as one, runs merged across chunk
+    /// boundaries (I:0x1000421fc).
+    fn scan_free(&mut self) -> Result<Fxc, String> {
+        let bpc = self.l.blocks_per_chunk;
+        let mut f = Fxc::new(self.l.blocks);
+        let mut run: Option<u64> = None;
+        for c in 0..self.chunks.len() {
+            let base = c as u64 * bpc;
+            let cnt = (self.l.blocks - base).min(bpc);
+            if self.chunks[c].free == cnt {
+                run.get_or_insert(base);
+                continue;
+            }
+            if self.chunks[c].free == 0 {
+                if let Some(s) = run.take() {
+                    f.insert(s, base - s);
+                }
+                continue;
+            }
+            let bm = self.bitmap(c)?.ok_or("a partly used chunk with no bitmap")?.clone();
+            for i in 0..cnt {
+                let used = bm[(i / 8) as usize] & (1 << (i % 8)) != 0;
+                match (used, run) {
+                    (false, None) => run = Some(base + i),
+                    (true, Some(s)) => {
+                        f.insert(s, base + i - s);
+                        run = None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(s) = run {
+            f.insert(s, self.l.blocks - s);
+        }
+        Ok(f)
+    }
+
+    /// What the free-extent cache's search clips: the metazone (to the
+    /// upper class's end) and the allocation zones' current chunks.
+    fn clip(&self) -> fxc::Clip {
+        let metazone = self.classes[0].enabled.then(|| (self.classes[0].start, self.classes[1].end));
+        let mut zones = [None; 4];
+        for (z, &(s, e)) in self.datazone.iter().enumerate() {
+            if e != 0 {
+                zones[z] = Some((s, e));
+            }
+        }
+        fxc::Clip { metazone, zones }
+    }
+
+    /// `spaceman_alloc` (I:0x100044290, K:0xfffffff0067535b0) of `count`
+    /// data blocks with no hint and a count taken back (the kernel's
+    /// `fs_make_hole_range_writable`, K:0xfffffff00670afbc): the free-extent
+    /// cache's best fit from the roving pointer, which then moves to the
+    /// allocation's end. Where they go and how many: fewer than asked when
+    /// nothing larger is free.
+    pub fn alloc_data(&mut self, count: u64) -> Result<(u64, u64), String> {
+        if count == 0 {
+            return Err("a data allocation of no blocks".into());
+        }
+        if (1..=4).contains(&count) && self.datazone[count as usize - 1].1 != 0 {
+            return Err(format!("not implemented: a {count}-block data allocation (the allocation zone's chunk words and refresh, I:0x100009014)"));
+        }
+        // The space and reserve checks (I:0x1000447cc..0x1000449d8) are not
+        // transcribed: refused wherever they could bind.
+        let held = self.reserve.0.saturating_sub(self.reserve.1);
+        if count + held + self.fq[FQ_MAIN].count + self.fq[FQ_IP].count >= self.sm_free {
+            return Err("not implemented: a data allocation the space manager's free-space and reserve checks may limit".into());
+        }
+        let clip = self.clip();
+        let f = self.fxc.as_ref().ok_or("a data allocation with no free-extent cache (the container not mounted read-write)")?;
+        if f.total() != self.sm_free {
+            return Err("not implemented: a data allocation with a free-extent cache that does not hold every free block (its rescan heuristic, I:0x10000db70)".into());
+        }
+        let found = f.search(self.rove, count, fxc::flags::PARTIAL | fxc::flags::AVOID, &clip)?;
+        let (start, got) = found.map_err(|_| "not implemented: a data allocation the free-extent cache cannot place (the chunk scan and the free queues' drain)".to_string())?;
+        if got == 0 {
+            return Err("not implemented: a data allocation the free-extent cache gives nothing for (the chunk scan)".into());
+        }
+        self.modify_bits(start, got, true)?;
+        self.fxc_remove(start, got);
+        let end = if start + got >= self.l.blocks { 0 } else { start + got };
+        self.rove = end;
+        // The roving pointer leaves a flagged chunk by the bitmap-hint
+        // search (I:0x100009498, I:0x100046da8), not transcribed.
+        let in_meta = clip.metazone.is_some_and(|(s, e)| (s..e).contains(&end));
+        let bpc = self.l.blocks_per_chunk;
+        let in_zone = clip.zones.iter().flatten().any(|&(s, _)| s / bpc == end / bpc);
+        if in_meta || in_zone {
+            return Err("not implemented: the roving data pointer ending in the metazone or an allocation zone's chunk (the bitmap-hint search, I:0x100046da8)".into());
+        }
+        Ok((start, got))
+    }
+
+    /// The roving data pointer.
+    pub fn rove(&self) -> u64 {
+        self.rove
+    }
+
+    /// The free-extent cache's extents.
+    pub fn free_extents(&self) -> Vec<fxc::Ext> {
+        self.fxc.as_ref().map(|f| f.extents()).unwrap_or_default()
     }
 
     // ---- The free queues.
@@ -763,6 +894,9 @@ impl<'a> Nx<'a> {
                 }
             } else {
                 self.modify_bits(p, n, false)?;
+                if let Some(f) = self.fxc.as_mut() {
+                    f.insert(p, n);
+                }
             }
             self.fq[q].count -= n;
             released += n;
@@ -1308,6 +1442,33 @@ impl<'a> Nx<'a> {
         if let Some(v) = self.vols.get_mut(&index) {
             v.fs_tree = t;
         }
+    }
+
+    /// Volume `index`'s extent-reference tree and its nodes.
+    pub fn extentref_tree(&mut self, index: usize) -> Result<(Tree, PhysStore<'_, 'a>), String> {
+        let t = self.vols.get(&index).ok_or_else(|| format!("no volume in slot {index}"))?.extentref;
+        Ok((t, PhysStore { nx: self, subtype: BLOCKREFTREE, class: 1 }))
+    }
+
+    /// Volume `index`'s extent-reference tree after a change: the
+    /// superblock names its root by address.
+    pub fn set_extentref_tree(&mut self, index: usize, t: Tree) -> Result<(), String> {
+        let v = self.vols.get_mut(&index).ok_or_else(|| format!("no volume in slot {index}"))?;
+        let moved = v.extentref.root != t.root;
+        v.extentref = t;
+        if moved {
+            self.vol_sb(index)?.put64(0x90, t.root);
+        }
+        Ok(())
+    }
+
+    /// File data written to blocks from `paddr` (data blocks go to the
+    /// device as written, not through the object cache).
+    pub fn write_data(&self, paddr: u64, buf: &[u8]) -> Result<(), String> {
+        if paddr == 0 || paddr + (buf.len() as u64).div_ceil(self.l.bs) > self.l.blocks {
+            return Err(format!("file data at block {paddr} outside the container"));
+        }
+        self.sink.write_at(paddr * self.l.bs, buf)
     }
 }
 

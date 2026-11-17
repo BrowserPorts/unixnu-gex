@@ -213,13 +213,19 @@ pub fn build_disk0_with(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() ->
         let user = slot(&nx, o)?;
         fsops::mount_rw(&mut nx, user, now)?;
         configure_data_volumes(&mut nx, system, data, user, now, &mut missing)?;
-        missing.push("the System volume after apfs_invert and the reaping of its old trees: (once Data and User exist) the data-volume trees' removal (restored_external's fixup_var), /private/xarts, apfs_sealvolume to the signed root hash, and the com.apple.os.update- snapshot".into());
+        // reserve_overprov_space (0x1000184ec → 0x10002e5bc, erase only):
+        // the disk's size from the whole-disk node's block size and count.
+        fsops::reserve_overprov_space(&mut nx, data, storage::disk0_bytes(), crate::darwin::storagestack::container_unmap(), now)?;
     }
     if os.is_none() {
         missing.push("the Data and User volumes (newfs_apfs -P), made after apfs_invert".into());
     }
     // 7.
-    missing.push("the restore's later writes to Preboot (install_kernel_cache's boot objects, populate_preboot_volume, install_splat's cryptex1) and Data's contents".into());
+    missing.push(if os.is_some() {
+        "the restore's later steps, in its order: install_kernel_cache's list (kernelcache, devicetree, iBoot, root_hash Image4 files and the AP ticket on Preboot and Hardware: personalized by the host, the large files' block maps following the device's cluster I/O size, drafts/s23/re-kernelcache.md), check_mounted's fixup_var (aks_bootstrap_fs of /mnt2 and BOM's copy of /private/var interleaved with remove_moved_trees), the mountpoints (/mnt1/private/xarts, /mnt2/hardware, MobileSoftwareUpdate, internal), populate_preboot_volume, apfs_sealvolume and the update snapshot".into()
+    } else {
+        "the restore's later writes to Preboot (install_kernel_cache's boot objects, populate_preboot_volume, install_splat's cryptex1) and Data's contents".into()
+    });
     // The kernel's own counting of the checksums it sets (its kext has
     // sites newfs_apfs's copy does not) and whether its read-write mount's
     // block-0 write has the newest mounting version are not traced.
@@ -1429,11 +1435,13 @@ mod tests {
         let com = c.omap().unwrap();
         let sb_paddr = com.lookup(&c, c.nx.fs_oid[1], c.xid()).unwrap().unwrap().paddr;
         let sb = c.read_raw(sb_paddr).unwrap();
-        assert_eq!((q(&sb, 0x28), q(&sb, 0x30), q(&sb, 0x38), q(&sb, 0x108), q(&sb, 0x58)), (2, 0xc, 0x2c8, 0x100, 7));
+        assert_eq!((q(&sb, 0x28), q(&sb, 0x30), q(&sb, 0x38), q(&sb, 0x108), q(&sb, 0x58)), (2, 0xc, 0x2c8, 0x100, 7 + 156_250));
         assert_eq!(&sb[0x60..0x74], &[5, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 0xcd, 0x01, 0x48, 0x15, 1, 0, 0, 0][..]);
         // The mount: the epoch, then the pfkur thread's inode 0x10; then
-        // /keybags (0x11) and usersession.kb (0x12).
-        assert_eq!((q(&sb, 0xb0), q(&sb, 0x3d8), q(&sb, 0xb8), u32::from_le_bytes(sb[0x428..0x42c].try_into().unwrap())), (0x13, 0x10, 1, 0x10));
+        // /keybags (0x11), usersession.kb (0x12) and the overprovisioning
+        // file (0x13: one contiguous unwritten extent of 156,250 blocks,
+        // trimmed when the device answers DK_FEATURE_UNMAP).
+        assert_eq!((q(&sb, 0xb0), q(&sb, 0x3d8), q(&sb, 0xb8), u32::from_le_bytes(sb[0x428..0x42c].try_into().unwrap())), (0x14, 0x10, 2, 0x10));
         let pfkur = c.read_raw(q(&sb, 0x418)).unwrap();
         assert_eq!((u32::from_le_bytes(pfkur[24..28].try_into().unwrap()), u32::from_le_bytes(pfkur[28..32].try_into().unwrap())), (0x4000_0002, 0x20));
         let usb = c.read_raw(com.lookup(&c, c.nx.fs_oid[6], c.xid()).unwrap().unwrap().paddr).unwrap();
@@ -1479,6 +1487,11 @@ mod tests {
         assert_eq!((q(ino, 0), q(ino, 0x30), u32::from_le_bytes(ino[0x3c..0x40].try_into().unwrap()), u16::from_le_bytes([ino[0x50], ino[0x51]])), (3, 0x8000, 0, 0o100600));
         assert_eq!(q(&ino[ino.len() - 0x28..], 0x10), u64::MAX, "the stream's default crypto identifier");
         assert!(recs.iter().any(|(k, v)| k[..] == (0x10u64 | 6 << 60).to_le_bytes() && v[..4] == 1u32.to_le_bytes()));
+        let op = &recs.iter().find(|(k, _)| k[..] == (0x13u64 | 3 << 60).to_le_bytes()).expect("the overprovisioning file").1;
+        let trimmed = if crate::darwin::storagestack::container_unmap() { 0x800 } else { 0 };
+        assert_eq!((q(op, 0x30), u32::from_le_bytes(op[0x3c..0x40].try_into().unwrap())), (0x800_8000 | trimmed, 3));
+        let fx = &recs.iter().find(|(k, _)| k.len() == 16 && q(k, 0) == (0x13 | 8 << 60)).expect("its extent").1;
+        assert_eq!((q(fx, 0), q(fx, 16)), (0x0300_0000_2625_a000, q(fx, 8)));
         // The keybag: its block from the checkpoint's nx_keylocker.
         let latest = (0..u64::from(c.nx.xp_desc_blocks & 0x7fff_ffff)).map(|i| raw(c.nx.xp_desc_base + i)).filter(|b| &b[32..36] == b"NXSB").max_by_key(|b| q(b, 16)).unwrap();
         let (kb, kn) = (q(&latest, 0x510), q(&latest, 0x518));

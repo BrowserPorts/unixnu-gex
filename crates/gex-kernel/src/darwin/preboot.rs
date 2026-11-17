@@ -140,8 +140,9 @@ pub enum Ticket {
     /// The device's own, a file the owner copied from its Preboot volume
     /// (GEX_DARWIN_CRYPTEX1_TICKET=path).
     File(String),
-    /// The web device's own platform's (GEX_DARWIN_CRYPTEX1_TICKET=web-device),
-    /// which is not implemented: looking it up is reported.
+    /// The web device's own (GEX_DARWIN_CRYPTEX1_TICKET=web-device): the one
+    /// its manifest key signed for it ([`super::webdevice`]), when it has
+    /// one; looking it up is reported when it has none.
     WebDevice,
 }
 
@@ -173,6 +174,9 @@ pub struct Sources {
     /// nonce in its NVRAM, a measured input ([`cryptex1_boot_nonce_hash`]).
     pub nonce_hash: Option<String>,
     pub host: Option<Host>,
+    /// The web device the system boots as (GEX_DARWIN_WEB_DEVICE), with
+    /// [`Ticket::WebDevice`].
+    pub web_device: Option<super::webdevice::WebDevice>,
 }
 
 static SOURCES: OnceLock<Sources> = OnceLock::new();
@@ -194,6 +198,9 @@ pub fn set_sources(s: Sources) -> Result<(), String> {
 /// while the device has not rolled the nonce since the restore, it is the
 /// device's ticket's `cnch`.
 pub fn cryptex1_boot_nonce_hash() -> Result<Vec<u8>, String> {
+    if super::webdevice::get().is_some() {
+        return Err("the measured cryptex1 boot nonce hash of a device of Apple's: the web device makes its own".to_string());
+    }
     let Some(hex) = sources().nonce_hash.as_deref() else {
         return Err("the device's cryptex1 boot nonce hash (its AppleImage4's hash of the cryptex1 boot nonce in its NVRAM nonce-seeds, entangled with its UID key when asked: a measured input, GEX_DARWIN_CRYPTEX1_NONCE_HASH, is not configured)".to_string());
     };
@@ -359,7 +366,10 @@ fn cryptex1_unmodelled(rel: &str, listing: bool) -> Option<String> {
     let why = match &s.ticket {
         Ticket::File(_) => return None,
         Ticket::Unset => "no source of it is configured (GEX_DARWIN_CRYPTEX1_TICKET: the device's own ticket file, or web-device)",
-        Ticket::WebDevice => "the web device's own platform, whose tickets are not implemented",
+        Ticket::WebDevice => match &s.web_device {
+            Some(w) if w.ticket.is_some() => return None,
+            _ => "the web device has none: its manifest key has not signed one for it (gexc darwin-web-ticket)",
+        },
     };
     let name = match ticket_name() {
         Ok(n) => n,
@@ -435,8 +445,13 @@ fn lay_cryptex1(fs: &crate::vfs::tmpfs::TmpFs, s: &Sources, t: &[super::iokit::N
     fs.add_file(&at, restore_manifest(identity));
     fs.set_times_now(&at, Some((made, 0)), Some((made, 0)), made).map_err(|e| format!("the Preboot volume's {at}: {e:?}"))?;
     record(fs, &at, &file_owned(FOUNDATION_MODE))?;
-    if let Ticket::File(path) = &s.ticket {
-        let bytes = host_read(h, path).map_err(|e| format!("the Cryptex1 ticket GEX_DARWIN_CRYPTEX1_TICKET names: {e}"))?;
+    let ticket = match (&s.ticket, &s.web_device) {
+        (Ticket::File(path), _) => Some(path),
+        (Ticket::WebDevice, Some(w)) => w.ticket.as_ref(),
+        _ => None,
+    };
+    if let Some(path) = ticket {
+        let bytes = host_read(h, path).map_err(|e| format!("the Cryptex1 ticket {path}: {e}"))?;
         let at = format!("{}/{}", cryptex1::CURRENT, ticket_name_of(t)?);
         fs.add_file(&at, bytes);
         fs.set_times_now(&at, Some((made, 0)), Some((made, 0)), made).map_err(|e| format!("the Preboot volume's {at}: {e:?}"))?;
@@ -590,7 +605,7 @@ mod tests {
         let m = Value::Dict(vec![("BuildIdentities".into(), Value::Array(vec![identity.clone()]))]);
         std::fs::write(dir.join("BuildManifest.plist"), plist::to_xml(&m)).unwrap();
         let d = dir.to_str().unwrap().to_string();
-        let s = Sources { restore: Some(d.clone()), ticket: Ticket::File(format!("{d}/ticket")), nonce_hash: None, host: Some(Host { size: host_size, read: host_read, sha384: None }) };
+        let s = Sources { restore: Some(d.clone()), ticket: Ticket::File(format!("{d}/ticket")), nonce_hash: None, host: Some(Host { size: host_size, read: host_read, sha384: None }), web_device: None };
         let system = |p: &str| -> Result<Option<(Vec<u8>, Owned)>, String> {
             Ok(p.ends_with("SystemVersion.plist").then(|| (b"<plist/>".to_vec(), Owned { uid: 0, gid: 0, mode: 0o444, flags: 0x40 | 0x20 })))
         };

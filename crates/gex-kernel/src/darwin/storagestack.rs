@@ -503,6 +503,7 @@ pub fn unmeasured() -> Vec<String> {
     if CONTAINER_STATUS.is_none() {
         gaps.push(format!("the AppleAPFSContainer's Status (stand-in {STAND_IN_CONTAINER_STATUS:?}; measure {CONTAINER_STATUS_MEASUREMENT})"));
     }
+    gaps.push("the storage statistics count the disk nodes' requests only: the APFS container's own I/O at its start and the volumes' mounts (all 35 of its counters) is not modelled".into());
     if PCI_DEVICE_FACTS.is_none() {
         gaps.push(format!("the PCIe functions' configuration space (stand-in: the NAND controller 106b:2002, the root port 0:0, revisions 0, no subsystem IDs, PCIe capability version 2, links at 8 GT/s x1, root port subordinate bus 1; measure {PCI_MEASUREMENT})"));
     }
@@ -1024,10 +1025,15 @@ fn container_status() -> &'static str {
 
 /// The storage's I/O counters, as the drivers keep them and publish them
 /// in their Statistics dictionaries, each a live view of these counts.
-/// The disk I/O that moves them goes through [`driver_transfer`],
-/// [`driver_retry`], [`driver_error`], [`scheme_transfer`] and
-/// [`container_count`]; until the disk nodes do I/O none moves, and every
-/// count is zero.
+/// The disk nodes' requests move them ([`super::disknode`]): through
+/// [`driver_transfer`] and [`driver_error`] for every request that reaches
+/// the medium, and [`scheme_transfer`] for the container's. The APFS
+/// container's own I/O (its start, the volumes' mounts, its object cache
+/// and transactions), which [`container_count`] and the other two would
+/// count, is not modelled: the volumes are not mounted from the container
+/// yet, and that gap is reported at start ([`unmeasured`]).
+/// `IOBlockStorageDriver::incrementRetries` has no caller in the family;
+/// [`driver_retry`] is for a device driver that retries.
 pub mod stats {
     use super::{key, num64, Node, Prop};
     use std::sync::atomic::{AtomicU64, Ordering};

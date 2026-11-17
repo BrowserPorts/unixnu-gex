@@ -19,9 +19,14 @@
 //! block size is EINVAL (checked after the end); a transfer past the end
 //! is cut short. The block node's reads go through the buffer cache in
 //! 16 KiB buffers of its block size (`spec_read`, PAGE_SIZE 16 KiB with
-//! more than 1 GiB of memory): a buffer the medium gives short whose part
-//! the read wants starts past is EINVAL. Its writes (the buffer cache's
-//! read-modify-write, delayed and asynchronous writes) are not modelled.
+//! more than 1 GiB of memory), which stay valid until the vnode's last
+//! close, with the next buffer read ahead on a sequential read: a buffer
+//! the medium gives short whose part the read wants starts past is EINVAL.
+//! Its writes (the buffer cache's read-modify-write, delayed and
+//! asynchronous writes) are not modelled.
+//!
+//! Each request that reaches the medium is counted in the storage
+//! drivers' statistics ([`super::storagestack::stats`]).
 
 use super::apfswrite::Sink;
 use super::devfs::{Kind, Node};
@@ -176,22 +181,110 @@ fn dkreadwrite(n: &Node, off: u64, read: Option<&mut [u8]>, write: Option<&[u8]>
     if g.volume {
         return Err(e(if read.is_some() { EACCES } else { EROFS }));
     }
+    let m = media_of(n)?;
     match (read, write) {
-        (Some(b), _) => d.sink.read_at(g.base + off, &mut b[..n_bytes]).map_err(|_| e(EIO))?,
-        (_, Some(b)) => d.sink.write_at(g.base + off, &b[..n_bytes]).map_err(|_| e(EIO))?,
+        (Some(b), _) => request(d, m, g.base + off, Io::Read(&mut b[..n_bytes]))?,
+        (_, Some(b)) => request(d, m, g.base + off, Io::Write(&b[..n_bytes]))?,
         _ => {}
     }
     Ok(n_bytes)
 }
 
+/// A transfer a medium passes down to the storage driver.
+enum Io<'a> {
+    Read(&'a mut [u8]),
+    Write(&'a [u8]),
+}
+
+/// The namespace whose storage driver serves disk0 and the media above it.
+const MAIN_NSID: u32 = 1;
+
+/// One request of medium `m` at disk0 offset `at`, as it goes down the
+/// stack to the medium, counted where its drivers count it: the container
+/// scheme's read and write (0xfffffff00668390c, 0xfffffff0066839f4) add
+/// one operation and the buffer's length before passing it on, and a write
+/// marks the scheme dirty (its +0xe0 bits, which DKIOCSYNCHRONIZECACHE
+/// consults); `IOBlockStorageDriver::prepareRequestCompletion` adds the
+/// bytes moved and the time since `prepareRequest` (latency 0), and an
+/// error for a failed or short transfer.
+fn request(d: &Disk, m: Media, at: u64, io: Io<'_>) -> Result<(), Errno> {
+    use super::storagestack::stats;
+    let write = matches!(io, Io::Write(_));
+    let len = match &io {
+        Io::Read(b) => b.len(),
+        Io::Write(b) => b.len(),
+    } as u64;
+    if m == Media::Container {
+        stats::scheme_transfer(len, write);
+    }
+    let start = std::time::Instant::now();
+    let r = match io {
+        Io::Read(b) => d.sink.read_at(at, b),
+        Io::Write(b) => d.sink.write_at(at, b),
+    };
+    if write && m == Media::Container {
+        SCHEME_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+    }
+    let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let moved = if r.is_ok() { len } else { 0 };
+    stats::driver_transfer(MAIN_NSID, moved, ns, 0, write);
+    if r.is_err() {
+        stats::driver_error(MAIN_NSID, write);
+    }
+    r.map_err(|_| e(EIO))
+}
+
+/// The container scheme's dirty bits (its +0xe0, ORed with 3 by each write
+/// it passes down).
+static SCHEME_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// `PAGE_SIZE` on the device (16 KiB pages: the boot's memory size is
 /// over 1 GiB).
 const PAGE_SIZE: u64 = 16384;
 
-/// `spec_read` of a block node: buffers of `PAGE_SIZE / bsize` blocks.
+/// A block node's vnode in the buffer cache: its valid buffers by block
+/// number (each its bytes, `bsize - b_resid` of them), and `v_speclastr`,
+/// the last buffer `spec_read` read (-1 for a new vnode, `checkalias`).
+struct BlockVnode {
+    bufs: HashMap<u64, Vec<u8>>,
+    lastr: i64,
+}
+
+/// The block nodes' vnodes, by minor. Their buffers stay valid until the
+/// vnode's last close invalidates them (`spec_close`'s
+/// `buf_invalidateblks`).
+static BLOCK_VNODES: Mutex<Option<HashMap<u32, BlockVnode>>> = Mutex::new(None);
+
+/// How many buffers the block nodes may hold before the buffer cache could
+/// have to reuse one: `CONFIG_MIN_NBUF`, the fewest buffer headers the
+/// kernel makes (`bsd_get_bufferhdr_map_size`). Which buffer `getnewbuf`
+/// would take past that depends on every other user of the cache.
+const BUFFERS_HELD: usize = 256;
+
+/// One buffer of a block node read from the medium (`buf_strategy` to
+/// `dkreadwrite` of the buffer): its valid bytes, cut at the end of the
+/// medium, none at or past it.
+fn bdev_fill(d: &Disk, m: Media, g: Geometry, bn: u64, bsize: u64) -> Result<Vec<u8>, Errno> {
+    let start = bn * g.block;
+    if start >= g.size {
+        return Ok(Vec::new());
+    }
+    if g.volume {
+        return Err(e(EACCES));
+    }
+    let mut b = vec![0u8; bsize.min(g.size - start) as usize];
+    request(d, m, g.base + start, Io::Read(&mut b))?;
+    Ok(b)
+}
+
+/// `spec_read` of a block node: buffers of `PAGE_SIZE / bsize` blocks,
+/// read through the buffer cache (`buf_bread`), and when the read follows
+/// the last one, the next buffer read ahead too (`buf_breadn`, which skips
+/// a buffer already valid).
 fn bdev_read(n: &Node, mut off: u64, buf: &mut [u8]) -> Result<usize, Errno> {
     let d = DISK.get().ok_or(Errno::ENXIO)?;
-    let g = geometry(media_of(n)?).map_err(|_| Errno::EIO)?;
+    let m = media_of(n)?;
+    let g = geometry(m).map_err(|_| Errno::EIO)?;
     // v_specsize: the minor's block size, its preferred block size until
     // DKIOCSETBLOCKSIZE (which a process cannot issue).
     let spec = g.block;
@@ -200,26 +293,56 @@ fn bdev_read(n: &Node, mut off: u64, buf: &mut [u8]) -> Result<usize, Errno> {
     }
     let bscale = PAGE_SIZE / spec;
     let bsize = bscale * spec;
+    let mut cache = BLOCK_VNODES.lock().unwrap_or_else(|e| e.into_inner());
+    let cache = cache.get_or_insert_with(HashMap::new);
+    let held: usize = cache.values().map(|v| v.bufs.len()).sum();
+    let vn = cache.entry(n.minor).or_insert_with(|| BlockVnode { bufs: HashMap::new(), lastr: -1 });
+    let mut held = held;
     let mut done = 0usize;
-    while done < buf.len() {
+    loop {
         let bn = (off / spec) & !(bscale - 1);
         let on = (off % bsize) as usize;
-        // dkreadwrite of the buffer: nothing at or past the end, cut at it.
-        let start = bn * spec;
-        let have = if start >= g.size { 0 } else { bsize.min(g.size - start) as usize };
-        if have > 0 && g.volume {
-            return Err(e(EACCES));
+        let ahead = vn.lastr >= 0 && vn.lastr as u64 + bscale == bn;
+        let mut failed = None;
+        for (b, wanted) in [(bn, true), (bn + bscale, ahead)] {
+            // The read ahead is issued before the wanted buffer's read is
+            // waited for, whatever that read's outcome.
+            if !wanted || vn.bufs.contains_key(&b) {
+                continue;
+            }
+            if held >= BUFFERS_HELD {
+                super::note_unimplemented(format!(
+                    "a read of /dev/{} needing more than {BUFFERS_HELD} buffers in the buffer cache: which one getnewbuf reuses",
+                    n.name
+                ));
+                failed = failed.or(Some(e(EIO)));
+                continue;
+            }
+            match bdev_fill(d, m, g, b, bsize) {
+                Ok(bytes) => {
+                    vn.bufs.insert(b, bytes);
+                    held += 1;
+                }
+                // A failed read-ahead leaves no buffer and fails nothing.
+                Err(_) if b != bn => {}
+                Err(err) => failed = failed.or(Some(err)),
+            }
         }
+        // spec_read records the buffer it asked for whether or not the
+        // read worked.
+        vn.lastr = bn as i64;
+        if let Some(err) = failed {
+            return Err(err);
+        }
+        let have = vn.bufs[&bn].len();
         if on > have {
             return Err(e(EINVAL));
         }
         let take = (have - on).min(buf.len() - done);
-        if take > 0 {
-            d.sink.read_at(g.base + start + on as u64, &mut buf[done..done + take]).map_err(|_| e(EIO))?;
-        }
+        buf[done..done + take].copy_from_slice(&vn.bufs[&bn][on..on + take]);
         done += take;
         off += take as u64;
-        if have == 0 {
+        if done == buf.len() || take == 0 {
             break;
         }
     }
@@ -312,6 +435,11 @@ impl crate::vfs::FileHandle for DiskDev {
             *c == 0
         };
         if last {
+            if self.block() {
+                if let Some(v) = BLOCK_VNODES.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|c| c.get_mut(&self.node.minor)) {
+                    v.bufs.clear();
+                }
+            }
             // dkclose returns 0; what of the stack it does not model was
             // reported at the open.
             let _ = super::dkopen::dkclose(self.node.minor, self.block());
@@ -577,6 +705,74 @@ pub fn ioctl(n: &'static Node, com: u64, data: &mut [u8]) -> Answer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A disk of `n` bytes in memory, which fails I/O at or past `bad`.
+    struct Mem(Mutex<Vec<u8>>, u64);
+
+    impl super::super::apfsread::Medium for Mem {
+        fn size(&self) -> u64 {
+            self.0.lock().unwrap().len() as u64
+        }
+        fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<(), String> {
+            if off >= self.1 {
+                return Err("medium error".into());
+            }
+            buf.copy_from_slice(&self.0.lock().unwrap()[off as usize..off as usize + buf.len()]);
+            Ok(())
+        }
+    }
+
+    impl Sink for Mem {
+        fn write_at(&self, off: u64, buf: &[u8]) -> Result<(), String> {
+            if off >= self.1 {
+                return Err("medium error".into());
+            }
+            self.0.lock().unwrap()[off as usize..off as usize + buf.len()].copy_from_slice(buf);
+            Ok(())
+        }
+    }
+
+    fn counts() -> Vec<(String, u64)> {
+        let mut out = Vec::new();
+        for (who, p) in [("driver", super::super::storagestack::stats::driver(1)), ("scheme", super::super::storagestack::stats::scheme())] {
+            let super::super::iokit::Prop::Dict(d) = p else { panic!("statistics not a dictionary") };
+            for (k, v) in d {
+                if let super::super::iokit::Prop::Num(n, _) = v {
+                    out.push((format!("{who} {k}"), n));
+                }
+            }
+        }
+        out
+    }
+
+    fn delta(before: &[(String, u64)], key: &str) -> u64 {
+        let now = counts();
+        let at = |c: &[(String, u64)]| c.iter().find(|(k, _)| k == key).map(|(_, v)| *v).unwrap();
+        at(&now) - at(before)
+    }
+
+    /// Each request counts once in the driver's statistics with the bytes
+    /// moved; the container's also in the scheme's (before it goes down,
+    /// so a failed one too); a failed one is a driver error with no bytes.
+    #[test]
+    fn requests_counted() {
+        let d = Disk { sink: Arc::new(Mem(Mutex::new(vec![0u8; 1 << 20]), 1 << 19)), missing: Vec::new() };
+        let before = counts();
+        let mut b = vec![0u8; 8192];
+        request(&d, Media::Whole, 4096, Io::Read(&mut b)).unwrap();
+        request(&d, Media::Container, 0, Io::Write(&b[..4096])).unwrap();
+        assert!(request(&d, Media::Container, 1 << 19, Io::Read(&mut b)).is_err());
+        assert_eq!(delta(&before, "driver Operations (Read)"), 2);
+        assert_eq!(delta(&before, "driver Bytes (Read)"), 8192);
+        assert_eq!(delta(&before, "driver Errors (Read)"), 1);
+        assert_eq!(delta(&before, "driver Operations (Write)"), 1);
+        assert_eq!(delta(&before, "driver Bytes (Write)"), 4096);
+        assert_eq!(delta(&before, "scheme Operations (Read)"), 1);
+        assert_eq!(delta(&before, "scheme Bytes (Read)"), 8192);
+        assert_eq!(delta(&before, "scheme Operations (Write)"), 1);
+        assert_eq!(delta(&before, "scheme Bytes (Write)"), 4096);
+        assert!(SCHEME_DIRTY.load(std::sync::atomic::Ordering::Acquire));
+    }
 
     #[test]
     fn ioctl_numbers() {

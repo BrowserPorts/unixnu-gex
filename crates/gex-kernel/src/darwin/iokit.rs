@@ -346,11 +346,15 @@ pub fn properties(t: &[Node], i: u32) -> Vec<(String, Prop)> {
 ///   objects ("IO80211Controller", 0xfffffff00593be08), and the kernel only
 ///   names it among the keys IODTNVRAM's `skipKey` passes over
 ///   (0xfffffff007816644). IOKit.framework asks for it whenever
-///   `io_object_conforms_to` says no. On the display's framebuffer and its nub, so are
+///   `io_object_conforms_to` says no. Nor has any entry "Target Disk Mode":
+///   the kernelcache's one writer of the key (0xfffffff006442440, in
+///   IOSCSIArchitectureModelFamily) puts it in a dictionary its device
+///   holds, not in a property table, and APFS (0xfffffff00666edf8) only
+///   reads it. On the display's framebuffer and its nub, so are
 ///   the names no driver sets there ([`super::iomfb::property_absent`]).
 pub fn property_unknown(t: &[Node], i: u32, name: &str) -> bool {
     let Some(n) = t.get(i as usize) else { return false };
-    if name == "IOClassNameOverride" {
+    if name == "IOClassNameOverride" || name == "Target Disk Mode" {
         return false;
     }
     match &n.table {

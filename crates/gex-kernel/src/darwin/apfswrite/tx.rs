@@ -221,7 +221,30 @@ pub struct Nx<'a> {
     /// roving data pointer (`sm + 0x3e0`, zero at each mount).
     fxc: Option<Fxc>,
     rove: u64,
+    reaper: Reaper,
+    /// Blocks each volume's metadata gained or lost since its superblock
+    /// was last written (`fs_alloc_count`'s upkeep: a node made or deleted
+    /// counts, a node's copy-on-write does not), and the virtual objects a
+    /// volume's creation counted itself.
+    alloc_delta: BTreeMap<usize, i64>,
+    precounted: std::collections::HashSet<(Owner, u64)>,
+    /// The reap lists (`nx_reap_list_phys_t`), ephemeral, by identifier.
+    reap_lists: BTreeMap<u64, Vec<u8>>,
 }
+
+/// The container's reaper (`nx_reaper_phys_t`) as nx_reaper_add keeps it.
+#[derive(Clone, Copy, Debug)]
+struct Reaper {
+    next_reap_id: u64,
+    completed_id: u64,
+    head: u64,
+    tail: u64,
+    flags: u32,
+    rlcount: u32,
+}
+
+const OBJECT_TYPE_NX_REAP_LIST: u32 = 0x12;
+const NRL_NONE: u32 = 0xffff_ffff;
 
 fn u64a(b: &[u8], o: usize) -> u64 {
     u64::from_le_bytes(b[o..o + 8].try_into().unwrap())
@@ -324,6 +347,10 @@ impl<'a> Nx<'a> {
             sb_copy,
             fxc: None,
             rove: 0,
+            reaper: Reaper { next_reap_id: 1, completed_id: 0, head: 0, tail: 0, flags: 1, rlcount: 0 },
+            reap_lists: BTreeMap::new(),
+            alloc_delta: BTreeMap::new(),
+            precounted: Default::default(),
         })
     }
 
@@ -763,6 +790,151 @@ impl<'a> Nx<'a> {
         Ok((start, got))
     }
 
+    /// A new reap list (an ephemeral object; its entries all on its free
+    /// list).
+    fn reap_list_new(&mut self) -> u64 {
+        let oid = self.new_oid();
+        let bs = self.l.bs as usize;
+        let mut b = vec![0u8; bs];
+        let max = ((bs - 0x40) / 0x28) as u32;
+        b.put32(0x2c, max);
+        b.put32(0x34, NRL_NONE);
+        b.put32(0x38, NRL_NONE);
+        b.put32(0x3c, 0);
+        for i in 0..max {
+            b.put32(0x40 + 0x28 * i as usize, if i + 1 < max { i + 1 } else { NRL_NONE });
+        }
+        self.reap_lists.insert(oid, b);
+        self.eph_order.push(oid);
+        oid
+    }
+
+    /// `nx_reaper_add` (I:0x100016bf4): object `oid` of `ty` (`size` its
+    /// node size), of volume `fs_oid`, queued for the reaper in its tail
+    /// list (a new list when fewer than two entries are free): an entry
+    /// with the transaction and one with the reap identifier. The reap
+    /// identifier.
+    pub fn reaper_add(&mut self, ty: u32, size: u32, fs_oid: u64, oid: u64, flags: u32) -> Result<u64, String> {
+        let xid = self.xid;
+        let list = if self.reaper.head == 0 && self.reaper.tail == 0 {
+            let l = self.reap_list_new();
+            self.reaper.head = l;
+            self.reaper.tail = l;
+            self.reaper.rlcount = 1;
+            l
+        } else {
+            let l = self.reaper.tail;
+            if self.reaper.rlcount == 0 && self.reaper.head == self.reaper.tail {
+                self.reaper.rlcount = 1;
+            }
+            l
+        };
+        let mut list = list;
+        {
+            let b = self.reap_lists.get(&list).ok_or("the reaper's tail list not in the cache")?;
+            let (count, max) = (u32::from_le_bytes(b[0x30..0x34].try_into().unwrap()), u32::from_le_bytes(b[0x2c..0x30].try_into().unwrap()));
+            if count > max.wrapping_sub(2) {
+                let n = self.reap_list_new();
+                self.reap_lists.get_mut(&list).unwrap().put64(0x20, n);
+                self.reaper.tail = n;
+                if self.reaper.rlcount != 0 {
+                    self.reaper.rlcount += 1;
+                }
+                list = n;
+            }
+        }
+        let id = self.reaper.next_reap_id;
+        self.reaper.next_reap_id += 1;
+        let b = self.reap_lists.get_mut(&list).unwrap();
+        let rd = |b: &Vec<u8>, o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        let ent = |i: u32| 0x40 + 0x28 * i as usize;
+        let e = rd(b, 0x3c);
+        if e == NRL_NONE {
+            return Err("reap list object free list erroneously empty".into());
+        }
+        let e2 = rd(b, ent(e));
+        b.put32(0x3c, e2);
+        let last = rd(b, 0x38);
+        if last != NRL_NONE {
+            b.put32(ent(last), e);
+        }
+        if rd(b, 0x34) == NRL_NONE {
+            b.put32(0x34, e);
+        }
+        b.put32(0x38, e);
+        let count = rd(b, 0x30);
+        b.put32(0x30, count + 1);
+        b.put32(ent(e), NRL_NONE);
+        let put_entry = |b: &mut Vec<u8>, i: u32, fl: u32, last: u64| {
+            let o = ent(i);
+            b.put32(o + 4, fl);
+            b.put32(o + 8, ty);
+            b.put32(o + 12, size);
+            b.put64(o + 16, fs_oid);
+            b.put64(o + 24, oid);
+            b.put64(o + 32, last);
+        };
+        put_entry(b, e, if flags & 2 != 0 { 0x15 } else { 5 }, xid);
+        if e2 == NRL_NONE {
+            return Err("reap list object free list erroneously empty".into());
+        }
+        let e3 = rd(b, ent(e2));
+        b.put32(ent(e), e2);
+        b.put32(0x38, e2);
+        b.put32(0x3c, e3);
+        b.put32(0x30, count + 2);
+        b.put32(ent(e2), NRL_NONE);
+        let mut fl = if flags & 2 != 0 { 0x13 } else { 3 };
+        if flags & 1 != 0 {
+            fl |= 0xc;
+        }
+        put_entry(b, e2, fl, id);
+        Ok(id)
+    }
+
+    /// The container handed from the kernel to a user-space tool (or
+    /// back): it is mounted again as that one's library mounts it, its
+    /// counter taken from the newest checkpoint's copy.
+    pub fn remount(&mut self, mode: Mode) -> Result<(), String> {
+        if self.in_tx {
+            return Err("remounting a container with a transaction open".into());
+        }
+        self.mode = mode;
+        self.counter = u64a(&self.sb_copy, 0x3d8);
+        self.rw_mounted = false;
+        self.mount_rw()
+    }
+
+    /// The volume superblock's identifier of slot `index`.
+    pub fn vol_oid(&self, index: usize) -> Option<u64> {
+        self.fs_oid.get(index).copied().filter(|&o| o != 0)
+    }
+
+    /// Volume `index`'s file-system tree replaced by `t` (a new tree).
+    pub fn replace_fs_tree(&mut self, index: usize, t: Tree) -> Result<(), String> {
+        self.vols.get_mut(&index).ok_or_else(|| format!("no volume in slot {index}"))?.fs_tree = t;
+        Ok(())
+    }
+
+    /// A new physical tree for volume `index` (its extent-reference
+    /// tree's kind), and a new virtual one (its file-system tree's).
+    pub fn new_extentref_tree(&mut self, index: usize) -> Result<Tree, String> {
+        let bs = self.l.bs;
+        let (_, mut st) = self.extentref_tree(index)?;
+        Tree::create(&mut st, jtree_shape(bs, true), btree::cmp_jobj_hashed)
+    }
+
+    pub fn new_fs_tree(&mut self, index: usize, hashed: bool) -> Result<Tree, String> {
+        let bs = self.l.bs;
+        let (_, mut st) = self.fs_tree(index)?;
+        Tree::create(&mut st, jtree_shape(bs, false), if hashed { btree::cmp_jobj_hashed } else { btree::cmp_jobj_plain })
+    }
+
+    /// The block size.
+    pub fn block_size(&self) -> u64 {
+        self.l.bs
+    }
+
     /// The roving data pointer.
     pub fn rove(&self) -> u64 {
         self.rove
@@ -974,12 +1146,16 @@ impl<'a> Nx<'a> {
         let mut v = 0u32.to_le_bytes().to_vec();
         v.extend_from_slice(&(self.l.bs as u32).to_le_bytes());
         v.extend_from_slice(&paddr.to_le_bytes());
-        om.tree.insert(&mut PhysStore { nx: self, subtype: otype::OMAP_TREE_SUBTYPE, class: 2 }, &k, Some(&v))?;
+        let vol = match owner {
+            Owner::Volume(i) => Some(i),
+            Owner::Container => None,
+        };
+        om.tree.insert(&mut PhysStore { nx: self, subtype: otype::OMAP_TREE_SUBTYPE, class: 2, vol }, &k, Some(&v))?;
         if let Some((oxid, opaddr)) = old {
             if oxid != self.xid {
                 let mut ok = oid.to_le_bytes().to_vec();
                 ok.extend_from_slice(&oxid.to_le_bytes());
-                om.tree.remove(&mut PhysStore { nx: self, subtype: otype::OMAP_TREE_SUBTYPE, class: 2 }, &ok)?;
+                om.tree.remove(&mut PhysStore { nx: self, subtype: otype::OMAP_TREE_SUBTYPE, class: 2, vol }, &ok)?;
                 self.free(opaddr, 1)?;
             }
         }
@@ -1042,6 +1218,23 @@ impl<'a> Nx<'a> {
         order.extend(dirty.iter().copied().filter(is_sb));
         for (owner, oid) in order {
             let class = if enc(self, &(owner, oid)) { 0 } else { 1 };
+            if let Owner::Volume(i) = owner {
+                if self.virt.get(&(owner, oid)).is_some_and(|v| v.mapped.is_none()) && !self.precounted.remove(&(owner, oid)) {
+                    *self.alloc_delta.entry(i).or_default() += 1;
+                }
+            }
+            if owner == Owner::Container {
+                // A volume's superblock takes its allocation count's
+                // changes (the volume's objects were placed before it).
+                if let Some(i) = self.fs_oid.iter().position(|&o| o == oid) {
+                    let d = self.alloc_delta.remove(&i).unwrap_or(0);
+                    if d != 0 {
+                        let vo = self.virt.get_mut(&(owner, oid)).unwrap();
+                        let c = u64a(&vo.b, 0x58) as i64 + d;
+                        vo.b.put64(0x58, c as u64);
+                    }
+                }
+            }
             let paddr = self.alloc_meta_class(class)?;
             let old = self.virt.get(&(owner, oid)).ok_or("a dirty object not in the cache")?.mapped;
             self.omap_set(owner, oid, paddr, old)?;
@@ -1059,6 +1252,9 @@ impl<'a> Nx<'a> {
             self.count(Site::Cached);
             set_checksum(&mut b);
             self.sink.write_at(paddr * self.l.bs, &b)?;
+        }
+        if self.alloc_delta.values().any(|&d| d != 0) {
+            return Err("not implemented: a volume's allocation count changed in a transaction that did not change its superblock".into());
         }
         Ok(())
     }
@@ -1136,12 +1332,23 @@ impl<'a> Nx<'a> {
             match oid {
                 OID_SPACEMAN => eph.push((otype::EPHEMERAL | 0x5, 0, OID_SPACEMAN, self.spaceman_bytes())),
                 OID_REAPER => {
+                    let r = self.reaper;
                     let mut reaper = vec![0u8; bsz];
                     put_header(&mut reaper, OID_REAPER, xid, otype::EPHEMERAL | 0x11, 0);
-                    reaper.put64(0x20, 1);
-                    reaper.put32(0x40, 1);
+                    reaper.put64(0x20, r.next_reap_id);
+                    reaper.put64(0x28, r.completed_id);
+                    reaper.put64(0x30, r.head);
+                    reaper.put64(0x38, r.tail);
+                    reaper.put32(0x40, r.flags);
+                    reaper.put32(0x44, r.rlcount);
                     reaper.put32(0x6c, bs as u32 - 0x70);
                     eph.push((otype::EPHEMERAL | 0x11, 0, OID_REAPER, reaper));
+                }
+                oid if self.reap_lists.contains_key(&oid) => {
+                    let mut b = self.reap_lists[&oid].clone();
+                    let ty = otype::EPHEMERAL | OBJECT_TYPE_NX_REAP_LIST;
+                    put_header(&mut b, oid, xid, ty, 0);
+                    eph.push((ty, 0, oid, b));
                 }
                 oid => {
                     let o = self.eph.get(&oid).ok_or("an ephemeral object not in the cache")?;
@@ -1234,6 +1441,9 @@ impl<'a> Nx<'a> {
     /// committed, then block 0 from the last checkpoint, cleanly
     /// unmounted, if this mount wrote a checkpoint.
     pub fn unmount(&mut self) -> Result<(), String> {
+        if !self.rw_mounted {
+            return Ok(());
+        }
         if self.in_tx {
             self.commit()?;
         }
@@ -1250,8 +1460,8 @@ impl<'a> Nx<'a> {
         if self.mode == Mode::Userspace {
             // The next run's mount takes the count from the copy.
             self.counter = u64a(&self.sb_copy, 0x3d8);
-            self.rw_mounted = false;
         }
+        self.rw_mounted = false;
         Ok(())
     }
 
@@ -1340,10 +1550,10 @@ impl<'a> Nx<'a> {
         o.put32(0x28, otype::PHYSICAL | otype::BTREE);
         o.put32(0x2c, otype::PHYSICAL | otype::BTREE);
         let omap = self.phys_create(o, otype::PHYSICAL, 0, 2)?;
-        let omap_tree = Tree::create(&mut PhysStore { nx: self, subtype: otype::OMAP_TREE_SUBTYPE, class: 2 }, omap_shape(bs), btree::cmp_omap)?;
+        let omap_tree = Tree::create(&mut PhysStore { nx: self, subtype: otype::OMAP_TREE_SUBTYPE, class: 2, vol: None }, omap_shape(bs), btree::cmp_omap)?;
         self.phys_obj(omap)?.b.put64(0x30, omap_tree.root);
-        let extentref = Tree::create(&mut PhysStore { nx: self, subtype: BLOCKREFTREE, class: 1 }, jtree_shape(bs, true), btree::cmp_jobj_hashed)?;
-        let snapmeta = Tree::create(&mut PhysStore { nx: self, subtype: SNAPMETATREE, class: 1 }, jtree_shape(bs, true), btree::cmp_jobj_hashed)?;
+        let extentref = Tree::create(&mut PhysStore { nx: self, subtype: BLOCKREFTREE, class: 1, vol: None }, jtree_shape(bs, true), btree::cmp_jobj_hashed)?;
+        let snapmeta = Tree::create(&mut PhysStore { nx: self, subtype: SNAPMETATREE, class: 1, vol: None }, jtree_shape(bs, true), btree::cmp_jobj_hashed)?;
         self.vols.insert(index, Vol { oid: vol_oid, omap: Omap { phys: omap, tree: omap_tree }, encrypted: false, fs_tree: Tree { root: 0, shape: jtree_shape(bs, false), cmp: btree::cmp_jobj_hashed }, extentref, snapmeta });
 
         // The root and private directories.
@@ -1353,6 +1563,7 @@ impl<'a> Nx<'a> {
             fs_tree.insert(&mut fs, &k, Some(&val))?;
         }
         let root_oid = fs_tree.root;
+        self.precounted.insert((Owner::Volume(index), root_oid));
         self.vols.get_mut(&index).unwrap().fs_tree = fs_tree;
 
         let mut sb = vec![0u8; bs as usize];
@@ -1447,7 +1658,7 @@ impl<'a> Nx<'a> {
     /// Volume `index`'s extent-reference tree and its nodes.
     pub fn extentref_tree(&mut self, index: usize) -> Result<(Tree, PhysStore<'_, 'a>), String> {
         let t = self.vols.get(&index).ok_or_else(|| format!("no volume in slot {index}"))?.extentref;
-        Ok((t, PhysStore { nx: self, subtype: BLOCKREFTREE, class: 1 }))
+        Ok((t, PhysStore { nx: self, subtype: BLOCKREFTREE, class: 1, vol: Some(index) }))
     }
 
     /// Volume `index`'s extent-reference tree after a change: the
@@ -1477,6 +1688,8 @@ pub struct PhysStore<'n, 'a> {
     nx: &'n mut Nx<'a>,
     subtype: u32,
     class: usize,
+    /// The volume whose allocation count its nodes are in.
+    vol: Option<usize>,
 }
 
 impl Store for PhysStore<'_, '_> {
@@ -1495,9 +1708,15 @@ impl Store for PhysStore<'_, '_> {
         let mut b = n.b;
         b.put32(24, otype::PHYSICAL | otype::BTREE);
         b.put32(28, self.subtype);
+        if let Some(v) = self.vol {
+            *self.nx.alloc_delta.entry(v).or_default() += 1;
+        }
         self.nx.phys_create(b, otype::PHYSICAL, self.subtype, self.class)
     }
     fn delete(&mut self, id: u64) -> Result<(), String> {
+        if let Some(v) = self.vol {
+            *self.nx.alloc_delta.entry(v).or_default() -= 1;
+        }
         self.nx.phys.remove(&id);
         self.nx.phys_dirty.retain(|&p| p != id);
         self.nx.free(id, 1)

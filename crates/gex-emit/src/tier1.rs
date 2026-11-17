@@ -804,6 +804,12 @@ struct Emitter<'a> {
     /// ([`Self::emit_count_block`]) and a path that leaves it early
     /// takes back ([`Self::emit_uncount_from`]).
     cur_insns: (u64, u64),
+    /// Inside a fused loop or a region: the local the block entries add
+    /// their instructions to, written to the context's count (and zeroed)
+    /// wherever the registers are written back on the way out
+    /// ([`Self::emit_count_store`]). `None` elsewhere: an entry adds to the
+    /// context's count itself.
+    count_local: Option<u32>,
 }
 
 /// What a region member needs to know to branch to its neighbours.
@@ -875,6 +881,7 @@ impl<'a> Emitter<'a> {
             free_f64: Vec::new(),
             kuser_fault: false,
             cur_insns: (block_start, block_start),
+            count_local: None,
         }
     }
 
@@ -950,6 +957,7 @@ impl<'a> Emitter<'a> {
         self.f.i32_const(loop_poll());
         self.f.local_set(counter);
         self.reenter_local = Some(counter);
+        self.begin_count_local();
 
         self.f.loop_void();
         for _ in 0..n {
@@ -981,12 +989,14 @@ impl<'a> Emitter<'a> {
                       // Every member either branches back to the table or leaves the
                       // function, so falling out of the loop cannot happen.
         self.f.unreachable();
+        self.count_local = None;
     }
 
     /// Write every register the region writes back to the context -- all of
     /// them, not the dirty ones, since dirtiness depends on emission order and
     /// the guest reaches the members in another. Costs stores only on exit.
     fn flush_region_exit(&mut self) {
+        self.emit_count_store();
         let mut all: Vec<(GuestReg, u32)> = self
             .regs
             .iter()
@@ -1165,6 +1175,7 @@ impl<'a> Emitter<'a> {
             self.f.i32_const(loop_poll());
             self.f.local_set(counter);
             self.reenter_local = Some(counter);
+            self.begin_count_local();
             self.f.loop_void();
             self.loop_depth = Some(0);
         }
@@ -1185,6 +1196,7 @@ impl<'a> Emitter<'a> {
             self.loop_depth = None;
             self.reenter_local = None;
             self.loop_writes.clear();
+            self.count_local = None;
         }
     }
 
@@ -1466,6 +1478,7 @@ impl<'a> Emitter<'a> {
     }
 
     fn flush_inner(&mut self, keep_dirty: bool) {
+        self.emit_count_store();
         let mut dirty: Vec<(GuestReg, u32)> = self
             .regs
             .iter()
@@ -1615,7 +1628,47 @@ impl<'a> Emitter<'a> {
     /// its instructions.
     fn emit_count_block(&mut self, block: &Block) {
         self.cur_insns = (block.start, block.end);
-        self.emit_count(Self::insns(block.start, block.end));
+        let n = Self::insns(block.start, block.end);
+        match self.count_local {
+            Some(l) if n != 0 => {
+                self.f.local_get(l);
+                self.f.i64_const(n);
+                self.f.byte(0x7c); // i64.add
+                self.f.local_set(l);
+            }
+            Some(_) => {}
+            None => self.emit_count(n),
+        }
+    }
+
+    /// A fused loop or a region begins: its entries count in a local, from
+    /// 0, until it ends.
+    fn begin_count_local(&mut self) {
+        if !gex_abi::count_instructions() || self.func_regs.is_some() {
+            return;
+        }
+        let l = self.f.add_local(ValType::I64);
+        self.f.i64_const(0);
+        self.f.local_set(l);
+        self.count_local = Some(l);
+    }
+
+    /// Inside a fused loop or a region, on a way out (the registers'
+    /// write-back, [`Self::flush_inner`], [`Self::flush_region_exit`]):
+    /// what its entries counted goes to the context's count, and the local
+    /// starts again from 0, for a path that comes back into the loop. A
+    /// path's taking back and giving back ([`Self::emit_uncount_from`])
+    /// is the context's own, after this.
+    fn emit_count_store(&mut self) {
+        let Some(l) = self.count_local else { return };
+        self.ctx_base();
+        self.ctx_base();
+        self.f.load(0x29, 3, ctx::INSTRUCTIONS as u32); // i64.load
+        self.f.local_get(l);
+        self.f.byte(0x7c); // i64.add
+        self.f.store(0x37, 3, ctx::INSTRUCTIONS as u32); // i64.store
+        self.f.i64_const(0);
+        self.f.local_set(l);
     }
 
     /// A path that leaves the block being emitted at `pc`, the instruction

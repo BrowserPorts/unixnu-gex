@@ -28,7 +28,7 @@ pub fn cmd(args: &[String]) -> Result<ExitCode> {
     let f = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(out).with_context(|| format!("creating {out}"))?;
     // A new file reads as zeros, as clean_nand's DKIOCFORMAT leaves the disk.
     f.set_len(size).with_context(|| format!("sizing {out}"))?;
-    let sink = apfswrite::HostFile(f, size);
+    let sink = std::sync::Arc::new(apfswrite::HostFile(f, size));
     if let Some(gaps) = storage::unmeasured() {
         eprintln!("gexc: {gaps}");
     }
@@ -38,7 +38,7 @@ pub fn cmd(args: &[String]) -> Result<ExitCode> {
     }
     // The kernel's clock: the time the restore runs.
     let mut now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
-    let missing = apfswrite::restore::build_disk0(&sink, &mut now, os.as_ref()).map_err(|e| anyhow!("{out}: {e}"))?;
+    let missing = apfswrite::restore::build_disk0(sink, &mut now, os.as_ref()).map_err(|e| anyhow!("{out}: {e}"))?;
     // What the image lacks, beside it, for the disk nodes to report.
     let missing_path = format!("{out}.missing");
     if missing.is_empty() {

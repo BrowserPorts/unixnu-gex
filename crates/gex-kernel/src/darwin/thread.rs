@@ -248,6 +248,11 @@ pub struct DThread {
     /// (`ith_voucher_name`).
     pub voucher: Option<super::voucher::VoucherId>,
     pub voucher_name: u32,
+    /// The bank account whose bill it credits (`t_bankledger`), and its
+    /// processor time (nanoseconds) at its last credit
+    /// (`t_deduct_bank_ledger_time`); none without the host's clocks.
+    pub bank_ledger: Option<u64>,
+    pub bank_deduct: Option<u64>,
     /// The kevent override (an owner's or a workqueue kqueue servicer's)
     /// and the servicer override (a workloop's) on its QoS.
     pub kevent_override: u8,
@@ -716,6 +721,7 @@ impl Kernel {
             let _ = self.ipc().mach_port_deallocate(kport);
         }
         self.darwin_thread_ports_terminate(tid);
+        self.darwin_thread_bank_end(tid);
         if let Some(v) = self.dtask.threads.map.get_mut(&tid).and_then(|t| t.voucher.take()) {
             self.ipc_voucher_release(v);
         }

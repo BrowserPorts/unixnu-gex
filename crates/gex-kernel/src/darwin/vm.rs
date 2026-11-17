@@ -169,6 +169,9 @@ pub struct Entries {
     /// Where the task's `wired_mem` ledger is read by others: the bytes
     /// the user's wirings hold, kept as `user_wire_size` changes.
     wired_gauge: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// Where the map's submap entries (the shared region's) are read by
+    /// the task's footprint meter, its own and other processes'.
+    submap_gauge: Option<std::sync::Arc<std::sync::Mutex<Vec<(u64, u64)>>>>,
 }
 
 impl Entries {
@@ -184,6 +187,20 @@ impl Entries {
     pub fn set_wire_gauge(&mut self, gauge: std::sync::Arc<std::sync::atomic::AtomicU64>) {
         gauge.store(self.user_wire_size, std::sync::atomic::Ordering::Release);
         self.wired_gauge = Some(gauge);
+    }
+
+    /// The task's footprint meter's view of the submaps, which this map's
+    /// entries now keep.
+    pub fn set_submap_gauge(&mut self, gauge: std::sync::Arc<std::sync::Mutex<Vec<(u64, u64)>>>) {
+        self.submap_gauge = Some(gauge);
+        self.submaps_changed();
+    }
+
+    /// The submap entries, told to the gauge.
+    fn submaps_changed(&self) {
+        if let Some(g) = &self.submap_gauge {
+            *g.lock().unwrap_or_else(|e| e.into_inner()) = self.submaps(0, u64::MAX);
+        }
     }
 
     /// `user_wire_size`, told to the gauge.
@@ -216,14 +233,19 @@ impl Entries {
         }
         self.clip_range(start, end);
         let inside: Vec<u64> = self.ranges.range(start..end).map(|(&s, _)| s).collect();
+        let mut submap = false;
         for s in inside {
             if let Some(e) = self.ranges.remove(&s) {
                 if e.attrs.user_wired > 0 {
                     self.user_wire_size -= e.end - s;
                 }
+                submap |= e.attrs.kind == kind::SUBMAP;
             }
         }
         self.wire_size_changed();
+        if submap {
+            self.submaps_changed();
+        }
     }
 
     /// `[start, end)` becomes one new entry, as a new mapping over it does.
@@ -231,6 +253,9 @@ impl Entries {
         self.clear(start, end);
         if start < end {
             self.ranges.insert(start, Entry { end, attrs, offset });
+            if attrs.kind == kind::SUBMAP {
+                self.submaps_changed();
+            }
         }
     }
 
@@ -289,8 +314,14 @@ impl Entries {
     /// Change each entry of `[start, end)` by `f`, clipped to it.
     pub fn update(&mut self, start: u64, end: u64, f: impl Fn(&mut Attrs)) {
         self.clip_range(start, end);
+        let mut submap = false;
         for (_, e) in self.ranges.range_mut(start..end) {
+            let was = e.attrs.kind == kind::SUBMAP;
             f(&mut e.attrs);
+            submap |= was != (e.attrs.kind == kind::SUBMAP);
+        }
+        if submap {
+            self.submaps_changed();
         }
     }
 
@@ -298,8 +329,14 @@ impl Entries {
     /// the reusable-pages calls retag an entry.
     pub fn update_whole(&mut self, start: u64, end: u64, f: impl Fn(&mut Attrs)) {
         let first = self.ranges.range(..=start).next_back().filter(|(_, e)| e.end > start).map_or(start, |(&s, _)| s);
+        let mut submap = false;
         for (_, e) in self.ranges.range_mut(first..end) {
+            let was = e.attrs.kind == kind::SUBMAP;
             f(&mut e.attrs);
+            submap |= was != (e.attrs.kind == kind::SUBMAP);
+        }
+        if submap {
+            self.submaps_changed();
         }
     }
 

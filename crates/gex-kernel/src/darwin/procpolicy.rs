@@ -479,11 +479,8 @@ impl Kernel {
     /// `memorystatus_available_memory()`: what this app has left under its
     /// limit.
     pub(crate) fn darwin_available_memory(&mut self, m: &mut GuestMem<'_>) -> Result<u64, Errno> {
-        let Some(footprint) = self.darwin_phys_footprint(m) else {
-            self.darwin_unimplemented("phys_footprint on a host that cannot say which pages are a task's".into());
-            return Err(Errno::EINVAL);
-        };
-        Ok(self.procs.jetsam().available_memory(self.pid, footprint))
+        let Some(footprint) = self.darwin_footprint_now(m) else { return Err(Errno::EINVAL) };
+        Ok(self.procs.jetsam().available_memory(self.pid, footprint as u64))
     }
 
     /// `mac_proc_check_suspend_resume` (Sandbox's system-suspend-resume,

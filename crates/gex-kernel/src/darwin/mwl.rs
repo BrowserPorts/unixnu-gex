@@ -303,7 +303,8 @@ impl Kernel {
         use crate::mem::flags as lf;
         let prot = u64::from(r.prot & VM_PROT_DEFAULT);
         let size = r.size.checked_add(page_size - 1).ok_or(Kr::Failure)? & !(page_size - 1);
-        self.canonical(m, nr::MMAP, [r.address, size, prot, lf::PRIVATE | lf::FIXED, fd as u64, r.file_offset]).map_err(|e| if e == Errno::ENOMEM { Kr::ResourceShortage } else { Kr::Failure })?;
+        let call = [r.address, size, prot, lf::PRIVATE | lf::FIXED, fd as u64, r.file_offset];
+        self.darwin_footprint_release(m, r.address, r.address + size, super::footprint::Release::Remove, |k, m| k.canonical(m, nr::MMAP, call)).map_err(|e| if e == Errno::ENOMEM { Kr::ResourceShortage } else { Kr::Failure })?;
         self.dtask.vm.enter(r.address, r.address + size, super::vm::Attrs { kind: super::vm::kind::FILE_PRIVATE, max: prot as u8, ..Default::default() }, 0);
         let mut page = vec![0u8; page_size as usize];
         for i in 0..size / page_size {

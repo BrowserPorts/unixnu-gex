@@ -991,7 +991,9 @@ impl Kernel {
                     return k;
                 }
             }
-            return match self.canonical(m, nr::MMAP, [start, len, linux_prot, mf::PRIVATE | mf::ANONYMOUS | mf::FIXED, u64::MAX, 0]) {
+            // VM_FLAGS_OVERWRITE: vm_map_delete of what is there first.
+            let call = [start, len, linux_prot, mf::PRIVATE | mf::ANONYMOUS | mf::FIXED, u64::MAX, 0];
+            return match self.darwin_footprint_release(m, start, start + len, super::footprint::Release::Remove, |k, m| k.canonical(m, nr::MMAP, call)) {
                 Ok(_) => {
                     self.darwin_vm_enter_anon(start, start + len, attrs, p);
                     *addr = start;
@@ -1401,11 +1403,14 @@ impl Kernel {
         if k != kr::SUCCESS {
             return k;
         }
-        self.dtask.vm.clear(s, e);
-        match self.canonical(m, nr::MUNMAP, [s, e - s, 0, 0, 0, 0]) {
-            Ok(_) => kr::SUCCESS,
-            Err(_) => kr::INVALID_ARGUMENT,
-        }
+        // vm_map_delete: the range's pmap_remove, its pages looked at first.
+        self.darwin_footprint_release(m, s, e, super::footprint::Release::Remove, |k, m| {
+            k.dtask.vm.clear(s, e);
+            match k.canonical(m, nr::MUNMAP, [s, e - s, 0, 0, 0, 0]) {
+                Ok(_) => kr::SUCCESS,
+                Err(_) => kr::INVALID_ARGUMENT,
+            }
+        })
     }
 
     /// `mach_vm_protect` and `vm_map_protect`. Every page must be mapped

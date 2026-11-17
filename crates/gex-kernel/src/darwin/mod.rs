@@ -374,6 +374,9 @@ pub struct Task {
     pub rpc_replies: std::collections::HashMap<i32, Box<ipc::msg::Kmsg>>,
     /// When its footprint is next measured ([`footprint::SAMPLE`]).
     pub footprint_due: Option<std::time::Instant>,
+    /// A release of its pages is under way, the footprint's record held
+    /// ([`footprint::Release`]).
+    pub footprint_releasing: bool,
     /// Threads a semaphore operation woke, and how.
     pub sema_wake: Vec<(i32, wait::WaitResult)>,
     /// A blocked send's message and its send buffer, by thread.
@@ -417,9 +420,11 @@ impl Task {
         Task { pidversion: next_pidversion(), uniqueid: next_uniqueid(), start, rusage: rusage::Shared::new(abs), ..Default::default() }.with_wire_ledger()
     }
 
-    /// The map's wirings kept in the task's `wired_mem` ledger.
+    /// The map's wirings kept in the task's `wired_mem` ledger, and its
+    /// submaps told to its footprint meter.
     pub fn with_wire_ledger(mut self) -> Task {
         self.vm.set_wire_gauge(std::sync::Arc::clone(&self.rusage.wired));
+        self.vm.set_submap_gauge(std::sync::Arc::clone(&self.rusage.meter.submaps));
         self
     }
 }

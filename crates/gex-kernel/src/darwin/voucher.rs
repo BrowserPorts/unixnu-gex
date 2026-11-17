@@ -317,13 +317,16 @@ struct BankTask {
     /// `bt_accounts_to_pay`, `bt_accounts_to_charge`.
     to_pay: Vec<u64>,
     to_charge: Vec<u64>,
+    /// `bt_ledger`: its task's ledger, until the task lets go of the
+    /// context (`bank_destroy_bank_task_ledger`).
+    ledger: Option<std::sync::Arc<super::rusage::BankLedger>>,
 }
 
 /// `struct bank_account`: what a merchant task's work for a holder is
-/// billed to. The bill (`ba_bill`) and the ledgers it is rolled up into
-/// are not kept: proc_pid_rusage reports its billed and serviced figures
-/// as not kept for a process an account names, and ledger(2) is
-/// unimplemented.
+/// billed to: its bill (`ba_bill`), whose CPU time the merchant's threads
+/// that adopt it credit (`bank_swap_thread_bank_ledger`, `thread_dispatch`)
+/// and which goes to the holder's and merchant's ledgers as the account
+/// goes. The bill's energy (CLPC's estimate) is not kept.
 #[derive(Debug)]
 struct BankAccount {
     refs: u32,
@@ -334,6 +337,16 @@ struct BankAccount {
     proximateprocess: u64,
     thread_group: u64,
     so_persona: BankPersona,
+    /// `ba_bill`'s cpu_time, in Mach time units.
+    bill: u64,
+    /// A thread's time could not be credited (the host has no per-thread
+    /// clocks).
+    bill_unkept: bool,
+    /// Credits have been made to it (its energy entry has CLPC's
+    /// estimates).
+    credited: bool,
+    /// The threads that have it as their bank ledger (`t_bankledger`).
+    adopters: Vec<i32>,
 }
 
 #[derive(Debug)]
@@ -975,11 +988,14 @@ impl Kernel {
             }
         }
         // bank_get_bank_ledger_thread_group_and_persona: the bank's ledger
-        // and thread group are not modeled; the persona is none.
+        // (its thread group is not modeled; the persona is none), which
+        // bank_swap_thread_bank_ledger makes the thread's.
+        let ledger = self.bank_voucher_ledger(new);
         let tid = self.tid;
         let t = self.dtask.threads.map.entry(tid).or_default();
         let old = std::mem::replace(&mut t.voucher, new);
         t.voucher_name = name;
+        self.bank_swap_thread_ledger(tid, ledger);
         if let Some(o) = old {
             self.ipc_voucher_release(o);
         }
@@ -992,14 +1008,26 @@ impl Kernel {
         let Some(t) = self.dtask.threads.map.get_mut(&tid) else { return };
         let old = t.voucher.take();
         t.voucher_name = 0;
+        self.bank_swap_thread_ledger(tid, None);
         if let Some(o) = old {
             self.ipc_voucher_release(o);
         }
     }
 
+    /// Thread `tid` ends (`thread_terminate_self`'s
+    /// `bank_swap_thread_bank_ledger(thread, NULL)`), then lets go of its
+    /// voucher.
+    pub(crate) fn darwin_thread_bank_end(&mut self, tid: i32) {
+        self.bank_swap_thread_ledger(tid, None);
+    }
+
     /// The task's threads let go of the vouchers they adopted, as they end
     /// with it (`thread_deallocate_complete`).
     pub(crate) fn darwin_threads_vouchers_release(&mut self) {
+        let tids: Vec<i32> = self.dtask.threads.map.keys().copied().collect();
+        for tid in tids {
+            self.bank_swap_thread_ledger(tid, None);
+        }
         let held: Vec<VoucherId> = self.dtask.threads.map.values_mut().filter_map(|t| t.voucher.take()).collect();
         for v in held {
             self.ipc_voucher_release(v);
@@ -1124,7 +1152,9 @@ impl Kernel {
             macho_uuid: self.dtask.uuid,
         };
         let persona_uid = persona.as_ref().map_or(super::cred::UID_NONE, |p| p.get_uid());
-        BankTask { refs: 1, made: 0, voucher_ref: 0, info, persona_uid, hasentitlement: self.bank_task_is_propagate_entitled(), thread_group: super::coalition::thread_group(self.pid), to_pay: Vec::new(), to_charge: Vec::new() }
+        // get_bank_task_context: bt_ledger is the task's ledger.
+        let ledger = Some(std::sync::Arc::clone(&self.dtask.rusage.bank.lock().unwrap_or_else(|e| e.into_inner())));
+        BankTask { refs: 1, made: 0, voucher_ref: 0, info, persona_uid, hasentitlement: self.bank_task_is_propagate_entitled(), thread_group: super::coalition::thread_group(self.pid), to_pay: Vec::new(), to_charge: Vec::new(), ledger }
     }
 
     /// `bank_task_is_propagate_entitled`: a platform binary propagates
@@ -1216,20 +1246,11 @@ impl Kernel {
         }
         let vt = self.vt();
         let h = vt.alloc_handle();
-        vt.bank.insert(h, BankElem::Account(BankAccount { refs: 1, made: 1, merchant, holder, secureoriginator: so, proximateprocess: pp, thread_group: tg, so_persona: persona }));
+        vt.bank.insert(h, BankElem::Account(BankAccount { refs: 1, made: 1, merchant, holder, secureoriginator: so, proximateprocess: pp, thread_group: tg, so_persona: persona, bill: 0, bill_unkept: false, credited: false, adopters: Vec::new() }));
         self.bank_task(holder).to_pay.push(h);
         self.bank_task(merchant).to_charge.push(h);
         for t in [holder, merchant, so, pp] {
             self.bank_task(t).refs += 1;
-        }
-        // The holder's bills to pay and the merchant's to charge are what
-        // proc_pid_rusage's billed and serviced figures sum, which are not
-        // kept: each process is marked as having them.
-        for t in [holder, merchant] {
-            let (pid, unique_pid) = { let i = &self.bank_task(t).info; (i.pid, i.unique_pid) };
-            if let Some((p, _)) = self.darwin_public(pid).filter(|(p, _)| p.uniqueid == unique_pid) {
-                p.rusage.billing.store(true, std::sync::atomic::Ordering::Release);
-            }
         }
         h
     }
@@ -1245,7 +1266,24 @@ impl Kernel {
         acc.refs -= 1;
         assert!(acc.refs == 0, "Releasing a non zero ref bank account");
         let (holder, merchant, so, pp) = (acc.holder, acc.merchant, acc.secureoriginator, acc.proximateprocess);
-        // bank_rollup_chit_to_tasks: the bill is not kept (BankAccount).
+        let (bill, unkept, credited) = (acc.bill, acc.bill_unkept, acc.credited);
+        // bank_rollup_chit_to_tasks: the bill to the holder's ledger and the
+        // merchant's, unless they are the same ledger (or both gone).
+        let (hl, ml) = (self.bank_task(holder).ledger.clone(), self.bank_task(merchant).ledger.clone());
+        let same = match (&hl, &ml) {
+            (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            use std::sync::atomic::Ordering::AcqRel;
+            for (l, me) in [(hl, true), (ml, false)] {
+                let Some(l) = l else { continue };
+                if me { l.to_me.fetch_add(bill, AcqRel) } else { l.to_others.fetch_add(bill, AcqRel) };
+                l.unkept.fetch_or(unkept, AcqRel);
+                l.credited.fetch_or(credited, AcqRel);
+            }
+        }
         self.bank_task(holder).to_pay.retain(|&a| a != h);
         self.bank_task(merchant).to_charge.retain(|&a| a != h);
         self.vt().bank.remove(&h);
@@ -1259,8 +1297,110 @@ impl Kernel {
     /// accounts keep it while they last).
     pub(crate) fn darwin_bank_task_destroy(&mut self) {
         if let Some(h) = self.dtask.vouchers.bank_context.take() {
+            // bank_destroy_bank_task_ledger: no bill reaches the task's
+            // ledger from now on.
+            self.bank_task(h).ledger = None;
             self.bank_task_dealloc(h);
         }
+    }
+
+    /// `bank_get_bank_ledger_thread_group_and_persona`'s ledger for a
+    /// thread adopting voucher `v`: the bill of the account in its bank
+    /// value, unless the account's holder is its merchant. The task's bank
+    /// context is made if it has none, as the call makes it.
+    fn bank_voucher_ledger(&mut self, v: Option<VoucherId>) -> Option<u64> {
+        let ctx = self.get_bank_task_context();
+        let v = v?;
+        let ki = key_to_index(key::BANK);
+        let vi = self.iv_lookup(v, ki);
+        let h = self.ivac(ki).values(vi).first().copied()?;
+        if h == bank::DEFAULT_VALUE {
+            return None;
+        }
+        let h = if h == bank::DEFAULT_TASK_VALUE { ctx } else { h };
+        if self.bank_is_task(h) {
+            return None;
+        }
+        let a = self.bank_account(h);
+        (a.holder != a.merchant).then_some(h)
+    }
+
+    /// The CPU time thread `tid` used since its last credit, to the bill it
+    /// has as its bank ledger (`thread_dispatch` as it goes off its CPU,
+    /// `bank_swap_thread_bank_ledger`).
+    pub(crate) fn darwin_bank_credit(&mut self, tid: i32) {
+        let Some(t) = self.dtask.threads.map.get(&tid) else { return };
+        let (ledger, deduct) = (t.bank_ledger, t.bank_deduct);
+        if ledger.is_none() {
+            return;
+        }
+        let now = self.thread_signals.get(tid).and_then(|s| s.cpu.times()).map(|(u, s)| u + s);
+        if let Some(t) = self.dtask.threads.map.get_mut(&tid) {
+            t.bank_deduct = now;
+        }
+        let Some(BankElem::Account(a)) = ledger.and_then(|h| self.vt().bank.get_mut(&h)) else { return };
+        a.credited = true;
+        match (now, deduct) {
+            (Some(n), Some(d)) => a.bill = a.bill.wrapping_add(super::rusage::mach_of_ns(n.saturating_sub(d))),
+            _ => a.bill_unkept = true,
+        }
+    }
+
+    /// `bank_swap_thread_bank_ledger(thread, new)`: thread `tid`'s time so
+    /// far goes to the bill it had, and `new` is its bill from now on.
+    fn bank_swap_thread_ledger(&mut self, tid: i32, new: Option<u64>) {
+        let old = self.dtask.threads.map.get(&tid).and_then(|t| t.bank_ledger);
+        if old.is_none() && new.is_none() {
+            return;
+        }
+        self.darwin_bank_credit(tid);
+        if old.is_none() {
+            // The time from here on is the new bill's.
+            let now = self.thread_signals.get(tid).and_then(|s| s.cpu.times()).map(|(u, s)| u + s);
+            if let Some(t) = self.dtask.threads.map.get_mut(&tid) {
+                t.bank_deduct = now;
+            }
+        }
+        if let Some(BankElem::Account(a)) = old.and_then(|h| self.vt().bank.get_mut(&h)) {
+            a.adopters.retain(|&t| t != tid);
+        }
+        if let Some(BankElem::Account(a)) = new.and_then(|h| self.vt().bank.get_mut(&h)) {
+            a.adopters.push(tid);
+        }
+        if let Some(t) = self.dtask.threads.map.get_mut(&tid) {
+            t.bank_ledger = new;
+        }
+    }
+
+    /// `bank_billed_balance_safe` and `bank_serviced_balance_safe` of
+    /// process `pid` (unique id `uniqueid`), whose record is `s`: with a
+    /// bank context, its ledger's entries and the bills of its accounts to
+    /// pay and to charge; without, its ledger's. A bill a thread has as its
+    /// bank ledger while it runs has more than its last credit on a device
+    /// (the quantum's end credits it), so it is not known then.
+    pub(crate) fn darwin_bank_bills(&mut self, pid: i32, uniqueid: u64, s: &super::rusage::Shared) -> super::rusage::Bills {
+        use super::rusage::Bills;
+        let own = std::sync::Arc::clone(&s.bank.lock().unwrap_or_else(|e| e.into_inner()));
+        let ctx = self.vt().bank.values().find_map(|e| match e {
+            BankElem::Task(t) if t.info.pid == pid && t.info.unique_pid == uniqueid && t.ledger.as_ref().is_some_and(|l| std::sync::Arc::ptr_eq(l, &own)) => Some((t.to_pay.clone(), t.to_charge.clone())),
+            _ => None,
+        });
+        let Some((to_pay, to_charge)) = ctx else { return Bills::of_ledger(&own) };
+        let mut b = Bills::of_ledger(&own);
+        let bill = |k: &mut Kernel, h: u64| match k.vt().bank.get(&h) {
+            Some(BankElem::Account(a)) => Some((a.bill, a.bill_unkept, a.credited, a.adopters.clone())),
+            _ => None,
+        };
+        for (accounts, billed) in [(to_pay, true), (to_charge, false)] {
+            for h in accounts {
+                let Some((v, unkept, credited, adopters)) = bill(self, h) else { continue };
+                let running = adopters.iter().any(|&t| !matches!(self.procs.sched.state(t), Some(super::sched::RunState::Wait | super::sched::RunState::Unint)));
+                b.energy |= credited || !adopters.is_empty();
+                let total = if billed { &mut b.billed } else { &mut b.serviced };
+                *total = if unkept || running { None } else { total.map(|t| t.wrapping_add(v)) };
+            }
+        }
+        b
     }
 
     /// The bank element a value names, the default task value naming the

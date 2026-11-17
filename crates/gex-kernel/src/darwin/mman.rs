@@ -320,7 +320,15 @@ impl Kernel {
         } else {
             (fd as u64, file_pos)
         };
-        let at = match self.canonical(m, nr::MMAP, [addr, size, u64::from(cur), l, lfd, lpos]) {
+        // A fixed mapping replaces what was there (vm_map_enter's
+        // VM_FLAGS_OVERWRITE: vm_map_delete, its pmap_remove).
+        let call = [addr, size, u64::from(cur), l, lfd, lpos];
+        let mapped = if flags & FIXED != 0 {
+            self.darwin_footprint_release(m, addr & !PAGE_MASK, round(addr + size), super::footprint::Release::Remove, |k, m| k.canonical(m, nr::MMAP, call))
+        } else {
+            self.canonical(m, nr::MMAP, call)
+        };
+        let at = match mapped {
             Ok(at) => at,
             Err(Errno::ENOMEM) => return Err(Errno::ENOMEM),
             Err(Errno::EACCES) => return Err(Errno::EACCES),
@@ -356,7 +364,8 @@ impl Kernel {
         }
         let mut b = *a;
         // MAP_FIXED replaces what is there, if it is removable.
-        if b[3] as u32 & map::FIXED != 0 && self.darwin_region_delete_check(b[0] & !PAGE_MASK, round(b[0].wrapping_add(b[1]))) != kr::SUCCESS {
+        let fixed = b[3] as u32 & map::FIXED != 0;
+        if fixed && self.darwin_region_delete_check(b[0] & !PAGE_MASK, round(b[0].wrapping_add(b[1]))) != kr::SUCCESS {
             return Err(Errno::EACCES);
         }
         // Anywhere: vm_map_enter's search from the rounded hint.
@@ -365,7 +374,11 @@ impl Kernel {
             b[3] |= u64::from(map::FIXED);
         }
         let n = super::bsd::translate(super::bsd::sys::MMAP, &mut b);
-        let at = self.canonical(m, n, b)?;
+        let at = if fixed {
+            self.darwin_footprint_release(m, b[0] & !PAGE_MASK, round(b[0].wrapping_add(b[1])), super::footprint::Release::Remove, |k, m| k.canonical(m, n, b))?
+        } else {
+            self.canonical(m, n, b)?
+        };
         let file = self.fds.get(a[4] as i32).ok();
         let writable = file.as_ref().is_some_and(|f| f.writable);
         let max = if writable { prot::READ | prot::WRITE } else { prot::READ } as u8;
@@ -781,8 +794,10 @@ impl Kernel {
             if p.prot & prot::WRITE as u8 == 0 {
                 return KERN_PROTECTION_FAILURE;
             }
+            // deactivate_pages_in_object with DEACTIVATE_REUSABLE: the
+            // pages leave the task's footprint, still entered.
             if Self::darwin_kills(p) {
-                self.darwin_host_advise(m, p, p.start, p.end, HostAdvice::Reusable);
+                self.darwin_footprint_release(m, p.start, p.end, super::footprint::Release::Reusable, |k, m| k.darwin_host_advise(m, p, p.start, p.end, HostAdvice::Reusable));
             }
             // A large malloc block's tag says it is reusable now. (XNU skips
             // an entry with no object yet, one never touched, which only
@@ -806,6 +821,8 @@ impl Kernel {
             }
             if matches!(p.attrs.kind, kind::ANON | kind::SHM) {
                 self.darwin_host_advise(m, p, p.start, p.end, HostAdvice::Reuse);
+                // vm_object_reuse_pages: its reusable pages count again.
+                self.darwin_footprint_reused(m, p.start, p.end);
             }
             if p.attrs.alias == vm::tag::MALLOC_LARGE_REUSABLE {
                 self.dtask.vm.update_whole(p.start, p.end, |a| a.alias = vm::tag::MALLOC_LARGE_REUSED);

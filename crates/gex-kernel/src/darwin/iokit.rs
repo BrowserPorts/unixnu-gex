@@ -453,7 +453,7 @@ pub fn matching(tree: &[Node], dict: &[(String, DictValue)]) -> Result<Vec<u32>,
             .enumerate()
             .filter(|&(i, n2)| superclasses(n2.class).contains(&"IOService") && name(tree, i as u32) == n)
             .filter(|(_, n2)| class.map_or(true, |c| superclasses(n2.class).contains(&c)))
-            .filter(|(_, n2)| props.iter().all(|&(k, v)| n2.service_props.iter().any(|(pk, pv)| pk == k && matches!(pv, Prop::Str(s) if s == v))))
+            .filter(|(_, n2)| props.iter().all(|&(k, v)| n2.service_props.iter().any(|(pk, pv)| pk == k && matches!(pv, Prop::Str(s) | Prop::Sym(s) if s == v))))
             .map(|(i, _)| i as u32)
             .collect();
         return Ok(found);
@@ -484,7 +484,7 @@ pub fn matching(tree: &[Node], dict: &[(String, DictValue)]) -> Result<Vec<u32>,
     let wanted = |n: &Node| {
         superclasses(n.class).contains(&"IOService")
             && class.map_or(true, |c| superclasses(n.class).contains(&c))
-            && props.iter().all(|&(k, v)| n.service_props.iter().any(|(pk, pv)| pk == k && matches!(pv, Prop::Str(s) if s == v)))
+            && props.iter().all(|&(k, v)| n.service_props.iter().any(|(pk, pv)| pk == k && matches!(pv, Prop::Str(s) | Prop::Sym(s) if s == v)))
     };
     let found: Vec<u32> = tree.iter().enumerate().filter(|(_, n)| wanted(n)).map(|(i, _)| i as u32).collect();
     // APFS's own classes are all here, and so are the accelerator's (one
@@ -1538,6 +1538,9 @@ mod tests {
         assert_eq!(&keys[..3], &["Content", "Leaf", "Content Hint"]);
         assert!(keys.iter().any(|k| k == "BSD Name"));
         assert!(properties_missing(&t, media).unwrap().contains("IOStorageFeatures"));
+        // An OSSymbol's string matches as an OSString's does.
+        let bsd = super::super::storage::container_bsd_name();
+        assert_eq!(matching(&t, &[("BSD Name".to_string(), DictValue::Str(bsd))]), Ok(vec![media]));
     }
 
     #[test]

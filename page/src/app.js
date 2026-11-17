@@ -113,6 +113,10 @@ const PIECES = {
  *   onCrash({ pid, name, reason, code, signal })
  *              a program of the run crashed (the System's `crash` event,
  *              page/runtime README): it has ended and its windows are gone
+ *   hostCalls  {name: fn}: the page's answers to the program's calls through
+ *              /dev/gex-host (the System's `hostCalls`, page/runtime README),
+ *              registered as the run's system starts. fn(args) is given the
+ *              call's JSON, parsed, and returns (or resolves to) the answer.
  *   onStoreBusy({ name, signal })
  *              the OPFS store is open in another tab or window of the site
  *              (one page holds a store at a time): the page offers its user
@@ -924,6 +928,7 @@ async function begin(opts, base, at, state, meter, lets) {
         state.error = String(e.error?.stack ?? e.error);
         meter.end('failed', state.error);
       });
+      for (const [name, fn] of Object.entries(opts.hostCalls ?? {})) s.system.hostCalls.register(name, fn);
       if (opts.onCrash) {
         s.system.addEventListener('crash', ({ pid, name, reason, code, signal }) => opts.onCrash({ pid, name, reason, code, signal }));
       }

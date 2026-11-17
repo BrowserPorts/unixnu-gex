@@ -8,6 +8,7 @@ export const OPTIONS = [
   'container', 'canvas', 'size', 'args', 'env', 'cwd', 'exe', 'uid', 'mtimes', 'filesystem', 'network', 'wisp',
   'pageHosts', 'strace', 'trapstack', 'debug', 'compositor', 'gl', 'translation', 'hostx', 'mem64',
   'glLazy', 'background', 'baseUrl', 'launch', 'build', 'onLog', 'onExit', 'onProgress', 'onStoreBusy', 'onCrash', 'ready',
+  'hostCalls',
 ];
 
 /** The option of `names` one edit or a case away from `k`, if any. */
@@ -63,6 +64,11 @@ export function checkOptions(opts) {
   if (given('filesystem') && !filesystemValue(opts.filesystem)) bad('filesystem', "'memory', { kind: 'memory', max }, or { kind: 'opfs', name, cache }");
   for (const k of ['onLog', 'onExit', 'onProgress', 'onStoreBusy', 'onCrash']) if (given(k) && typeof opts[k] !== 'function') bad(k, 'a function');
   for (const k of ['debug', 'pageHosts']) if (given(k) && typeof opts[k] !== 'object') bad(k, 'an object, {name: value}');
+  if (given('hostCalls')) {
+    const calls = opts.hostCalls;
+    const ok = typeof calls === 'object' && Object.entries(calls).every(([n, fn]) => n && !/[\0\s]/.test(n) && typeof fn === 'function');
+    if (!ok) bad('hostCalls', 'an object, {name: function}, each name without spaces');
+  }
 }
 
 /** Where the guest's files are kept: `'memory'` (`MemoryFilesystem`),

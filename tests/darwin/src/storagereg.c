@@ -4,7 +4,8 @@
 // open state, size and UUID), every class conforming to OSObject, the
 // provider chain up to the controller's PCI nub, the namespace's protocol
 // characteristics found up the plane by a recursive search, and disk0 and
-// its partition in the device tree plane below the controller's nub;
+// its partition in the device tree plane below the controller, itself below
+// its nub there;
 // disk0 matched by its BSD major and minor as numbers, every IOMedia, the
 // firmware namespace's whole disk, the controller's children in the order
 // it makes them, its storage driver's statistics, and a search up the
@@ -97,9 +98,14 @@ int main(void) {
     if (ic == NULL || CFStringCompare(ic, CFSTR("PCI-Express"), 0) != kCFCompareEqualTo) return bad("the interconnect", 0, 1);
     CFRelease(pc);
 
-    // disk0 and its partition in the device tree plane, below s3e's nub.
-    io_registry_entry_t whole = up[3], part = up[1], dtp = IO_OBJECT_NULL;
-    if (IORegistryEntryGetParentEntry(whole, kIODeviceTreePlane, &dtp) != KERN_SUCCESS || !IOObjectIsEqualTo(dtp, up[7])) return bad("disk0's device tree parent", 0, 1);
+    // disk0 and its partition in the device tree plane, below the
+    // controller, which is below s3e's nub there.
+    io_registry_entry_t whole = up[3], part = up[1], dtp = IO_OBJECT_NULL, cdtp = IO_OBJECT_NULL;
+    if (IORegistryEntryGetParentEntry(whole, kIODeviceTreePlane, &dtp) != KERN_SUCCESS || !IOObjectIsEqualTo(dtp, up[6])) return bad("disk0's device tree parent", 0, 1);
+    if (IORegistryEntryGetParentEntry(part, kIODeviceTreePlane, &cdtp) != KERN_SUCCESS || !IOObjectIsEqualTo(cdtp, up[6])) return bad("the partition's device tree parent", 0, 1);
+    IOObjectRelease(cdtp);
+    if (IORegistryEntryGetParentEntry(up[6], kIODeviceTreePlane, &cdtp) != KERN_SUCCESS || !IOObjectIsEqualTo(cdtp, up[7])) return bad("the controller's device tree parent", 0, 1);
+    IOObjectRelease(cdtp);
     if (IORegistryEntryGetNameInPlane(whole, kIODeviceTreePlane, name) != KERN_SUCCESS || strcmp(name, "disk") != 0) return bad("disk0's device tree name", 0, 1);
     if (IORegistryEntryGetLocationInPlane(whole, kIODeviceTreePlane, loc) != KERN_SUCCESS || strcmp(loc, "1:0") != 0) return bad("disk0's device tree location", 0, 1);
     if (IORegistryEntryGetLocationInPlane(part, kIODeviceTreePlane, loc) != KERN_SUCCESS || strcmp(loc, "1:1") != 0) return bad("the partition's device tree location", 0, 1);

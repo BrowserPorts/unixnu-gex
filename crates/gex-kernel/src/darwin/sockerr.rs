@@ -33,6 +33,9 @@ impl Kernel {
         if io.unix_of(fd).is_ok() || io.remote_unix_of(fd).is_ok() {
             return Some(Proto::UnixStream);
         }
+        if let Some(s) = self.darwin_inet6_of(fd) {
+            return Some(if s.proto == super::inet6::Proto::Udp { Proto::Datagram } else { Proto::Tcp });
+        }
         let s = io.socket_of(fd).ok()?;
         Some(if s.kind == net::Kind::Udp { Proto::Datagram } else { Proto::Tcp })
     }

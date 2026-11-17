@@ -59,6 +59,7 @@ pub mod exit;
 pub mod exception;
 pub mod execve;
 pub mod fsops;
+pub mod inet6;
 pub mod ioctl;
 pub mod filesec;
 pub mod fixedcalls;

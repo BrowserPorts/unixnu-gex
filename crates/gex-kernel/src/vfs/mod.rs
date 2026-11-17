@@ -640,6 +640,11 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// The Darwin inet6 socket this is a descriptor of.
+    fn as_darwin_inet6(self: Arc<Self>) -> Option<Arc<crate::darwin::inet6::Inet6Socket>> {
+        None
+    }
+
     /// `vn_close`: the open file's last hold went (`closef` at the end of
     /// `fg_count`), for a device that is told of its close.
     fn vn_close(&self) {}

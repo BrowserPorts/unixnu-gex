@@ -896,6 +896,9 @@ impl Kernel {
                 return Some(neg(e));
             }
         }
+        if let Some(r) = self.darwin_inet6_call(m, raw, a) {
+            return Some(res(r));
+        }
         Some(match raw {
             // A unix socket's bind, which makes its name's socket file: its
             // record once made.

@@ -310,6 +310,9 @@ pub fn sb_socket(h: &Arc<dyn crate::vfs::FileHandle>) -> Option<SbSocket> {
     if Arc::clone(h).as_unix_socket().is_some() || Arc::clone(h).as_remote_unix().is_some() {
         return so(1, 1, 0, None);
     }
+    if let Some(s) = Arc::clone(h).as_darwin_inet6() {
+        return so(30, s.proto.ty(), s.proto.protocol(), Some(super::inet6::unbound_name()));
+    }
     let s = Arc::clone(h).as_inet_socket()?;
     let (ip, port) = s.local();
     let (ty, protocol) = if s.kind == crate::net::Kind::Udp { (2, 17) } else { (1, 6) };

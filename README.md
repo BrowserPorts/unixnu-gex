@@ -142,7 +142,10 @@ subsystem, most naming in their header the XNU source they port:
   refusals (`sockerr.rs`); Unix-domain stream sockets' sends and receives
   with the descriptors they carry, over XNU's socket buffer accounting
   (`unixsock.rs`, `sockbuf.rs`). As in upstream gex, an internet socket's
-  connection is carried by the host.
+  connection is carried by the host. The inet6 domain's UDP and TCP
+  sockets as `inet6sw`'s lookup makes them, and `lo0`'s IPv6 addresses
+  as `in6_control` checks and keeps them, from the `::1` the kernel gives
+  it at boot (`inet6.rs`).
 - **Security.** The MAC framework's checks, with AMFI and Sandbox as its
   policies (`mac.rs`); AMFI's decisions on code signatures, task ports, JIT
   and executable mappings (`amfi.rs`); AMFI's launch constraints, at exec
@@ -608,7 +611,7 @@ dyld and libSystem from the device's shared cache.
 | files | `fsops`, `pathrules`, `pathconf`, `statino`, `statfsino`, `dirino`, `setattr`, `xattr`, `clone`, `renameswap`, `lockf`, `lastclose`, `guarded`, `fileport`, `filesec`, `openmode`, `vectored`, `aio`, `fixedcalls`, `ioctl`, `realdev` |
 | kqueue, poll and pipes | `kq-pipe`, `vnode`, `vnextend`, `select`, `poll`, `pipe`, `timeouts` |
 | terminals and `/dev` | `pty`, `ptyjob`, `ptyclose`, `bsdpty`, `ttyinfo`, `ttydead`, `ttydrain`, `fcntltty`, `revoke`, `devfs`, `devattr`, `console` |
-| sockets | `sockerr`, `sockevent`, `sockname`, `sockopts`, `halfclose`, `nosigpipe`, `dgrambuf`, `streambuf` |
+| sockets | `sockerr`, `sockevent`, `sockname`, `sockopts`, `halfclose`, `nosigpipe`, `dgrambuf`, `streambuf`, `inet6` |
 | code signing and IOKit | `codesig`, `amfi`, `launchcon`, `policy`, `iokit`, `ioreg`, `iosurface`, `iosurfacex`, `iogpudev`, `accel`, `accelr`, `iomfb`, `iomfbmain` |
 | the GPU (WebMetal) | `metalwire`, `metal` |
 
@@ -803,7 +806,11 @@ is the reference (search `crates/gex-kernel/src/` for
   first, until `sysctl.name2oid` of it on the device measures it. APFS's `fsctl`s
   other than `APFSIOC_GET_DEV_BY_ROLE` and the virtual-interface query
   are reported.
-- **Sockets.** Interface `ioctl`s know only `lo0`. Out-of-band data,
+- **Sockets.** Interface `ioctl`s know only `lo0`. An inet6 socket's
+  protocol calls (binding, connecting, sending, receiving, its name,
+  `shutdown`, `fstat`, the `IPPROTO_IPV6` and protocol-level options),
+  raw and ICMPv6 sockets, and IPv6 addresses whose routes, on-link
+  prefixes or finite lifetimes the kernel would keep are reported. Out-of-band data,
   `SO_LINGER`, `SO_DONTROUTE`, `SO_OOBINLINE`, address sharing
   (`SO_REUSEADDR`, `SO_REUSEPORT`) when a bind is refused, keepalive probes
   on a connection the host carries, broadcast datagrams, a socket's owner

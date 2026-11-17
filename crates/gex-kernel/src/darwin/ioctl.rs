@@ -102,17 +102,24 @@ impl Kernel {
         Ok(())
     }
 
-    /// `SIOCGIFFLAGS` and `SIOCSIFFLAGS` (root's, already checked) of an
-    /// interface by name; `ifunit`'s ENXIO for a name no interface has, and
-    /// only the loopback interface is modelled.
-    fn darwin_ifflags(&mut self, com: u64, data: &mut [u8]) -> Result<(), Errno> {
-        use std::sync::atomic::Ordering::Relaxed;
-        const IFF_CANTCHANGE: u32 = 0x2 | 0x10 | 0x40 | 0x400 | 0x800 | 0x8000 | 0x200;
+    /// `ifunit` of the interface a request names in its first `IFNAMSIZ`
+    /// bytes: ENXIO for a name no interface has, and only the loopback
+    /// interface is modelled.
+    pub(super) fn darwin_ifunit(&mut self, data: &[u8]) -> Result<(), Errno> {
         let len = data[..16].iter().position(|&c| c == 0).unwrap_or(16);
         if &data[..len] != b"lo0" {
             self.darwin_unimplemented(format!("interface {:?} (only lo0 is modelled)", String::from_utf8_lossy(&data[..len])));
             return Err(Errno::ENXIO);
         }
+        Ok(())
+    }
+
+    /// `SIOCGIFFLAGS` and `SIOCSIFFLAGS` (root's, already checked) of an
+    /// interface by name.
+    pub(super) fn darwin_ifflags(&mut self, com: u64, data: &mut [u8]) -> Result<(), Errno> {
+        use std::sync::atomic::Ordering::Relaxed;
+        const IFF_CANTCHANGE: u32 = 0x2 | 0x10 | 0x40 | 0x400 | 0x800 | 0x8000 | 0x200;
+        self.darwin_ifunit(data)?;
         if com == cmd::SIOCGIFFLAGS {
             data[16..18].copy_from_slice(&(LO0_FLAGS.load(Relaxed) as u16).to_le_bytes());
         } else {
@@ -278,6 +285,7 @@ impl Kernel {
             // soo_ioctl: soioctl's MAC check first; the descriptor's
             // FNONBLOCK is what the socket here goes by.
             Kind::Socket if let Some(e) = super::mac::sb_socket(&file.handle).map(|so| self.darwin_mac_check_socket_ioctl(so, com)).filter(|&e| e != 0) => Err(super::errno::errno_of(e as i32)),
+            Kind::Socket if Arc::clone(&file.handle).as_darwin_inet6().is_some() => self.darwin_inet6_soioctl(com, data),
             Kind::Socket => match com {
                 cmd::FIONBIO => Ok(()),
                 cmd::FIOASYNC if int(data) == 0 => Ok(()),

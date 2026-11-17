@@ -2053,5 +2053,8 @@ mod tests {
         assert_eq!(matching(&[("IOProviderClass", "IOResources")]), Ok(vec![resources]));
         assert_eq!(matching(&[("IOProviderClass", "IOResources"), ("IOResourceMatch", "IOBSD")]), Ok(vec![resources]));
         assert!(matching(&[("IOProviderClass", "IOResources"), ("IOResourceMatch", "IONVRAM")]).is_err());
+        // IOSurface.framework's name match: only the root bears the name.
+        assert_eq!(matching(&[("IONameMatch", "IOCoreSurfaceRoot")]), Ok(vec![surface]));
+        assert!(matching(&[("IONameMatch", "IOResources")]).is_err());
     }
 }

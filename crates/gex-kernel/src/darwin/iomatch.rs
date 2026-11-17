@@ -607,7 +607,13 @@ pub fn existing(t: &[Node], g: &Graph, table: Id, once: bool) -> Result<Vec<u32>
     // only for the classes whose every service is here; else a match by a
     // key no other service can share (a BSD name, a registry entry ID of
     // the registry here) or by a device tree path is still the answer.
-    let complete = class.as_deref().is_some_and(class_complete);
+    // So it is when the dictionary's IONameMatch names only names whose
+    // every service is here (a matching service must bear one).
+    let names_complete = get(g, table, key::NAME_MATCH).is_some_and(|n| {
+        let names = names_of(g, n);
+        !names.is_empty() && names.iter().all(|x| name_complete(&String::from_utf8_lossy(x)))
+    });
+    let complete = class.as_deref().is_some_and(class_complete) || names_complete;
     let unique = (get(g, table, key::BSD_NAME).is_some() && !found.is_empty()) || get(g, table, key::REGISTRY_ENTRY_ID).is_some();
     match gap {
         Some(e) if !(unique && !found.is_empty()) => Err(e),
@@ -622,6 +628,13 @@ pub fn existing(t: &[Node], g: &Graph, table: Id, once: bool) -> Result<Vec<u32>
 fn class_complete(class: &str) -> bool {
     class == "IOPlatformExpertDevice"
         || super::storagestack::class_complete(class) || super::iopower::class_complete(class) || super::accel::class_complete(class) || super::iosurface::class_complete(class) || super::iomfb::class_complete(class)
+}
+
+/// Whether every registered service named `name` is in the registry here:
+/// IOSurfaceRoot's name is its own ([`super::iosurface::name_complete`]);
+/// a device tree nub's names are its device tree's, all here.
+fn name_complete(name: &str) -> bool {
+    super::iosurface::name_complete(name)
 }
 
 /// `OSDictionary::getCount`.

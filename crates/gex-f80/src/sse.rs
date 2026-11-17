@@ -166,27 +166,37 @@ mod tests {
         f32::from_bits(op(code, a.to_bits() as u64, b.to_bits() as u64, mx) as u32)
     }
 
+    /// The host's result as SSE gives it: an invalid operation (none of
+    /// these operands is a NaN) is SSE's default NaN, negative and quiet,
+    /// where a host that is not x86 (AArch64's is positive) differs.
+    fn sse64(r: f64) -> u64 {
+        if r.is_nan() { 0xfff8_0000_0000_0000 } else { r.to_bits() }
+    }
+    fn sse32(r: f32) -> u32 {
+        if r.is_nan() { 0xffc0_0000 } else { r.to_bits() }
+    }
+
     /// To nearest, every operation is the host's.
     #[test]
     fn nearest_is_ieee() {
         let vals = [1.0, 1.0 / 3.0, -2.0 / 7.0, 1e300, -1e-300, 4.9e-324, 2.2250738585072014e-308, 0.0, -0.0, 1e16 + 3.0];
         for &a in &vals {
             for &b in &vals {
-                assert_eq!(d(ADD, a, b, RN).to_bits(), (a + b).to_bits(), "{a} + {b}");
-                assert_eq!(d(SUB, a, b, RN).to_bits(), (a - b).to_bits(), "{a} - {b}");
-                assert_eq!(d(MUL, a, b, RN).to_bits(), (a * b).to_bits(), "{a} * {b}");
+                assert_eq!(d(ADD, a, b, RN).to_bits(), sse64(a + b), "{a} + {b}");
+                assert_eq!(d(SUB, a, b, RN).to_bits(), sse64(a - b), "{a} - {b}");
+                assert_eq!(d(MUL, a, b, RN).to_bits(), sse64(a * b), "{a} * {b}");
                 if !(a == 0.0 && b == 0.0) {
-                    assert_eq!(d(DIV, a, b, RN).to_bits(), (a / b).to_bits(), "{a} / {b}");
+                    assert_eq!(d(DIV, a, b, RN).to_bits(), sse64(a / b), "{a} / {b}");
                 }
                 let (fa, fb) = (a as f32, b as f32);
-                assert_eq!(s(ADD, fa, fb, RN).to_bits(), (fa + fb).to_bits(), "{fa} + {fb}");
-                assert_eq!(s(MUL, fa, fb, RN).to_bits(), (fa * fb).to_bits(), "{fa} * {fb}");
+                assert_eq!(s(ADD, fa, fb, RN).to_bits(), sse32(fa + fb), "{fa} + {fb}");
+                assert_eq!(s(MUL, fa, fb, RN).to_bits(), sse32(fa * fb), "{fa} * {fb}");
                 if !(fa == 0.0 && fb == 0.0) {
-                    assert_eq!(s(DIV, fa, fb, RN).to_bits(), (fa / fb).to_bits(), "{fa} / {fb}");
+                    assert_eq!(s(DIV, fa, fb, RN).to_bits(), sse32(fa / fb), "{fa} / {fb}");
                 }
             }
             if a >= 0.0 {
-                assert_eq!(d(SQRT, a, 0.0, RN).to_bits(), a.sqrt().to_bits(), "sqrt {a}");
+                assert_eq!(d(SQRT, a, 0.0, RN).to_bits(), sse64(a.sqrt()), "sqrt {a}");
             }
             assert_eq!(op(NARROW, a.to_bits(), 0, RN) as u32, (a as f32).to_bits(), "narrow {a}");
         }

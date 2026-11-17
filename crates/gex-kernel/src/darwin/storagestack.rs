@@ -340,15 +340,10 @@ fn add_pcie(t: &mut Vec<Node>, io: u32) -> Option<u32> {
         l.push(("IOInterruptControllers", "the MSI vectors the controller's driver allocates (ApplePCIEMSIController)"));
         l.push(("IOInterruptSpecifiers", "the MSI vectors the controller's driver allocates (ApplePCIEMSIController)"));
     }
-    // The personality "AppleEmbeddedNVMeController" (IONVMeFamily), and
-    // what its start sets of the controller's own: its panic action, its
-    // NAND's status once its namespaces are up, Identify Controller's
-    // strings as symbols (0xfffffff006a85d58), and its reporters' legend
-    // (AppleEmbeddedNVMeController's slot 0x850, 0xfffffff006a5dd18: a new
-    // legend of one state reporter). Its score: the personality has none,
-    // and `pciMatchNub` adds 1000 for an IOPCIMatch matched on the IDs or
-    // the subsystem's; neither class overrides `probe`.
-    let n = super::storage::nvme();
+    // The personality "AppleEmbeddedNVMeController" (IONVMeFamily). Its
+    // score: the personality has none, and `pciMatchNub` adds 1000 for an
+    // IOPCIMatch matched on the IDs or the subsystem's; neither class
+    // overrides `probe`. Then what its start sets ([`controller_props`]).
     let mut props = driver("com.apple.iokit.IONVMeFamily", CONTROLLER, PCI_DEVICE, None, "IODefaultMatchCategory", 1000, vec![
         key("IOPCIClassMatch", string("0x01800200&0xffffff00")),
         key("IOUserClientClass", string("AppleNVMeUpdateUC")),
@@ -360,33 +355,246 @@ fn add_pcie(t: &mut Vec<Node>, io: u32) -> Option<u32> {
         key("Physical Interconnect Location", string("Internal")),
         key("IOPCIUseDeviceMapper", Prop::Bool(true)),
     ]);
-    props.push(key("Serial Number", sym(n.serial)));
-    props.push(key("Model Number", sym(n.model)));
-    props.push(key("Firmware Revision", sym(n.firmware)));
-    props.push(key("IOPlatformPanicAction", num32(0)));
-    props.push(key("AppleNANDStatus", sym("Ready")));
-    // IOStateReporter::with(this, kIOReportCategoryPower, 2 states, unit
-    // 0x0101000000000000): channel 'NVMe Pwr' "NVMe Power States", its
-    // states 'OFF' and 'ACTIVE'; in group "NVMe" with no subgroup.
-    props.push(key("IOReportLegend", Prop::Array(vec![legend_entry(&[(0x4e56_4d65_2050_7772, "NVMe Power States")], channel_type(2, 1 << 1, 2), 0x0101_0000_0000_0000, "NVMe", None)])));
-    props.push(key("IOReportLegendPublic", Prop::Bool(true)));
-    let lacks = vec![
-        ("IOCommandPoolSize", "from CAP.MQES, the controller's register (IOControllerInit, 0xfffffff006a8316c)"),
-        ("NVMe Revision Supported", "\"%u.%u%u\" of the VS register, the controller's"),
-        ("Controller Characteristics", "the NAND's answers to the vendor commands (0xfffffff006a5c19c)"),
-        ("IOPolledInterface", "the polled adapter object"),
-        ("chip-id", "the NAND's"),
-        ("chip-revision", "the NAND's"),
-        ("IOMinimumSaturationByteCount", "not followed"),
-        ("IOMaximumSwapWrite", "not followed"),
-        ("VCParams", "not followed"),
-        ("NVMe Debug Data", "not followed"),
-    ];
+    props.extend(controller_props(t, &f.nvme));
+    let lacks = vec![("IOPowerManagement", "the controller's power management, not modelled (PMinit in 0xfffffff006a874dc, after Firmware Revision)")];
     // Its start attaches it below its nub in the `IODeviceTree` plane
     // (0xfffffff006a81ec0), with no name or location of that plane's.
     let mut c = service(CONTROLLER, CONTROLLER, Some(nvme), props, Table::Lacks(lacks));
     c.dt = Some(DtLink { parent: nvme, name: CONTROLLER.to_string(), location: None });
     Some(push(t, c))
+}
+
+/// What the controller's start (IONVMeController::start,
+/// 0xfffffff006a81d90) sets on itself, in its order:
+/// - `IOControllerInit` (0xfffffff006a8316c): IOCommandPoolSize, the
+///   request pool's size, min(CAP.MQES + 1, 65) less one (the embedded
+///   controller's queue limit, slot 0x680, is 0x40: 0xfffffff006a64180);
+///   "NVMe Revision Supported", `"%u.%u%u"` of the VS register's major,
+///   minor and tertiary bytes (a symbol); IOPlatformPanicAction 0. Its
+///   "Physical Interconnect Location" needs the embedded flag clear, which
+///   the embedded InitializeController sets first (0xfffffff006a5b4dc), and
+///   no entry up the plane has "ssd-off-in-S4".
+/// - `AllocateResources`, through the embedded slot 0x850
+///   (0xfffffff006a5dd18): a new reporters' legend of one
+///   `IOStateReporter` (kIOReportCategoryPower, 2 states, unit
+///   0x0101000000000000): channel 'NVMe Pwr' "NVMe Power States", states
+///   'OFF' and 'ACTIVE', in group "NVMe" with no subgroup.
+/// - Identify Controller's handler (0xfffffff006a85d58): IOPolledInterface
+///   when the request pool holds at least two (an
+///   `IONVMeControllerPolledAdapter`, which serializes as its class's note);
+///   the transfer limits (0xfffffff006a872e8 on) from MDTS's exponent `m`
+///   (MDTS if it is 1 to 7, else 8): segments of 4096 bytes (64-bit
+///   numbers), `1 << m` of them, `4096 << m` bytes, aligned to 4096;
+///   IOMinimumSaturationByteCount 0x800000 only on a link at 8 GT/s x4
+///   (slot 0x7c0, 0xfffffff006a88258: s3e's IOPCIExpressLinkStatus & 0x3ff
+///   is 0x43); Controller Characteristics ([`controller_characteristics`],
+///   replaced twice later in its place); the Identify strings as symbols,
+///   trailing spaces cut (0xfffffff006a85e40 on).
+/// - PMinit, which adds IOPowerManagement (0xfffffff006a8754c).
+/// - `IdentifyNamespaces` (0xfffffff006a5b84c): IOMaximumSwapWrite
+///   ([`swap_write_limit`]).
+/// - `StartController` (0xfffffff006a5e25c): once the namespaces are made,
+///   AppleNANDStatus "Ready".
+/// "NVMe Debug Data" and "nand-fragmentation" are set only by
+/// `setProperties` from a privileged task (0xfffffff006a83570,
+/// 0xfffffff006a9139c); chip-id and chip-revision are read from the device
+/// tree (0xfffffff006a89534), not set; VCParams and QueueSize are
+/// AppleANS3CGv2Controller's. None is here at boot.
+fn controller_props(t: &[Node], link: &PciFunction) -> Vec<(String, Prop)> {
+    let n = super::storage::nvme();
+    let c = controller_facts();
+    let pool = u64::from(c.mqes).min(64);
+    let m = mdts_exponent(c.mdts);
+    let mut p = vec![
+        key("IOCommandPoolSize", num32(pool)),
+        key("NVMe Revision Supported", sym(&format!("{}.{}{}", c.vs >> 16 & 0xff, c.vs >> 8 & 0xff, c.vs & 0xff))),
+        key("IOPlatformPanicAction", num32(0)),
+        key("IOReportLegend", Prop::Array(vec![legend_entry(&[(0x4e56_4d65_2050_7772, "NVMe Power States")], channel_type(2, 1 << 1, 2), 0x0101_0000_0000_0000, "NVMe", None)])),
+        key("IOReportLegendPublic", Prop::Bool(true)),
+    ];
+    if pool >= 2 {
+        p.push(key("IOPolledInterface", string("IONVMeControllerPolledAdapter is not serializable")));
+    }
+    p.extend([
+        key("IOMaximumSegmentByteCountRead", num64(4096)),
+        key("IOMaximumSegmentByteCountWrite", num64(4096)),
+        key("IOMaximumSegmentCountRead", num32(1 << m)),
+        key("IOMaximumSegmentCountWrite", num32(1 << m)),
+        key("IOMaximumByteCountRead", num32(4096 << m)),
+        key("IOMaximumByteCountWrite", num32(4096 << m)),
+        key("IOMinimumSegmentAlignmentByteCount", num32(4096)),
+    ]);
+    if link.link_status & 0x3ff == 0x43 {
+        p.push(key("IOMinimumSaturationByteCount", num32(0x80_0000)));
+    }
+    p.push(key("Controller Characteristics", controller_characteristics(&c, m)));
+    p.push(key("Serial Number", sym(n.serial)));
+    p.push(key("Model Number", sym(n.model)));
+    p.push(key("Firmware Revision", sym(n.firmware)));
+    if let Some(limit) = swap_write_limit(t, c.capacity_gb) {
+        p.push(key("IOMaximumSwapWrite", num64(limit)));
+    }
+    p.push(key("AppleNANDStatus", sym("Ready")));
+    p
+}
+
+/// MDTS's exponent as Identify Controller's handler takes it
+/// (0xfffffff006a85d9c): MDTS if it is 1 to 7, else (0, no limit, or more)
+/// 8.
+fn mdts_exponent(mdts: u8) -> u32 {
+    if (1..=7).contains(&mdts) { u32::from(mdts) } else { 8 }
+}
+
+/// `SetSwapWriteLimit` (0xfffffff006a5f25c) of the NAND's capacity in GB,
+/// by the device tree's /product artwork-device-idiom: a pad's or a
+/// phone's 4 GiB above 256 GB, 3 GiB above 128, 2 GiB above 64, 1 GiB above
+/// 16, else 0 (still set); a watch's 1 GiB from 16 GB, else none; none for
+/// any other idiom, or with no /product.
+fn swap_write_limit(t: &[Node], capacity_gb: u64) -> Option<u64> {
+    let idiom = super::iokit::dt_prop(t, "IODeviceTree:/product", "artwork-device-idiom")?;
+    let idiom = &idiom[..idiom.iter().position(|&b| b == 0).unwrap_or(idiom.len())];
+    match idiom {
+        b"pad" | b"phone" => Some(match capacity_gb {
+            c if c > 256 => 0x1_0000_0000,
+            c if c > 128 => 0xc000_0000,
+            c if c > 64 => 0x8000_0000,
+            c if c > 16 => 0x4000_0000,
+            _ => 0,
+        }),
+        b"watch" => (capacity_gb >= 16).then_some(0x4000_0000),
+        _ => None,
+    }
+}
+
+/// The controller's Controller Characteristics, in the order it is built:
+/// Preferred IO Size (`4096 << m`, 32 bits) and Encryption Type "AES-XTS"
+/// (the embedded slot 0x770, 0xfffffff006a5d7bc), then what
+/// `IdentifyNamespaces` appends to a copy of it (0xfffffff006a5b84c), from
+/// Identify Controller's Apple area and two vendor commands: vendor-name
+/// (bytes 0xe38, 16), nand-marketing-name (0xe18, 32), firmware-version
+/// (the 8 bytes of FR), msp-version (0xc00, 16), chip-id (the name of byte
+/// 0xc1c's chip, from the table at 0xfffffff006fa0688), controller-unique-id
+/// (the 20 bytes of SN), each an OSString of the bytes up to a NUL;
+/// nand-device-desc, the 64-bit number at 0xd00 if it is nonzero, else a
+/// 32-bit number of the halfword at 0xc1e and the byte at 0xc20 above it;
+/// manufacturer-id, 8 bytes of data, the first 6 the vendor command 0x38's
+/// answer (0xfffffff006a5f6e4); capacity, the halfword at 0xe06 in GB times
+/// 10^9 (64 bits); and the geometry the vendor command 0x37 answers
+/// (0xfffffff006a630ec), each a 32-bit number of the answer's words. "Low
+/// Power Mode" would come first if the controller's +0x268 were set, which
+/// nothing in IONVMeFamily writes.
+fn controller_characteristics(c: &ControllerFacts, m: u32) -> Prop {
+    let n = super::storage::nvme();
+    let field = |s: &str, len: usize| {
+        let mut b: Vec<u8> = s.bytes().take(len).collect();
+        b.resize(len, b' ');
+        string(&String::from_utf8_lossy(&b))
+    };
+    let upto = |s: &str, len: usize| string(&s.chars().take(len).collect::<String>());
+    let w = &c.geometry;
+    let desc = if c.nand_device_desc_64 != 0 { num64(c.nand_device_desc_64) } else { num32(u64::from(c.nand_device_desc_16) | u64::from(c.nand_device_desc_8) << 16) };
+    let mut id = c.manufacturer_id.to_vec();
+    id.resize(8, 0);
+    let mut d = vec![
+        key("Preferred IO Size", num32(4096 << m)),
+        key("Encryption Type", string("AES-XTS")),
+        key("vendor-name", upto(c.vendor_name, 16)),
+        key("nand-marketing-name", upto(c.nand_marketing_name, 32)),
+        key("firmware-version", field(n.firmware, 8)),
+        key("msp-version", upto(c.msp_version, 16)),
+        key("chip-id", string(["S3E", "S1X", "S4E", "S5E"].get(c.chip).copied().unwrap_or(""))),
+        key("controller-unique-id", field(n.serial, 20)),
+        key("nand-device-desc", desc),
+        key("manufacturer-id", Prop::Data(id)),
+        key("capacity", num64(c.capacity_gb * 1_000_000_000)),
+    ];
+    let g = |i: usize| num32(u64::from(w[i]));
+    d.extend([
+        key("caus", num32(u64::from(w[1].wrapping_mul(w[3])))),
+        key("blocks-per-cau", g(5)),
+        key("page-size", num32(u64::from(w[6] << 12))),
+        key("pages-per-block-mlc", g(10)),
+        key("num-bus", g(2)),
+        key("default-bits-per-cell", g(13)),
+        key("dies-per-channel", g(3)),
+        key("pages-per-block-slc", g(11)),
+        key("pages-in-read-verify", g(14)),
+        key("package_blocks_at_EOL", g(15)),
+        key("block-pairing-scheme", g(16)),
+        key("cau-per-die", g(1)),
+        key("num-dip", g(4)),
+        key("sec-per-page", g(6)),
+        key("sec-per-full-band", g(7)),
+        key("sec-per-full-band-slc", g(8)),
+        key("bytes-per-sec-meta", g(9)),
+        key("pages-per-block0", g(12)),
+        key("cell-type", g(13)),
+        key("ce-per-bus", g(0)),
+        key("program-scheme", g(17)),
+    ]);
+    Prop::Dict(d)
+}
+
+/// What the NAND's controller answers that its driver publishes: CAP.MQES
+/// (register 0x00, bits 15:0), the VS register (0x08), Identify
+/// Controller's MDTS (byte 77) and its Apple area, and the answers to the
+/// vendor commands 0x38 (the manufacturer's ID) and 0x37 (the geometry's
+/// 18 words, from offset 0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ControllerFacts {
+    pub mqes: u16,
+    pub vs: u32,
+    pub mdts: u8,
+    pub vendor_name: &'static str,
+    pub nand_marketing_name: &'static str,
+    pub msp_version: &'static str,
+    /// Byte 0xc1c, the chip's index.
+    pub chip: usize,
+    /// The 64-bit number at 0xd00, the halfword at 0xc1e and the byte at
+    /// 0xc20.
+    pub nand_device_desc_64: u64,
+    pub nand_device_desc_16: u16,
+    pub nand_device_desc_8: u8,
+    pub manufacturer_id: [u8; 6],
+    /// The halfword at 0xe06.
+    pub capacity_gb: u64,
+    pub geometry: [u32; 18],
+}
+
+/// The device's, once measured (with the measurement cited).
+pub const CONTROLLER_DEVICE_FACTS: Option<ControllerFacts> = None;
+
+/// What measures [`CONTROLLER_DEVICE_FACTS`].
+pub const CONTROLLER_MEASUREMENT: &str = "the AppleEmbeddedNVMeController's IOCommandPoolSize, NVMe Revision Supported, IOMaximumSegmentCountRead and Controller Characteristics (a sysdiagnose's ioreg IOService plane)";
+
+/// What stands in for [`CONTROLLER_DEVICE_FACTS`] while it is unset: a
+/// queue at least as deep as the driver's limit (so a pool of 64), no
+/// version (VS 0), no transfer limit (MDTS 0), strings that say what they
+/// are, the first chip of the table (S3E, as the controller's device tree
+/// entry is named), no device description, manufacturer ID or geometry
+/// (zeros), and the capacity of disk0's stand-in size in GB. A reported
+/// shortcut (`unmeasured`), not the device's.
+pub fn stand_in_controller() -> ControllerFacts {
+    ControllerFacts {
+        mqes: 0xffff,
+        vs: 0,
+        mdts: 0,
+        vendor_name: "(unmeasured)",
+        nand_marketing_name: "(unmeasured)",
+        msp_version: "(unmeasured)",
+        chip: 0,
+        nand_device_desc_64: 0,
+        nand_device_desc_16: 0,
+        nand_device_desc_8: 0,
+        manufacturer_id: [0; 6],
+        capacity_gb: super::storage::disk0_bytes() / 1_000_000_000,
+        geometry: [0; 18],
+    }
+}
+
+/// The controller facts in force: the device's, or the stand-in.
+pub fn controller_facts() -> ControllerFacts {
+    CONTROLLER_DEVICE_FACTS.unwrap_or_else(stand_in_controller)
 }
 
 /// `IOReportChannelType` as `IOReporter::legendWith` stores it, a 64-bit
@@ -512,6 +720,9 @@ pub fn unmeasured() -> Vec<String> {
     }
     if CONTAINER_STATUS.is_none() {
         gaps.push(format!("the AppleAPFSContainer's Status (stand-in {STAND_IN_CONTAINER_STATUS:?}; measure {CONTAINER_STATUS_MEASUREMENT})"));
+    }
+    if CONTROLLER_DEVICE_FACTS.is_none() {
+        gaps.push(format!("the NAND controller's registers and Apple Identify area (stand-in: CAP.MQES 0xffff, VS 0, MDTS 0, its strings \"(unmeasured)\", chip S3E, no device description, manufacturer ID or geometry, capacity {} GB; measure {CONTROLLER_MEASUREMENT})", stand_in_controller().capacity_gb));
     }
     if PCI_DEVICE_FACTS.is_none() {
         gaps.push(format!("the PCIe functions' configuration space (stand-in: the NAND controller 106b:2002, the root port 0:0, revisions 0, no subsystem IDs, PCIe capability version 2, links at 8 GT/s x1, root port subordinate bus 1; measure {PCI_MEASUREMENT})"));

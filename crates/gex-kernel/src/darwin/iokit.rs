@@ -1614,7 +1614,8 @@ mod tests {
     #[test]
     fn the_controller_has_every_namespace() {
         let mut b = Vec::new();
-        node(&mut b, "device-tree", &[("compatible", b"J120AP\0iPad7,1\0AppleARM\0")], 1);
+        node(&mut b, "device-tree", &[("compatible", b"J120AP\0iPad7,1\0AppleARM\0")], 2);
+        node(&mut b, "product", &[("artwork-device-idiom", b"pad\0")], 0);
         node(&mut b, "arm-io", &[("compatible", b"arm-io,t8011\0")], 1);
         node(&mut b, "apcie", &[("compatible", b"apcie,t8011\0")], 1);
         node(&mut b, "pci-bridge0", &[("compatible", b"apcie-bridge\0"), ("AAPL,unit-string", b"00000000")], 1);
@@ -1648,6 +1649,15 @@ mod tests {
         // The controller's legend and its PCI match's score.
         assert_eq!(p(ctl, "IOProbeScore"), Some(Prop::Num(1000, 32)));
         assert!(matches!(p(ctl, "IOReportLegend"), Some(Prop::Array(a)) if a.len() == 1));
+        // What its start sets, in its order, after the personality's.
+        let keys: Vec<String> = t[ctl as usize].service_props.iter().map(|(k, _)| k.clone()).skip_while(|k| k != "IOCommandPoolSize").collect();
+        assert_eq!(keys, ["IOCommandPoolSize", "NVMe Revision Supported", "IOPlatformPanicAction", "IOReportLegend", "IOReportLegendPublic", "IOPolledInterface", "IOMaximumSegmentByteCountRead", "IOMaximumSegmentByteCountWrite", "IOMaximumSegmentCountRead", "IOMaximumSegmentCountWrite", "IOMaximumByteCountRead", "IOMaximumByteCountWrite", "IOMinimumSegmentAlignmentByteCount", "Controller Characteristics", "Serial Number", "Model Number", "Firmware Revision", "IOMaximumSwapWrite", "AppleNANDStatus"]);
+        assert_eq!(p(ctl, "IOMaximumSegmentByteCountRead"), Some(Prop::Num(4096, 64)));
+        assert_eq!(p(ctl, "IOMaximumByteCountRead"), Some(Prop::Num(0x10_0000, 32)));
+        // A 64 GB pad's swap write limit, 1 GiB.
+        assert_eq!(p(ctl, "IOMaximumSwapWrite"), Some(Prop::Num(0x4000_0000, 64)));
+        assert!(matches!(p(ctl, "Controller Characteristics"), Some(Prop::Dict(d)) if d.len() == 32 && d[0] == ("Preferred IO Size".to_string(), Prop::Num(0x10_0000, 32))));
+        assert!(lookup(&t, ctl, "IOPowerManagement").is_err());
         // NS_06's transfers are of its type's 4 KiB at most.
         assert_eq!(p(ns6, "IOMaximumByteCountRead"), Some(Prop::Num(4096, 32)));
         assert_eq!(p(ns6, "IOMaximumSegmentCountRead"), Some(Prop::Num(1, 32)));

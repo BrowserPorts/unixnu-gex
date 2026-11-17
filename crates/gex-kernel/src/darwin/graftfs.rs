@@ -322,6 +322,7 @@ impl GraftFs {
             mtime: m,
             nlink,
             rdev: 0,
+            dev: 0,
             times: Times { mtime_ns: mn, atime: a, atime_ns: an, ctime: c, ctime_ns: cn },
         })
     }

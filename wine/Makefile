@@ -19,7 +19,7 @@
 #
 # Settings (command line, environment, or wine/local.mk, which is
 # not tracked):
-#   WINE32_CACHE   outputs, mirrors and downloads (default ~/.cache/gex/wine32, the top-level Makefile's CACHE/wine32)
+#   WINE32_CACHE   outputs, mirrors and downloads (default CACHE/wine32, CACHE as in the top-level Makefile)
 #   WINE_DIR   build from this Wine worktree instead of the pin: no fetch;
 #              its build tree is incremental (one per WINE_DIR), its dist
 #              keyed by its tree hash, uncommitted changes included
@@ -36,17 +36,20 @@
 
 WINE32 := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 ROOT := $(abspath $(WINE32)/..)
+include $(ROOT)/scripts/host.mk
 include $(ROOT)/toolchain/pins
 include $(WINE32)/wine.pins
 include $(WINE32)/libs.pins
 include $(WINE32)/legacy32/wine32.pins
 -include $(WINE32)/local.mk
 
-WINE32_CACHE ?= $(HOME)/.cache/gex/wine32
+CACHE ?= $(HOME)/.cache/gex
+EMSDK ?= $(HOME)/emsdk
+WINE32_CACHE ?= $(CACHE)/wine32
 WINE32_JOBS ?= 12
 GEXC ?= $(ROOT)/target/x86/release/gexc
-GEX_WINE_PREFIX ?= $(HOME)/.cache/gex/wine-$(WINE_X86_VERSION)
-GEX_CRT_SRC ?= $(HOME)/emsdk/upstream/emscripten/system/lib/compiler-rt/lib/builtins
+GEX_WINE_PREFIX ?= $(CACHE)/wine-$(WINE_X86_VERSION)
+GEX_CRT_SRC ?= $(EMSDK)/upstream/emscripten/system/lib/compiler-rt/lib/builtins
 NICE := nice -n 19
 C := $(WINE32_CACHE)
 export WINE32_JOBS GEX_WINE_PREFIX GEX_CRT_SRC WINE32_DL_SEED

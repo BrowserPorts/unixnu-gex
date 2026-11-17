@@ -21,6 +21,7 @@
 #            pinned ones make toolchains fetches
 
 ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
+include $(ROOT)/scripts/host.mk
 include $(ROOT)/toolchain/pins
 include $(ROOT)/wine/wine.pins
 include $(ROOT)/wine/libs.pins

@@ -19,8 +19,9 @@
 // peaks: pages touched then unmapped are in the lifetime peak, the
 // footprint after is below it, and TASK_VM_INFO's ledger peak is the same
 // ledger's; an interval reset begins the interval's peak at the footprint
-// then. Another process's footprint, read from outside it, and its peak
-// after it unmapped what it touched. The fields
+// then. The resident size holds the pages touched until they are
+// unmapped. Another process's footprint and resident size, read from
+// outside it, and its peak after it unmapped what it touched. The fields
 // the kernel does not keep are reported, so a strict run stops at a
 // call that copies one ("stop").
 
@@ -105,8 +106,14 @@ static int peaks(void) {
     if (f0.ri_lifetime_max_phys_footprint < f0.ri_phys_footprint || f0.ri_interval_max_phys_footprint < f0.ri_phys_footprint) return bad("the peaks against the footprint", (long)f0.ri_lifetime_max_phys_footprint, (long)f0.ri_phys_footprint);
     char *p = touch(SPAN);
     if (!p) return bad("mmap", errno, 0);
+    // The resident size (the pmap's phys_mem): the pages touched are in it
+    // until their unmap.
+    struct rusage_info_v6 ft;
+    if (proc_pid_rusage(getpid(), RUSAGE_INFO_V4, &ft) != 0) return bad("V4", errno, 0);
+    if (ft.ri_resident_size < f0.ri_resident_size + SPAN) return bad("the resident size over what was touched", (long)ft.ri_resident_size, (long)(f0.ri_resident_size + SPAN));
     munmap(p, SPAN);
     if (proc_pid_rusage(getpid(), RUSAGE_INFO_V4, &f1) != 0) return bad("V4", errno, 0);
+    if (f1.ri_resident_size + SPAN / 2 > ft.ri_resident_size) return bad("the resident size after the unmap", (long)f1.ri_resident_size, (long)(ft.ri_resident_size - SPAN));
     if (f1.ri_lifetime_max_phys_footprint < f0.ri_phys_footprint + SPAN) return bad("the lifetime peak over what was touched", (long)f1.ri_lifetime_max_phys_footprint, (long)(f0.ri_phys_footprint + SPAN));
     if (f1.ri_interval_max_phys_footprint < f0.ri_phys_footprint + SPAN) return bad("the interval peak over what was touched", (long)f1.ri_interval_max_phys_footprint, (long)(f0.ri_phys_footprint + SPAN));
     if (f1.ri_phys_footprint + SPAN / 2 > f1.ri_lifetime_max_phys_footprint) return bad("the footprint after the unmap", (long)f1.ri_phys_footprint, (long)(f1.ri_lifetime_max_phys_footprint - SPAN));
@@ -153,6 +160,7 @@ static int other(void) {
     read(up[0], &x, 1);
     if (proc_pid_rusage(c, RUSAGE_INFO_V4, &a) != 0) return bad("another process", errno, 0);
     if (a.ri_phys_footprint < SPAN || a.ri_lifetime_max_phys_footprint < a.ri_phys_footprint) return bad("another process's footprint", (long)a.ri_phys_footprint, (long)SPAN);
+    if (a.ri_resident_size < SPAN) return bad("another process's resident size", (long)a.ri_resident_size, (long)SPAN);
     write(down[1], &x, 1);
     read(up[0], &x, 1);
     if (proc_pid_rusage(c, RUSAGE_INFO_V4, &b) != 0) return bad("another process", errno, 0);

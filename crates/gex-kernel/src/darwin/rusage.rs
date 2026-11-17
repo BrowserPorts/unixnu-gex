@@ -33,8 +33,9 @@
 //! is read); the wakeups from interrupt context (`interrupt_wakeups`: a
 //! wait's deadline timer, and what a thread call wakes, its thread woken by
 //! the delayed timer's interrupt); each thread's runnable time; the map's
-//! user wirings (`wired_mem`); the `phys_footprint` ledger's balance and
-//! its lifetime and interval peaks, the process's pages looked at as the
+//! user wirings (`wired_mem`); the pmap's `phys_mem` ledger (every page
+//! it has entered) and the `phys_footprint` ledger's balance and its
+//! lifetime and interval peaks, the process's pages looked at as the
 //! call is made (from outside it through its published map and memory
 //! for another process, at its end for `p_ru`), the peaks held across
 //! every release of its pages ([`super::footprint`]); the fork's start
@@ -46,8 +47,7 @@
 //! and reported: the wakeups a thread call's signal or message to another
 //! task made, wakeups in the platform-idle state (every processor idle at
 //! the interrupt), VM page-ins (the guest's page faults are the host's,
-//! and the device's page cache is not modelled), the pmap's resident
-//! pages, disk I/O (which reads miss the buffer cache and the UBC),
+//! and the device's page cache is not modelled), disk I/O (which reads miss the buffer cache and the UBC),
 //! logical writes (the UBC's copies, write faults on shared file pages,
 //! AppleAPFS's own), the CPMU's instructions (XNU's own among them) and
 //! cycles, CLPC's energy, the footprint where the host keeps no view of
@@ -120,7 +120,7 @@ const UNKEPT: [(usize, &str, &str); 24] = [
     (ri::PKG_IDLE_WKUPS, "ri_pkg_idle_wkups", "the platform_idle_wakeups ledger: whether every processor was idle at the interrupt (cpu_idle_count == real_ncpus), which the device's own kernel threads and interrupts decide"),
     (ri::INTERRUPT_WKUPS, "ri_interrupt_wkups", "the interrupt_wakeups ledger: what a signal a thread call posted woke, or a thread call's message to another task's port"),
     (ri::PAGEINS, "ri_pageins", "the task's VM page-ins: its page faults, which the host takes, and the device's page cache"),
-    (ri::RESIDENT_SIZE, "ri_resident_size", "the pmap's phys_mem ledger: the pages the task faulted in, which the host's VM keeps"),
+    (ri::RESIDENT_SIZE, "ri_resident_size", "a look at the process's pages, which the host keeps no view of"),
     (ri::PHYS_FOOTPRINT, "ri_phys_footprint", "a look at the process's pages, which the host keeps no view of"),
     (ri::CHILD_PKG_IDLE_WKUPS, "ri_child_pkg_idle_wkups", "the reaped children's platform-idle wakeups"),
     (ri::CHILD_INTERRUPT_WKUPS, "ri_child_interrupt_wkups", "the reaped children's interrupt wakeups"),
@@ -421,8 +421,10 @@ pub struct Input {
     /// units; none without the host's clocks.
     pub runnable: Option<u64>,
     pub wired: u64,
-    /// The phys_footprint ledger's balance, where it is known now.
+    /// The phys_footprint ledger's balance and the phys_mem ledger's (the
+    /// pmap's pages, in bytes), where they are known now.
     pub footprint: Option<u64>,
+    pub resident: Option<u64>,
     /// Its lifetime peak and the peak of its interval
     /// (`ledger_get_lifetime_max`, `ledger_get_interval_max` without a
     /// reset), where they are known.
@@ -488,7 +490,10 @@ pub fn gather(i: &Input) -> Record {
         Some(t) => w[ri::PROC_EXIT_ABSTIME] = t,
         None => {
             w[ri::WIRED_SIZE] = i.wired;
-            mark(ri::RESIDENT_SIZE);
+            match i.resident {
+                Some(r) => w[ri::RESIDENT_SIZE] = r,
+                None => mark(ri::RESIDENT_SIZE),
+            }
             match i.footprint {
                 Some(f) => w[ri::PHYS_FOOTPRINT] = f,
                 None => mark(ri::PHYS_FOOTPRINT),
@@ -550,6 +555,7 @@ fn input(procs: &crate::proc::ProcTable, pid: i32, p: &super::procinfo::Public) 
         runnable,
         wired: s.wired.load(Ordering::Acquire),
         footprint: None,
+        resident: None,
         footprint_peaks: None,
         start_abstime: s.start_abstime.load(Ordering::Acquire),
         child: s.child(),
@@ -560,23 +566,31 @@ fn input(procs: &crate::proc::ProcTable, pid: i32, p: &super::procinfo::Public) 
     }
 }
 
+/// What a look at a process's pages says: the `phys_footprint` balance,
+/// its lifetime and interval peaks, and the `phys_mem` balance (bytes).
+#[derive(Clone, Copy, Debug)]
+pub struct Looked {
+    pub footprint: u64,
+    pub peaks: (u64, u64),
+    pub resident: u64,
+}
+
 /// A look at process `pid`'s pages from outside it, through the map and
 /// memory it published, its ledger told (the peaks raised, its callbacks
-/// left to it): the balance and its lifetime and interval peaks; none
-/// where the host keeps no view of its memory.
-pub fn footprint_from_outside(procs: &crate::proc::ProcTable, pid: i32, p: &super::procinfo::Public) -> Option<(u64, (u64, u64))> {
+/// left to it); none where the host keeps no view of its memory.
+pub fn footprint_from_outside(procs: &crate::proc::ProcTable, pid: i32, p: &super::procinfo::Public) -> Option<Looked> {
     let peer = procs.vm(pid).ok()?;
     let meter = &p.rusage.meter;
-    let fp = {
+    let (fp, resident) = {
         let mut pm = meter.lock();
         let mut fp = None;
         peer.mem.with_guest(&mut |g| fp = meter.measure(&mut pm, &peer.mm, g));
-        fp?
+        (fp?, pm.pages().resident * (super::mach::PAGE_MASK + 1))
     };
     let mut j = procs.jetsam();
     let l = j.ledgers.get_mut(&pid)?;
     l.observe(fp);
-    Some((fp as u64, (l.lifetime_max as u64, l.interval_max as u64)))
+    Some(Looked { footprint: fp as u64, peaks: (l.lifetime_max as u64, l.interval_max as u64), resident })
 }
 
 /// `proc_exit`'s stash of process `pid`'s usage in `p_ru`, before it
@@ -585,7 +599,7 @@ pub fn footprint_from_outside(procs: &crate::proc::ProcTable, pid: i32, p: &supe
 /// (`vm_map_terminate` only releases), so the peaks are its whole life's.
 pub fn proc_exit(procs: &crate::proc::ProcTable, pid: i32, p: &super::procinfo::Public) {
     let mut i = input(procs, pid, p);
-    i.footprint_peaks = footprint_from_outside(procs, pid, p).map(|(_, peaks)| peaks);
+    i.footprint_peaks = footprint_from_outside(procs, pid, p).map(|l| l.peaks);
     i.bills = *p.rusage.exit_bills.lock().unwrap_or_else(|e| e.into_inner());
     i.exit_abstime = Some(super::mach::absolute_time());
     let r = gather(&i);
@@ -635,11 +649,13 @@ impl Kernel {
                 if pid == self.pid {
                     if let Some(fp) = self.darwin_footprint_now(m) {
                         i.footprint = Some(fp as u64);
+                        i.resident = Some(self.dtask.rusage.meter.lock().pages().resident * (super::mach::PAGE_MASK + 1));
                         i.footprint_peaks = self.procs.jetsam().ledgers.get(&pid).map(|l| (l.lifetime_max as u64, l.interval_max as u64));
                     }
-                } else if let Some((fp, peaks)) = footprint_from_outside(&self.procs, pid, &target) {
-                    i.footprint = Some(fp);
-                    i.footprint_peaks = Some(peaks);
+                } else if let Some(l) = footprint_from_outside(&self.procs, pid, &target) {
+                    i.footprint = Some(l.footprint);
+                    i.resident = Some(l.resident);
+                    i.footprint_peaks = Some(l.peaks);
                 }
                 i.bills = Some(self.darwin_bank_bills(pid, target.uniqueid, &target.rusage));
                 gather(&i)
@@ -714,7 +730,7 @@ mod tests {
     }
 
     fn live() -> Input {
-        Input { uuid: [7; 16], time_ns: Some(1_000_000), runnable: Some(48_000), wired: 0x8000, footprint: Some(0x40000), start_abstime: 1000, bills: Some(Bills { billed: Some(0), serviced: Some(0), energy: false }), ..Input::default() }
+        Input { uuid: [7; 16], time_ns: Some(1_000_000), runnable: Some(48_000), wired: 0x8000, footprint: Some(0x40000), resident: Some(0x6_0000), start_abstime: 1000, bills: Some(Bills { billed: Some(0), serviced: Some(0), energy: false }), ..Input::default() }
     }
 
     #[test]
@@ -725,19 +741,23 @@ mod tests {
         assert_eq!(r.w[ri::USER_TIME], 24_000);
         assert_eq!(r.w[ri::SYSTEM_TIME], 0);
         assert_eq!((r.w[ri::WIRED_SIZE], r.w[ri::PHYS_FOOTPRINT], r.w[ri::PROC_START_ABSTIME], r.w[ri::PROC_EXIT_ABSTIME]), (0x8000, 0x40000, 1000, 0));
+        assert_eq!((r.w[ri::RESIDENT_SIZE], r.unkept & (1 << ri::RESIDENT_SIZE)), (0x6_0000, 0));
         assert_eq!(r.w[ri::RUNNABLE_TIME], 48_000);
         for f in [ri::FLAGS, ri::USER_PTIME, ri::SYSTEM_PTIME, ri::PINSTRUCTIONS, ri::PCYCLES, ri::PENERGY_NJ, ri::SECURE_TIME_IN_SYSTEM, ri::SECURE_PTIME_IN_SYSTEM] {
             assert_eq!((r.w[f], r.unkept & (1 << f)), (0, 0));
         }
         let v0 = r.unkept_within(SIZES[0]);
-        assert_eq!(v0.len(), 4, "{v0:?}");
-        assert!(v0[0].starts_with("ri_pkg_idle_wkups") && v0[3].starts_with("ri_resident_size"));
+        assert_eq!(v0.len(), 3, "{v0:?}");
+        assert!(v0[0].starts_with("ri_pkg_idle_wkups") && v0[2].starts_with("ri_pageins"));
+        // Not looked at: the resident size too.
+        let blind = gather(&Input { resident: None, ..live() });
+        assert!(blind.unkept_within(SIZES[0])[3].starts_with("ri_resident_size"));
         // V1 adds nothing unkept while no child was reaped; V2 the disk's.
-        assert_eq!(r.unkept_within(SIZES[1]).len(), 4);
-        assert_eq!(r.unkept_within(SIZES[2]).len(), 6);
+        assert_eq!(r.unkept_within(SIZES[1]).len(), 3);
+        assert_eq!(r.unkept_within(SIZES[2]).len(), 5);
         // V3: the QoS times, once; the bank's bills are kept.
-        assert_eq!(r.unkept_within(SIZES[3]).len(), 7);
-        assert_eq!(r.unkept_within(SIZES[6]).len(), 7 + 6);
+        assert_eq!(r.unkept_within(SIZES[3]).len(), 6);
+        assert_eq!(r.unkept_within(SIZES[6]).len(), 6 + 6);
     }
 
     #[test]
@@ -806,7 +826,7 @@ mod tests {
         let r = gather(&i);
         assert_eq!(&r.w[ri::CPU_TIME_QOS..ri::CPU_TIME_QOS + 7], &[1, 2, 3, 4, 5, 6, 7]);
         assert!(!r.unkept_within(SIZES[3]).join(" ").contains("ri_cpu_time_qos"));
-        assert_eq!(r.unkept_within(SIZES[3]).len(), 6);
+        assert_eq!(r.unkept_within(SIZES[3]).len(), 5);
     }
 
     #[test]

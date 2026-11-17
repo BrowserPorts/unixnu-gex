@@ -43,13 +43,15 @@
 //!   the device tree's `namespaces` (`AllocateNodes`, 0xfffffff006a5e35c):
 //!   NSID 1, the root, an `IOEmbeddedNVMeBlockDevice` named "NS_01"
 //!   (0xfffffff006a6ee48) at location "1" (`initWithNamespace`,
-//!   0xfffffff006a98c20).
+//!   0xfffffff006a98c20). Before it makes the namespaces it attaches
+//!   itself below its nub in the `IODeviceTree` plane (0xfffffff006a81ec0).
 //! - `IOBlockStorageDevice::init` (0xfffffff00596ee30) gives the namespace
 //!   "device-type" "Generic", which `IOBlockStorageDriver`'s personality
 //!   matches; the driver's media is the whole disk, named "<vendor>
 //!   <product> Media" (`acceptNewMedia`; the vendor string is empty,
 //!   0xfffffff006a96df4) and attached in the `IODeviceTree` plane to the
-//!   nearest provider there, s3e's nub, as "disk" at "<IOUnit>:0".
+//!   nearest provider there, the controller, as "disk" at "<IOUnit>:0"
+//!   (`IOUnitName` the controller personality's).
 //! - `IOGUIDPartitionScheme` (score 4000, `Content Mask`
 //!   "GUID_partition_scheme") reads the GPT and publishes the partition,
 //!   named for its entry and attached in the `IODeviceTree` plane beside
@@ -380,7 +382,11 @@ fn add_pcie(t: &mut Vec<Node>, io: u32) -> Option<u32> {
         ("VCParams", "not followed"),
         ("NVMe Debug Data", "not followed"),
     ];
-    Some(push(t, service(CONTROLLER, CONTROLLER, Some(nvme), props, Table::Lacks(lacks))))
+    // Its start attaches it below its nub in the `IODeviceTree` plane
+    // (0xfffffff006a81ec0), with no name or location of that plane's.
+    let mut c = service(CONTROLLER, CONTROLLER, Some(nvme), props, Table::Lacks(lacks));
+    c.dt = Some(DtLink { parent: nvme, name: CONTROLLER.to_string(), location: None });
+    Some(push(t, c))
 }
 
 /// `IOReportChannelType` as `IOReporter::legendWith` stores it, a 64-bit
@@ -543,7 +549,7 @@ fn add_pci_nub(t: &mut Vec<Node>, entry: u32, bridge: u32, dt_parent: u32, locat
     // The entry's own table: what was set on it before (a root port's
     // port object), after its device tree properties.
     n.service_props = e.service_props.clone();
-    n.dt = Some(DtLink { parent: dt_parent, name: e.name.clone(), location: location.to_string() });
+    n.dt = Some(DtLink { parent: dt_parent, name: e.name.clone(), location: Some(location.to_string()) });
     let data32 = |v: u32| Prop::Data(v.to_le_bytes().to_vec());
     let has = |k: &str| e.props.iter().any(|(pk, _)| pk == k && pk != super::iokit::DT_UNIT_KEY) || e.service_props.iter().any(|(pk, _)| pk == k);
     let mut add: Vec<(String, Prop)> = vec![key("pcidebug", Prop::Str(pcidebug.to_string()))];
@@ -641,8 +647,12 @@ fn add_storage(t: &mut Vec<Node>, controller: Option<u32>) {
     props.push(key("IOMediaIcon", Prop::Dict(vec![key("CFBundleIdentifier", string("com.apple.iokit.IOStorageFamily")), key("IOBundleResourceFile", string("Internal.icns"))])));
     props.extend(bsd_keys(Media::Whole));
     let mut whole = service(&format!("{} Media", n.model), "IOMedia", Some(drv), props, Table::Complete);
-    let dt_parent = controller.and_then(|c| t[c as usize].parent);
-    whole.dt = dt_parent.map(|p| DtLink { parent: p, name: "disk".to_string(), location: "1:0".to_string() });
+    // The media's parent in the `IODeviceTree` plane: the first provider
+    // up the plane that is in it (`acceptNewMedia`, and for a partition
+    // `attachMediaObjectToDeviceTree` through its whole disk's), the
+    // controller.
+    let dt_parent = controller;
+    whole.dt = dt_parent.map(|p| DtLink { parent: p, name: "disk".to_string(), location: Some("1:0".to_string()) });
     let whole = push(t, whole);
     add_bsd_client(t, whole, BSD_CLIENT);
     // The GPT scheme: its personality, and the disk's GUID it publishes.
@@ -663,7 +673,7 @@ fn add_storage(t: &mut Vec<Node>, controller: Option<u32>) {
     props.push(key("TierType", sym("Main")));
     props.extend(bsd_keys(Media::Partition));
     let mut part = service(PARTITION_NAME, "IOMedia", Some(gpt), props, Table::Complete);
-    part.dt = dt_parent.map(|p| DtLink { parent: p, name: "disk".to_string(), location: "1:1".to_string() });
+    part.dt = dt_parent.map(|p| DtLink { parent: p, name: "disk".to_string(), location: Some("1:1".to_string()) });
     let part = push(t, part);
     add_bsd_client(t, part, BSD_CLIENT);
     // AppleAPFSContainerScheme: its personality, its init's statistics
@@ -866,7 +876,7 @@ fn add_namespaces(t: &mut Vec<Node>, controller: Option<u32>, dt_parent: Option<
     props.push(key("IOMediaIcon", Prop::Dict(vec![key("CFBundleIdentifier", string("com.apple.iokit.IOStorageFamily")), key("IOBundleResourceFile", string("Internal.icns"))])));
     props.extend(bsd_keys(Media::Firmware));
     let mut whole = service(&format!("{} Media", n.model), "IOMedia", Some(drv), props, Table::Complete);
-    whole.dt = dt_parent.map(|p| DtLink { parent: p, name: "disk".to_string(), location: "2:0".to_string() });
+    whole.dt = dt_parent.map(|p| DtLink { parent: p, name: "disk".to_string(), location: Some("2:0".to_string()) });
     let whole = push(t, whole);
     add_bsd_client(t, whole, BSD_CLIENT);
     let diag = push(t, service(DIAGNOSTICS, DIAGNOSTICS, Some(c), Vec::new(), Table::Partial("the diagnostics access's properties (AppleNANDConfigAccess and AppleEmbeddedNVMeDiagnostics), not followed".to_string())));
@@ -971,7 +981,7 @@ pub fn location(n: &Node) -> Option<String> {
         APFS_VOLUME => super::storage::VOLUMES.iter().find(|v| v.name == n.name).map(|v| (v.index + 1).to_string()),
         "IOMedia" if n.name == PARTITION_NAME => Some("1".to_string()),
         BLOCK_DEVICE | EFFACEABLE => n.name.strip_prefix("NS_").and_then(|d| d.parse::<u32>().ok()).map(|nsid| format!("{nsid:x}")),
-        PCI_DEVICE => n.dt.as_ref().map(|d| d.location.clone()),
+        PCI_DEVICE => n.dt.as_ref().and_then(|d| d.location.clone()),
         _ => None,
     }
 }

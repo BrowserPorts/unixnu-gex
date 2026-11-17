@@ -33,12 +33,14 @@ pub struct Node {
 /// A service's link in the `IODeviceTree` plane (`attachToParent(parent,
 /// gIODTPlane)`): its parent there, and the name and location it was given
 /// in that plane (`setName`/`setLocation` with the plane, which key its
-/// registry table by the plane's `pathNameKey` and `pathLocationKey`).
+/// registry table by the plane's `pathNameKey` and `pathLocationKey`); a
+/// service given none there has its own (`getName(plane)` and
+/// `getLocation(plane)` fall back to them).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DtLink {
     pub parent: u32,
     pub name: String,
-    pub location: String,
+    pub location: Option<String>,
 }
 
 /// What a service's property table has of the device's.
@@ -508,7 +510,7 @@ pub fn location(n: &Node) -> Option<String> {
 /// in that plane, else its own ([`location`]).
 pub fn location_in(n: &Node, plane: Option<Plane>) -> Option<String> {
     match (&n.dt, plane) {
-        (Some(d), Some(Plane::DeviceTree)) => Some(d.location.clone()),
+        (Some(d), Some(Plane::DeviceTree)) => d.location.clone().or_else(|| location(n)),
         _ => location(n),
     }
 }
@@ -1635,7 +1637,10 @@ mod tests {
         let disk = t.iter().position(|n| n.service_props.iter().any(|(k, v)| k == "BSD Name" && *v == Prop::Sym(fw.clone()))).unwrap() as u32;
         assert_eq!(p(disk, "Size"), Some(Prop::Num(8 << 20, 64)));
         assert_eq!(p(disk, "Leaf"), Some(Prop::Bool(true)));
-        assert_eq!(t[disk as usize].dt.as_ref().map(|d| d.location.as_str()), Some("2:0"));
+        assert_eq!(t[disk as usize].dt.as_ref().and_then(|d| d.location.as_deref()), Some("2:0"));
+        assert_eq!(t[disk as usize].dt.as_ref().map(|d| d.parent), Some(ctl));
+        assert_eq!(t[ctl as usize].dt.as_ref().map(|d| t[d.parent as usize].class), Some(super::super::storagestack::PCI_DEVICE));
+        assert_eq!(location_in(&t[ctl as usize], Some(Plane::DeviceTree)), None);
         // NS_06 has AppleEffaceableBlockDevice and no medium.
         let ns6 = t.iter().position(|n| n.name == "NS_06").unwrap() as u32;
         let below: Vec<&str> = links(&t, ns6, Plane::Service, false).unwrap().iter().map(|&k| t[k as usize].class).collect();

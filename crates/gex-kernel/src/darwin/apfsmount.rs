@@ -137,10 +137,13 @@ pub fn vfsop_mount(args: &Args, mut flags: u32, medium: Media, dev: u32, from: &
         return Err(Refused::Unmodelled(format!("an APFS mount of the System volume from {from}, which the root is mounted from a snapshot of (apfs_mount's EALREADY)")));
     }
     flags |= mnt::JOURNALED;
-    let Some(unencrypted) = super::storage::volume_unencrypted(v) else {
-        return Err(Refused::Unmodelled(format!("an APFS mount of the {} volume: whether it is encrypted (its apfs_fs_flags)", vol.name)));
+    let fs_flags = match super::storage::volume_fs_flags(v) {
+        Ok(Some(f)) => f,
+        Ok(None) => return Err(Refused::Unmodelled(format!("an APFS mount of the {} volume: whether it is encrypted (its apfs_fs_flags)", vol.name))),
+        Err(e) => return Err(Refused::Unmodelled(format!("an APFS mount of the {} volume: its apfs_fs_flags in the disk0 image: {e}", vol.name))),
     };
-    let encrypted = !unencrypted;
+    // Neither unencrypted nor one-key (0xfffffff0066cd370).
+    let encrypted = fs_flags & (super::storage::APFS_FS_UNENCRYPTED | super::storage::APFS_FS_ONEKEY) == 0;
     if flags & mnt::CPROTECT != 0 && !encrypted {
         return Err(Refused::Errno(EINVAL));
     }

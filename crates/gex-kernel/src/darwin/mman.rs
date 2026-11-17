@@ -184,6 +184,7 @@ impl Kernel {
         let mut maxprot = prot::ALL as u8;
         let mapanon = flags & ANON != 0;
         let mut superpage = false;
+        let mut purgeable = false;
         if mapanon {
             // mac_proc_check_map_anon: AMFI's and Sandbox's say on a JIT
             // region (neither has one on another mapping).
@@ -196,10 +197,11 @@ impl Kernel {
                 if vm_flags != fd as u32 {
                     return Err(Errno::EINVAL);
                 }
-                if vm_flags & (vmf::PURGABLE | vmf::CHUNK_4GB) != 0 {
-                    self.darwin_unimplemented(format!("mmap's VM flags {:#x} (purgeable objects, 4 GB chunks)", vm_flags & (vmf::PURGABLE | vmf::CHUNK_4GB)));
+                if vm_flags & vmf::CHUNK_4GB != 0 {
+                    self.darwin_unimplemented(format!("mmap's VM flags {:#x} (4 GB chunks)", vm_flags & vmf::CHUNK_4GB));
                     return Err(Errno::EINVAL);
                 }
+                purgeable = vm_flags & vmf::PURGABLE != 0;
                 attrs.alias = (vm_flags >> 24) as u8;
                 superpage = vm_flags & vmf::SUPERPAGE_MASK != 0;
             }
@@ -389,7 +391,14 @@ impl Kernel {
         }
         if attrs.kind == kind::ANON {
             let below = self.mem.lock().vma_at(at.wrapping_sub(1)).map(|v| u64::from(v.prot)) == Some(u64::from(cur));
-            self.dtask.vm.enter_anon(at, at + size, attrs, below);
+            self.dtask.vm.enter_anon(at, at + size, attrs, below && !purgeable);
+            // VM_FLAGS_PURGABLE: the memory a new purgeable object.
+            if purgeable {
+                return match self.darwin_purgeable_over(m, at, size) {
+                    kr::SUCCESS => Ok(at + pageoff),
+                    _ => Err(Errno::ENOMEM),
+                };
+            }
         } else {
             self.dtask.vm.enter(at, at + size, attrs, if mapanon { 0 } else { file_pos });
         }

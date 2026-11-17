@@ -70,6 +70,8 @@ pub struct NamedEntry {
     /// A VM_COPY's entries, each waiting to be copied (`needs_copy`): a
     /// mapping of them copies on write whatever it asks.
     pub needs_copy: bool,
+    /// `is_fully_owned`: every object it names has an owner.
+    pub fully_owned: bool,
 }
 
 fn entries() -> &'static Mutex<HashMap<u64, NamedEntry>> {
@@ -174,9 +176,24 @@ impl Kernel {
             if permission & PURGABLE != 0 && protections & prot::WRITE as u32 == 0 {
                 return Err(kr::INVALID_ARGUMENT);
             }
+            // A purgeable object (nonvolatile, the caller's own; the kernel's
+            // alone to set its state with MAP_MEM_PURGABLE_KERNEL_ONLY), or
+            // one tagged "default", billed to the caller's ledgers.
             if permission & (PURGABLE | LEDGER_TAGGED) != 0 {
-                self.darwin_unimplemented("a purgeable or ledger-tagged object made by mach_make_memory_entry_64 (its owner's purgeable and tag ledgers)".into());
-                return Err(kr::FAILURE);
+                use super::purgeable::{tag, Purg};
+                let mut purg = if permission & PURGABLE != 0 { Purg::nonvolatile() } else { Purg::tagged() };
+                purg.only_by_kernel = permission & PURGABLE != 0 && permission & PURGABLE_KERNEL_ONLY != 0;
+                if permission & LEDGER_TAGGED != 0 {
+                    purg.tag = tag::DEFAULT;
+                }
+                let obj = self.darwin_owned_object(map_size, purg)?;
+                let Some(hold) = super::vmobject::with(obj, |o| o.hold.clone()).flatten() else {
+                    super::vmobject::release(obj);
+                    return Err(kr::FAILURE);
+                };
+                let e = NamedEntry { obj, hold, offset: 0, size: map_size, data_offset: 0, protection: protections, is_copy: false, internal: true, needs_copy: false, fully_owned: true };
+                *size = e.size;
+                return Ok(Made::New(insert(e)));
             }
             let Some(addr) = crate::host_hold(map_size as usize) else {
                 self.darwin_unimplemented("a named memory entry's object on a host that holds no pages apart from a task's".into());
@@ -184,7 +201,7 @@ impl Kernel {
             };
             let hold = Arc::new(Hold { addr, len: map_size });
             let obj = super::vmobject::allocate(map_size, super::vmobject::Pager::Anon, Some(Arc::clone(&hold)));
-            let e = NamedEntry { obj, hold, offset: 0, size: map_size, data_offset: 0, protection: protections, is_copy: false, internal: true, needs_copy: false };
+            let e = NamedEntry { obj, hold, offset: 0, size: map_size, data_offset: 0, protection: protections, is_copy: false, internal: true, needs_copy: false, fully_owned: false };
             *size = e.size;
             return Ok(Made::New(insert(e)));
         }
@@ -264,7 +281,10 @@ impl Kernel {
             });
             let internal = pieces.iter().take_while(|x| x.off < map_size).all(|x| matches!(x.attrs.kind, kind::ANON | kind::SHM | kind::OBJECT));
             let obj = super::vmobject::allocate(map_size, super::vmobject::Pager::Anon, Some(Arc::clone(&hold)));
-            let e = NamedEntry { obj, hold, offset: 0, size: map_size, data_offset: offset_in_page, protection: protections, is_copy: copy || permission & VM_SHARE != 0, internal, needs_copy: copy };
+            // is_fully_owned: of a share's entries, each one's object has an
+            // owner (a copy's objects are new).
+            let fully_owned = !copy && pieces.iter().take_while(|x| x.off < map_size).all(|x| super::vmobject::with(x.attrs.obj, |o| o.purg.as_ref().is_some_and(|p| p.owner.is_some())).unwrap_or(false));
+            let e = NamedEntry { obj, hold, offset: 0, size: map_size, data_offset: offset_in_page, protection: protections, is_copy: copy || permission & VM_SHARE != 0, internal, needs_copy: copy, fully_owned };
             *size = e.size - e.data_offset;
             return Ok(Made::New(insert(e)));
         }
@@ -303,7 +323,7 @@ impl Kernel {
             return Err(KERN_PROTECTION_FAILURE);
         }
         super::vmobject::reference(p.obj);
-        let e = NamedEntry { obj: p.obj, hold: Arc::clone(&p.hold), offset: p.offset + map_start, size: map_size, data_offset: offset_in_page, protection: protections, is_copy: false, internal: p.internal, needs_copy: false };
+        let e = NamedEntry { obj: p.obj, hold: Arc::clone(&p.hold), offset: p.offset + map_start, size: map_size, data_offset: offset_in_page, protection: protections, is_copy: false, internal: p.internal, needs_copy: false, fully_owned: p.fully_owned };
         *size = e.size - e.data_offset;
         Ok(Made::New(insert(e)))
     }
@@ -354,10 +374,12 @@ impl Kernel {
             self.darwin_unimplemented("a named memory entry's mapping on a host that cannot map its pages twice".into());
             return kr::FAILURE;
         }
+        // A purgeable or tagged object's entry has use_pmap off.
+        let owned = super::vmobject::with(e.obj, |o| o.purg.is_some()).unwrap_or(false);
         let attrs = if copy {
             Attrs { kind: kind::ANON, cow: true, max: max as u8, inherit, obj: e.obj, ..Attrs::default() }
         } else if e.internal {
-            Attrs { kind: kind::OBJECT, max: max as u8, inherit, obj: e.obj, ..Attrs::default() }
+            Attrs { kind: kind::OBJECT, max: max as u8, inherit, obj: e.obj, alt: owned, ..Attrs::default() }
         } else {
             Attrs { kind: kind::FILE_PRIVATE, max: max as u8, inherit, obj: e.obj, ..Attrs::default() }
         };
@@ -371,7 +393,7 @@ impl Kernel {
     /// `mach_memory_entry_purgable_control` of entry `e`: none of a copy;
     /// an object's whole or nothing; a non-purgeable object's
     /// (VM_PURGABLE_DENY) KERN_INVALID_ARGUMENT.
-    pub(crate) fn darwin_entry_purgable_control(&mut self, e: &NamedEntry, control: u32, state: i32) -> u64 {
+    pub(crate) fn darwin_entry_purgable_control(&mut self, e: &NamedEntry, control: u32, state: &mut i32) -> u64 {
         const SET_STATE: u32 = 0;
         const GET_STATE: u32 = 1;
         const SET_STATE_FROM_KERNEL: u32 = 3;
@@ -382,14 +404,21 @@ impl Kernel {
         if control != SET_STATE && control != GET_STATE {
             return kr::INVALID_ARGUMENT;
         }
-        if control == SET_STATE && (state & !ALL_MASKS != 0 || (state & 3) > 3) {
+        if control == SET_STATE && (*state & !ALL_MASKS != 0 || (*state & 3) > 3) {
             return kr::INVALID_ARGUMENT;
         }
         if e.is_copy {
             return kr::INVALID_ARGUMENT;
         }
-        // No purgeable object is made here: every object is DENY.
-        kr::INVALID_ARGUMENT
+        // The whole object, or nothing.
+        let size = super::vmobject::with(e.obj, |o| o.size);
+        if size.is_none() || e.offset != 0 || size != Some(e.size) {
+            return kr::INVALID_ARGUMENT;
+        }
+        let mut st = *state;
+        let r = self.darwin_own_memory(|k, m| k.darwin_object_purgable_control(m, e.obj, control, &mut st)).unwrap_or(kr::FAILURE);
+        *state = st;
+        r
     }
 
     /// `mach_memory_entry_access_tracking`: a release kernel tracks no

@@ -44,10 +44,13 @@ pub(super) fn routine(k: &mut Kernel, obj: &Kobject, id: i32, req: &Kmsg) -> Opt
         (Kobject::TaskRead | Kobject::TaskInspect | Kobject::TaskName, 3825 | 4817 | 3816) => Reply::err(kr::INVALID_ARGUMENT as i32),
         // mach_memory_entry_purgable_control(entry, control, &state).
         (Kobject::NamedEntry(id), 4900) => match (super::mig::arg(req, 0), super::mig::arg(req, 1), super::vmentry::get(*id)) {
-            (Some(control), Some(state), Some(e)) => match k.darwin_entry_purgable_control(&e, control as u32, state) {
-                0 => Reply::ok(state.to_le_bytes().to_vec()),
-                r => Reply::err(r as i32),
-            },
+            (Some(control), Some(state), Some(e)) => {
+                let mut st = state;
+                match k.darwin_entry_purgable_control(&e, control as u32, &mut st) {
+                    0 => Reply::ok(st.to_le_bytes().to_vec()),
+                    r => Reply::err(r as i32),
+                }
+            }
             (Some(_), Some(_), None) => Reply::err(kr::INVALID_ARGUMENT as i32),
             _ => Reply::err(MIG_BAD_ARGUMENTS),
         },
@@ -58,10 +61,15 @@ pub(super) fn routine(k: &mut Kernel, obj: &Kobject, id: i32, req: &Kmsg) -> Opt
             _ => Reply::err(MIG_BAD_ARGUMENTS),
         },
         // mach_memory_entry_ownership(entry, owner, ledger_tag, ledger_flags).
-        (Kobject::NamedEntry(_), 4902) => {
-            let mut r = Reply::err(kr::FAILURE as i32);
-            r.unimplemented = Some("mach_memory_entry_ownership (an object's owner and its tag ledgers)".into());
-            r
+        (Kobject::NamedEntry(id), 4902) => {
+            let owner = match req.descs.first() {
+                Some(super::ipc::msg::Desc::Port { right, .. }) => *right,
+                _ => return Some(Reply::err(MIG_BAD_ARGUMENTS)),
+            };
+            match (super::mig::arg(req, 0), super::mig::arg(req, 1)) {
+                (Some(tag), Some(flags)) => Reply::err(k.darwin_entry_ownership(*id, owner, tag as i32, flags as i32) as i32),
+                _ => Reply::err(MIG_BAD_ARGUMENTS),
+            }
         }
         _ => return None,
     })

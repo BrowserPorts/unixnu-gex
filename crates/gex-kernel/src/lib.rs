@@ -695,6 +695,34 @@ pub fn host_unhold(addr: usize, len: usize) {
     }
 }
 
+static HOST_PURGEABLE: std::sync::OnceLock<(fn(usize) -> Option<usize>, fn(usize, usize) -> bool)> = std::sync::OnceLock::new();
+
+/// Install the host's purgeable memory apart from any task's: `hold(len)`
+/// gives `len` bytes of fresh zero pages that are the host's purgeable
+/// memory (given back with [`set_host_hold`]'s `unhold`), never emptied by
+/// the host on its own; `purge(addr, len)` empties them, every mapping of
+/// them seeing fresh zero pages after, true when it did.
+pub fn set_host_purgeable(hold: fn(usize) -> Option<usize>, purge: fn(usize, usize) -> bool) {
+    let _ = HOST_PURGEABLE.set((hold, purge));
+}
+
+/// [`set_host_purgeable`]'s `hold`; none on a host without it.
+pub fn host_hold_purgeable(len: usize) -> Option<usize> {
+    HOST_PURGEABLE.get().and_then(|(hold, _)| hold(len))
+}
+
+/// [`set_host_purgeable`]'s `purge`.
+pub fn host_purge(addr: usize, len: usize) -> bool {
+    HOST_PURGEABLE.get().is_some_and(|(_, purge)| purge(addr, len))
+}
+
+/// The state of each `page`-byte page of `len` bytes at host address
+/// `addr` (memory the host holds, [`set_host_hold`]) into `out`, as
+/// [`GuestMem::page_states`] gives a guest memory's.
+pub fn host_page_states(addr: usize, len: usize, page: usize, out: &mut [u8]) -> bool {
+    HOST_PAGES.get().is_some_and(|f| f(addr, len, page, out))
+}
+
 /// Whether the host can map its pages twice ([`set_host_remap`]).
 pub fn host_can_remap() -> bool {
     HOST_REMAP.get().is_some()

@@ -130,6 +130,7 @@ mod vmmig;
 pub mod vmentry;
 pub mod vmobject;
 pub mod ubc;
+pub mod purgeable;
 pub mod coalition;
 pub mod importance;
 pub mod voucher;
@@ -429,6 +430,7 @@ impl Task {
     pub fn with_wire_ledger(mut self) -> Task {
         self.vm.set_wire_gauge(std::sync::Arc::clone(&self.rusage.wired));
         self.vm.set_submap_gauge(std::sync::Arc::clone(&self.rusage.meter.submaps));
+        self.vm.set_alt_gauge(std::sync::Arc::clone(&self.rusage.meter.alt));
         self
     }
 }

@@ -120,6 +120,15 @@ impl Kernel {
     /// one the child's new pmap has not entered. Its protection table is
     /// written before it first runs.
     pub fn darwin_fork_child_vm(&mut self, m: &mut GuestMem<'_>, plan: &[ForkRange]) {
+        // vm_map_fork's copy of a purgeable object is a new purgeable
+        // object, the kernel's (VM_MAP_COPYIN_PRESERVE_PURGEABLE).
+        for r in plan.iter().filter(|r| r.how == Inherit::Copy && r.own_pmap) {
+            for (ps, _, a) in self.dtask.vm.pieces(r.start, r.end) {
+                if super::vmobject::with(a.obj, |o| o.purg.as_ref().is_some_and(|p| p.state != super::purgeable::state::DENY)).unwrap_or(false) {
+                    self.darwin_unimplemented(format!("a fork's copy of purgeable memory at {ps:#x} (a new purgeable object the kernel owns)"));
+                }
+            }
+        }
         {
             let mut mm = self.mem.lock();
             for r in plan.iter().filter(|r| r.how == Inherit::None) {

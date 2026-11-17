@@ -135,11 +135,15 @@ pub struct Attrs {
     /// `VME_OBJECT`: the object it maps ([`super::vmobject`]), 0 for the
     /// task's own anonymous memory, which no one else names.
     pub obj: u64,
+    /// `!use_pmap`: its object (purgeable or ledger-tagged) has ledgers of
+    /// its own, and a page the pmap enters here is alternate accounting,
+    /// not the task's footprint.
+    pub alt: bool,
 }
 
 impl Default for Attrs {
     fn default() -> Attrs {
-        Attrs { kind: kind::ANON, max: PROT_ALL, alias: 0, inherit: inherit::DEFAULT, behavior: behavior::DEFAULT, zero_wired: false, no_cache: false, cow: false, jit: false, shared: false, wired: 0, user_wired: 0, obj: 0 }
+        Attrs { kind: kind::ANON, max: PROT_ALL, alias: 0, inherit: inherit::DEFAULT, behavior: behavior::DEFAULT, zero_wired: false, no_cache: false, cow: false, jit: false, shared: false, wired: 0, user_wired: 0, obj: 0, alt: false }
     }
 }
 
@@ -201,6 +205,8 @@ pub struct Map {
     /// Where the map's submap entries (the shared region's) are read by
     /// the task's footprint meter, its own and other processes'.
     submap_gauge: Option<std::sync::Arc<std::sync::Mutex<Vec<(u64, u64)>>>>,
+    /// And its entries with `use_pmap` off.
+    alt_gauge: Option<std::sync::Arc<std::sync::Mutex<Vec<(u64, u64)>>>>,
 }
 
 impl Drop for Map {
@@ -248,6 +254,14 @@ impl Entries {
         let mut m = self.lock();
         m.submap_gauge = Some(gauge);
         m.submaps_changed();
+    }
+
+    /// The task's footprint meter's view of the entries with `use_pmap`
+    /// off, which this map's entries now keep.
+    pub fn set_alt_gauge(&mut self, gauge: std::sync::Arc<std::sync::Mutex<Vec<(u64, u64)>>>) {
+        let mut m = self.lock();
+        m.alt_gauge = Some(gauge);
+        m.alt_changed();
     }
 
     /// See [`Map::clip`].
@@ -350,6 +364,13 @@ impl Map {
         Some(e)
     }
 
+    /// The entries with `use_pmap` off, told to their gauge.
+    fn alt_changed(&self) {
+        if let Some(g) = &self.alt_gauge {
+            *g.lock().unwrap_or_else(|e| e.into_inner()) = self.ranges.iter().filter(|(_, e)| e.attrs.alt).map(|(&s, e)| (s, e.end)).collect();
+        }
+    }
+
     /// The submap entries, told to the gauge.
     fn submaps_changed(&self) {
         if let Some(g) = &self.submap_gauge {
@@ -387,18 +408,22 @@ impl Map {
         }
         self.clip_range(start, end);
         let inside: Vec<u64> = self.ranges.range(start..end).map(|(&s, _)| s).collect();
-        let mut submap = false;
+        let (mut submap, mut alt) = (false, false);
         for s in inside {
             if let Some(e) = self.take(s) {
                 if e.attrs.user_wired > 0 {
                     self.user_wire_size -= e.end - s;
                 }
                 submap |= e.attrs.kind == kind::SUBMAP;
+                alt |= e.attrs.alt;
             }
         }
         self.wire_size_changed();
         if submap {
             self.submaps_changed();
+        }
+        if alt {
+            self.alt_changed();
         }
     }
 
@@ -409,6 +434,9 @@ impl Map {
             self.put(start, Entry { end, attrs, offset });
             if attrs.kind == kind::SUBMAP {
                 self.submaps_changed();
+            }
+            if attrs.alt {
+                self.alt_changed();
             }
         }
     }
@@ -470,12 +498,13 @@ impl Map {
     /// `f` gives another object holds a reference to the new one instead.
     pub fn update(&mut self, start: u64, end: u64, f: impl Fn(&mut Attrs)) {
         self.clip_range(start, end);
-        let mut submap = false;
+        let (mut submap, mut alt) = (false, false);
         let mut objs = Vec::new();
         for (_, e) in self.ranges.range_mut(start..end) {
-            let (was, obj) = (e.attrs.kind == kind::SUBMAP, e.attrs.obj);
+            let (was, obj, was_alt) = (e.attrs.kind == kind::SUBMAP, e.attrs.obj, e.attrs.alt);
             f(&mut e.attrs);
             submap |= was != (e.attrs.kind == kind::SUBMAP);
+            alt |= was_alt != e.attrs.alt;
             if obj != e.attrs.obj {
                 objs.push((obj, e.attrs.obj));
             }
@@ -486,6 +515,9 @@ impl Map {
         }
         if submap {
             self.submaps_changed();
+        }
+        if alt {
+            self.alt_changed();
         }
     }
 

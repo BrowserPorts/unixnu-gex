@@ -386,6 +386,19 @@ impl Pmap {
         true
     }
 
+    /// The task's own pages it holds in `ranges` (sorted or not, disjoint).
+    pub fn own_in(&self, ranges: &[(u64, u64)]) -> u64 {
+        let mut n = 0;
+        for &(s, e) in ranges {
+            for (c, i0, i1) in by_chunk(s & !(PAGE - 1), (e + PAGE - 1) & !(PAGE - 1)) {
+                if let Some(w) = self.chunks.get(&c) {
+                    n += (i0..i1).filter(|&i| get(w, i) == Held::Own).count() as u64;
+                }
+            }
+        }
+        n
+    }
+
     /// Whether the pmap holds a page of `[s, e)`; with `own_only`, one of
     /// the task's own.
     pub fn holds(&self, s: u64, e: u64, own_only: bool) -> bool {
@@ -483,6 +496,11 @@ pub enum Release {
 pub struct Meter {
     pmap: std::sync::Mutex<Pmap>,
     pub submaps: std::sync::Arc<std::sync::Mutex<Vec<(u64, u64)>>>,
+    /// The map's entries with `use_pmap` off (purgeable and tagged
+    /// objects'): their pages are the objects' owners', not the pmap's.
+    pub alt: std::sync::Arc<std::sync::Mutex<Vec<(u64, u64)>>>,
+    /// The task as an owner of objects, whose pages it is billed for.
+    owner: std::sync::Mutex<std::sync::Arc<super::purgeable::Owner>>,
 }
 
 /// The commpage alias in a task's memory: the host's mapping of the
@@ -515,9 +533,29 @@ impl Meter {
         self.pmap.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// A new task's pmap, as an exec makes it.
+    /// A new task's pmap, as an exec makes it, and the new task an owner of
+    /// nothing; the old task's objects disowned (`vm_owned_objects_disown`
+    /// at its end).
     pub fn reset(&self) {
         *self.lock() = Pmap::default();
+        let pid = self.owner().pid();
+        let old = std::mem::replace(&mut *self.owner.lock().unwrap_or_else(|e| e.into_inner()), std::sync::Arc::new(super::purgeable::Owner::of(pid)));
+        super::purgeable::disown(&old);
+    }
+
+    /// The task as an owner of objects.
+    pub fn owner(&self) -> std::sync::Arc<super::purgeable::Owner> {
+        std::sync::Arc::clone(&self.owner.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// The `phys_footprint` of what `pm` holds: the pmap's own pages less
+    /// those under entries with `use_pmap` off, its tables, and the
+    /// nonvolatile pages of the objects the task owns; none where the host
+    /// cannot say what it holds of those.
+    pub fn balance(&self, pm: &Pmap) -> Option<i64> {
+        let alt = self.alt.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let owned = super::purgeable::owned(&self.owner())?;
+        Some(pm.balance() - (pm.own_in(&alt) * PAGE) as i64 + owned.footprint as i64)
     }
 
     /// The ranges of map `mm` the pmap enters pages of: its mappings less
@@ -575,7 +613,10 @@ impl Meter {
             }
             true
         });
-        ok.then(|| pm.balance())
+        if !ok {
+            return None;
+        }
+        self.balance(pm)
     }
 
     /// Whether `how` releases anything of `[s, e)`: the record holds a page
@@ -679,12 +720,11 @@ impl Kernel {
         }
         // What the guest touched meanwhile is seen by the next look; the
         // balance only grew by it.
-        let after = pm.balance();
+        let after = rusage.meter.balance(&pm);
         drop(pm);
-        if before.is_none() {
-            self.darwin_unimplemented("phys_footprint on a host that cannot say which pages are a task's".into());
-        } else {
-            crossings.extend(self.darwin_footprint_is(after));
+        match (before, after) {
+            (Some(_), Some(after)) => crossings.extend(self.darwin_footprint_is(after)),
+            _ => self.darwin_unimplemented("phys_footprint on a host that cannot say which pages are a task's".into()),
         }
         for (c, l) in crossings {
             self.darwin_footprint_exceeded(m, c, l);
@@ -702,8 +742,9 @@ impl Kernel {
                 return;
             }
             pm.reused(s, e);
-            pm.balance()
+            rusage.meter.balance(&pm)
         };
+        let Some(fp) = fp else { return };
         if let Some((c, l)) = self.darwin_footprint_is(fp) {
             self.darwin_footprint_exceeded(m, c, l);
         }
@@ -819,9 +860,11 @@ impl Kernel {
     /// modelled runs no pageout (its pressure level stays normal), so its
     /// compressor holds nothing of the task's and nothing is swapped: the
     /// compressed sizes, their peak and lifetime, the decompressions and
-    /// the swap-ins are 0, as are the purgeable volatile sizes and the
-    /// purgeable and tag ledgers (no purgeable memory is made here).
-    pub(crate) fn darwin_task_vm_info(&mut self, m: &mut GuestMem<'_>, count: u32) -> super::kobject::Reply {
+    /// the swap-ins are 0. The purgeable and tag ledgers are the objects
+    /// the task owns ([`super::purgeable`]); TASK_VM_INFO_PURGEABLE
+    /// (`purgeable`) adds `vm_map_query_volatile` of the map's volatile
+    /// objects.
+    pub(crate) fn darwin_task_vm_info(&mut self, m: &mut GuestMem<'_>, count: u32, purgeable: bool) -> super::kobject::Reply {
         use super::kobject::Reply;
         const KERN_INVALID_ARGUMENT: i32 = 4;
         // TASK_VM_INFO_REV*_COUNT: natural_t of the packed structure.
@@ -860,6 +903,43 @@ impl Kernel {
         for (at, pages) in [(16, now.resident), (24, peaks.resident), (48, now.internal), (56, peaks.internal), (64, now.external), (72, peaks.external), (80, now.reusable), (88, peaks.reusable)] {
             put(&mut out, at, pages * PAGE);
         }
+        // vm_map_query_volatile: each entry of a volatile or emptied object,
+        // its size, the object's resident pages past the entry's offset,
+        // and the pmap's pages there.
+        if purgeable {
+            let (mut virt, mut res, mut pmap) = (0u64, 0u64, 0u64);
+            let ents: Vec<(u64, u64, u64, u64)> = {
+                let map = self.dtask.vm.lock();
+                let mut v = Vec::new();
+                let mut at = 0;
+                while let Some(e) = map.at_or_after(at) {
+                    v.push((e.start, e.end, e.attrs.obj, e.offset));
+                    at = e.end;
+                }
+                v
+            };
+            let pm = self.dtask.rusage.meter.lock();
+            for (s, e, obj, off) in ents {
+                let volatile = super::vmobject::with(obj, |o| o.purg.as_ref().is_some_and(|p| p.state == super::purgeable::state::VOLATILE || p.state == super::purgeable::state::EMPTY)).unwrap_or(false);
+                if !volatile {
+                    continue;
+                }
+                virt += e - s;
+                let resident = super::purgeable::resident(obj).unwrap_or(0) / PAGE;
+                res += resident.saturating_sub(off / PAGE) * PAGE;
+                let mut a = s;
+                while a < e {
+                    if pm.held(a) != Held::None {
+                        pmap += PAGE;
+                    }
+                    a += PAGE;
+                }
+            }
+            drop(pm);
+            put(&mut out, 96, pmap);
+            put(&mut out, 104, res);
+            put(&mut out, 112, virt);
+        }
         let mut n = REV0;
         if original >= REV1 {
             put(&mut out, 144, footprint as u64);
@@ -871,10 +951,17 @@ impl Kernel {
             n = REV2;
         }
         if original >= REV3 {
-            // ledger_phys_footprint_peak; the purgeable and tag ledgers
-            // after it are 0.
+            // ledger_phys_footprint_peak, then the purgeable and tag
+            // ledgers of what the task owns (their compressed parts 0).
             let peak = self.procs.jetsam().ledgers.get(&self.pid).map_or(footprint, |l| l.lifetime_max);
             put(&mut out, 168, peak as u64);
+            let Some(o) = super::purgeable::owned(&self.dtask.rusage.meter.owner()) else {
+                self.darwin_unimplemented("task_info TASK_VM_INFO's owned ledgers on a host that cannot say what it holds of purgeable memory".into());
+                return Reply::err(5);
+            };
+            for (at, v) in [(176, o.purgeable_nonvolatile), (192, o.purgeable_volatile), (208, o.network_nonvolatile), (224, o.network_volatile), (240, o.media_footprint), (256, o.media_nofootprint), (272, o.graphics_footprint), (288, o.graphics_nofootprint), (304, o.neural_footprint), (320, o.neural_nofootprint)] {
+                put(&mut out, at, v);
+            }
             n = REV3;
         }
         if original >= REV4 {

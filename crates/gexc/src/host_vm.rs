@@ -17,6 +17,38 @@ pub fn install() {
     gex_kernel::set_host_map_shared(map_shared);
     #[cfg(target_os = "macos")]
     gex_kernel::set_host_msync(msync);
+    #[cfg(target_os = "macos")]
+    gex_kernel::set_host_purgeable(hold_purgeable, purge);
+}
+
+/// Fresh purgeable zero pages anywhere in the host's address space
+/// (`mach_vm_allocate` with VM_FLAGS_PURGABLE): nonvolatile, so the host
+/// never empties them on its own.
+#[cfg(target_os = "macos")]
+fn hold_purgeable(len: usize) -> Option<usize> {
+    const VM_FLAGS_ANYWHERE: libc::c_int = 1;
+    const VM_FLAGS_PURGABLE: libc::c_int = 2;
+    if len == 0 || len % page() != 0 {
+        return None;
+    }
+    let mut at = 0u64;
+    // SAFETY: the kernel picks a free range and maps it; nothing else is
+    // touched.
+    let kr = unsafe { mach_vm_allocate(mach_task_self_, &mut at, len as u64, VM_FLAGS_ANYWHERE | VM_FLAGS_PURGABLE) };
+    (kr == 0).then_some(at as usize)
+}
+
+/// [`hold_purgeable`]'s pages emptied: the host's object made empty, then
+/// nonvolatile again.
+#[cfg(target_os = "macos")]
+fn purge(at: usize, _len: usize) -> bool {
+    extern "C" {
+        fn mach_vm_purgable_control(target: libc::c_uint, address: u64, control: libc::c_int, state: *mut libc::c_int) -> libc::c_int;
+    }
+    const SET_STATE: libc::c_int = 0;
+    let (mut empty, mut nonvolatile) = (2, 0);
+    // SAFETY: `at` is a purgeable range `hold_purgeable` allocated.
+    unsafe { mach_vm_purgable_control(mach_task_self_, at as u64, SET_STATE, &mut empty) == 0 && mach_vm_purgable_control(mach_task_self_, at as u64, SET_STATE, &mut nonvolatile) == 0 }
 }
 
 /// A shared mapping of `fd` (open for writing) from `offset` over the

@@ -326,6 +326,7 @@ impl Kernel {
         self.ipc().imp_remove_watchports(me);
         self.ipc().imp_disconnect_task(me);
         self.darwin_bank_task_destroy();
+        super::purgeable::disown(&self.dtask.rusage.meter.owner());
         let semas: Vec<ObjId> = self.dtask.semas.map.iter().filter(|(_, s)| s.active).map(|(&p, _)| p).collect();
         for p in semas {
             self.semaphore_destroy_internal(None, p);

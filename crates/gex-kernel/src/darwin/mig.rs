@@ -226,9 +226,27 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
     match (obj, req.id) {
         // host_info(host, flavor, out, &count)
         (Kobject::Host | Kobject::HostPriv, 200) => match (arg(req, 0), arg(req, 1)) {
-            (Some(HOST_VM_PURGABLE), Some(_)) => {
-                k.darwin_unimplemented("host_info HOST_VM_PURGABLE (purgeable memory has no page model here)".into());
-                Reply::err(KERN_FAILURE)
+            // vm_purgeable_stats of every object: each FIFO group's, the
+            // obsolete queue's and each LIFO group's count and bytes.
+            (Some(HOST_VM_PURGABLE), Some(count)) => {
+                const HOST_VM_PURGABLE_COUNT: u32 = 68;
+                if (count as u32) < HOST_VM_PURGABLE_COUNT {
+                    return Reply::err(KERN_FAILURE);
+                }
+                let mut unknown = false;
+                let (fifo, lifo, obsolete) = super::purgeable::stats(None, &mut |id| super::purgeable::resident(id).unwrap_or_else(|| {
+                    unknown = true;
+                    0
+                }));
+                if unknown {
+                    k.darwin_unimplemented("host_info HOST_VM_PURGABLE on a host that cannot say what it holds of purgeable memory".into());
+                }
+                let mut out = HOST_VM_PURGABLE_COUNT.to_le_bytes().to_vec();
+                for (c, b) in fifo.iter().chain(std::iter::once(&obsolete)).chain(lifo.iter()) {
+                    out.extend_from_slice(&c.to_le_bytes());
+                    out.extend_from_slice(&b.to_le_bytes());
+                }
+                Reply::ok(out)
             }
             (Some(flavor), Some(count)) => host_info(flavor, count as u32),
             _ => bad(),
@@ -949,7 +967,7 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             (Some(17), Some(_)) if matches!(obj, Kobject::TaskName | Kobject::TaskInspect) => Reply::err(KERN_INVALID_ARGUMENT),
             (Some(17), Some(_)) if matches!(obj, Kobject::TaskRead) && !k.darwin_read_conversion_ok() => Reply::err(KERN_INVALID_ARGUMENT),
             // TASK_VM_INFO and TASK_VM_INFO_PURGEABLE: the map's.
-            (Some(22 | 23), Some(count)) => match k.darwin_own_memory(|k, m| k.darwin_task_vm_info(m, count as u32)) {
+            (Some(flavor @ (22 | 23)), Some(count)) => match k.darwin_own_memory(|k, m| k.darwin_task_vm_info(m, count as u32, flavor == 23)) {
                 Ok(r) | Err(r) => r,
             },
             (Some(flavor), Some(count)) => task_info(flavor, count as u32, (k.darwin_dyld_infos, k.darwin_dyld_infos_size), k.darwin_audit_token()),
@@ -1362,6 +1380,24 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
                     return r;
                 }
                 k.darwin_vm_copyin(address, size).and_then(|b| k.darwin_vm_copy_overwrite_from(data, &b, Some(address))).map_or_else(|r| r, |()| Reply::ok(size.to_le_bytes().to_vec()))
+            }
+            _ => bad(),
+        },
+        // mach_vm_purgable_control and vm_purgable_control: the read
+        // port's map only to get the state (convert_port_to_map_read).
+        (Kobject::Task | Kobject::TaskRead, 4818 | 3830) => match (arg64(req, 0), arg(req, 2), arg(req, 3)) {
+            (Some(address), Some(control), Some(state)) => {
+                const GET_STATE: i32 = 1;
+                const SET_STATE_FROM_KERNEL: i32 = 3;
+                if matches!(obj, Kobject::TaskRead) && control != GET_STATE || control == SET_STATE_FROM_KERNEL {
+                    return Reply::err(4);
+                }
+                let mut st = state as i32;
+                match k.darwin_own_memory(|k, m| k.vm_purgable_control(m, address, control as u32 as u64, &mut st)) {
+                    Ok(0) => Reply::ok(st.to_le_bytes().to_vec()),
+                    Ok(r) => Reply::err(r as i32),
+                    Err(r) => r,
+                }
             }
             _ => bad(),
         },

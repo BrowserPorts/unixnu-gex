@@ -49,6 +49,10 @@ pub struct Object {
     /// The pages the host holds for it, where no task's memory does
     /// (a named entry's, a POSIX shared memory object's).
     pub hold: Option<Arc<Hold>>,
+    /// Its purgeable state and owner, for a purgeable or ledger-tagged
+    /// object ([`super::purgeable`]); none for any other (`VM_PURGABLE_DENY`,
+    /// owned by no one).
+    pub purg: Option<super::purgeable::Purg>,
 }
 
 impl Object {
@@ -81,7 +85,21 @@ pub fn allocate(size: u64, pager: Pager, hold: Option<Arc<Hold>>) -> u64 {
     let mut t = lock();
     let id = t.next;
     t.next += 1;
-    t.objects.insert(id, Object { refs: 1, size, pager, hold });
+    t.objects.insert(id, Object { refs: 1, size, pager, hold, purg: None });
+    id
+}
+
+/// A new purgeable or ledger-tagged object of `size` bytes, its pages
+/// `hold`, its state `purg` (its owner `owner`, its queue the nonvolatile
+/// one: `vm_purgeable_nonvolatile_enqueue`), and its maker's reference.
+pub fn allocate_owned(size: u64, hold: Arc<Hold>, mut purg: super::purgeable::Purg, owner: Option<Arc<super::purgeable::Owner>>) -> u64 {
+    let id = allocate(size, Pager::Anon, Some(hold));
+    if purg.state == super::purgeable::state::DENY {
+        super::purgeable::set_owner(&mut purg, id, owner);
+    } else {
+        super::purgeable::nonvolatile_enqueue(&mut purg, id, owner);
+    }
+    with(id, |o| o.purg = Some(purg));
     id
 }
 
@@ -98,7 +116,7 @@ pub fn of_file(key: super::ubc::FileKey, make: impl FnOnce() -> Arc<super::ubc::
     }
     let id = t.next;
     t.next += 1;
-    t.objects.insert(id, Object { refs: 1, size: 0, pager: Pager::Vnode(make()), hold: None });
+    t.objects.insert(id, Object { refs: 1, size: 0, pager: Pager::Vnode(make()), hold: None, purg: None });
     t.files.insert(key, id);
     id
 }
@@ -130,6 +148,10 @@ pub fn release(id: u64) {
         let o = t.objects.get_mut(&id).unwrap_or_else(|| panic!("vm_object_deallocate of object {id}, which is gone"));
         o.refs -= 1;
         if o.refs == 0 {
+            // vm_object_reap: off its purgeable queue and its owner's.
+            if let Some(p) = &mut o.purg {
+                super::purgeable::terminate(p, id);
+            }
             let o = t.objects.remove(&id);
             if let Some(Object { pager: Pager::Vnode(v), .. }) = &o {
                 t.files.remove(&v.key);

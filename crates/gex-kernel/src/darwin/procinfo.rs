@@ -335,6 +335,7 @@ impl Kernel {
 
     /// Publish this process's record for the others.
     pub fn darwin_publish(&mut self) {
+        self.dtask.rusage.meter.owner().set_pid(self.pid);
         self.darwin_live_sigmasks();
         self.darwin_live_realtimer();
         let r: Arc<dyn std::any::Any + Send + Sync> = Arc::new(self.darwin_public_now());

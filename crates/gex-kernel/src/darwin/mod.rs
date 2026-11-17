@@ -43,6 +43,7 @@ pub mod fileport;
 pub mod footprint;
 pub mod xattr;
 pub mod iokit;
+pub mod iodt;
 pub mod iomatch;
 pub mod iopower;
 pub mod image4;

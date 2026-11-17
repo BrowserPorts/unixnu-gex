@@ -287,7 +287,7 @@ fn add_pcie(t: &mut Vec<Node>, io: u32) -> Option<u32> {
     // The personality "AppleT8011PCIe"; no probe of its own, and
     // IOPCIHostBridge's (0xfffffff0064c3dfc) leaves the score. Its start
     // sets its user client class (0xfffffff0066183c8) and the function
-    // parent key AppleARMPlatform's helper makes of apcie's phandle 0xa5
+    // parent key AppleARMPlatform's helper makes of apcie's phandle
     // (0xfffffff005988104), empty data.
     let mut props = driver("com.apple.driver.AppleT8011PCIe", T8011_PCIE, super::platform::ARM_IO_DEVICE, Some("apcie,t8011"), "IODefaultMatchCategory", 0, vec![
         key("IONameMatch", string("apcie,t8011")),
@@ -295,7 +295,7 @@ fn add_pcie(t: &mut Vec<Node>, io: u32) -> Option<u32> {
         key("IOPlatformActiveAction", num64(1500)),
     ]);
     props.push(key("IOUserClientClass", sym("AppleEmbeddedPCIEUserClient")));
-    props.push(key(&format!("IOFunctionParent{:08X}", 0xa5), Prop::Data(Vec::new())));
+    props.push(key(&super::platform::function_parent(t, apcie), Prop::Data(Vec::new())));
     // `IOPCIBridge::start`'s PMinit, after `configure`.
     props.push(key(super::iopower::KEY, super::iopower::pci_bridge()));
     let rc = push(t, service(T8011_PCIE, T8011_PCIE, Some(apcie), props, Table::Lacks(vec![("what AppleEmbeddedPCIE::configure sets", "not followed")])));

@@ -146,12 +146,14 @@ pub fn set_tree(b: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// The registry over the device tree `b`: the platform's services, the
+/// The registry over the device tree `b` (with what `IODeviceTreeAlloc`
+/// derives, [`super::iodt::alloc`]): the platform's services, the
 /// root power domain ([`super::iopower`]), the GPU's, the display's and
 /// the storage's ([`super::storagestack`]), the resources nub and
 /// IOSurfaceRoot, the power plane's links, and the registry's root.
 pub fn build(b: &[u8]) -> Result<Vec<Node>, String> {
     let mut t = parse(b)?;
+    super::iodt::alloc(&mut t)?;
     let io = super::platform::add(&mut t);
     let rd = t.iter().position(|n| n.class == super::platform::PE).map(|pe| super::iopower::add(&mut t, pe as u32));
     if let Some(io) = io {
@@ -378,7 +380,9 @@ pub fn properties(t: &[Node], i: u32) -> Vec<(String, Prop)> {
 ///   the kernelcache's one writer of the key (0xfffffff006442440, in
 ///   IOSCSIArchitectureModelFamily) puts it in a dictionary its device
 ///   holds, not in a property table, and APFS (0xfffffff00666edf8) only
-///   reads it. On the display's framebuffer and its nub, so are
+///   reads it. Nor has a device tree entry, nub or not, a name,
+///   compatible, device_type or model beyond its device tree's
+///   ([`DT_NAME_KEYS`]). On the display's framebuffer and its nub, so are
 ///   the names no driver sets there ([`super::iomfb::property_absent`]).
 pub fn property_unknown(t: &[Node], i: u32, name: &str) -> bool {
     let Some(n) = t.get(i as usize) else { return false };
@@ -396,6 +400,9 @@ pub fn property_unknown(t: &[Node], i: u32, name: &str) -> bool {
     }
     if n.class == super::platform::RESOURCES {
         return true;
+    }
+    if n.class.is_empty() && DT_NAME_KEYS.contains(&name) {
+        return false;
     }
     if n.class.is_empty() && n.nub.is_none() && i != 0 || n.class == super::iosurface::CLASS {
         return false;
@@ -500,6 +507,15 @@ pub fn conforms(t: &[Node], i: u32, class: &str) -> Result<bool, String> {
         Err(what) => Err(what),
     }
 }
+
+/// The device tree properties `IODTCompareNubName` compares a nub's names
+/// by. No driver sets them on a device tree entry: of the kernelcache's
+/// references to these names, those that set or remove a property set
+/// a PCI nub's table (IOPCIFamily, 0xfffffff0064d8834 and
+/// 0xfffffff0064d88bc), AppleSPU's or the disk image driver's own objects
+/// (0xfffffff005b636cc, 0xfffffff005b6a9a8, 0xfffffff005f35810), or a
+/// dictionary's entry; the kernel only reads them.
+pub const DT_NAME_KEYS: [&str; 4] = ["name", "compatible", "device_type", "model"];
 
 /// The device tree property `IODeviceTreeAlloc` makes an entry's location
 /// and takes out of its table (`MakeReferenceTable`).
@@ -1891,17 +1907,19 @@ mod tests {
         assert_eq!(conforms(&t, up[4], "IODTPlatformExpert"), Ok(true));
         assert_eq!(conforms(&t, up[2], "AppleARMIO"), Ok(true));
         assert_eq!(links(&t, sgx, Plane::Service, true), Ok(vec![up[2]]));
-        // The device tree plane is as it was; the drivers' other nubs and
-        // the entries no driver here published are not known.
+        // The device tree plane is as it was. arm-io's driver makes a nub
+        // of each of arm-io's children; the platform expert none of the
+        // excluded top-level entries.
         assert_eq!(links(&t, sgx, Plane::DeviceTree, true), Ok(vec![arm_io]));
-        assert!(class(&t, uart).is_err() && provider(&t, uart).is_err() && provider(&t, chosen).is_err());
+        assert_eq!((class(&t, uart), provider(&t, uart)), (Ok("AppleARMIODevice"), Ok(Some(up[2]))));
+        assert!(provider(&t, chosen).is_err());
         assert!(links(&t, arm_io, Plane::Service, false).is_err() && links(&t, up[2], Plane::Service, false).is_err());
         // Properties a driver here may have set are reported, but for
         // IOClassNameOverride; a plain device tree entry has only its own.
         assert!(property_unknown(&t, accel, "PerformanceStatistics") && property_unknown(&t, sgx, "IODeviceMemory"));
         assert!(!property_unknown(&t, accel, "IOClassNameOverride") && !property_unknown(&t, up[4], "IOClassNameOverride") && !property_unknown(&t, 0, "IOClassNameOverride"));
         assert!(property_unknown(&t, 0, "IOPlatformSerialNumber"));
-        assert!(!property_unknown(&t, uart, "anything") && property_unknown(&t, root, "IOKitBuildVersion") && !property_unknown(&t, root, "anything"));
+        assert!(!property_unknown(&t, chosen, "anything") && property_unknown(&t, root, "IOKitBuildVersion") && !property_unknown(&t, root, "anything"));
         // The display's framebuffer on disp0's nub, a nub of arm-io's
         // driver as the GPU's is.
         let mut b = Vec::new();

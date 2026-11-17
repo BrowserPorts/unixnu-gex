@@ -357,6 +357,9 @@ fn registered(t: &[Node], i: u32) -> Result<bool, String> {
     if n.class == super::accel::CLASS || n.class == super::iomfb::CLASS || n.class == super::iosurface::CLASS {
         return Ok(true);
     }
+    if let Some(r) = super::platform::registers(n.class) {
+        return Ok(r);
+    }
     if let Some(r) = super::iopower::registers(n.class) {
         return Ok(r);
     }

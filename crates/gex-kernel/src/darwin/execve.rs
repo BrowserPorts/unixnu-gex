@@ -696,6 +696,10 @@ impl Kernel {
         };
         let wired = std::sync::Arc::clone(&self.dtask.rusage.wired);
         self.dtask.vm.set_wire_gauge(wired);
+        // The new task's pmap is empty; its map's submaps are its meter's.
+        self.dtask.rusage.meter.reset();
+        let submaps = std::sync::Arc::clone(&self.dtask.rusage.meter.submaps);
+        self.dtask.vm.set_submap_gauge(submaps);
         // task_bank_init, the image in place.
         self.darwin_task_bank_init();
         // The new task takes the old one's coalitions and roles (a spawn's

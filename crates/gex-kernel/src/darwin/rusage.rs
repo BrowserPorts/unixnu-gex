@@ -33,21 +33,24 @@
 //! is read); the wakeups from interrupt context (`interrupt_wakeups`: a
 //! wait's deadline timer, and what a thread call wakes, its thread woken by
 //! the delayed timer's interrupt); each thread's runnable time; the map's
-//! user wirings (`wired_mem`); the caller's own `phys_footprint`, measured
-//! as the call is made; the fork's start (`ps_start`), an ended process's
-//! end and `p_ru`; the reaped children's sums (`ri_child`); and the bank's
-//! bills where no account bills or charges the task. What needs counters
-//! that are not kept is given as 0 and reported: the wakeups a thread
-//! call's signal or message to another task made, wakeups in the
-//! platform-idle state (every processor idle at the interrupt), VM
-//! page-ins (the guest's page faults are the host's, and the device's page
-//! cache is not modelled), the pmap's resident pages, disk I/O (which
-//! reads miss the buffer cache and the UBC), logical writes (the UBC's
-//! copies, write faults on shared file pages, AppleAPFS's own), the CPMU's
-//! instructions (XNU's own among them) and cycles, CLPC's energy, another
-//! live process's footprint (only its own measurements are), the
-//! footprint's peaks (measurements see no peak between them), and bank
-//! bills once an account exists.
+//! user wirings (`wired_mem`); the `phys_footprint` ledger's balance and
+//! its lifetime and interval peaks, the process's pages looked at as the
+//! call is made (from outside it through its published map and memory
+//! for another process, at its end for `p_ru`), the peaks held across
+//! every release of its pages ([`super::footprint`]); the fork's start
+//! (`ps_start`), an ended process's end and `p_ru`; the reaped children's
+//! sums (`ri_child`); and the bank's bills where no account bills or
+//! charges the task. What needs counters that are not kept is given as 0
+//! and reported: the wakeups a thread call's signal or message to another
+//! task made, wakeups in the platform-idle state (every processor idle at
+//! the interrupt), VM page-ins (the guest's page faults are the host's,
+//! and the device's page cache is not modelled), the pmap's resident
+//! pages, disk I/O (which reads miss the buffer cache and the UBC),
+//! logical writes (the UBC's copies, write faults on shared file pages,
+//! AppleAPFS's own), the CPMU's instructions (XNU's own among them) and
+//! cycles, CLPC's energy, the footprint where the host keeps no view of
+//! the process's memory (the browser's), and bank bills once an account
+//! exists.
 
 use crate::syscalls::Kernel;
 use crate::GuestMem;
@@ -115,7 +118,7 @@ const UNKEPT: [(usize, &str, &str); 24] = [
     (ri::INTERRUPT_WKUPS, "ri_interrupt_wkups", "the interrupt_wakeups ledger: what a signal a thread call posted woke, or a thread call's message to another task's port"),
     (ri::PAGEINS, "ri_pageins", "the task's VM page-ins: its page faults, which the host takes, and the device's page cache"),
     (ri::RESIDENT_SIZE, "ri_resident_size", "the pmap's phys_mem ledger: the pages the task faulted in, which the host's VM keeps"),
-    (ri::PHYS_FOOTPRINT, "ri_phys_footprint", "another process's footprint now (only its own measurements are kept)"),
+    (ri::PHYS_FOOTPRINT, "ri_phys_footprint", "a look at the process's pages, which the host keeps no view of"),
     (ri::CHILD_PKG_IDLE_WKUPS, "ri_child_pkg_idle_wkups", "the reaped children's platform-idle wakeups"),
     (ri::CHILD_INTERRUPT_WKUPS, "ri_child_interrupt_wkups", "the reaped children's interrupt wakeups"),
     (ri::CHILD_PAGEINS, "ri_child_pageins", "the reaped children's page-ins"),
@@ -126,12 +129,12 @@ const UNKEPT: [(usize, &str, &str); 24] = [
     (ri::BILLED_SYSTEM_TIME, "ri_billed_system_time", "the bank accounts' bills"),
     (ri::SERVICED_SYSTEM_TIME, "ri_serviced_system_time", "the bank accounts' bills"),
     (ri::LOGICAL_WRITES, "ri_logical_writes", "the logical_writes ledger: cluster_write's copies into the UBC, the first write faults on shared file pages, AppleAPFS's own"),
-    (ri::LIFETIME_MAX_PHYS_FOOTPRINT, "ri_lifetime_max_phys_footprint", "the footprint's peak between measurements"),
+    (ri::LIFETIME_MAX_PHYS_FOOTPRINT, "ri_lifetime_max_phys_footprint", "a look at the process's pages, which the host keeps no view of"),
     (ri::INSTRUCTIONS, "ri_instructions", "the CPMU's instruction counts, XNU's own on the thread's behalf among them"),
     (ri::CYCLES, "ri_cycles", "the CPMU's cycle counts"),
     (ri::BILLED_ENERGY, "ri_billed_energy", "the bank accounts' bills"),
     (ri::SERVICED_ENERGY, "ri_serviced_energy", "the bank accounts' bills"),
-    (ri::INTERVAL_MAX_PHYS_FOOTPRINT, "ri_interval_max_phys_footprint", "the footprint's peak between measurements"),
+    (ri::INTERVAL_MAX_PHYS_FOOTPRINT, "ri_interval_max_phys_footprint", "a look at the process's pages, which the host keeps no view of"),
     (ri::RUNNABLE_TIME, "ri_runnable_time", "per-thread clocks on the host"),
     (ri::ENERGY_NJ, "ri_energy_nj", "CLPC's energy estimates"),
 ];
@@ -227,6 +230,9 @@ pub struct Shared {
     /// not counted here: a signal it posted, or a message it sent to a
     /// port another task receives.
     pub wkups_unkept: AtomicBool,
+    /// The task's footprint meter: what its pmap holds, for its own looks
+    /// and other processes'.
+    pub meter: super::footprint::Meter,
     child: Mutex<Child>,
     /// `p_ru->ri`: what `proc_exit` gathered.
     exit: Mutex<Option<Record>>,
@@ -377,6 +383,10 @@ pub struct Input {
     pub wired: u64,
     /// The phys_footprint ledger's balance, where it is known now.
     pub footprint: Option<u64>,
+    /// Its lifetime peak and the peak of its interval
+    /// (`ledger_get_lifetime_max`, `ledger_get_interval_max` without a
+    /// reset), where they are known.
+    pub footprint_peaks: Option<(u64, u64)>,
     pub start_abstime: u64,
     pub child: Child,
     pub billing: bool,
@@ -412,8 +422,18 @@ pub fn gather(i: &Input) -> Record {
         Some(n) => w[ri::INTERRUPT_WKUPS] = n,
         None => mark(ri::INTERRUPT_WKUPS),
     }
-    for f in [ri::PKG_IDLE_WKUPS, ri::PAGEINS, ri::DISKIO_BYTESREAD, ri::DISKIO_BYTESWRITTEN, ri::LOGICAL_WRITES, ri::LIFETIME_MAX_PHYS_FOOTPRINT, ri::INTERVAL_MAX_PHYS_FOOTPRINT, ri::INSTRUCTIONS, ri::CYCLES, ri::ENERGY_NJ] {
+    for f in [ri::PKG_IDLE_WKUPS, ri::PAGEINS, ri::DISKIO_BYTESREAD, ri::DISKIO_BYTESWRITTEN, ri::LOGICAL_WRITES, ri::INSTRUCTIONS, ri::CYCLES, ri::ENERGY_NJ] {
         mark(f);
+    }
+    match i.footprint_peaks {
+        Some((lifetime, interval)) => {
+            w[ri::LIFETIME_MAX_PHYS_FOOTPRINT] = lifetime;
+            w[ri::INTERVAL_MAX_PHYS_FOOTPRINT] = interval;
+        }
+        None => {
+            mark(ri::LIFETIME_MAX_PHYS_FOOTPRINT);
+            mark(ri::INTERVAL_MAX_PHYS_FOOTPRINT);
+        }
     }
     match i.qos {
         Some(q) => w[QOS_FIELDS].copy_from_slice(&q),
@@ -482,6 +502,7 @@ fn input(procs: &crate::proc::ProcTable, pid: i32, p: &super::procinfo::Public) 
         runnable,
         wired: s.wired.load(Ordering::Acquire),
         footprint: None,
+        footprint_peaks: None,
         start_abstime: s.start_abstime.load(Ordering::Acquire),
         child: s.child(),
         billing: s.billing.load(Ordering::Acquire),
@@ -491,10 +512,32 @@ fn input(procs: &crate::proc::ProcTable, pid: i32, p: &super::procinfo::Public) 
     }
 }
 
+/// A look at process `pid`'s pages from outside it, through the map and
+/// memory it published, its ledger told (the peaks raised, its callbacks
+/// left to it): the balance and its lifetime and interval peaks; none
+/// where the host keeps no view of its memory.
+pub fn footprint_from_outside(procs: &crate::proc::ProcTable, pid: i32, p: &super::procinfo::Public) -> Option<(u64, (u64, u64))> {
+    let peer = procs.vm(pid).ok()?;
+    let meter = &p.rusage.meter;
+    let fp = {
+        let mut pm = meter.lock();
+        let mut fp = None;
+        peer.mem.with_guest(&mut |g| fp = meter.measure(&mut pm, &peer.mm, g));
+        fp?
+    };
+    let mut j = procs.jetsam();
+    let l = j.ledgers.get_mut(&pid)?;
+    l.observe(fp);
+    Some((fp as u64, (l.lifetime_max as u64, l.interval_max as u64)))
+}
+
 /// `proc_exit`'s stash of process `pid`'s usage in `p_ru`, before it
-/// becomes a zombie, for `proc_pid_rusage` to read.
+/// becomes a zombie, for `proc_pid_rusage` to read: its pages looked at a
+/// last time first, as its threads have stopped and before its map goes
+/// (`vm_map_terminate` only releases), so the peaks are its whole life's.
 pub fn proc_exit(procs: &crate::proc::ProcTable, pid: i32, p: &super::procinfo::Public) {
     let mut i = input(procs, pid, p);
+    i.footprint_peaks = footprint_from_outside(procs, pid, p).map(|(_, peaks)| peaks);
     i.exit_abstime = Some(super::mach::absolute_time());
     let r = gather(&i);
     *p.rusage.exit.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
@@ -541,7 +584,13 @@ impl Kernel {
             None => {
                 let mut i = input(&self.procs, pid, &target);
                 if pid == self.pid {
-                    i.footprint = self.darwin_own_footprint(m);
+                    if let Some(fp) = self.darwin_footprint_now(m) {
+                        i.footprint = Some(fp as u64);
+                        i.footprint_peaks = self.procs.jetsam().ledgers.get(&pid).map(|l| (l.lifetime_max as u64, l.interval_max as u64));
+                    }
+                } else if let Some((fp, peaks)) = footprint_from_outside(&self.procs, pid, &target) {
+                    i.footprint = Some(fp);
+                    i.footprint_peaks = Some(peaks);
                 }
                 gather(&i)
             }
@@ -578,13 +627,6 @@ impl Kernel {
         self.dtask.rusage.interrupt_wkups.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// The caller's own `phys_footprint` ledger balance, measured now (a
-    /// measurement as its calls make them, the ledger told).
-    fn darwin_own_footprint(&mut self, m: &mut GuestMem<'_>) -> Option<u64> {
-        self.dtask.footprint_due = None;
-        self.darwin_footprint_tick(m)?;
-        self.procs.jetsam().ledgers.get(&self.pid).map(|l| l.balance as u64)
-    }
 }
 
 #[cfg(test)]
@@ -658,6 +700,11 @@ mod tests {
         for n in ["ri_billed_system_time", "ri_serviced_system_time", "ri_billed_energy", "ri_serviced_energy", "ri_phys_footprint"] {
             assert!(all.contains(n), "{n}");
         }
+        // Kept peaks fill their fields.
+        i.footprint_peaks = Some((0x90000, 0x50000));
+        let r = gather(&i);
+        assert_eq!((r.w[ri::LIFETIME_MAX_PHYS_FOOTPRINT], r.w[ri::INTERVAL_MAX_PHYS_FOOTPRINT]), (0x90000, 0x50000));
+        assert!(!r.unkept_within(SIZES[6]).join(" ").contains("max_phys_footprint"));
     }
 
     #[test]

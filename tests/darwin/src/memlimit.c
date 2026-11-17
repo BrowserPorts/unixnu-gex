@@ -2,7 +2,9 @@
 // a fatal limit set with MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES kills the
 // task whose touched pages go past it (SIGKILL); pages it made reusable or
 // unmapped are not counted; a task that nears its limit (80 %) is told by
-// its EVFILT_MEMORYSTATUS knote (NOTE_MEMORYSTATUS_PROC_LIMIT_WARN). Needs
+// its EVFILT_MEMORYSTATUS knote (NOTE_MEMORYSTATUS_PROC_LIMIT_WARN). A task
+// that goes past its limit and unmaps the pages at once is killed all the
+// same: the ledger's balance crossed the limit. Needs
 // the com.apple.private.memorystatus entitlement. The kill is a jetsam's:
 // PROC_PIDNOTEEXIT tells the parent NOTE_EXIT_MEMORY_PID, and its exit
 // reason is the jetsam's per-process limit.
@@ -64,6 +66,11 @@ static int child(const char *mode) {
         sleep(3);
         return 11;
     }
+    if (!strcmp(mode, "spike")) {
+        munmap(touched(96 * MB), 96 * MB);
+        sleep(3);
+        return 16;
+    }
     if (!strcmp(mode, "freed")) {
         // Made reusable, then unmapped: each is gone from the footprint.
         for (int i = 0; i < 4; i++) {
@@ -102,7 +109,8 @@ static int run(const char *mode) {
     if (waitid(P_PID, pid, &si, WEXITED | WNOWAIT) != 0) return -1;
     uint32_t d = 0;
     if (proc_pidinfo(pid, PROC_PIDNOTEEXIT, NOTE_EXITSTATUS | NOTE_EXIT_DETAIL, &d, sizeof d) != sizeof d) return -1;
-    if (strcmp(mode, "over") == 0 && d != (SIGKILL | NOTE_EXIT_MEMORY | NOTE_EXIT_MEMORY_PID)) return -2;
+    int over = strcmp(mode, "over") == 0 || strcmp(mode, "spike") == 0;
+    if (over && d != (SIGKILL | NOTE_EXIT_MEMORY | NOTE_EXIT_MEMORY_PID)) return -2;
     // Its exit reason: OS_REASON_JETSAM, JETSAM_REASON_MEMORY_PERPROCESSLIMIT,
     // a crash report asked for.
     struct {
@@ -111,8 +119,8 @@ static int run(const char *mode) {
         uint64_t flags;
         uint32_t size;
     } __attribute__((packed)) b;
-    if (strcmp(mode, "over") == 0 && (proc_pidinfo(pid, 25, 0, &b, sizeof b) != sizeof b || b.ns != 1 || b.code != 7 || b.flags != 2 || b.size != 0)) return -4;
-    if (strcmp(mode, "over") != 0 && d != 0) return -3;
+    if (over && (proc_pidinfo(pid, 25, 0, &b, sizeof b) != sizeof b || b.ns != 1 || b.code != 7 || b.flags != 2 || b.size != 0)) return -4;
+    if (!over && d != 0) return -3;
     if (waitpid(pid, &st, 0) != pid) return -1;
     return st;
 }
@@ -121,6 +129,8 @@ int main(int argc, char **argv) {
     if (argc > 1) return child(argv[1]);
     int st = run("over");
     if (!WIFSIGNALED(st) || WTERMSIG(st) != SIGKILL) return bad("past a fatal limit", st, SIGKILL);
+    st = run("spike");
+    if (!WIFSIGNALED(st) || WTERMSIG(st) != SIGKILL) return bad("past a fatal limit and back at once", st, SIGKILL);
     if ((st = run("freed")) != 0) return bad("memory made reusable or unmapped", st, 0);
     if ((st = run("near")) != 0) return bad("near the limit", st, 0);
     printf("memlimit ok\n");

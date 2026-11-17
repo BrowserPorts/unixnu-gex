@@ -207,11 +207,14 @@ impl Kernel {
             // CONFIG_LEDGER_INTERVAL_MAX (21H461's proc_rlimit_control at
             // 0xfffffff00763bf98): FOOTPRINT_INTERVAL_RESET, the only
             // option, begins a new interval of the phys_footprint ledger's
-            // peak; the ledger's own result is not looked at.
+            // peak; the ledger's own result is not looked at. The new
+            // interval begins at the balance now: the task's pages are
+            // looked at first, and the interval's peak so far held.
             RLIMIT_FOOTPRINT_INTERVAL => {
                 if arg as u32 & FOOTPRINT_INTERVAL_RESET == 0 {
                     return Err(Errno::EINVAL);
                 }
+                self.darwin_footprint_now(m);
                 if let Some(l) = self.procs.jetsam().ledgers.get_mut(&self.pid) {
                     l.get_interval_max(true);
                 }

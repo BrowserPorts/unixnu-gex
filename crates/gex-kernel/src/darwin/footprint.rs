@@ -3,15 +3,26 @@
 //! it does (`task_footprint_exceeded`, `memorystatus_on_ledger_footprint_
 //! exceeded`, `memorystatus_warn_process`).
 //!
-//! The balance is measured rather than credited page by page: the host's
-//! own VM says which of the task's pages are its memory (`pmap.c` counts a
-//! page as the task's when it is internal and not reusable, in memory or
-//! compressed), and the page tables mapping them are counted as arm64's
-//! pmap allocates them. A task measures itself on its thread calls, every
-//! [`SAMPLE`]; a limit is crossed when a measurement says so, not at the
-//! page that crossed it.
+//! The balance is what the task's pmap holds (`pmap.c`: its own pages,
+//! internal and not reusable, and the page tables mapping its pages), kept
+//! in a record of the task's pages ([`Pmap`]) rather than credited page by
+//! page: a page the task touched is seen in the host's VM, which faults it
+//! in. The device modelled runs no pageout (its pressure level stays
+//! normal, `kfilt`), so a page once entered stays the task's until a
+//! kernel operation removes it, and a page table stays until a
+//! `pmap_remove` empties it: what the host compresses or reclaims of a
+//! clean page (a page read and never written, a page `MADV_FREE` killed, a
+//! file's page) changes nothing here. Between kernel operations the
+//! balance can then only grow, so the ledger's peaks
+//! (`LF_TRACKING_MAX`) are exact when the task's pages are looked at
+//! before each operation that releases any ([`Kernel::darwin_footprint_
+//! release`]) and whenever the ledger is read. What the host reclaims of
+//! a page the task touched between two looks is not seen.
+//!
+//! A limit is crossed when a look says so, on the task's thread calls
+//! every [`SAMPLE`], before a release and at a read, not at the page that
+//! crossed it: the host takes the task's page faults.
 
-use super::vm::kind;
 use crate::page_state as ps;
 use crate::syscalls::Kernel;
 use crate::GuestMem;
@@ -151,6 +162,16 @@ impl Ledger {
         max
     }
 
+    /// A reading of the balance by another task (`ledger_get_balance` and
+    /// the peaks, from `proc_pid_rusage` of another process or at its
+    /// exit): a balance the ledger had at that moment, so the peaks hold it;
+    /// the limit's callbacks are the task's own.
+    pub fn observe(&mut self, balance: i64) {
+        self.balance = balance;
+        self.lifetime_max = self.lifetime_max.max(balance);
+        self.interval_max = self.interval_max.max(balance);
+    }
+
     /// `task_has_triggered_exc_resource`, and its mark.
     fn exc_triggered(&mut self) -> bool {
         let t = if self.memlimit_active { &mut self.exc_active } else { &mut self.exc_inactive };
@@ -158,44 +179,427 @@ impl Ledger {
     }
 }
 
-impl Kernel {
-    /// The task's footprint now, from the host's view of its pages; `None`
-    /// where the host cannot say.
-    pub(crate) fn darwin_phys_footprint(&mut self, m: &mut GuestMem<'_>) -> Option<u64> {
-        let (alias, alias_end) = (gex_abi::DARWIN_COMMPAGE_ALIAS, gex_abi::DARWIN_COMMPAGE_ALIAS + (gex_abi::DARWIN_COMMPAGE_END - gex_abi::DARWIN_COMMPAGE_RO));
-        let vmas: Vec<(u64, u64)> = self.mem.lock().vmas().iter().map(|v| (v.start, v.end)).filter(|&(s, e)| !(s >= alias && e <= alias_end)).collect();
-        let (mut internal, mut leaves, mut twigs) = (0u64, std::collections::BTreeSet::new(), std::collections::BTreeSet::new());
-        let mut out = vec![0u8; 4096];
-        for (s, e) in vmas {
-            for (ps_, pe, a) in self.dtask.vm.pieces(s, e) {
-                // The shared region's pages and tables are its own pmap's.
-                if a.kind == kind::SUBMAP {
+/// The map's page shift.
+const PAGE_SHIFT: u32 = PAGE.trailing_zeros();
+/// Pages a chunk of the record holds (64 MiB of the map), two bits each.
+const CHUNK_PAGES: u64 = 4096;
+const CHUNK_WORDS: usize = (CHUNK_PAGES / 32) as usize;
+/// Pages a leaf table maps.
+const LEAF_PAGES: u64 = 1 << (L3_SHIFT - PAGE_SHIFT);
+/// The low bit of each two-bit field of a word.
+const LOW: u64 = 0x5555_5555_5555_5555;
+
+/// What a task's pmap holds for one page of its map.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Held {
+    /// No entry.
+    None,
+    /// The task's own memory (internal, not reusable), resident or
+    /// compressed: in `phys_footprint` (`internal`, `internal_compressed`).
+    Own,
+    /// Its own memory made reusable (`PMAP_OPTIONS_SET_REUSABLE`): entered,
+    /// not counted.
+    Reusable,
+    /// A file's page: entered, not counted.
+    File,
+}
+
+impl Held {
+    fn bits(self) -> u64 {
+        match self {
+            Held::None => 0,
+            Held::Own => 1,
+            Held::Reusable => 2,
+            Held::File => 3,
+        }
+    }
+
+    fn of(bits: u64) -> Held {
+        match bits & 3 {
+            0 => Held::None,
+            1 => Held::Own,
+            2 => Held::Reusable,
+            _ => Held::File,
+        }
+    }
+
+    /// The page as a look finds it, the host's state of it being `st` and
+    /// `self` what the pmap held at the last look. A page the host holds
+    /// nothing of now (one it reclaimed, or one never touched) keeps what
+    /// the pmap held: the device modelled reclaims none.
+    pub fn looked(self, st: u8) -> Held {
+        let own = st & ps::EXTERNAL == 0;
+        if own && st & (ps::PRESENT | ps::PAGED_OUT) != 0 {
+            if st & ps::REUSABLE != 0 {
+                Held::Reusable
+            } else {
+                Held::Own
+            }
+        } else if !own && st & ps::PRESENT != 0 {
+            Held::File
+        } else {
+            self
+        }
+    }
+}
+
+/// The record of what a task's pmap holds: each page's [`Held`], the leaf
+/// tables (32 MB each) and twig tables (64 GB each) allocated.
+#[derive(Debug, Default)]
+pub struct Pmap {
+    chunks: std::collections::BTreeMap<u64, Box<[u64; CHUNK_WORDS]>>,
+    /// Pages held as [`Held::Own`].
+    own: u64,
+    leaves: std::collections::BTreeSet<u64>,
+    twigs: std::collections::BTreeSet<u64>,
+}
+
+/// The pages of `[s, e)` (page aligned) by chunk: the chunk, and the first
+/// and last-plus-one page index within it.
+fn by_chunk(s: u64, e: u64) -> impl Iterator<Item = (u64, usize, usize)> {
+    let (first, last) = (s >> PAGE_SHIFT, e >> PAGE_SHIFT);
+    let mut at = first;
+    std::iter::from_fn(move || {
+        if at >= last {
+            return None;
+        }
+        let c = at / CHUNK_PAGES;
+        let stop = ((c + 1) * CHUNK_PAGES).min(last);
+        let r = (c, (at - c * CHUNK_PAGES) as usize, (stop - c * CHUNK_PAGES) as usize);
+        at = stop;
+        Some(r)
+    })
+}
+
+fn own_in(w: u64) -> u64 {
+    u64::from((w & LOW & !(w >> 1)).count_ones())
+}
+
+fn get(words: &[u64; CHUNK_WORDS], i: usize) -> Held {
+    Held::of(words[i / 32] >> ((i % 32) * 2))
+}
+
+fn put(words: &mut [u64; CHUNK_WORDS], i: usize, h: Held) {
+    let (w, sh) = (i / 32, (i % 32) * 2);
+    words[w] = (words[w] & !(3 << sh)) | (h.bits() << sh);
+}
+
+impl Pmap {
+    /// What the pmap holds for the page at `addr`.
+    pub fn held(&self, addr: u64) -> Held {
+        let p = addr >> PAGE_SHIFT;
+        self.chunks.get(&(p / CHUNK_PAGES)).map_or(Held::None, |c| get(c, (p % CHUNK_PAGES) as usize))
+    }
+
+    /// The `phys_footprint` it makes: its own pages, the root table, the
+    /// leaf and twig tables.
+    pub fn balance(&self) -> i64 {
+        (self.own * PAGE + ROOT_SIZE + (self.leaves.len() + self.twigs.len()) as u64 * PAGE) as i64
+    }
+
+    /// A look at the pages of `ranges` (page aligned, sorted, disjoint),
+    /// `states(addr, pages, out)` giving the host's state of each: each
+    /// page's [`Held::looked`], a table for each page held. What lies
+    /// outside the ranges is no longer the task's map's (gone with its
+    /// mapping); `twigs` are twig tables the map has without a page of its
+    /// own under them (the commpage's, the shared region's nest). False
+    /// when the host cannot say.
+    pub fn look(&mut self, ranges: &[(u64, u64)], twigs: &[u64], states: &mut dyn FnMut(u64, u64, &mut [u8]) -> bool) -> bool {
+        let mut chunks: std::collections::BTreeMap<u64, Box<[u64; CHUNK_WORDS]>> = std::collections::BTreeMap::new();
+        let mut out = vec![0u8; CHUNK_PAGES as usize];
+        for &(s, e) in ranges {
+            for (c, i0, i1) in by_chunk(s, e) {
+                let at = (c * CHUNK_PAGES + i0 as u64) << PAGE_SHIFT;
+                let n = i1 - i0;
+                if !states(at, n as u64, &mut out[..n]) {
+                    return false;
+                }
+                let old = self.chunks.get(&c);
+                // Nothing held there and nothing on the host: nothing to keep.
+                if old.is_none() && out[..n].iter().all(|&st| st == 0) {
                     continue;
                 }
-                let mut at = ps_;
-                while at < pe {
-                    let n = ((pe - at) / PAGE).min(out.len() as u64);
-                    if !m.page_states(at, n * PAGE, PAGE, &mut out[..n as usize]).ok()? {
-                        return None;
+                let new = chunks.entry(c).or_insert_with(|| Box::new([0; CHUNK_WORDS]));
+                for (k, &st) in out[..n].iter().enumerate() {
+                    let i = i0 + k;
+                    let was = old.map_or(Held::None, |o| get(o, i));
+                    let h = was.looked(st);
+                    if h != Held::None {
+                        put(new, i, h);
+                        let page = (c * CHUNK_PAGES + i as u64) << PAGE_SHIFT;
+                        self.leaves.insert(page >> L3_SHIFT);
+                        self.twigs.insert(page >> L2_SHIFT);
                     }
-                    for (i, &st) in out[..n as usize].iter().enumerate() {
-                        let page = at + i as u64 * PAGE;
-                        let own = st & ps::EXTERNAL == 0;
-                        if own && st & (ps::PRESENT | ps::PAGED_OUT) != 0 && st & ps::REUSABLE == 0 {
-                            internal += 1;
-                        }
-                        // A page table holds a resident page's entry, or a
-                        // compressed one's marker.
-                        if st & ps::PRESENT != 0 || (own && st & ps::PAGED_OUT != 0) {
-                            leaves.insert(page >> L3_SHIFT);
-                            twigs.insert(page >> L2_SHIFT);
-                        }
-                    }
-                    at += n * PAGE;
                 }
             }
         }
-        Some(internal * PAGE + ROOT_SIZE + (leaves.len() + twigs.len()) as u64 * PAGE)
+        chunks.retain(|_, w| w.iter().any(|&x| x != 0));
+        self.own = chunks.values().map(|w| w.iter().map(|&x| own_in(x)).sum::<u64>()).sum();
+        self.chunks = chunks;
+        self.twigs.extend(twigs.iter().copied());
+        true
+    }
+
+    /// Whether the pmap holds a page of `[s, e)`; with `own_only`, one of
+    /// the task's own.
+    pub fn holds(&self, s: u64, e: u64, own_only: bool) -> bool {
+        by_chunk(s, e).any(|(c, i0, i1)| self.chunks.get(&c).is_some_and(|w| (i0..i1).any(|i| matches!((get(w, i), own_only), (Held::Own, _) | (Held::Reusable | Held::File, false)))))
+    }
+
+    /// Change the pages of `[s, e)` by `f`.
+    fn change(&mut self, s: u64, e: u64, f: impl Fn(Held) -> Held) {
+        for (c, i0, i1) in by_chunk(s, e) {
+            let Some(w) = self.chunks.get_mut(&c) else { continue };
+            for i in i0..i1 {
+                let (was, now) = (get(w, i), f(get(w, i)));
+                if was != now {
+                    self.own = self.own + u64::from(now == Held::Own) - u64::from(was == Held::Own);
+                    put(w, i, now);
+                }
+            }
+            if w.iter().all(|&x| x == 0) {
+                self.chunks.remove(&c);
+            }
+        }
+    }
+
+    /// `pmap_remove` of `[s, e)` (`vm_map_delete`, an overwrite): its
+    /// entries go, and each leaf table of the range left with none
+    /// (`refcnt` 0, `pmap_tte_deallocate`). Twig tables stay while the
+    /// pmap lives.
+    pub fn remove(&mut self, s: u64, e: u64) {
+        if s >= e {
+            return;
+        }
+        self.change(s, e, |_| Held::None);
+        let blocks: Vec<u64> = self.leaves.range(s >> L3_SHIFT..=(e - 1) >> L3_SHIFT).copied().collect();
+        for b in blocks {
+            let first = b * LEAF_PAGES;
+            let (c, i0) = (first / CHUNK_PAGES, (first % CHUNK_PAGES) as usize);
+            let used = self.chunks.get(&c).is_some_and(|w| w[i0 / 32..(i0 + LEAF_PAGES as usize) / 32].iter().any(|&x| x != 0));
+            if !used {
+                self.leaves.remove(&b);
+            }
+        }
+    }
+
+    /// `vm_map_reusable_pages` of `[s, e)`: the task's own pages there are
+    /// reusable (`deactivate_pages_in_object` with `DEACTIVATE_REUSABLE`),
+    /// still entered.
+    pub fn made_reusable(&mut self, s: u64, e: u64) {
+        self.change(s, e, |h| if h == Held::Own { Held::Reusable } else { h });
+    }
+
+    /// `vm_map_reuse_pages` of `[s, e)`: its reusable pages are the task's
+    /// own again (`vm_object_reuse_pages`, `PMAP_OPTIONS_CLEAR_REUSABLE`).
+    pub fn reused(&mut self, s: u64, e: u64) {
+        self.change(s, e, |h| if h == Held::Reusable { Held::Own } else { h });
+    }
+}
+
+/// What a kernel operation releases of the pages of its range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Release {
+    /// Every entry (`pmap_remove`): an unmapping, a mapping over it.
+    Remove,
+    /// The task's own pages become reusable.
+    Reusable,
+}
+
+/// A task's footprint meter, shared with the processes that read its
+/// ledger: the record of its pmap, and the submap entries (the shared
+/// region's, whose pages and tables are its own pmap's) its map
+/// publishes.
+#[derive(Debug, Default)]
+pub struct Meter {
+    pmap: std::sync::Mutex<Pmap>,
+    pub submaps: std::sync::Arc<std::sync::Mutex<Vec<(u64, u64)>>>,
+}
+
+/// The commpage alias in a task's memory: the host's mapping of the
+/// commpage, not the task's.
+fn commpage_alias() -> (u64, u64) {
+    (gex_abi::DARWIN_COMMPAGE_ALIAS, gex_abi::DARWIN_COMMPAGE_ALIAS + (gex_abi::DARWIN_COMMPAGE_END - gex_abi::DARWIN_COMMPAGE_RO))
+}
+
+/// `ranges` (sorted, disjoint) less `holes` (sorted, disjoint).
+fn less(ranges: &[(u64, u64)], holes: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    for &(s, e) in ranges {
+        let mut at = s;
+        for &(hs, he) in holes.iter().filter(|&&(hs, he)| hs < e && he > s) {
+            if hs > at {
+                out.push((at, hs));
+            }
+            at = at.max(he);
+        }
+        if at < e {
+            out.push((at, e));
+        }
+    }
+    out
+}
+
+impl Meter {
+    /// The record, held while a look or a release is made.
+    pub fn lock(&self) -> std::sync::MutexGuard<'_, Pmap> {
+        self.pmap.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A new task's pmap, as an exec makes it.
+    pub fn reset(&self) {
+        *self.lock() = Pmap::default();
+    }
+
+    /// The ranges of map `mm` the pmap enters pages of: its mappings less
+    /// the commpage alias and the submaps.
+    pub fn ranges(&self, mm: &crate::mem::Mm) -> Vec<(u64, u64)> {
+        let (alias, alias_end) = commpage_alias();
+        let vmas: Vec<(u64, u64)> = mm.lock().vmas().iter().map(|v| (v.start, v.end)).filter(|&(s, e)| !(s >= alias && e <= alias_end)).collect();
+        let mut holes = self.submaps.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        holes.sort_unstable();
+        less(&vmas, &holes)
+    }
+
+    /// The twig tables the map has whatever its pages: the commpage's
+    /// (`pmap_insert_commpage` expands to the twig level) and those over
+    /// the submaps (`pmap_nest` expands the grand pmap to it).
+    fn fixed_twigs(&self) -> Vec<u64> {
+        let mut t = vec![gex_abi::DARWIN_COMMPAGE_RW >> L2_SHIFT];
+        for &(s, e) in self.submaps.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            if s < e {
+                t.extend(s >> L2_SHIFT..=(e - 1) >> L2_SHIFT);
+            }
+        }
+        t
+    }
+
+    /// A look at the task's pages, its map `mm` and its memory `m`: the
+    /// balance; none where the host cannot say.
+    pub fn measure(&self, pm: &mut Pmap, mm: &crate::mem::Mm, m: &mut GuestMem<'_>) -> Option<i64> {
+        let ranges = self.ranges(mm);
+        let twigs = self.fixed_twigs();
+        let ok = pm.look(&ranges, &twigs, &mut |at, n, out| m.page_states(at, n * PAGE, PAGE, out).unwrap_or(false));
+        ok.then(|| pm.balance())
+    }
+
+    /// Whether `how` releases anything of `[s, e)`: the record holds a page
+    /// there it takes, or the host shows one the next look would. False
+    /// only when nothing there can lower the balance.
+    pub fn releases(&self, pm: &Pmap, mm: &crate::mem::Mm, m: &mut GuestMem<'_>, s: u64, e: u64, how: Release) -> bool {
+        let own_only = how == Release::Reusable;
+        if pm.holds(s, e, own_only) {
+            return true;
+        }
+        let ranges: Vec<(u64, u64)> = self.ranges(mm).into_iter().filter(|&(rs, re)| rs < e && re > s).map(|(rs, re)| (rs.max(s), re.min(e))).collect();
+        let mut out = vec![0u8; CHUNK_PAGES as usize];
+        for (rs, re) in ranges {
+            for (c, i0, i1) in by_chunk(rs, re) {
+                let at = (c * CHUNK_PAGES + i0 as u64) << PAGE_SHIFT;
+                let n = i1 - i0;
+                if !m.page_states(at, n as u64 * PAGE, PAGE, &mut out[..n]).unwrap_or(false) {
+                    return true;
+                }
+                if out[..n].iter().any(|&st| matches!((Held::None.looked(st), own_only), (Held::Own, _) | (Held::Reusable | Held::File, false))) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+impl Kernel {
+    /// The task's `phys_footprint` now: its pages looked at and its ledger
+    /// told (the limit's callbacks made); none where the host cannot say,
+    /// which is reported.
+    pub(crate) fn darwin_footprint_now(&mut self, m: &mut GuestMem<'_>) -> Option<i64> {
+        // A look made inside a release would wait on the release's own hold
+        // of the record; the release looked first.
+        if self.dtask.footprint_releasing {
+            return self.procs.jetsam().ledgers.get(&self.pid).map(|l| l.balance);
+        }
+        let rusage = std::sync::Arc::clone(&self.dtask.rusage);
+        let fp = {
+            let mut pm = rusage.meter.lock();
+            rusage.meter.measure(&mut pm, &self.mem, m)
+        };
+        let Some(fp) = fp else {
+            self.darwin_unimplemented("phys_footprint on a host that cannot say which pages are a task's".into());
+            return None;
+        };
+        if let Some((c, l)) = self.darwin_footprint_is(fp) {
+            self.darwin_footprint_exceeded(m, c, l);
+        }
+        Some(fp)
+    }
+
+    /// The ledger told the balance is `fp`: the callback it makes, if any,
+    /// with the ledger as it is then.
+    fn darwin_footprint_is(&mut self, fp: i64) -> Option<(Crossing, Ledger)> {
+        let pid = self.pid;
+        let mut j = self.procs.jetsam();
+        let l = j.ledgers.get_mut(&pid)?;
+        l.balance_is(fp).map(|c| (c, *l))
+    }
+
+    /// `op` releases pages of `[s, e)` as `how` says: the task's pages are
+    /// looked at first, so the ledger's peaks hold the balance it had, and
+    /// the record follows the release (no other task's look comes between).
+    /// The limit's callbacks are made after the operation, as the ledger's
+    /// AST makes them on the way back to user space.
+    pub(crate) fn darwin_footprint_release<R>(&mut self, m: &mut GuestMem<'_>, s: u64, e: u64, how: Release, op: impl FnOnce(&mut Kernel, &mut GuestMem<'_>) -> R) -> R {
+        if self.dtask.footprint_releasing || s >= e {
+            return op(self, m);
+        }
+        let rusage = std::sync::Arc::clone(&self.dtask.rusage);
+        let mut pm = rusage.meter.lock();
+        if !rusage.meter.releases(&pm, &self.mem, m, s, e, how) {
+            drop(pm);
+            return op(self, m);
+        }
+        let before = rusage.meter.measure(&mut pm, &self.mem, m);
+        let mut crossings = Vec::new();
+        if let Some(fp) = before {
+            crossings.extend(self.darwin_footprint_is(fp));
+        }
+        self.dtask.footprint_releasing = true;
+        let r = op(self, m);
+        self.dtask.footprint_releasing = false;
+        match how {
+            Release::Remove => pm.remove(s, e),
+            Release::Reusable => pm.made_reusable(s, e),
+        }
+        // What the guest touched meanwhile is seen by the next look; the
+        // balance only grew by it.
+        let after = pm.balance();
+        drop(pm);
+        if before.is_none() {
+            self.darwin_unimplemented("phys_footprint on a host that cannot say which pages are a task's".into());
+        } else {
+            crossings.extend(self.darwin_footprint_is(after));
+        }
+        for (c, l) in crossings {
+            self.darwin_footprint_exceeded(m, c, l);
+        }
+        r
+    }
+
+    /// `vm_map_reuse_pages` of `[s, e)` done: the reusable pages there are
+    /// the task's own again.
+    pub(crate) fn darwin_footprint_reused(&mut self, m: &mut GuestMem<'_>, s: u64, e: u64) {
+        let rusage = std::sync::Arc::clone(&self.dtask.rusage);
+        let fp = {
+            let mut pm = rusage.meter.lock();
+            if !pm.holds(s, e, false) {
+                return;
+            }
+            pm.reused(s, e);
+            pm.balance()
+        };
+        if let Some((c, l)) = self.darwin_footprint_is(fp) {
+            self.darwin_footprint_exceeded(m, c, l);
+        }
     }
 
     /// A task's thread calls: its footprint measured when it is due, and
@@ -205,19 +609,10 @@ impl Kernel {
         if let Some(next) = self.dtask.footprint_due.filter(|&t| t > now) {
             return Some(next);
         }
-        let Some(fp) = self.darwin_phys_footprint(m) else {
-            self.darwin_unimplemented("phys_footprint on a host that cannot say which pages are a task's".into());
+        if !self.procs.jetsam().ledgers.contains_key(&self.pid) {
             return None;
-        };
-        let pid = self.pid;
-        let (crossing, ledger) = {
-            let mut j = self.procs.jetsam();
-            let Some(l) = j.ledgers.get_mut(&pid) else { return None };
-            (l.balance_is(fp as i64), *l)
-        };
-        if let Some(c) = crossing {
-            self.darwin_footprint_exceeded(m, c, ledger);
         }
+        self.darwin_footprint_now(m)?;
         let next = now + SAMPLE;
         self.dtask.footprint_due = Some(next);
         Some(next)
@@ -309,13 +704,15 @@ impl Kernel {
     /// (`task.c`), with the caller's count checked and fixed as XNU does
     /// (an iOS 12 SDK's larger count is taken as rev2's): the map's size,
     /// entries, page and bounds; the purgeable volatile sizes (none: no
-    /// purgeable memory is made here); its `phys_footprint` and what its
-    /// memory limit leaves (`memorystatus_available_memory_internal`); the
+    /// purgeable memory is made here); its `phys_footprint` ledger's
+    /// balance (`get_task_phys_footprint`, the task's pages looked at now)
+    /// and lifetime peak (`ledger_get_lifetime_max`), and what its memory
+    /// limit leaves (`memorystatus_available_memory_internal`); the
     /// purgeable and owned-memory ledgers (none: neither purgeable memory
-    /// nor ownership changes are made here). What needs the pmap's and the
-    /// compressor's ledgers, which are not kept (resident, internal,
-    /// external, reusable and compressed sizes and peaks, the footprint's
-    /// peak, decompressions, swap-ins), is reported and given as 0.
+    /// nor ownership changes are made here). What needs the pmap's other
+    /// ledgers and the compressor's, which are not kept (resident, internal,
+    /// external, reusable and compressed sizes and peaks, decompressions,
+    /// swap-ins), is reported and given as 0.
     pub(crate) fn darwin_task_vm_info(&mut self, m: &mut GuestMem<'_>, count: u32) -> super::kobject::Reply {
         use super::kobject::Reply;
         const KERN_INVALID_ARGUMENT: i32 = 4;
@@ -349,10 +746,11 @@ impl Kernel {
         // vm_map_query_volatile finding no purgeable object.
         let _ = TASK_VM_INFO_PURGEABLE;
         let mut n = REV0;
-        let footprint = if original >= REV1 { self.darwin_phys_footprint(m) } else { None };
+        let footprint = if original >= REV1 { self.darwin_footprint_now(m) } else { None };
+        let peak = self.procs.jetsam().ledgers.get(&self.pid).map(|l| l.lifetime_max);
         if original >= REV1 {
             match footprint {
-                Some(f) => put(&mut out, 144, f),
+                Some(f) => put(&mut out, 144, f as u64),
                 None => unkept.push("phys_footprint (the host cannot say which pages are the task's)"),
             }
             n = REV1;
@@ -365,12 +763,15 @@ impl Kernel {
         if original >= REV3 {
             // ledger_phys_footprint_peak; the purgeable and tag ledgers
             // after it are 0.
-            unkept.push("ledger_phys_footprint_peak");
+            match (footprint, peak) {
+                (Some(_), Some(p)) => put(&mut out, 168, p as u64),
+                _ => unkept.push("ledger_phys_footprint_peak"),
+            }
             n = REV3;
         }
         if original >= REV4 {
             match footprint {
-                Some(f) => put(&mut out, 336, self.procs.jetsam().available_memory(self.pid, f)),
+                Some(f) => put(&mut out, 336, self.procs.jetsam().available_memory(self.pid, f as u64)),
                 None => unkept.push("limit_bytes_remaining"),
             }
             n = REV4;
@@ -443,5 +844,131 @@ mod tests {
         assert!(l.exc_triggered());
         l.memlimit_active = false;
         assert!(!l.exc_triggered());
+    }
+
+    /// A host whose pages have the states in `st`, by address; any other
+    /// page none.
+    fn host(st: &std::collections::BTreeMap<u64, u8>) -> impl FnMut(u64, u64, &mut [u8]) -> bool + '_ {
+        move |at, n, out| {
+            for (i, o) in out[..n as usize].iter_mut().enumerate() {
+                *o = st.get(&(at + i as u64 * PAGE)).copied().unwrap_or(0);
+            }
+            true
+        }
+    }
+
+    const BASE: u64 = 0x1_0000_0000;
+    /// The root and the one twig table every map here has.
+    const FIXED: i64 = (ROOT_SIZE + PAGE) as i64;
+
+    #[test]
+    fn a_look_counts_own_pages_and_the_tables_of_every_page_entered() {
+        let mut st = std::collections::BTreeMap::new();
+        // Two of its own pages (one compressed), a reusable one, a file's.
+        st.insert(BASE, ps::PRESENT);
+        st.insert(BASE + PAGE, ps::PAGED_OUT);
+        st.insert(BASE + 2 * PAGE, ps::PRESENT | ps::REUSABLE);
+        // A file's page in another leaf table's 32 MB.
+        st.insert(BASE + (1 << L3_SHIFT), ps::PRESENT | ps::EXTERNAL);
+        let mut pm = Pmap::default();
+        assert!(pm.look(&[(BASE, BASE + (2 << L3_SHIFT))], &[0], &mut host(&st)));
+        assert_eq!(pm.balance(), 2 * PAGE as i64 + FIXED + 2 * PAGE as i64);
+        assert_eq!((pm.held(BASE + 2 * PAGE), pm.held(BASE + (1 << L3_SHIFT))), (Held::Reusable, Held::File));
+        // The host reclaims a clean page of the task's and evicts the
+        // file's: the device modelled keeps both, and the tables.
+        st.remove(&BASE);
+        st.remove(&(BASE + (1 << L3_SHIFT)));
+        assert!(pm.look(&[(BASE, BASE + (2 << L3_SHIFT))], &[0], &mut host(&st)));
+        assert_eq!(pm.balance(), 2 * PAGE as i64 + FIXED + 2 * PAGE as i64);
+        // A page out of every range is the map's no more.
+        assert!(pm.look(&[(BASE + PAGE, BASE + (2 << L3_SHIFT))], &[0], &mut host(&st)));
+        assert_eq!(pm.held(BASE), Held::None);
+        assert_eq!(pm.balance(), PAGE as i64 + FIXED + 2 * PAGE as i64);
+    }
+
+    #[test]
+    fn a_remove_frees_a_leaf_table_left_empty_and_keeps_the_twig() {
+        let mut st = std::collections::BTreeMap::new();
+        for i in 0..4 {
+            st.insert(BASE + i * PAGE, ps::PRESENT);
+        }
+        st.insert(BASE + (1 << L3_SHIFT), ps::PRESENT);
+        let mut pm = Pmap::default();
+        assert!(pm.look(&[(BASE, BASE + (2 << L3_SHIFT))], &[], &mut host(&st)));
+        assert_eq!(pm.balance(), 5 * PAGE as i64 + FIXED + 2 * PAGE as i64);
+        // Part of the first table's pages: it stays.
+        pm.remove(BASE, BASE + 2 * PAGE);
+        assert_eq!(pm.balance(), 3 * PAGE as i64 + FIXED + 2 * PAGE as i64);
+        // The rest of them, and a range past them in the same table: it goes.
+        pm.remove(BASE + 2 * PAGE, BASE + 8 * PAGE);
+        assert_eq!(pm.balance(), PAGE as i64 + FIXED + PAGE as i64);
+        assert!(!pm.holds(BASE, BASE + (1 << L3_SHIFT), false) && pm.holds(BASE, BASE + (2 << L3_SHIFT), true));
+    }
+
+    #[test]
+    fn reusable_pages_leave_the_footprint_and_a_reuse_brings_them_back() {
+        let mut st = std::collections::BTreeMap::new();
+        for i in 0..3 {
+            st.insert(BASE + i * PAGE, ps::PRESENT);
+        }
+        let mut pm = Pmap::default();
+        assert!(pm.look(&[(BASE, BASE + 4 * PAGE)], &[], &mut host(&st)));
+        pm.made_reusable(BASE, BASE + 2 * PAGE);
+        assert_eq!(pm.balance(), PAGE as i64 + FIXED + PAGE as i64);
+        assert!(!pm.holds(BASE, BASE + 2 * PAGE, true) && pm.holds(BASE, BASE + 2 * PAGE, false));
+        // The host reclaims one of them; the reuse finds both still entered.
+        st.remove(&BASE);
+        st.insert(BASE + PAGE, ps::PRESENT | ps::REUSABLE);
+        assert!(pm.look(&[(BASE, BASE + 4 * PAGE)], &[], &mut host(&st)));
+        pm.reused(BASE, BASE + 4 * PAGE);
+        assert_eq!(pm.balance(), 3 * PAGE as i64 + FIXED + PAGE as i64);
+    }
+
+    #[test]
+    fn looks_before_each_release_give_the_exact_peaks() {
+        // N pages touched between two kernel operations, then unmapped: the
+        // look the unmap makes first holds the peak.
+        const N: u64 = 100;
+        let mut st = std::collections::BTreeMap::new();
+        let mut pm = Pmap::default();
+        let mut l = Ledger::default();
+        let range = [(BASE, BASE + 2 * N * PAGE)];
+        assert!(pm.look(&range, &[0], &mut host(&st)));
+        l.balance_is(pm.balance());
+        let empty = pm.balance();
+        for i in 0..N {
+            st.insert(BASE + i * PAGE, ps::PRESENT);
+        }
+        // A look on the thread calls; then the host reclaims some clean ones
+        // before the operation, which looks again first.
+        assert!(pm.look(&range, &[0], &mut host(&st)));
+        l.balance_is(pm.balance());
+        for i in 0..N / 4 {
+            st.remove(&(BASE + i * PAGE));
+        }
+        assert!(pm.look(&range, &[0], &mut host(&st)));
+        l.balance_is(pm.balance());
+        // The unmap: the host's pages go with the mapping.
+        st.clear();
+        pm.remove(BASE, BASE + N * PAGE);
+        l.balance_is(pm.balance());
+        assert_eq!(l.lifetime_max, empty + (N * PAGE) as i64 + PAGE as i64);
+        assert_eq!(l.balance, empty);
+        // A new interval begins at the balance; half as many pages touched.
+        assert_eq!(l.get_interval_max(true), l.lifetime_max);
+        for i in 0..N / 2 {
+            st.insert(BASE + i * PAGE, ps::PRESENT);
+        }
+        assert!(pm.look(&range, &[0], &mut host(&st)));
+        l.observe(pm.balance());
+        assert_eq!(l.get_interval_max(false), empty + (N / 2 * PAGE) as i64 + PAGE as i64);
+        assert_eq!(l.lifetime_max, empty + (N * PAGE) as i64 + PAGE as i64);
+    }
+
+    #[test]
+    fn the_counted_ranges_leave_out_the_holes() {
+        assert_eq!(less(&[(0, 10), (20, 30)], &[(5, 22), (25, 26)]), vec![(0, 5), (22, 25), (26, 30)]);
+        assert_eq!(less(&[(0, 10)], &[]), vec![(0, 10)]);
+        assert_eq!(less(&[(0, 10)], &[(0, 10)]), vec![]);
     }
 }

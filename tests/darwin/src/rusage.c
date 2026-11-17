@@ -9,16 +9,23 @@
 // cluster's figures (no AMP), the secure times and what follows them. A
 // child that has ended and is not yet reaped is read from what its exit
 // gathered: its end after its start, nothing wired, resident or in its
-// footprint. Once reaped, its time and its elapsed time (end less start)
+// footprint, with its lifetime peak (what it touched before its end). Once
+// reaped, its time and its elapsed time (end less start)
 // are its parent's ri_child sums; a parent with SA_NOCLDWAIT has them
 // added twice (at the child's exit and at the system's reap). The time by
 // effective QoS: a thread's time goes to the QoS it ran at (utility, then
 // background), and the seven sum to the task's time. Each sleep that its
-// deadline timer ends is a wakeup from interrupt context. The fields
+// deadline timer ends is a wakeup from interrupt context. The footprint's
+// peaks: pages touched then unmapped are in the lifetime peak, the
+// footprint after is below it, and TASK_VM_INFO's ledger peak is the same
+// ledger's; an interval reset begins the interval's peak at the footprint
+// then. Another process's footprint, read from outside it, and its peak
+// after it unmapped what it touched. The fields
 // the kernel does not keep are reported, so a strict run stops at a
 // call that copies one ("stop").
 
 #include <errno.h>
+#include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
 #include <pthread/qos.h>
@@ -70,6 +77,88 @@ static int zeros(const struct rusage_info_v6 *r, const char *whose) {
         if (after[i]) return bad(whose, (long)after[i], 0);
     if (r->ri_system_time || r->ri_flags || r->ri_user_ptime || r->ri_system_ptime || r->ri_pinstructions || r->ri_pcycles || r->ri_penergy_nj || r->ri_secure_time_in_system || r->ri_secure_ptime_in_system)
         return bad(whose, 1, 0);
+    return 0;
+}
+
+int proc_rlimit_control(pid_t pid, int flavor, void *arg);
+#ifndef RLIMIT_FOOTPRINT_INTERVAL
+#define RLIMIT_FOOTPRINT_INTERVAL 4
+#endif
+#ifndef FOOTPRINT_INTERVAL_RESET
+#define FOOTPRINT_INTERVAL_RESET 0x1
+#endif
+
+// 256 pages of 16 KiB: 4 MiB.
+static const size_t SPAN = 256 * 16384;
+
+static char *touch(size_t n) {
+    char *p = mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (p == MAP_FAILED) return NULL;
+    for (size_t i = 0; i < n; i += 16384) p[i] = 1;
+    return p;
+}
+
+// The footprint's peaks of this process.
+static int peaks(void) {
+    struct rusage_info_v6 f0, f1, f2;
+    if (proc_pid_rusage(getpid(), RUSAGE_INFO_V4, &f0) != 0) return bad("V4", errno, 0);
+    if (f0.ri_lifetime_max_phys_footprint < f0.ri_phys_footprint || f0.ri_interval_max_phys_footprint < f0.ri_phys_footprint) return bad("the peaks against the footprint", (long)f0.ri_lifetime_max_phys_footprint, (long)f0.ri_phys_footprint);
+    char *p = touch(SPAN);
+    if (!p) return bad("mmap", errno, 0);
+    munmap(p, SPAN);
+    if (proc_pid_rusage(getpid(), RUSAGE_INFO_V4, &f1) != 0) return bad("V4", errno, 0);
+    if (f1.ri_lifetime_max_phys_footprint < f0.ri_phys_footprint + SPAN) return bad("the lifetime peak over what was touched", (long)f1.ri_lifetime_max_phys_footprint, (long)(f0.ri_phys_footprint + SPAN));
+    if (f1.ri_interval_max_phys_footprint < f0.ri_phys_footprint + SPAN) return bad("the interval peak over what was touched", (long)f1.ri_interval_max_phys_footprint, (long)(f0.ri_phys_footprint + SPAN));
+    if (f1.ri_phys_footprint + SPAN / 2 > f1.ri_lifetime_max_phys_footprint) return bad("the footprint after the unmap", (long)f1.ri_phys_footprint, (long)(f1.ri_lifetime_max_phys_footprint - SPAN));
+    // TASK_VM_INFO's footprint and ledger peak: the same ledger's.
+    task_vm_info_data_t vi;
+    mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &n) != KERN_SUCCESS) return bad("TASK_VM_INFO", 1, 0);
+    if ((uint64_t)vi.ledger_phys_footprint_peak < f1.ri_lifetime_max_phys_footprint || vi.phys_footprint > (uint64_t)vi.ledger_phys_footprint_peak) return bad("TASK_VM_INFO's ledger peak", (long)vi.ledger_phys_footprint_peak, (long)f1.ri_lifetime_max_phys_footprint);
+    // A new interval, half as much touched: the interval's peak has that,
+    // the lifetime peak stays.
+    if (proc_rlimit_control(-1, RLIMIT_FOOTPRINT_INTERVAL, (void *)FOOTPRINT_INTERVAL_RESET) != 0) return bad("an interval reset", errno, 0);
+    struct rusage_info_v6 r0;
+    proc_pid_rusage(getpid(), RUSAGE_INFO_V4, &r0);
+    if (r0.ri_interval_max_phys_footprint >= f1.ri_lifetime_max_phys_footprint) return bad("the interval peak after a reset", (long)r0.ri_interval_max_phys_footprint, (long)f1.ri_phys_footprint);
+    p = touch(SPAN / 2);
+    if (!p) return bad("mmap", errno, 0);
+    madvise(p, SPAN / 2, MADV_FREE_REUSABLE);
+    proc_pid_rusage(getpid(), RUSAGE_INFO_V4, &f2);
+    munmap(p, SPAN / 2);
+    if (f2.ri_interval_max_phys_footprint < r0.ri_phys_footprint + SPAN / 2) return bad("the interval peak of what was touched then made reusable", (long)f2.ri_interval_max_phys_footprint, (long)(r0.ri_phys_footprint + SPAN / 2));
+    if (f2.ri_interval_max_phys_footprint >= f1.ri_lifetime_max_phys_footprint || f2.ri_lifetime_max_phys_footprint < f1.ri_lifetime_max_phys_footprint) return bad("the lifetime peak after the interval's", (long)f2.ri_lifetime_max_phys_footprint, (long)f1.ri_lifetime_max_phys_footprint);
+    if (f2.ri_phys_footprint + SPAN / 4 > f2.ri_interval_max_phys_footprint) return bad("reusable pages left in the footprint", (long)f2.ri_phys_footprint, (long)(f2.ri_interval_max_phys_footprint - SPAN / 2));
+    return 0;
+}
+
+// Another process's footprint: a child that touches SPAN, says so, unmaps
+// it when told, says so, and waits to be killed.
+static int other(void) {
+    int up[2], down[2];
+    if (pipe(up) || pipe(down)) return bad("pipe", errno, 0);
+    pid_t c = fork();
+    if (c == 0) {
+        char x = 0;
+        char *p = touch(SPAN);
+        write(up[1], &x, 1);
+        read(down[0], &x, 1);
+        munmap(p, SPAN);
+        write(up[1], &x, 1);
+        pause();
+        _exit(0);
+    }
+    char x = 0;
+    struct rusage_info_v6 a, b;
+    read(up[0], &x, 1);
+    if (proc_pid_rusage(c, RUSAGE_INFO_V4, &a) != 0) return bad("another process", errno, 0);
+    if (a.ri_phys_footprint < SPAN || a.ri_lifetime_max_phys_footprint < a.ri_phys_footprint) return bad("another process's footprint", (long)a.ri_phys_footprint, (long)SPAN);
+    write(down[1], &x, 1);
+    read(up[0], &x, 1);
+    if (proc_pid_rusage(c, RUSAGE_INFO_V4, &b) != 0) return bad("another process", errno, 0);
+    kill(c, SIGKILL);
+    waitpid(c, NULL, 0);
+    if (b.ri_lifetime_max_phys_footprint < a.ri_phys_footprint || b.ri_phys_footprint + SPAN / 2 > b.ri_lifetime_max_phys_footprint) return bad("another process's peak after its unmap", (long)b.ri_lifetime_max_phys_footprint, (long)a.ri_phys_footprint);
     return 0;
 }
 
@@ -154,6 +243,7 @@ int main(int argc, char **argv) {
     pid_t c = fork();
     if (c == 0) {
         spin(20000000);
+        touch(SPAN);
         _exit(0);
     }
     uint64_t post = mach_absolute_time();
@@ -163,6 +253,7 @@ int main(int argc, char **argv) {
     if (proc_pid_rusage(c, RUSAGE_INFO_V6, &z) != 0) return bad("the zombie", errno, 0);
     if (z.ri_proc_exit_abstime <= z.ri_proc_start_abstime || z.ri_proc_start_abstime < pre || z.ri_proc_start_abstime > post) return bad("its start and end", (long)(z.ri_proc_start_abstime - pre), (long)(post - pre));
     if (z.ri_wired_size || z.ri_resident_size || z.ri_phys_footprint || ns_of(z.ri_user_time) < 20000000) return bad("its memory and time", (long)z.ri_phys_footprint, 0);
+    if (z.ri_lifetime_max_phys_footprint < SPAN || z.ri_interval_max_phys_footprint < SPAN) return bad("its peaks", (long)z.ri_lifetime_max_phys_footprint, (long)SPAN);
     if (zeros(&z, "a zombie's zero field")) return 1;
     if (proc_pid_rusage(getpid(), RUSAGE_INFO_V1, &r) != 0 || r.ri_child_user_time) return bad("not reaped yet", (long)r.ri_child_user_time, 0);
     waitpid(c, NULL, 0);
@@ -208,6 +299,9 @@ int main(int argc, char **argv) {
         waitpid(c, &st, 0);
         if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) return bad("another user's process", st, 0);
     }
+    // The footprint's peaks, after the child sums above (another process
+    // read here is reaped, and its time added to them).
+    if (peaks() || other()) return 1;
     printf("rusage ok\n");
     return 0;
 }

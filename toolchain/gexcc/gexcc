@@ -1395,15 +1395,18 @@ if shared:
     deps = ['-L' + os.path.abspath(d) for d in libdirs] + deps
     # and no path of the build machine: the sysroot's as `=`, the rest
     # relative to this archive (archive_deps reads them back)
-    root, here = os.path.abspath(SYSROOT), os.path.dirname(os.path.abspath(out))
+    # (the sysroot by where it resolves to: a -L can reach it through a link,
+    # as gexcc itself is found through its resolved path)
+    root, here = os.path.realpath(SYSROOT), os.path.dirname(os.path.abspath(out))
 
     def portable(d):
         flag = '-L' if d.startswith('-L') else ''
         v = d[len(flag):]
         if not v.startswith('/'):
             return d
-        if v == root or v.startswith(root + '/'):
-            return flag + '=' + v[len(root):]
+        real = os.path.realpath(v)
+        if real == root or real.startswith(root + '/'):
+            return flag + '=' + real[len(root):]
         return flag + os.path.relpath(v, here)
     deps = [portable(d) for d in deps]
     # the deps go in a custom section of an empty wasm object (wasm-ld

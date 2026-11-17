@@ -212,6 +212,11 @@ impl Fxc {
         self.by_addr.values().sum()
     }
 
+    /// Whether the cache uses every node it has.
+    pub fn full(&self) -> bool {
+        self.by_addr.len() >= self.capacity
+    }
+
     /// Whether every extent asked for found room in the cache.
     pub fn exact(&self) -> bool {
         self.exact

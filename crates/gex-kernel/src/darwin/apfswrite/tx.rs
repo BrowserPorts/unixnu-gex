@@ -126,6 +126,23 @@ struct Class {
     enabled: bool,
 }
 
+/// An allocation zone (`sm + 0x4c0 + 0x20 * (count - 1)`) and its
+/// persisted slot (`spaceman_allocation_zone_info_phys_t`): the chunk it
+/// allocates from, and the ring of the chunks it left, oldest at `index`.
+#[derive(Clone, Copy, Default)]
+struct Zone {
+    start: u64,
+    end: u64,
+    enabled: bool,
+    prev: [(u64, u64); 7],
+    index: u16,
+}
+
+/// A chunk word's flags (`sm + 0x5d0`, I:0x1000497ac): a metazone chunk,
+/// an allocation zone's current chunk.
+const WORD_METAZONE: u32 = 0x400_0000;
+const WORD_ZONE: u32 = 0x800_0000;
+
 /// An object in the cache: its bytes (header included) and what it is.
 struct Obj {
     b: Vec<u8>,
@@ -203,7 +220,9 @@ pub struct Nx<'a> {
     sm_free: u64,
     /// `sm_fs_reserve_block_count`, `sm_fs_reserve_alloc_count`.
     reserve: (u64, u64),
-    datazone: [(u64, u64); 4],
+    /// The allocation zones for data allocations of 1 to 4 blocks
+    /// (`sm + 0x4c0`, their persisted slots `sm_datazone`).
+    zones: [Zone; 4],
     classes: [Class; 3],
     /// The free queues' age limit (`sm + 0x5f8`: 8, or 2 on a device with
     /// `DK_FEATURE_BARRIER`) and the main queue's count limit (`sm +
@@ -358,7 +377,7 @@ impl<'a> Nx<'a> {
             fq: [FreeQueue { limit: l.fq_ip_limit as u16, ..Default::default() }, FreeQueue { limit: l.fq_main_limit as u16, ..Default::default() }],
             sm_free,
             reserve: (0, 0),
-            datazone: [(0, 0); 4],
+            zones: [Zone::default(); 4],
             classes: [Class::default(); 3],
             age_limit: 8,
             main_count_limit: l.blocks >> 5,
@@ -433,8 +452,12 @@ impl<'a> Nx<'a> {
         }
         set_checksum(&mut sb);
         self.sink.write_at(0, &sb)?;
-        if self.datazone == [(0, 0); 4] {
-            self.datazone = first_mount_datazones(&self.l, &self.chunks)?;
+        if self.zones.iter().all(|z| !z.enabled) {
+            for (z, (start, end)) in first_mount_datazones(&self.l, &self.chunks)?.into_iter().enumerate() {
+                if end != 0 {
+                    self.zones[z] = Zone { start, end, enabled: true, prev: [(0, 0); 7], index: 0 };
+                }
+            }
         }
         self.newest_mounted = self.newest_mounted.max(APFS_VERSION);
         self.classes = [Class::default(); 3];
@@ -839,9 +862,9 @@ impl<'a> Nx<'a> {
     fn clip(&self) -> fxc::Clip {
         let metazone = self.classes[0].enabled.then(|| (self.classes[0].start, self.classes[1].end));
         let mut zones = [None; 4];
-        for (z, &(s, e)) in self.datazone.iter().enumerate() {
-            if e != 0 {
-                zones[z] = Some((s, e));
+        for (z, zone) in self.zones.iter().enumerate() {
+            if zone.enabled {
+                zones[z] = Some((zone.start, zone.end));
             }
         }
         fxc::Clip { metazone, zones }
@@ -849,24 +872,56 @@ impl<'a> Nx<'a> {
 
     /// `spaceman_alloc` (I:0x100044290, K:0xfffffff0067535b0) of `count`
     /// data blocks with no hint and a count taken back (the kernel's
-    /// `fs_make_hole_range_writable`, K:0xfffffff00670afbc): the free-extent
-    /// cache's best fit, its search given hint 0 (the hint spaceman_alloc
-    /// passes on every data allocation without flag 2, whether it started
-    /// from the roving pointer or a zone: measured), the roving pointer
-    /// then moved to the allocation's end. Where they go and how many:
-    /// fewer than asked when nothing larger is free.
+    /// `fs_make_hole_range_writable`, K:0xfffffff00670afbc). One to four
+    /// blocks come from that size's allocation zone when its chunk has a
+    /// free run that long (I:0x100044a1c..0x100044b14): the first such run
+    /// from the chunk's start, the zone moved to a new chunk once its
+    /// longest free run is shorter than the count; no search and no
+    /// roving-pointer move. Anything else is the free-extent cache's best
+    /// fit, its search given hint 0 (the hint spaceman_alloc passes on
+    /// every data allocation without flag 2, whether it started from the
+    /// roving pointer or a zone: measured), the roving pointer then moved
+    /// to the allocation's end and off the metazone and the zones' chunks
+    /// (I:0x100046580..0x100046c00). Where they go and how many: fewer
+    /// than asked when nothing larger is free.
     pub fn alloc_data(&mut self, count: u64) -> Result<(u64, u64), String> {
         if count == 0 {
             return Err("a data allocation of no blocks".into());
         }
-        if (1..=4).contains(&count) && self.datazone[count as usize - 1].1 != 0 {
-            return Err(format!("not implemented: a {count}-block data allocation (the allocation zone's chunk words and refresh, I:0x100009014)"));
-        }
-        // The space and reserve checks (I:0x1000447cc..0x1000449d8) are not
-        // transcribed: refused wherever they could bind.
+        // The space and reserve checks (I:0x1000447cc..0x1000449d8): the
+        // global count and the device's free blocks less what is reserved;
+        // this model does not keep the reservations in flight (dirty
+        // virtual objects, the kernel's write reservations), so it refuses
+        // wherever the checks could bind.
         let held = self.reserve.0.saturating_sub(self.reserve.1);
         if count + held + self.fq[FQ_MAIN].count + self.fq[FQ_IP].count >= self.sm_free {
             return Err("not implemented: a data allocation the space manager's free-space and reserve checks may limit".into());
+        }
+        let bpc = self.l.blocks_per_chunk;
+        let fxc_full = self.fxc.as_ref().is_some_and(|f| f.full());
+        if (1..=4).contains(&count) && self.zones[count as usize - 1].enabled {
+            let z = count as usize - 1;
+            let c = (self.zones[z].start / bpc) as usize;
+            if count <= self.longest(c)? {
+                // The chunk scan from the zone chunk's start (I:0x100045060..
+                // 0x100046140): the first run of `count` free blocks; the
+                // shorter runs before it go back to the cache, where an
+                // exact cache already holds them (a full one would recycle
+                // its smallest extent, I:0x10000b814).
+                let runs = self.free_runs(c)?;
+                let (rs, _) = *runs.iter().find(|r| r.1 >= count).ok_or("an allocation zone's chunk without the run its longest names")?;
+                if fxc_full && runs.iter().any(|r| r.0 < rs) {
+                    return Err("not implemented: a zone allocation re-inserting runs into a full free-extent cache (its recycling of the smallest extent, I:0x10000b814)".into());
+                }
+                self.modify_bits(rs, count, true)?;
+                self.fxc_remove(rs, count);
+                // The refresh (I:0x1000469a8): the zone's chunk no longer has
+                // a run of its size.
+                if self.longest(c)? <= z as u64 {
+                    self.zone_new_chunk(z)?;
+                }
+                return Ok((rs, count));
+            }
         }
         let clip = self.clip();
         let f = self.fxc.as_ref().ok_or("a data allocation with no free-extent cache (the container not mounted read-write)")?;
@@ -882,15 +937,185 @@ impl<'a> Nx<'a> {
         self.fxc_remove(start, got);
         let end = if start + got >= self.l.blocks { 0 } else { start + got };
         self.rove = end;
-        // The roving pointer leaves a flagged chunk by the bitmap-hint
-        // search (I:0x100009498, I:0x100046da8), not transcribed.
+        // Off the metazone and the zones' chunks (flagged, I:0x100009498,
+        // with count 5): the bitmap-hint search for one block
+        // (I:0x100046da8) takes the start of the first chunk after the
+        // end's, circularly, whose word has neither flag; the pointer stays
+        // when there is none.
         let in_meta = clip.metazone.is_some_and(|(s, e)| (s..e).contains(&end));
-        let bpc = self.l.blocks_per_chunk;
-        let in_zone = clip.zones.iter().flatten().any(|&(s, _)| s / bpc == end / bpc);
-        if in_meta || in_zone {
-            return Err("not implemented: the roving data pointer ending in the metazone or an allocation zone's chunk (the bitmap-hint search, I:0x100046da8)".into());
+        if in_meta || self.word_flags(end / bpc) & WORD_ZONE != 0 {
+            let c0 = end / bpc;
+            let cc = self.l.chunks;
+            if self.word_flags(c0) & (WORD_METAZONE | WORD_ZONE) == 0 {
+                return Ok((start, got));
+            }
+            let mut c = (c0 + 1) % cc;
+            while c != c0 {
+                if self.word_flags(c) & (WORD_METAZONE | WORD_ZONE) == 0 {
+                    self.rove = c * bpc;
+                    break;
+                }
+                c = (c + 1) % cc;
+            }
         }
         Ok((start, got))
+    }
+
+    /// The flags of chunk `c`'s word: a chunk of the metazone (from its
+    /// start's chunk to its end's, `spaceman_metazone_init` I:0x100007e8c),
+    /// an enabled allocation zone's current chunk.
+    fn word_flags(&self, c: u64) -> u32 {
+        let bpc = self.l.blocks_per_chunk;
+        let mut w = 0;
+        if let Some((s, _, e)) = self.l.metazone() {
+            if self.classes[0].enabled && c >= s / bpc && c <= (e - 1) / bpc {
+                w |= WORD_METAZONE;
+            }
+        }
+        if self.zones.iter().any(|z| z.enabled && z.start / bpc == c) {
+            w |= WORD_ZONE;
+        }
+        w
+    }
+
+    /// The blocks of chunk `c`.
+    fn chunk_len(&self, c: usize) -> u64 {
+        let bpc = self.l.blocks_per_chunk;
+        (self.l.blocks - c as u64 * bpc).min(bpc)
+    }
+
+    /// Chunk `c`'s free runs, in order: (first block, length).
+    fn free_runs(&mut self, c: usize) -> Result<Vec<(u64, u64)>, String> {
+        let base = c as u64 * self.l.blocks_per_chunk;
+        let n = self.chunk_len(c);
+        if self.chunks[c].free == 0 {
+            return Ok(Vec::new());
+        }
+        let Some(bm) = self.bitmap(c)? else { return Ok(vec![(base, n)]) };
+        let mut out = Vec::new();
+        let mut run: Option<u64> = None;
+        for i in 0..n {
+            let used = bm[(i / 8) as usize] & (1 << (i % 8)) != 0;
+            match (used, run) {
+                (false, None) => run = Some(i),
+                (true, Some(s)) => {
+                    out.push((base + s, i - s));
+                    run = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(s) = run {
+            out.push((base + s, n - s));
+        }
+        Ok(out)
+    }
+
+    /// The longest free run of chunk `c`: its word's low 24 bits, kept by
+    /// `spaceman_modify_bits` for every chunk it changes (I:0x1000497ac)
+    /// and by the mount's scan (a chunk with no bitmap: its free count).
+    fn longest(&mut self, c: usize) -> Result<u64, String> {
+        Ok(self.free_runs(c)?.iter().map(|r| r.1).max().unwrap_or(0).min(0xff_ffff))
+    }
+
+    /// `spaceman_get_new_chunk_for_allocation_zone` (I:0x100009014,
+    /// K:0xfffffff0066bb264) for zone `z` (blocks `z + 1`): the oldest chunk
+    /// of its ring that is unflagged and has a run longer than `z`, else
+    /// the chunk with the most free blocks such a run and no flag, found by
+    /// a scan of the chunk-info blocks from the current one (after the
+    /// zone's chunk; that block skipped when the chunk is its last or the
+    /// device's last) that stops at the end of the block where a wholly
+    /// free chunk is found. Finding none, the zone keeps its chunk (0x1c,
+    /// only logged).
+    fn zone_new_chunk(&mut self, z: usize) -> Result<(), String> {
+        let bpc = self.l.blocks_per_chunk;
+        let (bc, cc, cpc, nc) = (self.l.blocks, self.l.chunks, self.l.chunks_per_cib, self.l.cibs);
+        let zone = self.zones[z];
+        let mut i = zone.index as usize;
+        for _ in 0..7 {
+            let (ps, pe) = zone.prev[i];
+            if pe != 0 && pe <= bc {
+                let c = ps / bpc;
+                if c >= cc {
+                    // pe <= bc keeps the chunk on the device; the library
+                    // stops looking at the ring here.
+                    break;
+                }
+                if self.word_flags(c) & (WORD_METAZONE | WORD_ZONE) == 0 && self.longest(c as usize)? > z as u64 {
+                    return self.zone_install(z, c);
+                }
+            }
+            i = (i + 1) % 7;
+        }
+        let cur = zone.start / bpc;
+        let skip_cur = cur + 1 == cpc || cur == cc - 1;
+        let mut best: Option<u64> = None;
+        let mut best_free = 0;
+        for i in u64::from(skip_cur)..nc {
+            let cib = (cur / cpc + i) % nc;
+            let j0 = if i == 0 { cur % cpc + 1 } else { 0 };
+            let in_cib = (cc - cpc * cib).min(cpc);
+            for j in j0..in_cib {
+                let c = cpc * cib + j;
+                let f = self.chunks[c as usize].free & 0xf_ffff;
+                if f > best_free && self.word_flags(c) & (WORD_METAZONE | WORD_ZONE) == 0 && self.longest(c as usize)? > z as u64 {
+                    best = Some(c);
+                    best_free = f;
+                    if f == bpc {
+                        break;
+                    }
+                }
+            }
+            if best_free == bpc {
+                break;
+            }
+        }
+        match best {
+            Some(c) => self.zone_install(z, c),
+            None => Ok(()),
+        }
+    }
+
+    /// `spaceman_update_allocation_zone` (I:0x100008b9c): zone `z` moved to
+    /// chunk `c`, the chunk it leaves pushed onto its ring (or, when `c`
+    /// is in the ring, that entry taken out and the one it leaves put
+    /// newest).
+    fn zone_install(&mut self, z: usize, c: u64) -> Result<(), String> {
+        let bpc = self.l.blocks_per_chunk;
+        if c >= self.l.chunks {
+            return Err(format!("an allocation zone moved to chunk {c} past the device"));
+        }
+        let zone = &mut self.zones[z];
+        if zone.enabled {
+            let idx = zone.index as usize;
+            let mut pushed = false;
+            for k in 0..7 {
+                let p = (idx + k) % 7;
+                if zone.prev[p].1 != 0 && zone.prev[p].0 / bpc == c {
+                    if p != idx {
+                        let mut u = p;
+                        loop {
+                            let nx = (u + 1) % 7;
+                            zone.prev[u] = zone.prev[nx];
+                            u = nx;
+                            if nx == idx {
+                                break;
+                            }
+                        }
+                        zone.prev[if idx == 0 { 6 } else { idx - 1 }] = (zone.start, zone.end);
+                        pushed = true;
+                    }
+                    break;
+                }
+            }
+            if !pushed {
+                zone.prev[idx] = (zone.start, zone.end);
+                zone.index = ((idx + 1) % 7) as u16;
+            }
+        }
+        zone.start = c * bpc;
+        zone.end = if c == self.l.chunks - 1 { self.l.blocks } else { zone.start + bpc };
+        Ok(())
     }
 
     /// A new reap list (an ephemeral object; its entries all on its free
@@ -1340,6 +1565,12 @@ impl<'a> Nx<'a> {
     /// The roving data pointer.
     pub fn rove(&self) -> u64 {
         self.rove
+    }
+
+    /// The allocation zones for 1 to 4 blocks: enabled, the current
+    /// chunk's boundaries, the ring of chunks left and its index.
+    pub fn zones(&self) -> Vec<(bool, (u64, u64), [(u64, u64); 7], u16)> {
+        self.zones.iter().map(|z| (z.enabled, (z.start, z.end), z.prev, z.index)).collect()
     }
 
     /// The free-extent cache's extents.
@@ -1911,15 +2142,21 @@ impl<'a> Nx<'a> {
         sm.put32(0x14c, l.free_next_offset as u32);
         sm.put32(0x150, 1);
         sm.put32(0x154, 0x9d8);
-        // sm_datazone[SD_MAIN][size - 1]: current boundaries and zone id.
-        for (z, &(start, end)) in self.datazone.iter().enumerate() {
-            if end == 0 {
+        // sm_datazone[SD_MAIN][size - 1]: the current chunk's boundaries,
+        // the ring of previous chunks and its index, the zone id.
+        for (z, zone) in self.zones.iter().enumerate() {
+            if !zone.enabled {
                 continue;
             }
             let o = 0x158 + 136 * z;
-            sm.put64(o, start);
-            sm.put64(o + 8, end);
-            sm.put16(o + 128, z as u16 + 1);
+            sm.put64(o, zone.start);
+            sm.put64(o + 8, zone.end);
+            for (i, &(ps, pe)) in zone.prev.iter().enumerate() {
+                sm.put64(o + 0x10 + 0x10 * i, ps);
+                sm.put64(o + 0x18 + 0x10 * i, pe);
+            }
+            sm.put16(o + 0x80, z as u16 + 1);
+            sm.put16(o + 0x82, zone.index);
         }
         sm.put64(l.xid_offset as usize, self.ipbm_xid);
         sm.put16(l.bitmap_offset as usize, self.ipbm_index);

@@ -68,16 +68,17 @@ pub struct OsImage {
 /// with `now` the kernel's clock in nanoseconds since 1970 and `os` the
 /// operating system image (the System step is left out without it).
 pub fn build_disk0(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() -> u64, os: Option<&OsImage>) -> Result<Missing, String> {
-    build_disk0_with(disk, now, os, &mut || Ok(()), &mut |_| Ok(true), None)
+    build_disk0_with(disk, now, os, &mut |_| Ok(true), &mut || Ok(()), &mut |_| Ok(true), None)
 }
 
-/// [`build_disk0`], with `before_invert` run when the container is
-/// handed to apfs_invert (its state on disk then complete),
+/// [`build_disk0`], with `before_asr` given the container as asr's first
+/// call reaches the kernel (the build goes on only if it returns true),
+/// `before_invert` run when the container is handed to apfs_invert (its state on disk then complete),
 /// `after_invert` given the container apfs_invert left (the build goes
 /// on only if it returns true), and the device apfs_invert opens
 /// reporting `DK_FEATURE_BARRIER` as `barrier` says (the container
 /// device's own answer when `None`).
-pub fn build_disk0_with(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() -> u64, os: Option<&OsImage>, before_invert: &mut dyn FnMut() -> Result<(), String>, after_invert: &mut dyn FnMut(&mut Nx<'_>) -> Result<bool, String>, barrier: Option<bool>) -> Result<Missing, String> {
+pub fn build_disk0_with(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() -> u64, os: Option<&OsImage>, before_asr: &mut dyn FnMut(&mut Nx<'_>) -> Result<bool, String>, before_invert: &mut dyn FnMut() -> Result<(), String>, after_invert: &mut dyn FnMut(&mut Nx<'_>) -> Result<bool, String>, barrier: Option<bool>) -> Result<Missing, String> {
     let n = storage::nvme();
     let bs = u64::from(n.block_size);
     if disk.size() != storage::disk0_bytes() {
@@ -151,6 +152,9 @@ pub fn build_disk0_with(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() ->
     // and await_asr_and_retry's unmount of everything (Update's forced).
     // None is made yet: the container apfs_invert gets lacks them.
     missing.push("the kernel operations restored_external runs while asr writes and before apfs_invert (init_gigalocker's xART mount and gigalocker file, init_permanent_update_volume's Update remount, chown and unmount, mount_filesystem, fdr_restore_saved_data's Hardware FactoryData directories, commit_sep_os's Preboot paths and link, the forced unmount of Update): the container before apfs_invert lacks them, so every placement from asr's on follows a state the device does not have".into());
+    if !before_asr(&mut nx)? {
+        return Ok(missing);
+    }
     // 5. System mounted read-write at /mnt1 and asr's image file written
     // into it (restore_apfs_image_async, restored_external 0x10002d2a4),
     // then everything unmounted for the invert (0x100017488).
@@ -306,7 +310,7 @@ mod tests {
             }
             Ok(())
         };
-        build_disk0_with(disk.clone(), &mut now, Some(&os), &mut hook, &mut |_| Ok(false), None).unwrap();
+        build_disk0_with(disk.clone(), &mut now, Some(&os), &mut |_| Ok(true), &mut hook, &mut |_| Ok(false), None).unwrap();
         // After apfs_invert: the System volume holds the image's files.
         struct Part2(std::sync::Arc<super::super::HostFile>, u64, u64);
         impl Medium for Part2 {
@@ -394,7 +398,7 @@ mod tests {
         };
         use crate::darwin::apfsread::Container;
         // The binary runs on a regular file: no DK_FEATURE_BARRIER.
-        build_disk0_with(disk.clone(), &mut now, Some(&os), &mut hook, &mut |_| Ok(false), Some(false)).unwrap();
+        build_disk0_with(disk.clone(), &mut now, Some(&os), &mut |_| Ok(true), &mut hook, &mut |_| Ok(false), Some(false)).unwrap();
         // Block for block.
         use crate::darwin::apfsread::Medium;
         let theirs = super::super::HostFile(std::fs::File::open(&ctr_path).unwrap(), psize);
@@ -516,7 +520,7 @@ mod tests {
             nx.unmount()?;
             Ok(false)
         };
-        build_disk0_with(disk.clone(), &mut now, Some(&os), &mut || Ok(()), &mut after, Some(false)).unwrap();
+        build_disk0_with(disk.clone(), &mut now, Some(&os), &mut |_| Ok(true), &mut || Ok(()), &mut after, Some(false)).unwrap();
         let diffs = differing_blocks(&disk, base, psize, &ctr_path);
         if std::env::var("GEX_TEST_KEEP").is_err() {
             let _ = std::fs::remove_file(&disk_path);
@@ -578,7 +582,7 @@ mod tests {
             nx.unmount()?;
             Ok(false)
         };
-        build_disk0_with(disk.clone(), &mut now, Some(&os), &mut || Ok(()), &mut after, None).unwrap();
+        build_disk0_with(disk.clone(), &mut now, Some(&os), &mut |_| Ok(true), &mut || Ok(()), &mut after, None).unwrap();
         assert_eq!((counts[0].0 - counts[1].0, counts[0].1 - counts[1].1), (4_244, 6_636));
         disk.0.sync_all().unwrap();
         copy_container(&disk_path, &ctr_path, base, psize);
@@ -590,6 +594,103 @@ mod tests {
         }
         assert!(dev.status.success(), "device fsck: {}{}", String::from_utf8_lossy(&dev.stdout), String::from_utf8_lossy(&dev.stderr));
         assert!(host.status.success(), "host fsck: {}{}", String::from_utf8_lossy(&host.stdout), String::from_utf8_lossy(&host.stderr));
+    }
+
+    /// Data allocations of every size against the device library's
+    /// `spaceman_alloc` (GEX_TEST_NEWFS_A: the host-runnable user-space
+    /// `newfs_apfs -A`; GEX_TEST_DA_HOOK: the hook that calls the
+    /// library's own allocator at its first allocation, drafts/s18/da;
+    /// with GEX_TEST_SCRATCH): on disk0's container as asr finds it, each
+    /// allocation's blocks and the roving pointer after it, then every
+    /// allocation zone's chunk, ring and index. The sequence fills the
+    /// 4- and 1-block zones' chunks (the 1-block zone's is its chunk-info
+    /// block's last) and makes larger allocations between them.
+    #[test]
+    fn data_allocations_match_the_device_library() {
+        let (Ok(dir), Ok(tool), Ok(hook)) = (std::env::var("GEX_TEST_SCRATCH"), std::env::var("GEX_TEST_NEWFS_A"), std::env::var("GEX_TEST_DA_HOOK")) else { return };
+        const SEQ: &str = "2,3356,4x8193,3356,1x32769,2x16385,3x10923,256,4x3,5000,1x3,2x2,40000,3x2";
+        let size = storage::disk0_bytes();
+        let dir = std::path::Path::new(&dir);
+        let disk_path = dir.join(format!("gex-da-disk-{}", std::process::id()));
+        let ctr_path = dir.join(format!("gex-da-ctr-{}", std::process::id()));
+        let f = std::fs::OpenOptions::new().create(true).truncate(true).read(true).write(true).open(&disk_path).unwrap();
+        f.set_len(size).unwrap();
+        let disk = std::sync::Arc::new(super::super::HostFile(f, size));
+        let (base, psize) = storage::partition_extent();
+        let mut t = 1_700_000_000_000_000_000u64;
+        let mut now = || {
+            t += 1000;
+            t
+        };
+        let d2 = std::sync::Arc::clone(&disk);
+        let (dp, cp) = (disk_path.clone(), ctr_path.clone());
+        let mut theirs: Vec<(u64, u64, u64)> = Vec::new();
+        let mut ours: Vec<(u64, u64, u64)> = Vec::new();
+        let mut zones_theirs: Vec<String> = Vec::new();
+        let mut zones_ours: Vec<String> = Vec::new();
+        let mut before_asr = |nx: &mut Nx<'_>| -> Result<bool, String> {
+            nx.unmount()?;
+            d2.0.sync_all().map_err(|e| e.to_string())?;
+            copy_container(&dp, &cp, base, psize);
+            let run = std::process::Command::new(&tool)
+                .args(["-A", "-D", "-U", "0", "-G", "0", "-v", "Vtmp"])
+                .arg(&cp)
+                .env("DYLD_INSERT_LIBRARIES", &hook)
+                .env("DA_SEQ", SEQ)
+                .env("DA_NODES", "0")
+                .output()
+                .map_err(|e| e.to_string())?;
+            let out = String::from_utf8_lossy(&run.stdout).to_string();
+            let num = |l: &str, k: &str| -> u64 { l.split(k).nth(1).unwrap().split_whitespace().next().unwrap().parse().unwrap() };
+            let mut after = false;
+            for l in out.lines() {
+                if l.starts_with("alloc ") {
+                    assert_eq!(num(l, " ret "), 0, "{l}");
+                    theirs.push((num(l, " paddr "), num(l, " got "), num(l, " roving ")));
+                } else if l.starts_with("-- after") {
+                    after = true;
+                } else if after && l.trim_start().starts_with("zone ") {
+                    // "zone N [s,e) en E pend P priv V slot S cur [..) id I idx X prev [..)x7"
+                    let l = l.trim_start();
+                    let en = l.split(" en ").nth(1).unwrap().starts_with('1');
+                    let cur = l.split(" cur ").nth(1).map(|x| x.split(" id ").next().unwrap().to_string()).unwrap_or_default();
+                    let idx = l.split(" idx ").nth(1).map(|x| x.split_whitespace().next().unwrap().to_string()).unwrap_or_default();
+                    let prev = l.split(" prev ").nth(1).unwrap_or("").trim().to_string();
+                    zones_theirs.push(format!("{en} {cur} idx {idx} prev {prev}"));
+                }
+            }
+            assert!(!theirs.is_empty(), "the hook made no allocation: {out}{}", String::from_utf8_lossy(&run.stderr));
+            // The same on the port's container: the tool's mount (a regular
+            // file: no barrier), its transaction, then the allocations.
+            nx.set_barrier(false);
+            nx.remount(Mode::Userspace)?;
+            nx.begin()?;
+            for tok in SEQ.split(',') {
+                let (c, r) = match tok.split_once('x') {
+                    Some((c, r)) => (c.parse::<u64>().unwrap(), r.parse::<u64>().unwrap()),
+                    None => (tok.parse().unwrap(), 1),
+                };
+                for _ in 0..r {
+                    let (p, g) = nx.alloc_data(c)?;
+                    ours.push((p, g, nx.rove()));
+                }
+            }
+            for (en, (s, e), prev, idx) in nx.zones() {
+                let prev: Vec<String> = prev.iter().map(|(a, b)| format!("[{a},{b})")).collect();
+                zones_ours.push(format!("{en} [{s},{e}) idx {idx} prev {}", prev.join(" ")));
+            }
+            Ok(false)
+        };
+        build_disk0_with(disk.clone(), &mut now, None, &mut before_asr, &mut || Ok(()), &mut |_| Ok(true), None).unwrap();
+        if std::env::var("GEX_TEST_KEEP").is_err() {
+            let _ = std::fs::remove_file(&disk_path);
+            let _ = std::fs::remove_file(&ctr_path);
+        }
+        assert_eq!(ours.len(), theirs.len());
+        for (i, (a, b)) in ours.iter().zip(&theirs).enumerate() {
+            assert_eq!(a, b, "allocation {i} (paddr, got, roving)");
+        }
+        assert_eq!(zones_ours, zones_theirs);
     }
 
     #[test]

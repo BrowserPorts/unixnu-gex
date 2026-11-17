@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Wine's raster fonts (vgafix.fon, coure.fon, sserife.fon, vgasys.fon and the
 # rest), the fixed-pitch fonts a console window picks. Wine's fonts/ build
 # makes them from its .ttf with tools/sfnt2fon, which needs FreeType: the

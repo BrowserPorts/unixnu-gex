@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # The Unix libraries 64-bit Wine's loader links for a display:
 # wine32/deps.sh's, built LP64 for wasm64 (wcc64, lowered with the
 # program) at libs.pins' versions:

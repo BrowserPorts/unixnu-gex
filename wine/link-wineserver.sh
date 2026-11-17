@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Link wineserver as its own wasm32 program, the server of door calls:
 # every object under server/ compiled from a
 # door-enabled Wine source tree (server/door.c, server/wasm32_door.h), with

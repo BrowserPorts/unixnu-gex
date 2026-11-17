@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # A 64-bit Wine install and a win64 prefix for it,
 # built from a Wine tree with the 64-bit Wine work (wine/wine.pins names the
 # commit; another is built too, with a note):

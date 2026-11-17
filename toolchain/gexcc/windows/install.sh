@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # gexcc's Windows target: MinGW-named tools building Windows x64 programs and
 # DLLs as native wasm modules against 64-bit Wine's native PE side.
 #

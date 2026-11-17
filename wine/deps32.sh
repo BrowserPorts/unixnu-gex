@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # The Unix libraries the 32-bit Wine loader links in, static wasm32 builds (versions
 # and sha256s in libs.pins):
 #   FreeType (win32u), libwayland-client/-egl, libxml2, libxkbcommon and

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # The PE side of a 32-bit Wine dist, and the bare prefix it is staged through:
 #
 #   wine32/stage.sh BUILD SRC DIST BAREPFX

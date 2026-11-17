@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Link 32-bit Wine's wine loader: loader/main.o, ntdll's Unix side and every Unix
 # library a PE module calls, in one wasm32 program (a closed world):
 # each library's objects compiled again with its

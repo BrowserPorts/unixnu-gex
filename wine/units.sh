@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Function-tier units for the images a run named as unitless.
 #
 #   wine32/units.sh LOG UNITS GEXC DIST GAMEDIR [PREFIX]

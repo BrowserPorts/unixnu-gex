@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Run a Windows program on Wine under gexc: a 64-bit Wine install (--dist,
 # wine64-dist.sh's) or 32-bit Wine (Wine's own Unix side as wasm32 on gex)
 # with the dist and prefix `make -C wine` builds.

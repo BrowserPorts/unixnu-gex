@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # The function-tier units of a frozen set of images, for one gexc: prints the
 # cache directory (GEX_CGEN_CACHE) that holds them, building it first when no
 # set exists for that gexc's unit-key inputs. Gate legs that run frozen Wine

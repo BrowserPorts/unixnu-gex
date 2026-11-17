@@ -1645,6 +1645,45 @@ mod tests {
         assert!(matches!(p(ctl, "IOReportLegend"), Some(Prop::Array(a)) if a.len() == 1));
     }
 
+    #[test]
+    fn matching_gives_the_storage_in_its_registration_order() {
+        use super::super::osserialize::{Graph, Obj};
+        let mut b = Vec::new();
+        node(&mut b, "device-tree", &[("compatible", b"J120AP\0iPad7,1\0AppleARM\0")], 1);
+        node(&mut b, "arm-io", &[("compatible", b"arm-io,t8011\0")], 1);
+        node(&mut b, "apcie", &[("compatible", b"apcie,t8011\0")], 1);
+        node(&mut b, "pci-bridge0", &[("compatible", b"apcie-bridge\0"), ("AAPL,unit-string", b"00000000")], 1);
+        node(&mut b, "s3e", &[("AAPL,unit-string", b"00000000")], 0);
+        let mut t = parse(&b).unwrap();
+        let io = super::super::platform::add(&mut t).unwrap();
+        super::super::storagestack::add(&mut t, Some(io));
+        super::super::platform::add_resources(&mut t);
+        add_root(&mut t);
+        let by_class = |class: &str| {
+            let mut g = Graph::default();
+            let d = g.add(Obj::Dict(Vec::new()));
+            let v = g.add(Obj::String(class.as_bytes().to_vec()));
+            g.dict_set(d, b"IOProviderClass", v);
+            super::super::iomatch::existing(&t, &g, d, false).unwrap()
+        };
+        let media_order = super::super::storage::media_order().to_vec();
+        // The media, and their BSD clients, in the order the media order's
+        // stand-in states.
+        let media: Vec<_> = by_class("IOMedia").iter().map(|&i| super::super::storagestack::medium_of(&t[i as usize]).unwrap()).collect();
+        assert_eq!(media, media_order);
+        let clients: Vec<_> = by_class("IOMediaBSDClient").iter().map(|&i| super::super::storagestack::medium_of(&t[t[i as usize].parent.unwrap() as usize]).unwrap()).collect();
+        assert_eq!(clients, media_order);
+        // The bridges: the root complex's set before the root port's.
+        let order = super::super::iomatch::registration_order(&t);
+        let at = |class: &str| order.iter().position(|&i| t[i as usize].class == class).unwrap();
+        assert!(at("AppleT8011PCIe") < at("ApplePCIEHostBridge"));
+        // The platform expert device first; each nub before what matched
+        // on it.
+        assert_eq!(order[0], 0);
+        assert!(at("IOPCIDevice") < at("ApplePCIEHostBridge"));
+        assert!(at("AppleAPFSVolume") < at("AppleAPFSContainer"));
+    }
+
     /// device-tree { chosen { memory-map }, arm-io }, under the root.
     fn small_tree() -> Vec<Node> {
         let mut b = Vec::new();

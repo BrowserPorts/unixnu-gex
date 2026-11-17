@@ -371,32 +371,142 @@ fn chain(t: &[Node], i: u32) -> Vec<&'static str> {
     iokit::class(t, i).ok().and_then(iokit::class_chain).unwrap_or_default()
 }
 
+/// Whether entry `i` is a driver: a service matching attached to its
+/// provider, which `probeCandidates` gives its match category
+/// (`inst->setProperty(gIOMatchCategoryKey, category)`) and its probe's
+/// score. Every other service is a nub its provider's driver published.
+fn is_driver(n: &Node) -> bool {
+    !n.class.is_empty() && n.service_props.iter().any(|(k, _)| k == key::MATCH_CATEGORY)
+}
+
+/// The services entry `i` has in the `IOService` plane, in the order they
+/// were attached: the device tree entries a driver made nubs of (in the
+/// device tree's order, the order `IODTFindMatchingEntries` gives them to
+/// the publishing loop), then the services whose provider it is.
+fn service_children(t: &[Node], i: u32) -> Vec<u32> {
+    let nubs = t.iter().enumerate().filter(|(_, n)| n.class.is_empty() && n.nub.is_some_and(|(_, p)| p == i)).map(|(j, _)| j as u32);
+    let services = t.iter().enumerate().filter(|(_, n)| !n.class.is_empty() && n.parent == Some(i)).map(|(j, _)| j as u32);
+    nubs.chain(services).collect()
+}
+
+/// The order the registered services here were registered in at boot: the
+/// order `doServiceMatch` added each to its metaclass's instances
+/// (`getMetaClass()->addInstance(this)`, on the service's first matching),
+/// which is the order `copyExistingServices` gives them in.
+///
+/// The boot registers them as follows, and so does this model:
+/// - The platform expert device registers first
+///   (`IOPlatformExpertDevice::startIOServiceMatching`).
+/// - A driver's start registers the nubs it publishes in the order it
+///   publishes them and, if it registers itself, itself at its end:
+///   `IOPCIBridge::start` after `probeBus`, `IOBlockStorageDriver::start`
+///   after `handleStart` publishes its medium, `IOMediaBSDClient::start`
+///   after `createNodes`, AppleAPFSContainer's start after its volumes
+///   (0xfffffff00666b24c).
+/// - Each of those `registerService` calls (but the platform expert
+///   device's) is asynchronous: it queues the service's matching for the
+///   configuration threads, which run it after the call returns, so a
+///   driver's start has registered its nubs and itself before any driver
+///   starts on those nubs.
+/// - On a registered nub the drivers that match start in the order they
+///   were attached, each driver category's best first (`probeCandidates`
+///   starts the categories in the order of their best probe score, and
+///   `startCandidate` attaches the driver before it stalls for any
+///   `IOResourceMatch`).
+/// - The platform expert's start publishes IOResources (IOPMrootDomain's
+///   start, from `PMInstantiatePowerDomains`, publishes the IOKit
+///   resource) before `configure` publishes the top-level nubs. The
+///   services matched on IOResources wait for their resources (IOSurfaceRoot
+///   for IOBSD, which `bsd_init` publishes): they come last here.
+///
+/// The configuration threads are several, so the matching queued for
+/// different nubs runs concurrently, and the order of registrations in
+/// different branches of the plane relative to each other is the boot's.
+/// This model runs the matching of a driver's nubs one after the other, in
+/// the order they were registered, each with all the registrations it
+/// causes. Of the services whose order a matching answer shows (the
+/// classes whose every instance is here), that orders the storage's media,
+/// and the BSD clients that give them their minors, as the media order's
+/// stand-in states ([`super::storage::media_order`]); [`existing`] fails
+/// loudly where a measured media order disagrees with it.
+pub fn registration_order(t: &[Node]) -> Vec<u32> {
+    fn emit(t: &[Node], i: u32, out: &mut Vec<u32>) {
+        if registered(t, i) == Ok(true) && !out.contains(&i) {
+            out.push(i);
+        }
+    }
+    /// The drivers matched on the registered nub `i` start.
+    fn matched(t: &[Node], i: u32, out: &mut Vec<u32>) {
+        for c in service_children(t, i) {
+            if is_driver(&t[c as usize]) {
+                start(t, c, out);
+            }
+        }
+    }
+    fn start(t: &[Node], d: u32, out: &mut Vec<u32>) {
+        if t[d as usize].class == super::platform::PE {
+            if let Some(r) = t.iter().position(|n| n.class == super::platform::RESOURCES) {
+                emit(t, r as u32, out);
+            }
+        }
+        let children = service_children(t, d);
+        let nubs: Vec<u32> = children.iter().copied().filter(|&c| !is_driver(&t[c as usize])).collect();
+        for &c in &nubs {
+            emit(t, c, out);
+        }
+        emit(t, d, out);
+        // Drivers matched on this driver itself, once it is registered.
+        matched(t, d, out);
+        for &c in &nubs {
+            matched(t, c, out);
+        }
+    }
+    let mut out = Vec::new();
+    if t.first().is_some_and(|n| n.class.is_empty()) && t.iter().any(|n| n.class == super::platform::PE) {
+        emit(t, 0, &mut out);
+        matched(t, 0, &mut out);
+    }
+    // Trees with no platform (the storage stack alone): each service with no
+    // provider is registered in the order it was made.
+    for (i, n) in t.iter().enumerate() {
+        if !n.class.is_empty() && n.parent.is_none() && n.class != super::platform::RESOURCES && n.class != "IORegistryEntry" {
+            emit(t, i as u32, &mut out);
+            matched(t, i as u32, &mut out);
+        }
+    }
+    if let Some(r) = t.iter().position(|n| n.class == super::platform::RESOURCES) {
+        emit(t, r as u32, &mut out);
+        matched(t, r as u32, &mut out);
+    }
+    out
+}
+
 /// `applyToInstances` of `class`'s metaclass over the entries `members`
 /// (each of the class, registered): its set holds its own instances and,
 /// for each subclass, that subclass's set, each where it was added
 /// (`OSMetaClass::addInstance`: a subclass's set joins its superclass's
-/// when its first instance registers), walked depth first. An entry's
-/// registration is its place in the registry here.
-fn instance_order(t: &[Node], class: &str, members: &[u32]) -> Vec<u32> {
+/// when its first instance registers), walked depth first. `rank` is each
+/// entry's place in the [`registration_order`].
+fn instance_order(t: &[Node], class: &str, members: &[u32], rank: &dyn Fn(u32) -> usize) -> Vec<u32> {
     enum Slot {
         One(u32),
         Sub(&'static str, Vec<u32>),
     }
-    let mut slots: Vec<(u32, Slot)> = Vec::new();
+    let mut slots: Vec<(usize, Slot)> = Vec::new();
     for &m in members {
         let c = chain(t, m);
         let Some(p) = c.iter().position(|&x| x == class) else { continue };
         if p == 0 {
-            slots.push((m, Slot::One(m)));
+            slots.push((rank(m), Slot::One(m)));
             continue;
         }
         let sub = c[p - 1];
         match slots.iter_mut().find(|(_, s)| matches!(s, Slot::Sub(name, _) if *name == sub)) {
             Some((first, Slot::Sub(_, v))) => {
-                *first = (*first).min(m);
+                *first = (*first).min(rank(m));
                 v.push(m);
             }
-            _ => slots.push((m, Slot::Sub(sub, vec![m]))),
+            _ => slots.push((rank(m), Slot::Sub(sub, vec![m]))),
         }
     }
     slots.sort_by_key(|(at, _)| *at);
@@ -404,10 +514,24 @@ fn instance_order(t: &[Node], class: &str, members: &[u32]) -> Vec<u32> {
     for (_, s) in slots {
         match s {
             Slot::One(m) => out.push(m),
-            Slot::Sub(name, v) => out.extend(instance_order(t, name, &v)),
+            Slot::Sub(name, v) => out.extend(instance_order(t, name, &v, rank)),
         }
     }
     out
+}
+
+/// Whether the media's registration in [`registration_order`] is the order
+/// [`super::storage::media_order`] gives them their minors in (each
+/// medium's BSD client starts as its medium is matched); `Err` naming the
+/// difference when a measured media order disagrees with the model.
+fn media_order_agrees(t: &[Node], order: &[u32]) -> Result<(), String> {
+    let modelled: Vec<_> = order.iter().filter_map(|&i| super::storagestack::medium_of(&t[i as usize])).collect();
+    let wanted: Vec<_> = super::storage::media_order().into_iter().filter(|m| modelled.contains(m)).collect();
+    if modelled == wanted {
+        Ok(())
+    } else {
+        Err(format!("the services' registration order: the media order {wanted:?} differs from the order the modelled matching registers them in, {modelled:?}"))
+    }
 }
 
 /// `copyExistingServices(matching, kIOServiceMatchedState, once ?
@@ -426,9 +550,11 @@ pub fn existing(t: &[Node], g: &Graph, table: Id, once: bool) -> Result<Vec<u32>
     let class = provider.and_then(|p| as_string(g, p)).map(|s| String::from_utf8_lossy(s).into_owned());
     let base = class.as_deref().unwrap_or("IOService");
     let members: Vec<u32> = (0..t.len() as u32).filter(|&i| chain(t, i).contains(&base)).collect();
+    let order = registration_order(t);
+    let rank = |i: u32| order.iter().position(|&o| o == i).unwrap_or(usize::MAX);
     let mut found = Vec::new();
     let mut gap: Option<String> = None;
-    for i in instance_order(t, base, &members) {
+    for i in instance_order(t, base, &members, &rank) {
         match registered(t, i) {
             Ok(true) => {}
             Ok(false) => continue,
@@ -460,6 +586,11 @@ pub fn existing(t: &[Node], g: &Graph, table: Id, once: bool) -> Result<Vec<u32>
     }
     if once {
         found.truncate(1);
+    }
+    // The order of several media, or of their BSD clients, is the media
+    // order's.
+    if found.len() > 1 && found.iter().any(|&i| super::storagestack::medium_of(&t[i as usize]).is_some() || chain(t, i).contains(&super::storagestack::BSD_CLIENT)) {
+        media_order_agrees(t, &order)?;
     }
     // Which of the class's services the device has beyond these is known
     // only for the classes whose every service is here; else a match by a

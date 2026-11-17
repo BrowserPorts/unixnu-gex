@@ -985,6 +985,11 @@ fn media_of(n: &Node) -> Option<Media> {
     super::storage::media_by_name(name).map(|(m, _)| m)
 }
 
+/// The medium a storage entry is: an `IOMedia` with BSD nodes.
+pub fn medium_of(n: &Node) -> Option<Media> {
+    superclasses(n.class).contains(&"IOMedia").then(|| media_of(n)).flatten()
+}
+
 /// A storage driver's live Statistics ([`stats`]), and a medium's live
 /// "Open": `IOMedia::handleOpen` sets it once it holds its
 /// provider open at some level and `handleClose` clears it once it holds

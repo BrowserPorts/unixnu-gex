@@ -231,17 +231,12 @@ pub fn volume_unencrypted(index: u32) -> Option<bool> {
     }
 }
 
-/// Whether the volumes' IOMedia are writable (`IOMedia::isWritable`, the
-/// `isWritable` APFS gives `IOMedia::init`, which it calls only through
-/// the vtable, 0xfffffff006f27da0): unmeasured. Stand-in: writable.
-pub const VOLUMES_WRITABLE: bool = true;
-
-/// What measures [`VOLUMES_WRITABLE`].
-pub const VOLUMES_WRITABLE_MEASUREMENT: &str = "the \"Writable\" property of the AppleAPFSVolume entries (a sysdiagnose's ioreg IOMedia entries)";
-
-/// Whether a volume's IOMedia is writable ([`VOLUMES_WRITABLE`]).
+/// Whether a volume's IOMedia is writable: `AppleAPFSVolume::init` gives
+/// `IOMedia::init` its container medium's `isWritable` (0xfffffff00666d52c,
+/// the `AppleAPFSMedia` the container is on), which is disk0's
+/// ([`disk_writable`]).
 pub fn volume_writable() -> bool {
-    VOLUMES_WRITABLE
+    disk_writable()
 }
 
 /// Whether iBoot's `/chosen` names the System volume as the one booted:
@@ -256,25 +251,23 @@ pub const BOOT_UUID_MATCHES: bool = false;
 /// What measures [`BOOT_UUID_MATCHES`].
 pub const BOOT_UUID_MEASUREMENT: &str = "`statfs(\"/\")`'s f_mntfromname on the device: \"com.apple.os.update-...@/dev/disk1s1\" for no match, a snapshot device's path for one";
 
-/// Whether the NVMe namespace reports itself write-protected: its
-/// `IONVMeBlockStorageDevice::reportWriteProtection` (0xfffffff006a96f7c,
-/// slot 0x5a8 of its vtable 0xfffffff006fab200) answers bit 0 of the
-/// controller's byte +0x189, which the controller sets at run time. disk0's
-/// IOMedia is writable when it is not (IOBlockStorageDriver.cpp
-/// `instantiateMediaObject`: `!_writeProtected`), and the GPT partition
-/// (IOGUIDPartitionScheme.cpp) and the container's `AppleAPFSMedia` (the
-/// container scheme's start, 0xfffffff0066829d4, `isWritable()` of the
-/// partition at 0xfffffff006682de4) are writable as it is. Unmeasured.
-/// Stand-in: writable.
-pub const DISK_WRITABLE: bool = true;
-
-/// What measures [`DISK_WRITABLE`].
-pub const DISK_WRITABLE_MEASUREMENT: &str = "the \"Writable\" property of disk0's IOMedia (a sysdiagnose's ioreg IOMedia entries)";
-
-/// Whether disk0, its partition and the container's medium are writable
-/// ([`DISK_WRITABLE`]).
+/// Whether disk0, its partition and the container's medium are writable.
+/// disk0's IOMedia is writable when its NVMe namespace does not report
+/// itself write-protected (IOBlockStorageDriver.cpp `instantiateMediaObject`:
+/// `!_writeProtected`), and the GPT partition (IOGUIDPartitionScheme.cpp)
+/// and the container's `AppleAPFSMedia` (the container scheme's start,
+/// `isWritable()` of the partition at 0xfffffff006682de4) are writable as
+/// it is. The namespace's `IONVMeBlockStorageDevice::reportWriteProtection`
+/// (0xfffffff006a96f7c, slot 0x5a8 of its vtable 0xfffffff006fab200)
+/// answers bit 8 of its controller's flags (+0x188). Only
+/// `IONVMeController`'s handler of the SMART log's critical warning (slot
+/// 0x628, 0xfffffff006a86214) sets that bit, from the warning's read-only
+/// bit, and `AppleEmbeddedNVMeController`, the internal storage's
+/// controller, replaces that handler with one that clears the bit and
+/// succeeds (0xfffffff006a5cd90, in its vtable 0xfffffff006f9fab0): the
+/// namespace is never write-protected.
 pub fn disk_writable() -> bool {
-    DISK_WRITABLE
+    true
 }
 
 /// The facts still unset, each with what measures it, as the line gexc
@@ -299,8 +292,6 @@ pub fn unmeasured() -> Option<String> {
     gaps.push(super::mig::machine::MEM_ACTUAL_STAND_IN.to_string());
     gaps.push(super::mig::machine::MEM_SIZE_STAND_IN.to_string());
     gaps.push(format!("whether iBoot's /chosen boot-uuid or apfs-preboot-uuid names the System volume (stand-in {BOOT_UUID_MATCHES}: the root mounted from its snapshot by name, with a new fsid; measure {BOOT_UUID_MEASUREMENT})"));
-    gaps.push(format!("whether the volumes' IOMedia are writable (stand-in {VOLUMES_WRITABLE}; measure {VOLUMES_WRITABLE_MEASUREMENT})"));
-    gaps.push(format!("whether disk0 is write-protected (stand-in writable: {DISK_WRITABLE}; measure {DISK_WRITABLE_MEASUREMENT})"));
     if DEVICE.disk0_bytes.is_none() {
         gaps.push(format!("disk0's capacity (APFS statfs counts are stand-ins; measure {CAPACITY_MEASUREMENT})"));
     }

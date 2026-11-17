@@ -246,6 +246,29 @@ impl Tree {
         }
     }
 
+    /// The record with the greatest key at or below `key` (the lookup's
+    /// LE mode, 0x10002ce74): an index node's entries are its children's
+    /// first keys, so the child the descent takes holds it, if any does.
+    pub fn get_le(&self, st: &mut dyn Store, key: &[u8]) -> Result<Option<(Vec<u8>, Option<Vec<u8>>)>, String> {
+        let s = &self.shape;
+        let mut id = self.root;
+        loop {
+            let n = st.get(id)?;
+            if n.nkeys() == 0 {
+                return Ok(None);
+            }
+            let (i, f) = search(s, &n, self.cmp, key);
+            if !f && i == 0 {
+                return Ok(None);
+            }
+            let i = if f { i } else { i - 1 };
+            if n.is_leaf() {
+                return Ok(Some((n.key(s, i).to_vec(), n.val(s, i).map(|v| v.to_vec()))));
+            }
+            id = self.child_of(&n, i);
+        }
+    }
+
     /// Every record in key order.
     pub fn records(&self, st: &mut dyn Store) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>, String> {
         let mut out = Vec::new();

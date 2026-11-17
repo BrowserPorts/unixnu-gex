@@ -70,7 +70,7 @@ fn drec_key(parent: u64, name: &str) -> Vec<u8> {
 /// `fs_tx_enter`: the container's transaction joined, the volume
 /// superblock changed with it.
 fn fs_tx_enter(nx: &mut Nx<'_>, vol: usize) -> Result<(), String> {
-    nx.begin()?;
+    nx.enter()?;
     nx.vol_sb(vol)?;
     Ok(())
 }

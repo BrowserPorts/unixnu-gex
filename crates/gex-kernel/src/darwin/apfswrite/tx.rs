@@ -41,16 +41,20 @@
 //! checkpoint maps among them (C, the copy stored before its own count). A
 //! mount takes the count from the newest checkpoint's copy.
 //!
+//! The container's reaper (`nx_reaper`, I:0x1000176a4) takes the trees
+//! queued for it at the next mount, a step at a time inside the open
+//! transaction, which `tx_leave`'s rules close when they bind.
+//!
 //! What is not implemented is refused: metadata of more than one block,
-//! data allocations, a free queue drained for an allocation or for its
-//! size, snapshots, chunk-info address blocks, Fusion.
+//! data allocations the allocation zones or the space checks serve, a
+//! free queue drained for an allocation or for its size, snapshots, chunk-info address blocks, Fusion.
 
 use super::btree::{self, Store, Tree};
 use super::fxc::{self, Fxc};
 use super::container::{Formatted, Layout, NX_CLEANLY_UNMOUNTED};
-use super::node::{tree_flags, Node, Shape};
+use super::node::{flags as node_flags, tree_flags, Node, Shape};
 use super::{put_header, set_checksum, Put, Sink};
-use crate::darwin::apfsread::otype;
+use crate::darwin::apfsread::{omap_val, otype};
 use std::collections::{BTreeMap, HashMap};
 
 /// `nx_newest_mounted_version` APFS 2236.140.6 writes
@@ -230,9 +234,14 @@ pub struct Nx<'a> {
     precounted: std::collections::HashSet<(Owner, u64)>,
     /// The reap lists (`nx_reap_list_phys_t`), ephemeral, by identifier.
     reap_lists: BTreeMap<u64, Vec<u8>>,
+    /// The open transaction's operation count (`tx + 0x20`: one per
+    /// `tx_enter` that opened or joined it).
+    tx_ops: u64,
 }
 
-/// The container's reaper (`nx_reaper_phys_t`) as nx_reaper_add keeps it.
+/// The container's reaper (`nx_reaper_phys_t`): its lists, and the entry
+/// it is working on (`nr_type` to `nr_rlflags`, left as the last entry's
+/// once it is done, its identifier cleared).
 #[derive(Clone, Copy, Debug)]
 struct Reaper {
     next_reap_id: u64,
@@ -241,10 +250,26 @@ struct Reaper {
     tail: u64,
     flags: u32,
     rlcount: u32,
+    ty: u32,
+    size: u32,
+    fs_oid: u64,
+    oid: u64,
+    xid: u64,
+    nrle_flags: u32,
 }
 
 const OBJECT_TYPE_NX_REAP_LIST: u32 = 0x12;
 const NRL_NONE: u32 = 0xffff_ffff;
+/// `nr_flags`' `NR_CONTINUE`; `nrle_flags`' `NRLE_VALID`,
+/// `NRLE_REAP_ID_RECORD`, `NRLE_CALL`.
+const NR_CONTINUE: u32 = 0x2;
+const NRLE_VALID: u32 = 0x1;
+const NRLE_REAP_ID_RECORD: u32 = 0x2;
+const NRLE_CALL: u32 = 0x4;
+
+fn u32a(b: &[u8], o: usize) -> u32 {
+    u32::from_le_bytes(b[o..o + 4].try_into().unwrap())
+}
 
 fn u64a(b: &[u8], o: usize) -> u64 {
     u64::from_le_bytes(b[o..o + 8].try_into().unwrap())
@@ -347,10 +372,11 @@ impl<'a> Nx<'a> {
             sb_copy,
             fxc: None,
             rove: 0,
-            reaper: Reaper { next_reap_id: 1, completed_id: 0, head: 0, tail: 0, flags: 1, rlcount: 0 },
+            reaper: Reaper { next_reap_id: 1, completed_id: 0, head: 0, tail: 0, flags: 1, rlcount: 0, ty: 0, size: 0, fs_oid: 0, oid: 0, xid: 0, nrle_flags: 0 },
             reap_lists: BTreeMap::new(),
             alloc_delta: BTreeMap::new(),
             precounted: Default::default(),
+            tx_ops: 0,
         })
     }
 
@@ -437,6 +463,7 @@ impl<'a> Nx<'a> {
             return Ok(());
         }
         self.in_tx = true;
+        self.tx_ops = 0;
         if self.fq_too_big(FQ_IP, false)? {
             while self.fq_too_big(FQ_IP, true)? {
                 if self.free_completed(FQ_IP)? == 0 {
@@ -476,6 +503,60 @@ impl<'a> Nx<'a> {
             }
         }
         Ok(())
+    }
+
+    /// `tx_enter` (I:0x10004bc64) by a caller that leaves its transaction
+    /// with `tx_leave`: the open transaction joined, or a new one opened,
+    /// its operation count raised.
+    pub fn enter(&mut self) -> Result<(), String> {
+        self.begin()?;
+        self.tx_ops += 1;
+        Ok(())
+    }
+
+    /// `tx_leave` (I:0x10004bc74) with `flags`: the transaction closes and
+    /// its checkpoint is written when the caller asks (flag 4), when it
+    /// holds more than 100,000 operations, when the object cache holds too
+    /// many changed objects (I:0x100036ccc), or when the space manager
+    /// needs a flush (I:0x100041c4c: the main free queue holding more than
+    /// the free blocks, or more than its count limit, halved while the free
+    /// blocks are under a 32nd of the device; a free queue past its node
+    /// threshold); else it stays open for the next caller to join.
+    pub fn leave(&mut self, flags: u32) -> Result<(), String> {
+        if !self.in_tx {
+            return Ok(());
+        }
+        let mut close = flags & 4 != 0 || self.tx_ops > 100_000;
+        // The cache's changed virtual and physical objects (cache+0x374,
+        // +0x378): the objects this model keeps, and at most the chunk-info
+        // blocks, bitmaps and the pool's bitmap besides; 1,024 on a solid
+        // state device (a regular file's ENOTTY counts as one), 256 else.
+        let low = (self.virt_dirty.len() + self.phys_dirty.len()) as u64;
+        let high = low + self.cib_dirty.iter().filter(|d| **d).count() as u64 + self.chunks.iter().filter(|c| c.dirty).count() as u64 + 1;
+        let limit = if self.mode == Mode::Kernel { 256 } else { 1024 };
+        if high >= limit {
+            return Err("not implemented: a transaction the object cache's count of changed objects may close (its counting of chunk-info blocks and bitmaps, and the kernel's limit)".into());
+        }
+        let main = self.fq[FQ_MAIN].count;
+        let shift = if self.sm_free < self.l.blocks / 32 { 1 } else { 0 };
+        if main > self.sm_free || main > self.main_count_limit >> shift || self.fq_too_big(FQ_IP, false)? || self.fq_too_big(FQ_MAIN, false)? {
+            close = true;
+        }
+        if close {
+            self.commit()?;
+        }
+        Ok(())
+    }
+
+    /// The blocks the space manager can still give
+    /// (`spaceman_get_free_blocks`, I:0x100040a80 → I:0x100040bac, with no
+    /// volume): the free blocks, or with the main free queue's and less
+    /// the volume reserves not yet held, whichever is less (its
+    /// reservation counters, sm+0x340 and +0x348, are zero: nothing this
+    /// model runs reserves space).
+    fn free_blocks_available(&self) -> u64 {
+        let with_queue = self.sm_free.wrapping_add(self.fq[FQ_MAIN].count).wrapping_add(self.reserve.1.wrapping_sub(self.reserve.0));
+        self.sm_free.min(with_queue)
     }
 
     // ---- The internal pool.
@@ -890,6 +971,290 @@ impl<'a> Nx<'a> {
         }
         put_entry(b, e2, fl, id);
         Ok(id)
+    }
+
+    /// The reaper's run at a container mount (`nx_mount` I:0x1000340ec →
+    /// I:0x1000175b4; the kernel's `apfs_reaper` thread runs the same
+    /// loop, K 0xfffffff0066bee04): when an entry is in progress or the
+    /// head list holds one, `nx_reaper` (I:0x1000176a4) takes the entries
+    /// one at a time, each step in the open transaction, joined or opened
+    /// by `tx_enter`, left with flags from the free space (`tx_leave(xid,
+    /// (free < 1000) | (free < 2000) << 2)`, I:0x100017998). With the lists
+    /// empty the transaction is left with no flags, open for the next
+    /// caller.
+    pub fn reaper_run(&mut self) -> Result<(), String> {
+        if self.reaper.oid == 0 {
+            if self.reaper.head == 0 {
+                return Ok(());
+            }
+            let b = self.reap_lists.get(&self.reaper.head).ok_or("the reaper's head list not in the cache")?;
+            if u32a(b, 0x30) == 0 && u64a(b, 0x20) == 0 {
+                return Ok(());
+            }
+        }
+        loop {
+            self.enter()?;
+            if self.reaper.oid == 0 {
+                self.reaper_next_record()?;
+                if self.reaper.oid == 0 {
+                    return self.leave(0);
+                }
+            }
+            let r = self.reaper;
+            if r.nrle_flags & NRLE_CALL != 0 {
+                match r.ty & otype::MASK {
+                    otype::BTREE | otype::BTREE_NODE => self.btree_node_reap(r.ty, r.size, r.fs_oid, r.oid)?,
+                    // The object descriptor table (I:0x100037fd4): the types
+                    // with reap functions not transcribed here.
+                    0x1 | 0x5 | 0x6 | 0x7 | 0x8 | 0xb | 0xd | 0x11 | 0x12 | 0x19 | 0x1b | 0x1d | 0x1e => return Err(format!("not implemented: reaping an object of type {:#x} (its descriptor's reap function, I:0x100037fd4)", r.ty)),
+                    // "object type not reapable?": logged, the entry dropped.
+                    _ => {}
+                }
+            }
+            // The entry done (no reap function returns EINPROGRESS here).
+            if r.nrle_flags & NRLE_REAP_ID_RECORD != 0 {
+                self.reaper.completed_id = r.xid;
+            }
+            self.reaper.flags &= !NR_CONTINUE;
+            self.reaper.oid = 0;
+            let free = self.free_blocks_available();
+            self.leave(u32::from(free < 1000) | u32::from(free < 2000) << 2)?;
+        }
+    }
+
+    /// `nx_reaper_next_record` (I:0x10001855c): the head list's first entry
+    /// becomes the reaper's, the entry back on the list's free list; an
+    /// exhausted list gives way to the next one, and is deleted.
+    fn reaper_next_record(&mut self) -> Result<(), String> {
+        if self.reaper.head == 0 {
+            return Ok(());
+        }
+        let ent = |i: u32| 0x40 + 0x28 * i as usize;
+        while self.reaper.oid == 0 {
+            let head = self.reaper.head;
+            let b = self.reap_lists.get_mut(&head).ok_or("the reaper's head list not in the cache")?;
+            let first = u32a(b, 0x34);
+            if first == NRL_NONE {
+                let next = u64a(b, 0x20);
+                if next == 0 {
+                    if self.reaper.rlcount == 0 && self.reaper.head == self.reaper.tail {
+                        self.reaper.rlcount = 1;
+                    }
+                    break;
+                }
+                if !self.reap_lists.contains_key(&next) {
+                    return Err("the next reap list not in the cache".into());
+                }
+                self.reaper.head = next;
+                if self.reaper.rlcount != 0 {
+                    self.reaper.rlcount -= 1;
+                }
+                self.reap_lists.remove(&head);
+                self.eph_order.retain(|&o| o != head);
+                continue;
+            }
+            let e = ent(first);
+            let next = u32a(b, e);
+            self.reaper.nrle_flags = u32a(b, e + 4);
+            self.reaper.ty = u32a(b, e + 8);
+            self.reaper.size = u32a(b, e + 12);
+            self.reaper.fs_oid = u64a(b, e + 16);
+            self.reaper.oid = u64a(b, e + 24);
+            self.reaper.xid = u64a(b, e + 32);
+            if u32a(b, 0x34) == u32a(b, 0x38) {
+                b.put32(0x38, next);
+            }
+            b.put32(e + 4, 0);
+            let f = u32a(b, 0x3c);
+            b.put32(e, f);
+            b.put32(0x3c, first);
+            let c = u32a(b, 0x30);
+            b.put32(0x30, c - 1);
+            b.put32(0x34, next);
+        }
+        Ok(())
+    }
+
+    /// `nx_reaper_add_sub_object` (I:0x1000170c4, no flags): object `oid`
+    /// queued at the front of the head list (a new head list when that one
+    /// is full), to be reaped next.
+    fn reaper_add_sub_object(&mut self, ty: u32, size: u32, fs_oid: u64, oid: u64) -> Result<(), String> {
+        let xid = self.xid;
+        if self.reaper.head == 0 && self.reaper.tail == 0 {
+            let l = self.reap_list_new();
+            self.reaper.head = l;
+            self.reaper.tail = l;
+            self.reaper.rlcount = 1;
+        } else {
+            if !self.reap_lists.contains_key(&self.reaper.head) {
+                return Err("the reaper's head list not in the cache".into());
+            }
+            if self.reaper.rlcount == 0 && self.reaper.head == self.reaper.tail {
+                self.reaper.rlcount = 1;
+            }
+        }
+        let mut list = self.reaper.head;
+        let b = &self.reap_lists[&list];
+        if u32a(b, 0x2c).wrapping_sub(1) < u32a(b, 0x30) {
+            let n = self.reap_list_new();
+            let head = self.reaper.head;
+            self.reap_lists.get_mut(&n).unwrap().put64(0x20, head);
+            self.reaper.head = n;
+            if self.reaper.rlcount != 0 {
+                self.reaper.rlcount += 1;
+            }
+            list = n;
+        }
+        let b = self.reap_lists.get_mut(&list).unwrap();
+        let i = u32a(b, 0x3c);
+        if i == NRL_NONE {
+            return Err("reap list object free list erroneously empty".into());
+        }
+        let e = 0x40 + 0x28 * i as usize;
+        let f = u32a(b, e);
+        b.put32(0x3c, f);
+        let f = u32a(b, 0x34);
+        b.put32(e, f);
+        b.put32(0x34, i);
+        if u32a(b, 0x38) == NRL_NONE {
+            b.put32(0x38, i);
+        }
+        let c = u32a(b, 0x30);
+        b.put32(0x30, c + 1);
+        b.put32(e + 4, NRLE_VALID | NRLE_CALL);
+        b.put32(e + 8, ty);
+        b.put32(e + 12, size);
+        b.put64(e + 16, fs_oid);
+        b.put64(e + 24, oid);
+        b.put64(e + 32, xid);
+        Ok(())
+    }
+
+    /// The slot of the volume whose superblock is `fs_oid`.
+    fn vol_index(&self, fs_oid: u64) -> Result<usize, String> {
+        self.fs_oid.iter().position(|&o| o == fs_oid && o != 0).ok_or_else(|| format!("no volume {fs_oid:#x}"))
+    }
+
+    /// `btree_node_reap` (I:0x1000253a0), a B-tree node's reap function:
+    /// its volume's superblock changed; an index node's children, last to
+    /// first, deleted when they are leaves (a level-1 node's) and queued
+    /// for the reaper when not; then the node deleted. A hashed node is
+    /// refused (ENOTSUP), the reaper logging it and dropping the entry.
+    fn btree_node_reap(&mut self, ty: u32, size: u32, fs_oid: u64, oid: u64) -> Result<(), String> {
+        let vol = if fs_oid != 0 { Some(self.vol_index(fs_oid)?) } else { None };
+        let physical = ty & otype::PHYSICAL != 0;
+        let b = if physical {
+            self.phys_obj(oid)?.b.clone()
+        } else {
+            let owner = vol.map_or(Owner::Container, Owner::Volume);
+            self.virt.get(&(owner, oid)).ok_or_else(|| format!("not implemented: reading virtual object {oid:#x} through its object map"))?.b.clone()
+        };
+        let n = Node { b };
+        if n.flags() & node_flags::HASHED != 0 {
+            return Ok(());
+        }
+        if let Some(v) = vol {
+            self.vol_sb(v)?;
+        }
+        if !n.is_leaf() {
+            if n.flags() & node_flags::FIXED_KV_SIZE != 0 {
+                return Err("not implemented: reaping a fixed-size B-tree's index node".into());
+            }
+            let shape = jtree_shape(self.l.bs, physical);
+            let child_ty = (u32a(&n.b, 24) & !otype::MASK) | otype::BTREE_NODE;
+            let child_fs = if vol.is_some() { fs_oid } else { 0 };
+            for i in (0..n.nkeys()).rev() {
+                let child = n.child(&shape, i);
+                if n.level() < 2 {
+                    self.obj_delete(child_ty, size, vol, child)?;
+                } else {
+                    self.reaper_add_sub_object(child_ty, size, child_fs, child)?;
+                }
+            }
+        }
+        self.obj_delete(ty, size, vol, oid)
+    }
+
+    /// `obj_delete` (I:0x100038968, by identifier I:0x100038d1c) of object
+    /// `oid` of `ty` and `size` bytes, of volume `vol`: a physical one's
+    /// blocks freed, a virtual one's mapping deleted from its object map.
+    fn obj_delete(&mut self, ty: u32, size: u32, vol: Option<usize>, oid: u64) -> Result<(), String> {
+        let n = u64::from(size).div_ceil(self.l.bs);
+        if ty & otype::PHYSICAL != 0 {
+            self.phys.remove(&oid);
+            self.phys_dirty.retain(|&p| p != oid);
+            return self.fs_free(vol, oid, n);
+        }
+        let owner = vol.map_or(Owner::Container, Owner::Volume);
+        if self.virt_dirty.contains(&(owner, oid)) {
+            return Err(format!("not implemented: deleting virtual object {oid:#x} changed in this transaction"));
+        }
+        let vo = self.virt.remove(&(owner, oid)).ok_or_else(|| format!("no virtual object {oid:#x}"))?;
+        let (mxid, paddr) = vo.mapped.ok_or_else(|| format!("not implemented: deleting virtual object {oid:#x} never placed"))?;
+        self.omap_delete(owner, oid, mxid, paddr, n)
+    }
+
+    /// `omap_delete` (I:0x10003eedc) with flag 1 (an object's deletion) of
+    /// `oid`'s mapping of transaction `xid_old` at `paddr`: in a volume's
+    /// map (no snapshot holds it) a record of an older transaction of the
+    /// same object leaves a deleted marker at this transaction, the
+    /// mapping goes (unless the marker took its key) and its blocks are
+    /// freed; in the container's map it goes and its blocks are freed.
+    fn omap_delete(&mut self, owner: Owner, oid: u64, xid_old: u64, paddr: u64, n: u64) -> Result<(), String> {
+        let xid = self.xid;
+        let vol = match owner {
+            Owner::Volume(i) => Some(i),
+            Owner::Container => None,
+        };
+        let mut om = self.omap_of(owner)?;
+        if vol.is_some() && u32a(&self.phys_obj(om.phys)?.b, 0x24) != 0 {
+            return Err("not implemented: deleting a mapping from an object map with snapshots".into());
+        }
+        om.phys = self.phys_modify(om.phys)?;
+        let key = |o: u64, x: u64| {
+            let mut k = o.to_le_bytes().to_vec();
+            k.extend_from_slice(&x.to_le_bytes());
+            k
+        };
+        let mut st = PhysStore { nx: self, subtype: otype::OMAP_TREE_SUBTYPE, class: 2, vol: None };
+        let marker = vol.is_some() && xid_old != 0 && om.tree.get_le(&mut st, &key(oid, xid_old - 1))?.is_some_and(|(k, _)| u64a(&k, 0) == oid);
+        if marker {
+            let mut v = omap_val::DELETED.to_le_bytes().to_vec();
+            v.extend_from_slice(&(n as u32 * self.l.bs as u32).to_le_bytes());
+            v.extend_from_slice(&paddr.to_le_bytes());
+            let mut st = PhysStore { nx: self, subtype: otype::OMAP_TREE_SUBTYPE, class: 2, vol: None };
+            om.tree.insert(&mut st, &key(oid, xid), Some(&v))?;
+        }
+        if !(xid_old == xid && marker) {
+            let mut st = PhysStore { nx: self, subtype: otype::OMAP_TREE_SUBTYPE, class: 2, vol: None };
+            om.tree.remove(&mut st, &key(oid, xid_old))?.ok_or_else(|| format!("no mapping of {oid:#x} at {xid_old}"))?;
+        }
+        let root = om.tree.root;
+        self.phys_obj(om.phys)?.b.put64(0x30, root);
+        self.phys_dirty_mark(om.phys);
+        self.set_omap(owner, om)?;
+        self.fs_free(vol, paddr, n)
+    }
+
+    /// `spaceman_free` (I:0x100047fd8) of `n` blocks at `paddr` for volume
+    /// `vol`: to the main free queue, the volume's allocation count less
+    /// them (I:0x1000483c8) and its last-change transaction this one
+    /// (I:0x10001e498).
+    fn fs_free(&mut self, vol: Option<usize>, paddr: u64, n: u64) -> Result<(), String> {
+        self.free(paddr, n)?;
+        let Some(v) = vol else { return Ok(()) };
+        let xid = self.xid;
+        let sb = self.vol_sb(v)?;
+        if u64a(sb, 0x48) != 0 {
+            return Err("not implemented: a free by a volume with a reserve (the space manager's reserve count, I:0x1000483c8)".into());
+        }
+        let role = u16::from_le_bytes([sb[0x3c4], sb[0x3c5]]);
+        if [0u16, 2, 0x40, 0x240].contains(&role) {
+            return Err(format!("not implemented: a free by a volume of role {role:#x} (+0x428, I:0x10001e498)"));
+        }
+        sb.put64(0x420, xid);
+        *self.alloc_delta.entry(v).or_default() -= n as i64;
+        Ok(())
     }
 
     /// The container handed from the kernel to a user-space tool (or
@@ -1341,6 +1706,12 @@ impl<'a> Nx<'a> {
                     reaper.put64(0x38, r.tail);
                     reaper.put32(0x40, r.flags);
                     reaper.put32(0x44, r.rlcount);
+                    reaper.put32(0x48, r.ty);
+                    reaper.put32(0x4c, r.size);
+                    reaper.put64(0x50, r.fs_oid);
+                    reaper.put64(0x58, r.oid);
+                    reaper.put64(0x60, r.xid);
+                    reaper.put32(0x68, r.nrle_flags);
                     reaper.put32(0x6c, bs as u32 - 0x70);
                     eph.push((otype::EPHEMERAL | 0x11, 0, OID_REAPER, reaper));
                 }

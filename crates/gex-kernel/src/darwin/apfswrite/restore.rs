@@ -52,7 +52,7 @@ pub fn key_os_version(build: &str) -> Result<u32, String> {
 /// transactions holds (on internal storage the kernel commits only when a
 /// sync, an unmount or a full transaction asks it to, K 0x675a6a0, so the
 /// grouping follows what else wrote to the container meanwhile).
-pub const RUN_STAND_IN: &str = "the erase restore's clock readings, transaction grouping and the order its concurrent writers reach the kernel on disk0 (stand-in: the clock of the machine building the image; each call joining the open transaction until a sync, unmount or volume creation commits it, as with no other writer on the container; asr's four writer threads' pwrites reaching the kernel in step order, the System volume's rename to the name it already has after them, and the kernel's container unmounted (its last transaction committed, block 0 written) before apfs_invert opens the device; measure the device's disk0 after its erase restore)";
+pub const RUN_STAND_IN: &str = "the erase restore's clock readings, transaction grouping and the order its concurrent writers reach the kernel on disk0 (stand-in: the clock of the machine building the image; each call joining the open transaction until a sync, unmount or volume creation commits it, as with no other writer on the container; asr's four writer threads' pwrites reaching the kernel in step order, the System volume's rename to the name it already has after them, the kernel's container unmounted (its last transaction committed, block 0 written) before apfs_invert opens the device, and the kernel's apfs_reaper thread, started by its next mount of the container, running to its end before anything else reaches the container; measure the device's disk0 after its erase restore)";
 
 /// The restore's build.
 pub const RESTORE_BUILD: &str = "21H461";
@@ -68,14 +68,16 @@ pub struct OsImage {
 /// with `now` the kernel's clock in nanoseconds since 1970 and `os` the
 /// operating system image (the System step is left out without it).
 pub fn build_disk0(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() -> u64, os: Option<&OsImage>) -> Result<Missing, String> {
-    build_disk0_with(disk, now, os, &mut || Ok(()), None)
+    build_disk0_with(disk, now, os, &mut || Ok(()), &mut |_| Ok(true), None)
 }
 
 /// [`build_disk0`], with `before_invert` run when the container is
-/// handed to apfs_invert (its state on disk then complete), and the
-/// device apfs_invert opens reporting `DK_FEATURE_BARRIER` as `barrier`
-/// says (the container device's own answer when `None`).
-pub fn build_disk0_with(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() -> u64, os: Option<&OsImage>, before_invert: &mut dyn FnMut() -> Result<(), String>, barrier: Option<bool>) -> Result<Missing, String> {
+/// handed to apfs_invert (its state on disk then complete),
+/// `after_invert` given the container apfs_invert left (the build goes
+/// on only if it returns true), and the device apfs_invert opens
+/// reporting `DK_FEATURE_BARRIER` as `barrier` says (the container
+/// device's own answer when `None`).
+pub fn build_disk0_with(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() -> u64, os: Option<&OsImage>, before_invert: &mut dyn FnMut() -> Result<(), String>, after_invert: &mut dyn FnMut(&mut Nx<'_>) -> Result<bool, String>, barrier: Option<bool>) -> Result<Missing, String> {
     let n = storage::nvme();
     let bs = u64::from(n.block_size);
     if disk.size() != storage::disk0_bytes() {
@@ -153,7 +155,18 @@ pub fn build_disk0_with(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() ->
             before_invert()?;
             let barrier = barrier.unwrap_or_else(crate::darwin::storagestack::container_barrier);
             super::invert::invert(&mut nx, system, super::asr::IMAGE_NAME, std::sync::Arc::clone(&disk), base, barrier, now)?;
-            missing.push("the System volume's content after apfs_invert: the data-volume trees' removal, apfs_sealvolume to the signed root hash (and the reaping of the old trees at its mount), and the com.apple.os.update- snapshot".into());
+            if !after_invert(&mut nx)? {
+                return Ok(missing);
+            }
+            // The kernel's next mount of the container (await_asr_and_retry
+            // mounting xART, 0x100017510): its device's barrier answer, the
+            // reaper started on the old trees apfs_invert queued (the
+            // apfs_reaper thread, run to its end at the mount: RUN_STAND_IN),
+            // its transaction left open.
+            nx.set_barrier(crate::darwin::storagestack::container_barrier());
+            nx.remount(Mode::Kernel)?;
+            nx.reaper_run()?;
+            missing.push("the System volume after apfs_invert and the reaping of its old trees: the kernel's mounts of xART and Update, then (once Data and User exist) the data-volume trees' removal (restored_external's fixup_var), /private/xarts, apfs_sealvolume to the signed root hash, and the com.apple.os.update- snapshot".into());
         }
         None => missing.push("the System volume's content: ASR of 044-76040-038.dmg into /mnt1/apfs_invert_asr_img (no image given), apfs_invert, the data-volume trees' removal, apfs_sealvolume to the signed root hash, and the com.apple.os.update- snapshot".into()),
     }
@@ -280,7 +293,7 @@ mod tests {
             }
             Ok(())
         };
-        build_disk0_with(disk.clone(), &mut now, Some(&os), &mut hook, None).unwrap();
+        build_disk0_with(disk.clone(), &mut now, Some(&os), &mut hook, &mut |_| Ok(false), None).unwrap();
         // After apfs_invert: the System volume holds the image's files.
         struct Part2(std::sync::Arc<super::super::HostFile>, u64, u64);
         impl Medium for Part2 {
@@ -368,7 +381,7 @@ mod tests {
         };
         use crate::darwin::apfsread::Container;
         // The binary runs on a regular file: no DK_FEATURE_BARRIER.
-        build_disk0_with(disk.clone(), &mut now, Some(&os), &mut hook, Some(false)).unwrap();
+        build_disk0_with(disk.clone(), &mut now, Some(&os), &mut hook, &mut |_| Ok(false), Some(false)).unwrap();
         // Block for block.
         use crate::darwin::apfsread::Medium;
         let theirs = super::super::HostFile(std::fs::File::open(&ctr_path).unwrap(), psize);
@@ -389,6 +402,109 @@ mod tests {
             }
             off += n as u64;
         }
+        if std::env::var("GEX_TEST_KEEP").is_err() {
+            let _ = std::fs::remove_file(&disk_path);
+            let _ = std::fs::remove_file(&ctr_path);
+        }
+        assert!(diffs.is_empty(), "{} blocks differ: {:?}", diffs.len(), &diffs[..diffs.len().min(40)]);
+    }
+
+    /// The blocks of `psize` bytes at `base` of `disk` that differ from the
+    /// container file `theirs`.
+    fn differing_blocks(disk: &super::super::HostFile, base: u64, psize: u64, theirs: &std::path::Path) -> Vec<String> {
+        use crate::darwin::apfsread::Medium;
+        let theirs = super::super::HostFile(std::fs::File::open(theirs).unwrap(), psize);
+        let (mut a, mut b) = (vec![0u8; 1 << 20], vec![0u8; 1 << 20]);
+        let mut diffs = Vec::new();
+        let mut off = 0;
+        while off < psize {
+            let n = (psize - off).min(1 << 20) as usize;
+            disk.read_at(base + off, &mut a[..n]).unwrap();
+            theirs.read_at(off, &mut b[..n]).unwrap();
+            if a[..n] != b[..n] {
+                for blk in 0..n / 4096 {
+                    if a[blk * 4096..(blk + 1) * 4096] != b[blk * 4096..(blk + 1) * 4096] {
+                        let t = u32::from_le_bytes(b[blk * 4096 + 24..blk * 4096 + 28].try_into().unwrap());
+                        diffs.push(format!("block {} (their type {t:#x})", off / 4096 + blk as u64));
+                    }
+                }
+            }
+            off += n as u64;
+        }
+        diffs
+    }
+
+    /// The container partition of disk file `disk` copied to the
+    /// container file `ctr`.
+    fn copy_container(disk: &std::path::Path, ctr: &std::path::Path, base: u64, psize: u64) {
+        let _ = std::fs::remove_file(ctr);
+        let copy = std::process::Command::new("python3")
+            .args(["-I", "/Volumes/Ferrochrome/offloaded-builds/gex-cryptex/drafts/s16/tools/sparsecopy.py"])
+            .arg(disk)
+            .arg(ctr)
+            .args([base.to_string(), psize.to_string()])
+            .status()
+            .unwrap();
+        assert!(copy.success());
+    }
+
+    /// The reaper at the next mount after apfs_invert, against the device
+    /// library's (GEX_TEST_NEWFS_A: the host-runnable user-space
+    /// `newfs_apfs -A`, with GEX_TEST_UDIF and GEX_TEST_SCRATCH): its
+    /// mount reaps apfs_invert's old trees, and the volume it adds joins
+    /// the reaper's open transaction; the container block for block (the
+    /// port given the tool's clock readings).
+    #[test]
+    fn reaper_matches_the_device_library() {
+        use crate::darwin::apfsread::Container;
+        let (Ok(dmg), Ok(dir), Ok(tool)) = (std::env::var("GEX_TEST_UDIF"), std::env::var("GEX_TEST_SCRATCH"), std::env::var("GEX_TEST_NEWFS_A")) else { return };
+        let f = std::fs::File::open(&dmg).unwrap();
+        let len = f.metadata().unwrap().len();
+        let image = std::sync::Arc::new(crate::darwin::udif::Udif::open(std::sync::Arc::new(super::super::HostFile(f, len))).unwrap());
+        let partition = image.partition("Apple_APFS").unwrap();
+        let os = OsImage { image: std::sync::Arc::clone(&image), partition };
+        let size = storage::disk0_bytes();
+        let dir = std::path::Path::new(&dir);
+        let disk_path = dir.join(format!("gex-reap-disk-{}", std::process::id()));
+        let ctr_path = dir.join(format!("gex-reap-ctr-{}", std::process::id()));
+        let f = std::fs::OpenOptions::new().create(true).truncate(true).read(true).write(true).open(&disk_path).unwrap();
+        f.set_len(size).unwrap();
+        let disk = std::sync::Arc::new(super::super::HostFile(f, size));
+        let (base, psize) = storage::partition_extent();
+        let mut t = 1_800_000_000_000_000_000u64;
+        let mut now = || {
+            t += 1000;
+            t
+        };
+        let d2 = std::sync::Arc::clone(&disk);
+        let (dp, cp) = (disk_path.clone(), ctr_path.clone());
+        let mut after = move |nx: &mut Nx<'_>| -> Result<bool, String> {
+            d2.0.sync_all().map_err(|e| e.to_string())?;
+            copy_container(&dp, &cp, base, psize);
+            let run = std::process::Command::new(&tool).args(["-A", "-D", "-U", "0", "-G", "0", "-v", "Vtmp"]).arg(&cp).output().map_err(|e| e.to_string())?;
+            eprintln!("{}", String::from_utf8_lossy(&run.stderr));
+            assert!(run.status.success(), "newfs_apfs -A failed");
+            // The tool's clock readings, from the volume it made.
+            let c = std::sync::Arc::new(Container::open(std::sync::Arc::new(super::super::HostFile(std::fs::File::open(&cp).unwrap(), psize))).unwrap());
+            let com = c.omap().unwrap();
+            let q = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+            let sbb = c.read_raw(com.lookup(&c, c.nx.fs_oid[6], c.xid()).unwrap().unwrap().paddr).unwrap();
+            let vom = crate::darwin::apfsread::Omap::open(&c, q(&sbb, 0x80)).unwrap();
+            let rootb = c.read_raw(vom.lookup(&c, q(&sbb, 0x88), c.xid()).unwrap().unwrap().paddr).unwrap();
+            let toc_v = |slot: usize| 4096 - 40 - u16::from_le_bytes(rootb[56 + 8 * slot + 4..56 + 8 * slot + 6].try_into().unwrap()) as usize;
+            let times = super::super::tx::VolumeTimes { formatted: q(&sbb, 0x130), root: q(&rootb, toc_v(1) + 8), private: q(&rootb, toc_v(0) + 8), modified: q(&sbb, 0x100) };
+            // The same on the port's container: the tool's mount (a
+            // regular file: no DK_FEATURE_BARRIER), its reaper, the volume.
+            nx.set_barrier(false);
+            nx.remount(Mode::Userspace)?;
+            nx.reaper_run()?;
+            nx.create_volume(&NewVolume { name: "Vtmp".into(), role: 0, encrypted: false, e_apfs: true, times, uid: 0, gid: 0, key_os_version: 0, size_bytes: None })?;
+            nx.commit()?;
+            nx.unmount()?;
+            Ok(false)
+        };
+        build_disk0_with(disk.clone(), &mut now, Some(&os), &mut || Ok(()), &mut after, Some(false)).unwrap();
+        let diffs = differing_blocks(&disk, base, psize, &ctr_path);
         if std::env::var("GEX_TEST_KEEP").is_err() {
             let _ = std::fs::remove_file(&disk_path);
             let _ = std::fs::remove_file(&ctr_path);

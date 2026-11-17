@@ -5,6 +5,7 @@ use gex_kernel::errno::Errno;
 use gex_kernel::vfs::hostfs::host_xattr::{set_host_xattr, On};
 use gex_kernel::vfs::XattrOp;
 use std::ffi::CString;
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 
 pub fn install() {
@@ -48,7 +49,7 @@ fn call(on: &On<'_>, op: XattrOp<'_>) -> Result<usize, Errno> {
         On::Path(p) => Some(CString::new(p.as_os_str().as_bytes()).map_err(|_| Errno::EINVAL)?),
         On::Fd(_) => None,
     };
-    let fd = match on { On::Fd(fd) => *fd, On::Path(_) => -1 };
+    let fd = match on { On::Fd(f) => f.as_raw_fd(), On::Path(_) => -1 };
     let name_c = |n: &str| CString::new(n).map_err(|_| Errno::EINVAL);
     // SAFETY: every pointer is a live CString or slice for the call's length.
     #[cfg(not(target_os = "macos"))]

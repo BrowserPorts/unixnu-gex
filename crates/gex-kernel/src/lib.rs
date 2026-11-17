@@ -37,6 +37,7 @@ pub mod cpus;
 pub mod darwin;
 pub mod errno;
 pub mod eventfd;
+pub mod hostos;
 pub mod inotify;
 pub mod vnote;
 pub mod procnote;

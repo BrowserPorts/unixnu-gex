@@ -2985,7 +2985,7 @@ fn take_runner() -> bool {
         let Ok((cx, child)) = rx.recv() else { return };
         // Named by its guest tid, as a thread spawned for it is (per-thread
         // CPU by name).
-        let _ = std::fs::write("/proc/thread-self/comm", format!("gex-tid-{}", child.tid));
+        (gex_kernel::hostos::calls().name_thread)(&format!("gex-tid-{}", child.tid));
         guest_thread_body(cx, child);
     });
     match started {
@@ -5124,24 +5124,10 @@ mod host_stream_tests {
     }
 }
 
-/// The host process's real user and group ids.
-///
-/// Read from `/proc/self/status` rather than through `libc`, which keeps this
-/// crate free of a C dependency; falling back to 1000 costs only fidelity.
+/// The host process's real user and group ids, as the host says them
+/// (`gex_kernel::hostos`); falling back to 1000 costs only fidelity.
 fn host_identity() -> (u32, u32) {
-    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
-        return (1000, 1000);
-    };
-    let field = |name: &str| -> Option<u32> {
-        status
-            .lines()
-            .find(|l| l.starts_with(name))?
-            .split_whitespace()
-            .nth(1)?
-            .parse()
-            .ok()
-    };
-    (field("Uid:").unwrap_or(1000), field("Gid:").unwrap_or(1000))
+    (gex_kernel::hostos::calls().ids)().map_or((1000, 1000), |ids| (ids.uid, ids.gid))
 }
 
 /// Copy the ELF segments and the initial stack into guest memory.

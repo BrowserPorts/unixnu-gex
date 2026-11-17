@@ -1,6 +1,7 @@
 //! Processor time, natively. A guest thread is a host thread here, so its
-//! time is the host thread's, as Linux's scheduler counts it
-//! (`/proc/self/task/<tid>/schedstat`, nanoseconds on a processor), and a
+//! time is the host thread's, as the host counts it (Linux's
+//! `/proc/self/task/<tid>/schedstat`, nanoseconds on a processor; the host's
+//! word, `gex_kernel::hostos`), and a
 //! process's is its threads': the live ones read as they go, the ended ones
 //! kept. As the browser shim's `usage.rs` does, a process says its total to
 //! the process table (what another process's `/proc/<pid>/stat`,
@@ -26,7 +27,7 @@ const LOOK_EVERY: Duration = Duration::from_millis(50);
 /// used when it began running this process (a host thread an `execve` keeps
 /// has run the program before).
 struct Running {
-    tid: u32,
+    tid: u64,
     base: u64,
 }
 
@@ -59,25 +60,16 @@ thread_local! {
     static MINE: RefCell<Option<Mine>> = const { RefCell::new(None) };
 }
 
-/// A schedstat's first field: time on a processor, in nanoseconds.
-fn schedstat(path: &str) -> Option<u64> {
-    std::fs::read_to_string(path).ok()?.split_whitespace().next()?.parse().ok()
-}
-
 fn thread_now() -> u64 {
-    schedstat("/proc/thread-self/schedstat").unwrap_or(0)
+    (gex_kernel::hostos::calls().thread_cpu_ns)(None).unwrap_or(0)
 }
 
-fn of_thread(tid: u32) -> Option<u64> {
-    schedstat(&format!("/proc/self/task/{tid}/schedstat"))
+fn of_thread(tid: u64) -> Option<u64> {
+    (gex_kernel::hostos::calls().thread_cpu_ns)(Some(tid))
 }
 
-/// This host thread's id: `/proc/thread-self` is `<pid>/task/<tid>`.
-fn host_tid() -> u32 {
-    std::fs::read_link("/proc/thread-self")
-        .ok()
-        .and_then(|p| p.file_name()?.to_str()?.parse().ok())
-        .unwrap_or(0)
+fn host_tid() -> u64 {
+    (gex_kernel::hostos::calls().thread_id)()
 }
 
 /// The kernel's processor-time clocks read these from now on.
@@ -132,7 +124,7 @@ fn leave() {
 /// The live threads' time (a thread gone meanwhile counts once its own
 /// `leave` has added it).
 fn live_of(pid: i32) -> u64 {
-    let live: Vec<(u32, u64)> = {
+    let live: Vec<(u64, u64)> = {
         let all = PROCS.lock().unwrap_or_else(|e| e.into_inner());
         all.get(&pid).map(|p| p.live.values().map(|r| (r.tid, r.base)).collect()).unwrap_or_default()
     };

@@ -18,6 +18,7 @@ mod prof;
 mod eject;
 mod pe_info;
 mod units;
+mod host_os;
 mod host_vm;
 mod host_xattr;
 mod host_thread_time;
@@ -52,6 +53,7 @@ fn main() -> ExitCode {
 }
 
 fn real_main() -> Result<ExitCode> {
+    host_os::install();
     host_xattr::install();
     host_vm::install();
     host_walk::install();

@@ -80,7 +80,7 @@ pub fn build_lock() -> Result<BuildLock> {
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 let holder = std::fs::read_to_string(&path).unwrap_or_default();
-                let alive = holder.trim().parse::<u32>().is_ok_and(|p| std::path::Path::new(&format!("/proc/{p}")).exists());
+                let alive = holder.trim().parse::<u32>().is_ok_and(gex_kernel::hostos::calls().alive);
                 if !alive && !holder.is_empty() {
                     let _ = std::fs::remove_file(&path);
                     continue;

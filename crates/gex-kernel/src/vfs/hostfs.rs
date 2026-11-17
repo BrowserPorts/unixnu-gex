@@ -292,10 +292,9 @@ impl FileHandle for HostHandle {
     }
 
     fn xattr(&self, op: super::XattrOp<'_>) -> Option<Result<usize, Errno>> {
-        use std::os::unix::io::AsRawFd;
         let f = self.file.lock().unwrap_or_else(|e| e.into_inner());
         let changes = !matches!(op, super::XattrOp::Get { .. } | super::XattrOp::List { .. });
-        let r = host_xattr::call(host_xattr::On::Fd(f.as_raw_fd()), op);
+        let r = host_xattr::call(host_xattr::On::Fd(&f), op);
         drop(f);
         if changes && r.is_ok() {
             self.vnote(crate::vnote::note::ATTRIB);
@@ -385,10 +384,9 @@ struct HostDir {
 
 impl FileHandle for HostDir {
     fn xattr(&self, op: super::XattrOp<'_>) -> Option<Result<usize, Errno>> {
-        use std::os::unix::io::AsRawFd;
         let (f, _, _) = self.held.as_ref()?;
         let changes = !matches!(op, super::XattrOp::Get { .. } | super::XattrOp::List { .. });
-        let r = host_xattr::call(host_xattr::On::Fd(f.as_raw_fd()), op);
+        let r = host_xattr::call(host_xattr::On::Fd(f), op);
         if changes && r.is_ok() {
             crate::vnote::post(crate::inotify::Key { fs: self.fs, ino: self.md.ino }, crate::vnote::note::ATTRIB);
         }
@@ -407,22 +405,28 @@ impl FileHandle for HostDir {
     fn read_dir(&self) -> Result<Vec<DirEntry>, Errno> {
         use std::os::fd::AsRawFd;
         let at = match &self.held {
+            // Linux lists the descriptor itself through its /proc link
             Some((f, _, _)) if cfg!(target_os = "linux") => PathBuf::from(format!("/proc/self/fd/{}", f.as_raw_fd())),
-            _ => self.host.clone(),
+            // elsewhere, where the host says it is now (`getdents` on a
+            // directory removed fails with ENOENT)
+            Some((f, _, _)) => match (crate::hostos::calls().fd_path)(f.as_raw_fd()) {
+                Some(Ok(now)) => now,
+                Some(Err(e)) => return Err(e),
+                None => self.host.clone(),
+            },
+            None => self.host.clone(),
         };
         list_dir(&at, &self.md)
     }
-    #[cfg(target_os = "linux")]
     fn moved(&self) -> Option<Result<super::Moved, Errno>> {
         use std::os::fd::AsRawFd;
         let (file, was, root) = self.held.as_ref()?;
-        let now = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok()?;
-        let now = now.to_str()?;
-        if now.ends_with(" (deleted)") {
-            return Some(Err(Errno::ENOENT));
-        }
+        let now = match (crate::hostos::calls().fd_path)(file.as_raw_fd())? {
+            Ok(now) => now,
+            Err(e) => return Some(Err(e)),
+        };
         // Moved out of the mount: the path it was opened at is all there is.
-        let rel = Path::new(now).strip_prefix(root).ok()?;
+        let rel = now.strip_prefix(root).ok()?;
         // Any directory renamed here counts as this one moving: the host
         // keeps no count per directory.
         Some(Ok(super::Moved { was: was.clone(), now: rel.to_str()?.to_string(), epoch: self.gate.epoch() }))
@@ -916,6 +920,7 @@ impl FileSystem for HostFs {
 
 use std::os::unix::fs::OpenOptionsExt;
 
+
 /// Extended attributes on the host's files, `user.` only either way: a
 /// guest neither sets nor sees the host's other namespaces. The calls
 /// themselves are the host's ([`set_host_xattr`]: this crate has no unsafe
@@ -981,10 +986,10 @@ pub mod host_xattr {
     use crate::errno::Errno;
 
     /// The node: a host path (its final link not followed: the guest's walk
-    /// already followed it, or was asked not to) or an open descriptor.
+    /// already followed it, or was asked not to) or an open file.
     pub enum On<'a> {
         Path(&'a std::path::Path),
-        Fd(i32),
+        Fd(&'a std::fs::File),
     }
 
     /// The host's `l*xattr`/`f*xattr` calls, one [`XattrOp`] on `on`: what
@@ -1004,14 +1009,17 @@ pub mod host_xattr {
         match op {
             XattrOp::Get { name, buf } => {
                 xattr_name(name).map_err(not_user)?;
+                user_permission(&on, false)?;
                 calls(&on, XattrOp::Get { name, buf })
             }
             XattrOp::Set { name, value, flags } => {
                 xattr_name(name)?;
+                user_permission(&on, true)?;
                 calls(&on, XattrOp::Set { name, value, flags })
             }
             XattrOp::Remove { name } => {
                 xattr_name(name).map_err(not_user)?;
+                user_permission(&on, true)?;
                 calls(&on, XattrOp::Remove { name })
             }
             XattrOp::List { buf } => {
@@ -1035,6 +1043,28 @@ pub mod host_xattr {
                 Ok(mine.len())
             }
         }
+    }
+
+    /// Linux's `xattr_permission` for a `user.` name: only regular files
+    /// and directories carry one (a write elsewhere is `EPERM`, a read
+    /// `ENODATA`); in a sticky directory only its owner (or root) writes
+    /// one; and then the node's own permission, read or write. A Linux host
+    /// applies these itself; XNU applies none of them.
+    fn user_permission(on: &On<'_>, write: bool) -> Result<(), Errno> {
+        use std::os::unix::fs::MetadataExt;
+        let md = match on {
+            On::Path(p) => std::fs::symlink_metadata(p),
+            On::Fd(f) => f.metadata(),
+        }
+        .map_err(|e| Errno::from_io(&e))?;
+        if !md.is_file() && !md.is_dir() {
+            return Err(if write { Errno::EPERM } else { Errno::ENODATA });
+        }
+        let ids = super::host_ids();
+        if write && md.is_dir() && md.mode() & 0o1000 != 0 && ids.uid != 0 && md.uid() != ids.uid {
+            return Err(Errno::EPERM);
+        }
+        super::access_by(&md, if write { 2 } else { 4 })
     }
 }
 
@@ -1140,8 +1170,14 @@ mod tests {
 /// what has an execute bit. ACLs and read-only mounts are not seen.
 #[cfg(unix)]
 fn host_access(host: &std::path::Path, mode: u32) -> Result<(), Errno> {
-    use std::os::unix::fs::MetadataExt;
     let md = std::fs::metadata(host).map_err(|e| Errno::from_io(&e))?;
+    access_by(&md, mode)
+}
+
+/// [`host_access`] for a node already looked at.
+#[cfg(unix)]
+fn access_by(md: &std::fs::Metadata, mode: u32) -> Result<(), Errno> {
+    use std::os::unix::fs::MetadataExt;
     let mode = mode & 7;
     if mode == 0 {
         return Ok(());

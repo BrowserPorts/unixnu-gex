@@ -1513,10 +1513,13 @@ mod tests {
         let classes: Vec<&str> = up.iter().map(|&i| t[i as usize].class).collect();
         assert_eq!(classes, ["AppleAPFSMedia", "AppleAPFSContainerScheme", "IOMedia", "IOGUIDPartitionScheme", "IOMedia", "IOBlockStorageDriver", "IOEmbeddedNVMeBlockDevice"]);
         assert!(provider(&t, *up.last().unwrap()).is_err());
-        // Each medium's children: its storage driver, then its BSD client.
+        // Each medium's children: its BSD client (its category started
+        // first), then its storage driver.
         let disk0 = up[4];
         let kids: Vec<&str> = links(&t, disk0, Plane::Service, false).unwrap().iter().map(|&i| t[i as usize].class).collect();
-        assert_eq!(kids, ["IOGUIDPartitionScheme", "IOMediaBSDClient"]);
+        assert_eq!(kids, ["IOMediaBSDClient", "IOGUIDPartitionScheme"]);
+        let kids: Vec<&str> = links(&t, media, Plane::Service, false).unwrap().iter().map(|&i| t[i as usize].class).collect();
+        assert_eq!(kids, ["AppleAPFSMediaBSDClient", "AppleAPFSContainer"]);
         // A recursive search up the parents finds the namespace's
         // characteristics.
         let (found, refused) = search(&t, media, Plane::Service, 3, "Protocol Characteristics", |_| true).unwrap();

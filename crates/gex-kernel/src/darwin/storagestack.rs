@@ -12,16 +12,16 @@
 //!               NS_01@1           IOEmbeddedNVMeBlockDevice, NSID 1
 //!                 IOBlockStorageDriver
 //!                   <model> Media IOMedia, disk0
+//!                     IOMediaBSDClient
 //!                     IOGUIDPartitionScheme
 //!                       Container@1           IOMedia, disk0s1
+//!                         IOMediaBSDClient
 //!                         AppleAPFSContainerScheme
 //!                           AppleAPFSMedia    disk1
+//!                             AppleAPFSMediaBSDClient
 //!                             AppleAPFSContainer
 //!                               <volume>@<slot+1>   AppleAPFSVolume
 //!                                 AppleAPFSVolumeBSDClient
-//!                             AppleAPFSMediaBSDClient
-//!                         IOMediaBSDClient
-//!                     IOMediaBSDClient
 //! ```
 //!
 //! - The PCIe path. `AppleT8011PCIe` (com.apple.driver.AppleT8011PCIe) is
@@ -63,9 +63,13 @@
 //! - `IOMediaBSDClient` (`IOResourceMatch` IOBSD, score 30000) matches every
 //!   IOMedia, and APFS's `AppleAPFSMediaBSDClient` and
 //!   `AppleAPFSVolumeBSDClient` (31000) its own. Each gives its medium its
-//!   BSD keys ([`super::storage::units`]). It matches once `IOKitBSDInit`
-//!   publishes IOBSD, so it attaches after the storage driver below the
-//!   medium (the media order's stand-in, [`super::storage::media_order`]).
+//!   BSD keys ([`super::storage::units`]). Its category is started before
+//!   the storage drivers' (`probeCandidates` starts the categories in the
+//!   order of their best probe score, 30000 and 31000 above the schemes'),
+//!   and `startCandidate` attaches it before it stalls for IOBSD, which
+//!   `IOKitBSDInit` publishes: it is the medium's first child. When it
+//!   gets its nodes is the media order's stand-in
+//!   ([`super::storage::media_order`]).
 //!
 //! The controller's other namespaces (its firmware namespace NS_02 with its
 //! own driver and whole disk, NS_03's diagnostics, NS_05's NVRAM, NS_06's
@@ -640,6 +644,7 @@ fn add_storage(t: &mut Vec<Node>, controller: Option<u32>) {
     let dt_parent = controller.and_then(|c| t[c as usize].parent);
     whole.dt = dt_parent.map(|p| DtLink { parent: p, name: "disk".to_string(), location: "1:0".to_string() });
     let whole = push(t, whole);
+    add_bsd_client(t, whole, BSD_CLIENT);
     // The GPT scheme: its personality, and the disk's GUID it publishes.
     let g = super::storage::gpt();
     let mut props = driver("com.apple.iokit.IOStorageFamily", GPT, "IOMedia", None, "IOStorage", 4000, vec![key("IOPropertyMatch", Prop::Dict(vec![key("Whole", Prop::Bool(true))])), key("Content Mask", string("GUID_partition_scheme"))]);
@@ -660,6 +665,7 @@ fn add_storage(t: &mut Vec<Node>, controller: Option<u32>) {
     let mut part = service(PARTITION_NAME, "IOMedia", Some(gpt), props, Table::Complete);
     part.dt = dt_parent.map(|p| DtLink { parent: p, name: "disk".to_string(), location: "1:1".to_string() });
     let part = push(t, part);
+    add_bsd_client(t, part, BSD_CLIENT);
     // AppleAPFSContainerScheme: its personality, its init's statistics
     // and APFSComposited (the container's nx_fusion_uuid null,
     // 0xfffffff0066824d4).
@@ -686,6 +692,7 @@ fn add_storage(t: &mut Vec<Node>, controller: Option<u32>) {
     props.push(key("UUID", sym(&uuid_string(&super::storage::container_uuid()))));
     props.extend(bsd_keys(Media::Container));
     let media = push(t, service(APFS_MEDIA, APFS_MEDIA, Some(scheme), props, Table::Complete));
+    add_bsd_client(t, media, APFS_MEDIA_BSD);
     // AppleAPFSContainer: its personality, then what its start sets
     // (0xfffffff00666ade4): its statistics (live, [`stats`]), then its
     // Status.
@@ -711,9 +718,6 @@ fn add_storage(t: &mut Vec<Node>, controller: Option<u32>) {
         let vol = push(t, service(v.name, APFS_VOLUME, Some(container), props, Table::Partial(partial.to_string())));
         add_bsd_client(t, vol, APFS_VOLUME_BSD);
     }
-    add_bsd_client(t, media, APFS_MEDIA_BSD);
-    add_bsd_client(t, part, BSD_CLIENT);
-    add_bsd_client(t, whole, BSD_CLIENT);
     add_namespaces(t, controller, dt_parent);
 }
 

@@ -154,7 +154,7 @@ pub fn children_unknown(class: &str) -> Option<&'static str> {
         // (and the wlan function below it) is published only once its
         // client, the WLAN driver, enables the port at run time.
         T8011_PCIE => Some("pci-bridge2's nub and the wlan function below it, which the bridge publishes once the WLAN driver enables that manual-enable port"),
-        TEMP_SENSOR | NVRAM | DIAG_DRIVER | EFFACEABLE_DRIVER | NAMESPACE_DEVICE => Some("the clients its family attaches, not followed"),
+        NAMESPACE_DEVICE => Some("the clients its family attaches, not followed"),
         _ => None,
     }
 }
@@ -165,7 +165,7 @@ pub fn children_unknown(class: &str) -> Option<&'static str> {
 pub fn class_complete(class: &str) -> bool {
     matches!(
         class,
-        APFS_SCHEME | APFS_MEDIA | APFS_CONTAINER | APFS_VOLUME | APFS_MEDIA_BSD | APFS_VOLUME_BSD | GPT | HOST_BRIDGE | T8011_PCIE | CONTROLLER | "AppleNVMeController" | "IONVMeController" | BLOCK_DEVICE | EFFACEABLE | "IONVMeBlockStorageDevice" | "IOBlockStorageDevice" | DRIVER | "IOMedia" | BSD_CLIENT | "IOPartitionScheme" | NAMESPACE_DEVICE | DIAGNOSTICS
+        APFS_SCHEME | APFS_MEDIA | APFS_CONTAINER | APFS_VOLUME | APFS_MEDIA_BSD | APFS_VOLUME_BSD | GPT | HOST_BRIDGE | T8011_PCIE | CONTROLLER | "AppleNVMeController" | "IONVMeController" | BLOCK_DEVICE | EFFACEABLE | "IONVMeBlockStorageDevice" | "IOBlockStorageDevice" | DRIVER | "IOMedia" | BSD_CLIENT | "IOPartitionScheme" | NAMESPACE_DEVICE | DIAGNOSTICS | TEMP_SENSOR | NVRAM | DIAG_DRIVER | EFFACEABLE_DRIVER
     )
 }
 
@@ -838,6 +838,9 @@ pub fn unmeasured() -> Vec<String> {
     if FIRMWARE_EUI64.is_none() {
         gaps.push(format!("NS_02's EUI64 (stand-in 0) and that no partition scheme recognizes the firmware namespace's contents (stand-in: a leaf with no content); measure {FIRMWARE_EUI64_MEASUREMENT} and its IOMedia's Content"));
     }
+    if EFFACEABLE_EUI64.is_none() {
+        gaps.push(format!("NS_06's EUI64 (stand-in 0); measure {EFFACEABLE_EUI64_MEASUREMENT}"));
+    }
     if CONTAINER_STATUS.is_none() {
         gaps.push(format!("the AppleAPFSContainer's Status (stand-in {STAND_IN_CONTAINER_STATUS:?}; measure {CONTAINER_STATUS_MEASUREMENT})"));
     }
@@ -1171,18 +1174,61 @@ pub const FIRMWARE_BLOCKS: u64 = 2048;
 /// shortcut.
 pub const FIRMWARE_EUI64: Option<u64> = None;
 
+/// The effaceable namespace's (NSID 6) Identify Namespace EUI64: the
+/// device's, once measured; zero meanwhile, a reported shortcut.
+pub const EFFACEABLE_EUI64: Option<u64> = None;
+
+/// What measures [`EFFACEABLE_EUI64`].
+pub const EFFACEABLE_EUI64_MEASUREMENT: &str = "the NamespaceUUID of NS_06 (a sysdiagnose's ioreg IOService plane)";
+
 /// What measures [`FIRMWARE_EUI64`].
 pub const FIRMWARE_EUI64_MEASUREMENT: &str = "the NamespaceUUID of NS_02 (a sysdiagnose's ioreg IOService plane)";
 
 /// The controller's objects made before its namespaces (InitializeController,
-/// 0xfffffff006a5b640, then slot 0x930, 0xfffffff006a5ecc4): its
-/// temperature sensor, an `AppleEmbeddedNVMeTemperatureSensor` (an
-/// IOHIDEventService), and its NVRAM, an `AppleEmbeddedNVMeNVRAM` on NSID 5.
-/// Neither is given a name (each is its class's) or a location. Their
-/// tables are their families': not followed.
+/// 0xfffffff006a5b640, then slot 0x930, 0xfffffff006a5ecc4), neither given
+/// a name (each is its class's) or a location:
+/// - Its temperature sensor, an `AppleEmbeddedNVMeTemperatureSensor` (an
+///   IOHIDEventService). Its init (0xfffffff006a651d0) sets QueueSize 0;
+///   AppleEmbeddedHIDEventService's `handleStart` (0xfffffff006b03430) sets
+///   Built-In (its orientation and placement are 0, so not those);
+///   `IOHIDEventService::start` (0xfffffff005aeb150) then sets its location
+///   ID ('TN0n'), vendor, vendor source, product, version and country
+///   (32-bit numbers, the controller giving none), its product name "NAND
+///   CH0 temp", its one usage pair (page 0xff00, usage 5), its report
+///   interval (0: the override 0xfffffff006b039c8) and primary usage; the
+///   controller has no Transport, Manufacturer or SerialNumber to copy. It
+///   registers (0xfffffff005aeb8c0). IOHIDFamily's personality of
+///   `IOHIDProviderPropertyMerger` on IOHIDEventService then merges its
+///   IOProviderMergeProperties into it (its probe merges them and fails):
+///   IOCFPlugInTypes, HIDServiceSupport and IOUserClientClass. No driver
+///   matches it.
+/// - Its NVRAM, an `AppleEmbeddedNVMeNVRAM` on NSID 5: its start
+///   (0xfffffff006a757fc) sets nothing and registers (0xfffffff006a75920,
+///   `IONVRAMController::registerService`). No driver matches it.
 fn add_controller_objects(t: &mut Vec<Node>, controller: u32) {
-    push(t, service(TEMP_SENSOR, TEMP_SENSOR, Some(controller), Vec::new(), Table::Partial("the HID event service's properties (IOHIDEventService and AppleEmbeddedHIDEventService), not followed".to_string())));
-    push(t, service(NVRAM, NVRAM, Some(controller), Vec::new(), Table::Partial("the NVRAM controller's properties (IONVRAMController and AppleEmbeddedNVMeNVRAM), not followed".to_string())));
+    let props = vec![
+        key("QueueSize", num32(0)),
+        key("Built-In", Prop::Bool(true)),
+        key("LocationID", num32(0x544e_306e)),
+        key("VendorID", num32(0)),
+        key("VendorIDSource", num32(0)),
+        key("ProductID", num32(0)),
+        key("VersionNumber", num32(0)),
+        key("CountryCode", num32(0)),
+        key("Product", string("NAND CH0 temp")),
+        key("DeviceUsagePairs", Prop::Array(vec![Prop::Dict(vec![key("DeviceUsagePage", num32(0xff00)), key("DeviceUsage", num32(5))])])),
+        key("ReportInterval", num32(0)),
+        key("PrimaryUsagePage", num32(0xff00)),
+        key("PrimaryUsage", num32(5)),
+        key("IOCFPlugInTypes", Prop::Dict(vec![
+            key("7DDEECA8-A7B4-11DA-8A0E-0014519758EF", string("IOHIDFamily.kext/PlugIns/IOHIDLib.plugin")),
+            key("FA12FA38-6F1A-11D4-BA0C-0005028F18D5", string("IOHIDFamily.kext/PlugIns/IOHIDLib.plugin")),
+        ])),
+        key("HIDServiceSupport", Prop::Bool(true)),
+        key("IOUserClientClass", string("IOHIDEventServiceUserClient")),
+    ];
+    push(t, service(TEMP_SENSOR, TEMP_SENSOR, Some(controller), props, Table::Complete));
+    push(t, service(NVRAM, NVRAM, Some(controller), Vec::new(), Table::Complete));
 }
 
 /// The namespaces after the root (`AllocateNodes`, 0xfffffff006a5e35c,
@@ -1221,13 +1267,29 @@ fn add_namespaces(t: &mut Vec<Node>, controller: Option<u32>, dt_parent: Option<
     whole.dt = dt_parent.map(|p| DtLink { parent: p, name: "disk".to_string(), location: Some("2:0".to_string()) });
     let whole = push(t, whole);
     add_bsd_client(t, whole, BSD_CLIENT);
-    let diag = push(t, service(DIAGNOSTICS, DIAGNOSTICS, Some(c), Vec::new(), Table::Partial("the diagnostics access's properties (AppleNANDConfigAccess and AppleEmbeddedNVMeDiagnostics), not followed".to_string())));
+    // Diagnostics' start (0xfffffff006a713b8) and its driver's
+    // (0xfffffff006c7b2cc) set nothing; both register (0xfffffff006a71504,
+    // 0xfffffff006c7b474).
+    let diag = push(t, service(DIAGNOSTICS, DIAGNOSTICS, Some(c), Vec::new(), Table::Complete));
     let props = driver("com.apple.driver.AppleDiagnosticDataAccessReadOnly", DIAG_DRIVER, "AppleNANDConfigAccess", None, "AppleDiagnosticDataAccess", 99, Vec::new());
-    push(t, service(DIAG_DRIVER, DIAG_DRIVER, Some(diag), props, Table::Partial("what AppleDiagnosticDataAccessReadOnly's start sets, not followed".to_string())));
-    let eff = push(t, service("NS_06", EFFACEABLE, Some(c), namespace_props(6, 0, block), Table::Partial("what IONVMeEffaceableDevice adds to or changes of IOEmbeddedNVMeBlockDevice's properties, and NSID 6's EUI64, not followed".to_string())));
+    push(t, service(DIAG_DRIVER, DIAG_DRIVER, Some(diag), props, Table::Complete));
+    // NS_06: IONVMeEffaceableDevice overrides the strings the namespace's
+    // Device Characteristics take (its vtable 0xfffffff006fa4380): vendor
+    // "Apple", product "Effaceable", revision "unknown revision".
+    let mut props = namespace_props(6, EFFACEABLE_EUI64.unwrap_or(0), block);
+    if let Some((_, Prop::Dict(d))) = props.iter_mut().find(|(k, _)| k == "Device Characteristics") {
+        for (k, v) in [("Vendor Name", "Apple"), ("Product Name", "Effaceable"), ("Product Revision Level", "unknown revision")] {
+            set(d, k, string(v));
+        }
+    }
+    let eff = push(t, service("NS_06", EFFACEABLE, Some(c), props, Table::Complete));
+    // AppleEffaceableBlockDevice's start (AppleEffaceableStorage's,
+    // 0xfffffff006586900) sets nothing and registers (0xfffffff006586ab4).
     let props = driver("com.apple.driver.AppleEffaceableBlockDevice", EFFACEABLE_DRIVER, EFFACEABLE, None, "IODefaultMatchCategory", 0, Vec::new());
-    push(t, service(EFFACEABLE_DRIVER, EFFACEABLE_DRIVER, Some(eff), props, Table::Partial("what AppleEffaceableBlockDevice's start sets, not followed".to_string())));
-    push(t, service("NS_07", NAMESPACE_DEVICE, Some(c), Vec::new(), Table::Partial("the panic log namespace's properties (AppleNVMeNamespaceDevice), not followed".to_string())));
+    push(t, service(EFFACEABLE_DRIVER, EFFACEABLE_DRIVER, Some(eff), props, Table::Complete));
+    // NS_07's start (0xfffffff006a7d5c4) names it, sets its type's key
+    // (0xfffffff006a7d8a0, the panic log's) and registers.
+    push(t, service("NS_07", NAMESPACE_DEVICE, Some(c), vec![key(NAMESPACE_TYPE_KEYS[namespace_type(7) as usize], Prop::Bool(true))], Table::Complete));
 }
 
 /// The namespace's IOStorageFeatures, a dictionary of three booleans in
@@ -1268,7 +1330,7 @@ fn add_bsd_client(t: &mut Vec<Node>, medium: u32, class: &'static str) {
 pub fn registers(class: &str) -> Option<bool> {
     match class {
         GPT | APFS_SCHEME => Some(false),
-        T8011_PCIE | PCI_DEVICE | HOST_BRIDGE | CONTROLLER | BLOCK_DEVICE | EFFACEABLE | DRIVER | "IOMedia" | BSD_CLIENT | APFS_MEDIA | APFS_CONTAINER | APFS_VOLUME | APFS_MEDIA_BSD | APFS_VOLUME_BSD | DIAGNOSTICS | NAMESPACE_DEVICE => Some(true),
+        T8011_PCIE | PCI_DEVICE | HOST_BRIDGE | CONTROLLER | BLOCK_DEVICE | EFFACEABLE | DRIVER | "IOMedia" | BSD_CLIENT | APFS_MEDIA | APFS_CONTAINER | APFS_VOLUME | APFS_MEDIA_BSD | APFS_VOLUME_BSD | DIAGNOSTICS | NAMESPACE_DEVICE | TEMP_SENSOR | NVRAM | DIAG_DRIVER | EFFACEABLE_DRIVER => Some(true),
         _ => None,
     }
 }
@@ -1280,7 +1342,7 @@ pub fn registers(class: &str) -> Option<bool> {
 /// answer rests on flags at +0xb0 not traced).
 pub fn property_override(t: &[Node], i: u32, name: &str) -> Option<String> {
     let n = t.get(i as usize)?;
-    if name == "WriteCacheState" && superclasses(n.class).contains(&"IOBlockStorageDevice") {
+    if name == "WriteCacheState" && superclasses(n.class).contains(&"IOBlockStorageDevice") && n.class != EFFACEABLE {
         return Some(format!("{}'s WriteCacheState (getWriteCacheState, from flags not traced)", n.name));
     }
     None
@@ -1348,6 +1410,12 @@ pub fn medium_of(n: &Node) -> Option<Media> {
 /// none ([`super::dkopen`]'s levels).
 pub fn live_prop(t: &[Node], i: u32, name: &str) -> Option<Prop> {
     let n = t.get(i as usize)?;
+    // The effaceable namespace's getWriteCacheState (0xfffffff006a709f0)
+    // answers success without writing, and IOBlockStorageDevice's
+    // getProperty override (0xfffffff00596ee88) starts from false.
+    if name == "WriteCacheState" && n.class == EFFACEABLE {
+        return Some(Prop::Bool(false));
+    }
     if name == "Statistics" {
         return match n.class {
             DRIVER => stats::namespace_of(t, i).map(stats::driver),

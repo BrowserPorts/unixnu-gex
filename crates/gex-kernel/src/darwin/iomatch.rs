@@ -810,6 +810,146 @@ fn compare_property(t: &[Node], i: u32, g: &Graph, table: Id, k: &str) -> Result
     Ok(copy_property(t, i, k)?.is_some_and(|p| equal(V::G(g, v), V::P(&p))))
 }
 
+/// `MatchPropertyTable` of IOHIDFamily (0xfffffff005ae2154), which
+/// `IOHIDEventService::matchPropertyTable` (0xfffffff005aec640) asks after
+/// IOService's: each of the table's keys it compares, with the table's
+/// value the receiver, must equal the service's (a key the table lacks
+/// passes, one the service lacks fails): PrimaryUsagePage, PrimaryUsage,
+/// each of the table's DeviceUsagePairs until one passes `CompareDeviceUsage`,
+/// `CompareDeviceUsage` of the table itself (which fails a service with no
+/// DeviceUsagePairs array), Transport, LocationID, VendorID, the product
+/// ID (`CompareProductID`), ModelNumber, VersionNumber, Manufacturer,
+/// SerialNumber, PhysicalDeviceUniqueID and BootProtocol. A table with
+/// HIDDefaultBehavior or HIDCompatibilityInterface needs the service to
+/// have it, and one with IOUserClass a CFBundleIdentifier string beginning
+/// "com.apple." (0xfffffff005ae2324).
+fn hid_match(t: &[Node], i: u32, g: &Graph, table: Id) -> Result<bool, String> {
+    let has = |k: &str| get(g, table, k);
+    let num = |p: &Option<Prop>| match p {
+        Some(Prop::Num(v, _)) => Some(*v),
+        _ => None,
+    };
+    // CompareDeviceUsage of `m` (the table, or one of its pairs).
+    let usage = |m: Id| -> Result<bool, String> {
+        let page = get(g, m, "DeviceUsagePage").filter(|&v| matches!(g.get(v), Obj::Number { .. }));
+        let use_ = get(g, m, "DeviceUsage").filter(|&v| matches!(g.get(v), Obj::Number { .. }));
+        let Some(Prop::Array(pairs)) = copy_property(t, i, "DeviceUsagePairs")? else { return Ok(false) };
+        let mut matches = true;
+        if page.is_some() || use_.is_some() {
+            for pair in &pairs {
+                let Prop::Dict(d) = pair else { continue };
+                let field = |k: &str| d.iter().find(|(n, _)| n == k).map(|(_, v)| v).filter(|v| matches!(v, Prop::Num(..)));
+                let (Some(p), Some(pp)) = (page, field("DeviceUsagePage")) else { continue };
+                matches = equal(V::G(g, p), V::P(pp));
+                if !matches {
+                    continue;
+                }
+                // A score is always asked for: a page alone decides.
+                let Some(u) = use_ else { break };
+                let Some(pu) = field("DeviceUsage") else { continue };
+                matches = equal(V::G(g, u), V::P(pu));
+                if matches {
+                    break;
+                }
+            }
+        }
+        Ok(matches)
+    };
+    for k in ["PrimaryUsagePage", "PrimaryUsage"] {
+        if !compare_property(t, i, g, table, k)? {
+            return Ok(false);
+        }
+    }
+    if let Some(pairs) = has("DeviceUsagePairs") {
+        if let Obj::Array(e) = g.get(pairs) {
+            let mut matches = true;
+            for &p in e {
+                if !matches!(g.get(p), Obj::Dict(_)) {
+                    continue;
+                }
+                matches = usage(p)?;
+                if matches {
+                    break;
+                }
+            }
+            if !matches {
+                return Ok(false);
+            }
+        }
+    }
+    if !usage(table)? {
+        return Ok(false);
+    }
+    for k in ["Transport", "LocationID", "VendorID"] {
+        if !compare_property(t, i, g, table, k)? {
+            return Ok(false);
+        }
+    }
+    // CompareProductID: the first of its four ways that matched with a
+    // score; else whether none failed (the table has no such key).
+    let pid = copy_property(t, i, "ProductID")?;
+    let table_pid = has("ProductID");
+    let mask = has("ProductIDMask").filter(|&m| matches!(g.get(m), Obj::Number { .. })).and_then(|m| g.u64_value(m)).map(|m| m as u32);
+    let array = has("ProductIDArray").and_then(|a| match g.get(a) {
+        Obj::Array(e) => Some(e.clone()),
+        _ => None,
+    });
+    let wildcard = table_pid.is_some_and(|p| matches!(g.get(p), Obj::String(s) | Obj::Symbol(s) if s == b"*"));
+    let (pid_match, pid_scored) = if wildcard { (true, true) } else {
+        match table_pid {
+            None => (true, false),
+            Some(p) => {
+                let m = pid.as_ref().is_some_and(|q| equal(V::G(g, p), V::P(q)));
+                (m, m)
+            }
+        }
+    };
+    let pid_num = num(&pid).map(|v| v as u32);
+    let (array_match, array_scored) = match &array {
+        None => (true, false),
+        Some(e) => {
+            let m = pid.as_ref().is_some_and(|q| matches!(q, Prop::Num(..)) && e.iter().any(|&a| matches!(g.get(a), Obj::Number { .. }) && equal(V::G(g, a), V::P(q))));
+            (m, m)
+        }
+    };
+    let table_pid_num = table_pid.filter(|&p| matches!(g.get(p), Obj::Number { .. })).and_then(|p| g.u64_value(p)).map(|v| v as u32);
+    let (mask_match, mask_scored) = match (table_pid_num, mask) {
+        (Some(v), Some(m)) => {
+            let ok = pid_num.is_some_and(|r| r & m == v & m);
+            (ok, ok)
+        }
+        _ => (true, false),
+    };
+    let (mask_array_match, mask_array_scored) = match (&array, mask) {
+        (Some(e), Some(m)) => {
+            let ok = pid_num.is_some_and(|r| e.iter().any(|&a| matches!(g.get(a), Obj::Number { .. }) && g.u64_value(a).is_some_and(|v| r & m == v as u32 & m)));
+            (ok, ok)
+        }
+        _ => (true, false),
+    };
+    let product = (pid_match && pid_scored) || (array_match && array_scored) || (mask_match && mask_scored) || (mask_array_match && mask_array_scored) || (pid_match && array_match && mask_match && mask_array_match);
+    if !product {
+        return Ok(false);
+    }
+    for k in ["ModelNumber", "VersionNumber", "Manufacturer", "SerialNumber", "PhysicalDeviceUniqueID", "BootProtocol"] {
+        if !compare_property(t, i, g, table, k)? {
+            return Ok(false);
+        }
+    }
+    for k in ["HIDDefaultBehavior", "HIDCompatibilityInterface"] {
+        if has(k).is_some() && copy_property(t, i, k)?.is_none() {
+            return Ok(false);
+        }
+    }
+    if has("IOUserClass").is_some() {
+        let apple = has("CFBundleIdentifier").is_some_and(|b| matches!(g.get(b), Obj::String(s) | Obj::Symbol(s) if s.starts_with(b"com.apple.")));
+        if !apple {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// The entry's `matchPropertyTable(table, score)` (slot 0x328), by its
 /// class:
 /// - `IOService`'s calls the one-argument form (slot 0x330), true but for
@@ -821,12 +961,12 @@ fn compare_property(t: &[Node], i: u32, g: &Graph, table: Id, k: &str) -> Result
 ///   (`matchNubWithPropertyTable`, slot 0x5a0, IOPCIBridge's for every
 ///   bridge here: `pciMatchNub` against the configuration registers, then
 ///   the tunnel checks, which no nub here is subject to).
-/// - `IOHIDEventService`'s is its own (0xfffffff005aec640), not followed.
+/// - `IOHIDEventService`'s is its own (0xfffffff005aec640, [`hid_match`]).
 /// - The other classes here keep IOService's.
 fn match_property_table(t: &[Node], i: u32, g: &Graph, table: Id) -> Result<bool, String> {
     let c = chain(t, i);
     if c.contains(&"IOHIDEventService") {
-        return Err(format!("IOHIDEventService's matchPropertyTable on {}", iokit::name(t, i)));
+        return hid_match(t, i, g, table);
     }
     if c.contains(&"IOMedia") {
         for k in ["Content", "Content Hint", "Ejectable", "Leaf", "Open", "Preferred Block Size", "Removable", "Size", "UUID", "Whole", "Writable"] {

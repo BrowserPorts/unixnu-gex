@@ -1817,6 +1817,49 @@ mod tests {
         assert_eq!(super::super::iomatch::registration_order(&t).iter().filter(|&&i| class(i) == "IOPMrootDomain").count(), 1);
     }
 
+    #[test]
+    fn the_controllers_other_children_register_with_their_tables() {
+        use super::super::osserialize::{Graph, Obj};
+        let mut b = Vec::new();
+        node(&mut b, "device-tree", &[("compatible", b"J120AP\0iPad7,1\0AppleARM\0")], 1);
+        node(&mut b, "arm-io", &[("compatible", b"arm-io,t8011\0")], 1);
+        node(&mut b, "apcie", &[("compatible", b"apcie,t8011\0")], 1);
+        node(&mut b, "pci-bridge0", &[("compatible", b"apcie-bridge\0"), ("AAPL,unit-string", b"00000000")], 1);
+        node(&mut b, "s3e", &[("AAPL,unit-string", b"00000000")], 0);
+        let t = build(&b).unwrap();
+        let find = |class: &str| t.iter().position(|n| n.class == class).unwrap() as u32;
+        let p = |i: u32, k: &str| properties(&t, i).into_iter().find(|(pk, _)| pk == k).map(|(_, v)| v);
+        let sensor = find("AppleEmbeddedNVMeTemperatureSensor");
+        assert_eq!(p(sensor, "LocationID"), Some(Prop::Num(0x544e_306e, 32)));
+        assert_eq!(properties_missing(&t, sensor), None);
+        // NS_06's characteristics are the effaceable device's, and its
+        // write cache state is false.
+        let ns6 = t.iter().position(|n| n.name == "NS_06").unwrap() as u32;
+        assert!(matches!(p(ns6, "Device Characteristics"), Some(Prop::Dict(d)) if d[0] == ("Vendor Name".to_string(), Prop::Str("Apple".to_string())) && d[1].1 == Prop::Str("Effaceable".to_string())));
+        assert_eq!(lookup(&t, ns6, "WriteCacheState"), Ok(Some(serialize_prop(&Prop::Bool(false)))));
+        let ns7 = t.iter().position(|n| n.name == "NS_07").unwrap() as u32;
+        assert_eq!(p(ns7, "EmbeddedDeviceTypePanicLog"), Some(Prop::Bool(true)));
+        // They register: the sensor matches as IOHIDEventService by its
+        // usage page and location (a unique ID decides it), and its class.
+        let by = |entries: &[(&str, Obj)]| {
+            let mut g = Graph::default();
+            let d = g.add(Obj::Dict(Vec::new()));
+            for (k, v) in entries {
+                let v = g.add(v.clone());
+                g.dict_set(d, k.as_bytes(), v);
+            }
+            super::super::iomatch::existing(&t, &g, d, false)
+        };
+        let s = |v: &str| Obj::String(v.as_bytes().to_vec());
+        assert_eq!(by(&[("IOProviderClass", s("AppleEmbeddedNVMeTemperatureSensor"))]), Ok(vec![sensor]));
+        assert_eq!(by(&[("IOProviderClass", s("AppleEmbeddedNVMeTemperatureSensor")), ("PrimaryUsagePage", Obj::Number { size: 32, value: 0xff00 }), ("DeviceUsagePage", Obj::Number { size: 32, value: 0xff00 })]), Ok(vec![sensor]));
+        assert_eq!(by(&[("IOProviderClass", s("AppleEmbeddedNVMeTemperatureSensor")), ("DeviceUsagePage", Obj::Number { size: 32, value: 0xff00 }), ("DeviceUsage", Obj::Number { size: 32, value: 4 })]), Ok(vec![]));
+        assert_eq!(by(&[("IOProviderClass", s("AppleEmbeddedNVMeTemperatureSensor")), ("ProductID", s("*"))]), Ok(vec![sensor]));
+        assert_eq!(by(&[("IOProviderClass", s("AppleEmbeddedNVMeTemperatureSensor")), ("ProductIDArray", Obj::Array(Vec::new()))]), Ok(vec![]));
+        assert_eq!(by(&[("IOProviderClass", s("AppleEmbeddedNVMeNVRAM"))]), Ok(vec![find("AppleEmbeddedNVMeNVRAM")]));
+        assert_eq!(by(&[("IOProviderClass", s("AppleDiagnosticDataAccessReadOnly"))]), Ok(vec![find("AppleDiagnosticDataAccessReadOnly")]));
+    }
+
     /// device-tree { chosen { memory-map }, arm-io }, under the root.
     fn small_tree() -> Vec<Node> {
         let mut b = Vec::new();

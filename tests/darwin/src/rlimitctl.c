@@ -1,6 +1,8 @@
 // proc_rlimit_control: the wakeups monitor each task starts with, what
 // asking for its parameters reports after turning it off, and what the
-// other flavors refuse.
+// other flavors refuse. The footprint's interval peak (the release kernel
+// has CONFIG_LEDGER_INTERVAL_MAX) is reset with FOOTPRINT_INTERVAL_RESET,
+// its only option.
 
 #include <errno.h>
 #include <stdint.h>
@@ -48,6 +50,9 @@ int main(void) {
     if (proc_rlimit_control(-1, RLIMIT_THREAD_CPULIMITS, (void *)0) != -1 || errno != EINVAL) return bad("a percentage of nothing", errno, EINVAL);
     errno = 0;
     if (proc_rlimit_control(getpid(), RLIMIT_THREAD_CPULIMITS, (void *)50) != -1 || errno != EINVAL) return bad("a pid for this thread's limit", errno, EINVAL);
+    errno = 0;
+    if (proc_rlimit_control(-1, RLIMIT_FOOTPRINT_INTERVAL, (void *)0) != -1 || errno != EINVAL) return bad("an interval with no option", errno, EINVAL);
+    if (proc_rlimit_control(-1, RLIMIT_FOOTPRINT_INTERVAL, (void *)FOOTPRINT_INTERVAL_RESET) != 0) return bad("an interval reset", errno, 0);
     errno = 0;
     if (proc_rlimit_control(-1, 99, &w) != -1 || errno != EINVAL) return bad("a flavor that does not exist", errno, EINVAL);
     errno = 0;

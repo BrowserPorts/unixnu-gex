@@ -142,7 +142,12 @@ pub fn superclasses(class: &str) -> &'static [&'static str] {
 /// here have all theirs (user clients are not registry entries here).
 pub fn children_unknown(class: &str) -> Option<&'static str> {
     match class {
-        T8011_PCIE => Some("the root complex's other ports (pci-bridge2, whose port is enabled by hand)"),
+        // pci-bridge2's port has manual-enable: AppleEmbeddedPCIE's port
+        // bring-up leaves it down (0xfffffff00662337c) and config space
+        // behind a port not up is not read (0xfffffff00661d6bc), so its nub
+        // (and the wlan function below it) is published only once its
+        // client, the WLAN driver, enables the port at run time.
+        T8011_PCIE => Some("pci-bridge2's nub and the wlan function below it, which the bridge publishes once the WLAN driver enables that manual-enable port"),
         TEMP_SENSOR | NVRAM | DIAG_DRIVER | EFFACEABLE_DRIVER | NAMESPACE_DEVICE => Some("the clients its family attaches, not followed"),
         _ => None,
     }

@@ -41,10 +41,9 @@
 //! checkpoint maps among them (C, the copy stored before its own count). A
 //! mount takes the count from the newest checkpoint's copy.
 //!
-//! What is not implemented is refused: the B-trees' general split and
-//! merge ([`super::btree`]), metadata of more than one block, data
-//! allocations, a free queue drained for an allocation or for its size,
-//! snapshots, chunk-info address blocks, Fusion.
+//! What is not implemented is refused: metadata of more than one block,
+//! data allocations, a free queue drained for an allocation or for its
+//! size, snapshots, chunk-info address blocks, Fusion.
 
 use super::btree::{self, Store, Tree};
 use super::container::{Formatted, Layout, NX_CLEANLY_UNMOUNTED};

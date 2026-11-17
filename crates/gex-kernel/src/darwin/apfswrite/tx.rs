@@ -120,6 +120,8 @@ pub struct Nx<'a> {
     ipbm_tail: u16,
     fq: [FreeQueue; 2],
     sm_free: u64,
+    /// `sm_fs_reserve_block_count`, `sm_fs_reserve_alloc_count`.
+    reserve: (u64, u64),
     datazone: [(u64, u64); 4],
     meta_cursor: u64,
     omap: BTreeMap<(u64, u64), (u32, u32, u64)>,
@@ -188,6 +190,7 @@ impl<'a> Nx<'a> {
             ipbm_tail: (l.ip_bm_count - 1) as u16,
             fq: [FreeQueue { limit: l.fq_ip_limit as u16, ..Default::default() }, FreeQueue { limit: l.fq_main_limit as u16, ..Default::default() }],
             sm_free,
+            reserve: (0, 0),
             datazone: [(0, 0); 4],
             meta_cursor: l.first_metadata_block(),
             omap: BTreeMap::new(),
@@ -549,6 +552,8 @@ impl<'a> Nx<'a> {
         sm.put32(0x40, l.cibs as u32);
         sm.put32(0x44, l.cabs as u32);
         sm.put64(0x48, self.sm_free);
+        sm.put64(0xb8, self.reserve.0);
+        sm.put64(0xc0, self.reserve.1);
         sm.put32(0x50, l.addr_offset as u32);
         sm.put32(0x80, (l.addr_offset + 8 * l.cibs) as u32);
         sm.put32(0x90, 1);
@@ -646,7 +651,22 @@ impl<'a> Nx<'a> {
         sb.put64(0x28, 0x2);
         let unwritten = v.e_apfs && ![0x1u16, 0x4, 0x8, 0x10, 0x20, 0x80, 0xc0, 0x100, 0x140, 0x280, 0x2c0].contains(&v.role);
         sb.put64(0x38, 0x8 | if unwritten { 0x80 } else { 0 });
-        sb.put64(0x58, 5);
+        // `fssize=` (-s): the reserve and the quota, in blocks rounded up;
+        // the space manager's reserve grows by it and counts the blocks the
+        // volume holds against it (`spaceman_fs_bounds_set`, 0x100049c60;
+        // measured: a volume's 5 blocks, for reserves of more than 5).
+        let alloc = 5u64;
+        if let Some(bytes) = v.size_bytes {
+            let blocks = bytes.div_ceil(bs);
+            if blocks < alloc {
+                return Err("not implemented: a volume reserve smaller than the blocks the new volume holds (spaceman_fs_bounds_set's count of them)".into());
+            }
+            sb.put64(0x48, blocks);
+            sb.put64(0x50, blocks);
+            self.reserve.0 += blocks;
+            self.reserve.1 += alloc;
+        }
+        sb.put64(0x58, alloc);
         if self.mode == Mode::Kernel {
             // wrapped_meta_crypto_state_t: version 5.0, no flags, class F
             // (6), the OS version, key revision 1.
@@ -740,6 +760,8 @@ pub struct NewVolume {
     pub gid: u32,
     /// `cp_os_version()`, the kernel's meta crypto state's.
     pub key_os_version: u32,
+    /// `-s`'s bytes (`fssize=`): the volume's reserve and quota.
+    pub size_bytes: Option<u64>,
 }
 
 /// The fs-tree records `apfs_newfs` inserts, in its order: the root's
@@ -1068,9 +1090,9 @@ mod tests {
         assert_eq!(order, want);
     }
 
-    /// newfs_apfs's own -C and seven -A runs in the restore's order
-    /// (GEX_TEST_NEWFS_RESTORE7: its image), byte for byte, given its uuid
-    /// and clock readings.
+    /// newfs_apfs's own -C and seven -A runs in the restore's order and
+    /// with its sizes (GEX_TEST_NEWFS_RESTORE7: its image), byte for byte,
+    /// given its uuid and clock readings.
     #[test]
     fn volumes_match_newfs() {
         let Ok(path) = std::env::var("GEX_TEST_NEWFS_RESTORE7") else { return };
@@ -1094,8 +1116,8 @@ mod tests {
         let q = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
         // The six-object volumes are 8 blocks apart from the zone's middle.
         let mid = fm.layout.metazone().unwrap().1;
-        let vols = [("System", 0x1u16), ("xART", 0x100), ("Hardware", 0x140), ("Preboot", 0x10), ("Update", 0xc0), ("Data", 0x40), ("User", 0x2)];
-        for (k, (name, role)) in vols.iter().enumerate() {
+        let vols = [("System", 0x1u16, None), ("xART", 0x100, Some(10_485_760)), ("Hardware", 0x140, Some(6_291_456)), ("Preboot", 0x10, None), ("Update", 0xc0, None), ("Data", 0x40, None), ("User", 0x2, None)];
+        for (k, (name, role, size)) in vols.iter().enumerate() {
             let sbb = rd(mid + 7 + 8 * k as u64);
             let rootb = rd(mid + 6 + 8 * k as u64);
             // The clock readings: the format's start, the directories'
@@ -1104,7 +1126,7 @@ mod tests {
             let toc_v = |slot: usize| 4096 - 40 - u16::from_le_bytes(rootb[56 + 8 * slot + 4..56 + 8 * slot + 6].try_into().unwrap()) as usize;
             let times = VolumeTimes { formatted: q(&sbb, 0x130), root: tv(toc_v(1) + 8), private: tv(toc_v(0) + 8), modified: q(&sbb, 0x100) };
             nx.mount_rw().unwrap();
-            nx.create_volume(&NewVolume { name: name.to_string(), role: *role, encrypted: false, e_apfs: true, times, uid: 0, gid: 0, key_os_version: 0 }).unwrap();
+            nx.create_volume(&NewVolume { name: name.to_string(), role: *role, encrypted: false, e_apfs: true, times, uid: 0, gid: 0, key_os_version: 0, size_bytes: *size }).unwrap();
             nx.commit().unwrap();
             nx.unmount().unwrap();
         }

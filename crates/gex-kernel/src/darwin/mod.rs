@@ -250,6 +250,12 @@ pub struct Task {
     /// to wake or start, a creator pass.
     pub workq: Option<Box<workq::Workq>>,
     pub workq_wake: Vec<i32>,
+    /// A thread call is running (`THREAD_TAG_CALLOUT` with
+    /// `callout_woken_from_icontext`): the threads it wakes are interrupt
+    /// wakeups. And the workqueue threads it woke whose wake is yet to be
+    /// done.
+    pub in_callout: bool,
+    pub callout_woken: std::collections::HashSet<i32>,
     pub workq_creator_pending: Option<u32>,
     /// Every thread request: the workqueue's (`workq_kernreturn`'s) and
     /// the kqueues' (`kqwq_request`, `kqwl_request`).

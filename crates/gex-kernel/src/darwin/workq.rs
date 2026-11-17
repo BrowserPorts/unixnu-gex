@@ -2066,6 +2066,9 @@ impl Kernel {
     /// thread is started.
     fn workq_thread_wakeup(&mut self, tid: i32) {
         self.dtask.workq_wake.push(tid);
+        if self.dtask.in_callout {
+            self.dtask.callout_woken.insert(tid);
+        }
     }
 
     /// What the workqueue owes after a call outside it: a creator pass, and
@@ -2080,7 +2083,12 @@ impl Kernel {
         for tid in std::mem::take(&mut self.dtask.workq_wake) {
             let Some(t) = self.dtask.threads.map.get_mut(&tid).and_then(|t| t.wq.as_mut()) else { continue };
             match t.unstarted.take() {
-                Some(req) => self.dtask.spawns.push(req),
+                Some(req) => {
+                    self.dtask.spawns.push(req);
+                    if self.dtask.callout_woken.remove(&tid) {
+                        self.darwin_interrupt_wakeup();
+                    }
+                }
                 None => {
                     self.darwin_wake(m, tid, WaitResult::Awakened);
                 }

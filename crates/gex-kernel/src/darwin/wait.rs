@@ -132,6 +132,9 @@ impl Kernel {
         slot.waiting = false;
         slot.result = Some(result);
         let word = slot.word;
+        if self.dtask.in_callout | self.dtask.callout_woken.remove(&tid) {
+            self.darwin_interrupt_wakeup();
+        }
         let mut k = m.kernel();
         let v = k.read_u32(word).unwrap_or(0).wrapping_add(1);
         let _ = k.write_u32(word, v);
@@ -152,7 +155,12 @@ impl Kernel {
         let own_deadline = wait.deadline.is_some_and(|d| Instant::now() >= d);
         let res = match r {
             Err(e) if e == Errno::EINTR => WaitResult::Interrupted,
-            _ if own_deadline => WaitResult::TimedOut,
+            // thread_timer_expire: the wait's timer, from the timer
+            // interrupt, makes it runnable.
+            _ if own_deadline => {
+                self.dtask.rusage.interrupt_wkups.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                WaitResult::TimedOut
+            }
             _ => {
                 self.darwin_finish = Some(wait);
                 return End::Again;

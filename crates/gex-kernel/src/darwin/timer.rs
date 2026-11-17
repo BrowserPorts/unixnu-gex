@@ -153,20 +153,45 @@ impl Kernel {
             if key.0 > now {
                 break Some(key.0);
             }
-            match self.dtask.timers.armed.remove(&key).expect("first key") {
+            // A delayed thread call: the timer interrupt woke a thread of
+            // its group (thread_call_wake), so what that thread wakes is an
+            // interrupt wakeup. The framebuffer's vertical blank is an
+            // interrupt event source's work-loop thread's, not a callout's.
+            let action = self.dtask.timers.armed.remove(&key).expect("first key");
+            self.dtask.in_callout = action != Action::Iomfb;
+            self.darwin_ipc_callout(true);
+            match action {
                 Action::MkTimer(port) => self.mk_timer_expire(m, port, key),
                 Action::Workq(c) => self.darwin_workq_call(m, c),
-                Action::RealTimer => self.darwin_realitexpire(),
+                Action::RealTimer => {
+                    // psignal's wakeup of a thread, if any, is not followed.
+                    self.dtask.rusage.wkups_unkept.store(true, std::sync::atomic::Ordering::Release);
+                    self.darwin_realitexpire()
+                }
                 Action::Iomfb => self.darwin_iomfb_blank(m),
                 Action::Knote(n, state) => {
                     self.filt_timerexpire(n, state);
                     self.darwin_kevent_settle(m);
                 }
             }
+            self.darwin_ipc_callout(false);
+            self.dtask.in_callout = false;
         };
         match (own, jetsam) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
+        }
+    }
+
+    /// A thread call begins (`true`) or ends: the processes it told of
+    /// something in the meantime have their interrupt wakeups marked as
+    /// not followed.
+    fn darwin_ipc_callout(&mut self, begin: bool) {
+        let told = std::mem::replace(&mut *self.ipc().callout_remotes.lock().unwrap_or_else(|e| e.into_inner()), begin.then(Vec::new));
+        for pid in told.unwrap_or_default() {
+            if let Some((p, _)) = self.darwin_public(pid) {
+                p.rusage.wkups_unkept.store(true, std::sync::atomic::Ordering::Release);
+            }
         }
     }
 

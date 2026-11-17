@@ -13,7 +13,8 @@
 // are its parent's ri_child sums; a parent with SA_NOCLDWAIT has them
 // added twice (at the child's exit and at the system's reap). The time by
 // effective QoS: a thread's time goes to the QoS it ran at (utility, then
-// background), and the seven sum to the task's time. The fields
+// background), and the seven sum to the task's time. Each sleep that its
+// deadline timer ends is a wakeup from interrupt context. The fields
 // the kernel does not keep are reported, so a strict run stops at a
 // call that copies one ("stop").
 
@@ -128,6 +129,14 @@ int main(int argc, char **argv) {
     uint64_t qsum = q2.ri_cpu_time_qos_default + q2.ri_cpu_time_qos_maintenance + q2.ri_cpu_time_qos_background + q2.ri_cpu_time_qos_utility + q2.ri_cpu_time_qos_legacy + q2.ri_cpu_time_qos_user_initiated + q2.ri_cpu_time_qos_user_interactive;
     if (ns_of(qsum > q2.ri_user_time ? qsum - q2.ri_user_time : q2.ri_user_time - qsum) > 1000000) return bad("the QoS times' sum against the time (us)", (long)(ns_of(qsum) / 1000), (long)(ns_of(q2.ri_user_time) / 1000));
     pthread_set_qos_class_self_np(QOS_CLASS_DEFAULT, 0);
+
+    // Five sleeps, five interrupt wakeups (at least: a thread call may wake
+    // a thread of the process meanwhile).
+    struct rusage_info_v6 w0, w1;
+    proc_pid_rusage(getpid(), RUSAGE_INFO_V0, &w0);
+    for (int i = 0; i < 5; i++) usleep(2000);
+    proc_pid_rusage(getpid(), RUSAGE_INFO_V0, &w1);
+    if (w1.ri_interrupt_wkups - w0.ri_interrupt_wkups < 5) return bad("interrupt wakeups of five sleeps", (long)(w1.ri_interrupt_wkups - w0.ri_interrupt_wkups), 5);
 
     // Wirings: three 16 KiB pages, then none.
     uint64_t wired0 = r.ri_wired_size;

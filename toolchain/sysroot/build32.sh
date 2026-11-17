@@ -105,25 +105,28 @@ for h in $(grep -l __i386__ "$SR"/asm/*.h); do
 done
 
 cd "$OUT/crt-build"
+# against this sysroot's musl and clang's own headers, as build64.sh's (with
+# no sysroot, clang's Linux driver searches the build machine's /usr/include)
+CRT_CFLAGS="$WASM_CFLAGS -nostdinc -isystem $SR -isystem $(clang -print-resource-dir)/include"
 # objects of other flags are built again (a build directory copied from one
 # made without gexcc's -fvisibility=default kept its hidden builtins, and
 # libc.so then exported none of them)
-if [ "$(cat .gex-flags 2>/dev/null)" != "$CRT $WASM_CFLAGS" ]; then
+if [ "$(cat .gex-flags 2>/dev/null)" != "$CRT $CRT_CFLAGS" ]; then
   rm -f ./*.o
-  printf '%s' "$CRT $WASM_CFLAGS" > .gex-flags
+  printf '%s' "$CRT $CRT_CFLAGS" > .gex-flags
 fi
-objs=
+objs= todo=
 for f in "$CRT"/*.c; do
   b=$(basename "$f" .c)
   case $b in
     apple_versioning|clear_cache|enable_execute_stack|trampoline_setup|emutls|\
     gcc_personality_v0|os_version_check|atomic*|*xf*|*xc3|*bf2|crtbegin|crtend) continue ;;
   esac
-  [ "$b.o" -nt "$f" ] || clang $WASM_CFLAGS -Wno-everything -c "$f" -o "$b.o" &
+  [ "$b.o" -nt "$f" ] || todo="$todo $f"
   objs="$objs $b.o"
-  [ $(jobs -p | wc -l) -ge "$JOBS" ] && wait -n 2>/dev/null || true
 done
-wait
+# JOBS compiles at a time (sh has no `wait -n`)
+[ -z "$todo" ] || printf '%s\n' $todo | xargs -P "$JOBS" -I{} sh -c 'clang $1 -Wno-everything -c "$2" -o "$(basename "$2" .c).o"' sh "$CRT_CFLAGS" {}
 rm -f "$OUT/sysroot/lib/libclang_rt.builtins-wasm32.a"
 llvm-ar crs "$OUT/sysroot/lib/libclang_rt.builtins-wasm32.a" $objs
 # The ICALL pass (wcc applies it to Wine's PE-side code, -D_WIN32).

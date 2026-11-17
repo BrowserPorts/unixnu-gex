@@ -15,6 +15,7 @@
 pub mod container;
 pub mod gpt;
 pub mod restore;
+pub mod seal;
 pub mod tx;
 
 use super::apfsread::Medium;

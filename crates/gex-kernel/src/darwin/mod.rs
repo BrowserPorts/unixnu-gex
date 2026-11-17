@@ -17,6 +17,7 @@ pub mod aio;
 pub mod amfi;
 pub mod apfs;
 pub mod apfsread;
+pub mod apfswrite;
 pub mod applematch;
 pub mod attrcall;
 pub mod attrlist;

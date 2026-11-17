@@ -330,7 +330,7 @@ pub const LO0_INDEX: u16 = 1;
 /// `mbuf_default_ncl(mem_actual)` (`ncl_table`), rounded down to whole
 /// 16 KiB pages of clusters; `mem_actual` is iBoot's `memSizeActual`, a
 /// fact of the device answered with the 4 GiB stand-in
-/// ([`MEM_ACTUAL_STAND_IN`]).
+/// ([`super::mig::machine::MEM_ACTUAL`]).
 pub fn udp_recvspace() -> u64 {
     const MB: u64 = 1 << 20;
     const GB: u64 = 1 << 30;
@@ -338,7 +338,7 @@ pub fn udp_recvspace() -> u64 {
     const NCLPG: u64 = 16384 >> MCLSHIFT;
     // ncl_table: (nt_maxmem, nt_mbpool).
     const NCL_TABLE: [(u64, u64); 5] = [(GB, 64 * MB), (4 * GB, 96 * MB), (8 * GB, 128 * MB), (16 * GB, 256 * MB), (32 * GB, 512 * MB)];
-    let mem = super::mig::machine::MEMORY;
+    let mem = super::mig::machine::MEM_ACTUAL;
     let mut pool = NCL_TABLE[0].1;
     for (maxmem, mbpool) in NCL_TABLE {
         if mem < maxmem {
@@ -354,8 +354,6 @@ pub fn udp_recvspace() -> u64 {
     }
 }
 
-/// The stand-in [`udp_recvspace`] rests on, as gexc reports it.
-pub const MEM_ACTUAL_STAND_IN: &str = "the device's physical memory size (iBoot's memSizeActual, mem_actual: hw.memsize, and the mbuf pool's tier that sets udp_recvspace) (stand-in 4 GiB, so a 96 MB pool and udp_recvspace 786896; under 4 GiB the pool is 64 MB and udp_recvspace 196724; measure `sysctl hw.memsize hw.memsize_physical net.inet.udp.recvspace` on the device)";
 
 /// The zone embedded in a scoped address (`ntohs(s6_addr16[1])`).
 fn zone(a: &[u8; 16]) -> u16 {

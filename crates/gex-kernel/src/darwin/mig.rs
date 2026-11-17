@@ -35,8 +35,22 @@ pub(crate) const MIG_BAD_ARGUMENTS: i32 = -304;
 pub mod machine {
     /// J120's device tree: `cpu0`..`cpu2` (`#main-cpus` 3).
     pub const NCPUS: u32 = 3;
-    /// The iPad Pro (12.9-inch, 2nd generation)'s 4 GiB.
-    pub const MEMORY: u64 = 4 << 30;
+    /// iBoot's `memSizeActual`, the DRAM's size: `mem_actual` and
+    /// `max_mem_actual` (`arm_vm_init`), which `hw.memsize_physical`,
+    /// `scale_setup`, the mbuf pool's tier and IOGPU read. The iPad Pro
+    /// (12.9-inch, 2nd generation)'s 4 GiB, unmeasured ([`MEM_ACTUAL_STAND_IN`]).
+    pub const MEM_ACTUAL: u64 = 4 << 30;
+    /// iBoot's `memSize`, the DRAM less the carveouts iBoot keeps at its
+    /// top, rounded down to the page: `mem_size` and `max_mem`
+    /// (`arm_vm_init`, with no `maxmem` boot argument), which `hw.memsize`,
+    /// `host_basic_info`, memorystatus and the user wire limit read.
+    /// Unmeasured: the stand-in is [`MEM_ACTUAL`]'s, where the device's is
+    /// below it by the carveouts ([`MEM_SIZE_STAND_IN`]).
+    pub const MEM_SIZE: u64 = MEM_ACTUAL;
+    /// The stand-in [`MEM_ACTUAL`] is, as gexc reports it.
+    pub const MEM_ACTUAL_STAND_IN: &str = "the device's DRAM size (iBoot's memSizeActual: mem_actual and max_mem_actual, hw.memsize_physical, and the mbuf pool's tier that sets udp_recvspace) (stand-in 4 GiB, so a 96 MB pool and udp_recvspace 786896; under 4 GiB the pool is 64 MB and udp_recvspace 196724; measure `sysctl hw.memsize_physical net.inet.udp.recvspace` on the device)";
+    /// The stand-in [`MEM_SIZE`] is, as gexc reports it.
+    pub const MEM_SIZE_STAND_IN: &str = "the memory the kernel manages (iBoot's memSize: mem_size and max_mem, hw.memsize, host_basic_info's memory_size and max_mem, the user wire limit, IOSurface's allocation limit) (stand-in 4 GiB, the DRAM's, where the device's is below it by iBoot's carveouts; memorystatus's ios13extended_footprint answer is the same for any size above 2 GB; measure `sysctl hw.memsize` on the device)";
     /// `task_threadmax` after `scale_setup`: `CONFIG_TASK_MAX` is 512 for
     /// the xsmall memory tag, and a machine with at least 3 GiB (and under
     /// 8) doubles it.
@@ -1357,7 +1371,10 @@ fn host_info(flavor: i32, count: u32) -> Reply {
     const HOST_SEMAPHORE_TRAPS: i32 = 7;
     const HOST_MACH_MSG_TRAP: i32 = 8;
     const HOST_PREFERRED_USER_ARCH: i32 = 12;
-    let mem32 = MEMORY.min(u64::from(u32::MAX)) as u32;
+    // machine_conf's `(uint32_t)mem_size`: the device's mem_size is below
+    // 4 GiB, so the cast keeps it whole; the 4 GiB stand-in is held at the
+    // largest 32-bit size rather than wrapped to 0, which no device gives.
+    let mem32 = MEM_SIZE.min(u64::from(u32::MAX)) as u32;
     match flavor {
         // max_cpus, avail_cpus, memory_size, cpu_type, cpu_subtype, then
         // with room cpu_threadtype, physical_cpu, physical_cpu_max,
@@ -1368,7 +1385,7 @@ fn host_info(flavor: i32, count: u32) -> Reply {
             }
             let mut w = vec![NCPUS, NCPUS, mem32, CPU_TYPE_ARM64, machine::CPU_SUBTYPE];
             if count >= 12 {
-                w.extend([0, NCPUS, NCPUS, NCPUS, NCPUS, MEMORY as u32, (MEMORY >> 32) as u32]);
+                w.extend([0, NCPUS, NCPUS, NCPUS, NCPUS, MEM_SIZE as u32, (MEM_SIZE >> 32) as u32]);
             }
             Reply::ok(words(&w))
         }

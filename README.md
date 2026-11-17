@@ -806,9 +806,14 @@ is the reference (search `crates/gex-kernel/src/` for
   first, until `sysctl.name2oid` of it on the device measures it. APFS's `fsctl`s
   other than `APFSIOC_GET_DEV_BY_ROLE` and the virtual-interface query
   are reported.
-- **Sockets.** Interface `ioctl`s know only `lo0`. `udp_recvspace`
-  follows the mbuf pool that the device's memory size sets: 4 GiB stands
-  in until `sysctl hw.memsize` on the device measures it. An inet6 socket's
+- **Memory size.** The device's DRAM (iBoot's `memSizeActual`:
+  `hw.memsize_physical`, `scale_setup`, the mbuf pool's tier that sets
+  `udp_recvspace`, IOGPU's sizes) and the memory the kernel manages, the
+  DRAM less iBoot's carveouts (`memSize`, `max_mem`: `hw.memsize`,
+  `host_basic_info`, memorystatus, the user wire limit, IOSurface's
+  allocation limit) are 4 GiB each until `sysctl hw.memsize_physical
+  hw.memsize` on the device measures them.
+- **Sockets.** Interface `ioctl`s know only `lo0`. An inet6 socket's
   protocol calls (binding, connecting, sending, receiving, its name,
   `shutdown`, `fstat`, the `IPPROTO_IPV6` and protocol-level options),
   raw and ICMPv6 sockets, and IPv6 addresses whose routes, on-link

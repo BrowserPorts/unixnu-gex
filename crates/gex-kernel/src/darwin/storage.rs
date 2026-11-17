@@ -296,7 +296,8 @@ pub fn unmeasured() -> Option<String> {
     gaps.push(super::preboot::NEXT_OBJ_ID_STAND_IN.to_string());
     gaps.push(super::kern::DEVFS_STAT_STAND_IN.to_string());
     gaps.push(super::kern::PREBOOT_BOOTED_FLAGS_STAND_IN.to_string());
-    gaps.push(super::inet6::MEM_ACTUAL_STAND_IN.to_string());
+    gaps.push(super::mig::machine::MEM_ACTUAL_STAND_IN.to_string());
+    gaps.push(super::mig::machine::MEM_SIZE_STAND_IN.to_string());
     gaps.push(format!("whether iBoot's /chosen boot-uuid or apfs-preboot-uuid names the System volume (stand-in {BOOT_UUID_MATCHES}: the root mounted from its snapshot by name, with a new fsid; measure {BOOT_UUID_MEASUREMENT})"));
     gaps.push(format!("whether the volumes' IOMedia are writable (stand-in {VOLUMES_WRITABLE}; measure {VOLUMES_WRITABLE_MEASUREMENT})"));
     gaps.push(format!("whether disk0 is write-protected (stand-in writable: {DISK_WRITABLE}; measure {DISK_WRITABLE_MEASUREMENT})"));

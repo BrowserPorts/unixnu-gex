@@ -126,7 +126,10 @@ pub fn value(path: &str) -> Option<Value> {
         "hw.ncpu" | "hw.activecpu" | "hw.physicalcpu" | "hw.physicalcpu_max" | "hw.logicalcpu" | "hw.logicalcpu_max" => I32(NCPUS as i32),
         "hw.byteorder" => I32(1234),
         "hw.pagesize" | "hw.pagesize_compat" | "hw.pagesize32" => I32(16384),
-        "hw.memsize" => I64(4 << 30),
+        // max_mem; max_mem_actual is hw.memsize_physical (not macOS's
+        // names, kern_mib.c).
+        "hw.memsize" => I64(super::mig::machine::MEM_SIZE as i64),
+        "hw.memsize_physical" => I64(super::mig::machine::MEM_ACTUAL as i64),
         "hw.cputype" => I32(0x0100_000c),
         "hw.cpusubtype" => I32(super::mig::machine::CPU_SUBTYPE as i32),
         "hw.cpufamily" => I32(0x67ce_ee93u32 as i32),

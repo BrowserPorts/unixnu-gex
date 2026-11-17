@@ -87,9 +87,10 @@ mod kr {
 
 /// `MAX_WIRE_COUNT`.
 const MAX_WIRE_COUNT: u16 = 65535;
-/// `vm_per_task_user_wire_limit` as `kmem_set_user_wire_limits` makes it for
-/// 4 GiB and a jetsam kernel: 80% of it.
-const PER_TASK_USER_WIRE_LIMIT: u64 = (4 << 30) * 80 / 100;
+/// `vm_per_task_user_wire_limit` as `kmem_set_user_wire_limits` makes it
+/// from `max_mem` on a jetsam kernel: 80% of it below 8 GiB
+/// (`wire_limit_percents[bit_floor(max_mem) - 32]`, the index at least 0).
+const PER_TASK_USER_WIRE_LIMIT: u64 = super::mig::machine::MEM_SIZE * 80 / 100;
 
 /// `ANON_CHUNK_SIZE`: anonymous memory is entered in entries of at most this.
 pub const ANON_CHUNK_SIZE: u64 = 128 << 20;

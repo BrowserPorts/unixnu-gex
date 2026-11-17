@@ -499,12 +499,13 @@ pub fn matching(tree: &[Node], dict: &[(String, DictValue)]) -> Result<Vec<u32>,
     Ok(found)
 }
 
-/// `OSObject::metaCast`: whether the entry is, or inherits from, `class`.
-/// Every device tree entry is an `IOService`, whatever nub replaced it.
+/// `OSObject::metaCast`: whether the entry is, or inherits from, `class`,
+/// up to `OSObject`, the root of every class. Every device tree entry is an
+/// `IOService`, whatever nub replaced it.
 pub fn conforms(t: &[Node], i: u32, class: &str) -> Result<bool, String> {
     match self::class(t, i) {
-        Ok(c) => Ok(superclasses(c).contains(&class)),
-        Err(_) if matches!(class, "IOService" | "IORegistryEntry") => Ok(true),
+        Ok(c) => Ok(class_chain(c).is_some_and(|chain| chain.contains(&class))),
+        Err(_) if matches!(class, "IOService" | "IORegistryEntry" | "OSObject") => Ok(true),
         Err(what) => Err(what),
     }
 }
@@ -1162,10 +1163,10 @@ pub fn open_user_client(k: &mut crate::syscalls::Kernel, service: u32, ty: u32) 
     Ok(id)
 }
 
-/// A class with its superclasses and OSObject, as a Sandbox class walk
-/// visits them (`getMetaClass`, then each `getSuperClass`); none for a
-/// class this registry does not know.
-fn class_chain(class: &str) -> Option<Vec<&'static str>> {
+/// A class with its superclasses and OSObject, as `metaCast` and a Sandbox
+/// class walk visit them (`getMetaClass`, then each `getSuperClass`); none
+/// for a class this registry does not know.
+pub fn class_chain(class: &str) -> Option<Vec<&'static str>> {
     let s = superclasses(class);
     if s.is_empty() {
         return None;
@@ -1632,6 +1633,10 @@ mod tests {
         assert!(class(&t, 1).is_err());
         assert_eq!(conforms(&t, 1, "IOService"), Ok(true));
         assert_eq!(conforms(&t, root, "IOService"), Ok(false));
+        // OSObject is every class's root, the registry's root's too.
+        assert_eq!(conforms(&t, root, "OSObject"), Ok(true));
+        assert_eq!(conforms(&t, 0, "OSObject"), Ok(true));
+        assert_eq!(conforms(&t, 1, "OSObject"), Ok(true));
         // Flat: the root's one child; recursive: depth first.
         let mut flat = RegistryIter::new(root, Plane::DeviceTree, 0);
         assert_eq!(all(&t, &mut flat), vec![0]);

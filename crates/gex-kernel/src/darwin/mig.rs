@@ -2145,13 +2145,13 @@ fn connect_routine(k: &mut Kernel, req: &Kmsg, id: u32, n: i32) -> Reply {
         2800 | 2810 => Reply::ok(io_name_reply(c.class)),
         2801 => match inline_cstr(req, 0, 128) {
             Some((name, _)) => {
-                let chain = super::iokit::superclasses(c.class);
-                if chain.is_empty() {
-                    let mut r = Reply::err(ret::UNSUPPORTED);
-                    r.unimplemented = Some(format!("the superclasses of the user client class {}", c.class));
-                    r
-                } else {
-                    Reply::ok(u32::from(chain.contains(&String::from_utf8_lossy(name).as_ref())).to_le_bytes().to_vec())
+                match super::iokit::class_chain(c.class) {
+                    None => {
+                        let mut r = Reply::err(ret::UNSUPPORTED);
+                        r.unimplemented = Some(format!("the superclasses of the user client class {}", c.class));
+                        r
+                    }
+                    Some(chain) => Reply::ok(u32::from(chain.contains(&String::from_utf8_lossy(name).as_ref())).to_le_bytes().to_vec()),
                 }
             }
             None => bad(),

@@ -843,10 +843,16 @@ struct TaskSpace<'k, 'm, 'g> {
 }
 
 impl Space for TaskSpace<'_, '_, '_> {
+    /// `copyin` from the task: the region's mappings entered in this call
+    /// are in its map already (`vm_map_enter` of the shared region's
+    /// submap, which the task's map nests), so their protections are put
+    /// in force for the checked copy first, as they are when the call
+    /// returns.
     fn copyin(&mut self, _c: &Contents, addr: u64, len: u64) -> Result<Vec<u8>, Errno> {
         if !self.k.mem.lock().check_access(addr, len, crate::mem::prot::READ) {
             return Err(Errno::EFAULT);
         }
+        self.k.darwin_flush_perms(self.m);
         Ok(self.m.read(addr, len as usize)?.to_vec())
     }
 
@@ -864,9 +870,15 @@ impl Space for TaskSpace<'_, '_, '_> {
 }
 
 /// A region's entry put in a task's memory, and in its memory map with the
-/// entry's protections.
+/// entry's protections. Its pages are the region's (`vm_map_enter` of the
+/// shared region's submap, its contents the shared region pager's), not a
+/// copy out to the task: they are filled through the kernel's view of the
+/// memory, whatever the task's own protections of it are, as at a mapping
+/// call the region's pages are read-only to the task.
 fn install(mm: &crate::mem::Mm, m: &mut GuestMem<'_>, c: &Contents, mp: &Mapping) -> Result<(), String> {
     use std::os::fd::AsRawFd;
+    let mut k = m.kernel();
+    let m = &mut k;
     let (start, len) = (mp.address, mp.size);
     crate::big_op("shared cache", len as usize);
     match &mp.source {
@@ -924,9 +936,10 @@ fn install(mm: &crate::mem::Mm, m: &mut GuestMem<'_>, c: &Contents, mp: &Mapping
     Ok(())
 }
 
-/// A removed entry out of a task's memory and its map.
+/// A removed entry out of a task's memory and its map (through the kernel's
+/// view, as [`install`]).
 fn uninstall(mm: &crate::mem::Mm, m: &mut GuestMem<'_>, mp: &Mapping) {
-    let _ = m.discard(mp.address, mp.size as usize);
+    let _ = m.kernel().discard(mp.address, mp.size as usize);
     let _ = mm.lock().unmap(mp.address, mp.size);
 }
 

@@ -541,6 +541,24 @@ fn add_bsd_client(t: &mut Vec<Node>, medium: u32, class: &'static str) {
     push(t, service(class, class, Some(medium), props, Table::Complete));
 }
 
+/// Whether a service of `class` here registers itself (`registerService`,
+/// which makes it an instance its metaclass tracks): the PCI bridges
+/// (`IOPCIBridge::start`), the nubs they publish (`publishNub`), the
+/// controller (0xfffffff006a81f50) and its namespaces (0xfffffff006a958d8),
+/// IOBlockStorageDriver and IOMediaBSDClient (their starts), every medium
+/// (by its driver or scheme), and AppleAPFSContainer (its start,
+/// 0xfffffff00666b24c, after its volumes). The partition schemes do not:
+/// IOGUIDPartitionScheme's start registers only its partitions, and
+/// AppleAPFSContainerScheme's (0xfffffff0066829d4) only its medium.
+/// None for a class not here.
+pub fn registers(class: &str) -> Option<bool> {
+    match class {
+        GPT | APFS_SCHEME => Some(false),
+        T8011_PCIE | PCI_DEVICE | HOST_BRIDGE | CONTROLLER | BLOCK_DEVICE | DRIVER | "IOMedia" | BSD_CLIENT | APFS_MEDIA | APFS_CONTAINER | APFS_VOLUME | APFS_MEDIA_BSD | APFS_VOLUME_BSD => Some(true),
+        _ => None,
+    }
+}
+
 /// A property a class here answers from its `getProperty` override rather
 /// than its table, when that answer is not modelled: a namespace's
 /// WriteCacheState (IOBlockStorageDevice's override, 0xfffffff00596ee88,
@@ -552,6 +570,12 @@ pub fn property_override(t: &[Node], i: u32, name: &str) -> Option<String> {
         return Some(format!("{}'s WriteCacheState (getWriteCacheState, from flags not traced)", n.name));
     }
     None
+}
+
+/// The configuration register at `reg` (a dword's offset) of the PCI nub
+/// `i`, as IOPCIFamily saved it (`savedConfig`), which is not modelled.
+pub fn pci_config(t: &[Node], i: u32, reg: u8) -> Result<u32, String> {
+    Err(format!("the configuration register {reg:#04x} of {}", t[i as usize].name))
 }
 
 /// `IORegistryEntry::getLocation`: what the drivers gave their objects

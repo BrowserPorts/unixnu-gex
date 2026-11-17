@@ -458,80 +458,6 @@ pub fn search(t: &[Node], i: u32, plane: Plane, options: u32, name: &str, mut al
     Ok((None, refused))
 }
 
-/// The services a matching dictionary asks for: `IOProviderClass` by class
-/// (and its superclasses), any other string by the service's property of
-/// that name; `Err` for what is not a string.
-pub fn matching(tree: &[Node], dict: &[(String, DictValue)]) -> Result<Vec<u32>, String> {
-    let mut class = None;
-    let mut props = Vec::new();
-    let mut name_match = None;
-    for (k, v) in dict {
-        match (k.as_str(), v) {
-            ("IOProviderClass", DictValue::Str(c)) => class = Some(c.as_str()),
-            // compareNames: the service's name (copyName) against it.
-            ("IONameMatch", DictValue::Str(n)) => name_match = Some(n.as_str()),
-            (_, DictValue::Str(s)) => props.push((k.as_str(), s.as_str())),
-            _ => return Err(format!("the matching key {k} ({v:?})")),
-        }
-    }
-    // By name: the services that only IOSurface's kext names are all here
-    // (a device tree nub's name is the platform's, compared by
-    // IODTCompareNubName, and no node of the tree bears these).
-    if let Some(n) = name_match {
-        if !super::iosurface::name_complete(n) {
-            return Err(format!("the services named {n:?}: the drivers' own are not here"));
-        }
-        let found = tree
-            .iter()
-            .enumerate()
-            .filter(|&(i, n2)| superclasses(n2.class).contains(&"IOService") && name(tree, i as u32) == n)
-            .filter(|(_, n2)| class.map_or(true, |c| superclasses(n2.class).contains(&c)))
-            .filter(|(_, n2)| props.iter().all(|&(k, v)| n2.service_props.iter().any(|(pk, pv)| pk == k && matches!(pv, Prop::Str(s) | Prop::Sym(s) if s == v))))
-            .map(|(i, _)| i as u32)
-            .collect();
-        return Ok(found);
-    }
-    // IOResources, the one of its class: matched by the resources an
-    // IOResourceMatch names being published (`IOResourcesMatchPropertyTable`);
-    // by another property, or a resource not modelled, not known.
-    if class == Some(super::platform::RESOURCES) {
-        let Some(at) = tree.iter().position(|n| n.class == super::platform::RESOURCES) else { return Ok(Vec::new()) };
-        for &(k, v) in &props {
-            if k != "IOResourceMatch" {
-                return Err(format!("IOResources by its property {k}"));
-            }
-            if !tree[at].service_props.iter().any(|(pk, _)| pk == v) {
-                return Err(format!("whether the resource {v} is published"));
-            }
-        }
-        return Ok(vec![at as u32]);
-    }
-    // The platform expert device is registered (`IOPlatformExpertDevice`
-    // calls `registerService`); its properties are partly the platform's.
-    if class == Some("IOPlatformExpertDevice") {
-        if !props.is_empty() {
-            return Err(format!("the platform expert device by its properties {props:?}"));
-        }
-        return Ok(if tree.is_empty() { Vec::new() } else { vec![0] });
-    }
-    let wanted = |n: &Node| {
-        superclasses(n.class).contains(&"IOService")
-            && class.map_or(true, |c| superclasses(n.class).contains(&c))
-            && props.iter().all(|&(k, v)| n.service_props.iter().any(|(pk, pv)| pk == k && matches!(pv, Prop::Str(s) | Prop::Sym(s) if s == v)))
-    };
-    let found: Vec<u32> = tree.iter().enumerate().filter(|(_, n)| wanted(n)).map(|(i, _)| i as u32).collect();
-    // APFS's own classes are all here, and so are the accelerator's (one
-    // GPU, one accelerator). Of the classes above them (and of services by
-    // property alone) the storage drivers' and the whole disk's are not, so
-    // those are answered only by a BSD name found here.
-    let complete = class.is_some_and(super::storagestack::class_complete) || class.is_some_and(super::accel::class_complete) || class.is_some_and(super::iosurface::class_complete) || class.is_some_and(super::iomfb::class_complete);
-    let by_name = props.iter().any(|&(k, _)| k == "BSD Name");
-    if !complete && !(by_name && !found.is_empty()) {
-        return Err(format!("the services of class {class:?} with {props:?}: the drivers' own are not here"));
-    }
-    Ok(found)
-}
-
 /// `OSObject::metaCast`: whether the entry is, or inherits from, `class`,
 /// up to `OSObject`, the root of every class. Every device tree entry is an
 /// `IOService`, whatever nub replaced it.
@@ -657,54 +583,6 @@ pub fn dt_prop<'a>(t: &'a [Node], path: &str, name: &str) -> Option<&'a [u8]> {
 /// Whether tree `t` has a node at `path`.
 pub fn dt_has(t: &[Node], path: &str) -> bool {
     matches!(from_path(t, path), Ok(Some(_)))
-}
-
-/// A value in a matching dictionary.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DictValue {
-    Str(String),
-    Other(u32),
-}
-
-/// `OSUnserializeBinary` of a matching dictionary of strings: `None` for
-/// anything else's framing.
-pub fn unserialize_dict(b: &[u8]) -> Option<Vec<(String, DictValue)>> {
-    const DICTIONARY: u32 = 0x01;
-    const SYMBOL: u32 = 0x08;
-    const STRING: u32 = 0x09;
-    let word = |o: usize| b.get(o..o + 4).map(|w| u32::from_le_bytes(w.try_into().unwrap()));
-    if word(0)? != 0xd3 {
-        return None;
-    }
-    let head = word(4)?;
-    if (head >> 24) & 0x7f != DICTIONARY {
-        return None;
-    }
-    let count = head & 0x00ff_ffff;
-    let mut at = 8;
-    let mut out = Vec::new();
-    for _ in 0..count {
-        let k = word(at)?;
-        if (k >> 24) & 0x7f != SYMBOL {
-            return None;
-        }
-        let klen = (k & 0x00ff_ffff) as usize;
-        let key = b.get(at + 4..at + 4 + klen)?;
-        let key = String::from_utf8_lossy(&key[..key.iter().position(|&c| c == 0).unwrap_or(klen)]).into_owned();
-        at += 4 + ((klen + 3) & !3);
-        let v = word(at)?;
-        let kind = (v >> 24) & 0x7f;
-        let vlen = (v & 0x00ff_ffff) as usize;
-        let value = if kind == STRING || kind == SYMBOL {
-            let bytes = b.get(at + 4..at + 4 + vlen)?;
-            DictValue::Str(String::from_utf8_lossy(&bytes[..bytes.iter().position(|&c| c == 0).unwrap_or(vlen)]).into_owned())
-        } else {
-            DictValue::Other(kind)
-        };
-        at += 4 + ((vlen + 3) & !3);
-        out.push((key, value));
-    }
-    Some(out)
 }
 
 /// An iterator handed out: an `OSCollectionIterator` over a fixed set,
@@ -1616,7 +1494,12 @@ mod tests {
         assert_eq!(g.objs.iter().filter(|o| matches!(o, super::super::osserialize::Obj::Number { value: 4096, size: 32 })).count(), 2, "Physical/Logical Block Size shared, EncryptionBlockSize its own");
         // An OSSymbol's string matches as an OSString's does.
         let bsd = super::super::storage::container_bsd_name();
-        assert_eq!(matching(&t, &[("BSD Name".to_string(), DictValue::Str(bsd))]), Ok(vec![media]));
+        let mut g = super::super::osserialize::Graph::default();
+        let d = g.add(super::super::osserialize::Obj::Dict(Vec::new()));
+        let v = g.add(super::super::osserialize::Obj::Symbol(bsd.into_bytes()));
+        g.dict_set(d, b"BSD Name", v);
+        let (g, d) = super::super::iomatch::task_dictionary(&super::super::osserialize::serialize_binary(&g, d)).unwrap().unwrap();
+        assert_eq!(super::super::iomatch::existing(&t, &g, d, false), Ok(vec![media]));
         // Up the IOService plane from the medium to the namespace, which
         // has no provider here (no platform).
         let mut up = vec![media];
@@ -1859,9 +1742,19 @@ mod tests {
         // The kernel's resources are published; the others are not known.
         assert!(t[resources as usize].service_props.iter().all(|(_, v)| *v == Prop::Sym("IOService".to_string())));
         assert!(property_unknown(&t, resources, "IONVRAM") && property_unknown(&t, resources, "IOResourceMatched"));
-        let dict = |pairs: &[(&str, &str)]| pairs.iter().map(|(k, v)| (k.to_string(), DictValue::Str(v.to_string()))).collect::<Vec<_>>();
-        assert_eq!(matching(&t, &dict(&[("IOProviderClass", "IOResources")])), Ok(vec![resources]));
-        assert_eq!(matching(&t, &dict(&[("IOProviderClass", "IOResources"), ("IOResourceMatch", "IOBSD")])), Ok(vec![resources]));
-        assert!(matching(&t, &dict(&[("IOProviderClass", "IOResources"), ("IOResourceMatch", "IONVRAM")])).is_err());
+        let matching = |pairs: &[(&str, &str)]| {
+            use super::super::osserialize::{serialize_binary, Graph, Obj};
+            let mut g = Graph::default();
+            let d = g.add(Obj::Dict(Vec::new()));
+            for (k, v) in pairs {
+                let v = g.add(Obj::String(v.as_bytes().to_vec()));
+                g.dict_set(d, k.as_bytes(), v);
+            }
+            let (g, d) = super::super::iomatch::task_dictionary(&serialize_binary(&g, d)).unwrap().unwrap();
+            super::super::iomatch::existing(&t, &g, d, false)
+        };
+        assert_eq!(matching(&[("IOProviderClass", "IOResources")]), Ok(vec![resources]));
+        assert_eq!(matching(&[("IOProviderClass", "IOResources"), ("IOResourceMatch", "IOBSD")]), Ok(vec![resources]));
+        assert!(matching(&[("IOProviderClass", "IOResources"), ("IOResourceMatch", "IONVRAM")]).is_err());
     }
 }

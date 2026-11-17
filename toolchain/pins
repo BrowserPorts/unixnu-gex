@@ -31,6 +31,15 @@ BUSYBOX_SHA256  := 3311dff32e746499f4df0d5df04d7eb396382d7e108bb9250e7b519b83704
 LINUX_HEADERS_URL    := https://snapshot.debian.org/archive/debian/20261115T210008Z/pool/main/l/linux/linux-libc-dev_6.12.117-1_all.deb
 LINUX_HEADERS_SHA256 := 8b4848725a2705e5b1612f2135c44300716690ba762368ab87df127e9a5ed416
 
+# binaryen, the sysroots' wasm-opt (toolchain/binaryen.sh): its release build
+# for the host, each by the digest the release publishes.
+BINARYEN_VERSION              := 133
+BINARYEN_URL                  := https://github.com/WebAssembly/binaryen/releases/download/version_133/binaryen-version_133
+BINARYEN_SHA256_X86_64_LINUX  := 2dc9c7813f5375db93d96ead4b78222fcc3e2677bbb832297af4797782a37489
+BINARYEN_SHA256_AARCH64_LINUX := 89c07ea56faf38d0fbecf36ca8ec0721756716185f265b568e133d427f299bf8
+BINARYEN_SHA256_ARM64_MACOS   := ad66da82ac13f163e424b1643f16c6dfcccc98b5966296b43e52d3cab04f84a8
+BINARYEN_SHA256_X86_64_MACOS  := 13a9b90be775c6389ce3d1f879cb8627bea56708ba8c122983941d53a8199b95
+
 # The guest-side cross compilers the page's assets are built with
 # (page/build-assets.sh: the gears, the guest GL driver, ld-musl for the
 # aarch64 and x86-64 guests): musl.cc's builds, fetched by make toolchains.

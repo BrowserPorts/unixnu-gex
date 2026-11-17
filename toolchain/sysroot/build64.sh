@@ -104,25 +104,11 @@ wait
 rm -f "$OUT/sysroot/lib/libclang_rt.builtins-wasm64.a"
 llvm-ar crs "$OUT/sysroot/lib/libclang_rt.builtins-wasm64.a" $objs
 
-# binaryen 133 (--memory64-lowering of whole programs, exception handling)
-BINARYEN_VERSION=133
-if [ -n "${GEX_BINARYEN:-}" ]; then
-  ln -sfn "$(realpath "$GEX_BINARYEN")" "$OUT/sysroot/binaryen"
-else
-  # fetched once per host into the cache, linked from every sysroot
-  cache=${XDG_CACHE_HOME:-$HOME/.cache}/gex/binaryen-$BINARYEN_VERSION
-  if [ ! -x "$cache/bin/wasm-opt" ]; then
-    t=binaryen-version_$BINARYEN_VERSION
-    mkdir -p "$(dirname "$cache")"
-    tmp=$(mktemp -d "$(dirname "$cache")/.binaryen.XXXXXX")
-    curl -sSfL "https://github.com/WebAssembly/binaryen/releases/download/version_$BINARYEN_VERSION/$t-x86_64-linux.tar.gz" | tar xz -C "$tmp"
-    rm -rf "$cache"
-    mv "$tmp/$t" "$cache"
-    rm -rf "$tmp"
-  fi
-  rm -rf "$OUT/sysroot/binaryen"
-  ln -sfn "$cache" "$OUT/sysroot/binaryen"
-fi
+# binaryen (--memory64-lowering of whole programs, exception handling): the
+# pinned build for this host, or GEX_BINARYEN (toolchain/binaryen.sh), fetched
+# once into the cache and linked from every sysroot
+rm -rf "$OUT/sysroot/binaryen"
+ln -sfn "$("$HERE/../binaryen.sh")" "$OUT/sysroot/binaryen"
 # Wine's PE side (wcc64 -D_WIN32): the LLP64 plugin, its llp64.h, and the
 # ICALL pass (its Win64 mode)
 "$HERE/llp64/build.sh" "$OUT/sysroot/lib"

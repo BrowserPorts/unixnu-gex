@@ -7,7 +7,7 @@
 // paths (GEXCC_PKG_CONFIG_RUNTIME).
 
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { FIXTURES, gexcc } from '../lib/gexcc.mjs';
 
@@ -18,7 +18,8 @@ const F = join(FIXTURES, 'glibc');
 export default async function (t) {
   const c = gexcc(t);
   const bin = c.env.PATH.split(':')[0];
-  const prefix = dirname(bin);
+  // as the install wrote it into its scripts: resolved (out/ can be a link)
+  const prefix = realpathSync(dirname(bin));
 
   // glibc's names
   const d = c.dir('compat');

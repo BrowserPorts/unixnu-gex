@@ -13,9 +13,15 @@
 // program is an ELF launcher that execs gexcc-exec, which runs it under
 // GEXCC_GEXC: set here to this arch's gexc (GEXC_X86, GEXC_A64, GEXC, then
 // target/x86/release and target/release).
+//
+// The launcher is i386 Linux code, which only a Linux kernel with IA-32
+// emulation runs: elsewhere (macOS, AArch64 Linux) a program is run through
+// gexcc-exec, as its launcher would. `c.direct` says which (found once, by
+// running a program), `c.program` runs one either way, and fixture scripts
+// see GEXCC_DIRECT=1 or 0.
 
 import { execFileSync, spawn } from 'node:child_process';
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 const ROOT = join(import.meta.dirname, '..', '..');
@@ -30,6 +36,26 @@ const which = (cmd, path = process.env.PATH) => {
 };
 
 let runs = 0;
+
+/** Per gexcc: whether this host runs one of its programs itself. */
+const direct = new Map();
+
+/** Whether `cc`'s programs start by themselves here: one built in `dir`, run. */
+function runsDirect(cc, dir, env) {
+  if (direct.has(cc)) return direct.get(cc);
+  writeFileSync(join(dir, 'direct.c'), 'int main(void) { return 0; }\n');
+  execFileSync(cc, ['-o', join(dir, 'direct'), join(dir, 'direct.c')], { env, stdio: 'ignore' });
+  let yes = true;
+  try {
+    execFileSync(join(dir, 'direct'), [], { env, stdio: 'ignore' });
+  } catch (e) {
+    // the kernel refuses the file: not a program it runs
+    if (!['ENOEXEC', 'EACCES', 'EBADARCH'].includes(e.code) && e.status !== 126) throw e;
+    yes = false;
+  }
+  direct.set(cc, yes);
+  return yes;
+}
 
 export function gexcc(t) {
   const x86 = t.arch === 'x86';
@@ -46,6 +72,8 @@ export function gexcc(t) {
   const top = join(t.workDir, 'gexcc', `${t.arch}-${process.pid}`);
   rmSync(top, { recursive: true, force: true });
   mkdirSync(top, { recursive: true });
+  const self = runsDirect(cc, top, env);
+  env.GEXCC_DIRECT = self ? '1' : '0';
 
   /**
    * `argv` as a process: `{ code, out }`, `code` as a shell gives it (128 +
@@ -76,6 +104,11 @@ export function gexcc(t) {
     sysroot,
     env,
     run,
+    /** Whether this host runs a gexcc program itself (its i386 launcher). */
+    direct: self,
+    /** `argv` (a gexcc program first) as `run` runs it: directly where the host
+     *  runs the program itself, else through gexcc-exec, as its launcher would. */
+    program: (argv, opts = {}) => run(self ? argv : [join(bin, 'gexcc-exec'), ...argv], opts),
     /** A fresh work directory of this test's, `name`. */
     dir(name) {
       const d = join(top, name);
@@ -142,6 +175,9 @@ export async function script(t, name, { env = {}, timeout = 1200000, need = [] }
       t.check(m[2] || name, m[1] === 'ok');
       if (m[1] === 'ok') oks.push(l);
       checks++;
+    } else if (/^note\b/.test(l)) {
+      // a leg this host cannot have, and why (not a check)
+      t.say(l.replace(/^note:?\s*/, ''));
     } else if (/^skip\b/.test(l)) {
       if (r.code === 0 && !checks && !need.length) t.skip(l.replace(/^skip:?\s*/, ''));
       t.check(l, false, 'a leg not run');

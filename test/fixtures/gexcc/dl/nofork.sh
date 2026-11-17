@@ -45,6 +45,9 @@ cat > "$W/l.c" <<'X'
 int lib_fork(void) { pid_t p = fork(); if (p == 0) _exit(0); if (p > 0) waitpid(p, 0, 0); return p < 0 ? -1 : 0; }
 X
 fail=0
+# a program, run as its launcher would run it: directly where the host runs
+# the launcher (GEXCC_DIRECT=1), else through gexcc-exec
+run() { if [ "${GEXCC_DIRECT:-1}" = 1 ]; then "$@"; else gexcc-exec "$@"; fi; }
 # asyncify's exports, in a program's kept wasm or a side module
 asy() { grep -a -c asyncify_start_unwind "$1"; }
 check() {  # NAME WANT GOT
@@ -53,8 +56,8 @@ check() {  # NAME WANT GOT
 cd "$W" || exit 2
 # static
 GEXCC_KEEP_WASM=1 gexcc -O2 -o fs p.c && GEXCC_KEEP_WASM=1 gexcc -O2 -fgex-no-fork -o ns p.c || { echo "FAIL nofork: static build"; exit 1; }
-check static-fork "fork 3 spawn 7 1" "$(./fs 2>/dev/null | tr '\n' ' ')$(asy fs.wasm)"
-check static-nofork "fork ENOSYS spawn 7 0" "$(./ns 2>/dev/null | tr '\n' ' ')$(asy ns.wasm)"
+check static-fork "fork 3 spawn 7 1" "$(run ./fs 2>/dev/null | tr '\n' ' ')$(asy fs.wasm)"
+check static-nofork "fork ENOSYS spawn 7 0" "$(run ./ns 2>/dev/null | tr '\n' ' ')$(asy ns.wasm)"
 # shared: the environment variable, and a library built with the flag
 if [ -f "$(gexcc --print-sysroot)/lib/libc.so" ]; then
     export LD_LIBRARY_PATH="$(gexcc --print-sysroot)/lib:$W"
@@ -63,8 +66,8 @@ if [ -f "$(gexcc --print-sysroot)/lib/libc.so" ]; then
         GEXCC_SHARED=1 GEXCC_KEEP_WASM=1 gexcc -O2 -DLIB -o fd p.c -L. -lfl &&
         GEXCC_SHARED=1 GEXCC_KEEP_WASM=1 GEXCC_NOFORK=1 gexcc -O2 -DLIB -o nd p.c -L. -lnl ||
         { echo "FAIL nofork: shared build"; exit 1; }
-    check shared-fork "fork 3 lib forked spawn 7 1 1" "$(./fd 2>/dev/null | tr '\n' ' ')$(asy fd.wasm) $(asy libfl.so)"
-    check shared-nofork "fork ENOSYS lib ENOSYS spawn 7 0 0" "$(./nd 2>/dev/null | tr '\n' ' ')$(asy nd.wasm) $(asy libnl.so)"
+    check shared-fork "fork 3 lib forked spawn 7 1 1" "$(run ./fd 2>/dev/null | tr '\n' ' ')$(asy fd.wasm) $(asy libfl.so)"
+    check shared-nofork "fork ENOSYS lib ENOSYS spawn 7 0 0" "$(run ./nd 2>/dev/null | tr '\n' ' ')$(asy nd.wasm) $(asy libnl.so)"
 else
     echo "ok   nofork-shared: no libc.so in this gexcc"
 fi

@@ -59,13 +59,21 @@ if [ -n "$(cxxabi_paths "$P/sysroot/lib/libc++abi.a")" ]; then
 elif [ -z "$(cxxabi_paths "$W/cxx")" ]; then ok "c++: libc++abi's sources as /llvm"
 else bad "c++: names libc++abi's build tree"; cxxabi_paths "$W/cxx" | head -3; fi
 want="ran a 2"
-got=$(GEXCC_RUNNER=$RUNNER "$W/none" a 2>&1); s=$?
-[ "$got" = "$want" ] && [ $s = 3 ] && ok "empty: runs through GEXCC_RUNNER" || bad "empty: GEXCC_RUNNER run gave '$got' (exit $s)"
-got=$(env -u GEXCC_RUNNER PATH="$B:/usr/bin:/bin" "$W/default" a 2>&1); s=$?
-[ "$got" = "$want" ] && [ $s = 3 ] && ok "unset: runs through gexcc-exec on PATH" || bad "unset: gave '$got' (exit $s)"
-got=$(env -u GEXCC_RUNNER PATH=/nonexistent "$W/none" a 2>&1); s=$?
-[ $s = 127 ] && ok "empty, no runner anywhere: says so (127)" || bad "empty, no runner: exit $s ($got)"
-got=$(GEXCC_RUNNER=$RUNNER "$W/cxx" 2>&1); s=$?
+# The launcher picks the runner: legs only a host that runs it (a Linux
+# kernel with IA-32 emulation, GEXCC_DIRECT=1) can see. Elsewhere the
+# program runs through the runner, as its launcher would run it.
+if [ "${GEXCC_DIRECT:-1}" = 1 ]; then
+    got=$(GEXCC_RUNNER=$RUNNER "$W/none" a 2>&1); s=$?
+    [ "$got" = "$want" ] && [ $s = 3 ] && ok "empty: runs through GEXCC_RUNNER" || bad "empty: GEXCC_RUNNER run gave '$got' (exit $s)"
+    got=$(env -u GEXCC_RUNNER PATH="$B:/usr/bin:/bin" "$W/default" a 2>&1); s=$?
+    [ "$got" = "$want" ] && [ $s = 3 ] && ok "unset: runs through gexcc-exec on PATH" || bad "unset: gave '$got' (exit $s)"
+    got=$(env -u GEXCC_RUNNER PATH=/nonexistent "$W/none" a 2>&1); s=$?
+    [ $s = 127 ] && ok "empty, no runner anywhere: says so (127)" || bad "empty, no runner: exit $s ($got)"
+    got=$(GEXCC_RUNNER=$RUNNER "$W/cxx" 2>&1); s=$?
+else
+    echo "note bakerunner: this host does not run a gexcc program's i386 launcher, so which runner it picks is not seen"
+    got=$("$RUNNER" "$W/cxx" 2>&1); s=$?
+fi
 [ "$got" = "caught xxx" ] && [ $s = 0 ] && ok "c++: runs" || bad "c++: gave '$got' (exit $s)"
 [ $fail = 0 ] && echo "bakerunner: all ok"
 exit $fail

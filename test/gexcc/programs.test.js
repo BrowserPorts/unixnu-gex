@@ -9,6 +9,9 @@
 // any `system()` call without BUSYBOX (a gexcc busybox for the guest's
 // /bin/sh). A source with `gexcc-test: as root` runs as root on both sides,
 // in a user namespace with root and 65535 other ids mapped.
+//
+// The reference is the host's own Linux kernel: on another host (macOS) only
+// the shared programs below, which need none, are run.
 
 import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -31,8 +34,10 @@ export default async function (t) {
   const busybox = process.env.BUSYBOX && existsSync(process.env.BUSYBOX) ? process.env.BUSYBOX : null;
   const srcs = readdirSync(DIR).filter((f) => /\.(c|cpp)$/.test(f)).sort();
   const asRoot = ['unshare', '--map-auto', '--map-root-user'];
+  const linux = process.platform === 'linux';
+  if (!linux) t.say(`the programs against the host: the reference is a Linux kernel, and this host runs ${process.platform}: not run`);
 
-  await pool(srcs, async (f) => {
+  if (linux) await pool(srcs, async (f) => {
     const cxx = f.endsWith('.cpp');
     const name = f.replace(/\.(c|cpp)$/, '');
     const src = join(DIR, f);
@@ -73,7 +78,7 @@ export default async function (t) {
   for (const [src, out, want, cxx] of [['sh.c', 'sh', 'shared c', false], ['shx.cpp', 'shx', 'shared c++ 7', true]]) {
     try {
       await c.build(['-O2', '-o', out, src], { cxx, shared: true, cwd: d });
-      const r = await c.run([`./${out}`], { cwd: d, env: { LD_LIBRARY_PATH: c.libdir } });
+      const r = await c.program([`./${out}`], { cwd: d, env: { LD_LIBRARY_PATH: c.libdir } });
       t.eq(`shared-${out}`, r.out, want);
     } catch (e) {
       t.check(`shared-${out}: builds`, false, e.message);

@@ -703,7 +703,7 @@ fn cache_key(image: &Image, xlate: &Options, build: &str) -> String {
         // different symbol tables translate differently.
         (image.symbols.len() as u64).to_le_bytes().into(),
         // Emitter switches read from the environment.
-        vec![gex_emit::tier1::knobs()],
+        gex_emit::tier1::knobs().to_le_bytes().to_vec(),
     ];
     for seg in &image.segments {
         fields.push(seg.vaddr.to_le_bytes().into());
@@ -1296,6 +1296,11 @@ fn run_process(
             // other part of the kernel is what exec is defined to keep.
             k.mem.lock().renew(image.brk);
             k.ctx_addr = ctx_addr;
+            // The new image's thread counts in its new context, from the
+            // zero a new memory holds.
+            if k.darwin && gex_abi::count_instructions() {
+                k.signals.thread().set_ctx(ctx_addr);
+            }
             // `exec_program` already named the file it loaded, as a guest path;
             // argv[0] (all `exe_path` has here) may be a bare `wc`.
             k.argv = opts.args.clone();
@@ -1853,6 +1858,9 @@ fn run_process(
             return Ok((Exit::Status(0), Stats::default()));
         }
         let kernel = take_kernel(&spawn);
+        // The old image's threads have stopped: what they retired is the
+        // process's before their memory goes.
+        kernel.darwin_exec_instructions(&mut GuestMem::new(memory.bytes()));
         let (proc_state, wayland) = (Arc::clone(&spawn.proc_state), spawn.wayland.clone());
         // The old image's memory goes before the new one runs: every holder
         // of it is dropped here, or it stays resident for the new program's
@@ -3383,6 +3391,8 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         }
         // A monitor is per-thread; the child's starts clear.
         let _ = gm.write_u64(ctx_addr + ctx::MON_SIZE as u64, 0);
+        // So does a Darwin child's instruction count: a new task's thread.
+        child_kernel.darwin_thread_counts_at(&mut gm, ctx_addr, true);
         if child_kernel.darwin {
             child_kernel.darwin_fork_child_vm(&mut gm, &plan);
             child_kernel.darwin_fork_unshared(&unshared);
@@ -3710,6 +3720,11 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
             // fork-then-exec, and the whole point of the fork.
             stop_other_threads(&cx, false);
             let kernel = take_kernel(&cx);
+            // The old image's threads have stopped: what they retired is
+            // the process's before their memory goes.
+            if let Some(memory) = store.data().memory.clone() {
+                kernel.darwin_exec_instructions(&mut GuestMem::new(memory.bytes()));
+            }
             let opts = RunOptions {
                 args: req.argv.clone(),
                 env: req.envp.clone(),

@@ -564,9 +564,18 @@ pub mod ctx {
     /// area, or after `v31`.
     pub const WAIT: usize = if super::X86 { SCRATCH + 64 } else { V + 32 * 16 };
 
+    /// The instructions the thread has retired, a `u64` that translated
+    /// code counts up block by block where [`super::count_instructions`]
+    /// is on (a Darwin process's: its CPMU's PMC1 at EL0). The kernel's,
+    /// never the program's: below its memory, in no register. A64 only:
+    /// an x86-64 context ends at the wait word (its size is a door
+    /// server's ABI), and nothing counts there.
+    pub const INSTRUCTIONS: usize = WAIT + 8;
+
     /// Total size of the context structure, rounded up. The x87 stack and
-    /// the scratch area are x86-64's; both end with the wait word.
-    pub const SIZE: usize = WAIT + 8;
+    /// the scratch area are x86-64's; both end with the wait word, and an
+    /// A64 context with the instruction count.
+    pub const SIZE: usize = if super::X86 { WAIT + 8 } else { INSTRUCTIONS + 8 };
 
     /// Where the guest puts a system-call number: `x8`, or `rax` (`x(0)` in
     /// gex's numbering of x86-64 registers, which is the hardware's).
@@ -1407,6 +1416,23 @@ pub fn commpage_fold() -> bool {
     COMMPAGE_FOLD.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+static COUNT_INSTRUCTIONS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Whether translated code counts the instructions each thread retires in
+/// its context ([`ctx::INSTRUCTIONS`]): set before anything is translated,
+/// by a runner whose kernel reports them (a Darwin process's
+/// `ri_instructions`). Off, the code is what it was without it. Only an
+/// A64 block's length is its instruction count, so never on x86-64.
+pub fn set_count_instructions(on: bool) {
+    assert!(!(on && X86), "an x86-64 block's length is not its instruction count");
+    COUNT_INSTRUCTIONS.store(on, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`set_count_instructions`] turned counting on.
+pub fn count_instructions() -> bool {
+    COUNT_INSTRUCTIONS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// A constant effective address in Darwin's commpage, moved to its alias.
 pub fn fold_commpage(ea: u64) -> Option<u64> {
     (commpage_fold() && (DARWIN_COMMPAGE_RO..DARWIN_COMMPAGE_END).contains(&ea)).then(|| ea - DARWIN_COMMPAGE_RO + DARWIN_COMMPAGE_ALIAS)
@@ -1486,7 +1512,9 @@ mod tests {
         assert!(ctx::X87 % 16 == 0 && ctx::X87_TMP % 16 == 0);
         assert!(!X86 || ctx::WAIT >= ctx::SCRATCH + 64);
         assert!(X86 || ctx::WAIT == ctx::v(31) + 16);
-        assert!(ctx::SIZE == ctx::WAIT + 8);
+        assert!(ctx::INSTRUCTIONS == ctx::WAIT + 8);
+        assert!(X86 || ctx::SIZE == ctx::INSTRUCTIONS + 8);
+        assert!(!X86 || ctx::SIZE == ctx::WAIT + 8);
         assert!(ctx::SIZE % 8 == 0);
         // The vector slots must be 16-byte aligned for `v128` accesses.
         assert!(ctx::V % 16 == 0);

@@ -148,8 +148,8 @@ const UNKEPT: [(usize, &str, &str); 21] = [
     (ri::SERVICED_SYSTEM_TIME, "ri_serviced_system_time", "a bill one of whose adopting threads runs at the read (the device credits it at quantum ends), or whose time could not be read"),
     (ri::LOGICAL_WRITES, "ri_logical_writes", "the logical_writes ledger: cluster_write's copies into the UBC and direct writes, the first write fault on each vnode page, dirty pages discarded, and AppleAPFS's obj_dirty (once per metadata object a transaction first dirties)"),
     (ri::LIFETIME_MAX_PHYS_FOOTPRINT, "ri_lifetime_max_phys_footprint", "a look at the process's pages, which the host keeps no view of"),
-    (ri::INSTRUCTIONS, "ri_instructions", "PMC1 at every switch and quantum expiry (recount_snapshot): the program's retired instructions and XNU's own at EL1 while the thread is on core"),
-    (ri::CYCLES, "ri_cycles", "PMC0: the core's cycles while the thread is on core, at the frequency CLPC set"),
+    (ri::INSTRUCTIONS, "ri_instructions", "PMC1 at every switch and quantum expiry (recount_snapshot): the instructions the translator counts in each thread's context (none where the function tier runs, or where the host keeps no view of the process's memory)"),
+    (ri::CYCLES, "ri_cycles", "PMC0 over the threads' on-core time: per-thread clocks on the host"),
     (ri::INTERVAL_MAX_PHYS_FOOTPRINT, "ri_interval_max_phys_footprint", "a look at the process's pages, which the host keeps no view of"),
     (ri::RUNNABLE_TIME, "ri_runnable_time", "per-thread clocks on the host"),
 ];
@@ -464,7 +464,102 @@ pub struct Input {
     /// `proc_exit`'s gathering at this Mach time: the map is gone, so
     /// nothing is wired or resident, and the footprint is set to 0.
     pub exit_abstime: Option<u64>,
+    /// recount's instructions of the task ([`cpmu::instructions`]), where
+    /// they are counted.
+    pub instructions: Option<u64>,
 }
+
+/// recount's CPMU figures (`CONFIG_PERVASIVE_CPI`): `ri_instructions` and
+/// `ri_cycles`.
+///
+/// What 21H461's kernel does: `recount_snapshot` (0xfffffff0072287f8,
+/// `mt_cur_cpu_cycles_instrs_speculative` inlined) reads PMC0 and PMC1
+/// raw, adds each one's rise since the processor's last read to the
+/// processor's running sums (`cpu+0x228` cycles, `+0x230` instructions),
+/// and stores them, unscaled, in the snapshot. `recount_switch_thread` (at
+/// `thread_invoke` 0xfffffff007231cac, `thread_quantum_expire`
+/// 0xfffffff00722640c and `processor_idle`) adds the snapshot's rise since
+/// the processor's last snapshot to the thread going off core, its task's
+/// track and the processor's (`recount_absorb_snap`; an idle thread's to
+/// none), at the kernel level (no `PRECISE_USER_KERNEL_TIME`).
+/// `mt_cpu_run` (0xfffffff007346530) sets PMCR1 to count both counters at
+/// EL0 (A32 and A64) and at EL1, so the sums are the program's and the
+/// kernel's while the thread is on core. `task_power_info_locked` sums the
+/// task track's levels (`recount_usage_cycles`, `recount_usage_
+/// instructions`), and an exec's task takes the old one's
+/// (`task_rollup_accounting_info`, `recount_task_copy`).
+///
+/// Instructions: the translator counts what each thread retires at EL0 in
+/// its context (`gex_abi::ctx::INSTRUCTIONS`, block by block, taking back
+/// what a fault or a signal leaves unretired); an ended thread's, and those
+/// of the threads an exec ends, go to its process's sum. XNU's own
+/// instructions at EL1 on the thread's behalf (its exception entries and
+/// returns, the system calls' bodies, faults, interrupts and switches) are
+/// not run here: none are added ([`EL1_STAND_IN`]). The figure is the
+/// count up to the read, where the device's lags by each running thread's
+/// stretch since its last switch or quantum end, as the time does.
+///
+/// Cycles: PMC0 counts the core's clock, which runs at the DVFS state CLPC
+/// sets (the device tree's `/arm-io/pmgr/clpc` has `dynamic-cpu-control`
+/// 1). The IPSW's device tree (J120's, `/arm-io/pmgr`) gives the states'
+/// frequencies as 16.16 fixed-point pairs whose first is the frequency in
+/// MHz: `ecore-static-vvfc` 396, 768, 1152 and `pcore-static-vvfc` 804,
+/// 1140, 1548, 1956, 2316, 2400 ([`cpmu::STATES_MHZ`]; the A10X's cores
+/// pair a fast and an efficient one under one processor, which the kernel
+/// sees as three, `cpu0`..`cpu2`). The tables iBoot fills in
+/// (`voltage-states0`, `voltage-states1`) are blank there, and CLPC's
+/// choice among the states over time is AppleT8011CLPC's, not modelled:
+/// every on-core stretch is held in the top state, a stand-in
+/// ([`DVFS_STAND_IN`]). On-core time is the threads' time, as
+/// `ri_user_time` has it.
+pub mod cpmu {
+    use gex_abi::ctx;
+
+    /// The DVFS states the cores run in, by frequency in MHz: the
+    /// efficient cores' (`ecore-static-vvfc`), then the fast ones'
+    /// (`pcore-static-vvfc`), each pair's first 16.16 word.
+    pub const STATES_MHZ: [u64; 9] = [396, 768, 1152, 804, 1140, 1548, 1956, 2316, 2400];
+
+    /// The state every on-core stretch is held in: the fast cores' top
+    /// (a stand-in for CLPC's choice, [`super::DVFS_STAND_IN`]).
+    pub fn state() -> usize {
+        STATES_MHZ.len() - 1
+    }
+
+    /// The cycles of `ns` nanoseconds on core in the current state.
+    pub fn cycles(ns: u64) -> u64 {
+        (u128::from(ns) * u128::from(STATES_MHZ[state()]) / 1000) as u64
+    }
+
+    /// The task's instructions: its ended threads' (`dead`) and each of
+    /// `threads`' context's count, read with `read`; none where they are
+    /// not counted or a context cannot be read.
+    pub fn instructions(dead: u64, threads: Option<&crate::signal::ThreadSigs>, read: &mut dyn FnMut(u64) -> Option<u64>) -> Option<u64> {
+        if !gex_abi::count_instructions() {
+            return None;
+        }
+        let mut n = dead;
+        if let Some(threads) = threads {
+            for tid in threads.tids() {
+                let Some(t) = threads.get(tid) else { continue };
+                let c = t.ctx();
+                if c == 0 {
+                    continue;
+                }
+                n = n.wrapping_add(read(c + ctx::INSTRUCTIONS as u64)?);
+            }
+        }
+        Some(n)
+    }
+}
+
+/// The stand-in for XNU's EL1 instructions in `ri_instructions`, as gexc
+/// reports it.
+pub const EL1_STAND_IN: &str = "XNU's own instructions at EL1 on a thread's behalf in ri_instructions (PMC1 counts EL1 too: exception entries and returns, system calls' and faults' bodies, interrupts, switches) (stand-in: none, only the program's EL0 instructions the translator counts; measure on the device the ri_instructions rise across a loop of a known instruction count that makes N system calls, or takes N faults, against the same loop without them)";
+
+/// The stand-in for the cores' DVFS states in `ri_cycles`, as gexc reports
+/// it.
+pub const DVFS_STAND_IN: &str = "the DVFS state CLPC holds each on-core stretch in, which ri_cycles counts PMC0 at (the states are the device tree's pmgr static-vvfc, 396 to 2400 MHz; AppleT8011CLPC's choice over time and iBoot's voltage-states are not known here) (stand-in: the fast cores' top state, 2400 MHz, for all on-core time; measure ri_cycles over ri_user_time of a process on the device, CPU-bound and bursty, at each QoS)";
 
 /// Nanoseconds as Mach time units.
 pub fn mach_of_ns(ns: u64) -> u64 {
@@ -494,8 +589,16 @@ pub fn gather(i: &Input) -> Record {
             mark(ri::PKG_IDLE_WKUPS);
         }
     }
-    for f in [ri::PAGEINS, ri::DISKIO_BYTESREAD, ri::DISKIO_BYTESWRITTEN, ri::LOGICAL_WRITES, ri::INSTRUCTIONS, ri::CYCLES] {
+    for f in [ri::PAGEINS, ri::DISKIO_BYTESREAD, ri::DISKIO_BYTESWRITTEN, ri::LOGICAL_WRITES] {
         mark(f);
+    }
+    match i.instructions {
+        Some(n) => w[ri::INSTRUCTIONS] = n,
+        None => mark(ri::INSTRUCTIONS),
+    }
+    match i.time_ns {
+        Some(ns) => w[ri::CYCLES] = cpmu::cycles(ns),
+        None => mark(ri::CYCLES),
     }
     match i.footprint_peaks {
         Some((lifetime, interval)) => {
@@ -587,7 +690,21 @@ fn input(procs: &crate::proc::ProcTable, pid: i32, p: &super::procinfo::Public) 
         qos,
         wakeups: (!s.wkups_unkept.load(Ordering::Acquire)).then(|| (s.interrupt_wkups.load(Ordering::Acquire), s.pkg_idle_wkups.load(Ordering::Acquire))),
         exit_abstime: None,
+        instructions: None,
     }
+}
+
+/// Process `pid`'s instructions ([`cpmu::instructions`]) read from
+/// outside it, through the memory it published; none where the host keeps
+/// no view of it.
+pub fn instructions_from_outside(procs: &crate::proc::ProcTable, pid: i32, p: &super::procinfo::Public) -> Option<u64> {
+    let peer = procs.vm(pid).ok()?;
+    let mut n = None;
+    peer.mem.with_guest(&mut |g| {
+        let mut k = g.kernel();
+        n = cpmu::instructions(procs.dead_instructions(pid), p.threads.as_deref(), &mut |a| k.read_u64(a).ok());
+    });
+    n
 }
 
 /// What a look at a process's pages says: the `phys_footprint` balance,
@@ -624,6 +741,7 @@ pub fn footprint_from_outside(procs: &crate::proc::ProcTable, pid: i32, p: &supe
 pub fn proc_exit(procs: &crate::proc::ProcTable, pid: i32, p: &super::procinfo::Public) {
     let mut i = input(procs, pid, p);
     i.footprint_peaks = footprint_from_outside(procs, pid, p).map(|l| l.peaks);
+    i.instructions = instructions_from_outside(procs, pid, p);
     i.bills = *p.rusage.exit_bills.lock().unwrap_or_else(|e| e.into_inner());
     i.exit_abstime = Some(super::mach::absolute_time());
     let r = gather(&i);
@@ -670,6 +788,12 @@ impl Kernel {
             Some(r) => r,
             None => {
                 let mut i = input(&self.procs, pid, &target);
+                i.instructions = if pid == self.pid {
+                    let mut k = m.kernel();
+                    cpmu::instructions(self.procs.dead_instructions(pid), target.threads.as_deref(), &mut |a| k.read_u64(a).ok())
+                } else {
+                    instructions_from_outside(&self.procs, pid, &target)
+                };
                 if pid == self.pid {
                     if let Some(fp) = self.darwin_footprint_now(m) {
                         i.footprint = Some(fp as u64);
@@ -709,6 +833,43 @@ impl Kernel {
         let Some(cell) = self.dtask.policy.clone().or_else(|| self.procs.task_policy(self.pid)) else { return };
         let task = cell.lock().unwrap_or_else(|e| e.into_inner()).effective;
         cell.qos_time.thread_changed(&t, inputs, &task);
+    }
+
+    /// An exec's: the old image's threads are gone, their instructions
+    /// with them into the process's sum, which the new task keeps
+    /// (`task_rollup_accounting_info`'s `recount_task_copy`, and
+    /// `thread_copy_resource_info`'s for the thread that goes on). `m` is
+    /// the old image's memory, its threads stopped.
+    pub fn darwin_exec_instructions(&self, m: &mut GuestMem<'_>) {
+        if !self.darwin || !gex_abi::count_instructions() {
+            return;
+        }
+        let mut k = m.kernel();
+        for tid in self.thread_signals.tids() {
+            let Some(t) = self.thread_signals.get(tid) else { continue };
+            let c = t.ctx();
+            if c == 0 {
+                continue;
+            }
+            t.set_ctx(0);
+            if let Ok(n) = k.read_u64(c + gex_abi::ctx::INSTRUCTIONS as u64) {
+                self.procs.add_dead_instructions(self.pid, n);
+            }
+        }
+    }
+
+    /// The process's thread whose context is at `ctx` starts counting
+    /// there: a fork's child (its context the parent's copy, which a new
+    /// task's thread does not keep: its count starts at 0), or an exec's
+    /// new image (a new memory).
+    pub fn darwin_thread_counts_at(&mut self, m: &mut GuestMem<'_>, ctx: u64, fresh: bool) {
+        if !self.darwin || !gex_abi::count_instructions() {
+            return;
+        }
+        if fresh {
+            let _ = m.kernel().write_u64(ctx + gex_abi::ctx::INSTRUCTIONS as u64, 0);
+        }
+        self.signals.thread().set_ctx(ctx);
     }
 
     /// One of this task's threads was made runnable from interrupt
@@ -783,7 +944,28 @@ mod tests {
         assert_eq!(r.unkept_within(SIZES[2]).len(), 5);
         // V3: the QoS times, once; the bank's bills are kept.
         assert_eq!(r.unkept_within(SIZES[3]).len(), 6);
-        assert_eq!(r.unkept_within(SIZES[6]).len(), 6 + 5);
+        // V4: the logical writes, the peaks (not looked at) and the
+        // instructions (not counted here); the cycles come with the time.
+        assert_eq!(r.unkept_within(SIZES[6]).len(), 6 + 4);
+    }
+
+    #[test]
+    fn the_cpmu_fields_are_the_counted_instructions_and_the_time_at_the_top_state() {
+        let mut i = live();
+        i.instructions = Some(123_456);
+        let r = gather(&i);
+        assert_eq!(r.w[ri::INSTRUCTIONS], 123_456);
+        // 1 ms at 2400 MHz.
+        assert_eq!(r.w[ri::CYCLES], 2_400_000);
+        let all = r.unkept_within(SIZES[6]).join(" ");
+        assert!(!all.contains("ri_instructions") && !all.contains("ri_cycles"), "{all}");
+        // No time, no cycles.
+        let r = gather(&Input { time_ns: None, ..i });
+        assert!(r.unkept_within(SIZES[6]).join(" ").contains("ri_cycles"));
+        // The states are the device tree's, the fast cores' top last.
+        assert_eq!(cpmu::STATES_MHZ[cpmu::state()], 2400);
+        // A task whose instructions are not counted has none.
+        assert_eq!(cpmu::instructions(5, None, &mut |_| Some(1)), gex_abi::count_instructions().then_some(5));
     }
 
     #[test]

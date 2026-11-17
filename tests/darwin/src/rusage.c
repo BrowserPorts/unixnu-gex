@@ -28,6 +28,15 @@
 // outside it, and its peak after it unmapped what it touched. The fields
 // the kernel does not keep are reported, so a strict run stops at a
 // call that copies one ("stop").
+//
+// Instructions and cycles (recount's PMC1 and PMC0): a loop of a known
+// count retires exactly that many more instructions for twice as many
+// passes; a loop whose loads and stores take the first-touch faults of a
+// file's private mapping (each instruction resumed at the access) counts
+// exactly what the same loop counts over pages already touched; a signal
+// handler run in the middle of a loop adds only its own; a thread's count
+// stays its task's after it ends; an exec keeps the process's count, and
+// a fork's child starts from none. The cycles are the time at one clock.
 
 #include <errno.h>
 #include <mach/mach.h>
@@ -95,6 +104,124 @@ static int zeros(const struct rusage_info_v6 *r, const char *whose) {
         if (after[i]) return bad(whose, (long)after[i], 0);
     if (r->ri_system_time || r->ri_flags || r->ri_user_ptime || r->ri_system_ptime || r->ri_pinstructions || r->ri_pcycles || r->ri_penergy_nj || r->ri_secure_time_in_system || r->ri_secure_ptime_in_system || r->ri_energy_nj || r->ri_billed_energy || r->ri_serviced_energy)
         return bad(whose, 1, 0);
+    return 0;
+}
+
+// n passes of a two-instruction loop.
+__attribute__((noinline)) static void loop2(uint64_t n) {
+    __asm__ volatile("1: subs %0, %0, #1\n b.ne 1b" : "+r"(n) : : "cc");
+}
+
+// A load and a store, then a stride on, n times, from p: five
+// instructions a pass.
+__attribute__((noinline)) static void touch_loop(volatile char *p, uint64_t n, uint64_t stride) {
+    __asm__ volatile("1: ldrb w9, [%0]\n strb w9, [%0]\n add %0, %0, %2\n subs %1, %1, #1\n b.ne 1b"
+                     : "+r"(p), "+r"(n) : "r"(stride) : "w9", "cc", "memory");
+}
+
+static uint64_t insns(void) {
+    struct rusage_info_v6 r;
+    if (proc_pid_rusage(getpid(), RUSAGE_INFO_V4, &r) != 0) return 0;
+    return r.ri_instructions;
+}
+
+// The rise across one touch_loop, the same code each time.
+__attribute__((noinline)) static uint64_t across_touch(volatile char *p, uint64_t n) {
+    uint64_t a = insns();
+    touch_loop(p, n, 16384);
+    return insns() - a;
+}
+
+static volatile uint64_t handled;
+static void on_alarm(int s) {
+    (void)s;
+    handled++;
+}
+
+static void *counting_thread(void *arg) {
+    loop2((uint64_t)(uintptr_t)arg);
+    return NULL;
+}
+
+int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
+
+static int instructions(void) {
+    char self[1024];
+    if (proc_pidpath(getpid(), self, sizeof self) <= 0) return bad("its path", errno, 0);
+    // The rise across a call of loop2: the loop's 2n and the fixed path
+    // between the two reads, which cancels in a difference.
+    uint64_t a = insns(), b, c;
+    loop2(1000000);
+    b = insns();
+    loop2(2000000);
+    c = insns();
+    if ((c - b) - (b - a) != 2000000) return bad("instructions of a million more passes", (long)((c - b) - (b - a)), 2000000);
+    // The same loop over a file's private mapping: first touches (a read
+    // fault, then a write fault, each instruction run again) and then the
+    // same pages again.
+    enum { PAGES = 32 };
+    char path[] = "/private/var/tmp/rusage.XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0 || ftruncate(fd, PAGES * 16384) != 0) return bad("a file to map", errno, 0);
+    unlink(path);
+    char *f = mmap(NULL, PAGES * 16384, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (f == MAP_FAILED) return bad("mmap of the file", errno, 0);
+    uint64_t first = across_touch(f, PAGES), again = across_touch(f, PAGES);
+    munmap(f, PAGES * 16384);
+    if (first != again) return bad("instructions of a loop through first touches", (long)first, (long)again);
+    if (again < 5 * PAGES) return bad("instructions of a loop over pages", (long)again, 5 * PAGES);
+    // A loop a timer's signal interrupts: its own count and the handlers'.
+    struct sigaction sa = { .sa_handler = on_alarm };
+    sigaction(SIGALRM, &sa, NULL);
+    struct itimerval it = { { 0, 2000 }, { 0, 2000 } };
+    uint64_t s0 = insns(), loops = 0;
+    handled = 0;
+    setitimer(ITIMER_REAL, &it, NULL);
+    while (handled < 20) {
+        loop2(100000);
+        loops++;
+    }
+    struct itimerval off = { { 0, 0 }, { 0, 0 } };
+    setitimer(ITIMER_REAL, &off, NULL);
+    uint64_t s1 = insns();
+    signal(SIGALRM, SIG_DFL);
+    // Each pass of the outer loop and each handler's frame, its return
+    // and the call to it are a few hundred at most.
+    uint64_t base = 2 * 100000 * loops;
+    if (s1 - s0 < base || s1 - s0 - base > 1000 * (loops + handled + 4)) return bad("instructions of a loop with signals, over its own", (long)(s1 - s0 - base), (long)(1000 * (loops + handled + 4)));
+    // A thread that ends: its count stays its task's.
+    uint64_t j0 = insns();
+    pthread_t th;
+    pthread_create(&th, NULL, counting_thread, (void *)(uintptr_t)3000000);
+    pthread_join(th, NULL);
+    if (insns() - j0 < 6000000) return bad("an ended thread's instructions", (long)(insns() - j0), 6000000);
+    // A fork's child starts from none; an exec keeps the count.
+    int pp[2];
+    pipe(pp);
+    uint64_t before = insns();
+    pid_t c1 = fork();
+    if (c1 == 0) {
+        uint64_t mine = insns();
+        write(pp[1], &mine, sizeof mine);
+        loop2(2000000);
+        char n[32];
+        snprintf(n, sizeof n, "%d", pp[1]);
+        execl(self, self, "exec-count", n, (char *)NULL);
+        _exit(3);
+    }
+    uint64_t child0 = 0, child1 = 0;
+    read(pp[0], &child0, sizeof child0);
+    read(pp[0], &child1, sizeof child1);
+    int st;
+    waitpid(c1, &st, 0);
+    if (child0 >= before) return bad("a fork's child's instructions at its start", (long)child0, 0);
+    if (child1 < child0 + 4000000) return bad("an exec's instructions after it", (long)child1, (long)(child0 + 4000000));
+    // The cycles: the time at the cores' clock.
+    struct rusage_info_v6 r;
+    proc_pid_rusage(getpid(), RUSAGE_INFO_V4, &r);
+    uint64_t ns = ns_of(r.ri_user_time), want = ns * 2400 / 1000;
+    if (r.ri_cycles + want / 1000 + 2400 < want || r.ri_cycles > want + want / 1000 + 2400) return bad("the cycles against the time", (long)r.ri_cycles, (long)want);
     return 0;
 }
 
@@ -189,6 +316,11 @@ static int other(void) {
 
 int main(int argc, char **argv) {
     struct rusage_info_v6 r;
+    if (argc > 2 && strcmp(argv[1], "exec-count") == 0) {
+        uint64_t n = insns();
+        write(atoi(argv[2]), &n, sizeof n);
+        return 0;
+    }
     if (argc > 1 && strcmp(argv[1], "stop") == 0) {
         printf("rusage stop\n");
         fflush(stdout);
@@ -360,7 +492,7 @@ int main(int argc, char **argv) {
     }
     // The footprint's peaks, after the child sums above (another process
     // read here is reaped, and its time added to them).
-    if (peaks() || other()) return 1;
+    if (peaks() || other() || instructions()) return 1;
     printf("rusage ok\n");
     return 0;
 }

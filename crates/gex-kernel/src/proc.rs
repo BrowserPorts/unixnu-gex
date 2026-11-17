@@ -436,6 +436,11 @@ struct Proc {
     /// Its ended threads' runnable time (`task->total_runnable_time`), in
     /// Mach time units.
     dead_runnable: u64,
+    /// The instructions its ended threads retired, and those of the
+    /// threads an exec ended (recount's task track keeps every on-core
+    /// interval of its threads, and `task_rollup_accounting_info` carries
+    /// it to an exec's task).
+    dead_instructions: u64,
     /// Darwin's `p_persona`'s id: the id it is counted against
     /// (`chgproccnt`) instead of its real uid.
     persona: Option<u32>,
@@ -856,6 +861,7 @@ impl ProcTable {
                     dead_cpu: (0, 0),
                     children_cpu: (0, 0),
                     dead_runnable: 0,
+                    dead_instructions: 0,
                     persona: None,
                     child_end: None,
                     execed: false,
@@ -952,6 +958,7 @@ impl ProcTable {
             dead_cpu: (0, 0),
             children_cpu: (0, 0),
             dead_runnable: 0,
+            dead_instructions: 0,
             persona,
             child_end: None,
             execed: false,
@@ -1996,6 +2003,18 @@ impl ProcTable {
         if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == pid) {
             p.dead_runnable += runnable;
         }
+    }
+
+    /// Add a thread's retired instructions to `pid`'s ended threads'.
+    pub fn add_dead_instructions(&self, pid: i32, n: u64) {
+        if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == pid) {
+            p.dead_instructions = p.dead_instructions.wrapping_add(n);
+        }
+    }
+
+    /// `pid`'s ended threads' retired instructions.
+    pub fn dead_instructions(&self, pid: i32) -> u64 {
+        self.lock().procs.iter().find(|p| p.pid == pid).map_or(0, |p| p.dead_instructions)
     }
 
     /// `pid`'s ended threads' runnable time.

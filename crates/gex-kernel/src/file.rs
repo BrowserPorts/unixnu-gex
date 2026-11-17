@@ -354,6 +354,7 @@ impl OpenFile {
         let n = self.handle.read_at(off, buf)?;
         if !self.handle.is_stream() {
             self.offset.fetch_add(n, Ordering::Relaxed);
+            self.through_cache(off, n);
         }
         Ok(n)
     }
@@ -378,6 +379,7 @@ impl OpenFile {
         let n = self.handle.write_at(off, buf)?;
         if !self.handle.is_stream() {
             self.offset.store(off + n, Ordering::Relaxed);
+            self.through_cache(off, n);
         }
         Ok(n)
     }
@@ -386,14 +388,29 @@ impl OpenFile {
         if !self.readable {
             return Err(Errno::EBADF);
         }
-        self.handle.read_at(offset, buf)
+        let n = self.handle.read_at(offset, buf)?;
+        self.through_cache(offset, n);
+        Ok(n)
     }
 
     pub fn pwrite(&self, offset: u64, buf: &[u8]) -> SysResult {
         if !self.writable {
             return Err(Errno::EBADF);
         }
-        self.handle.write_at(offset, buf)
+        let n = self.handle.write_at(offset, buf)?;
+        self.through_cache(offset, n);
+        Ok(n)
+    }
+
+    /// A Darwin system's file pages that a `read` or `write` of `n` bytes
+    /// at `off` moved through its cache ([`crate::darwin::pagecache`]).
+    fn through_cache(&self, off: u64, n: u64) {
+        if n == 0 || !crate::darwin::pagecache::on() || self.handle.is_stream() {
+            return;
+        }
+        if let Some(key) = self.handle.host_id() {
+            crate::darwin::pagecache::through_cache(key, off, n);
+        }
     }
 
     pub fn seek(&self, offset: i64, whence: u32) -> SysResult {

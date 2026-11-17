@@ -130,11 +130,10 @@ pub mod ri {
 }
 
 /// Each field that can go unkept: its name, and what it needs.
-const UNKEPT: [(usize, &str, &str); 21] = [
+const UNKEPT: [(usize, &str, &str); 20] = [
     (ri::USER_TIME, "ri_user_time", "per-thread clocks on the host"),
     (ri::PKG_IDLE_WKUPS, "ri_pkg_idle_wkups", "the platform_idle_wakeups ledger: what a signal a thread call posted woke, or a thread call's message to another task's port"),
     (ri::INTERRUPT_WKUPS, "ri_interrupt_wkups", "the interrupt_wakeups ledger: what a signal a thread call posted woke, or a thread call's message to another task's port"),
-    (ri::PAGEINS, "ri_pageins", "VM_PAGE_COUNT_AS_PAGEIN at the task's faults (vm_fault_page, vm_fault_enter_prepare): the device's page cache (which file pages are resident, which came in clustered and are not yet mapped) and every first fault on a file page, the shared cache's included, whose nested pmap is not modelled, and instruction fetches, which are not seen"),
     (ri::RESIDENT_SIZE, "ri_resident_size", "a look at the process's pages, which the host keeps no view of"),
     (ri::PHYS_FOOTPRINT, "ri_phys_footprint", "a look at the process's pages, which the host keeps no view of"),
     (ri::CHILD_PKG_IDLE_WKUPS, "ri_child_pkg_idle_wkups", "the reaped children's platform-idle wakeups"),
@@ -286,6 +285,10 @@ pub struct Shared {
     /// The task's footprint meter: what its pmap holds, for its own looks
     /// and other processes'.
     pub meter: super::footprint::Meter,
+    /// `task->pageins`: `VM_PAGE_COUNT_AS_PAGEIN` at its faults
+    /// ([`super::pagecache::fault`]). An exec's task takes the old one's
+    /// (`task_rollup_accounting_info`).
+    pub pageins: AtomicU64,
     child: Mutex<Child>,
     /// `p_ru->ri`: what `proc_exit` gathered.
     exit: Mutex<Option<Record>>,
@@ -467,6 +470,8 @@ pub struct Input {
     /// recount's instructions of the task ([`cpmu::instructions`]), where
     /// they are counted.
     pub instructions: Option<u64>,
+    /// `counter_load(&task->pageins)`.
+    pub pageins: u64,
 }
 
 /// recount's CPMU figures (`CONFIG_PERVASIVE_CPI`): `ri_instructions` and
@@ -589,9 +594,10 @@ pub fn gather(i: &Input) -> Record {
             mark(ri::PKG_IDLE_WKUPS);
         }
     }
-    for f in [ri::PAGEINS, ri::DISKIO_BYTESREAD, ri::DISKIO_BYTESWRITTEN, ri::LOGICAL_WRITES] {
+    for f in [ri::DISKIO_BYTESREAD, ri::DISKIO_BYTESWRITTEN, ri::LOGICAL_WRITES] {
         mark(f);
     }
+    w[ri::PAGEINS] = i.pageins;
     match i.instructions {
         Some(n) => w[ri::INSTRUCTIONS] = n,
         None => mark(ri::INSTRUCTIONS),
@@ -691,6 +697,7 @@ fn input(procs: &crate::proc::ProcTable, pid: i32, p: &super::procinfo::Public) 
         wakeups: (!s.wkups_unkept.load(Ordering::Acquire)).then(|| (s.interrupt_wkups.load(Ordering::Acquire), s.pkg_idle_wkups.load(Ordering::Acquire))),
         exit_abstime: None,
         instructions: None,
+        pageins: s.pageins.load(Ordering::Acquire),
     }
 }
 
@@ -934,19 +941,21 @@ mod tests {
             assert_eq!((r.w[f], r.unkept & (1 << f)), (0, 0));
         }
         let v0 = r.unkept_within(SIZES[0]);
-        assert_eq!(v0.len(), 3, "{v0:?}");
-        assert!(v0[0].starts_with("ri_pkg_idle_wkups") && v0[2].starts_with("ri_pageins"));
+        assert_eq!(v0.len(), 2, "{v0:?}");
+        assert!(v0[0].starts_with("ri_pkg_idle_wkups") && v0[1].starts_with("ri_interrupt_wkups"));
         // Not looked at: the resident size too.
         let blind = gather(&Input { resident: None, ..live() });
-        assert!(blind.unkept_within(SIZES[0])[3].starts_with("ri_resident_size"));
+        assert!(blind.unkept_within(SIZES[0])[2].starts_with("ri_resident_size"));
         // V1 adds nothing unkept while no child was reaped; V2 the disk's.
-        assert_eq!(r.unkept_within(SIZES[1]).len(), 3);
-        assert_eq!(r.unkept_within(SIZES[2]).len(), 5);
+        assert_eq!(r.unkept_within(SIZES[1]).len(), 2);
+        assert_eq!(r.unkept_within(SIZES[2]).len(), 4);
         // V3: the QoS times, once; the bank's bills are kept.
-        assert_eq!(r.unkept_within(SIZES[3]).len(), 6);
+        assert_eq!(r.unkept_within(SIZES[3]).len(), 5);
         // V4: the logical writes, the peaks (not looked at) and the
         // instructions (not counted here); the cycles come with the time.
-        assert_eq!(r.unkept_within(SIZES[6]).len(), 6 + 4);
+        assert_eq!(r.unkept_within(SIZES[6]).len(), 5 + 4);
+        // The page-ins are the task's counter.
+        assert_eq!(gather(&Input { pageins: 7, ..live() }).w[ri::PAGEINS], 7);
     }
 
     #[test]
@@ -995,7 +1004,7 @@ mod tests {
         let r = gather(&i);
         assert_eq!((r.w[ri::WIRED_SIZE], r.w[ri::RESIDENT_SIZE], r.w[ri::PHYS_FOOTPRINT], r.w[ri::PROC_EXIT_ABSTIME]), (0, 0, 0, 5000));
         assert_eq!(r.unkept & ((1 << ri::RESIDENT_SIZE) | (1 << ri::PHYS_FOOTPRINT)), 0);
-        assert_eq!(r.unkept_within(SIZES[0]).len(), 3);
+        assert_eq!(r.unkept_within(SIZES[0]).len(), 2);
     }
 
     #[test]
@@ -1035,7 +1044,7 @@ mod tests {
         let r = gather(&i);
         assert_eq!(&r.w[ri::CPU_TIME_QOS..ri::CPU_TIME_QOS + 7], &[1, 2, 3, 4, 5, 6, 7]);
         assert!(!r.unkept_within(SIZES[3]).join(" ").contains("ri_cpu_time_qos"));
-        assert_eq!(r.unkept_within(SIZES[3]).len(), 5);
+        assert_eq!(r.unkept_within(SIZES[3]).len(), 4);
     }
 
     #[test]
@@ -1045,7 +1054,7 @@ mod tests {
         let r = gather(&i);
         assert_eq!((r.w[ri::INTERRUPT_WKUPS], r.w[ri::PKG_IDLE_WKUPS]), (9, 4));
         let v0 = r.unkept_within(SIZES[0]).join(" ");
-        assert!(!v0.contains("ri_interrupt_wkups") && !v0.contains("ri_pkg_idle_wkups") && v0.contains("ri_pageins"));
+        assert!(v0.is_empty(), "{v0}");
         // A reaped child's are its parent's sums, kept as its own were.
         let mut c = Child::default();
         i.exit_abstime = Some(5000);
@@ -1063,11 +1072,11 @@ mod tests {
         c.add(&r);
         c.add(&r);
         assert_eq!((c.user_time, c.system_time, c.elapsed_abstime), (2 * (24_000 + 10), 0, 2 * (4000 + 100)));
-        // The child's wakeups and page-ins are not kept, so neither are
-        // the sums; its time is.
+        // The child's wakeups are not kept, so neither are the sums; its
+        // time and page-ins are.
         let mut p = live();
         p.child = c;
         let all = gather(&p).unkept_within(SIZES[1]).join(" ");
-        assert!(all.contains("ri_child_pageins") && all.contains("ri_child_interrupt_wkups") && !all.contains("ri_child_user_time"));
+        assert!(!all.contains("ri_child_pageins") && all.contains("ri_child_interrupt_wkups") && !all.contains("ri_child_user_time"));
     }
 }

@@ -956,6 +956,7 @@ impl Kernel {
                 mm.is_unentered(page) && mm.vma_at(at).is_some_and(|v| v.prot & need != 0) && mm.enter_page(page)
             };
             if entered {
+                self.darwin_file_page_fault(at);
                 self.darwin_flush_perms(m);
                 return (Delivery::Resume(pc), 0);
             }
@@ -1008,6 +1009,7 @@ impl Kernel {
             if let Some(e) = self.dtask.vm.at_or_after(addr).filter(|e| e.start <= addr) {
                 let shared = e.attrs.kind == super::vm::kind::FILE_SHARED && !e.attrs.cow;
                 if super::ubc::fault(m, &self.mem, e.attrs.obj, e.start, e.end, e.offset, shared, addr) {
+                    self.darwin_file_page_fault(addr);
                     self.darwin_flush_perms(m);
                     return (Delivery::Resume(pc), 0);
                 }

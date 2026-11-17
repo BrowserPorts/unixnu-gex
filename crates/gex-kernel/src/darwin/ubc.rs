@@ -79,6 +79,12 @@ impl Vnode {
         resizing.map_or(now, |r| r.min(now))
     }
 
+    /// The file's size as the pager sees it now.
+    pub fn pager_size(&self) -> u64 {
+        let resizing = *self.resizing.lock().unwrap_or_else(|e| e.into_inner());
+        self.size(resizing)
+    }
+
     /// Map `[at, at + len)` of guest memory `m` from the file's `offset`:
     /// the file's own pages where `shared` and the open can write, else a
     /// copy made on write. Whether the host did.
@@ -203,6 +209,8 @@ fn tasks(procs: &ProcTable) -> Vec<Task> {
 /// new end leave every mapping of it, in every task, and every named
 /// entry's hold of them.
 pub fn will_resize(key: FileKey, new: u64) {
+    // The object's resident pages past it go too.
+    super::pagecache::truncate(key, new);
     let Some(id) = vmobject::by_file(key) else { return };
     let Some(v) = vnode(id) else { return };
     let mut resizing = v.resizing.lock().unwrap_or_else(|e| e.into_inner());

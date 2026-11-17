@@ -27,7 +27,7 @@
 // unmapped. Another process's footprint and resident size, read from
 // outside it, and its peak after it unmapped what it touched. The fields
 // the kernel does not keep are reported, so a strict run stops at a
-// call that copies one ("stop").
+// call that copies one ("stop": V2's, whose disk I/O is not kept).
 //
 // Instructions and cycles (recount's PMC1 and PMC0): a loop of a known
 // count retires exactly that many more instructions for twice as many
@@ -37,6 +37,10 @@
 // handler run in the middle of a loop adds only its own; a thread's count
 // stays its task's after it ends; an exec keeps the process's count, and
 // a fork's child starts from none. The cycles are the time at one clock.
+//
+// Page-ins: the first touch of each page of a file's mapping that no pmap
+// has mapped is one; a page a read brought in, or another process mapped
+// first, is none; a reaped child's are its parent's ri_child_pageins.
 
 #include <errno.h>
 #include <mach/mach.h>
@@ -225,6 +229,65 @@ static int instructions(void) {
     return 0;
 }
 
+static uint64_t pageins(void) {
+    struct rusage_info_v6 r;
+    if (proc_pid_rusage(getpid(), RUSAGE_INFO_V0, &r) != 0) return 0;
+    return r.ri_pageins;
+}
+
+// The page-ins: each page of a file's mapping that no pmap has mapped,
+// at its first touch in this process (a page the pager reads, or one a
+// cluster read brought in), is one; a page a read(2) brought in is a
+// cache hit, none; a page another process mapped first, none; and a
+// reaped child's are its parent's ri_child_pageins.
+static int page_ins(void) {
+    enum { N = 64 };
+    char path[] = "/private/var/tmp/rusage-pi.XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0 || ftruncate(fd, N * 16384) != 0) return bad("a file to map", errno, 0);
+    unlink(path);
+    // Pages 0..3 through the cache by a read.
+    char buf[4 * 16384];
+    if (pread(fd, buf, sizeof buf, 0) != (ssize_t)sizeof buf) return bad("pread", errno, 0);
+    volatile char *f = mmap(NULL, N * 16384, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (f == MAP_FAILED) return bad("mmap of the file", errno, 0);
+    uint64_t p0 = pageins();
+    for (int i = 0; i < 4; i++) (void)f[i * 16384];
+    uint64_t p1 = pageins();
+    if (p1 != p0) return bad("page-ins of pages a read brought in", (long)(p1 - p0), 0);
+    // Ten pages from page 20 on, each first touched here: ten, and none
+    // when they are touched again.
+    for (int i = 20; i < 30; i++) (void)f[i * 16384];
+    uint64_t p2 = pageins();
+    for (int i = 20; i < 30; i++) (void)f[i * 16384];
+    uint64_t p3 = pageins();
+    if (p2 - p1 != 10 || p3 != p2) return bad("page-ins of ten first touches, then again", (long)(p2 - p1), 10);
+    // A child that touches pages 20..29 (mapped here first) and 40..44
+    // (mapped by no one yet): five.
+    int pp[2];
+    pipe(pp);
+    pid_t c = fork();
+    if (c == 0) {
+        uint64_t a = pageins();
+        for (int i = 20; i < 30; i++) (void)f[i * 16384];
+        for (int i = 40; i < 45; i++) (void)f[i * 16384];
+        uint64_t n = pageins() - a;
+        write(pp[1], &n, sizeof n);
+        _exit(0);
+    }
+    uint64_t n = 0;
+    read(pp[0], &n, sizeof n);
+    struct rusage_info_v6 b0, b1;
+    proc_pid_rusage(getpid(), RUSAGE_INFO_V1, &b0);
+    waitpid(c, NULL, 0);
+    proc_pid_rusage(getpid(), RUSAGE_INFO_V1, &b1);
+    munmap((void *)f, N * 16384);
+    close(fd);
+    if (n != 5) return bad("a child's page-ins of pages mapped first by its parent and of new ones", (long)n, 5);
+    if (b1.ri_child_pageins - b0.ri_child_pageins < 5) return bad("a reaped child's page-ins in ri_child_pageins", (long)(b1.ri_child_pageins - b0.ri_child_pageins), 5);
+    return 0;
+}
+
 int proc_rlimit_control(pid_t pid, int flavor, void *arg);
 #ifndef RLIMIT_FOOTPRINT_INTERVAL
 #define RLIMIT_FOOTPRINT_INTERVAL 4
@@ -324,7 +387,7 @@ int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "stop") == 0) {
         printf("rusage stop\n");
         fflush(stdout);
-        proc_pid_rusage(getpid(), RUSAGE_INFO_V0, &r);
+        proc_pid_rusage(getpid(), RUSAGE_INFO_V2, &r);
         return 0;
     }
     // The calendar and Mach clocks read together near its start, for
@@ -492,7 +555,7 @@ int main(int argc, char **argv) {
     }
     // The footprint's peaks, after the child sums above (another process
     // read here is reaped, and its time added to them).
-    if (peaks() || other() || instructions()) return 1;
+    if (peaks() || other() || instructions() || page_ins()) return 1;
     printf("rusage ok\n");
     return 0;
 }

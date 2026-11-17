@@ -178,6 +178,11 @@ int main(int argc, char **argv) {
         proc_pid_rusage(getpid(), RUSAGE_INFO_V0, &r);
         return 0;
     }
+    // The calendar and Mach clocks read together near its start, for
+    // p_start and ps_start below.
+    struct timeval tv0;
+    gettimeofday(&tv0, NULL);
+    uint64_t abs0 = mach_absolute_time();
     if (proc_pid_rusage(getpid(), 7, &r) != -1 || errno != EINVAL) return bad("flavor 7", errno, EINVAL);
     if (proc_pid_rusage(99999, RUSAGE_INFO_V6, &r) != -1 || errno != ESRCH) return bad("no such process", errno, ESRCH);
 
@@ -192,21 +197,21 @@ int main(int argc, char **argv) {
     uint64_t before = usage_ns();
     if (proc_pid_rusage(getpid(), RUSAGE_INFO_V6, &r) != 0) return bad("V6", errno, 0);
     uint64_t after = usage_ns(), now = mach_absolute_time();
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
     struct { uint8_t uuid[16]; uint64_t uniqueid, puniqueid; int32_t idversion; uint32_t r2; uint64_t r3, r4; } u;
     if (proc_pidinfo(getpid(), 17, 0, &u, sizeof u) != sizeof u || memcmp(u.uuid, r.ri_uuid, 16)) return bad("its UUID", errno, 0);
     uint64_t t = ns_of(r.ri_user_time);
     if (t + 1000 < before || t > after + 1000) return bad("its time (ms)", (long)(t / 1000000), (long)(before / 1000000));
     if (zeros(&r, "a zero field")) return 1;
     if (r.ri_proc_exit_abstime != 0 || r.ri_proc_start_abstime == 0 || r.ri_proc_start_abstime >= now) return bad("its start and end", (long)r.ri_proc_exit_abstime, 0);
-    // p_start was read with ps_start (the calendar clock may be slewed
-    // against the Mach clock meanwhile: 0.2% of the time since).
+    // p_start was read with ps_start: from them to the clocks read near
+    // its start, the calendar clock may be slewed against the Mach clock
+    // by adjtime (ntp_update_second: 5000 PPM while more than a second
+    // off) and the NTP frequency (MAXFREQ, 500 PPM).
     struct { uint32_t f[30]; uint64_t start_sec, start_usec; } b;
     if (proc_pidinfo(getpid(), 3, 0, &b, 136) != 136) return bad("its BSD info", errno, 0);
-    int64_t wall = ((int64_t)tv.tv_sec - (int64_t)b.start_sec) * 1000000 + ((int64_t)tv.tv_usec - (int64_t)b.start_usec);
-    int64_t mach = (int64_t)(ns_of(now - r.ri_proc_start_abstime) / 1000);
-    if (llabs(wall - mach) > 20000 + mach / 500) return bad("its start against p_start (us)", (long)mach, (long)wall);
+    int64_t wall = ((int64_t)tv0.tv_sec - (int64_t)b.start_sec) * 1000000 + ((int64_t)tv0.tv_usec - (int64_t)b.start_usec);
+    int64_t mach = (int64_t)(ns_of(abs0 - r.ri_proc_start_abstime) / 1000);
+    if (llabs(wall - mach) > 20000 + mach * 5500 / 1000000) return bad("its start against p_start (us)", (long)mach, (long)wall);
     if (r.ri_runnable_time < r.ri_user_time) return bad("its runnable time", (long)r.ri_runnable_time, (long)r.ri_user_time);
     if (r.ri_phys_footprint == 0) return bad("its footprint", 0, 1);
     if (r.ri_child_user_time || r.ri_child_elapsed_abstime || r.ri_billed_system_time || r.ri_serviced_system_time || r.ri_billed_energy || r.ri_serviced_energy) return bad("no children, no bank bills", 1, 0);

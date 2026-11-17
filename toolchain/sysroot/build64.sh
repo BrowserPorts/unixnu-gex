@@ -57,11 +57,13 @@ if [ -f lib/libc.a ] && [ -n "$(find "$MUSL/arch" "$MUSL/include" "$MUSL/src/int
 fi
 make -s -j"$JOBS" install-headers install-libs >/dev/null
 
-# Linux UAPI headers: the host's x86 set, whose non-i386 branches are x86-64's.
+# Linux UAPI headers, the pinned ones (toolchain/linux-headers.sh): x86's
+# set, whose non-i386 branches are x86-64's.
 SR="$OUT/sysroot/include"
+LH=$("$HERE/../linux-headers.sh")
 rm -rf "$SR/linux" "$SR/asm-generic" "$SR/asm"
-cp -r /usr/include/linux /usr/include/asm-generic "$SR/"
-cp -rL /usr/include/asm "$SR/asm"
+cp -rL "$LH/linux" "$LH/asm-generic" "$SR/"
+cp -rL "$LH/x86_64-linux-gnu/asm" "$SR/asm"
 
 # libgex: the wasm32 runtime's setjmp and dlopen (data-model neutral C) and
 # the x86-64 signal-frame runner.

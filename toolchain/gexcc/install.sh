@@ -62,9 +62,11 @@ fi
 ln -sfn build/sysroot "$PREFIX/sysroot"
 mkdir -p "$PREFIX/sysroot/usr/include" "$PREFIX/sysroot/usr/lib/pkgconfig" "$PREFIX/sysroot/usr/share/pkgconfig"
 # the rest of the Linux UAPI headers (build32.sh copies linux/, asm/,
-# asm-generic/): architecture-neutral, from the host's linux-libc-dev
+# asm-generic/): architecture-neutral, the pinned ones
+LH=$("$ROOT/toolchain/linux-headers.sh")
 for d in mtd sound video xen misc rdma; do
-  [ -d "/usr/include/$d" ] && { rm -rf "$PREFIX/sysroot/include/$d"; cp -r "/usr/include/$d" "$PREFIX/sysroot/include/"; }
+  rm -rf "$PREFIX/sysroot/include/$d"
+  cp -rL "$LH/$d" "$PREFIX/sysroot/include/"
 done
 
 # gexcc's wrapper headers (include/: setjmp.h), searched before the libc's

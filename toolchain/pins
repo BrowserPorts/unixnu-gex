@@ -26,6 +26,11 @@ BUSYBOX_VERSION := 1.37.0
 BUSYBOX_URL     := https://busybox.net/downloads/busybox-1.37.0.tar.bz2
 BUSYBOX_SHA256  := 3311dff32e746499f4df0d5df04d7eb396382d7e108bb9250e7b519b837043a4
 
+# Linux's UAPI headers the sysroots and gexcc carry (toolchain/linux-headers.sh):
+# Debian's linux-libc-dev, from its snapshot archive, on any host.
+LINUX_HEADERS_URL    := https://snapshot.debian.org/archive/debian/20261115T210008Z/pool/main/l/linux/linux-libc-dev_6.12.117-1_all.deb
+LINUX_HEADERS_SHA256 := 8b4848725a2705e5b1612f2135c44300716690ba762368ab87df127e9a5ed416
+
 # The guest-side cross compilers the page's assets are built with
 # (page/build-assets.sh: the gears, the guest GL driver, ld-musl for the
 # aarch64 and x86-64 guests): musl.cc's builds, fetched by make toolchains.

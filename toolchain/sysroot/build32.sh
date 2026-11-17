@@ -88,13 +88,15 @@ if [ -n "${GEX_SNAPSHOT:-}" ]; then
   llvm-ar crs "$OUT/sysroot/lib/libgex-snap.a" $sobjs
 fi
 
-# Linux UAPI headers (Wine's Unix side includes linux/*.h). asm/ is the
-# host's x86 set taken down its i386 branches: gex-kernel serves the i386
-# ABI. swab.h keeps its generic C (its i386 branch is inline asm).
+# Linux UAPI headers (Wine's Unix side includes linux/*.h), the pinned ones
+# (toolchain/linux-headers.sh). asm/ is the x86 set taken down its i386
+# branches: gex-kernel serves the i386 ABI. swab.h keeps its generic C (its
+# i386 branch is inline asm).
 SR="$OUT/sysroot/include"
+LH=$("$HERE/../linux-headers.sh")
 rm -rf "$SR/linux" "$SR/asm-generic" "$SR/asm"
-cp -r /usr/include/linux /usr/include/asm-generic "$SR/"
-cp -rL /usr/include/asm "$SR/asm"
+cp -rL "$LH/linux" "$LH/asm-generic" "$SR/"
+cp -rL "$LH/x86_64-linux-gnu/asm" "$SR/asm"
 for h in $(grep -l __i386__ "$SR"/asm/*.h); do
   case $h in */swab.h) continue ;; esac
   sed -i -e 's/defined(__i386__)/(defined(__i386__) || defined(__wasm32__))/g' \

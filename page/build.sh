@@ -129,11 +129,9 @@ xwl_key() { # xwl_key <mt|st>
     } | sha256sum | cut -c1-32
 }
 xwl_host_tools() {
-    # The distro's, when it has them all; otherwise built once into the cache.
-    if pkg-config --exists wayland-scanner wayland-protocols xwaylandproto 2>/dev/null &&
-       [ -f /usr/share/aclocal/xorg-macros.m4 ] && [ -f /usr/include/X11/xshmfence.h ]; then
-        return 0
-    fi
+    # Built once into the cache at host-tools.sh's tags, on every host: the
+    # X protocol headers are then the same everywhere, not the distribution's
+    # (and a host that is not Linux has none).
     "$HERE/../ports/xwayland/host-tools.sh" "$CACHE/xwl-host"
     GEX_XWL_HOST_TOOLS="$CACHE/xwl-host"; export GEX_XWL_HOST_TOOLS
 }

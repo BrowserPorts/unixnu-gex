@@ -31,6 +31,12 @@ BUSYBOX_SHA256  := 3311dff32e746499f4df0d5df04d7eb396382d7e108bb9250e7b519b83704
 LINUX_HEADERS_URL    := https://snapshot.debian.org/archive/debian/20261115T210008Z/pool/main/l/linux/linux-libc-dev_6.12.117-1_all.deb
 LINUX_HEADERS_SHA256 := 8b4848725a2705e5b1612f2135c44300716690ba762368ab87df127e9a5ed416
 
+# xkeyboard-config's data, which Xwayland's built-in keymap is compiled from
+# and whose licence the page ships (ports/xwayland/build.sh): Debian's
+# xkb-data, through toolchain/debian-package.sh.
+XKB_DATA_URL    := https://snapshot.debian.org/archive/debian/20240619T083124Z/pool/main/x/xkeyboard-config/xkb-data_2.42-1_all.deb
+XKB_DATA_SHA256 := 196ff18533382f64e057ea49df2bb486bd4275a4cc0917361edb560b8756dada
+
 # binaryen, the sysroots' wasm-opt (toolchain/binaryen.sh): its release build
 # for the host, each by the digest the release publishes.
 BINARYEN_VERSION              := 133

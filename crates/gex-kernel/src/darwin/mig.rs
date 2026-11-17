@@ -478,12 +478,16 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             let Some(n) = arg(req, 0) else { return bad() };
             let n = n as u32 as usize;
             let Some(bytes) = req.body.get(NDR + 4..NDR + 4 + n) else { return bad() };
-            let Some(dict) = super::iokit::unserialize_dict(bytes) else {
-                let mut r = Reply::err(K_IO_RETURN_NOT_READY);
-                r.unimplemented = Some(format!("a matching dictionary of nested or other kinds: {:x?}", &bytes[..bytes.len().min(160)]));
-                return r;
+            let (g, dict) = match super::iomatch::task_dictionary(bytes) {
+                Ok(Some(d)) => d,
+                Ok(None) => return Reply::err(super::iokit::ret::BAD_ARGUMENT),
+                Err(what) => {
+                    let mut r = Reply::err(K_IO_RETURN_NOT_READY);
+                    r.unimplemented = Some(what);
+                    return r;
+                }
             };
-            match super::iokit::matching(super::iokit::tree(), &dict) {
+            match super::iomatch::existing(super::iokit::tree(), &g, dict, false) {
                 Ok(items) => {
                     let id = super::iokit::iterator_new(items);
                     let port = k.ipc().global_port(Kobject::IoIterator(id));
@@ -509,12 +513,16 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             let Some(n) = arg(req, 0) else { return bad() };
             let n = n as u32 as usize;
             let Some(bytes) = req.body.get(NDR + 4..NDR + 4 + n) else { return bad() };
-            let Some(dict) = super::iokit::unserialize_dict(bytes) else {
-                let mut r = Reply::err(K_IO_RETURN_NOT_READY);
-                r.unimplemented = Some(format!("a matching dictionary of nested or other kinds: {:x?}", &bytes[..bytes.len().min(300)]));
-                return r;
+            let (g, dict) = match super::iomatch::task_dictionary(bytes) {
+                Ok(Some(d)) => d,
+                Ok(None) => return Reply::err(super::iokit::ret::BAD_ARGUMENT),
+                Err(what) => {
+                    let mut r = Reply::err(K_IO_RETURN_NOT_READY);
+                    r.unimplemented = Some(what);
+                    return r;
+                }
             };
-            match super::iokit::matching(super::iokit::tree(), &dict) {
+            match super::iomatch::existing(super::iokit::tree(), &g, dict, true) {
                 Ok(items) => match items.first() {
                     Some(&i) => {
                         let port = k.ipc().global_port(Kobject::IoEntry(i));
@@ -654,12 +662,16 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             let Some(bytes) = req.body.get(at + 4..at + 4 + n) else { return bad() };
             let ref_at = at + 4 + ((n + 3) & !3);
             let Some(refs) = i32_at(&req.body, ref_at) else { return bad() };
-            // A dictionary not read here, whether malformed (xnu's
-            // kIOReturnBadArgument) or of kinds this reader lacks, is said.
-            let Some(dict) = super::iokit::unserialize_dict(bytes) else {
-                let mut r = Reply::err(K_IO_RETURN_NOT_READY);
-                r.unimplemented = Some(format!("a matching dictionary of nested or other kinds: {:x?}", &bytes[..bytes.len().min(300)]));
-                return r;
+            // A malformed dictionary is kIOReturnBadArgument; XML text is
+            // not read here.
+            let (g, dict) = match super::iomatch::task_dictionary(bytes) {
+                Ok(Some(d)) => d,
+                Ok(None) => return Reply::err(super::iokit::ret::BAD_ARGUMENT),
+                Err(what) => {
+                    let mut r = Reply::err(K_IO_RETURN_NOT_READY);
+                    r.unimplemented = Some(what);
+                    return r;
+                }
             };
             // IOServiceUserNotification::init: no bigger a reference than
             // an OSAsyncReference64.
@@ -675,7 +687,7 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
                 _ => return Reply::err(K_IO_RETURN_UNSUPPORTED),
             };
             let items = if existing {
-                match super::iokit::matching(super::iokit::tree(), &dict) {
+                match super::iomatch::existing(super::iokit::tree(), &g, dict, false) {
                     Ok(items) => items,
                     Err(what) => {
                         let mut r = Reply::err(K_IO_RETURN_NOT_READY);

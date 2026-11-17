@@ -268,7 +268,7 @@ fn storage_driver(m: Media) -> Option<Client> {
         Media::Whole => Some(Client::Gpt),
         Media::Partition => Some(Client::Scheme),
         Media::Container => Some(Client::Container),
-        Media::Volume(_) => None,
+        Media::Volume(_) | Media::Firmware => None,
     }
 }
 
@@ -368,6 +368,7 @@ fn provider_open(t: &mut Table, m: Media, level: u32) -> Result<bool, String> {
         Media::Partition => partition_open(t, Client::Gpt, Client::Media(m), level),
         Media::Container => scheme_open(t, Client::Media(m), level),
         Media::Volume(_) => partition_open(t, Client::Container, Client::Media(m), level),
+        Media::Firmware => Err("the open of the firmware namespace's storage driver (NS_02's IOBlockStorageDriver)".to_string()),
     }
 }
 
@@ -381,6 +382,7 @@ fn provider_close(t: &mut Table, m: Media) -> Result<(), String> {
         Media::Partition => partition_close(t, Client::Gpt, Client::Media(m)),
         Media::Container => scheme_close(t, Client::Media(m)),
         Media::Volume(_) => partition_close(t, Client::Container, Client::Media(m)),
+        Media::Firmware => Err("the close of the firmware namespace's storage driver (NS_02's IOBlockStorageDriver)".to_string()),
     }
 }
 

@@ -1244,8 +1244,16 @@ impl Kernel {
             let mut fflags = if file.readable { FREAD } else { 0 } | if file.writable { FWRITE } else { 0 };
             fflags |= dflags as u32 & (O_SHLOCK | O_EXLOCK);
             self.darwin_dkopen(n.minor, fflags, block, &format!("/dev/{}", n.name))?;
-            self.darwin_unimplemented(format!("opening /dev/{}: what the open disk node does after dkopen (its I/O and last close, dkclose)", n.name));
-            return Err(Errno::ENXIO);
+            if let Some(gap) = super::disknode::gaps() {
+                self.darwin_unimplemented(format!("opening /dev/{}: {gap}", n.name));
+            }
+            if block && file.writable {
+                self.darwin_unimplemented(format!("opening /dev/{} for writing: a block node's writes (the buffer cache's read-modify-write, delayed and asynchronous writes)", n.name));
+            }
+            if let Some(d) = file.handle.darwin_disk() {
+                d.opened();
+            }
+            return Ok(());
         }
         Ok(())
     }

@@ -130,6 +130,8 @@ pub struct Gpt {
 pub struct Units {
     pub main: u32,
     pub container: u32,
+    /// The firmware namespace's (NSID 2) whole disk's.
+    pub firmware: u32,
 }
 
 /// The web device's facts. Unset until measured on a 64 GB J120 erase-
@@ -138,7 +140,7 @@ pub struct Units {
 pub const DEVICE: Facts = Facts { units: None, media_order: None, nvme: None, gpt: None, container_uuid: None };
 
 /// What measures [`Facts::units`].
-pub const UNITS_MEASUREMENT: &str = "the BSD names of the main NVMe namespace's IOMedia and of the AppleAPFSMedia (a sysdiagnose's ioreg IOMedia entries)";
+pub const UNITS_MEASUREMENT: &str = "the BSD names of the NVMe namespaces' IOMedia (NS_01's and NS_02's) and of the AppleAPFSMedia (a sysdiagnose's ioreg IOMedia entries)";
 
 /// What measures [`Facts::nvme`].
 pub const NVME_MEASUREMENT: &str = "disk0's IOMedia's name, Size and Preferred Block Size, its NVMe namespace's NamespaceUUID, Device Characteristics and IOStorageFeatures (a sysdiagnose's ioreg IOService plane)";
@@ -160,14 +162,13 @@ pub fn nvme() -> Nvme {
 pub const GPT_MEASUREMENT: &str = "the UUID of disk0's IOGUIDPartitionScheme and the Base, Size, UUID and GPT Attributes of its partition (a sysdiagnose's ioreg IOMedia entries)";
 
 /// What stands in for [`Facts::gpt`]: GUIDs that say they are not the
-/// device's (the restore makes them at random), and the partition over the
-/// whole of what a GPT of 128 entries of 128 bytes leaves of the disk at
-/// [`nvme`]'s block size (the first usable LBA after the header and the
-/// entries, the last before their backups), with no attributes.
+/// device's (the restore makes them at random), and the partition MediaKit
+/// lays out for the restore over the whole disk at [`nvme`]'s geometry
+/// ([`super::apfswrite::gpt::Map`]), with no attributes.
 pub fn stand_in_gpt() -> Gpt {
     let n = nvme();
-    let entries = (128 * 128u64).div_ceil(u64::from(n.block_size));
-    Gpt { disk_guid: uuid("00000000-0000-4000-8000-000000000001"), first_lba: 2 + entries, last_lba: n.blocks - 2 - entries, partition_guid: uuid("00000000-0000-4000-8000-000000000002"), attributes: 0 }
+    let m = super::apfswrite::gpt::Map::new(u64::from(n.block_size), n.blocks);
+    Gpt { disk_guid: uuid("00000000-0000-4000-8000-000000000001"), first_lba: m.first, last_lba: m.last, partition_guid: uuid("00000000-0000-4000-8000-000000000002"), attributes: 0 }
 }
 
 /// The GPT in force: the device's, or the stand-in.
@@ -203,9 +204,16 @@ pub fn partition_extent() -> (u64, u64) {
 }
 
 /// What stands in for [`Facts::units`] while it is unset: the main
-/// namespace the first whole disk, the container the next. A reported
-/// shortcut ([`unmeasured`]), not a fact of the device.
-pub const STAND_IN_UNITS: Units = Units { main: 0, container: 1 };
+/// namespace the first whole disk, the container the next, the firmware
+/// namespace's after it. Each whole disk's `IOMediaBSDClient` takes the
+/// first free anchor as it starts, which is when the IOBSD resource is
+/// published for the disks already registered by then, so the order is
+/// the boot's. The firmware namespace's disk after the container's is
+/// what a report of the iOS 16 and later devices' layout gives (the
+/// firmware namespace dumped from disk2 there, disk1 before iOS 16 made
+/// the container a whole disk of its own). A reported shortcut
+/// ([`unmeasured`]), not a fact of the device.
+pub const STAND_IN_UNITS: Units = Units { main: 0, container: 1, firmware: 2 };
 
 /// The unit numbers in force: the device's, or the stand-in.
 pub fn units() -> Units {
@@ -223,11 +231,13 @@ pub enum Media {
     Container,
     /// The container's volume at this slot.
     Volume(u32),
+    /// The firmware namespace's (NSID 2) whole disk.
+    Firmware,
 }
 
-/// How many media have nodes: the disk, its partition, the container and
-/// its volumes.
-pub const MEDIA: usize = 3 + VOLUMES.len();
+/// How many media have nodes: the disk, its partition, the container, its
+/// volumes and the firmware namespace's disk.
+pub const MEDIA: usize = 4 + VOLUMES.len();
 
 /// The major `IOMediaBSDClient` takes for every disk, block and character
 /// alike: `devsw_add(-1)`, in IOStorageFamily's `IOMediaBSDClientGlobals`
@@ -258,9 +268,11 @@ pub const DISK_OWNER: (u32, u32, u32) = (0, 5, 0o640);
 /// only once `bsd_autoconf`'s `IOKitBSDInit` publishes the IOBSD resource,
 /// so the media registered by then take their minors in the order the
 /// matching threads start their clients: a fact of the boot, not of the
-/// kernelcache. A reported shortcut ([`unmeasured`]).
+/// kernelcache. The firmware namespace's disk comes last, after the
+/// container's as its unit does ([`STAND_IN_UNITS`]). A reported shortcut
+/// ([`unmeasured`]).
 pub const STAND_IN_MEDIA_ORDER: [Media; MEDIA] = {
-    let mut out = [Media::Whole, Media::Partition, Media::Container, Media::Volume(0), Media::Volume(0), Media::Volume(0), Media::Volume(0), Media::Volume(0), Media::Volume(0), Media::Volume(0)];
+    let mut out = [Media::Whole, Media::Partition, Media::Container, Media::Volume(0), Media::Volume(0), Media::Volume(0), Media::Volume(0), Media::Volume(0), Media::Volume(0), Media::Volume(0), Media::Firmware];
     let mut i = 0;
     while i < VOLUMES.len() {
         out[3 + i] = Media::Volume(VOLUMES[i].index);
@@ -287,6 +299,7 @@ pub fn media_bsd_name(m: Media) -> String {
         Media::Partition => partition_bsd_name(),
         Media::Container => container_bsd_name(),
         Media::Volume(i) => volume_bsd_name(i),
+        Media::Firmware => format!("disk{}", units().firmware),
     }
 }
 
@@ -369,7 +382,7 @@ pub fn disk_writable() -> bool {
 pub fn unmeasured() -> Option<String> {
     let mut gaps = Vec::new();
     if DEVICE.units.is_none() {
-        gaps.push(format!("the storage's BSD units (stand-in disk{}, disk{}; measure {UNITS_MEASUREMENT})", STAND_IN_UNITS.main, STAND_IN_UNITS.container));
+        gaps.push(format!("the storage's BSD units (stand-in disk{}, disk{}, firmware disk{}; measure {UNITS_MEASUREMENT})", STAND_IN_UNITS.main, STAND_IN_UNITS.container, STAND_IN_UNITS.firmware));
     }
     if DEVICE.media_order.is_none() {
         gaps.push(format!("the disks' BSD minors (stand-in: the media's registration order; measure {MEDIA_ORDER_MEASUREMENT})"));
@@ -393,6 +406,7 @@ pub fn unmeasured() -> Option<String> {
     if DEVICE.gpt.is_none() {
         gaps.push(format!("disk0's GPT GUIDs and layout (stand-in: unmeasured GUIDs, the partition over all usable blocks; measure {GPT_MEASUREMENT})"));
     }
+    gaps.extend(super::storagestack::unmeasured());
     if DEVICE.container_uuid.is_none() {
         gaps.push(format!("the container's nx_uuid (stand-in 00000000-0000-4000-8000-000000000003; measure {CONTAINER_UUID_MEASUREMENT})"));
     }
@@ -445,25 +459,21 @@ const fn uuid(s: &str) -> [u8; 16] {
     out
 }
 
-/// A volume's UUID. newfs_apfs gives the volumes the restore adds (`-D`,
-/// no `-T`) the UUID `uuid_from_role` makes of their role:
-/// 61706673-7575-6964-RRRR-766f6c756d00 ("apfsuuid", the role, "volum").
-/// The System volume is then ASR's restore of the system image's volume,
-/// whose UUID is 04769D26-2CA0-4825-B443-E2E5F88300F2 (044-76040-038.dmg);
-/// whether ASR keeps it or the volume's own is not yet traced, and the
-/// image's stands in (a reported shortcut).
+/// A volume's UUID. newfs_apfs 2236.140.6 gives every volume it adds the
+/// UUID `uuid_from_role` makes (on unless `-T`; the restore's `-D` asks for
+/// it again): "apfsuuid", the role big-endian, "volum" and the volume's
+/// slot, 61706673-7575-6964-RRRR-766f6c756dII (0x10001b554; the kernel's
+/// volume creation, 0xfffffff006672cc8, sets the same last byte). The
+/// System volume keeps its own: `apfs_invert`, which makes the system
+/// image's volume of the file ASR wrote into it, keeps the outer volume's
+/// UUID (its superblock update, 0x100006d00).
 pub fn volume_uuid(index: u32) -> [u8; 16] {
     let Some(v) = volume(index) else { return [0; 16] };
-    if v.role == role::SYSTEM {
-        return SYSTEM_IMAGE_UUID;
-    }
     let mut u = uuid("61706673-7575-6964-0000-766f6c756d00");
     u[8..10].copy_from_slice(&v.role.to_be_bytes());
+    u[15] = v.index as u8;
     u
 }
-
-/// The system image's volume's UUID (044-76040-038.dmg).
-pub const SYSTEM_IMAGE_UUID: [u8; 16] = uuid("04769D26-2CA0-4825-B443-E2E5F88300F2");
 
 
 /// The name of the System volume's sealed snapshot the restore makes and
@@ -510,8 +520,9 @@ mod tests {
 
     #[test]
     fn volumes_take_their_roles_uuids() {
-        assert_eq!(volume_uuid(4), uuid("61706673-7575-6964-0010-766f6c756d00"), "Preboot");
-        assert_eq!(volume_uuid(3), uuid("61706673-7575-6964-0140-766f6c756d00"), "Hardware");
-        assert_eq!(volume_uuid(0), SYSTEM_IMAGE_UUID);
+        assert_eq!(volume_uuid(4), uuid("61706673-7575-6964-0010-766f6c756d04"), "Preboot");
+        assert_eq!(volume_uuid(3), uuid("61706673-7575-6964-0140-766f6c756d03"), "Hardware");
+        assert_eq!(volume_uuid(0), uuid("61706673-7575-6964-0001-766f6c756d00"), "System");
+        assert_eq!(volume_uuid(1), uuid("61706673-7575-6964-0040-766f6c756d01"), "Data");
     }
 }

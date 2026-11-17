@@ -11551,6 +11551,11 @@ impl Kernel {
                 let _ = crate::darwin::set_result(m, self.ctx_addr, e.as_return());
                 return SyscallOutcome::Continue;
             }
+            // A change to a file of a frozen container waits for its thaw.
+            if let Some(e) = self.darwin_frozen_writer(m, raw, &a) {
+                let _ = crate::darwin::set_result(m, self.ctx_addr, e.as_return());
+                return SyscallOutcome::Continue;
+            }
             if let Some(out) = self.darwin_psynch_call(m, raw, &a) {
                 if self.trace {
                     eprintln!("[gex:{}] pc=0x{pc:x} darwin {}({:#x}, {:#x}, {:#x}) -> {}", self.pid, crate::darwin::sysno::name(raw).unwrap_or("?"), a[0], a[1], a[2], if matches!(out, SyscallOutcome::Blocking(_)) { "blocks" } else { "done" });

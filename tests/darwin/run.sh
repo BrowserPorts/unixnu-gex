@@ -388,6 +388,22 @@ hello from /var/tmp/gex-exec-fat with 1 argument" 0
     bsdpty) check_root bsdpty "bsdpty ok" 0 ;;
     devfs) check_root devfs "devfs ok" 0 ;;
     disknodes) check_root disknodes "disknodes ok" 0 ;;
+    # The disk nodes' I/O, on the restore's disk0 image (as root); an image
+    # its build left incomplete is reported at the open, where a strict
+    # run stops.
+    diskio)
+        if [ -z "${GEX_DARWIN_DISK0:-}" ]; then
+            if [ "$named" -gt 0 ]; then echo "FAIL diskio: no GEX_DARWIN_DISK0 (set it)"; fail=1; else echo "SKIP diskio (set GEX_DARWIN_DISK0)"; fi
+        else
+            strict=${GEX_DARWIN_STRICT:-}
+            GEX_DARWIN_STRICT=0
+            check_root_as 0:0 diskio "diskio ok" 0
+            GEX_DARWIN_STRICT=$strict
+            if [ "$strict" = 1 ] && [ -s "$GEX_DARWIN_DISK0.missing" ]; then
+                check_root_as 0:0 diskio "" $STRICT_STOP
+            fi
+        fi ;;
+    fsfreeze) check_root_as 0:0 fsfreeze "fsfreeze ok" 0 ;;
     fmount) check_root fmount "fmount ok" 0 ;;
     mntupdate) check_root_as 0:0 mntupdate "mntupdate ok" 0 ;;
     fsstatwait) check_root fsstatwait "fsstatwait ok" 0 ;;
@@ -574,7 +590,7 @@ if [ "$named" -gt 0 ]; then
         run "$p"
     done
 else
-    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate thinfo tasksuspend portrefs crosstask spawnports taskname taskreg procfind debugport excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl iokit storagereg ioreg accel accelr metalwire metal iosurface iosurfacex iosurfacesplash iosurfacexpreboard iogpudev iomfb iomfbmain xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit sbxinit sbxexec sbxkill hostspecial sbxmask sbxnet sbxiokit sbxpriv sbxfile sbxscrub cfrunloop xpc-anon layout overlay stackfb launchcon shregion console owners apfsroles disknodes fmount mntupdate fsstatwait ignition graftdmg tcload inet6 rusage; do
+    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate thinfo tasksuspend portrefs crosstask spawnports taskname taskreg procfind debugport excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl iokit storagereg ioreg accel accelr metalwire metal iosurface iosurfacex iosurfacesplash iosurfacexpreboard iogpudev iomfb iomfbmain xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit sbxinit sbxexec sbxkill hostspecial sbxmask sbxnet sbxiokit sbxpriv sbxfile sbxscrub cfrunloop xpc-anon layout overlay stackfb launchcon shregion console owners apfsroles disknodes diskio fsfreeze fmount mntupdate fsstatwait ignition graftdmg tcload inet6 rusage; do
         run "$p"
     done
 fi

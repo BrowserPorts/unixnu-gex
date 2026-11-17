@@ -213,7 +213,7 @@ impl Kernel {
     /// The directory a lookup from descriptor `dirfd` (Darwin's numbering)
     /// starts in: the working directory's path, or the descriptor's, with
     /// no link on it; none when it is not one (the call reports why).
-    fn darwin_sb_start(&self, dirfd: u64) -> Option<Found> {
+    pub(crate) fn darwin_sb_start(&self, dirfd: u64) -> Option<Found> {
         let p = self.path_io().at_path_str(super::bsd::dirfd(dirfd) as i32, ".").ok()?;
         let path = self.vfs.canonical(&p);
         let md = self.vfs.metadata(&path).ok()?;

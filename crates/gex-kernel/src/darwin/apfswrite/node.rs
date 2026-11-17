@@ -272,6 +272,19 @@ impl Node {
         let e = self.vend() - l.v as usize;
         Some(&self.b[e..e + l.vl as usize])
     }
+    /// Record `i`'s value length as the space computations take it
+    /// (`btree_node_val_len`, 0x100025a48): none for a ghost or the
+    /// sentinel, an index entry's child identifier and hash.
+    pub fn val_len(&self, s: &Shape, i: usize) -> usize {
+        let l = self.loc(s, i);
+        if l.v >= OFF_SENTINEL {
+            0
+        } else if !self.is_leaf() {
+            s.index_val()
+        } else {
+            l.vl as usize
+        }
+    }
     /// An index entry's child identifier.
     pub fn child(&self, s: &Shape, i: usize) -> u64 {
         u64a(self.val(s, i).expect("an index entry with no value"), 0)
@@ -420,6 +433,18 @@ impl Node {
                 (self.vend() - self.kstart() - off - (flen - want)) as u16
             }
         })
+    }
+
+    /// Space for `len` bytes (0x100030440): the first free-list entry long
+    /// enough (the list as it is now, the record's old space pushed),
+    /// else the gap.
+    fn space_alloc(&mut self, s: &Shape, l: List, len: usize) -> Result<u16, i32> {
+        let (prev, off) = self.first_fit(s, l, len);
+        if off != OFF_INVALID {
+            self.take(s, l, len, prev, off);
+            return Ok(off);
+        }
+        self.gap_alloc(s, l, len)
     }
 
     /// Grows the table of contents by `grow` bytes: the key area moves up
@@ -573,8 +598,8 @@ impl Node {
             self.push(s, List::Val, l.v, l.vl as usize);
         }
         let n = self.nkeys();
-        let (a, e) = (self.toc_at(idx), self.esz());
-        self.b.copy_within(a + e..a + e * n, a);
+        let (a, end, e) = (self.toc_at(idx), self.toc_at(n), self.esz());
+        self.b.copy_within(a + e..end, a);
         self.set_nkeys(n - 1);
         self.shrink_after_remove(s);
         if self.is_root() && self.nkeys() == 0 && !keep_root {
@@ -704,7 +729,7 @@ impl Node {
             if dk == 0 {
                 koff = if idx < n { self.loc(s, idx).k } else { OFF_INVALID };
             } else if koff == OFF_INVALID {
-                koff = self.gap_alloc(s, List::Key, kl)?;
+                koff = self.space_alloc(s, List::Key, kl)?;
             } else {
                 self.take(s, List::Key, kl, kprev, koff);
             }
@@ -715,7 +740,7 @@ impl Node {
                 slot_v = if sentinel { OFF_SENTINEL } else { OFF_INVALID };
             } else {
                 slot_v = if voff_new == OFF_INVALID {
-                    self.gap_alloc(s, List::Val, vlen)?
+                    self.space_alloc(s, List::Val, vlen)?
                 } else {
                     self.take(s, List::Val, vlen, vprev, voff_new);
                     voff_new

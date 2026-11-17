@@ -257,7 +257,7 @@ pub const PARTITION_NAME: &str = "Container";
 
 /// A service entry.
 fn service(name: &str, class: &'static str, parent: Option<u32>, service_props: Vec<(String, Prop)>, table: Table) -> Node {
-    Node { name: name.to_string(), props: Vec::new(), class, service_props, parent, children: Vec::new(), kernel_only: false, nub: None, dt: None, table }
+    Node { name: name.to_string(), props: Vec::new(), class, service_props, parent, children: Vec::new(), kernel_only: false, nub: None, dt: None, table, power: None }
 }
 
 /// Push `n` below its parent; its index.
@@ -296,6 +296,8 @@ fn add_pcie(t: &mut Vec<Node>, io: u32) -> Option<u32> {
     ]);
     props.push(key("IOUserClientClass", sym("AppleEmbeddedPCIEUserClient")));
     props.push(key(&format!("IOFunctionParent{:08X}", 0xa5), Prop::Data(Vec::new())));
+    // `IOPCIBridge::start`'s PMinit, after `configure`.
+    props.push(key(super::iopower::KEY, super::iopower::pci_bridge()));
     let rc = push(t, service(T8011_PCIE, T8011_PCIE, Some(apcie), props, Table::Lacks(vec![("what AppleEmbeddedPCIE::configure sets", "not followed")])));
     // apcie as the host bridge's configuration left it: three address
     // cells and two size cells (as its device tree entry has them), and
@@ -323,18 +325,22 @@ fn add_pcie(t: &mut Vec<Node>, io: u32) -> Option<u32> {
         set(&mut p.service_props, k, v);
     }
     publish_nub(p, &f.root_port);
-    for (k, v) in [("IOInterruptControllers", Prop::Array(vec![sym("apcie-0")])), ("IOInterruptSpecifiers", Prop::Array(vec![Prop::Data(vec![0; 8])])), ("IOPCIResourced", Prop::Bool(true))] {
+    // `IOPCIDevice::attach`'s PMinit comes after `attachToChild`.
+    for (k, v) in [("IOInterruptControllers", Prop::Array(vec![sym("apcie-0")])), ("IOInterruptSpecifiers", Prop::Array(vec![Prop::Data(vec![0; 8])])), (super::iopower::KEY, super::iopower::pci_function()), ("IOPCIResourced", Prop::Bool(true))] {
         set(&mut p.service_props, k, v);
     }
     // The personality "ApplePCIEHostBridge", by bundle AppleT8011PCIe:
     // matched by the nub's compatible; its probe keeps the score
     // (0xfffffff00662af30); IOPCI2PCIBridge's start sets IOPCIPowerOnProbe.
     let mut props = driver("com.apple.driver.AppleT8011PCIe", HOST_BRIDGE, PCI_DEVICE, Some("apcie-bridge"), "IODefaultMatchCategory", 5000, vec![key("IONameMatch", string("apcie-bridge"))]);
+    // `IOPCIBridge::start`'s PMinit, then IOPCI2PCIBridge's key.
+    props.push(key(super::iopower::KEY, super::iopower::pci_bridge()));
     props.push(key("IOPCIPowerOnProbe", Prop::Bool(true)));
     let host = push(t, service("IOPP", HOST_BRIDGE, Some(port), props, Table::Complete));
     let nvme = add_pci_nub(t, s3e, host, port, "0", &f.nvme, "1:0:0");
     let n = &mut t[nvme as usize];
     publish_nub(n, &f.nvme);
+    set(&mut n.service_props, super::iopower::KEY, super::iopower::pci_function());
     set(&mut n.service_props, "IOPCIResourced", Prop::Bool(true));
     if let Table::Lacks(l) = &mut n.table {
         l.push(("IOInterruptControllers", "the MSI vectors the controller's driver allocates (ApplePCIEMSIController)"));
@@ -356,10 +362,9 @@ fn add_pcie(t: &mut Vec<Node>, io: u32) -> Option<u32> {
         key("IOPCIUseDeviceMapper", Prop::Bool(true)),
     ]);
     props.extend(controller_props(t, &f.nvme));
-    let lacks = vec![("IOPowerManagement", "the controller's power management, not modelled (PMinit in 0xfffffff006a874dc, after Firmware Revision)")];
     // Its start attaches it below its nub in the `IODeviceTree` plane
     // (0xfffffff006a81ec0), with no name or location of that plane's.
-    let mut c = service(CONTROLLER, CONTROLLER, Some(nvme), props, Table::Lacks(lacks));
+    let mut c = service(CONTROLLER, CONTROLLER, Some(nvme), props, Table::Complete);
     c.dt = Some(DtLink { parent: nvme, name: CONTROLLER.to_string(), location: None });
     Some(push(t, c))
 }
@@ -390,7 +395,8 @@ fn add_pcie(t: &mut Vec<Node>, io: u32) -> Option<u32> {
 ///   is 0x43); Controller Characteristics ([`controller_characteristics`],
 ///   replaced twice later in its place); the Identify strings as symbols,
 ///   trailing spaces cut (0xfffffff006a85e40 on).
-/// - PMinit, which adds IOPowerManagement (0xfffffff006a8754c).
+/// - PMinit, which adds IOPowerManagement (0xfffffff006a8754c;
+///   [`super::iopower::nvme_controller`]).
 /// - `IdentifyNamespaces` (0xfffffff006a5b84c): IOMaximumSwapWrite
 ///   ([`swap_write_limit`]).
 /// - `StartController` (0xfffffff006a5e25c): once the namespaces are made,
@@ -431,6 +437,7 @@ fn controller_props(t: &[Node], link: &PciFunction) -> Vec<(String, Prop)> {
     p.push(key("Serial Number", sym(n.serial)));
     p.push(key("Model Number", sym(n.model)));
     p.push(key("Firmware Revision", sym(n.firmware)));
+    p.push(key(super::iopower::KEY, super::iopower::nvme_controller()));
     if let Some(limit) = swap_write_limit(t, c.capacity_gb) {
         p.push(key("IOMaximumSwapWrite", num64(limit)));
     }
@@ -851,6 +858,8 @@ fn add_storage(t: &mut Vec<Node>, controller: Option<u32>) {
     // [`stats`]).
     let mut props = driver("com.apple.iokit.IOStorageFamily", DRIVER, "IOBlockStorageDevice", None, "IODefaultMatchCategory", 0, vec![key("IOPropertyMatch", Prop::Dict(vec![key("device-type", string("Generic"))]))]);
     props.push(key("Statistics", stats::driver(1)));
+    // Its start's PMinit, after `handleStart` publishes its medium.
+    props.push(key(super::iopower::KEY, super::iopower::joined_without_driver()));
     let drv = push(t, service(DRIVER, DRIVER, Some(ns), props, Table::Complete));
     // disk0: its content the GPT scheme's Content Mask, no leaf; its icon
     // the internal one (the namespace's Physical Interconnect Location).
@@ -1090,6 +1099,7 @@ fn add_namespaces(t: &mut Vec<Node>, controller: Option<u32>, dt_parent: Option<
     let ns = push(t, service("NS_02", BLOCK_DEVICE, Some(c), namespace_props(2, eui, block), Table::Complete));
     let mut props = driver("com.apple.iokit.IOStorageFamily", DRIVER, "IOBlockStorageDevice", None, "IODefaultMatchCategory", 0, vec![key("IOPropertyMatch", Prop::Dict(vec![key("device-type", string("Generic"))]))]);
     props.push(key("Statistics", stats::driver(2)));
+    props.push(key(super::iopower::KEY, super::iopower::joined_without_driver()));
     let drv = push(t, service(DRIVER, DRIVER, Some(ns), props, Table::Complete));
     let mut props = medium("", "", true, block, FIRMWARE_BLOCKS * block, true, super::storage::disk_writable());
     props.push(key("IOMediaIcon", Prop::Dict(vec![key("CFBundleIdentifier", string("com.apple.iokit.IOStorageFamily")), key("IOBundleResourceFile", string("Internal.icns"))])));

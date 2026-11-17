@@ -66,7 +66,8 @@ pub const PRIVATE: i32 = 0x7f00;
 
 /// `bootsessionuuid_string`.
 /// `kern.bootsessionuuid`: this boot's, a version 4 UUID in capitals as
-/// the real system's is. What sets it is outside the kernel; here it comes
+/// the real system's is. IOPMrootDomain's start sets it
+/// (`initializeBootSessionUUID`: `uuid_generate`, random); here it comes
 /// from the one thing unique to the boot, the time it began.
 pub fn bootsessionuuid() -> &'static str {
     use sha2::Digest;

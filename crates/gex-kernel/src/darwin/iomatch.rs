@@ -357,6 +357,9 @@ fn registered(t: &[Node], i: u32) -> Result<bool, String> {
     if n.class == super::accel::CLASS || n.class == super::iomfb::CLASS || n.class == super::iosurface::CLASS {
         return Ok(true);
     }
+    if let Some(r) = super::iopower::registers(n.class) {
+        return Ok(r);
+    }
     if let Some(r) = super::storagestack::registers(n.class) {
         return Ok(r);
     }
@@ -415,7 +418,9 @@ fn service_children(t: &[Node], i: u32) -> Vec<u32> {
 ///   `IOResourceMatch`).
 /// - The platform expert's start publishes IOResources (IOPMrootDomain's
 ///   start, from `PMInstantiatePowerDomains`, publishes the IOKit
-///   resource) before `configure` publishes the top-level nubs. The
+///   resource), and the root domain registers itself at the end of that
+///   start (0xfffffff0078629f8), before `configure` publishes the
+///   top-level nubs. The
 ///   services matched on IOResources wait for their resources (IOSurfaceRoot
 ///   for IOBSD, which `bsd_init` publishes): they come last here.
 ///
@@ -446,6 +451,9 @@ pub fn registration_order(t: &[Node]) -> Vec<u32> {
     fn start(t: &[Node], d: u32, out: &mut Vec<u32>) {
         if t[d as usize].class == super::platform::PE {
             if let Some(r) = t.iter().position(|n| n.class == super::platform::RESOURCES) {
+                emit(t, r as u32, out);
+            }
+            if let Some(r) = t.iter().position(|n| n.class == super::iopower::ROOT_DOMAIN) {
                 emit(t, r as u32, out);
             }
         }
@@ -610,7 +618,7 @@ pub fn existing(t: &[Node], g: &Graph, table: Id, once: bool) -> Result<Vec<u32>
 /// root, `IOPlatformExpertDevice::initWithArgs`).
 fn class_complete(class: &str) -> bool {
     class == "IOPlatformExpertDevice"
-        || super::storagestack::class_complete(class) || super::accel::class_complete(class) || super::iosurface::class_complete(class) || super::iomfb::class_complete(class)
+        || super::storagestack::class_complete(class) || super::iopower::class_complete(class) || super::accel::class_complete(class) || super::iosurface::class_complete(class) || super::iomfb::class_complete(class)
 }
 
 /// `OSDictionary::getCount`.

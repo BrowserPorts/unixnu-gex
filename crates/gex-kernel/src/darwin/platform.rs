@@ -210,7 +210,7 @@ pub fn add(t: &mut Vec<Node>) -> Option<u32> {
     if !names(root, "AppleARM") {
         return None;
     }
-    let driver = |name: &str, class: &'static str, parent: u32, service_props| Node { name: name.to_string(), props: Vec::new(), class, service_props, parent: Some(parent), children: Vec::new(), kernel_only: false, nub: None, dt: None, table: super::iokit::Table::Drivers };
+    let driver = |name: &str, class: &'static str, parent: u32, service_props| Node { name: name.to_string(), props: Vec::new(), class, service_props, parent: Some(parent), children: Vec::new(), kernel_only: false, nub: None, dt: None, table: super::iokit::Table::Drivers, power: None };
     let pe = t.len() as u32;
     // The personality "AppleARMPE": IONameMatch "AppleARM", IOProbeScore
     // 1000 (a 64-bit number, which the probe's 32-bit score replaces).
@@ -221,10 +221,14 @@ pub fn add(t: &mut Vec<Node>) -> Option<u32> {
     let io = t.len() as u32;
     // The personality "AppleT8011IO": IONameMatch "arm-io,t8011",
     // IOPlatformActiveAction 80000.
-    let props = driver_props("com.apple.driver.AppleT8011", ARM_IO, PLATFORM_DEVICE, Some("arm-io,t8011"), "IODefaultMatchCategory", 0, vec![
+    let mut props = driver_props("com.apple.driver.AppleT8011", ARM_IO, PLATFORM_DEVICE, Some("arm-io,t8011"), "IODefaultMatchCategory", 0, vec![
         ("IONameMatch".to_string(), Prop::Str("arm-io,t8011".to_string())),
         ("IOPlatformActiveAction".to_string(), Prop::Num(80000, 64)),
     ]);
+    // AppleARMIO's start (0xfffffff00598c0b4): PMinit (0xfffffff00598c0f0)
+    // and temporaryPowerClampOn (0xfffffff00598c100), before what
+    // AppleT801xIO's start sets; it never joins the power plane.
+    props.push((super::iopower::KEY.to_string(), super::iopower::clamped_without_driver()));
     t.push(driver(ARM_IO, ARM_IO, arm_io, props));
     Some(io)
 }
@@ -243,6 +247,6 @@ pub fn arm_io_nub(t: &mut [Node], io: u32, name: &str) -> Option<u32> {
 pub fn add_resources(t: &mut Vec<Node>) -> u32 {
     let published = |key: &str| (key.to_string(), Prop::Sym("IOService".to_string()));
     let at = t.len() as u32;
-    t.push(Node { name: RESOURCES.to_string(), props: Vec::new(), class: RESOURCES, service_props: vec![published("IOKit"), published("IOBSD")], parent: None, children: Vec::new(), kernel_only: false, nub: None, dt: None, table: super::iokit::Table::Drivers });
+    t.push(Node { name: RESOURCES.to_string(), props: Vec::new(), class: RESOURCES, service_props: vec![published("IOKit"), published("IOBSD")], parent: None, children: Vec::new(), kernel_only: false, nub: None, dt: None, table: super::iokit::Table::Drivers, power: None });
     at
 }

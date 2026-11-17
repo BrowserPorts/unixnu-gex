@@ -1,46 +1,57 @@
 //! APFS's transactions on a mounted container, as APFS 2236.140.6 runs
-//! them (the erase ramdisk's `newfs_apfs`, which carries the same code as
-//! the kernelcache's kext, measured run for run against this): allocation
-//! from the metadata zone, the space manager's copy-on-write of its
-//! chunk-info blocks and bitmaps into the internal pool, the free queues
-//! that hold what a transaction frees, the container object map's
-//! rewrite, and the checkpoint each transaction ends with.
+//! them (the erase ramdisk's `newfs_apfs` and `apfs_invert` carry the
+//! library the kernelcache's kext has; addresses are `apfs_invert`'s, I:,
+//! unless named): the object cache's copy-on-write, the space manager's
+//! allocation and free queues, the object maps, and the checkpoint each
+//! transaction ends with.
 //!
-//! What a transaction does, in order:
+//! Objects:
 //!
-//! - the first change to a chunk in a transaction moves its chunk-info
-//!   block (once a transaction) and then its bitmap to the internal
-//!   pool's first unused blocks, the old blocks going to the pool's free
-//!   queue (a block freed right after another in the same transaction
-//!   extends its entry);
-//! - metadata is allocated from the metadata zone's upper half, the first
-//!   free block from where the last allocation ended;
-//! - at the flush, a changed container object map is written to two new
-//!   blocks and its old two go to the main free queue; the changed
-//!   chunk-info blocks and bitmaps are written; the pool's bitmap goes to
-//!   the next block of its ring (the one it leaves joins the ring's free
-//!   list's tail); then the checkpoint: the space manager, reaper and free
-//!   queues (by object identifier) in the data area, the checkpoint map and
-//!   a copy of the superblock in the descriptor area;
-//! - a free queue's tree is made, its identifier the container's next,
-//!   when the first block is freed to it.
+//! - a physical object (an object map, its tree's nodes, a volume's
+//!   extent-reference and snapshot trees' nodes) takes a block when it is
+//!   made and, at its first change in a transaction, a new block, the old
+//!   one going to the main free queue at once (`obj_modify`, I:0x10003ae80);
+//! - a virtual object (a volume superblock, a file-system tree's nodes)
+//!   keeps its identifier and takes a block only at the flush
+//!   (`obj_write_prepare`, I:0x100035c88), in the order the transaction
+//!   first changed it, objects of encrypted volumes first and volume
+//!   superblocks last; its object map gets the new mapping and loses the
+//!   old one, whose block is freed;
+//! - an ephemeral object (the space manager, the reaper, the free queues'
+//!   nodes) is written to the checkpoint data ring.
+//!
+//! Space (`spaceman_alloc`, I:0x100044290): metadata from a metazone
+//! class's cursor (the lower half for encrypted volumes' objects, the upper
+//! half for the rest; object maps read the upper cursor but do not move
+//! it), first fit around the whole device; a chunk's first change in a
+//! transaction moves its chunk-info block and bitmap to the internal pool,
+//! by the pool's roving cursor (I:0x1000405fc), the old blocks going to the
+//! pool's free queue; the pool's bitmap moves to its ring's next block at
+//! its first change in a transaction. Freed blocks wait in the free
+//! queues, merged with their neighbours of the same transaction
+//! (I:0x1000484d8), until a later transaction releases them
+//! (`spaceman_free_completed`, I:0x100040f68): at its start, those more
+//! than the age limit older, and whatever keeps the queues under their
+//! limits (I:0x100041860).
 //!
 //! `nx_counters[0]` (`NX_CNTR_OBJ_CKSUM_SET`) counts the checksums set at
-//! three sites: objects written through the object cache (A, 0x100035450),
-//! ephemeral objects and the superblock written to block 0 (B,
-//! 0x10003be14, the value stored including its own count), and raw
-//! buffers, the superblock copy and checkpoint map among them (C,
-//! 0x10003be40, the copy stored before its own count). A mount takes the
-//! count from the newest checkpoint's copy.
+//! three sites: objects written through the object cache (A), ephemeral
+//! objects and the superblock written to block 0 (B, the value stored
+//! including its own count), and raw buffers, the superblock copy and
+//! checkpoint maps among them (C, the copy stored before its own count). A
+//! mount takes the count from the newest checkpoint's copy.
 //!
-//! What is not implemented is refused: a free queue or object map that
-//! outgrows one node, the checkpoint rings wrapping, the free queues'
-//! draining, chunk-info address blocks, Fusion.
+//! What is not implemented is refused: the B-trees' general split and
+//! merge ([`super::btree`]), metadata of more than one block, data
+//! allocations, a free queue drained for an allocation or for its size,
+//! snapshots, chunk-info address blocks, Fusion.
 
-use super::container::{empty_fixed_root, Formatted, Layout, NX_CLEANLY_UNMOUNTED};
+use super::btree::{self, Store, Tree};
+use super::container::{Formatted, Layout, NX_CLEANLY_UNMOUNTED};
+use super::node::{tree_flags, Node, Shape};
 use super::{put_header, set_checksum, Put, Sink};
 use crate::darwin::apfsread::otype;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// `nx_newest_mounted_version` APFS 2236.140.6 writes
 /// (2236 * 10^12 + 140 * 10^9 + 6 * 10^6).
@@ -55,7 +66,10 @@ const SPACEMAN_FREE_QUEUE: u32 = 0x09;
 const BLOCKREFTREE: u32 = 0x0f;
 const SNAPMETATREE: u32 = 0x10;
 const FSTREE: u32 = 0x0e;
-const BTOFF_INVALID: u16 = 0xffff;
+/// `CHECKPOINT_MAP_LAST`.
+const CHECKPOINT_MAP_LAST: u32 = 1;
+/// `APFS_FS_UNENCRYPTED`.
+const APFS_FS_UNENCRYPTED: u64 = 1;
 
 /// Where the checksums are counted (see the module's notes).
 #[derive(Clone, Copy)]
@@ -75,13 +89,17 @@ pub enum Mode {
     Kernel,
 }
 
-/// A free queue (`spaceman_free_queue_t`) and its records.
+/// The free queues (`sm_fq`): the internal pool's and the main device's.
+const FQ_IP: usize = 0;
+const FQ_MAIN: usize = 1;
+
+/// A free queue's state (`spaceman_free_queue_t`).
 #[derive(Default)]
 struct FreeQueue {
-    oid: u64,
+    tree: Option<Tree>,
+    count: u64,
+    oldest_xid: u64,
     limit: u16,
-    /// (xid, first block) -> blocks.
-    entries: BTreeMap<(u64, u64), u64>,
 }
 
 /// A chunk's state (`chunk_info_t`) and its bitmap once read.
@@ -93,6 +111,60 @@ struct Chunk {
     dirty: bool,
 }
 
+/// A metazone class (`sm + 0x3f0 + 0x20 * class`): its blocks, cursor and
+/// state.
+#[derive(Clone, Copy, Default)]
+struct Class {
+    start: u64,
+    end: u64,
+    cursor: u64,
+    state: i16,
+    enabled: bool,
+}
+
+/// An object in the cache: its bytes (header included) and what it is.
+struct Obj {
+    b: Vec<u8>,
+    /// `o_type`'s storage bits and subtype (a B-tree node's type is set
+    /// from its root flag when it is written).
+    storage: u32,
+    subtype: u32,
+    /// The metazone class its blocks come from.
+    class: usize,
+}
+
+/// Who maps a virtual object: the container (volume superblocks) or a
+/// volume (by slot).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Owner {
+    Container,
+    Volume(usize),
+}
+
+/// A virtual object's state in this mount: its bytes, and its mapping as
+/// of the last flush.
+struct VObj {
+    b: Vec<u8>,
+    mapped: Option<(u64, u64)>,
+}
+
+/// An object map: its `omap_phys_t`'s block and its tree.
+#[derive(Clone, Copy)]
+struct Omap {
+    phys: u64,
+    tree: Tree,
+}
+
+/// A volume as the container holds it.
+pub struct Vol {
+    pub oid: u64,
+    omap: Omap,
+    pub encrypted: bool,
+    pub fs_tree: Tree,
+    pub extentref: Tree,
+    pub snapmeta: Tree,
+}
+
 /// A mounted container.
 pub struct Nx<'a> {
     sink: &'a dyn Sink,
@@ -100,8 +172,9 @@ pub struct Nx<'a> {
     pub uuid: [u8; 16],
     pub mode: Mode,
     /// The transaction in progress (one past the last checkpoint's when
-    /// none is).
+    /// none is), and whether it has started.
     pub xid: u64,
+    in_tx: bool,
     pub next_oid: u64,
     counter: u64,
     newest_mounted: u64,
@@ -109,12 +182,16 @@ pub struct Nx<'a> {
     desc_len: u64,
     data_index: u64,
     data_len: u64,
+    /// A checkpoint was written in this mount.
+    wrote_checkpoint: bool,
     chunks: Vec<Chunk>,
     cib_addr: Vec<u64>,
     cib_xid: Vec<u64>,
     cib_dirty: Vec<bool>,
     ip_used: Vec<bool>,
+    ip_cursor: u64,
     ipbm_index: u16,
+    ipbm_xid: u64,
     ipbm_next: Vec<u16>,
     ipbm_head: u16,
     ipbm_tail: u16,
@@ -123,16 +200,43 @@ pub struct Nx<'a> {
     /// `sm_fs_reserve_block_count`, `sm_fs_reserve_alloc_count`.
     reserve: (u64, u64),
     datazone: [(u64, u64); 4],
-    meta_cursor: u64,
-    omap: BTreeMap<(u64, u64), (u32, u32, u64)>,
-    omap_addr: u64,
-    omap_dirty: bool,
+    classes: [Class; 3],
+    /// The free queues' age limit (`sm + 0x5f8`: 8, or 2 on a device with
+    /// `DK_FEATURE_BARRIER`) and the main queue's count limit (`sm +
+    /// 0x5e8`).
+    pub age_limit: u64,
+    main_count_limit: u64,
+    omap: Omap,
+    phys: HashMap<u64, Obj>,
+    phys_dirty: Vec<u64>,
+    eph: HashMap<u64, Obj>,
+    eph_order: Vec<u64>,
+    virt: HashMap<(Owner, u64), VObj>,
+    virt_dirty: Vec<(Owner, u64)>,
     pub fs_oid: Vec<u64>,
+    pub vols: BTreeMap<usize, Vol>,
     rw_mounted: bool,
+    sb_copy: Vec<u8>,
 }
 
-const FQ_IP: usize = 0;
-const FQ_MAIN: usize = 1;
+fn u64a(b: &[u8], o: usize) -> u64 {
+    u64::from_le_bytes(b[o..o + 8].try_into().unwrap())
+}
+
+/// The object map trees' shape: physical, fixed 16-byte keys and values.
+fn omap_shape(bs: u64) -> Shape {
+    Shape { bt_flags: tree_flags::SEQUENTIAL_INSERT | tree_flags::PHYSICAL, node_size: bs as usize, key_size: 16, val_size: 16, hash_size: 0 }
+}
+/// The free queues': ephemeral, ghosts allowed, 16-byte keys, 8-byte
+/// values.
+fn fq_shape(bs: u64) -> Shape {
+    Shape { bt_flags: tree_flags::SEQUENTIAL_INSERT | tree_flags::ALLOW_GHOSTS | tree_flags::EPHEMERAL, node_size: bs as usize, key_size: 16, val_size: 8, hash_size: 0 }
+}
+/// A volume's file-system, extent-reference and snapshot trees'.
+fn jtree_shape(bs: u64, physical: bool) -> Shape {
+    let f = tree_flags::SEQUENTIAL_INSERT | tree_flags::KV_NONALIGNED | if physical { tree_flags::PHYSICAL } else { 0 };
+    Shape { bt_flags: f, node_size: bs as usize, key_size: 0, val_size: 0, hash_size: 0 }
+}
 
 impl<'a> Nx<'a> {
     /// The container `newfs_apfs -C` just made (its state is [`Formatted`]'s,
@@ -149,8 +253,7 @@ impl<'a> Nx<'a> {
             let n = u32::from_le_bytes(b[0x24..0x28].try_into().unwrap()) as usize;
             for j in 0..n {
                 let o = 0x28 + 32 * j;
-                let q = |at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
-                chunks.push(Chunk { xid: q(o), free: u64::from(u32::from_le_bytes(b[o + 20..o + 24].try_into().unwrap())), bitmap_addr: q(o + 24), bitmap: None, dirty: false });
+                chunks.push(Chunk { xid: u64a(&b, o), free: u64::from(u32::from_le_bytes(b[o + 20..o + 24].try_into().unwrap())), bitmap_addr: u64a(&b, o + 24), bitmap: None, dirty: false });
             }
             cib_addr.push(addr);
         }
@@ -163,15 +266,21 @@ impl<'a> Nx<'a> {
         if l.ip_bm_size != 1 {
             return Err("not implemented: an internal pool bitmap of more than one block".into());
         }
-        let mut ipbm_next: Vec<u16> = (0..l.ip_bm_count).map(|i| if i == 0 || i + 1 == l.ip_bm_count { IP_BM_INDEX_INVALID } else { (i + 1) as u16 }).collect();
-        ipbm_next[0] = IP_BM_INDEX_INVALID;
+        if l.cabs != 0 {
+            return Err("not implemented: chunk-info address blocks".into());
+        }
+        let ipbm_next: Vec<u16> = (0..l.ip_bm_count).map(|i| if i == 0 || i + 1 == l.ip_bm_count { IP_BM_INDEX_INVALID } else { (i + 1) as u16 }).collect();
         let sm_free = chunks.iter().map(|c| c.free).sum();
+        let mut sb_copy = vec![0u8; bs as usize];
+        sink.read_at((l.desc_base + 1) * bs, &mut sb_copy)?;
+        let omap_tree = Tree { root: f.omap_tree, shape: omap_shape(bs), cmp: btree::cmp_omap };
         Ok(Nx {
             sink,
             l,
             uuid,
             mode,
             xid: 2,
+            in_tx: false,
             next_oid: 0x402,
             counter: super::container::format_copy_count(&l)?,
             newest_mounted: 0,
@@ -179,12 +288,15 @@ impl<'a> Nx<'a> {
             desc_len: 2,
             data_index: 0,
             data_len: l.sm_bytes / bs + 1,
+            wrote_checkpoint: false,
             chunks,
             cib_xid: vec![1; l.cibs as usize],
             cib_dirty: vec![false; l.cibs as usize],
             cib_addr,
             ip_used,
+            ip_cursor: 0,
             ipbm_index: 0,
+            ipbm_xid: 1,
             ipbm_next,
             ipbm_head: 1,
             ipbm_tail: (l.ip_bm_count - 1) as u16,
@@ -192,12 +304,20 @@ impl<'a> Nx<'a> {
             sm_free,
             reserve: (0, 0),
             datazone: [(0, 0); 4],
-            meta_cursor: l.first_metadata_block(),
-            omap: BTreeMap::new(),
-            omap_addr: f.omap,
-            omap_dirty: false,
+            classes: [Class::default(); 3],
+            age_limit: 8,
+            main_count_limit: l.blocks >> 5,
+            omap: Omap { phys: f.omap, tree: omap_tree },
+            phys: HashMap::new(),
+            phys_dirty: Vec::new(),
+            eph: HashMap::new(),
+            eph_order: vec![OID_SPACEMAN, OID_REAPER],
+            virt: HashMap::new(),
+            virt_dirty: Vec::new(),
             fs_oid: vec![0; l.max_file_systems as usize],
+            vols: BTreeMap::new(),
             rw_mounted: false,
+            sb_copy,
         })
     }
 
@@ -206,16 +326,30 @@ impl<'a> Nx<'a> {
         self.counter
     }
 
+    /// Whether the device reports `DK_FEATURE_BARRIER` (the in-memory space
+    /// manager's start, I:0x10003ffec; the kernel's 0xfffffff00674d5f4):
+    /// the free queues' age limit 2 and the main queue's count limit at
+    /// most 1 GiB of blocks; else 8 and a 32nd of the blocks.
+    pub fn set_barrier(&mut self, barrier: bool) {
+        self.main_count_limit = self.l.blocks >> 5;
+        if barrier {
+            self.age_limit = 2;
+            self.main_count_limit = self.main_count_limit.min((1u64 << 30) / self.l.bs);
+        } else {
+            self.age_limit = 8;
+        }
+    }
+
     /// The read-write mount: block 0 rewritten (its last state, not
     /// cleanly unmounted), the allocation zones chosen
-    /// (`spaceman_allocation_init`), and the newest mounting version
-    /// raised to this APFS's. `newfs_apfs` does this at each run; the
-    /// kernel once.
+    /// (`spaceman_allocation_init`), the metazone cursors and the pool's
+    /// cursor reset (`spaceman_metazone_init`, I:0x100007e8c), and the
+    /// newest mounting version raised to this APFS's. `newfs_apfs` does
+    /// this at each run; the kernel once.
     pub fn mount_rw(&mut self) -> Result<(), String> {
         if self.rw_mounted {
             return Ok(());
         }
-        // Block 0 as the last checkpoint left it, the clean flag cleared.
         let bs = self.l.bs as usize;
         let mut sb = vec![0u8; bs];
         self.sink.read_at(0, &mut sb)?;
@@ -234,6 +368,13 @@ impl<'a> Nx<'a> {
             self.datazone = first_mount_datazones(&self.l, &self.chunks)?;
         }
         self.newest_mounted = self.newest_mounted.max(APFS_VERSION);
+        self.classes = [Class::default(); 3];
+        if let Some((start, mid, end)) = self.l.metazone() {
+            self.classes[0] = Class { start, end: mid, cursor: start, state: 0, enabled: true };
+            self.classes[1] = Class { start: mid, end, cursor: mid, state: 0, enabled: true };
+        }
+        self.ip_cursor = 0;
+        self.wrote_checkpoint = false;
         self.rw_mounted = true;
         Ok(())
     }
@@ -245,40 +386,111 @@ impl<'a> Nx<'a> {
         o
     }
 
-    fn ip_alloc(&mut self) -> Result<u64, String> {
-        let i = self.ip_used.iter().position(|u| !u).ok_or("the internal pool is full")?;
-        self.ip_used[i] = true;
-        Ok(self.l.ip_base + i as u64)
+    /// `tx_enter` opening a transaction: the free queues' drain at its
+    /// start (I:0x100041860).
+    pub fn begin(&mut self) -> Result<(), String> {
+        if self.in_tx {
+            return Ok(());
+        }
+        self.in_tx = true;
+        if self.fq_too_big(FQ_IP, false)? {
+            while self.fq_too_big(FQ_IP, true)? {
+                if self.free_completed(FQ_IP)? == 0 {
+                    break;
+                }
+            }
+        }
+        while self.fq[FQ_IP].count != 0 && self.xid - self.fq[FQ_IP].oldest_xid > self.age_limit {
+            if self.free_completed(FQ_IP)? == 0 {
+                break;
+            }
+        }
+        if self.main_count_limit < self.fq[FQ_MAIN].count {
+            while self.fq[FQ_MAIN].count > self.main_count_limit / 2 {
+                if self.free_completed(FQ_MAIN)? == 0 {
+                    break;
+                }
+            }
+        }
+        if self.sm_free < self.fq[FQ_MAIN].count {
+            while self.fq[FQ_MAIN].count > self.sm_free / 2 {
+                if self.free_completed(FQ_MAIN)? == 0 {
+                    break;
+                }
+            }
+        }
+        if self.fq_too_big(FQ_MAIN, false)? {
+            while self.fq_too_big(FQ_MAIN, true)? {
+                if self.free_completed(FQ_MAIN)? == 0 {
+                    break;
+                }
+            }
+        }
+        while self.fq[FQ_MAIN].count != 0 && self.xid - self.fq[FQ_MAIN].oldest_xid > self.age_limit {
+            if self.free_completed(FQ_MAIN)? == 0 {
+                break;
+            }
+        }
+        Ok(())
     }
 
-    /// Frees `n` blocks from `paddr` to a free queue in this transaction.
-    fn fq_free(&mut self, q: usize, paddr: u64, n: u64) {
-        if self.fq[q].oid == 0 {
-            self.fq[q].oid = self.new_oid();
+    // ---- The internal pool.
+
+    /// The pool's bitmap's first change in this transaction: it moves to
+    /// its ring's next block, the one it leaves joining the ring's free
+    /// list (I:0x10004051c, I:0x10004996c).
+    fn ipbm_touch(&mut self) -> Result<(), String> {
+        if self.ipbm_xid == self.xid {
+            return Ok(());
         }
-        let xid = self.xid;
-        let prev = self.fq[q].entries.range((xid, 0)..=(xid, paddr)).next_back().map(|(k, v)| (*k, *v));
-        match prev {
-            Some((k, len)) if k.1 + len == paddr => {
-                self.fq[q].entries.insert(k, len + n);
-            }
-            _ => {
-                self.fq[q].entries.insert((xid, paddr), n);
-            }
+        let new = self.ipbm_head;
+        if new == IP_BM_INDEX_INVALID {
+            return Err("the internal pool bitmap ring has no free block".into());
         }
+        if self.ipbm_tail == new {
+            self.ipbm_tail = IP_BM_INDEX_INVALID;
+        }
+        self.ipbm_head = self.ipbm_next[new as usize];
+        self.ipbm_next[new as usize] = IP_BM_INDEX_INVALID;
+        let old = self.ipbm_index;
+        if self.ipbm_tail != IP_BM_INDEX_INVALID {
+            self.ipbm_next[self.ipbm_tail as usize] = old;
+        }
+        self.ipbm_next[old as usize] = IP_BM_INDEX_INVALID;
+        self.ipbm_tail = old;
+        if self.ipbm_head == IP_BM_INDEX_INVALID {
+            self.ipbm_head = old;
+        }
+        self.ipbm_index = new;
+        self.ipbm_xid = self.xid;
+        Ok(())
     }
+
+    /// A pool block by the roving cursor (I:0x1000405fc).
+    fn ip_alloc(&mut self) -> Result<u64, String> {
+        let n = self.l.ip_blocks;
+        let start = self.ip_cursor;
+        let i = (start..n).chain(0..start).find(|&i| !self.ip_used[i as usize]).ok_or("not implemented: draining the internal pool's free queue for an allocation")?;
+        self.ipbm_touch()?;
+        self.ip_used[i as usize] = true;
+        self.ip_cursor = if i + 1 >= n { 0 } else { i + 1 };
+        Ok(self.l.ip_base + i)
+    }
+
+    // ---- Chunks.
 
     /// The first change to chunk `c` in this transaction: its chunk-info
-    /// block and bitmap move to new pool blocks.
+    /// block and bitmap move to new pool blocks (`spaceman_modify_bits`,
+    /// I:0x1000471c4).
     fn touch_chunk(&mut self, c: usize) -> Result<(), String> {
-        if self.chunks[c].xid == self.xid {
+        if self.chunks[c].xid == self.xid && self.chunks[c].bitmap_addr != 0 {
             return Ok(());
         }
         let cib = c / self.l.chunks_per_cib as usize;
         if self.cib_xid[cib] != self.xid {
             let new = self.ip_alloc()?;
             let old = self.cib_addr[cib];
-            self.fq_free(FQ_IP, old, 1);
+            self.fq_insert(FQ_IP, old, 1)?;
             self.cib_addr[cib] = new;
             self.cib_xid[cib] = self.xid;
         }
@@ -292,7 +504,7 @@ impl<'a> Nx<'a> {
                 self.sink.read_at(old * bs, &mut b)?;
                 self.chunks[c].bitmap = Some(b);
             }
-            self.fq_free(FQ_IP, old, 1);
+            self.fq_insert(FQ_IP, old, 1)?;
         } else {
             self.chunks[c].bitmap = Some(vec![0u8; bs as usize]);
         }
@@ -303,92 +515,442 @@ impl<'a> Nx<'a> {
         Ok(())
     }
 
-    fn block_used(&mut self, b: u64) -> Result<bool, String> {
-        let bpc = self.l.blocks_per_chunk;
-        let c = (b / bpc) as usize;
+    fn bitmap(&mut self, c: usize) -> Result<Option<&Vec<u8>>, String> {
+        let bs = self.l.bs;
         let ch = &mut self.chunks[c];
         if ch.bitmap_addr == 0 {
-            return Ok(false);
+            return Ok(None);
         }
         if ch.bitmap.is_none() {
-            let mut buf = vec![0u8; self.l.bs as usize];
-            self.sink.read_at(ch.bitmap_addr * self.l.bs, &mut buf)?;
+            let mut buf = vec![0u8; bs as usize];
+            self.sink.read_at(ch.bitmap_addr * bs, &mut buf)?;
             ch.bitmap = Some(buf);
         }
-        let i = (b % bpc) as usize;
-        Ok(ch.bitmap.as_ref().unwrap()[i / 8] & (1 << (i % 8)) != 0)
+        Ok(ch.bitmap.as_ref())
     }
 
-    /// One block of metadata from the metadata zone's upper half.
-    pub fn alloc_meta(&mut self) -> Result<u64, String> {
-        let end = self.l.metazone().map_or(self.l.blocks, |z| z.2);
-        let mut b = self.meta_cursor;
-        while b < end && self.block_used(b)? {
+    /// The first free block of chunk `c` at or after block `from`.
+    fn first_free_in(&mut self, c: usize, from: u64) -> Result<Option<u64>, String> {
+        let bpc = self.l.blocks_per_chunk;
+        let base = c as u64 * bpc;
+        let end = (base + bpc).min(self.l.blocks);
+        if self.chunks[c].free == 0 {
+            return Ok(None);
+        }
+        let Some(bm) = self.bitmap(c)? else { return Ok((from < end).then_some(from)) };
+        let mut b = from;
+        while b < end {
+            let i = (b - base) as usize;
+            if i % 8 == 0 && bm[i / 8] == 0xff {
+                b += 8;
+                continue;
+            }
+            if bm[i / 8] & (1 << (i % 8)) == 0 {
+                return Ok(Some(b));
+            }
             b += 1;
         }
-        if b >= end {
-            return Err("not implemented: allocating metadata past the metadata zone".into());
+        Ok(None)
+    }
+
+    /// Marks `n` blocks from `b` used or free (`spaceman_modify_bits`).
+    fn modify_bits(&mut self, b: u64, n: u64, used: bool) -> Result<(), String> {
+        let bpc = self.l.blocks_per_chunk;
+        let mut at = b;
+        while at < b + n {
+            let c = (at / bpc) as usize;
+            let run = (b + n).min((c as u64 + 1) * bpc) - at;
+            self.touch_chunk(c)?;
+            let ch = &mut self.chunks[c];
+            let bm = ch.bitmap.as_mut().unwrap();
+            for k in at..at + run {
+                let i = (k % bpc) as usize;
+                if used {
+                    bm[i / 8] |= 1 << (i % 8);
+                } else {
+                    bm[i / 8] &= !(1 << (i % 8));
+                }
+            }
+            if used {
+                ch.free -= run;
+                self.sm_free -= run;
+            } else {
+                ch.free += run;
+                self.sm_free += run;
+            }
+            at += run;
         }
-        let c = (b / self.l.blocks_per_chunk) as usize;
-        self.touch_chunk(c)?;
-        let i = (b % self.l.blocks_per_chunk) as usize;
-        let ch = &mut self.chunks[c];
-        ch.bitmap.as_mut().unwrap()[i / 8] |= 1 << (i % 8);
-        ch.free -= 1;
-        self.sm_free -= 1;
-        self.meta_cursor = b + 1;
+        Ok(())
+    }
+
+    /// One block of metadata for metazone class `idx` (I:0x100044290 with
+    /// flag 0x40): first fit around the device from the class's cursor
+    /// (I:0x100008294), the class's cursor moved after it (I:0x1000081c0).
+    pub fn alloc_meta_class(&mut self, idx: usize) -> Result<u64, String> {
+        let cur = match idx {
+            0 => self.classes[0].cursor,
+            1 => self.classes[1].cursor,
+            _ if self.classes[2].enabled => self.classes[2].cursor,
+            _ => self.classes[1].cursor,
+        };
+        let start = if cur >= self.l.blocks { 0 } else { cur };
+        let bpc = self.l.blocks_per_chunk;
+        let sc = (start / bpc) as usize;
+        let n = self.chunks.len();
+        let mut found = None;
+        for k in 0..n {
+            let c = (sc + k) % n;
+            let from = if k == 0 { start } else { c as u64 * bpc };
+            if let Some(b) = self.first_free_in(c, from)? {
+                found = Some(b);
+                break;
+            }
+        }
+        if found.is_none() {
+            // Back at the start chunk: its blocks before the start.
+            if let Some(b) = self.first_free_in(sc, sc as u64 * bpc)? {
+                if b < start {
+                    found = Some(b);
+                }
+            }
+        }
+        let Some(b) = found else {
+            return Err("not implemented: draining the main free queue for a metadata allocation".into());
+        };
+        self.modify_bits(b, 1, true)?;
+        let end = if b + 1 >= self.l.blocks { 0 } else { b + 1 };
+        let c = &mut self.classes[idx.min(2)];
+        if c.start <= end && end < c.end {
+            c.cursor = end;
+            c.state = 0;
+        } else if c.cursor == c.start {
+            c.cursor = end;
+            c.state = 1;
+        } else if c.state < 0 {
+            c.cursor = c.start;
+            c.state = 0;
+        } else if c.state == 0 {
+            c.cursor = c.start;
+        } else {
+            c.cursor = end;
+            c.state += 1;
+        }
         Ok(b)
     }
 
-    /// Writes an object through the object cache (its checksum counted at
-    /// site A).
-    pub fn write_cached(&mut self, paddr: u64, mut b: Vec<u8>) -> Result<(), String> {
-        self.count(Site::Cached);
-        set_checksum(&mut b);
-        self.sink.write_at(paddr * self.l.bs, &b)
+    /// One block of metadata from the upper metazone class.
+    pub fn alloc_meta(&mut self) -> Result<u64, String> {
+        self.alloc_meta_class(1)
     }
 
-    /// Maps virtual `oid` at this transaction to `paddr` in the container's
-    /// object map.
-    pub fn omap_set(&mut self, oid: u64, paddr: u64) {
-        self.omap.insert((oid, self.xid), (0, self.l.bs as u32, paddr));
-        self.omap_dirty = true;
+    // ---- The free queues.
+
+    fn fq_tree(&mut self, q: usize) -> Result<Tree, String> {
+        if let Some(t) = self.fq[q].tree {
+            return Ok(t);
+        }
+        let shape = fq_shape(self.l.bs);
+        let t = Tree::create(&mut EphStore { nx: self }, shape, btree::cmp_fq)?;
+        self.fq[q].tree = Some(t);
+        Ok(t)
     }
 
-    /// The transaction's flush and checkpoint.
+    /// `spaceman_free` (I:0x100047fd8): `n` blocks from `paddr` to the main
+    /// free queue in this transaction.
+    pub fn free(&mut self, paddr: u64, n: u64) -> Result<(), String> {
+        self.fq_insert(FQ_MAIN, paddr, n)
+    }
+
+    /// `spaceman_fq_tree_insert` (I:0x1000484d8): merged with the
+    /// transaction's entries before and after it.
+    fn fq_insert(&mut self, q: usize, paddr: u64, n: u64) -> Result<(), String> {
+        let xid = self.xid;
+        let mut t = self.fq_tree(q)?;
+        let key = |x: u64, p: u64| {
+            let mut k = x.to_le_bytes().to_vec();
+            k.extend_from_slice(&p.to_le_bytes());
+            k
+        };
+        let recs = t.records(&mut EphStore { nx: self })?;
+        let entry = |r: &(Vec<u8>, Option<Vec<u8>>)| (u64a(&r.0, 0), u64a(&r.0, 8), r.1.as_ref().map_or(1, |v| u64a(v, 0)));
+        let pred = recs.iter().map(entry).filter(|&(x, p, _)| (x, p as i64) <= (xid, paddr as i64)).last();
+        let (mut start, mut len) = (paddr, n);
+        if let Some((px, pp, pl)) = pred {
+            if px == xid {
+                if paddr < pp + pl {
+                    return Err(format!("not implemented: a free of blocks {paddr}+{n} overlapping the queued {pp}+{pl}"));
+                }
+                if pp + pl == paddr {
+                    start = pp;
+                    len = pl + n;
+                }
+            }
+        }
+        let succ = recs.iter().map(entry).find(|&(x, p, _)| (x, p as i64) > (xid, start as i64));
+        let mut remove_succ = None;
+        if let Some((sx, sp, sl)) = succ {
+            if sx == xid && sp <= start + len {
+                if sp < start + len {
+                    return Err(format!("not implemented: a free of blocks {paddr}+{n} overlapping the queued {sp}+{sl}"));
+                }
+                len += sl;
+                remove_succ = Some(sp);
+            }
+        }
+        let v = len.to_le_bytes();
+        t.insert(&mut EphStore { nx: self }, &key(xid, start), (len != 1).then_some(&v[..]))?;
+        if let Some(sp) = remove_succ {
+            t.remove(&mut EphStore { nx: self }, &key(xid, sp))?;
+        }
+        self.fq[q].tree = Some(t);
+        if self.fq[q].count == 0 {
+            self.fq[q].oldest_xid = xid;
+        }
+        self.fq[q].count += n;
+        if self.fq_too_big(q, false)? {
+            return Err("not implemented: a free queue drained because its tree outgrew its node limit".into());
+        }
+        Ok(())
+    }
+
+    /// The free queue's "too big" test (I:0x100043f1c): to start a drain,
+    /// or (`cont`) to go on with one.
+    fn fq_too_big(&mut self, q: usize, cont: bool) -> Result<bool, String> {
+        let Some(t) = self.fq[q].tree else { return Ok(false) };
+        let limit = u64::from(self.fq[q].limit);
+        let root = EphStore { nx: self }.get(t.root)?;
+        let nodes = super::node::Info::read(&root.b).node_count;
+        let bs = self.l.bs as usize;
+        Ok(if limit >= 2 {
+            if cont {
+                nodes > limit >> 1
+            } else {
+                nodes > (3 * limit) >> 2
+            }
+        } else {
+            nodes > 1 || btree::root_free(&root) < if cont { bs / 2 } else { bs / 4 }
+        })
+    }
+
+    /// `spaceman_free_completed` (I:0x100040f68): the oldest transaction's
+    /// entries released, if a durable checkpoint covers them (every
+    /// earlier transaction's is: each ends with its checkpoint written);
+    /// the blocks released.
+    fn free_completed(&mut self, q: usize) -> Result<u64, String> {
+        let Some(mut t) = self.fq[q].tree else { return Ok(0) };
+        let durable = self.xid - 1;
+        let recs = t.records(&mut EphStore { nx: self })?;
+        let Some(first) = recs.first() else { return Ok(0) };
+        let first_xid = u64a(&first.0, 0);
+        let mut released = 0;
+        for (k, v) in recs {
+            let (x, p) = (u64a(&k, 0), u64a(&k, 8));
+            let len = v.as_ref().map_or(1, |v| u64a(v, 0));
+            if x > self.xid {
+                return Err("a free queue entry of a later transaction".into());
+            }
+            if x > first_xid {
+                self.fq[q].oldest_xid = x;
+                break;
+            }
+            if x > durable {
+                break;
+            }
+            let n = if q == FQ_IP { len } else { len.min(4 * self.l.blocks_per_chunk) };
+            if q == FQ_IP {
+                self.ipbm_touch()?;
+                for i in 0..len {
+                    self.ip_used[(p + i - self.l.ip_base) as usize] = false;
+                }
+            } else {
+                self.modify_bits(p, n, false)?;
+            }
+            self.fq[q].count -= n;
+            released += n;
+            t.remove(&mut EphStore { nx: self }, &k)?;
+            if n < len {
+                let mut nk = x.to_le_bytes().to_vec();
+                nk.extend_from_slice(&(p + n).to_le_bytes());
+                let v = (len - n).to_le_bytes();
+                t.insert(&mut EphStore { nx: self }, &nk, (len - n != 1).then_some(&v[..]))?;
+            }
+        }
+        self.fq[q].tree = Some(t);
+        Ok(released)
+    }
+
+    // ---- Objects.
+
+    fn phys_obj(&mut self, paddr: u64) -> Result<&mut Obj, String> {
+        if !self.phys.contains_key(&paddr) {
+            let mut b = vec![0u8; self.l.bs as usize];
+            self.sink.read_at(paddr * self.l.bs, &mut b)?;
+            let t = u32::from_le_bytes(b[24..28].try_into().unwrap());
+            let st = u32::from_le_bytes(b[28..32].try_into().unwrap());
+            let class = if t & 0xffff == otype::OMAP || st == otype::OMAP_TREE_SUBTYPE { 2 } else { 1 };
+            self.phys.insert(paddr, Obj { b, storage: t & otype::STORAGETYPE_MASK, subtype: st, class });
+        }
+        Ok(self.phys.get_mut(&paddr).unwrap())
+    }
+
+    fn phys_dirty_mark(&mut self, paddr: u64) {
+        if !self.phys_dirty.contains(&paddr) {
+            self.phys_dirty.push(paddr);
+        }
+    }
+
+    /// A new physical object of `class` (`obj_create`, I:0x100037844): its
+    /// block.
+    fn phys_create(&mut self, mut b: Vec<u8>, storage: u32, subtype: u32, class: usize) -> Result<u64, String> {
+        let paddr = self.alloc_meta_class(class)?;
+        b.put64(8, paddr);
+        b.put64(16, self.xid);
+        self.phys.insert(paddr, Obj { b, storage, subtype, class });
+        self.phys_dirty_mark(paddr);
+        Ok(paddr)
+    }
+
+    /// `obj_modify` of a physical object (I:0x10003b2ac): a new block at
+    /// its first change in this transaction, the old one freed at once.
+    fn phys_modify(&mut self, paddr: u64) -> Result<u64, String> {
+        let xid = self.xid;
+        let o = self.phys_obj(paddr)?;
+        if u64a(&o.b, 16) == xid {
+            return Ok(paddr);
+        }
+        let class = o.class;
+        let new = self.alloc_meta_class(class)?;
+        let mut o = self.phys.remove(&paddr).unwrap();
+        o.b.put64(8, new);
+        o.b.put64(16, xid);
+        self.phys.insert(new, o);
+        self.phys_dirty.retain(|&p| p != paddr);
+        self.phys_dirty_mark(new);
+        self.free(paddr, 1)?;
+        Ok(new)
+    }
+
+    /// `omap_set` (I:0x10003ecb0) and the old mapping's `omap_delete`
+    /// (I:0x10003eedc) for object `oid` of `owner`, now at `paddr`: without
+    /// snapshots the old record goes and its block is freed.
+    fn omap_set(&mut self, owner: Owner, oid: u64, paddr: u64, old: Option<(u64, u64)>) -> Result<(), String> {
+        let mut om = self.omap_of(owner)?;
+        om.phys = self.phys_modify(om.phys)?;
+        let mut k = oid.to_le_bytes().to_vec();
+        k.extend_from_slice(&self.xid.to_le_bytes());
+        let mut v = 0u32.to_le_bytes().to_vec();
+        v.extend_from_slice(&(self.l.bs as u32).to_le_bytes());
+        v.extend_from_slice(&paddr.to_le_bytes());
+        om.tree.insert(&mut PhysStore { nx: self, subtype: otype::OMAP_TREE_SUBTYPE, class: 2 }, &k, Some(&v))?;
+        if let Some((oxid, opaddr)) = old {
+            if oxid != self.xid {
+                let mut ok = oid.to_le_bytes().to_vec();
+                ok.extend_from_slice(&oxid.to_le_bytes());
+                om.tree.remove(&mut PhysStore { nx: self, subtype: otype::OMAP_TREE_SUBTYPE, class: 2 }, &ok)?;
+                self.free(opaddr, 1)?;
+            }
+        }
+        let root = om.tree.root;
+        self.phys_obj(om.phys)?.b.put64(0x30, root);
+        self.phys_dirty_mark(om.phys);
+        self.set_omap(owner, om)
+    }
+
+    fn omap_of(&self, owner: Owner) -> Result<Omap, String> {
+        match owner {
+            Owner::Container => Ok(self.omap),
+            Owner::Volume(i) => self.vols.get(&i).map(|v| v.omap).ok_or_else(|| format!("no volume in slot {i}")),
+        }
+    }
+
+    fn set_omap(&mut self, owner: Owner, om: Omap) -> Result<(), String> {
+        match owner {
+            Owner::Container => self.omap = om,
+            Owner::Volume(i) => {
+                let v = self.vols.get_mut(&i).ok_or_else(|| format!("no volume in slot {i}"))?;
+                let moved = v.omap.phys != om.phys;
+                v.omap = om;
+                // The superblock names its object map by address.
+                if moved {
+                    self.vol_sb(i)?.put64(0x80, om.phys);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A new virtual object of `owner`: its identifier.
+    fn virt_create(&mut self, owner: Owner, mut b: Vec<u8>) -> u64 {
+        let oid = self.new_oid();
+        b.put64(8, oid);
+        self.virt.insert((owner, oid), VObj { b, mapped: None });
+        self.virt_dirty.push((owner, oid));
+        oid
+    }
+
+    /// `obj_modify` of a virtual object: dirty from now on in this
+    /// transaction.
+    fn virt_modify(&mut self, owner: Owner, oid: u64) {
+        if !self.virt_dirty.contains(&(owner, oid)) {
+            self.virt_dirty.push((owner, oid));
+        }
+    }
+
+    /// The flush (`obj_cache_flush_prepare`, I:0x100035080): the virtual
+    /// objects' blocks and mappings in three passes (encrypted volumes'
+    /// objects, the others, volume superblocks), each written as it is
+    /// placed.
+    fn flush(&mut self) -> Result<(), String> {
+        let dirty = std::mem::take(&mut self.virt_dirty);
+        let is_sb = |o: &(Owner, u64)| o.0 == Owner::Container;
+        let enc = |nx: &Nx, o: &(Owner, u64)| matches!(o.0, Owner::Volume(i) if nx.vols.get(&i).is_some_and(|v| v.encrypted));
+        let mut order: Vec<(Owner, u64)> = dirty.iter().copied().filter(|o| !is_sb(o) && enc(self, o)).collect();
+        order.extend(dirty.iter().copied().filter(|o| !is_sb(o) && !enc(self, o)));
+        order.extend(dirty.iter().copied().filter(is_sb));
+        for (owner, oid) in order {
+            let class = if enc(self, &(owner, oid)) { 0 } else { 1 };
+            let paddr = self.alloc_meta_class(class)?;
+            let old = self.virt.get(&(owner, oid)).ok_or("a dirty object not in the cache")?.mapped;
+            self.omap_set(owner, oid, paddr, old)?;
+            let xid = self.xid;
+            let vo = self.virt.get_mut(&(owner, oid)).unwrap();
+            vo.mapped = Some((xid, paddr));
+            vo.b.put64(8, oid);
+            vo.b.put64(16, xid);
+            let mut b = vo.b.clone();
+            let ty = u32::from_le_bytes(b[24..28].try_into().unwrap());
+            if ty & 0xffff == otype::BTREE || ty & 0xffff == otype::BTREE_NODE {
+                let root = Node { b: b.clone() }.is_root();
+                b.put32(24, (ty & !0xffff) | if root { otype::BTREE } else { otype::BTREE_NODE });
+            }
+            self.count(Site::Cached);
+            set_checksum(&mut b);
+            self.sink.write_at(paddr * self.l.bs, &b)?;
+        }
+        Ok(())
+    }
+
+    /// The transaction's flush and checkpoint (`tx_flush`, I:0x10004bfb8).
     pub fn commit(&mut self) -> Result<(), String> {
+        self.begin()?;
         let bs = self.l.bs;
         let bsz = bs as usize;
         let xid = self.xid;
-        if self.omap_dirty {
-            let old = self.omap_addr;
-            let phys = self.alloc_meta()?;
-            let tree = self.alloc_meta()?;
-            self.fq_free(FQ_MAIN, old, 2);
-            let mut t = empty_fixed_root(bs, tree, xid, otype::PHYSICAL | otype::BTREE, otype::OMAP_TREE_SUBTYPE, 0x12, 16, 16);
-            let kv: Vec<(Vec<u8>, Option<Vec<u8>>)> = self
-                .omap
-                .iter()
-                .map(|((o, x), (f, s, p))| {
-                    let mut k = o.to_le_bytes().to_vec();
-                    k.extend_from_slice(&x.to_le_bytes());
-                    let mut v = f.to_le_bytes().to_vec();
-                    v.extend_from_slice(&s.to_le_bytes());
-                    v.extend_from_slice(&p.to_le_bytes());
-                    (k, Some(v))
-                })
-                .collect();
-            fill_fixed_leaf(&mut t, &kv, 16, 16)?;
-            self.write_cached(tree, t)?;
-            let mut o = vec![0u8; bsz];
-            put_header(&mut o, phys, xid, otype::PHYSICAL | otype::OMAP, 0);
-            o.put32(0x20, 1);
-            o.put32(0x28, otype::PHYSICAL | otype::BTREE);
-            o.put32(0x2c, otype::PHYSICAL | otype::BTREE);
-            o.put64(0x30, tree);
-            self.write_cached(phys, o)?;
-            self.omap_addr = phys;
-            self.omap_dirty = false;
+        self.flush()?;
+        // Physical objects.
+        let dirty = std::mem::take(&mut self.phys_dirty);
+        for paddr in dirty {
+            let o = self.phys.get(&paddr).ok_or("a dirty physical object not in the cache")?;
+            let mut b = o.b.clone();
+            let t = u32::from_le_bytes(b[24..28].try_into().unwrap());
+            if t & 0xffff == otype::BTREE || t & 0xffff == otype::BTREE_NODE {
+                let root = Node { b: b.clone() }.is_root();
+                put_header(&mut b, paddr, xid, o.storage | if root { otype::BTREE } else { otype::BTREE_NODE }, o.subtype);
+            }
+            self.count(Site::Cached);
+            set_checksum(&mut b);
+            self.sink.write_at(paddr * bs, &b)?;
+            self.phys.get_mut(&paddr).unwrap().b = b;
         }
         // Chunk-info blocks and bitmaps.
         for cib in 0..self.l.cibs as usize {
@@ -412,7 +974,9 @@ impl<'a> Nx<'a> {
                 b.put32(o + 20, ch.free as u32);
                 b.put64(o + 24, ch.bitmap_addr);
             }
-            self.write_cached(addr, b)?;
+            self.count(Site::Cached);
+            set_checksum(&mut b);
+            self.sink.write_at(addr * bs, &b)?;
             self.cib_dirty[cib] = false;
         }
         for c in 0..self.chunks.len() {
@@ -422,95 +986,109 @@ impl<'a> Nx<'a> {
                 self.sink.write_at(ch.bitmap_addr * bs, ch.bitmap.as_ref().unwrap())?;
             }
         }
-        // The pool's bitmap to the ring's next block.
-        let new = self.ipbm_head;
-        if new == IP_BM_INDEX_INVALID {
-            return Err("the internal pool bitmap ring has no free block".into());
+        if self.ipbm_xid == xid {
+            let mut ipbm = vec![0u8; bsz];
+            for (i, _) in self.ip_used.iter().enumerate().filter(|(_, u)| **u) {
+                ipbm[i / 8] |= 1 << (i % 8);
+            }
+            self.sink.write_at((self.l.ip_bm_base + u64::from(self.ipbm_index)) * bs, &ipbm)?;
         }
-        self.ipbm_head = self.ipbm_next[new as usize];
-        self.ipbm_next[new as usize] = IP_BM_INDEX_INVALID;
-        let old = self.ipbm_index;
-        self.ipbm_next[self.ipbm_tail as usize] = old;
-        self.ipbm_tail = old;
-        self.ipbm_next[old as usize] = IP_BM_INDEX_INVALID;
-        self.ipbm_index = new;
-        let mut ipbm = vec![0u8; bsz];
-        for (i, _) in self.ip_used.iter().enumerate().filter(|(_, u)| **u) {
-            ipbm[i / 8] |= 1 << (i % 8);
-        }
-        self.sink.write_at((self.l.ip_bm_base + u64::from(new)) * bs, &ipbm)?;
 
-        // The checkpoint.
-        let desc_index = self.desc_index + self.desc_len;
-        let data_index = self.data_index + self.data_len;
+        // The checkpoint: ephemeral objects in list order (map order at
+        // mount, then creation), map blocks, the superblock copy last.
+        let desc_start = (self.desc_index + self.desc_len) % self.l.desc_blocks;
+        let data_start = (self.data_index + self.data_len) % self.l.data_blocks;
         let mut eph: Vec<(u32, u32, u64, Vec<u8>)> = Vec::new();
-        let sm = self.spaceman_bytes();
-        eph.push((otype::EPHEMERAL | 0x5, 0, OID_SPACEMAN, sm));
-        let mut reaper = vec![0u8; bsz];
-        put_header(&mut reaper, OID_REAPER, xid, otype::EPHEMERAL | 0x11, 0);
-        reaper.put64(0x20, 1);
-        reaper.put32(0x40, 1);
-        reaper.put32(0x6c, bs as u32 - 0x70);
-        eph.push((otype::EPHEMERAL | 0x11, 0, OID_REAPER, reaper));
-        for q in 0..2 {
-            if self.fq[q].oid != 0 {
-                let b = self.fq_node(q)?;
-                eph.push((otype::EPHEMERAL | otype::BTREE, SPACEMAN_FREE_QUEUE, self.fq[q].oid, b));
+        for oid in self.eph_order.clone() {
+            match oid {
+                OID_SPACEMAN => eph.push((otype::EPHEMERAL | 0x5, 0, OID_SPACEMAN, self.spaceman_bytes())),
+                OID_REAPER => {
+                    let mut reaper = vec![0u8; bsz];
+                    put_header(&mut reaper, OID_REAPER, xid, otype::EPHEMERAL | 0x11, 0);
+                    reaper.put64(0x20, 1);
+                    reaper.put32(0x40, 1);
+                    reaper.put32(0x6c, bs as u32 - 0x70);
+                    eph.push((otype::EPHEMERAL | 0x11, 0, OID_REAPER, reaper));
+                }
+                oid => {
+                    let o = self.eph.get(&oid).ok_or("an ephemeral object not in the cache")?;
+                    let mut b = o.b.clone();
+                    let root = Node { b: b.clone() }.is_root();
+                    let ty = o.storage | if root { otype::BTREE } else { otype::BTREE_NODE };
+                    put_header(&mut b, oid, xid, ty, o.subtype);
+                    eph.push((ty, o.subtype, oid, b));
+                }
             }
         }
-        eph.sort_by_key(|e| e.2);
+        // A map block's entries: (bs - sizeof(checkpoint_map_phys_t)) /
+        // sizeof(checkpoint_mapping_t).
+        let per_map = ((bs - 0x28) / 0x28) as usize;
+        let maps = eph.len().div_ceil(per_map).max(1);
         let data_blocks: u64 = eph.iter().map(|e| e.3.len() as u64 / bs).sum();
-        if desc_index + 2 > self.l.desc_blocks || data_index + data_blocks > self.l.data_blocks {
-            return Err("not implemented: a checkpoint ring wrapping".into());
+        if (maps as u64) + 1 > self.l.desc_blocks || data_blocks > self.l.data_blocks {
+            return Err("not implemented: a checkpoint larger than its rings".into());
         }
-        let mut map = vec![0u8; bsz];
-        let map_paddr = self.l.desc_base + desc_index;
-        put_header(&mut map, map_paddr, xid, otype::PHYSICAL | otype::CHECKPOINT_MAP, 0);
-        map.put32(0x20, 1);
-        map.put32(0x24, eph.len() as u32);
-        let mut at = self.l.data_base + data_index;
+        let mut at = data_start;
+        let mut map_blocks: Vec<Vec<u8>> = (0..maps).map(|_| vec![0u8; bsz]).collect();
         for (i, (ty, sub, oid, mut b)) in eph.into_iter().enumerate() {
-            let o = 0x28 + 40 * i;
+            let (m, j) = (i / per_map, i % per_map);
+            let o = 0x28 + 40 * j;
+            let map = &mut map_blocks[m];
             map.put32(o, ty);
             map.put32(o + 4, sub);
             map.put32(o + 8, b.len() as u32);
             map.put64(o + 0x18, oid);
-            map.put64(o + 0x20, at);
+            map.put64(o + 0x20, self.l.data_base + at);
+            map.put32(0x24, j as u32 + 1);
             self.count(Site::Ephemeral);
             set_checksum(&mut b);
-            self.sink.write_at(at * bs, &b)?;
-            at += b.len() as u64 / bs;
+            for blk in 0..b.len() / bsz {
+                let idx = (at + blk as u64) % self.l.data_blocks;
+                self.sink.write_at((self.l.data_base + idx) * bs, &b[blk * bsz..(blk + 1) * bsz])?;
+            }
+            at = (at + b.len() as u64 / bs) % self.l.data_blocks;
         }
-        self.desc_index = desc_index;
-        self.data_index = data_index;
+        self.desc_index = desc_start;
+        self.desc_len = maps as u64 + 1;
+        self.data_index = data_start;
         self.data_len = data_blocks;
+        for (m, map) in map_blocks.iter_mut().enumerate() {
+            let paddr = self.l.desc_base + (desc_start + m as u64) % self.l.desc_blocks;
+            put_header(map, paddr, xid, otype::PHYSICAL | otype::CHECKPOINT_MAP, 0);
+            map.put32(0x20, if m + 1 == maps { CHECKPOINT_MAP_LAST } else { 0 });
+        }
         let mut sb = self.superblock()?;
         sb.put64(0x3d8, self.counter);
         self.count(Site::Raw);
         set_checksum(&mut sb);
-        self.sink.write_at((map_paddr + 1) * bs, &sb)?;
-        self.count(Site::Raw);
-        set_checksum(&mut map);
-        self.sink.write_at(map_paddr * bs, &map)?;
+        let sb_at = self.l.desc_base + (desc_start + maps as u64) % self.l.desc_blocks;
+        self.sink.write_at(sb_at * bs, &sb)?;
+        self.sb_copy = sb;
+        for (m, map) in map_blocks.iter_mut().enumerate() {
+            self.count(Site::Raw);
+            set_checksum(map);
+            let paddr = self.l.desc_base + (desc_start + m as u64) % self.l.desc_blocks;
+            self.sink.write_at(paddr * bs, map)?;
+        }
+        self.wrote_checkpoint = true;
+        self.in_tx = false;
         self.xid += 1;
         Ok(())
     }
 
     /// The superblock as the latest checkpoint has it.
     fn superblock(&self) -> Result<Vec<u8>, String> {
-        let bs = self.l.bs as usize;
-        let mut sb = vec![0u8; bs];
-        self.sink.read_at((self.l.desc_base + 1) * self.l.bs, &mut sb)?;
+        let mut sb = self.sb_copy.clone();
         put_header(&mut sb, 1, self.xid, otype::EPHEMERAL | otype::NX_SUPERBLOCK, 0);
         sb.put64(0x58, self.next_oid);
         sb.put64(0x60, self.xid + 1);
-        sb.put32(0x80, (self.desc_index + self.desc_len) as u32);
-        sb.put32(0x84, (self.data_index + self.data_len) as u32);
+        sb.put32(0x80, ((self.desc_index + self.desc_len) % self.l.desc_blocks) as u32);
+        sb.put32(0x84, ((self.data_index + self.data_len) % self.l.data_blocks) as u32);
         sb.put32(0x88, self.desc_index as u32);
         sb.put32(0x8c, self.desc_len as u32);
         sb.put32(0x90, self.data_index as u32);
         sb.put32(0x94, self.data_len as u32);
-        sb.put64(0xa0, self.omap_addr);
+        sb.put64(0xa0, self.omap.phys);
         for (i, &o) in self.fs_oid.iter().enumerate() {
             sb.put64(0xb8 + 8 * i, o);
         }
@@ -519,21 +1097,26 @@ impl<'a> Nx<'a> {
         Ok(sb)
     }
 
-    /// The unmount: block 0 from the last checkpoint, cleanly unmounted.
+    /// The unmount (`tx_unmount`, I:0x10004af70): an open transaction
+    /// committed, then block 0 from the last checkpoint, cleanly
+    /// unmounted, if this mount wrote a checkpoint.
     pub fn unmount(&mut self) -> Result<(), String> {
-        let mut sb = vec![0u8; self.l.bs as usize];
-        self.sink.read_at((self.l.desc_base + self.desc_index + 1) * self.l.bs, &mut sb)?;
-        let c = self.count(Site::Ephemeral);
-        sb.put64(0x3d8, c);
-        sb.put64(0x4f0, NX_CLEANLY_UNMOUNTED);
-        set_checksum(&mut sb);
-        self.sink.write_at(0, &sb)?;
+        if self.in_tx {
+            self.commit()?;
+        }
+        if self.wrote_checkpoint {
+            let mut sb = self.sb_copy.clone();
+            let c = self.count(Site::Ephemeral);
+            sb.put64(0x3d8, c);
+            if self.desc_len != 0 && self.data_len != 0 {
+                sb.put64(0x4f0, NX_CLEANLY_UNMOUNTED);
+            }
+            set_checksum(&mut sb);
+            self.sink.write_at(0, &sb)?;
+        }
         if self.mode == Mode::Userspace {
             // The next run's mount takes the count from the copy.
-            self.counter = u64::from_le_bytes(sb[0x3d8..0x3e0].try_into().unwrap());
-            let mut copy = vec![0u8; 8];
-            self.sink.read_at((self.l.desc_base + self.desc_index + 1) * self.l.bs + 0x3d8, &mut copy)?;
-            self.counter = u64::from_le_bytes(copy.try_into().unwrap());
+            self.counter = u64a(&self.sb_copy, 0x3d8);
             self.rw_mounted = false;
         }
         Ok(())
@@ -565,9 +1148,9 @@ impl<'a> Nx<'a> {
         sm.put64(0xb0, l.ip_base);
         for (q, base) in [(FQ_IP, 0xc8usize), (FQ_MAIN, 0xf0)] {
             let f = &self.fq[q];
-            sm.put64(base, f.entries.values().sum());
-            sm.put64(base + 8, f.oid);
-            sm.put64(base + 16, f.entries.keys().next().map_or(0, |k| k.0));
+            sm.put64(base, f.count);
+            sm.put64(base + 8, f.tree.map_or(0, |t| t.root));
+            sm.put64(base + 16, f.oldest_xid);
             sm.put16(base + 24, f.limit);
         }
         sm.put16(0x140, self.ipbm_head);
@@ -587,7 +1170,7 @@ impl<'a> Nx<'a> {
             sm.put64(o + 8, end);
             sm.put16(o + 128, z as u16 + 1);
         }
-        sm.put64(l.xid_offset as usize, self.xid);
+        sm.put64(l.xid_offset as usize, self.ipbm_xid);
         sm.put16(l.bitmap_offset as usize, self.ipbm_index);
         for (i, &n) in self.ipbm_next.iter().enumerate() {
             sm.put16(l.free_next_offset as usize + 2 * i, n);
@@ -598,25 +1181,10 @@ impl<'a> Nx<'a> {
         sm
     }
 
-    fn fq_node(&self, q: usize) -> Result<Vec<u8>, String> {
-        let f = &self.fq[q];
-        let mut b = empty_fixed_root(self.l.bs, f.oid, self.xid, otype::EPHEMERAL | otype::BTREE, SPACEMAN_FREE_QUEUE, 0xe, 16, 8);
-        let kv: Vec<(Vec<u8>, Option<Vec<u8>>)> = f
-            .entries
-            .iter()
-            .map(|((x, p), n)| {
-                let mut k = x.to_le_bytes().to_vec();
-                k.extend_from_slice(&p.to_le_bytes());
-                (k, (*n != 1).then(|| n.to_le_bytes().to_vec()))
-            })
-            .collect();
-        fill_fixed_leaf(&mut b, &kv, 16, 8)?;
-        Ok(b)
-    }
-
     /// `apfs_newfs`: a volume added (`newfs_apfs -A`), in its own
     /// transaction.
     pub fn create_volume(&mut self, v: &NewVolume) -> Result<u64, String> {
+        self.begin()?;
         let bs = self.l.bs;
         let xid = self.xid;
         // apfs_fs_index: System 0, Data 1, the rest the first free from 2.
@@ -628,21 +1196,31 @@ impl<'a> Nx<'a> {
         if self.fs_oid[index] != 0 {
             return Err(format!("existing file system (slot {index})"));
         }
+        if v.encrypted {
+            return Err("not implemented: an encrypted volume (its keys are the device's Secure Enclave's)".into());
+        }
         let vol_oid = self.new_oid();
-        let omap = self.alloc_meta()?;
-        let omap_tree = self.alloc_meta()?;
-        let extentref = self.alloc_meta()?;
-        let snapmeta = self.alloc_meta()?;
-        let root = self.alloc_meta()?;
-        let root_oid = self.new_oid();
-        let sbaddr = self.alloc_meta()?;
+        // The volume's object map and its tree, then its extent-reference
+        // and snapshot trees.
+        let mut o = vec![0u8; bs as usize];
+        put_header(&mut o, 0, xid, otype::PHYSICAL | otype::OMAP, 0);
+        o.put32(0x28, otype::PHYSICAL | otype::BTREE);
+        o.put32(0x2c, otype::PHYSICAL | otype::BTREE);
+        let omap = self.phys_create(o, otype::PHYSICAL, 0, 2)?;
+        let omap_tree = Tree::create(&mut PhysStore { nx: self, subtype: otype::OMAP_TREE_SUBTYPE, class: 2 }, omap_shape(bs), btree::cmp_omap)?;
+        self.phys_obj(omap)?.b.put64(0x30, omap_tree.root);
+        let extentref = Tree::create(&mut PhysStore { nx: self, subtype: BLOCKREFTREE, class: 1 }, jtree_shape(bs, true), btree::cmp_jobj_hashed)?;
+        let snapmeta = Tree::create(&mut PhysStore { nx: self, subtype: SNAPMETATREE, class: 1 }, jtree_shape(bs, true), btree::cmp_jobj_hashed)?;
+        self.vols.insert(index, Vol { oid: vol_oid, omap: Omap { phys: omap, tree: omap_tree }, encrypted: false, fs_tree: Tree { root: 0, shape: jtree_shape(bs, false), cmp: btree::cmp_jobj_hashed }, extentref, snapmeta });
 
         // The root and private directories.
-        let mut fsroot = vec![0u8; bs as usize];
-        put_header(&mut fsroot, root_oid, xid, otype::BTREE, FSTREE);
-        let recs = initial_records(v);
-        fill_var_leaf(&mut fsroot, &recs, 0x42)?;
-        self.write_cached(root, fsroot)?;
+        let mut fs = VirtStore { nx: self, owner: Owner::Volume(index), subtype: FSTREE };
+        let mut fs_tree = Tree::create(&mut fs, jtree_shape(bs, false), btree::cmp_jobj_hashed)?;
+        for (k, val) in initial_records(v) {
+            fs_tree.insert(&mut fs, &k, Some(&val))?;
+        }
+        let root_oid = fs_tree.root;
+        self.vols.get_mut(&index).unwrap().fs_tree = fs_tree;
 
         let mut sb = vec![0u8; bs as usize];
         put_header(&mut sb, vol_oid, xid, otype::FS, 0);
@@ -680,15 +1258,15 @@ impl<'a> Nx<'a> {
         sb.put32(0x7c, otype::PHYSICAL | otype::BTREE);
         sb.put64(0x80, omap);
         sb.put64(0x88, root_oid);
-        sb.put64(0x90, extentref);
-        sb.put64(0x98, snapmeta);
+        sb.put64(0x90, extentref.root);
+        sb.put64(0x98, snapmeta.root);
         sb.put64(0xb0, 0x10);
         let mut uuid = *b"apfsuuid\0\0volum\0";
         uuid[8..10].copy_from_slice(&v.role.to_be_bytes());
         uuid[15] = index as u8;
         sb[0xf0..0x100].copy_from_slice(&uuid);
         sb.put64(0x100, v.times.modified);
-        sb.put64(0x108, if v.encrypted { 0 } else { 1 });
+        sb.put64(0x108, APFS_FS_UNENCRYPTED);
         sb[0x110..0x110 + FORMATTED_BY.len()].copy_from_slice(FORMATTED_BY.as_bytes());
         sb.put64(0x130, v.times.formatted);
         sb.put64(0x138, xid);
@@ -703,35 +1281,129 @@ impl<'a> Nx<'a> {
         }
         sb.put32(0x42c, 2);
         sb.put32(0x450, 2);
-        if v.encrypted {
-            return Err("not implemented: an encrypted volume (its keys are the device's Secure Enclave's)".into());
-        }
-        self.write_cached(sbaddr, sb)?;
-
-        // The volume's object map: its root tree's node.
-        let mut t = empty_fixed_root(bs, omap_tree, xid, otype::PHYSICAL | otype::BTREE, otype::OMAP_TREE_SUBTYPE, 0x12, 16, 16);
-        let mut k = root_oid.to_le_bytes().to_vec();
-        k.extend_from_slice(&xid.to_le_bytes());
-        let mut val = 0u32.to_le_bytes().to_vec();
-        val.extend_from_slice(&(bs as u32).to_le_bytes());
-        val.extend_from_slice(&root.to_le_bytes());
-        fill_fixed_leaf(&mut t, &[(k, Some(val))], 16, 16)?;
-        self.write_cached(omap_tree, t)?;
-        let mut o = vec![0u8; bs as usize];
-        put_header(&mut o, omap, xid, otype::PHYSICAL | otype::OMAP, 0);
-        o.put32(0x28, otype::PHYSICAL | otype::BTREE);
-        o.put32(0x2c, otype::PHYSICAL | otype::BTREE);
-        o.put64(0x30, omap_tree);
-        self.write_cached(omap, o)?;
-        for (addr, sub) in [(extentref, BLOCKREFTREE), (snapmeta, SNAPMETATREE)] {
-            let mut n = vec![0u8; bs as usize];
-            put_header(&mut n, addr, xid, otype::PHYSICAL | otype::BTREE, sub);
-            fill_var_leaf(&mut n, &[], 0x52)?;
-            self.write_cached(addr, n)?;
-        }
+        // The superblock's identifier was the volume's first.
+        self.virt.insert((Owner::Container, vol_oid), VObj { b: sb, mapped: None });
+        self.virt_dirty.push((Owner::Container, vol_oid));
         self.fs_oid[index] = vol_oid;
-        self.omap_set(vol_oid, sbaddr);
         Ok(vol_oid)
+    }
+}
+
+impl<'a> Nx<'a> {
+    /// Volume `index`'s superblock, changed in this transaction
+    /// (`obj_modify`).
+    pub fn vol_sb(&mut self, index: usize) -> Result<&mut Vec<u8>, String> {
+        let oid = *self.fs_oid.get(index).filter(|&&o| o != 0).ok_or_else(|| format!("no volume in slot {index}"))?;
+        self.virt_modify(Owner::Container, oid);
+        Ok(&mut self.virt.get_mut(&(Owner::Container, oid)).ok_or_else(|| format!("volume {index}'s superblock not in the cache"))?.b)
+    }
+
+    /// Volume `index`'s file-system tree and the store of its nodes.
+    pub fn fs_tree(&mut self, index: usize) -> Result<(Tree, VirtStore<'_, 'a>), String> {
+        let t = self.vols.get(&index).ok_or_else(|| format!("no volume in slot {index}"))?.fs_tree;
+        Ok((t, VirtStore { nx: self, owner: Owner::Volume(index), subtype: FSTREE }))
+    }
+
+    /// Volume `index`'s file-system tree after a change.
+    pub fn set_fs_tree(&mut self, index: usize, t: Tree) {
+        if let Some(v) = self.vols.get_mut(&index) {
+            v.fs_tree = t;
+        }
+    }
+}
+
+/// A physical tree's nodes.
+pub struct PhysStore<'n, 'a> {
+    nx: &'n mut Nx<'a>,
+    subtype: u32,
+    class: usize,
+}
+
+impl Store for PhysStore<'_, '_> {
+    fn get(&mut self, id: u64) -> Result<Node, String> {
+        Ok(Node { b: self.nx.phys_obj(id)?.b.clone() })
+    }
+    fn put(&mut self, id: u64, n: Node) -> Result<(), String> {
+        self.nx.phys_obj(id)?.b = n.b;
+        self.nx.phys_dirty_mark(id);
+        Ok(())
+    }
+    fn modify(&mut self, id: u64) -> Result<u64, String> {
+        self.nx.phys_modify(id)
+    }
+    fn create(&mut self, n: Node) -> Result<u64, String> {
+        let mut b = n.b;
+        b.put32(24, otype::PHYSICAL | otype::BTREE);
+        b.put32(28, self.subtype);
+        self.nx.phys_create(b, otype::PHYSICAL, self.subtype, self.class)
+    }
+    fn delete(&mut self, id: u64) -> Result<(), String> {
+        self.nx.phys.remove(&id);
+        self.nx.phys_dirty.retain(|&p| p != id);
+        self.nx.free(id, 1)
+    }
+}
+
+/// The free queues' nodes (ephemeral).
+pub struct EphStore<'n, 'a> {
+    nx: &'n mut Nx<'a>,
+}
+
+impl Store for EphStore<'_, '_> {
+    fn get(&mut self, id: u64) -> Result<Node, String> {
+        self.nx.eph.get(&id).map(|o| Node { b: o.b.clone() }).ok_or_else(|| format!("no ephemeral object {id:#x}"))
+    }
+    fn put(&mut self, id: u64, n: Node) -> Result<(), String> {
+        self.nx.eph.get_mut(&id).ok_or_else(|| format!("no ephemeral object {id:#x}"))?.b = n.b;
+        Ok(())
+    }
+    fn modify(&mut self, id: u64) -> Result<u64, String> {
+        Ok(id)
+    }
+    fn create(&mut self, n: Node) -> Result<u64, String> {
+        let oid = self.nx.new_oid();
+        self.nx.eph.insert(oid, Obj { b: n.b, storage: otype::EPHEMERAL, subtype: SPACEMAN_FREE_QUEUE, class: 1 });
+        self.nx.eph_order.push(oid);
+        Ok(oid)
+    }
+    fn delete(&mut self, id: u64) -> Result<(), String> {
+        self.nx.eph.remove(&id);
+        self.nx.eph_order.retain(|&o| o != id);
+        Ok(())
+    }
+}
+
+/// A volume's virtual tree's nodes.
+pub struct VirtStore<'n, 'a> {
+    nx: &'n mut Nx<'a>,
+    owner: Owner,
+    subtype: u32,
+}
+
+impl Store for VirtStore<'_, '_> {
+    fn get(&mut self, id: u64) -> Result<Node, String> {
+        if let Some(o) = self.nx.virt.get(&(self.owner, id)) {
+            return Ok(Node { b: o.b.clone() });
+        }
+        Err(format!("not implemented: reading virtual object {id:#x} through its object map"))
+    }
+    fn put(&mut self, id: u64, n: Node) -> Result<(), String> {
+        self.nx.virt.get_mut(&(self.owner, id)).ok_or_else(|| format!("no virtual object {id:#x}"))?.b = n.b;
+        self.nx.virt_modify(self.owner, id);
+        Ok(())
+    }
+    fn modify(&mut self, id: u64) -> Result<u64, String> {
+        self.nx.virt_modify(self.owner, id);
+        Ok(id)
+    }
+    fn create(&mut self, n: Node) -> Result<u64, String> {
+        let mut b = n.b;
+        b.put32(24, otype::BTREE);
+        b.put32(28, self.subtype);
+        Ok(self.nx.virt_create(self.owner, b))
+    }
+    fn delete(&mut self, id: u64) -> Result<(), String> {
+        Err(format!("not implemented: deleting virtual object {id:#x}"))
     }
 }
 
@@ -807,114 +1479,6 @@ fn initial_records(v: &NewVolume) -> Vec<(Vec<u8>, Vec<u8>)> {
         (k, val)
     };
     vec![drec("root", 2, v.times.root), inode(2, 0o40755, v.times.root, "root"), drec("private-dir", 3, v.times.private), inode(3, 0o40644, v.times.private, "private-dir")]
-}
-
-/// A root-and-leaf node of variable-size records, inserted in the order
-/// given: keys from the table of contents' end forwards, values from the
-/// value area's end backwards; the table of contents (8 entries' room, or
-/// more by 8 at a time) in key order.
-fn fill_var_leaf(b: &mut [u8], recs: &[(Vec<u8>, Vec<u8>)], bt_flags: u32) -> Result<(), String> {
-    let bsz = b.len();
-    let avail = bsz - 56 - 40;
-    let toc_entries = recs.len().div_ceil(8).max(1) * 8;
-    let toc = toc_entries * 8;
-    let mut order: Vec<usize> = (0..recs.len()).collect();
-    order.sort_by(|&x, &y| fs_key_cmp(&recs[x].0, &recs[y].0));
-    let (mut koff, mut voff) = (0usize, 0usize);
-    let mut locs = vec![(0u16, 0u16, 0u16, 0u16); recs.len()];
-    let kstart = 56 + toc;
-    let vend = bsz - 40;
-    for (i, (k, v)) in recs.iter().enumerate() {
-        if koff + k.len() + voff + v.len() + toc > avail {
-            return Err("not implemented: a B-tree node splitting".into());
-        }
-        b[kstart + koff..kstart + koff + k.len()].copy_from_slice(k);
-        voff += v.len();
-        b[vend - voff..vend - voff + v.len()].copy_from_slice(v);
-        locs[i] = (koff as u16, k.len() as u16, voff as u16, v.len() as u16);
-        koff += k.len();
-    }
-    for (slot, &i) in order.iter().enumerate() {
-        let (ko, kl, vo, vl) = locs[i];
-        let o = 56 + 8 * slot;
-        b.put16(o, ko);
-        b.put16(o + 2, kl);
-        b.put16(o + 4, vo);
-        b.put16(o + 6, vl);
-    }
-    b.put16(0x20, 3);
-    b.put32(0x24, recs.len() as u32);
-    b.put16(0x28, 0);
-    b.put16(0x2a, toc as u16);
-    b.put16(0x2c, koff as u16);
-    b.put16(0x2e, (avail - toc - koff - voff) as u16);
-    b.put16(0x30, BTOFF_INVALID);
-    b.put16(0x32, 0);
-    b.put16(0x34, BTOFF_INVALID);
-    b.put16(0x36, 0);
-    let i = bsz - 40;
-    b.put32(i, bt_flags);
-    b.put32(i + 4, bsz as u32);
-    b.put32(i + 16, recs.iter().map(|r| r.0.len()).max().unwrap_or(0) as u32);
-    b.put32(i + 20, recs.iter().map(|r| r.1.len()).max().unwrap_or(0) as u32);
-    b.put64(i + 24, recs.len() as u64);
-    b.put64(i + 32, 1);
-    Ok(())
-}
-
-/// The file-system tree's key order: object identifier, then record
-/// type, then (for directory records) the hash and name.
-fn fs_key_cmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
-    let ha = u64::from_le_bytes(a[..8].try_into().unwrap());
-    let hb = u64::from_le_bytes(b[..8].try_into().unwrap());
-    let (ia, ta) = (ha & 0x0fff_ffff_ffff_ffff, ha >> 60);
-    let (ib, tb) = (hb & 0x0fff_ffff_ffff_ffff, hb >> 60);
-    ia.cmp(&ib).then(ta.cmp(&tb)).then_with(|| {
-        if a.len() >= 12 && b.len() >= 12 {
-            let xa = u32::from_le_bytes(a[8..12].try_into().unwrap()) >> 10;
-            let xb = u32::from_le_bytes(b[8..12].try_into().unwrap()) >> 10;
-            xa.cmp(&xb).then_with(|| a[12..].cmp(&b[12..]))
-        } else {
-            a[8..].cmp(&b[8..])
-        }
-    })
-}
-
-/// Records into an empty fixed-size root-and-leaf node, in the order
-/// given (sorted): keys forwards, values backwards from the value area's
-/// end, a record without a value (a ghost) taking none.
-fn fill_fixed_leaf(b: &mut [u8], recs: &[(Vec<u8>, Option<Vec<u8>>)], k: usize, v: usize) -> Result<(), String> {
-    let bsz = b.len();
-    let toc = u16::from_le_bytes(b[0x2a..0x2c].try_into().unwrap()) as usize;
-    if recs.len() * 4 > toc {
-        return Err("not implemented: a fixed-size B-tree outgrowing its root node".into());
-    }
-    let kstart = 56 + toc;
-    let vend = bsz - 40;
-    let mut voff = 0usize;
-    let mut longest_val = 0;
-    for (i, (key, val)) in recs.iter().enumerate() {
-        b[kstart + k * i..kstart + k * (i + 1)].copy_from_slice(key);
-        b.put16(56 + 4 * i, (k * i) as u16);
-        match val {
-            Some(val) => {
-                voff += v;
-                b[vend - voff..vend - voff + v].copy_from_slice(val);
-                b.put16(56 + 4 * i + 2, voff as u16);
-                longest_val = v;
-            }
-            None => b.put16(56 + 4 * i + 2, BTOFF_INVALID),
-        }
-    }
-    let avail = bsz - 56 - 40;
-    b.put32(0x24, recs.len() as u32);
-    b.put16(0x2c, (k * recs.len()) as u16);
-    b.put16(0x2e, (avail - toc - k * recs.len() - voff) as u16);
-    let i = bsz - 40;
-    b.put32(i + 16, if recs.is_empty() { 0 } else { k as u32 });
-    b.put32(i + 20, longest_val as u32);
-    b.put64(i + 24, recs.len() as u64);
-    Ok(())
 }
 
 /// `spaceman_datazone_init` at the first read-write mount of a container
@@ -1090,15 +1654,15 @@ mod tests {
         assert_eq!(order, want);
     }
 
-    /// newfs_apfs's own -C and seven -A runs in the restore's order and
-    /// with its sizes (GEX_TEST_NEWFS_RESTORE7: its image), byte for byte,
-    /// given its uuid and clock readings.
-    #[test]
-    fn volumes_match_newfs() {
-        let Ok(path) = std::env::var("GEX_TEST_NEWFS_RESTORE7") else { return };
-        use crate::darwin::apfsread::Medium;
+    /// Replays newfs_apfs's own -C and -A runs (the image at `path`),
+    /// each volume's name, role and size given, byte for byte over the
+    /// container's metadata, given its uuid and clock readings (found
+    /// through the image's own object maps).
+    fn replay(path: &str, vols: &[(&str, u16, Option<u64>)]) {
+        use crate::darwin::apfsread::{tests_support, Container, Medium};
         use std::os::unix::fs::FileExt;
-        let want = std::fs::File::open(&path).unwrap();
+        use std::sync::Arc;
+        let want = std::fs::File::open(path).unwrap();
         let rd = |blk: u64| {
             let mut b = vec![0u8; 4096];
             want.read_exact_at(&mut b, blk * 4096).unwrap();
@@ -1107,32 +1671,36 @@ mod tests {
         let b0 = rd(0);
         let uuid: [u8; 16] = b0[0x48..0x58].try_into().unwrap();
         let blocks = 15_625_000u64;
-        let tmp = std::env::temp_dir().join(format!("gex-apfswrite-r7-{}", std::process::id()));
+        let c = Arc::new(Container::open(Arc::new(tests_support::HostFile(std::fs::File::open(path).unwrap(), blocks * 4096))).unwrap());
+        let com = c.omap().unwrap();
+        let tmp = std::env::temp_dir().join(format!("gex-apfswrite-replay-{}-{}", std::process::id(), vols.len()));
         let f = std::fs::OpenOptions::new().create(true).truncate(true).read(true).write(true).open(&tmp).unwrap();
         f.set_len(blocks * 4096).unwrap();
         let sink = crate::darwin::apfswrite::HostFile(f, blocks * 4096);
         let fm = super::super::container::format(&sink, 4096, blocks, uuid).unwrap();
         let mut nx = Nx::formatted(&sink, &fm, uuid, Mode::Userspace).unwrap();
         let q = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
-        // The six-object volumes are 8 blocks apart from the zone's middle.
-        let mid = fm.layout.metazone().unwrap().1;
-        let vols = [("System", 0x1u16, None), ("xART", 0x100, Some(10_485_760)), ("Hardware", 0x140, Some(6_291_456)), ("Preboot", 0x10, None), ("Update", 0xc0, None), ("Data", 0x40, None), ("User", 0x2, None)];
-        for (k, (name, role, size)) in vols.iter().enumerate() {
-            let sbb = rd(mid + 7 + 8 * k as u64);
-            let rootb = rd(mid + 6 + 8 * k as u64);
-            // The clock readings: the format's start, the directories'
-            // creation (their records' date_added), the end.
-            let tv = |o: usize| q(&rootb, o);
-            let toc_v = |slot: usize| 4096 - 40 - u16::from_le_bytes(rootb[56 + 8 * slot + 4..56 + 8 * slot + 6].try_into().unwrap()) as usize;
-            let times = VolumeTimes { formatted: q(&sbb, 0x130), root: tv(toc_v(1) + 8), private: tv(toc_v(0) + 8), modified: q(&sbb, 0x100) };
+        for (name, role, size) in vols.iter() {
             nx.mount_rw().unwrap();
+            let index = match role {
+                1 => 0,
+                0x40 => 1,
+                _ => (2..nx.fs_oid.len()).find(|&i| nx.fs_oid[i] == 0).unwrap(),
+            };
+            let sbb = c.read_raw(com.lookup(&c, c.nx.fs_oid[index], c.xid()).unwrap().unwrap().paddr).unwrap();
+            let vom = crate::darwin::apfsread::Omap::open(&c, q(&sbb, 0x80)).unwrap();
+            let rootb = c.read_raw(vom.lookup(&c, q(&sbb, 0x88), c.xid()).unwrap().unwrap().paddr).unwrap();
+            let toc_v = |slot: usize| 4096 - 40 - u16::from_le_bytes(rootb[56 + 8 * slot + 4..56 + 8 * slot + 6].try_into().unwrap()) as usize;
+            let times = VolumeTimes { formatted: q(&sbb, 0x130), root: q(&rootb, toc_v(1) + 8), private: q(&rootb, toc_v(0) + 8), modified: q(&sbb, 0x100) };
             nx.create_volume(&NewVolume { name: name.to_string(), role: *role, encrypted: false, e_apfs: true, times, uid: 0, gid: 0, key_os_version: 0, size_bytes: *size }).unwrap();
             nx.commit().unwrap();
             nx.unmount().unwrap();
         }
         let mut bad = Vec::new();
         let l = fm.layout;
-        let mut blks: Vec<u64> = (0..=l.desc_base + 16).chain(l.data_base..l.data_base + 30).chain(l.ip_bm_base..l.ip_bm_base + 16).chain(l.ip_base..l.ip_base + 24).chain(mid - 2..mid + 60).collect();
+        let mid = l.metazone().unwrap().1;
+        let mut blks: Vec<u64> = (0..=l.desc_base + l.desc_blocks).chain(l.data_base..l.data_base + 120).chain(l.ip_bm_base..l.ip_bm_base + 16).chain(l.ip_base..l.ip_base + 40).chain(mid - 2..mid + 200).collect();
+        blks.sort();
         blks.dedup();
         for blk in blks {
             let mut a = vec![0u8; 4096];
@@ -1145,5 +1713,24 @@ mod tests {
         }
         let _ = std::fs::remove_file(&tmp);
         assert!(bad.is_empty(), "{}", bad.join("; "));
+    }
+
+    /// newfs_apfs's own -C and seven -A runs in the restore's order and
+    /// with its sizes (GEX_TEST_NEWFS_RESTORE7: its image).
+    #[test]
+    fn volumes_match_newfs() {
+        let Ok(path) = std::env::var("GEX_TEST_NEWFS_RESTORE7") else { return };
+        replay(&path, &[("System", 0x1u16, None), ("xART", 0x100, Some(10_485_760)), ("Hardware", 0x140, Some(6_291_456)), ("Preboot", 0x10, None), ("Update", 0xc0, None), ("Data", 0x40, None), ("User", 0x2, None)]);
+    }
+
+    /// Fourteen runs (GEX_TEST_NEWFS_RUNS14: the restore's seven with
+    /// their sizes, then seven of no role): the free queues drain from the
+    /// eleventh transaction on and the blocks they release are reused.
+    #[test]
+    fn draining_matches_newfs() {
+        let Ok(path) = std::env::var("GEX_TEST_NEWFS_RUNS14") else { return };
+        let mut vols = vec![("System", 0x1u16, None), ("xART", 0x100, Some(10_485_760)), ("Hardware", 0x140, Some(6_291_456)), ("Preboot", 0x10, None), ("Update", 0xc0, None), ("Data", 0x40, None), ("User", 0x2, None)];
+        vols.extend(["V8", "V9", "V10", "V11", "V12", "V13", "V14"].iter().map(|n| (*n, 0u16, None)));
+        replay(&path, &vols);
     }
 }

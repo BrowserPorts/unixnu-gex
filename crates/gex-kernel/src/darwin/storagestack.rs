@@ -881,6 +881,13 @@ fn storage_features() -> Prop {
     features(true)
 }
 
+/// Whether the APFS container's medium has Barrier in its
+/// IOStorageFeatures (what the APFS device layer's features query reads,
+/// 0xfffffff006650c78 into its +0x4f8).
+pub fn container_barrier() -> bool {
+    matches!(storage_features(), Prop::Dict(d) if d.iter().any(|(k, v)| k == "Barrier" && matches!(v, Prop::Bool(true))))
+}
+
 /// A namespace's IOStorageFeatures, Barrier only on NSID 1.
 fn features(barrier: bool) -> Prop {
     let n = super::storage::nvme();

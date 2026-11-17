@@ -71,16 +71,20 @@ pub fn build_disk0(disk: &dyn Sink, now: &mut dyn FnMut() -> u64) -> Result<Miss
     // 3. The container and the volumes format_media adds.
     let f = container::format(&part, bs, size / bs, storage::container_uuid())?;
     let mut nx = Nx::formatted(&part, &f, storage::container_uuid(), Mode::Kernel)?;
+    // The free queues' age limit follows the container device's
+    // DK_FEATURE_BARRIER (0xfffffff00674d5f4 reads it at +0x4f8).
+    nx.set_barrier(crate::darwin::storagestack::container_barrier());
     nx.mount_rw()?;
     let kv = key_os_version(RESTORE_BUILD)?;
-    let add = |nx: &mut Nx<'_>, name: &str, role: u16, size_bytes: Option<u64>, now: &mut dyn FnMut() -> u64| -> Result<(), String> {
+    let add = |nx: &mut Nx<'_>, name: &str, role: u16, size_bytes: Option<u64>, now: &mut dyn FnMut() -> u64| -> Result<u64, String> {
         let formatted = now();
         let root = now();
         let private = now();
         let modified = now();
         let v = NewVolume { name: name.into(), role, encrypted: false, e_apfs: true, times: VolumeTimes { formatted, root, private, modified }, uid: 0, gid: 0, key_os_version: kv, size_bytes };
-        nx.create_volume(&v)?;
-        nx.commit()
+        let oid = nx.create_volume(&v)?;
+        nx.commit()?;
+        Ok(oid)
     };
     add(&mut nx, "System", storage::role::SYSTEM, None, now)?;
     add(&mut nx, "xART", storage::role::XART, Some(10_485_760), now)?;

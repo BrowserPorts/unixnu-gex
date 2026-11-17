@@ -18,6 +18,8 @@
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 WCC=$here/wcc
+# (the configure builds archive with LLVM's ar and ranlib, as the rest here: a
+# host's own may not know a wasm object; macOS's ranlib drops each one)
 out=$(realpath -m "$1") dl=$(realpath -m "$2")
 # wcc names the libraries' sources by OUT's place, /wine-deps, not this host's.
 export GEX_WCC_MAP="${GEX_WCC_MAP:+$GEX_WCC_MAP:}$out=/wine-deps"
@@ -34,7 +36,7 @@ tar xf "$dl/freetype-$FREETYPE_VERSION.tar.xz"
 (cd freetype-$FREETYPE_VERSION &&
   ./configure --host=wasm32-unknown-linux-musl --prefix="$I" --enable-static --disable-shared \
     --without-zlib --without-bzip2 --without-png --without-harfbuzz --without-brotli \
-    CC="$WCC" CFLAGS=-O2 > "$out/freetype-configure.log" 2>&1 &&
+    CC="$WCC" AR=llvm-ar RANLIB=llvm-ranlib CFLAGS=-O2 > "$out/freetype-configure.log" 2>&1 &&
   make -j"$J" > "$out/freetype-make.log" 2>&1 && make install > "$out/freetype-install.log" 2>&1)
 
 # wayland: the client library, wayland-egl and the host's scanner, compiled
@@ -72,7 +74,7 @@ tar xf "$dl/libxml2-$LIBXML2_VERSION.tar.xz"
 (cd libxml2-$LIBXML2_VERSION &&
   ./configure --host=wasm32-unknown-linux-musl --prefix="$I" --enable-static --disable-shared \
     --without-python --without-zlib --without-lzma --without-http --without-ftp --without-modules \
-    --without-threads --without-catalog --without-debug --without-icu CC="$WCC" CFLAGS=-O2 > "$out/xml-configure.log" 2>&1 &&
+    --without-threads --without-catalog --without-debug --without-icu CC="$WCC" AR=llvm-ar RANLIB=llvm-ranlib CFLAGS=-O2 > "$out/xml-configure.log" 2>&1 &&
   make -j"$J" libxml2.la > "$out/xml-make.log" 2>&1 &&
   make install-libLTLIBRARIES install-data > "$out/xml-install.log" 2>&1)
 
@@ -101,11 +103,14 @@ PYTHONPATH=$out/meson python3 -m mesonbuild.mesonmain setup xkb-build libxkbcomm
 ninja -C xkb-build -j"$J" libxkbcommon.a libxkbregistry.a > "$out/xkb-make.log" 2>&1
 PYTHONPATH=$out/meson python3 -m mesonbuild.mesonmain install -C xkb-build --no-rebuild --tags devel,runtime > "$out/xkb-install.log" 2>&1
 
-# gex-gl's EGL: Khronos's headers (the host's) and a pkg-config file whose
+# gex-gl's EGL: Khronos's headers, as the pinned Mesa tree (the submodule)
+# carries them, on any host, and a pkg-config file whose
 # library is the gexgl.o the Makefile builds (WINE32_GL_O; it changes with gex,
 # these libraries do not).
 mkdir -p "$I/egl/include"
-cp -r /usr/include/EGL /usr/include/KHR "$I/egl/include/"
+GLINC=$here/../third_party/mesa/include
+[ -d "$GLINC/EGL" ] || { echo "no $GLINC/EGL: git submodule update --init third_party/mesa" >&2; exit 1; }
+cp -r "$GLINC/EGL" "$GLINC/KHR" "$I/egl/include/"
 printf 'Name: egl\nDescription: gex-gl EGL (wasm32, static: guest/gl/gexgl.c)\nVersion: 1.5\nCflags: -I%s\nLibs: %s\n' \
   "$I/egl/include" "${WINE32_GL_O:?WINE32_GL_O}" > "$I/lib/pkgconfig/egl.pc"
 
@@ -116,7 +121,7 @@ tar xf "$dl/nettle-$NETTLE_VERSION.tar.gz"
 (cd nettle-$NETTLE_VERSION &&
   ./configure --host=wasm32-unknown-linux-musl --prefix="$I" --libdir="$I/lib" --enable-static --disable-shared \
     --enable-mini-gmp --disable-assembler --disable-fat --disable-documentation --disable-openssl \
-    CC="$WCC" CFLAGS=-O2 > "$out/nettle-configure.log" 2>&1 &&
+    CC="$WCC" AR=llvm-ar RANLIB=llvm-ranlib CFLAGS=-O2 > "$out/nettle-configure.log" 2>&1 &&
   make -j"$J" > "$out/nettle-make.log" 2>&1 && make install > "$out/nettle-install.log" 2>&1)
 tar xf "$dl/gnutls-$GNUTLS_VERSION.tar.xz"
 (cd gnutls-$GNUTLS_VERSION &&
@@ -126,7 +131,7 @@ tar xf "$dl/gnutls-$GNUTLS_VERSION.tar.xz"
     --disable-doc --disable-tools --disable-tests --disable-cxx --disable-nls --disable-hardware-acceleration \
     --disable-padlock --disable-libdane --disable-guile --disable-ktls \
     --with-default-trust-store-file=/etc/ssl/certs/ca-certificates.crt \
-    CC="$WCC" CFLAGS=-O2 > "$out/gnutls-configure.log" 2>&1 &&
+    CC="$WCC" AR=llvm-ar RANLIB=llvm-ranlib CFLAGS=-O2 > "$out/gnutls-configure.log" 2>&1 &&
   make -j"$J" > "$out/gnutls-make.log" 2>&1 && make install > "$out/gnutls-install.log" 2>&1)
 [ -f "$I/lib/libgnutls.a" ] || { echo "wine32/deps: GnuTLS failed ($out/gnutls-*.log)" >&2; exit 1; }
 cp "$dl/$(basename "$CACERT_URL")" "$I/ca-certificates.crt"

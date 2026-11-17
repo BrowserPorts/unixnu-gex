@@ -84,6 +84,9 @@ pub fn run(mut ra: RunArgs, bytes: &[u8]) -> Result<ExitCode> {
     // The device's current cryptex1 boot nonce hash, which the ticket's
     // evaluation needs and only the device has.
     ra.opts.darwin_cryptex1_nonce_hash = std::env::var("GEX_DARWIN_CRYPTEX1_NONCE_HASH").ok();
+    // The web device's directory (gexc darwin-web-device): the device the
+    // system boots as, with GEX_DARWIN_CRYPTEX1_TICKET=web-device.
+    ra.opts.darwin_web_device = std::env::var_os("GEX_DARWIN_WEB_DEVICE").filter(|v| !v.is_empty()).map(PathBuf::from);
     // Its commpage is folded to its alias at the top of the memory in
     // everything translated for it, which needs the addresses its code
     // builds in registers seen as the constants they are; and its tables

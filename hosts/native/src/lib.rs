@@ -273,6 +273,10 @@ pub struct RunOptions {
     /// The device's current cryptex1 boot nonce hash, hexadecimal
     /// (`GEX_DARWIN_CRYPTEX1_NONCE_HASH`), a measured input.
     pub darwin_cryptex1_nonce_hash: Option<String>,
+    /// The web device's directory (`GEX_DARWIN_WEB_DEVICE`, `gexc
+    /// darwin-web-device`'s): with `web-device` tickets, the device the
+    /// system boots as.
+    pub darwin_web_device: Option<std::path::PathBuf>,
     /// Run ahead-of-time code only (`aot_only`): an ejected Windows
     /// program's runtime, with no tier-1 module and no run-time translator.
     pub aot_only: bool,
@@ -299,6 +303,7 @@ impl Default for RunOptions {
             darwin_disk0: None,
             darwin_cryptex1_ticket: None,
             darwin_cryptex1_nonce_hash: None,
+            darwin_web_device: None,
             args: Vec::new(),
             env: Vec::new(),
             trace: false,
@@ -1386,6 +1391,10 @@ fn run_process(
                 Some(path) => Ticket::File(path.to_string()),
             },
             nonce_hash: opts.darwin_cryptex1_nonce_hash.clone().filter(|h| !h.is_empty()),
+            web_device: match &opts.darwin_web_device {
+                Some(dir) => Some(darwin_web_device(dir)?),
+                None => None,
+            },
             host: Some(Host { size: darwin_host_size, read: darwin_host_read, sha384: Some(darwin_host_sha384) }),
         };
         gex_kernel::darwin::boot(tc.as_deref(), sandbox, device_tree.as_deref(), volume_attrs, cryptex1).map_err(|e| anyhow!("the boot payload: {e}"))?;
@@ -8841,6 +8850,21 @@ pub(crate) fn note_wine32_image(base: u64, size: u64, path: &str) {
 fn wine32_image_at(pc: u64) -> Option<(String, u64)> {
     let g = WINE32_IMAGES.lock().unwrap_or_else(|e| e.into_inner());
     g.iter().find(|&&(b, e, _)| b <= pc && pc < e).map(|(b, _, n)| (n.clone(), pc - b))
+}
+
+/// The web device of directory `dir`: what it has of its own, its root's
+/// certificate, identity and cryptex1 boot nonce slot, and the Cryptex1
+/// ticket its manifest key signed for it, when there is one (its private
+/// keys and UID are the tools', which this does not read).
+fn darwin_web_device(dir: &std::path::Path) -> Result<gex_kernel::darwin::webdevice::WebDevice> {
+    use gex_kernel::darwin::webdevice::{files, of_files};
+    let read = |name: &str| std::fs::read(dir.join(name)).map_err(|e| anyhow!("the web device's {}: {e}", dir.join(name).display()));
+    let root = read(files::ROOT_CERT)?;
+    let identity = read(files::IDENTITY)?;
+    let slot = read(files::CRYPTEX1_BOOT_SLOT)?;
+    let ticket = dir.join(files::CRYPTEX1_TICKET);
+    let ticket = ticket.exists().then(|| ticket.to_string_lossy().into_owned());
+    of_files(root, &identity, &slot, ticket).map_err(|e| anyhow!("{}: {e}", dir.display()))
 }
 
 /// A host file's size, for the Darwin kernel's copies of the restore's

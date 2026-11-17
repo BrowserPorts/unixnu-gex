@@ -138,21 +138,47 @@ pub fn parse(b: &[u8]) -> Result<Vec<Node>, String> {
     Ok(out)
 }
 
-/// Install the device tree the boot payload carries, and the services
-/// published over it ([`build`]).
-pub fn set_tree(b: &[u8]) -> Result<(), String> {
-    let t = build(b)?;
+/// Install the device tree the boot payload carries, with what the boot
+/// puts in `/chosen` (`chosen`: each property set, added when the tree
+/// has no placeholder of it), and the services published over it
+/// ([`build_with`]).
+pub fn set_tree(b: &[u8], chosen: &[(&str, Vec<u8>)]) -> Result<(), String> {
+    let t = build_with(b, chosen)?;
     let _ = TREE.set(t);
     Ok(())
 }
 
-/// The registry over the device tree `b` (with what `IODeviceTreeAlloc`
-/// derives, [`super::iodt::alloc`]): the platform's services, the
-/// root power domain ([`super::iopower`]), the GPU's, the display's and
-/// the storage's ([`super::storagestack`]), the resources nub and
-/// IOSurfaceRoot, the power plane's links, and the registry's root.
+/// `chosen`'s properties set on tree `t`'s `/chosen`, as the boot loader
+/// fills it in before the kernel starts.
+pub fn fill_chosen(t: &mut [Node], chosen: &[(&str, Vec<u8>)]) -> Result<(), String> {
+    if chosen.is_empty() {
+        return Ok(());
+    }
+    let at = from_path(t, "IODeviceTree:/chosen")?.ok_or("the device tree has no /chosen for the boot to fill in")?;
+    let props = &mut t[at as usize].props;
+    for (name, value) in chosen {
+        match props.iter_mut().find(|(k, _)| k == name) {
+            Some((_, v)) => *v = value.clone(),
+            None => props.push((name.to_string(), value.clone())),
+        }
+    }
+    Ok(())
+}
+
+/// The registry over the device tree `b` ([`build_with`], `/chosen` as the
+/// tree has it).
 pub fn build(b: &[u8]) -> Result<Vec<Node>, String> {
+    build_with(b, &[])
+}
+
+/// The registry over the device tree `b` with `chosen` filled in (with what
+/// `IODeviceTreeAlloc` derives, [`super::iodt::alloc`]): the platform's
+/// services, the root power domain ([`super::iopower`]), the GPU's, the
+/// display's and the storage's ([`super::storagestack`]), the resources nub
+/// and IOSurfaceRoot, the power plane's links, and the registry's root.
+pub fn build_with(b: &[u8], chosen: &[(&str, Vec<u8>)]) -> Result<Vec<Node>, String> {
     let mut t = parse(b)?;
+    fill_chosen(&mut t, chosen)?;
     super::iodt::alloc(&mut t)?;
     let io = super::platform::add(&mut t);
     let rd = t.iter().position(|n| n.class == super::platform::PE).map(|pe| super::iopower::add(&mut t, pe as u32));

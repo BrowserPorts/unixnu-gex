@@ -26,6 +26,7 @@ mod host_walk;
 mod darwin_run;
 mod dsc_info;
 mod darwin_disk;
+mod darwin_web;
 #[cfg(feature = "webmetal")]
 mod host_webmetal;
 
@@ -102,6 +103,8 @@ fn real_main() -> Result<ExitCode> {
         "pe-info" => pe_info::cmd_pe_info(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "dsc-info" => dsc_info::cmd(&argv[2..]),
         "darwin-disk0" => darwin_disk::cmd(&argv[2..]),
+        "darwin-web-device" => darwin_web::cmd_device(&argv[2..]),
+        "darwin-web-ticket" => darwin_web::cmd_ticket(&argv[2..]),
         "webmetal-info" => cmd_webmetal_info(),
         "units" => units::cmd_units(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "profile" => cmd_profile(&argv[2..]).map(|_| ExitCode::SUCCESS),
@@ -218,6 +221,12 @@ usage:
   gexc profile show [--top N] IN   summarise a profile
   gexc darwin-disk0 <out> [<dmg>]  write the web device's disk0 as its erase
                                    restore makes it (exit 2: steps missing)
+  gexc darwin-web-device init|show|roll <dir>
+                                   make the web device (its root, manifest key,
+                                   identity, UID and nonce slot), show it, or
+                                   roll its cryptex1 boot nonce
+  gexc darwin-web-ticket <dir>     sign the web device's Cryptex1 ticket for its
+                                   current nonce (GEX_DARWIN_RESTORE)
   gexc webmetal-info               the WebGPU implementation the Darwin
                                    personality's GPU runs on (the `webmetal`
                                    build), or why there is none

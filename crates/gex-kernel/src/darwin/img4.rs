@@ -74,8 +74,10 @@
 //! The kext's evaluation of a firmware payload against its manifest, which
 //! APFS asks for a cryptex's graft ([`super::graft`]), is
 //! [`super::image4`]'s for `CHIP_CRYPTEX1_BOOT_AP`, against this device
-//! tree's `/chosen` and the device's measured cryptex1 boot nonce hash
-//! ([`super::preboot::cryptex1_boot_nonce_hash`]); the other chips are
+//! tree's `/chosen` and the device's cryptex1 boot nonce hash (the
+//! measured one of a device of Apple's,
+//! [`super::preboot::cryptex1_boot_nonce_hash`], or the web device's own,
+//! [`super::webdevice`]); the other chips are
 //! reported ([`crate::syscalls::Kernel::darwin_img4_firmware_execute`]).
 
 use std::sync::Mutex;
@@ -252,6 +254,20 @@ pub fn ignition_failure_summary(b: &[u8; IGNITION_FAILURE_BLOB_SIZE]) -> String 
 /// instance (the ignition blob, the Cryptex1 ticket's name) and restored
 /// read: the IPSW's device tree has them zero or does not have them, and
 /// they stand in until measured. A reported shortcut (storage::unmeasured).
+/// The `/chosen` stand-in's report: on the web device its boot fills in
+/// its identity ([`super::webdevice::Identity::chosen`]), and the rest stands
+/// in.
+pub fn chosen_stand_in() -> &'static str {
+    if super::webdevice::get().is_some() {
+        WEB_DEVICE_CHOSEN_STAND_IN
+    } else {
+        CHOSEN_STAND_IN
+    }
+}
+
+/// The `/chosen` values the web device's boot does not fill in yet.
+pub const WEB_DEVICE_CHOSEN_STAND_IN: &str = "the /chosen values iBoot fills in beyond the web device's identity (stand-in: the IPSW device tree's, boot-manifest-hash, boot-nonce, die-id, unique-device-id and random-seed zero, and no chip-epoch, esdm-fuses or manifest-properties love; the web device's boot has no AP ticket of its own to give the boot manifest hash)";
+
 pub const CHOSEN_STAND_IN: &str = "the /chosen values iBoot fills in (stand-in: the IPSW device tree's, chip-id, board-id, unique-chip-id, certificate-production-status, certificate-security-mode, effective-production-status-ap and effective-security-mode-ap zero, and no security-domain, chip-epoch, esdm-fuses or manifest-properties love: an ignition blob and a Cryptex1 ticket name of ECID 0; measure IODeviceTree:/chosen on the device, `ioreg -p IODeviceTree -n chosen -l`)";
 
 /// The chip environment AppleImage4 evaluates against: this device tree's
@@ -266,12 +282,22 @@ impl super::image4::Environment for Device<'_> {
         read(self.tree, CHOSEN, name, size)
     }
 
-    fn cryptex1_boot_nonce_hash(&self, _domain: u32) -> Result<Vec<u8>, String> {
-        super::preboot::cryptex1_boot_nonce_hash()
+    /// The web device's hash of its own slot, as its AppleImage4 makes it;
+    /// a device of Apple's, the measured one.
+    fn cryptex1_boot_nonce_hash(&self, _domain: u32) -> Result<Vec<u8>, super::image4::Fail> {
+        match super::webdevice::get() {
+            Some(w) => super::webdevice::nonce_hash(w, dt_prop(self.tree, "IODeviceTree:/defaults", "entangle-nonce").is_some()),
+            None => super::preboot::cryptex1_boot_nonce_hash().map_err(super::image4::Fail::Unmodelled),
+        }
     }
 
+    /// The web device's AppleImage4 trusts its platform's root; a device of
+    /// Apple's, the root its kext embeds.
     fn anchor(&self) -> Result<Vec<u8>, String> {
-        super::image4::anchor()
+        match super::webdevice::get() {
+            Some(w) => Ok(w.root.clone()),
+            None => super::image4::anchor(),
+        }
     }
 }
 

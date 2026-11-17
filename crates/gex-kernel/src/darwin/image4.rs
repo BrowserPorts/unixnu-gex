@@ -24,7 +24,7 @@
 //!    cryptex1 boot nonce hash ('cnch') must carry the device's current
 //!    one, else ESTALE.
 //!
-//! ECANCELED, an object's violated constraint, becomes ENOEXEC
+//! EBADEXEC, an object's violated constraint, becomes ENOEXEC
 //! (0xfffffff005a8ef94). On success the authenticated payload is the IM4P's
 //! data (`Img4DecodeGetPayload`, 0xfffffff005aa4a0c).
 //!
@@ -36,12 +36,12 @@
 //! implementation's digest, 48 bytes); signatures RSA PKCS#1 v1.5 through
 //! corecrypto's `ccrsa_verify_pkcs1v15`.
 //!
-//! The cryptex1 boot nonce's hash is the device's: the nonce is its NVRAM's
-//! (`nonce-seeds`), entangled with the UID key through IOAESAccelerator
-//! (key 0x8A4, 0xfffffff005a99210) when `/defaults` has `entangle-nonce`
-//! (the IPSW's device tree has not) or the nonce slot asks for it (its
-//! flag 0x40, NVRAM data), so it cannot be made here: it is a measured
-//! input ([`Environment::cryptex1_boot_nonce_hash`]).
+//! The cryptex1 boot nonce's hash is the device's
+//! ([`Environment::cryptex1_boot_nonce_hash`]): the nonce of the cryptex1
+//! boot slot of its nonce magazine (NVRAM `nonce-seeds`), hashed as
+//! [`nonce`] does. A device of Apple's has it in its NVRAM, where only
+//! the device reads it, so for one the hash is a measured input; the web
+//! device ([`super::webdevice`]) keeps its slot itself.
 
 use sha2::{Digest, Sha384};
 
@@ -65,7 +65,12 @@ pub mod e {
     pub const EFTYPE: i32 = 79;
     pub const EAUTH: i32 = 80;
     pub const EOVERFLOW: i32 = 84;
-    pub const ECANCELED: i32 = 85;
+    pub const ENXIO: i32 = 6;
+    pub const ERANGE: i32 = 34;
+    pub const ESHLIBVERS: i32 = 87;
+    pub const ENODATA: i32 = 96;
+    /// An object's violated constraint (`EBADEXEC`).
+    pub const EBADEXEC: i32 = 85;
 }
 
 /// A libDER return code as the kext's errno (0xfffffff005a8f818, its table
@@ -624,8 +629,9 @@ pub trait Environment {
     fn chosen(&self, name: &str, size: usize) -> Result<Option<Vec<u8>>, i32>;
     /// The hash AppleImage4 makes of the current nonce of the chip's nonce
     /// domain `domain` (0xfffffff005a99118, 0xfffffff005a99210,
-    /// 0xfffffff005aa0a5c), or why it is not known.
-    fn cryptex1_boot_nonce_hash(&self, domain: u32) -> Result<Vec<u8>, String>;
+    /// 0xfffffff005aa0a5c; [`nonce::cryptex1_boot_hash`]): the errno the
+    /// query fails with, or why it is not known.
+    fn cryptex1_boot_nonce_hash(&self, domain: u32) -> Result<Vec<u8>, Fail>;
     /// The chip's anchor, the kext's root certificate, or why it is not
     /// there.
     fn anchor(&self) -> Result<Vec<u8>, String>;
@@ -952,12 +958,12 @@ impl Eval<'_> {
     /// 0xfffffff005a9d650: `p` imposed on the chip's environment: the
     /// manifest's value against the device's under the descriptor's
     /// operator. A violation is EACCES for the manifest's properties and
-    /// ECANCELED for an object's; a value of the wrong type or encoding is
+    /// EBADEXEC for an object's; a value of the wrong type or encoding is
     /// libDER's error as an errno; the device's error is the error.
     fn impose(&mut self, desc: &Desc, p: &Property<'_>) -> R<()> {
         let violation = match desc.container {
             0 => e::EACCES,
-            1 => e::ECANCELED,
+            1 => e::EBADEXEC,
             _ => return Ok(()),
         };
         if !constrainable(desc) {
@@ -1183,7 +1189,7 @@ fn verify_cert(key: &[u8], cert: &Cert<'_>) -> Result<(), i32> {
 /// manifest's chain is one certificate under 128 KiB (0xfffffff005aa8be8),
 /// issued by the anchor's subject and signed by its key. The leaf's key and
 /// Image4 constraints.
-fn verify_chain<'a>(anchor: &'a [u8], chain: &'a [u8]) -> Result<(&'a [u8], Option<&'a [u8]>), i32> {
+pub(crate) fn verify_chain<'a>(anchor: &'a [u8], chain: &'a [u8]) -> Result<(&'a [u8], Option<&'a [u8]>), i32> {
     let mut certs = vec![anchor];
     let mut rest = chain;
     loop {
@@ -1358,7 +1364,7 @@ fn anti_replay(ev: &Eval<'_>) -> R<()> {
     if domain != CRYPTEX1_BOOT_NONCE_DOMAIN {
         return Err(Fail::Unmodelled(format!("the nonce magazine's slot for CHIP_CRYPTEX1_BOOT_AP in nonce domain {domain} (0xfffffff005a9f268)")));
     }
-    let hash = ev.env.env.cryptex1_boot_nonce_hash(domain).map_err(Fail::Unmodelled)?;
+    let hash = ev.env.env.cryptex1_boot_nonce_hash(domain)?;
     if *cnch != hash {
         return Err(Fail::Code(e::ESTALE));
     }
@@ -1405,8 +1411,239 @@ pub fn execute(fourcc: u32, payload: &[u8], manifest: &[u8], env: &dyn Environme
             Some(d) => Outcome::Authenticated(d.to_vec()),
             None => Outcome::Panic("Img4DecodeGetPayload: the payload has no data".into()),
         },
-        e::ECANCELED => Outcome::Status(e::ENOEXEC),
+        e::EBADEXEC => Outcome::Status(e::ENOEXEC),
         s => Outcome::Status(s),
+    }
+}
+
+/// AppleImage4's nonce slots (one per nonce domain in its nonce magazine,
+/// NVRAM `nonce-seeds`) and the hash the BOOT anti-replay policy
+/// (0xfffffff005a96474) makes of the cryptex1 boot slot's nonce.
+///
+/// A slot's data (parsed at 0xfffffff005a9a254, written at
+/// 0xfffffff005a9a3a0) is 37 bytes: a version byte (0), the flags as a
+/// big-endian `u32` of which the parse keeps the last byte's low seven
+/// bits, the nonce (16 bytes) and the proposal (16 bytes, there with flag
+/// [`flag::PROPOSAL`]).
+///
+/// The cryptex1 boot domain (its record at 0xfffffff006cf24a8: domain 1,
+/// entitlement `com.apple.private.img4.nonce.cryptex1.boot`) has nonces of
+/// 16 bytes (the record's +0x48). The policy queries the nonce (runtime
+/// +0x70, 0xfffffff005a99118; the slot's access, 0xfffffff005a8f7d4, and
+/// the domain's own check, 0xfffffff005a8d65c, which a device without PPL
+/// passes), entangles it (runtime +0x78, 0xfffffff005a99210) and hashes it
+/// (0xfffffff005aa0a5c). Entangling is IOAESAccelerator's AES with key
+/// 0x8A4, the UID's, over the nonce (a multiple of 16 bytes, else the kext
+/// panics), a zero IV, operation 0 and a 128-bit key spec, done only when
+/// `/defaults` has `entangle-nonce` (read at 0xfffffff005a988f0) or the
+/// slot has [`flag::ENTANGLE`]; AppleImage4 never sets that flag (its roll
+/// clears it), so only NVRAM written elsewhere does. The hash is SHA-384
+/// truncated to 32 bytes: the chip's digest (its +0x30, `ccsha384_di`,
+/// 48 bytes) and the kext's copy of it with 32 (0xfffffff006cf9a90, made at
+/// 0xfffffff005aa3a28), of which 0xfffffff005a98ebc takes the shorter when
+/// the chip has BNCH and nonce domain constraints (its +0x198, +0x1b8) and
+/// no +0x1a0, as `CHIP_CRYPTEX1_BOOT_AP` has.
+pub mod nonce {
+    use super::{e, Fail};
+    use sha2::{Digest, Sha384};
+
+    /// A slot's data.
+    pub const SLOT_SIZE: usize = 37;
+    /// The cryptex1 boot domain's nonce length (its record's +0x48).
+    pub const CRYPTEX1_BOOT_NONCE_LENGTH: usize = 16;
+    /// The hash's length: SHA-384 truncated.
+    pub const HASH_LENGTH: usize = 32;
+
+    /// A slot's flags.
+    pub mod flag {
+        /// The nonce is spent (0xfffffff005a9a240 sets it): ESTALE.
+        pub const SPENT: u32 = 0x2;
+        /// The proposal is there.
+        pub const PROPOSAL: u32 = 0x4;
+        /// The nonce is not to be had: ENXIO, whose policy asks for the
+        /// boot nonce hash instead.
+        pub const UNAVAILABLE: u32 = 0x8;
+        /// The nonce is entangled with the UID key.
+        pub const ENTANGLE: u32 = 0x40;
+    }
+
+    /// A slot, as the kext holds it parsed.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Slot {
+        pub flags: u32,
+        pub nonce: [u8; 16],
+        pub proposal: [u8; 16],
+    }
+
+    impl Slot {
+        /// 0xfffffff005a9a254: a slot's data. None is ENODATA, a version
+        /// past 0 ESHLIBVERS when there is a whole slot of it and ERANGE
+        /// when not, version 0 of another length ERANGE.
+        pub fn parse(b: &[u8]) -> Result<Slot, i32> {
+            let Some(&version) = b.first() else { return Err(e::ENODATA) };
+            if version != 0 {
+                return Err(if b.len() > SLOT_SIZE - 1 { e::ESHLIBVERS } else { e::ERANGE });
+            }
+            if b.len() != SLOT_SIZE {
+                return Err(e::ERANGE);
+            }
+            Ok(Slot { flags: u32::from(b[4] & 0x7f), nonce: b[5..21].try_into().unwrap(), proposal: b[21..37].try_into().unwrap() })
+        }
+
+        /// 0xfffffff005a9a3a0: the slot's data.
+        pub fn to_bytes(&self) -> [u8; SLOT_SIZE] {
+            let mut b = [0u8; SLOT_SIZE];
+            b[1..5].copy_from_slice(&self.flags.to_be_bytes());
+            b[5..21].copy_from_slice(&self.nonce);
+            b[21..37].copy_from_slice(&self.proposal);
+            b
+        }
+
+        /// The roll (0xfffffff005a9a5dc) of a slot with no proposal: a new
+        /// nonce of the domain's length from the kernel's random source
+        /// (runtime +0xd8, `read_random`), `random` here, and the flags
+        /// 0x40, 0x23 and (from the old 0x2) 0x8 cleared. (With a proposal
+        /// the proposal becomes the nonce; that path and the level the
+        /// caller passes are not modelled.)
+        pub fn rolled(&self, random: [u8; CRYPTEX1_BOOT_NONCE_LENGTH]) -> Result<Slot, String> {
+            if self.flags & flag::PROPOSAL != 0 {
+                return Err("rolling a nonce slot that holds a proposal (0xfffffff005a9a5dc's proposal path)".into());
+            }
+            let clear = flag::ENTANGLE | 0x23 | ((self.flags << 2) & 0x8);
+            Ok(Slot { flags: self.flags & !clear, nonce: random, proposal: self.proposal })
+        }
+    }
+
+    /// The cryptex1 boot nonce hash of `slot`, as the BOOT policy makes it:
+    /// the access check's errno (ESTALE for a spent nonce, the status the
+    /// policy fails with), the policy's other path for an unavailable one
+    /// and the entangling (both not modelled), else SHA-384 of the nonce,
+    /// truncated. `entangle_nonce` is `/defaults`' `entangle-nonce`.
+    pub fn cryptex1_boot_hash(slot: &Slot, entangle_nonce: bool) -> Result<Vec<u8>, Fail> {
+        if slot.flags & flag::SPENT != 0 {
+            return Err(Fail::Code(e::ESTALE));
+        }
+        if slot.flags & flag::UNAVAILABLE != 0 {
+            return Err(Fail::Unmodelled("the BOOT anti-replay policy's boot nonce hash query for a nonce slot whose nonce is unavailable (ENXIO; 0xfffffff005a96558, runtime +0x80)".into()));
+        }
+        let n = &slot.nonce[..CRYPTEX1_BOOT_NONCE_LENGTH];
+        if entangle_nonce || slot.flags & flag::ENTANGLE != 0 {
+            return Err(Fail::Unmodelled("entangling the cryptex1 boot nonce with the UID key: IOAESAccelerator's performAES (vtable +0x550) with key 0x8A4, a zero IV and operation 0 (0xfffffff005a99210), whose AES direction and mode are the accelerator driver's, not traced".into()));
+        }
+        Ok(Sha384::digest(n)[..HASH_LENGTH].to_vec())
+    }
+}
+
+/// DER as Image4 has it: the items, the `[PRIVATE]` properties, and sets
+/// in DER's order (X.690 11.6: by their encodings, compared as octet
+/// strings, the shorter padded with zeros), which is the order of Apple's
+/// manifests' properties and objects.
+pub mod enc {
+    /// A definite, minimal length.
+    pub fn len(n: usize) -> Vec<u8> {
+        if n < 0x80 {
+            return vec![n as u8];
+        }
+        let b: Vec<u8> = n.to_be_bytes().iter().copied().skip_while(|&c| c == 0).collect();
+        let mut v = vec![0x80 | b.len() as u8];
+        v.extend(b);
+        v
+    }
+
+    pub fn tlv(tag: &[u8], content: &[u8]) -> Vec<u8> {
+        let mut v = tag.to_vec();
+        v.extend(len(content.len()));
+        v.extend_from_slice(content);
+        v
+    }
+
+    pub fn seq(items: &[Vec<u8>]) -> Vec<u8> {
+        tlv(&[0x30], &items.concat())
+    }
+
+    /// A SET in DER's order.
+    pub fn set(items: &[Vec<u8>]) -> Vec<u8> {
+        let mut v: Vec<&Vec<u8>> = items.iter().collect();
+        v.sort_by(|a, b| {
+            let n = a.len().max(b.len());
+            let pad = |x: &Vec<u8>| x.iter().copied().chain(std::iter::repeat(0)).take(n).collect::<Vec<u8>>();
+            pad(a).cmp(&pad(b))
+        });
+        tlv(&[0x31], &v.into_iter().flatten().copied().collect::<Vec<u8>>())
+    }
+
+    pub fn ia5(s: &[u8]) -> Vec<u8> {
+        tlv(&[0x16], s)
+    }
+
+    pub fn utf8(s: &str) -> Vec<u8> {
+        tlv(&[0x0c], s.as_bytes())
+    }
+
+    /// An INTEGER of the unsigned big-endian `b`, minimal.
+    pub fn uint(b: &[u8]) -> Vec<u8> {
+        let mut v: Vec<u8> = b.iter().copied().skip_while(|&c| c == 0).collect();
+        if v.first().is_none_or(|&c| c & 0x80 != 0) {
+            v.insert(0, 0);
+        }
+        tlv(&[0x02], &v)
+    }
+
+    pub fn int(v: u64) -> Vec<u8> {
+        uint(&v.to_be_bytes())
+    }
+
+    pub fn boolean(v: bool) -> Vec<u8> {
+        tlv(&[0x01], &[if v { 0xff } else { 0x00 }])
+    }
+
+    pub fn octets(b: &[u8]) -> Vec<u8> {
+        tlv(&[0x04], b)
+    }
+
+    pub fn null() -> Vec<u8> {
+        vec![0x05, 0x00]
+    }
+
+    /// An OBJECT IDENTIFIER of its content's bytes.
+    pub fn oid(content: &[u8]) -> Vec<u8> {
+        tlv(&[0x06], content)
+    }
+
+    /// A BIT STRING of whole bytes.
+    pub fn bits(b: &[u8]) -> Vec<u8> {
+        let mut c = vec![0u8];
+        c.extend_from_slice(b);
+        tlv(&[0x03], &c)
+    }
+
+    /// `[n]` constructed.
+    pub fn context(n: u8, content: &[u8]) -> Vec<u8> {
+        tlv(&[0xa0 | n], content)
+    }
+
+    /// `[PRIVATE code]` constructed's identifier: 0xff and the code in base
+    /// 128.
+    pub fn private_tag(code: u32) -> Vec<u8> {
+        let mut digits = vec![];
+        let mut v = code;
+        loop {
+            digits.push((v & 0x7f) as u8);
+            v >>= 7;
+            if v == 0 {
+                break;
+            }
+        }
+        digits.reverse();
+        let last = digits.len() - 1;
+        let mut t = vec![0xff];
+        t.extend(digits.iter().enumerate().map(|(i, &d)| if i == last { d } else { d | 0x80 }));
+        t
+    }
+
+    /// An Image4 property: `[PRIVATE code] { IA5String code, value }`.
+    pub fn property(code: u32, value: Vec<u8>) -> Vec<u8> {
+        tlv(&private_tag(code), &seq(&[ia5(&code.to_be_bytes()), value]))
     }
 }
 
@@ -1524,8 +1761,8 @@ mod tests {
             Ok(Some(b))
         }
 
-        fn cryptex1_boot_nonce_hash(&self, _domain: u32) -> Result<Vec<u8>, String> {
-            self.nonce.clone().ok_or_else(|| "not measured".to_string())
+        fn cryptex1_boot_nonce_hash(&self, _domain: u32) -> Result<Vec<u8>, Fail> {
+            self.nonce.clone().ok_or_else(|| Fail::Unmodelled("not measured".to_string()))
         }
 
         fn anchor(&self) -> Result<Vec<u8>, String> {
@@ -1788,10 +2025,10 @@ mod tests {
         assert_eq!(ev.properties(&[prop("DGST", octets(&sha384(&raw))), prop("EPRO", boolean(true)), prop("ESEC", boolean(true))].concat(), 1), Ok(()));
         let mut ev = eval(&f, &p);
         assert_eq!(ev.properties(&prop("DGST", octets(&[0; 48])), 1), Err(Fail::Code(dr::DECODE_ERROR)));
-        assert_eq!(ev.error, Some(e::ECANCELED));
+        assert_eq!(ev.error, Some(e::EBADEXEC));
         let mut ev = eval(&f, &p);
         assert_eq!(ev.properties(&prop("ESEC", boolean(false)), 1), Err(Fail::Code(dr::DECODE_ERROR)));
-        assert_eq!(ev.error, Some(e::ECANCELED));
+        assert_eq!(ev.error, Some(e::EBADEXEC));
     }
 
     #[test]

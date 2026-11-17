@@ -146,6 +146,7 @@ pub mod purgeable;
 pub mod coalition;
 pub mod importance;
 pub mod voucher;
+pub mod webdevice;
 pub mod wait;
 pub mod workinterval;
 pub mod workq;
@@ -166,10 +167,23 @@ pub struct SandboxProfiles {
 /// load is the kernel's panic), without which there are no trust caches;
 /// the Sandbox kext's profiles; and the sealed volumes' owners, modes and
 /// flags, by volume ([`volattrs::Vol`]); and where the restore's Cryptex1
-/// comes from ([`preboot::Sources`]). Once per system.
+/// comes from ([`preboot::Sources`]); on the web device
+/// ([`webdevice`]), its identity in `/chosen`, as its boot puts it there.
+/// Once per system.
 pub fn boot(trust_cache: Option<&[u8]>, sandbox: SandboxProfiles, device_tree: Option<&[u8]>, volume_attrs: Vec<(volattrs::Vol, Vec<u8>)>, cryptex1: preboot::Sources) -> Result<(), String> {
-    if let Some(t) = device_tree {
-        iokit::set_tree(t)?;
+    let chosen = match (&cryptex1.ticket, &cryptex1.web_device) {
+        (preboot::Ticket::WebDevice, Some(w)) => {
+            webdevice::set(w.clone())?;
+            w.identity.chosen()
+        }
+        (preboot::Ticket::WebDevice, None) => return Err("the Cryptex1 ticket is the web device's (GEX_DARWIN_CRYPTEX1_TICKET=web-device), but no web device is configured (GEX_DARWIN_WEB_DEVICE)".into()),
+        (_, Some(_)) => return Err("a web device is configured (GEX_DARWIN_WEB_DEVICE), but the Cryptex1 ticket is not its own (GEX_DARWIN_CRYPTEX1_TICKET=web-device)".into()),
+        (_, None) => Vec::new(),
+    };
+    match device_tree {
+        Some(t) => iokit::set_tree(t, &chosen)?,
+        None if !chosen.is_empty() => return Err("the web device's boot fills in /chosen, but the boot payload has no device tree".into()),
+        None => {}
     }
     // The device facts that stand in until measured, once at start.
     if let Some(gaps) = storage::unmeasured() {

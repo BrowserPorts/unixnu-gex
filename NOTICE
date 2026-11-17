@@ -54,6 +54,18 @@ crates/gex-kernel/src/darwin/xz.rs
     "This file has been put into the public domain. You can do whatever
     you want with this file."
 
+crates/gexc (`gexc darwin-web-device`, `gexc darwin-web-ticket`) and the
+gex-kernel tests of the web device's chain and tickets
+    Built with the RustCrypto rsa crate 0.9 (RSA key pairs and PKCS #1
+    v1.5 signatures) from crates.io, and the crates it builds with: pkcs1,
+    pkcs8, spki, der, const-oid, base64ct, signature, zeroize,
+    num-bigint-dig, num-integer, num-iter, num-traits, rand, rand_core,
+    rand_chacha, ppv-lite86, getrandom and lazy_static (MIT OR
+    Apache-2.0), spin (MIT), wasi (Apache-2.0 WITH LLVM-exception OR
+    Apache-2.0 OR MIT), and subtle, Copyright (c) 2016-2017 Isis Agora
+    Lovecruft, Henry de Valence; Copyright (c) 2016-2024 Isis Agora
+    Lovecruft (BSD-3-Clause). Each crate's licence text is in it.
+
 The MIT licence of musl libc and of Emscripten's dlmalloc changes (each
 under its copyright line above):
 

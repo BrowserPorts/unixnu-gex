@@ -83,6 +83,7 @@ pub mod macvfs;
 pub mod kobject;
 pub mod lockf;
 pub mod lzfse;
+pub mod inflate;
 pub mod mach;
 pub mod mach_msg;
 pub mod memorystatus;

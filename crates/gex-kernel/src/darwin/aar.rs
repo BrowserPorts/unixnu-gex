@@ -36,7 +36,7 @@
 //! | `b` | LZBITMAP ("ZBM") | [`super::apfsread::lzbitmap`] |
 //! | `4` | LZ4 in libcompression's `bv41`/`bv4-`/`bv4$` blocks | below |
 //! | `-` | none: only stored chunks | refused otherwise, as `aa` does |
-//! | `z` | zlib (RFC 1950 streams, `78 5e`) | not implemented: no inflater |
+//! | `z` | zlib: RFC 1950 streams (`78 5e`) | [`super::inflate`], below |
 //! | `x` | LZMA (xz streams) | not implemented |
 //! | `m` | LZRAVEN (`aa -a lzraven`) | not implemented |
 //!
@@ -45,11 +45,18 @@
 //! libcompression decodes a chunk into a buffer of its raw size and stops
 //! when the buffer is full, so a payload that expands past its raw size
 //! gives its first raw-size bytes and what follows is not read (`aa` takes
-//! such LZFSE, LZVN, LZBITMAP and LZ4 chunks). The LZBITMAP and LZ4
-//! decoders here do the same; the LZFSE decoder refuses a stream that does
-//! not end exactly at its destination's end, so an LZFSE or LZVN chunk
-//! that expands past its raw size, or (LZVN) has bytes after its
-//! end-of-stream opcode, is refused here, as not implemented.
+//! such LZFSE, LZVN, LZBITMAP, LZ4 and zlib chunks). The LZBITMAP, LZ4
+//! and DEFLATE decoders here do the same; the LZFSE decoder refuses a
+//! stream that does not end exactly at its destination's end, so an LZFSE
+//! or LZVN chunk that expands past its raw size, or (LZVN) has bytes after
+//! its end-of-stream opcode, is refused here, as not implemented.
+//!
+//! A zlib chunk's first two bytes, the RFC 1950 header, are skipped
+//! whatever they hold (a payload under 2 bytes is refused), and the rest is
+//! decoded as raw DEFLATE; the Adler-32 trailer is not read, and bytes
+//! after the final block are not read either. `aa` takes chunks whose
+//! header has a bad check, a preset dictionary flag or another method, a
+//! bad or missing trailer, or a stored block whose NLEN is wrong.
 //!
 //! The LZBITMAP decoder is the kernel's (AppleFSCompressionTypeZlib's
 //! copy); the host's libcompression refuses two things it takes, a stream
@@ -122,6 +129,7 @@ use std::ops::Range;
 
 use super::apfsread::lzbitmap;
 use super::image4::{self, der, tag};
+use super::inflate;
 use super::lzfse;
 
 /// The largest block size a pbz stream may have (`aa` refuses 0x8000001).
@@ -255,7 +263,14 @@ fn decode_chunk(alg: Algorithm, payload: &[u8], dst: &mut [u8]) -> Result<(), St
         Algorithm::Lzbitmap => lzbitmap::decode(dst, payload).map_err(|e| e.to_string())?,
         Algorithm::Lz4 => lz4(payload, dst)?,
         Algorithm::None => return Err("a payload not stored in a stream of no algorithm (invalid output size)".into()),
-        Algorithm::Zlib => return Err("zlib-compressed pbz chunks: no inflater".into()),
+        Algorithm::Zlib => {
+            let raw = payload.get(2..).ok_or("a zlib payload under 2 bytes (invalid output size)")?;
+            match inflate::decode_buffer(raw, dst, inflate::Variant::Host) {
+                Ok(n) => n,
+                Err(e @ inflate::Error::Rejected(_)) => return Err(format!("{e} (invalid output size)")),
+                Err(e @ inflate::Error::Undefined(_)) => return Err(format!("{e}: not implemented")),
+            }
+        }
         Algorithm::Lzma => return Err("LZMA-compressed pbz chunks: not implemented".into()),
         Algorithm::Lzraven => return Err("LZRAVEN-compressed pbz chunks: not implemented".into()),
     };
@@ -892,7 +907,7 @@ mod tests {
         // Algorithms.
         assert!(pbz_decode(&pbz(b'q', 0x10000, &[(n, &a)])).unwrap_err().contains("non-supported"));
         assert!(pbz_decode(&pbz(b'-', 0x10000, &[(n + 1, &a)])).unwrap_err().contains("not stored"));
-        assert!(pbz_decode(&pbz(b'z', 0x10000, &[(n + 1, &a)])).unwrap_err().contains("zlib-compressed pbz chunks: no inflater"));
+        assert!(pbz_decode(&pbz(b'z', 0x10000, &[(n + 1, &a)])).unwrap_err().contains("invalid output size"));
         assert!(pbz_decode(&pbz(b'x', 0x10000, &[(n + 1, &a)])).unwrap_err().contains("LZMA"));
         assert!(pbz_decode(&pbz(b'm', 0x10000, &[(n + 1, &a)])).unwrap_err().contains("LZRAVEN"));
         // Stored chunks need no decoder, whatever the algorithm.
@@ -921,6 +936,15 @@ mod tests {
         assert!(pbz_decode(&pbz(b'b', 64, &[(9, z)])).unwrap_err().contains("invalid output size"));
         // LZ4.
         assert_eq!(pbz_decode(&pbz(b'4', 64, &[(5, b"bv41\x05\0\0\0\x06\0\0\0\x50abcdebv4$")])).unwrap(), b"abcde");
+        // zlib: "hello" in a fixed block; the header and trailer not read,
+        // the decoder stopping when the chunk is full.
+        let z = b"\x78\x5e\xcb\x48\xcd\xc9\xc9\x07\x00\x06\x2c\x02\x15";
+        assert_eq!(pbz_decode(&pbz(b'z', 64, &[(5, z)])).unwrap(), b"hello");
+        assert_eq!(pbz_decode(&pbz(b'z', 64, &[(5, &[b"\xff\xff", &z[2..9]].concat())])).unwrap(), b"hello");
+        assert_eq!(pbz_decode(&pbz(b'z', 64, &[(3, z)])).unwrap(), b"hel");
+        assert!(pbz_decode(&pbz(b'z', 64, &[(6, z)])).unwrap_err().contains("invalid output size"));
+        assert!(pbz_decode(&pbz(b'z', 64, &[(5, &z[..1])])).unwrap_err().contains("under 2 bytes"));
+        assert!(pbz_decode(&pbz(b'z', 64, &[(5, b"\x78\x5e\x07")])).unwrap_err().contains("invalid output size"));
     }
 
     /// An LZ4 sequence: `lit` literals, then a match of `m` bytes
@@ -1063,7 +1087,7 @@ mod tests {
     /// (GEX_TEST_AAR_DIR: `<name>.aar` or `<name>.aa` with `<name>.json`,
     /// `aa list -list-format json`; `raw.aar`, `aa archive -a raw` of the
     /// tree `src/`, which the other `.aar` archive with their algorithms;
-    /// `zlib.aar`, `lzma.aar`, `lzraven.aar` the algorithms not read).
+    /// `lzma.aar`, `lzraven.aar` the algorithms not read).
     #[test]
     fn host_archives() {
         let Ok(dir) = std::env::var("GEX_TEST_AAR_DIR") else { return };
@@ -1080,10 +1104,6 @@ mod tests {
             let src = std::fs::read(&path).unwrap();
             let decoded = archive_stream(&src);
             match name.as_str() {
-                "zlib" => {
-                    assert!(decoded.unwrap_err().contains("no inflater"));
-                    continue;
-                }
                 "lzma" | "lzraven" => {
                     assert!(decoded.unwrap_err().contains("not implemented"), "{name}");
                     continue;
@@ -1091,7 +1111,7 @@ mod tests {
                 _ => {}
             }
             let a = decoded.unwrap_or_else(|e| panic!("{name}: {e}"));
-            if ["lzfse", "lzbitmap", "lz4", "lzfse4m"].contains(&name.as_str()) {
+            if ["lzfse", "lzbitmap", "lz4", "lzfse4m", "zlib"].contains(&name.as_str()) {
                 assert!(*a == *raw, "{name}: not the raw archive");
             }
             let es = entries(&a).unwrap_or_else(|e| panic!("{name}: {e}"));

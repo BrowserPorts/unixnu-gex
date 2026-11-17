@@ -46,7 +46,7 @@ pub fn add_service(t: &mut Vec<Node>, resources: u32) {
         ("IOProbeScore".to_string(), Prop::Num(0, 32)),
     ];
     let at = t.len() as u32;
-    t.push(Node { name: super::NAME.to_string(), props: Vec::new(), class: super::CLASS, service_props, parent: Some(resources), children: Vec::new(), kernel_only: false, nub: None, dt: None, table: crate::darwin::iokit::Table::Drivers });
+    t.push(Node { name: super::NAME.to_string(), props: Vec::new(), class: super::CLASS, service_props, parent: Some(resources), children: Vec::new(), kernel_only: false, nub: None, dt: None, table: crate::darwin::iokit::Table::Drivers, power: None });
     t[resources as usize].children.push(at);
 }
 

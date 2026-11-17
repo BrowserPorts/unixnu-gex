@@ -12,16 +12,16 @@
 //!               NS_01@1           IOEmbeddedNVMeBlockDevice, NSID 1
 //!                 IOBlockStorageDriver
 //!                   <model> Media IOMedia, disk0
+//!                     IOMediaBSDClient
 //!                     IOGUIDPartitionScheme
 //!                       Container@1           IOMedia, disk0s1
+//!                         IOMediaBSDClient
 //!                         AppleAPFSContainerScheme
 //!                           AppleAPFSMedia    disk1
+//!                             AppleAPFSMediaBSDClient
 //!                             AppleAPFSContainer
 //!                               <volume>@<slot+1>   AppleAPFSVolume
 //!                                 AppleAPFSVolumeBSDClient
-//!                             AppleAPFSMediaBSDClient
-//!                         IOMediaBSDClient
-//!                     IOMediaBSDClient
 //! ```
 //!
 //! - The PCIe path. `AppleT8011PCIe` (com.apple.driver.AppleT8011PCIe) is
@@ -43,13 +43,15 @@
 //!   the device tree's `namespaces` (`AllocateNodes`, 0xfffffff006a5e35c):
 //!   NSID 1, the root, an `IOEmbeddedNVMeBlockDevice` named "NS_01"
 //!   (0xfffffff006a6ee48) at location "1" (`initWithNamespace`,
-//!   0xfffffff006a98c20).
+//!   0xfffffff006a98c20). Before it makes the namespaces it attaches
+//!   itself below its nub in the `IODeviceTree` plane (0xfffffff006a81ec0).
 //! - `IOBlockStorageDevice::init` (0xfffffff00596ee30) gives the namespace
 //!   "device-type" "Generic", which `IOBlockStorageDriver`'s personality
 //!   matches; the driver's media is the whole disk, named "<vendor>
 //!   <product> Media" (`acceptNewMedia`; the vendor string is empty,
 //!   0xfffffff006a96df4) and attached in the `IODeviceTree` plane to the
-//!   nearest provider there, s3e's nub, as "disk" at "<IOUnit>:0".
+//!   nearest provider there, the controller, as "disk" at "<IOUnit>:0"
+//!   (`IOUnitName` the controller personality's).
 //! - `IOGUIDPartitionScheme` (score 4000, `Content Mask`
 //!   "GUID_partition_scheme") reads the GPT and publishes the partition,
 //!   named for its entry and attached in the `IODeviceTree` plane beside
@@ -63,9 +65,13 @@
 //! - `IOMediaBSDClient` (`IOResourceMatch` IOBSD, score 30000) matches every
 //!   IOMedia, and APFS's `AppleAPFSMediaBSDClient` and
 //!   `AppleAPFSVolumeBSDClient` (31000) its own. Each gives its medium its
-//!   BSD keys ([`super::storage::units`]). It matches once `IOKitBSDInit`
-//!   publishes IOBSD, so it attaches after the storage driver below the
-//!   medium (the media order's stand-in, [`super::storage::media_order`]).
+//!   BSD keys ([`super::storage::units`]). Its category is started before
+//!   the storage drivers' (`probeCandidates` starts the categories in the
+//!   order of their best probe score, 30000 and 31000 above the schemes'),
+//!   and `startCandidate` attaches it before it stalls for IOBSD, which
+//!   `IOKitBSDInit` publishes: it is the medium's first child. When it
+//!   gets its nodes is the media order's stand-in
+//!   ([`super::storage::media_order`]).
 //!
 //! The controller's other namespaces (its firmware namespace NS_02 with its
 //! own driver and whole disk, NS_03's diagnostics, NS_05's NVRAM, NS_06's
@@ -148,7 +154,7 @@ pub fn children_unknown(class: &str) -> Option<&'static str> {
         // (and the wlan function below it) is published only once its
         // client, the WLAN driver, enables the port at run time.
         T8011_PCIE => Some("pci-bridge2's nub and the wlan function below it, which the bridge publishes once the WLAN driver enables that manual-enable port"),
-        TEMP_SENSOR | NVRAM | DIAG_DRIVER | EFFACEABLE_DRIVER | NAMESPACE_DEVICE => Some("the clients its family attaches, not followed"),
+        NAMESPACE_DEVICE => Some("the clients its family attaches, not followed"),
         _ => None,
     }
 }
@@ -159,7 +165,7 @@ pub fn children_unknown(class: &str) -> Option<&'static str> {
 pub fn class_complete(class: &str) -> bool {
     matches!(
         class,
-        APFS_SCHEME | APFS_MEDIA | APFS_CONTAINER | APFS_VOLUME | APFS_MEDIA_BSD | APFS_VOLUME_BSD | GPT | HOST_BRIDGE | T8011_PCIE | CONTROLLER | "AppleNVMeController" | "IONVMeController" | BLOCK_DEVICE | EFFACEABLE | "IONVMeBlockStorageDevice" | "IOBlockStorageDevice" | DRIVER | "IOMedia" | BSD_CLIENT | "IOPartitionScheme" | NAMESPACE_DEVICE | DIAGNOSTICS
+        APFS_SCHEME | APFS_MEDIA | APFS_CONTAINER | APFS_VOLUME | APFS_MEDIA_BSD | APFS_VOLUME_BSD | GPT | HOST_BRIDGE | T8011_PCIE | CONTROLLER | "AppleNVMeController" | "IONVMeController" | BLOCK_DEVICE | EFFACEABLE | "IONVMeBlockStorageDevice" | "IOBlockStorageDevice" | DRIVER | "IOMedia" | BSD_CLIENT | "IOPartitionScheme" | NAMESPACE_DEVICE | DIAGNOSTICS | TEMP_SENSOR | NVRAM | DIAG_DRIVER | EFFACEABLE_DRIVER
     )
 }
 
@@ -251,7 +257,7 @@ pub const PARTITION_NAME: &str = "Container";
 
 /// A service entry.
 fn service(name: &str, class: &'static str, parent: Option<u32>, service_props: Vec<(String, Prop)>, table: Table) -> Node {
-    Node { name: name.to_string(), props: Vec::new(), class, service_props, parent, children: Vec::new(), kernel_only: false, nub: None, dt: None, table }
+    Node { name: name.to_string(), props: Vec::new(), class, service_props, parent, children: Vec::new(), kernel_only: false, nub: None, dt: None, table, power: None }
 }
 
 /// Push `n` below its parent; its index.
@@ -280,17 +286,23 @@ fn add_pcie(t: &mut Vec<Node>, io: u32) -> Option<u32> {
     let s3e = super::platform::child(t, bridge0, "s3e", &[])?;
     // The personality "AppleT8011PCIe"; no probe of its own, and
     // IOPCIHostBridge's (0xfffffff0064c3dfc) leaves the score. Its start
-    // sets its user client class (0xfffffff0066183c8) and the function
-    // parent key AppleARMPlatform's helper makes of apcie's phandle 0xa5
-    // (0xfffffff005988104), empty data.
+    // (AppleEmbeddedPCIE's, 0xfffffff0066175b4) sets its reporters' legend
+    // ([`pcie_legend`]), its user client class (0xfffffff0066183c8) and the
+    // function parent key AppleARMPlatform's helper makes of apcie's
+    // phandle (0xfffffff005988104), empty data; its `configure`
+    // (0xfffffff006619f34) sets nothing.
     let mut props = driver("com.apple.driver.AppleT8011PCIe", T8011_PCIE, super::platform::ARM_IO_DEVICE, Some("apcie,t8011"), "IODefaultMatchCategory", 0, vec![
         key("IONameMatch", string("apcie,t8011")),
         key("IOPlatformQuiesceAction", num64(4000)),
         key("IOPlatformActiveAction", num64(1500)),
     ]);
+    props.push(key("IOReportLegend", pcie_legend(t, apcie)));
+    props.push(key("IOReportLegendPublic", Prop::Bool(true)));
     props.push(key("IOUserClientClass", sym("AppleEmbeddedPCIEUserClient")));
-    props.push(key(&format!("IOFunctionParent{:08X}", 0xa5), Prop::Data(Vec::new())));
-    let rc = push(t, service(T8011_PCIE, T8011_PCIE, Some(apcie), props, Table::Lacks(vec![("what AppleEmbeddedPCIE::configure sets", "not followed")])));
+    props.push(key(&super::platform::function_parent(t, apcie), Prop::Data(Vec::new())));
+    // `IOPCIBridge::start`'s PMinit, after `configure`.
+    props.push(key(super::iopower::KEY, super::iopower::pci_bridge()));
+    let rc = push(t, service(T8011_PCIE, T8011_PCIE, Some(apcie), props, Table::Complete));
     // apcie as the host bridge's configuration left it: three address
     // cells and two size cells (as its device tree entry has them), and
     // configured (`bridgeConstructDeviceTree`).
@@ -317,32 +329,38 @@ fn add_pcie(t: &mut Vec<Node>, io: u32) -> Option<u32> {
         set(&mut p.service_props, k, v);
     }
     publish_nub(p, &f.root_port);
-    for (k, v) in [("IOInterruptControllers", Prop::Array(vec![sym("apcie-0")])), ("IOInterruptSpecifiers", Prop::Array(vec![Prop::Data(vec![0; 8])])), ("IOPCIResourced", Prop::Bool(true))] {
+    // `IOPCIDevice::attach`'s PMinit comes after `attachToChild`.
+    for (k, v) in [("IOInterruptControllers", Prop::Array(vec![sym("apcie-0")])), ("IOInterruptSpecifiers", Prop::Array(vec![Prop::Data(vec![0; 8])])), (super::iopower::KEY, super::iopower::pci_function()), ("IOPCIResourced", Prop::Bool(true))] {
         set(&mut p.service_props, k, v);
     }
     // The personality "ApplePCIEHostBridge", by bundle AppleT8011PCIe:
     // matched by the nub's compatible; its probe keeps the score
     // (0xfffffff00662af30); IOPCI2PCIBridge's start sets IOPCIPowerOnProbe.
     let mut props = driver("com.apple.driver.AppleT8011PCIe", HOST_BRIDGE, PCI_DEVICE, Some("apcie-bridge"), "IODefaultMatchCategory", 5000, vec![key("IONameMatch", string("apcie-bridge"))]);
+    // `IOPCIBridge::start`'s PMinit, then IOPCI2PCIBridge's key.
+    props.push(key(super::iopower::KEY, super::iopower::pci_bridge()));
     props.push(key("IOPCIPowerOnProbe", Prop::Bool(true)));
     let host = push(t, service("IOPP", HOST_BRIDGE, Some(port), props, Table::Complete));
     let nvme = add_pci_nub(t, s3e, host, port, "0", &f.nvme, "1:0:0");
     let n = &mut t[nvme as usize];
     publish_nub(n, &f.nvme);
+    set(&mut n.service_props, super::iopower::KEY, super::iopower::pci_function());
     set(&mut n.service_props, "IOPCIResourced", Prop::Bool(true));
     if let Table::Lacks(l) = &mut n.table {
-        l.push(("IOInterruptControllers", "the MSI vectors the controller's driver allocates (ApplePCIEMSIController)"));
-        l.push(("IOInterruptSpecifiers", "the MSI vectors the controller's driver allocates (ApplePCIEMSIController)"));
+        l.push(("IOInterruptControllers", "the MSI vectors the controller's driver allocates (ApplePCIEMSIController): how many IONVMeFamily asks for, and the function's MSI capability, are not traced"));
+        l.push(("IOInterruptSpecifiers", "the MSI vectors the controller's driver allocates (ApplePCIEMSIController): how many IONVMeFamily asks for, and the function's MSI capability, are not traced"));
+        // `IOPCIBridge::getNubResources` (0xfffffff0064ca150) gives a nub
+        // whose iommu-parent is a DART mapper its window, from the DART's
+        // retrieveVMLimits (0xfffffff005f29334, not followed), and the
+        // mapper's page size; pci-bridge0 has no iommu-parent.
+        l.push(("IOPCIDeviceMemoryMapBase", "the DART's retrieveVMLimits, not followed"));
+        l.push(("IOPCIDeviceMemoryMapSize", "the DART's retrieveVMLimits, not followed"));
+        l.push(("IOPCIDeviceMapperPageSize", "the DART mapper's getPageSize, not followed"));
     }
-    // The personality "AppleEmbeddedNVMeController" (IONVMeFamily), and
-    // what its start sets of the controller's own: its panic action, its
-    // NAND's status once its namespaces are up, Identify Controller's
-    // strings as symbols (0xfffffff006a85d58), and its reporters' legend
-    // (AppleEmbeddedNVMeController's slot 0x850, 0xfffffff006a5dd18: a new
-    // legend of one state reporter). Its score: the personality has none,
-    // and `pciMatchNub` adds 1000 for an IOPCIMatch matched on the IDs or
-    // the subsystem's; neither class overrides `probe`.
-    let n = super::storage::nvme();
+    // The personality "AppleEmbeddedNVMeController" (IONVMeFamily). Its
+    // score: the personality has none, and `pciMatchNub` adds 1000 for an
+    // IOPCIMatch matched on the IDs or the subsystem's; neither class
+    // overrides `probe`. Then what its start sets ([`controller_props`]).
     let mut props = driver("com.apple.iokit.IONVMeFamily", CONTROLLER, PCI_DEVICE, None, "IODefaultMatchCategory", 1000, vec![
         key("IOPCIClassMatch", string("0x01800200&0xffffff00")),
         key("IOUserClientClass", string("AppleNVMeUpdateUC")),
@@ -354,30 +372,357 @@ fn add_pcie(t: &mut Vec<Node>, io: u32) -> Option<u32> {
         key("Physical Interconnect Location", string("Internal")),
         key("IOPCIUseDeviceMapper", Prop::Bool(true)),
     ]);
-    props.push(key("Serial Number", sym(n.serial)));
-    props.push(key("Model Number", sym(n.model)));
-    props.push(key("Firmware Revision", sym(n.firmware)));
-    props.push(key("IOPlatformPanicAction", num32(0)));
-    props.push(key("AppleNANDStatus", sym("Ready")));
-    // IOStateReporter::with(this, kIOReportCategoryPower, 2 states, unit
-    // 0x0101000000000000): channel 'NVMe Pwr' "NVMe Power States", its
-    // states 'OFF' and 'ACTIVE'; in group "NVMe" with no subgroup.
-    props.push(key("IOReportLegend", Prop::Array(vec![legend_entry(&[(0x4e56_4d65_2050_7772, "NVMe Power States")], channel_type(2, 1 << 1, 2), 0x0101_0000_0000_0000, "NVMe", None)])));
-    props.push(key("IOReportLegendPublic", Prop::Bool(true)));
-    let lacks = vec![
-        ("IOCommandPoolSize", "from CAP.MQES, the controller's register (IOControllerInit, 0xfffffff006a8316c)"),
-        ("NVMe Revision Supported", "\"%u.%u%u\" of the VS register, the controller's"),
-        ("Controller Characteristics", "the NAND's answers to the vendor commands (0xfffffff006a5c19c)"),
-        ("IOPolledInterface", "the polled adapter object"),
-        ("chip-id", "the NAND's"),
-        ("chip-revision", "the NAND's"),
-        ("IOMinimumSaturationByteCount", "not followed"),
-        ("IOMaximumSwapWrite", "not followed"),
-        ("VCParams", "not followed"),
-        ("NVMe Debug Data", "not followed"),
-    ];
-    Some(push(t, service(CONTROLLER, CONTROLLER, Some(nvme), props, Table::Lacks(lacks))))
+    props.extend(controller_props(t, &f.nvme));
+    // Its start attaches it below its nub in the `IODeviceTree` plane
+    // (0xfffffff006a81ec0), with no name or location of that plane's.
+    let mut c = service(CONTROLLER, CONTROLLER, Some(nvme), props, Table::Complete);
+    c.dt = Some(DtLink { parent: nvme, name: CONTROLLER.to_string(), location: None });
+    Some(push(t, c))
 }
+
+/// What the controller's start (IONVMeController::start,
+/// 0xfffffff006a81d90) sets on itself, in its order:
+/// - `IOControllerInit` (0xfffffff006a8316c): IOCommandPoolSize, the
+///   request pool's size, min(CAP.MQES + 1, 65) less one (the embedded
+///   controller's queue limit, slot 0x680, is 0x40: 0xfffffff006a64180);
+///   "NVMe Revision Supported", `"%u.%u%u"` of the VS register's major,
+///   minor and tertiary bytes (a symbol); IOPlatformPanicAction 0. Its
+///   "Physical Interconnect Location" needs the embedded flag clear, which
+///   the embedded InitializeController sets first (0xfffffff006a5b4dc), and
+///   no entry up the plane has "ssd-off-in-S4".
+/// - `AllocateResources`, through the embedded slot 0x850
+///   (0xfffffff006a5dd18): a new reporters' legend of one
+///   `IOStateReporter` (kIOReportCategoryPower, 2 states, unit
+///   0x0101000000000000): channel 'NVMe Pwr' "NVMe Power States", states
+///   'OFF' and 'ACTIVE', in group "NVMe" with no subgroup.
+/// - Identify Controller's handler (0xfffffff006a85d58): IOPolledInterface
+///   when the request pool holds at least two (an
+///   `IONVMeControllerPolledAdapter`, which serializes as its class's note);
+///   the transfer limits (0xfffffff006a872e8 on) from MDTS's exponent `m`
+///   (MDTS if it is 1 to 7, else 8): segments of 4096 bytes (64-bit
+///   numbers), `1 << m` of them, `4096 << m` bytes, aligned to 4096;
+///   IOMinimumSaturationByteCount 0x800000 only on a link at 8 GT/s x4
+///   (slot 0x7c0, 0xfffffff006a88258: s3e's IOPCIExpressLinkStatus & 0x3ff
+///   is 0x43); Controller Characteristics ([`controller_characteristics`],
+///   replaced twice later in its place); the Identify strings as symbols,
+///   trailing spaces cut (0xfffffff006a85e40 on).
+/// - PMinit, which adds IOPowerManagement (0xfffffff006a8754c;
+///   [`super::iopower::nvme_controller`]).
+/// - `IdentifyNamespaces` (0xfffffff006a5b84c): IOMaximumSwapWrite
+///   ([`swap_write_limit`]).
+/// - `StartController` (0xfffffff006a5e25c): once the namespaces are made,
+///   AppleNANDStatus "Ready".
+/// "NVMe Debug Data" and "nand-fragmentation" are set only by
+/// `setProperties` from a privileged task (0xfffffff006a83570,
+/// 0xfffffff006a9139c); chip-id and chip-revision are read from the device
+/// tree (0xfffffff006a89534), not set; VCParams and QueueSize are
+/// AppleANS3CGv2Controller's. None is here at boot.
+fn controller_props(t: &[Node], link: &PciFunction) -> Vec<(String, Prop)> {
+    let n = super::storage::nvme();
+    let c = controller_facts();
+    let pool = u64::from(c.mqes).min(64);
+    let m = mdts_exponent(c.mdts);
+    let mut p = vec![
+        key("IOCommandPoolSize", num32(pool)),
+        key("NVMe Revision Supported", sym(&format!("{}.{}{}", c.vs >> 16 & 0xff, c.vs >> 8 & 0xff, c.vs & 0xff))),
+        key("IOPlatformPanicAction", num32(0)),
+        key("IOReportLegend", Prop::Array(vec![legend_entry(&[(0x4e56_4d65_2050_7772, "NVMe Power States")], channel_type(2, 1 << 1, 2), 0x0101_0000_0000_0000, "NVMe", None)])),
+        key("IOReportLegendPublic", Prop::Bool(true)),
+    ];
+    if pool >= 2 {
+        p.push(key("IOPolledInterface", string("IONVMeControllerPolledAdapter is not serializable")));
+    }
+    p.extend([
+        key("IOMaximumSegmentByteCountRead", num64(4096)),
+        key("IOMaximumSegmentByteCountWrite", num64(4096)),
+        key("IOMaximumSegmentCountRead", num32(1 << m)),
+        key("IOMaximumSegmentCountWrite", num32(1 << m)),
+        key("IOMaximumByteCountRead", num32(4096 << m)),
+        key("IOMaximumByteCountWrite", num32(4096 << m)),
+        key("IOMinimumSegmentAlignmentByteCount", num32(4096)),
+    ]);
+    if link.link_status & 0x3ff == 0x43 {
+        p.push(key("IOMinimumSaturationByteCount", num32(0x80_0000)));
+    }
+    p.push(key("Controller Characteristics", controller_characteristics(&c, m)));
+    p.push(key("Serial Number", sym(n.serial)));
+    p.push(key("Model Number", sym(n.model)));
+    p.push(key("Firmware Revision", sym(n.firmware)));
+    p.push(key(super::iopower::KEY, super::iopower::nvme_controller()));
+    if let Some(limit) = swap_write_limit(t, c.capacity_gb) {
+        p.push(key("IOMaximumSwapWrite", num64(limit)));
+    }
+    p.push(key("AppleNANDStatus", sym("Ready")));
+    p
+}
+
+/// MDTS's exponent as Identify Controller's handler takes it
+/// (0xfffffff006a85d9c): MDTS if it is 1 to 7, else (0, no limit, or more)
+/// 8.
+fn mdts_exponent(mdts: u8) -> u32 {
+    if (1..=7).contains(&mdts) { u32::from(mdts) } else { 8 }
+}
+
+/// `SetSwapWriteLimit` (0xfffffff006a5f25c) of the NAND's capacity in GB,
+/// by the device tree's /product artwork-device-idiom: a pad's or a
+/// phone's 4 GiB above 256 GB, 3 GiB above 128, 2 GiB above 64, 1 GiB above
+/// 16, else 0 (still set); a watch's 1 GiB from 16 GB, else none; none for
+/// any other idiom, or with no /product.
+fn swap_write_limit(t: &[Node], capacity_gb: u64) -> Option<u64> {
+    let idiom = super::iokit::dt_prop(t, "IODeviceTree:/product", "artwork-device-idiom")?;
+    let idiom = &idiom[..idiom.iter().position(|&b| b == 0).unwrap_or(idiom.len())];
+    match idiom {
+        b"pad" | b"phone" => Some(match capacity_gb {
+            c if c > 256 => 0x1_0000_0000,
+            c if c > 128 => 0xc000_0000,
+            c if c > 64 => 0x8000_0000,
+            c if c > 16 => 0x4000_0000,
+            _ => 0,
+        }),
+        b"watch" => (capacity_gb >= 16).then_some(0x4000_0000),
+        _ => None,
+    }
+}
+
+/// The controller's Controller Characteristics, in the order it is built:
+/// Preferred IO Size (`4096 << m`, 32 bits) and Encryption Type "AES-XTS"
+/// (the embedded slot 0x770, 0xfffffff006a5d7bc), then what
+/// `IdentifyNamespaces` appends to a copy of it (0xfffffff006a5b84c), from
+/// Identify Controller's Apple area and two vendor commands: vendor-name
+/// (bytes 0xe38, 16), nand-marketing-name (0xe18, 32), firmware-version
+/// (the 8 bytes of FR), msp-version (0xc00, 16), chip-id (the name of byte
+/// 0xc1c's chip, from the table at 0xfffffff006fa0688), controller-unique-id
+/// (the 20 bytes of SN), each an OSString of the bytes up to a NUL;
+/// nand-device-desc, the 64-bit number at 0xd00 if it is nonzero, else a
+/// 32-bit number of the halfword at 0xc1e and the byte at 0xc20 above it;
+/// manufacturer-id, 8 bytes of data, the first 6 the vendor command 0x38's
+/// answer (0xfffffff006a5f6e4); capacity, the halfword at 0xe06 in GB times
+/// 10^9 (64 bits); and the geometry the vendor command 0x37 answers
+/// (0xfffffff006a630ec), each a 32-bit number of the answer's words. "Low
+/// Power Mode" would come first if the controller's +0x268 were set, which
+/// nothing in IONVMeFamily writes.
+fn controller_characteristics(c: &ControllerFacts, m: u32) -> Prop {
+    let n = super::storage::nvme();
+    let field = |s: &str, len: usize| {
+        let mut b: Vec<u8> = s.bytes().take(len).collect();
+        b.resize(len, b' ');
+        string(&String::from_utf8_lossy(&b))
+    };
+    let upto = |s: &str, len: usize| string(&s.chars().take(len).collect::<String>());
+    let w = &c.geometry;
+    let desc = if c.nand_device_desc_64 != 0 { num64(c.nand_device_desc_64) } else { num32(u64::from(c.nand_device_desc_16) | u64::from(c.nand_device_desc_8) << 16) };
+    let mut id = c.manufacturer_id.to_vec();
+    id.resize(8, 0);
+    let mut d = vec![
+        key("Preferred IO Size", num32(4096 << m)),
+        key("Encryption Type", string("AES-XTS")),
+        key("vendor-name", upto(c.vendor_name, 16)),
+        key("nand-marketing-name", upto(c.nand_marketing_name, 32)),
+        key("firmware-version", field(n.firmware, 8)),
+        key("msp-version", upto(c.msp_version, 16)),
+        key("chip-id", string(["S3E", "S1X", "S4E", "S5E"].get(c.chip).copied().unwrap_or(""))),
+        key("controller-unique-id", field(n.serial, 20)),
+        key("nand-device-desc", desc),
+        key("manufacturer-id", Prop::Data(id)),
+        key("capacity", num64(c.capacity_gb * 1_000_000_000)),
+    ];
+    let g = |i: usize| num32(u64::from(w[i]));
+    d.extend([
+        key("caus", num32(u64::from(w[1].wrapping_mul(w[3])))),
+        key("blocks-per-cau", g(5)),
+        key("page-size", num32(u64::from(w[6] << 12))),
+        key("pages-per-block-mlc", g(10)),
+        key("num-bus", g(2)),
+        key("default-bits-per-cell", g(13)),
+        key("dies-per-channel", g(3)),
+        key("pages-per-block-slc", g(11)),
+        key("pages-in-read-verify", g(14)),
+        key("package_blocks_at_EOL", g(15)),
+        key("block-pairing-scheme", g(16)),
+        key("cau-per-die", g(1)),
+        key("num-dip", g(4)),
+        key("sec-per-page", g(6)),
+        key("sec-per-full-band", g(7)),
+        key("sec-per-full-band-slc", g(8)),
+        key("bytes-per-sec-meta", g(9)),
+        key("pages-per-block0", g(12)),
+        key("cell-type", g(13)),
+        key("ce-per-bus", g(0)),
+        key("program-scheme", g(17)),
+    ]);
+    Prop::Dict(d)
+}
+
+/// What the NAND's controller answers that its driver publishes: CAP.MQES
+/// (register 0x00, bits 15:0), the VS register (0x08), Identify
+/// Controller's MDTS (byte 77) and its Apple area, and the answers to the
+/// vendor commands 0x38 (the manufacturer's ID) and 0x37 (the geometry's
+/// 18 words, from offset 0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ControllerFacts {
+    pub mqes: u16,
+    pub vs: u32,
+    pub mdts: u8,
+    pub vendor_name: &'static str,
+    pub nand_marketing_name: &'static str,
+    pub msp_version: &'static str,
+    /// Byte 0xc1c, the chip's index.
+    pub chip: usize,
+    /// The 64-bit number at 0xd00, the halfword at 0xc1e and the byte at
+    /// 0xc20.
+    pub nand_device_desc_64: u64,
+    pub nand_device_desc_16: u16,
+    pub nand_device_desc_8: u8,
+    pub manufacturer_id: [u8; 6],
+    /// The halfword at 0xe06.
+    pub capacity_gb: u64,
+    pub geometry: [u32; 18],
+}
+
+/// The device's, once measured (with the measurement cited).
+pub const CONTROLLER_DEVICE_FACTS: Option<ControllerFacts> = None;
+
+/// What measures [`CONTROLLER_DEVICE_FACTS`].
+pub const CONTROLLER_MEASUREMENT: &str = "the AppleEmbeddedNVMeController's IOCommandPoolSize, NVMe Revision Supported, IOMaximumSegmentCountRead and Controller Characteristics (a sysdiagnose's ioreg IOService plane)";
+
+/// What stands in for [`CONTROLLER_DEVICE_FACTS`] while it is unset: a
+/// queue at least as deep as the driver's limit (so a pool of 64), no
+/// version (VS 0), no transfer limit (MDTS 0), strings that say what they
+/// are, the first chip of the table (S3E, as the controller's device tree
+/// entry is named), no device description, manufacturer ID or geometry
+/// (zeros), and the capacity of disk0's stand-in size in GB. A reported
+/// shortcut (`unmeasured`), not the device's.
+pub fn stand_in_controller() -> ControllerFacts {
+    ControllerFacts {
+        mqes: 0xffff,
+        vs: 0,
+        mdts: 0,
+        vendor_name: "(unmeasured)",
+        nand_marketing_name: "(unmeasured)",
+        msp_version: "(unmeasured)",
+        chip: 0,
+        nand_device_desc_64: 0,
+        nand_device_desc_16: 0,
+        nand_device_desc_8: 0,
+        manufacturer_id: [0; 6],
+        capacity_gb: super::storage::disk0_bytes() / 1_000_000_000,
+        geometry: [0; 18],
+    }
+}
+
+/// The controller facts in force: the device's, or the stand-in.
+pub fn controller_facts() -> ControllerFacts {
+    CONTROLLER_DEVICE_FACTS.unwrap_or_else(stand_in_controller)
+}
+
+/// The root complex's reporters' legend (`_createReporters`,
+/// 0xfffffff0066187cc), for each of apcie's ports that has a port object
+/// (its children with "apcie-port"), in port order:
+/// - its link states, an `IOStateReporter` (kIOReportCategoryPower, 4
+///   states, unit 0x0100007900000000): channel "LStPrt" and the port's
+///   character, "PCIe Port <n> Link States";
+/// - its energy, an `IOSimpleReporter` (kIOReportCategoryPower, unit
+///   0x0300007900000000): "EngyPrt" and the character, "PCIe Port <n>
+///   Energy";
+/// - its events, an `IOSimpleReporter` (kIOReportCategoryDebug, unit 0):
+///   "Ev", the event's two digits, "Prt" and the character, named by the
+///   format table at 0xfffffff007b2c888 ([`PCIE_EVENTS`]).
+/// The legend holds them as link states (group "AppleEmbeddedPCIE",
+/// subgroup "Link States"), events (group "Link Events") and energy (group
+/// "Energy Model").
+fn pcie_legend(t: &[Node], apcie: u32) -> Prop {
+    let mut ports: Vec<u32> = t[apcie as usize].children.iter().filter_map(|&c| t[c as usize].props.iter().find(|(k, _)| k == "apcie-port").and_then(|(_, v)| v.get(..4)).map(|v| u32::from_le_bytes(v.try_into().unwrap()))).collect();
+    ports.sort_unstable();
+    let ch = |i: u32| u64::from(if i < 10 { b'0' + i as u8 } else { b'a' + (i - 10) as u8 });
+    let (mut states, mut energy, mut events) = (Vec::new(), Vec::new(), Vec::new());
+    for &i in &ports {
+        states.push((0x4c53_7450_7274 << 8 | ch(i), format!("PCIe Port {i} Link States")));
+        energy.push((0x456e_6779_5072_74 << 8 | ch(i), format!("PCIe Port {i} Energy")));
+        for (j, &(title, width)) in PCIE_EVENTS.iter().enumerate() {
+            let j = j as u64;
+            let id = 0x4576 << 48 | (0x30 + j / 10) << 40 | (0x30 + j % 10) << 32 | 0x5072_7400 | ch(i);
+            let format = format!("Port %u {title}");
+            events.push((id, format!("{:<width$}", format, width = width).replacen("%u", &i.to_string(), 1)));
+        }
+    }
+    let entry = |chans: &[(u64, String)], ty, unit, group, sub| {
+        let c: Vec<(u64, &str)> = chans.iter().map(|(id, n)| (*id, n.as_str())).collect();
+        legend_entry(&c, ty, unit, group, sub)
+    };
+    Prop::Array(vec![
+        entry(&states, channel_type(2, 1 << 1, 4), 0x0100_0079_0000_0000, "AppleEmbeddedPCIE", Some("Link States")),
+        entry(&events, channel_type(1, 1 << 15, 1), 0, "Link Events", None),
+        entry(&energy, channel_type(1, 1 << 1, 1), 0x0300_0079_0000_0000, "Energy Model", None),
+    ])
+}
+
+/// The root complex's port events' names (the format table at
+/// 0xfffffff007b2c888): each "Port %u " and its title, padded with spaces
+/// to the width given.
+const PCIE_EVENTS: [(&str, usize); 62] = [
+    ("Enable Request", 40),
+    ("Enable Complete", 40),
+    ("Disable Request", 40),
+    ("Disable Complete", 40),
+    ("Disable Hardware Off", 40),
+    ("Disable LTSSM Off", 40),
+    ("Suspend Request", 40),
+    ("Suspend Complete", 40),
+    ("Suspend Hardware Off", 40),
+    ("Suspend LTSSM Off", 40),
+    ("Deep Sleep Entry", 40),
+    ("Deep Sleep Exit", 40),
+    ("Link Up", 40),
+    ("Link Up Timeout", 40),
+    ("Unexpected Link Down", 40),
+    ("PMETO Timeout", 40),
+    ("Root Port Error Interrupt", 40),
+    ("Correctable Error Interrupt", 40),
+    ("Non-fatal Error Interrupt", 40),
+    ("Fatal Error Interrupt Error", 40),
+    ("AER EP Unc Data Link Protocol Error", 43),
+    ("AER EP Unc Surprise Down Error", 43),
+    ("AER EP Unc Poisoned TLP", 43),
+    ("AER EP Unc Flow Ctrl Protocol Error", 43),
+    ("AER EP Unc Completion Timeout", 43),
+    ("AER EP Unc Completer Abort", 43),
+    ("AER EP Unc Unexpected Completion", 43),
+    ("AER EP Unc Receiver Overflow", 43),
+    ("AER EP Unc Malformed TLP", 43),
+    ("AER EP Unc ECRC Error", 43),
+    ("AER EP Unc Unsupported Request", 43),
+    ("AER EP Unc Uncorrected Internal Err", 43),
+    ("AER EP Unc Atomic OP Egress Blocked", 43),
+    ("AER EP Unc TLP Prefix Blocked Error", 43),
+    ("AER EP Cor Receiver Error", 43),
+    ("AER EP Cor Bad TLP", 43),
+    ("AER EP Cor Bad DLLP", 43),
+    ("AER EP Cor REPLAY_NUM Rollover", 43),
+    ("AER EP Cor Retry Timer Timeout", 43),
+    ("AER EP Cor Advisory Non-Fatal Error", 43),
+    ("AER EP Cor Corrected Internal Error", 43),
+    ("AER RC Unc Data Link Protocol Error", 43),
+    ("AER RC Unc Surprise Down Error", 43),
+    ("AER RC Unc Poisoned TLP", 43),
+    ("AER RC Unc Flow Ctrl Protocol Error", 43),
+    ("AER RC Unc Completion Timeout", 43),
+    ("AER RC Unc Completer Abort", 43),
+    ("AER RC Unc Unexpected Completion", 43),
+    ("AER RC Unc Receiver Overflow", 43),
+    ("AER RC Unc Malformed TLP", 43),
+    ("AER RC Unc ECRC Error", 43),
+    ("AER RC Unc Unsupported Request", 43),
+    ("AER RC Unc Uncorrected Internal Err", 43),
+    ("AER RC Unc Atomic OP Egress Blocked", 43),
+    ("AER RC Unc TLP Prefix Blocked Error", 43),
+    ("AER RC Cor Receiver Error", 43),
+    ("AER RC Cor Bad TLP", 43),
+    ("AER RC Cor Bad DLLP", 43),
+    ("AER RC Cor REPLAY_NUM Rollover", 43),
+    ("AER RC Cor Retry Timer Timeout", 43),
+    ("AER RC Cor Advisory Non-Fatal Error", 43),
+    ("AER RC Cor Corrected Internal Error", 43),
+];
 
 /// `IOReportChannelType` as `IOReporter::legendWith` stores it, a 64-bit
 /// number of its bytes: the report format, a reserved byte, the
@@ -500,10 +845,16 @@ pub fn unmeasured() -> Vec<String> {
     if FIRMWARE_EUI64.is_none() {
         gaps.push(format!("NS_02's EUI64 (stand-in 0) and that no partition scheme recognizes the firmware namespace's contents (stand-in: a leaf with no content); measure {FIRMWARE_EUI64_MEASUREMENT} and its IOMedia's Content"));
     }
+    if EFFACEABLE_EUI64.is_none() {
+        gaps.push(format!("NS_06's EUI64 (stand-in 0); measure {EFFACEABLE_EUI64_MEASUREMENT}"));
+    }
     if CONTAINER_STATUS.is_none() {
         gaps.push(format!("the AppleAPFSContainer's Status (stand-in {STAND_IN_CONTAINER_STATUS:?}; measure {CONTAINER_STATUS_MEASUREMENT})"));
     }
     gaps.push("the storage statistics count the disk nodes' requests only: the APFS container's own I/O at its start and the volumes' mounts (all 35 of its counters) is not modelled".into());
+    if CONTROLLER_DEVICE_FACTS.is_none() {
+        gaps.push(format!("the NAND controller's registers and Apple Identify area (stand-in: CAP.MQES 0xffff, VS 0, MDTS 0, its strings \"(unmeasured)\", chip S3E, no device description, manufacturer ID or geometry, capacity {} GB; measure {CONTROLLER_MEASUREMENT})", stand_in_controller().capacity_gb));
+    }
     if PCI_DEVICE_FACTS.is_none() {
         gaps.push(format!("the PCIe functions' configuration space (stand-in: the NAND controller 106b:2002, the root port 0:0, revisions 0, no subsystem IDs, PCIe capability version 2, links at 8 GT/s x1, root port subordinate bus 1; measure {PCI_MEASUREMENT})"));
     }
@@ -534,13 +885,12 @@ fn add_pci_nub(t: &mut Vec<Node>, entry: u32, bridge: u32, dt_parent: u32, locat
         ("assigned-addresses", "the BARs' addresses, the bridge's allocation over the device's sizes"),
         ("ranges", "the bridge windows, the configurator's allocation over the device's sizes"),
         ("IODeviceMemory", "the BARs' ranges, from the allocation"),
-        ("IOMapperID", "what the DART mapper and the platform's IOPCIDeviceChanged handler set, not followed"),
     ]));
     n.props = e.props.clone();
     // The entry's own table: what was set on it before (a root port's
     // port object), after its device tree properties.
     n.service_props = e.service_props.clone();
-    n.dt = Some(DtLink { parent: dt_parent, name: e.name.clone(), location: location.to_string() });
+    n.dt = Some(DtLink { parent: dt_parent, name: e.name.clone(), location: Some(location.to_string()) });
     let data32 = |v: u32| Prop::Data(v.to_le_bytes().to_vec());
     let has = |k: &str| e.props.iter().any(|(pk, _)| pk == k && pk != super::iokit::DT_UNIT_KEY) || e.service_props.iter().any(|(pk, _)| pk == k);
     let mut add: Vec<(String, Prop)> = vec![key("pcidebug", Prop::Str(pcidebug.to_string()))];
@@ -631,6 +981,8 @@ fn add_storage(t: &mut Vec<Node>, controller: Option<u32>) {
     // [`stats`]).
     let mut props = driver("com.apple.iokit.IOStorageFamily", DRIVER, "IOBlockStorageDevice", None, "IODefaultMatchCategory", 0, vec![key("IOPropertyMatch", Prop::Dict(vec![key("device-type", string("Generic"))]))]);
     props.push(key("Statistics", stats::driver(1)));
+    // Its start's PMinit, after `handleStart` publishes its medium.
+    props.push(key(super::iopower::KEY, super::iopower::joined_without_driver()));
     let drv = push(t, service(DRIVER, DRIVER, Some(ns), props, Table::Complete));
     // disk0: its content the GPT scheme's Content Mask, no leaf; its icon
     // the internal one (the namespace's Physical Interconnect Location).
@@ -638,9 +990,14 @@ fn add_storage(t: &mut Vec<Node>, controller: Option<u32>) {
     props.push(key("IOMediaIcon", Prop::Dict(vec![key("CFBundleIdentifier", string("com.apple.iokit.IOStorageFamily")), key("IOBundleResourceFile", string("Internal.icns"))])));
     props.extend(bsd_keys(Media::Whole));
     let mut whole = service(&format!("{} Media", n.model), "IOMedia", Some(drv), props, Table::Complete);
-    let dt_parent = controller.and_then(|c| t[c as usize].parent);
-    whole.dt = dt_parent.map(|p| DtLink { parent: p, name: "disk".to_string(), location: "1:0".to_string() });
+    // The media's parent in the `IODeviceTree` plane: the first provider
+    // up the plane that is in it (`acceptNewMedia`, and for a partition
+    // `attachMediaObjectToDeviceTree` through its whole disk's), the
+    // controller.
+    let dt_parent = controller;
+    whole.dt = dt_parent.map(|p| DtLink { parent: p, name: "disk".to_string(), location: Some("1:0".to_string()) });
     let whole = push(t, whole);
+    add_bsd_client(t, whole, BSD_CLIENT);
     // The GPT scheme: its personality, and the disk's GUID it publishes.
     let g = super::storage::gpt();
     let mut props = driver("com.apple.iokit.IOStorageFamily", GPT, "IOMedia", None, "IOStorage", 4000, vec![key("IOPropertyMatch", Prop::Dict(vec![key("Whole", Prop::Bool(true))])), key("Content Mask", string("GUID_partition_scheme"))]);
@@ -659,8 +1016,9 @@ fn add_storage(t: &mut Vec<Node>, controller: Option<u32>) {
     props.push(key("TierType", sym("Main")));
     props.extend(bsd_keys(Media::Partition));
     let mut part = service(PARTITION_NAME, "IOMedia", Some(gpt), props, Table::Complete);
-    part.dt = dt_parent.map(|p| DtLink { parent: p, name: "disk".to_string(), location: "1:1".to_string() });
+    part.dt = dt_parent.map(|p| DtLink { parent: p, name: "disk".to_string(), location: Some("1:1".to_string()) });
     let part = push(t, part);
+    add_bsd_client(t, part, BSD_CLIENT);
     // AppleAPFSContainerScheme: its personality, its init's statistics
     // and APFSComposited (the container's nx_fusion_uuid null,
     // 0xfffffff0066824d4).
@@ -687,6 +1045,7 @@ fn add_storage(t: &mut Vec<Node>, controller: Option<u32>) {
     props.push(key("UUID", sym(&uuid_string(&super::storage::container_uuid()))));
     props.extend(bsd_keys(Media::Container));
     let media = push(t, service(APFS_MEDIA, APFS_MEDIA, Some(scheme), props, Table::Complete));
+    add_bsd_client(t, media, APFS_MEDIA_BSD);
     // AppleAPFSContainer: its personality, then what its start sets
     // (0xfffffff00666ade4): its statistics (live, [`stats`]), then its
     // Status.
@@ -712,9 +1071,6 @@ fn add_storage(t: &mut Vec<Node>, controller: Option<u32>) {
         let vol = push(t, service(v.name, APFS_VOLUME, Some(container), props, Table::Partial(partial.to_string())));
         add_bsd_client(t, vol, APFS_VOLUME_BSD);
     }
-    add_bsd_client(t, media, APFS_MEDIA_BSD);
-    add_bsd_client(t, part, BSD_CLIENT);
-    add_bsd_client(t, whole, BSD_CLIENT);
     add_namespaces(t, controller, dt_parent);
 }
 
@@ -722,7 +1078,8 @@ fn add_storage(t: &mut Vec<Node>, controller: Option<u32>) {
 /// IOEmbeddedNVMeBlockDevice, 0xfffffff006a954d8, 0xfffffff006a95e10,
 /// 0xfffffff006a70014 and 0xfffffff006a97a20): IOBlockStorageDevice::init's
 /// device type, its unit, Identify Namespace's EUI64 and NSID, its
-/// reporters' legend, the transfer limits, Encryption, its type's key
+/// reporters' legend, the transfer limits (its type's,
+/// [`NAMESPACE_MAX_BYTES`]), Encryption, its type's key
 /// (from the table at 0xfffffff007c17c08: the root's EmbeddedDeviceTypeRoot,
 /// the firmware's EmbeddedDeviceTypeFirmware, ...) and, but on the root,
 /// autodiskmount false; its storage features (Unmap from ONCS Dataset
@@ -735,6 +1092,7 @@ fn add_storage(t: &mut Vec<Node>, controller: Option<u32>) {
 fn namespace_props(nsid: u32, eui64: u64, block: u64) -> Vec<(String, Prop)> {
     let n = super::storage::nvme();
     let ty = namespace_type(nsid);
+    let max = u64::from(NAMESPACE_MAX_BYTES[ty as usize]);
     let mut p = vec![
         key("device-type", sym("Generic")),
         key("IOUnit", num32(u64::from(nsid))),
@@ -742,15 +1100,15 @@ fn namespace_props(nsid: u32, eui64: u64, block: u64) -> Vec<(String, Prop)> {
         key("NamespaceID", num32(u64::from(nsid))),
         key("IOReportLegend", namespace_legend()),
         key("IOReportLegendPublic", Prop::Bool(true)),
-        key("IOMaximumSegmentCountRead", num32(256)),
-        key("IOMaximumSegmentCountWrite", num32(256)),
-        key("IOMaximumSegmentByteCountRead", num32(0x10_0000)),
-        key("IOMaximumSegmentByteCountWrite", num32(0x10_0000)),
+        key("IOMaximumSegmentCountRead", num32(max >> 12)),
+        key("IOMaximumSegmentCountWrite", num32(max >> 12)),
+        key("IOMaximumSegmentByteCountRead", num32(max)),
+        key("IOMaximumSegmentByteCountWrite", num32(max)),
         key("IOMinimumSegmentAlignmentByteCount", num32(4096)),
-        key("IOMaximumByteCountRead", num32(0x10_0000)),
-        key("IOMaximumByteCountWrite", num32(0x10_0000)),
-        key("IOMaximumBlockCountRead", num32(256)),
-        key("IOMaximumBlockCountWrite", num32(256)),
+        key("IOMaximumByteCountRead", num32(max)),
+        key("IOMaximumByteCountWrite", num32(max)),
+        key("IOMaximumBlockCountRead", num32(max >> 12)),
+        key("IOMaximumBlockCountWrite", num32(max >> 12)),
         key("Encryption", Prop::Bool(true)),
         key(NAMESPACE_TYPE_KEYS[ty as usize], Prop::Bool(true)),
     ];
@@ -777,6 +1135,12 @@ fn namespace_props(nsid: u32, eui64: u64, block: u64) -> Vec<(String, Prop)> {
     }
     p
 }
+
+/// The most a namespace's transfer may be, in bytes, by its type
+/// (0xfffffff007c17d38): the namespace's publishing (0xfffffff006a70014)
+/// takes it as its byte counts and a segment's size, and its 4096-byte
+/// blocks as its block and segment counts.
+const NAMESPACE_MAX_BYTES: [u32; 14] = [0, 0x10_0000, 0x10_0000, 0x1000, 0x1000, 0x2000, 0x1000, 0, 0x10_0000, 0x10_0000, 0x10_0000, 0x10_0000, 0x10_0000, 0x10_0000];
 
 /// The namespaces' types' keys (0xfffffff007c17c08), by type.
 const NAMESPACE_TYPE_KEYS: [&str; 14] = [
@@ -817,18 +1181,61 @@ pub const FIRMWARE_BLOCKS: u64 = 2048;
 /// shortcut.
 pub const FIRMWARE_EUI64: Option<u64> = None;
 
+/// The effaceable namespace's (NSID 6) Identify Namespace EUI64: the
+/// device's, once measured; zero meanwhile, a reported shortcut.
+pub const EFFACEABLE_EUI64: Option<u64> = None;
+
+/// What measures [`EFFACEABLE_EUI64`].
+pub const EFFACEABLE_EUI64_MEASUREMENT: &str = "the NamespaceUUID of NS_06 (a sysdiagnose's ioreg IOService plane)";
+
 /// What measures [`FIRMWARE_EUI64`].
 pub const FIRMWARE_EUI64_MEASUREMENT: &str = "the NamespaceUUID of NS_02 (a sysdiagnose's ioreg IOService plane)";
 
 /// The controller's objects made before its namespaces (InitializeController,
-/// 0xfffffff006a5b640, then slot 0x930, 0xfffffff006a5ecc4): its
-/// temperature sensor, an `AppleEmbeddedNVMeTemperatureSensor` (an
-/// IOHIDEventService), and its NVRAM, an `AppleEmbeddedNVMeNVRAM` on NSID 5.
-/// Neither is given a name (each is its class's) or a location. Their
-/// tables are their families': not followed.
+/// 0xfffffff006a5b640, then slot 0x930, 0xfffffff006a5ecc4), neither given
+/// a name (each is its class's) or a location:
+/// - Its temperature sensor, an `AppleEmbeddedNVMeTemperatureSensor` (an
+///   IOHIDEventService). Its init (0xfffffff006a651d0) sets QueueSize 0;
+///   AppleEmbeddedHIDEventService's `handleStart` (0xfffffff006b03430) sets
+///   Built-In (its orientation and placement are 0, so not those);
+///   `IOHIDEventService::start` (0xfffffff005aeb150) then sets its location
+///   ID ('TN0n'), vendor, vendor source, product, version and country
+///   (32-bit numbers, the controller giving none), its product name "NAND
+///   CH0 temp", its one usage pair (page 0xff00, usage 5), its report
+///   interval (0: the override 0xfffffff006b039c8) and primary usage; the
+///   controller has no Transport, Manufacturer or SerialNumber to copy. It
+///   registers (0xfffffff005aeb8c0). IOHIDFamily's personality of
+///   `IOHIDProviderPropertyMerger` on IOHIDEventService then merges its
+///   IOProviderMergeProperties into it (its probe merges them and fails):
+///   IOCFPlugInTypes, HIDServiceSupport and IOUserClientClass. No driver
+///   matches it.
+/// - Its NVRAM, an `AppleEmbeddedNVMeNVRAM` on NSID 5: its start
+///   (0xfffffff006a757fc) sets nothing and registers (0xfffffff006a75920,
+///   `IONVRAMController::registerService`). No driver matches it.
 fn add_controller_objects(t: &mut Vec<Node>, controller: u32) {
-    push(t, service(TEMP_SENSOR, TEMP_SENSOR, Some(controller), Vec::new(), Table::Partial("the HID event service's properties (IOHIDEventService and AppleEmbeddedHIDEventService), not followed".to_string())));
-    push(t, service(NVRAM, NVRAM, Some(controller), Vec::new(), Table::Partial("the NVRAM controller's properties (IONVRAMController and AppleEmbeddedNVMeNVRAM), not followed".to_string())));
+    let props = vec![
+        key("QueueSize", num32(0)),
+        key("Built-In", Prop::Bool(true)),
+        key("LocationID", num32(0x544e_306e)),
+        key("VendorID", num32(0)),
+        key("VendorIDSource", num32(0)),
+        key("ProductID", num32(0)),
+        key("VersionNumber", num32(0)),
+        key("CountryCode", num32(0)),
+        key("Product", string("NAND CH0 temp")),
+        key("DeviceUsagePairs", Prop::Array(vec![Prop::Dict(vec![key("DeviceUsagePage", num32(0xff00)), key("DeviceUsage", num32(5))])])),
+        key("ReportInterval", num32(0)),
+        key("PrimaryUsagePage", num32(0xff00)),
+        key("PrimaryUsage", num32(5)),
+        key("IOCFPlugInTypes", Prop::Dict(vec![
+            key("7DDEECA8-A7B4-11DA-8A0E-0014519758EF", string("IOHIDFamily.kext/PlugIns/IOHIDLib.plugin")),
+            key("FA12FA38-6F1A-11D4-BA0C-0005028F18D5", string("IOHIDFamily.kext/PlugIns/IOHIDLib.plugin")),
+        ])),
+        key("HIDServiceSupport", Prop::Bool(true)),
+        key("IOUserClientClass", string("IOHIDEventServiceUserClient")),
+    ];
+    push(t, service(TEMP_SENSOR, TEMP_SENSOR, Some(controller), props, Table::Complete));
+    push(t, service(NVRAM, NVRAM, Some(controller), Vec::new(), Table::Complete));
 }
 
 /// The namespaces after the root (`AllocateNodes`, 0xfffffff006a5e35c,
@@ -858,21 +1265,38 @@ fn add_namespaces(t: &mut Vec<Node>, controller: Option<u32>, dt_parent: Option<
     let ns = push(t, service("NS_02", BLOCK_DEVICE, Some(c), namespace_props(2, eui, block), Table::Complete));
     let mut props = driver("com.apple.iokit.IOStorageFamily", DRIVER, "IOBlockStorageDevice", None, "IODefaultMatchCategory", 0, vec![key("IOPropertyMatch", Prop::Dict(vec![key("device-type", string("Generic"))]))]);
     props.push(key("Statistics", stats::driver(2)));
+    props.push(key(super::iopower::KEY, super::iopower::joined_without_driver()));
     let drv = push(t, service(DRIVER, DRIVER, Some(ns), props, Table::Complete));
     let mut props = medium("", "", true, block, FIRMWARE_BLOCKS * block, true, super::storage::disk_writable());
     props.push(key("IOMediaIcon", Prop::Dict(vec![key("CFBundleIdentifier", string("com.apple.iokit.IOStorageFamily")), key("IOBundleResourceFile", string("Internal.icns"))])));
     props.extend(bsd_keys(Media::Firmware));
     let mut whole = service(&format!("{} Media", n.model), "IOMedia", Some(drv), props, Table::Complete);
-    whole.dt = dt_parent.map(|p| DtLink { parent: p, name: "disk".to_string(), location: "2:0".to_string() });
+    whole.dt = dt_parent.map(|p| DtLink { parent: p, name: "disk".to_string(), location: Some("2:0".to_string()) });
     let whole = push(t, whole);
     add_bsd_client(t, whole, BSD_CLIENT);
-    let diag = push(t, service(DIAGNOSTICS, DIAGNOSTICS, Some(c), Vec::new(), Table::Partial("the diagnostics access's properties (AppleNANDConfigAccess and AppleEmbeddedNVMeDiagnostics), not followed".to_string())));
+    // Diagnostics' start (0xfffffff006a713b8) and its driver's
+    // (0xfffffff006c7b2cc) set nothing; both register (0xfffffff006a71504,
+    // 0xfffffff006c7b474).
+    let diag = push(t, service(DIAGNOSTICS, DIAGNOSTICS, Some(c), Vec::new(), Table::Complete));
     let props = driver("com.apple.driver.AppleDiagnosticDataAccessReadOnly", DIAG_DRIVER, "AppleNANDConfigAccess", None, "AppleDiagnosticDataAccess", 99, Vec::new());
-    push(t, service(DIAG_DRIVER, DIAG_DRIVER, Some(diag), props, Table::Partial("what AppleDiagnosticDataAccessReadOnly's start sets, not followed".to_string())));
-    let eff = push(t, service("NS_06", EFFACEABLE, Some(c), namespace_props(6, 0, block), Table::Partial("what IONVMeEffaceableDevice adds to or changes of IOEmbeddedNVMeBlockDevice's properties, and NSID 6's EUI64, not followed".to_string())));
+    push(t, service(DIAG_DRIVER, DIAG_DRIVER, Some(diag), props, Table::Complete));
+    // NS_06: IONVMeEffaceableDevice overrides the strings the namespace's
+    // Device Characteristics take (its vtable 0xfffffff006fa4380): vendor
+    // "Apple", product "Effaceable", revision "unknown revision".
+    let mut props = namespace_props(6, EFFACEABLE_EUI64.unwrap_or(0), block);
+    if let Some((_, Prop::Dict(d))) = props.iter_mut().find(|(k, _)| k == "Device Characteristics") {
+        for (k, v) in [("Vendor Name", "Apple"), ("Product Name", "Effaceable"), ("Product Revision Level", "unknown revision")] {
+            set(d, k, string(v));
+        }
+    }
+    let eff = push(t, service("NS_06", EFFACEABLE, Some(c), props, Table::Complete));
+    // AppleEffaceableBlockDevice's start (AppleEffaceableStorage's,
+    // 0xfffffff006586900) sets nothing and registers (0xfffffff006586ab4).
     let props = driver("com.apple.driver.AppleEffaceableBlockDevice", EFFACEABLE_DRIVER, EFFACEABLE, None, "IODefaultMatchCategory", 0, Vec::new());
-    push(t, service(EFFACEABLE_DRIVER, EFFACEABLE_DRIVER, Some(eff), props, Table::Partial("what AppleEffaceableBlockDevice's start sets, not followed".to_string())));
-    push(t, service("NS_07", NAMESPACE_DEVICE, Some(c), Vec::new(), Table::Partial("the panic log namespace's properties (AppleNVMeNamespaceDevice), not followed".to_string())));
+    push(t, service(EFFACEABLE_DRIVER, EFFACEABLE_DRIVER, Some(eff), props, Table::Complete));
+    // NS_07's start (0xfffffff006a7d5c4) names it, sets its type's key
+    // (0xfffffff006a7d8a0, the panic log's) and registers.
+    push(t, service("NS_07", NAMESPACE_DEVICE, Some(c), vec![key(NAMESPACE_TYPE_KEYS[namespace_type(7) as usize], Prop::Bool(true))], Table::Complete));
 }
 
 /// The namespace's IOStorageFeatures, a dictionary of three booleans in
@@ -920,7 +1344,7 @@ fn add_bsd_client(t: &mut Vec<Node>, medium: u32, class: &'static str) {
 pub fn registers(class: &str) -> Option<bool> {
     match class {
         GPT | APFS_SCHEME => Some(false),
-        T8011_PCIE | PCI_DEVICE | HOST_BRIDGE | CONTROLLER | BLOCK_DEVICE | EFFACEABLE | DRIVER | "IOMedia" | BSD_CLIENT | APFS_MEDIA | APFS_CONTAINER | APFS_VOLUME | APFS_MEDIA_BSD | APFS_VOLUME_BSD | DIAGNOSTICS | NAMESPACE_DEVICE => Some(true),
+        T8011_PCIE | PCI_DEVICE | HOST_BRIDGE | CONTROLLER | BLOCK_DEVICE | EFFACEABLE | DRIVER | "IOMedia" | BSD_CLIENT | APFS_MEDIA | APFS_CONTAINER | APFS_VOLUME | APFS_MEDIA_BSD | APFS_VOLUME_BSD | DIAGNOSTICS | NAMESPACE_DEVICE | TEMP_SENSOR | NVRAM | DIAG_DRIVER | EFFACEABLE_DRIVER => Some(true),
         _ => None,
     }
 }
@@ -932,7 +1356,7 @@ pub fn registers(class: &str) -> Option<bool> {
 /// answer rests on flags at +0xb0 not traced).
 pub fn property_override(t: &[Node], i: u32, name: &str) -> Option<String> {
     let n = t.get(i as usize)?;
-    if name == "WriteCacheState" && superclasses(n.class).contains(&"IOBlockStorageDevice") {
+    if name == "WriteCacheState" && superclasses(n.class).contains(&"IOBlockStorageDevice") && n.class != EFFACEABLE {
         return Some(format!("{}'s WriteCacheState (getWriteCacheState, from flags not traced)", n.name));
     }
     None
@@ -975,7 +1399,7 @@ pub fn location(n: &Node) -> Option<String> {
         APFS_VOLUME => super::storage::VOLUMES.iter().find(|v| v.name == n.name).map(|v| (v.index + 1).to_string()),
         "IOMedia" if n.name == PARTITION_NAME => Some("1".to_string()),
         BLOCK_DEVICE | EFFACEABLE => n.name.strip_prefix("NS_").and_then(|d| d.parse::<u32>().ok()).map(|nsid| format!("{nsid:x}")),
-        PCI_DEVICE => n.dt.as_ref().map(|d| d.location.clone()),
+        PCI_DEVICE => n.dt.as_ref().and_then(|d| d.location.clone()),
         _ => None,
     }
 }
@@ -989,12 +1413,23 @@ fn media_of(n: &Node) -> Option<Media> {
     super::storage::media_by_name(name).map(|(m, _)| m)
 }
 
+/// The medium a storage entry is: an `IOMedia` with BSD nodes.
+pub fn medium_of(n: &Node) -> Option<Media> {
+    superclasses(n.class).contains(&"IOMedia").then(|| media_of(n)).flatten()
+}
+
 /// A storage driver's live Statistics ([`stats`]), and a medium's live
 /// "Open": `IOMedia::handleOpen` sets it once it holds its
 /// provider open at some level and `handleClose` clears it once it holds
 /// none ([`super::dkopen`]'s levels).
 pub fn live_prop(t: &[Node], i: u32, name: &str) -> Option<Prop> {
     let n = t.get(i as usize)?;
+    // The effaceable namespace's getWriteCacheState (0xfffffff006a709f0)
+    // answers success without writing, and IOBlockStorageDevice's
+    // getProperty override (0xfffffff00596ee88) starts from false.
+    if name == "WriteCacheState" && n.class == EFFACEABLE {
+        return Some(Prop::Bool(false));
+    }
     if name == "Statistics" {
         return match n.class {
             DRIVER => stats::namespace_of(t, i).map(stats::driver),

@@ -28,17 +28,23 @@ pub struct Node {
     pub dt: Option<DtLink>,
     /// What the service's property table has of the device's.
     pub table: Table,
+    /// Its parent in the power plane ([`super::iopower`]): a joined
+    /// service's connection, a connection's parent, or the registry's root
+    /// for the power plane's root ([`super::iopower::TO_REGISTRY_ROOT`]).
+    pub power: Option<u32>,
 }
 
 /// A service's link in the `IODeviceTree` plane (`attachToParent(parent,
 /// gIODTPlane)`): its parent there, and the name and location it was given
 /// in that plane (`setName`/`setLocation` with the plane, which key its
-/// registry table by the plane's `pathNameKey` and `pathLocationKey`).
+/// registry table by the plane's `pathNameKey` and `pathLocationKey`); a
+/// service given none there has its own (`getName(plane)` and
+/// `getLocation(plane)` fall back to them).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DtLink {
     pub parent: u32,
     pub name: String,
-    pub location: String,
+    pub location: Option<String>,
 }
 
 /// What a service's property table has of the device's.
@@ -88,6 +94,7 @@ pub fn superclasses(class: &str) -> &'static [&'static str] {
         "IOUserClient" => &["IOUserClient", "IOService", "IORegistryEntry"],
         "AppleAPFSUserClient" => &["AppleAPFSUserClient", "IOUserClient", "IOService", "IORegistryEntry"],
         "IOSurfaceRoot" | "IOSurfaceRootUserClient" => super::iosurface::superclasses(class),
+        super::iopower::ROOT_DOMAIN | super::iopower::ROOT_PARENT | super::iopower::CONNECTION => super::iopower::superclasses(class),
         super::iomfb::CLASS | super::iomfb::UC_CLASS => super::iomfb::superclasses(class),
         _ => match super::platform::superclasses(class) {
             [] => super::accel::superclasses(class),
@@ -118,7 +125,7 @@ pub fn parse(b: &[u8]) -> Result<Vec<Node>, String> {
         let name = props.iter().find(|(k, _)| k == "name").map_or(String::new(), |(_, v)| String::from_utf8_lossy(&v[..v.iter().position(|&c| c == 0).unwrap_or(v.len())]).into_owned());
         let id = out.len() as u32;
         let kernel_only = props.iter().any(|(k, _)| k == "kernel-only");
-        out.push(Node { name, props, class: "", service_props: Vec::new(), parent, children: Vec::new(), kernel_only, nub: None, dt: None, table: Table::Drivers });
+        out.push(Node { name, props, class: "", service_props: Vec::new(), parent, children: Vec::new(), kernel_only, nub: None, dt: None, table: Table::Drivers, power: None });
         for _ in 0..nchildren {
             let c = node(b, at, Some(id), out)?;
             out[id as usize].children.push(c);
@@ -132,11 +139,23 @@ pub fn parse(b: &[u8]) -> Result<Vec<Node>, String> {
 }
 
 /// Install the device tree the boot payload carries, and the services
-/// published over it: the platform's, the GPU's, the display's and the
-/// storage's ([`super::storagestack`]).
+/// published over it ([`build`]).
 pub fn set_tree(b: &[u8]) -> Result<(), String> {
+    let t = build(b)?;
+    let _ = TREE.set(t);
+    Ok(())
+}
+
+/// The registry over the device tree `b` (with what `IODeviceTreeAlloc`
+/// derives, [`super::iodt::alloc`]): the platform's services, the
+/// root power domain ([`super::iopower`]), the GPU's, the display's and
+/// the storage's ([`super::storagestack`]), the resources nub and
+/// IOSurfaceRoot, the power plane's links, and the registry's root.
+pub fn build(b: &[u8]) -> Result<Vec<Node>, String> {
     let mut t = parse(b)?;
+    super::iodt::alloc(&mut t)?;
     let io = super::platform::add(&mut t);
+    let rd = t.iter().position(|n| n.class == super::platform::PE).map(|pe| super::iopower::add(&mut t, pe as u32));
     if let Some(io) = io {
         if let Some(gpu) = super::platform::arm_io_nub(&mut t, io, "gpu,t8011") {
             super::accel::add_service(&mut t, gpu);
@@ -148,15 +167,17 @@ pub fn set_tree(b: &[u8]) -> Result<(), String> {
     super::storagestack::add(&mut t, io);
     let resources = super::platform::add_resources(&mut t);
     super::iosurface::add_service(&mut t, resources);
+    if let Some(rd) = rd {
+        super::iopower::join_services(&mut t, rd);
+    }
     add_root(&mut t);
-    let _ = TREE.set(t);
-    Ok(())
+    Ok(t)
 }
 
 /// `IORegistryEntry::initialize`: the registry's root, "Root"; the device
 /// tree hangs from it in the `IODeviceTree` plane.
 fn add_root(t: &mut Vec<Node>) {
-    t.push(Node { name: "Root".to_string(), props: Vec::new(), class: "IORegistryEntry", service_props: Vec::new(), parent: None, children: vec![0], kernel_only: false, nub: None, dt: None, table: Table::Drivers });
+    t.push(Node { name: "Root".to_string(), props: Vec::new(), class: "IORegistryEntry", service_props: Vec::new(), parent: None, children: vec![0], kernel_only: false, nub: None, dt: None, table: Table::Drivers, power: None });
 }
 
 /// Whether the kernel sets the root entry's property `name`: the planes
@@ -182,15 +203,17 @@ pub fn root() -> Option<u32> {
 pub enum Plane {
     Service,
     DeviceTree,
+    Power,
 }
 
-/// The plane of a name; `Err` for one whose links are not here: the power
-/// plane, and the planes families make (and a name that is none, which
-/// xnu answers as no plane).
+/// The plane of a name; `Err` for one whose links are not here: the planes
+/// families make (and a name that is none, which xnu answers as no
+/// plane).
 pub fn plane(name: &[u8]) -> Result<Plane, String> {
     match name {
         b"IOService" => Ok(Plane::Service),
         b"IODeviceTree" => Ok(Plane::DeviceTree),
+        b"IOPower" => Ok(Plane::Power),
         _ => Err(format!("the {} plane", String::from_utf8_lossy(name))),
     }
 }
@@ -207,6 +230,7 @@ pub fn links(t: &[Node], i: u32, plane: Plane, parents: bool) -> Result<Vec<u32>
     let root = t.len() as u32 - 1;
     if i == root {
         return match (plane, parents) {
+            (Plane::Power, _) => super::iopower::links(t, i, parents),
             (_, true) => Ok(Vec::new()),
             (Plane::DeviceTree, false) => Ok(n.children.clone()),
             (Plane::Service, false) => Err("the registry root's children in the IOService plane (IOResources, IOUserResources and the platform)".to_string()),
@@ -217,6 +241,7 @@ pub fn links(t: &[Node], i: u32, plane: Plane, parents: bool) -> Result<Vec<u32>
     let dt_children = || t.iter().enumerate().filter(|(_, c)| c.dt.as_ref().is_some_and(|d| d.parent == i)).map(|(c, _)| c as u32);
     if n.class.is_empty() {
         return match (plane, parents) {
+            (Plane::Power, _) => super::iopower::links(t, i, parents),
             (Plane::DeviceTree, true) => Ok(vec![n.parent.unwrap_or(root)]),
             (Plane::DeviceTree, false) => Ok(n.children.iter().copied().chain(dt_children()).collect()),
             (Plane::Service, true) => provider(t, i).map(|p| p.into_iter().collect()),
@@ -226,6 +251,7 @@ pub fn links(t: &[Node], i: u32, plane: Plane, parents: bool) -> Result<Vec<u32>
         };
     }
     match (plane, parents) {
+        (Plane::Power, _) => super::iopower::links(t, i, parents),
         (Plane::DeviceTree, true) => Ok(n.dt.iter().map(|d| d.parent).collect()),
         (Plane::DeviceTree, false) => Ok(dt_children().collect()),
         (Plane::Service, true) => provider(t, i).map(|p| p.into_iter().collect()),
@@ -260,6 +286,10 @@ pub fn provider(t: &[Node], i: u32) -> Result<Option<u32>, String> {
     }
     if n.class == super::platform::RESOURCES {
         return Ok(Some(root));
+    }
+    // A power connection is in the power plane only.
+    if n.class == super::iopower::CONNECTION {
+        return Ok(None);
     }
     n.parent.map(Some).ok_or_else(|| format!("the provider of {} (the storage controller)", n.name))
 }
@@ -350,7 +380,9 @@ pub fn properties(t: &[Node], i: u32) -> Vec<(String, Prop)> {
 ///   the kernelcache's one writer of the key (0xfffffff006442440, in
 ///   IOSCSIArchitectureModelFamily) puts it in a dictionary its device
 ///   holds, not in a property table, and APFS (0xfffffff00666edf8) only
-///   reads it. On the display's framebuffer and its nub, so are
+///   reads it. Nor has a device tree entry, nub or not, a name,
+///   compatible, device_type or model beyond its device tree's
+///   ([`DT_NAME_KEYS`]). On the display's framebuffer and its nub, so are
 ///   the names no driver sets there ([`super::iomfb::property_absent`]).
 pub fn property_unknown(t: &[Node], i: u32, name: &str) -> bool {
     let Some(n) = t.get(i as usize) else { return false };
@@ -368,6 +400,9 @@ pub fn property_unknown(t: &[Node], i: u32, name: &str) -> bool {
     }
     if n.class == super::platform::RESOURCES {
         return true;
+    }
+    if n.class.is_empty() && DT_NAME_KEYS.contains(&name) {
+        return false;
     }
     if n.class.is_empty() && n.nub.is_none() && i != 0 || n.class == super::iosurface::CLASS {
         return false;
@@ -415,7 +450,7 @@ pub fn service_prop<'a>(n: &'a Node, name: &str) -> Option<&'a Prop> {
 /// ([`property_unknown`]).
 pub fn lookup(t: &[Node], i: u32, name: &str) -> Result<Option<Vec<u8>>, String> {
     let Some(node) = t.get(i as usize) else { return Ok(None) };
-    if let Some(what) = super::storagestack::property_override(t, i, name) {
+    if let Some(what) = super::storagestack::property_override(t, i, name).or_else(|| super::platform::property_override(t, i, name)) {
         return Err(what);
     }
     if let Some(p) = live_prop(t, i, name) {
@@ -473,6 +508,15 @@ pub fn conforms(t: &[Node], i: u32, class: &str) -> Result<bool, String> {
     }
 }
 
+/// The device tree properties `IODTCompareNubName` compares a nub's names
+/// by. No driver sets them on a device tree entry: of the kernelcache's
+/// references to these names, those that set or remove a property set
+/// a PCI nub's table (IOPCIFamily, 0xfffffff0064d8834 and
+/// 0xfffffff0064d88bc), AppleSPU's or the disk image driver's own objects
+/// (0xfffffff005b636cc, 0xfffffff005b6a9a8, 0xfffffff005f35810), or a
+/// dictionary's entry; the kernel only reads them.
+pub const DT_NAME_KEYS: [&str; 4] = ["name", "compatible", "device_type", "model"];
+
 /// The device tree property `IODeviceTreeAlloc` makes an entry's location
 /// and takes out of its table (`MakeReferenceTable`).
 pub const DT_UNIT_KEY: &str = "AAPL,unit-string";
@@ -508,7 +552,7 @@ pub fn location(n: &Node) -> Option<String> {
 /// in that plane, else its own ([`location`]).
 pub fn location_in(n: &Node, plane: Option<Plane>) -> Option<String> {
     match (&n.dt, plane) {
-        (Some(d), Some(Plane::DeviceTree)) => Some(d.location.clone()),
+        (Some(d), Some(Plane::DeviceTree)) => d.location.clone().or_else(|| location(n)),
         _ => location(n),
     }
 }
@@ -1513,10 +1557,13 @@ mod tests {
         let classes: Vec<&str> = up.iter().map(|&i| t[i as usize].class).collect();
         assert_eq!(classes, ["AppleAPFSMedia", "AppleAPFSContainerScheme", "IOMedia", "IOGUIDPartitionScheme", "IOMedia", "IOBlockStorageDriver", "IOEmbeddedNVMeBlockDevice"]);
         assert!(provider(&t, *up.last().unwrap()).is_err());
-        // Each medium's children: its storage driver, then its BSD client.
+        // Each medium's children: its BSD client (its category started
+        // first), then its storage driver.
         let disk0 = up[4];
         let kids: Vec<&str> = links(&t, disk0, Plane::Service, false).unwrap().iter().map(|&i| t[i as usize].class).collect();
-        assert_eq!(kids, ["IOGUIDPartitionScheme", "IOMediaBSDClient"]);
+        assert_eq!(kids, ["IOMediaBSDClient", "IOGUIDPartitionScheme"]);
+        let kids: Vec<&str> = links(&t, media, Plane::Service, false).unwrap().iter().map(|&i| t[i as usize].class).collect();
+        assert_eq!(kids, ["AppleAPFSMediaBSDClient", "AppleAPFSContainer"]);
         // A recursive search up the parents finds the namespace's
         // characteristics.
         let (found, refused) = search(&t, media, Plane::Service, 3, "Protocol Characteristics", |_| true).unwrap();
@@ -1575,7 +1622,7 @@ mod tests {
         node(&mut b, "device-tree", &[("compatible", b"J120AP\0iPad7,1\0AppleARM\0")], 1);
         node(&mut b, "arm-io", &[("compatible", b"arm-io,t8011\0")], 1);
         node(&mut b, "apcie", &[("compatible", b"apcie,t8011\0"), ("#address-cells", &3u32.to_le_bytes())], 1);
-        node(&mut b, "pci-bridge0", &[("compatible", b"apcie-bridge\0"), ("AAPL,unit-string", b"00000000"), ("#address-cells", &1u32.to_le_bytes()), ("#size-cells", &0u32.to_le_bytes())], 1);
+        node(&mut b, "pci-bridge0", &[("compatible", b"apcie-bridge\0"), ("AAPL,unit-string", b"00000000"), ("#address-cells", &1u32.to_le_bytes()), ("#size-cells", &0u32.to_le_bytes()), ("apcie-port", &0u32.to_le_bytes())], 1);
         node(&mut b, "s3e", &[("AAPL,unit-string", b"00000000"), ("reg", &0x10u32.to_le_bytes())], 0);
         let mut t = parse(&b).unwrap();
         let io = super::super::platform::add(&mut t).unwrap();
@@ -1604,12 +1651,34 @@ mod tests {
         assert_eq!(super::super::storagestack::pci_config(&t, s3e, 0x08), Ok(0x0180_0200));
         // The DT plane keeps the configured flag on apcie.
         assert_eq!(p(2, "IOPCIConfigured"), Some(Prop::Bool(true)));
+        // The DART's keys are s3e's alone (it has an iommu-parent); the
+        // mapper's ID is the mapper's. The root's clock is the bus clock.
+        assert!(lookup(&t, s3e, "IOPCIDeviceMapperPageSize").is_err());
+        assert_eq!((lookup(&t, port, "IOPCIDeviceMapperPageSize"), lookup(&t, port, "IOMapperID")), (Ok(None), Ok(None)));
+        assert!(lookup(&t, 0, "clock-frequency").is_err());
+        // The root complex's legend: link states, events, energy, for
+        // port 0.
+        let rc = t.iter().position(|n| n.class == "AppleT8011PCIe").unwrap() as u32;
+        let Some(Prop::Array(legend)) = p(rc, "IOReportLegend") else { panic!("no legend") };
+        let chans = |e: &Prop| match e {
+            Prop::Dict(d) => match &d[0].1 {
+                Prop::Array(c) => c.clone(),
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+        assert_eq!(legend.len(), 3);
+        assert_eq!(chans(&legend[0]), vec![Prop::Array(vec![Prop::Num(0x004c_5374_5072_7430, 64), Prop::Num(0x0004_0002_0002, 64), Prop::Sym("PCIe Port 0 Link States".to_string())])]);
+        let events = chans(&legend[1]);
+        assert_eq!(events.len(), 62);
+        assert_eq!(events[0], Prop::Array(vec![Prop::Num(0x4576_3030_5072_7430, 64), Prop::Num(0x0001_8000_0001, 64), Prop::Sym(format!("{:<39}", "Port 0 Enable Request"))]));
     }
 
     #[test]
     fn the_controller_has_every_namespace() {
         let mut b = Vec::new();
-        node(&mut b, "device-tree", &[("compatible", b"J120AP\0iPad7,1\0AppleARM\0")], 1);
+        node(&mut b, "device-tree", &[("compatible", b"J120AP\0iPad7,1\0AppleARM\0")], 2);
+        node(&mut b, "product", &[("artwork-device-idiom", b"pad\0")], 0);
         node(&mut b, "arm-io", &[("compatible", b"arm-io,t8011\0")], 1);
         node(&mut b, "apcie", &[("compatible", b"apcie,t8011\0")], 1);
         node(&mut b, "pci-bridge0", &[("compatible", b"apcie-bridge\0"), ("AAPL,unit-string", b"00000000")], 1);
@@ -1632,7 +1701,10 @@ mod tests {
         let disk = t.iter().position(|n| n.service_props.iter().any(|(k, v)| k == "BSD Name" && *v == Prop::Sym(fw.clone()))).unwrap() as u32;
         assert_eq!(p(disk, "Size"), Some(Prop::Num(8 << 20, 64)));
         assert_eq!(p(disk, "Leaf"), Some(Prop::Bool(true)));
-        assert_eq!(t[disk as usize].dt.as_ref().map(|d| d.location.as_str()), Some("2:0"));
+        assert_eq!(t[disk as usize].dt.as_ref().and_then(|d| d.location.as_deref()), Some("2:0"));
+        assert_eq!(t[disk as usize].dt.as_ref().map(|d| d.parent), Some(ctl));
+        assert_eq!(t[ctl as usize].dt.as_ref().map(|d| t[d.parent as usize].class), Some(super::super::storagestack::PCI_DEVICE));
+        assert_eq!(location_in(&t[ctl as usize], Some(Plane::DeviceTree)), None);
         // NS_06 has AppleEffaceableBlockDevice and no medium.
         let ns6 = t.iter().position(|n| n.name == "NS_06").unwrap() as u32;
         let below: Vec<&str> = links(&t, ns6, Plane::Service, false).unwrap().iter().map(|&k| t[k as usize].class).collect();
@@ -1640,6 +1712,157 @@ mod tests {
         // The controller's legend and its PCI match's score.
         assert_eq!(p(ctl, "IOProbeScore"), Some(Prop::Num(1000, 32)));
         assert!(matches!(p(ctl, "IOReportLegend"), Some(Prop::Array(a)) if a.len() == 1));
+        // What its start sets, in its order, after the personality's.
+        let keys: Vec<String> = t[ctl as usize].service_props.iter().map(|(k, _)| k.clone()).skip_while(|k| k != "IOCommandPoolSize").collect();
+        assert_eq!(keys, ["IOCommandPoolSize", "NVMe Revision Supported", "IOPlatformPanicAction", "IOReportLegend", "IOReportLegendPublic", "IOPolledInterface", "IOMaximumSegmentByteCountRead", "IOMaximumSegmentByteCountWrite", "IOMaximumSegmentCountRead", "IOMaximumSegmentCountWrite", "IOMaximumByteCountRead", "IOMaximumByteCountWrite", "IOMinimumSegmentAlignmentByteCount", "Controller Characteristics", "Serial Number", "Model Number", "Firmware Revision", "IOPowerManagement", "IOMaximumSwapWrite", "AppleNANDStatus"]);
+        assert_eq!(p(ctl, "IOMaximumSegmentByteCountRead"), Some(Prop::Num(4096, 64)));
+        assert_eq!(p(ctl, "IOMaximumByteCountRead"), Some(Prop::Num(0x10_0000, 32)));
+        // A 64 GB pad's swap write limit, 1 GiB.
+        assert_eq!(p(ctl, "IOMaximumSwapWrite"), Some(Prop::Num(0x4000_0000, 64)));
+        assert!(matches!(p(ctl, "Controller Characteristics"), Some(Prop::Dict(d)) if d.len() == 32 && d[0] == ("Preferred IO Size".to_string(), Prop::Num(0x10_0000, 32))));
+        assert_eq!(p(ctl, "IOPowerManagement"), Some(super::super::iopower::nvme_controller()));
+        // NS_06's transfers are of its type's 4 KiB at most.
+        assert_eq!(p(ns6, "IOMaximumByteCountRead"), Some(Prop::Num(4096, 32)));
+        assert_eq!(p(ns6, "IOMaximumSegmentCountRead"), Some(Prop::Num(1, 32)));
+    }
+
+    #[test]
+    fn matching_gives_the_storage_in_its_registration_order() {
+        use super::super::osserialize::{Graph, Obj};
+        let mut b = Vec::new();
+        node(&mut b, "device-tree", &[("compatible", b"J120AP\0iPad7,1\0AppleARM\0")], 1);
+        node(&mut b, "arm-io", &[("compatible", b"arm-io,t8011\0")], 1);
+        node(&mut b, "apcie", &[("compatible", b"apcie,t8011\0")], 1);
+        node(&mut b, "pci-bridge0", &[("compatible", b"apcie-bridge\0"), ("AAPL,unit-string", b"00000000")], 1);
+        node(&mut b, "s3e", &[("AAPL,unit-string", b"00000000")], 0);
+        let mut t = parse(&b).unwrap();
+        let io = super::super::platform::add(&mut t).unwrap();
+        super::super::storagestack::add(&mut t, Some(io));
+        super::super::platform::add_resources(&mut t);
+        add_root(&mut t);
+        let by_class = |class: &str| {
+            let mut g = Graph::default();
+            let d = g.add(Obj::Dict(Vec::new()));
+            let v = g.add(Obj::String(class.as_bytes().to_vec()));
+            g.dict_set(d, b"IOProviderClass", v);
+            super::super::iomatch::existing(&t, &g, d, false).unwrap()
+        };
+        let media_order = super::super::storage::media_order().to_vec();
+        // The media, and their BSD clients, in the order the media order's
+        // stand-in states.
+        let media: Vec<_> = by_class("IOMedia").iter().map(|&i| super::super::storagestack::medium_of(&t[i as usize]).unwrap()).collect();
+        assert_eq!(media, media_order);
+        let clients: Vec<_> = by_class("IOMediaBSDClient").iter().map(|&i| super::super::storagestack::medium_of(&t[t[i as usize].parent.unwrap() as usize]).unwrap()).collect();
+        assert_eq!(clients, media_order);
+        // The bridges: the root complex's set before the root port's.
+        let order = super::super::iomatch::registration_order(&t);
+        let at = |class: &str| order.iter().position(|&i| t[i as usize].class == class).unwrap();
+        assert!(at("AppleT8011PCIe") < at("ApplePCIEHostBridge"));
+        // The platform expert device first; each nub before what matched
+        // on it.
+        assert_eq!(order[0], 0);
+        assert!(at("IOPCIDevice") < at("ApplePCIEHostBridge"));
+        assert!(at("AppleAPFSVolume") < at("AppleAPFSContainer"));
+    }
+
+    #[test]
+    fn the_power_plane_runs_from_the_root_parent_to_the_storage() {
+        let mut b = Vec::new();
+        node(&mut b, "device-tree", &[("compatible", b"J120AP\0iPad7,1\0AppleARM\0")], 1);
+        node(&mut b, "arm-io", &[("compatible", b"arm-io,t8011\0")], 1);
+        node(&mut b, "apcie", &[("compatible", b"apcie,t8011\0")], 1);
+        node(&mut b, "pci-bridge0", &[("compatible", b"apcie-bridge\0"), ("AAPL,unit-string", b"00000000")], 1);
+        node(&mut b, "s3e", &[("AAPL,unit-string", b"00000000")], 0);
+        let t = build(&b).unwrap();
+        let root = t.len() as u32 - 1;
+        let class = |i: u32| t[i as usize].class;
+        let down = |i: u32| links(&t, i, Plane::Power, false);
+        // Root, IORootParent, a connection, the root domain.
+        let rp = down(root).unwrap();
+        assert_eq!(rp.len(), 1);
+        assert_eq!(class(rp[0]), super::super::iopower::ROOT_PARENT);
+        let c = down(rp[0]).unwrap();
+        assert_eq!(c.iter().map(|&i| class(i)).collect::<Vec<_>>(), [super::super::iopower::CONNECTION]);
+        let rd = down(c[0]).unwrap()[0];
+        assert_eq!(class(rd), super::super::iopower::ROOT_DOMAIN);
+        assert_eq!(links(&t, rd, Plane::Power, true), Ok(c.clone()));
+        assert_eq!(links(&t, c[0], Plane::Power, true), Ok(vec![rp[0]]));
+        assert_eq!(links(&t, rp[0], Plane::Power, true), Ok(vec![root]));
+        // The root domain's other children are not here.
+        assert!(down(rd).is_err());
+        // Up from NS_01's storage driver: the controller, s3e, IOPP,
+        // pci-bridge0, the root complex, the root domain.
+        let drv = t.iter().position(|n| n.class == "IOBlockStorageDriver").unwrap() as u32;
+        let mut up = vec![drv];
+        while let Ok(p) = links(&t, *up.last().unwrap(), Plane::Power, true) {
+            let Some(&p) = p.first() else { break };
+            up.push(p);
+        }
+        let services: Vec<&str> = up.iter().map(|&i| class(i)).filter(|c| *c != super::super::iopower::CONNECTION).collect();
+        assert_eq!(services, ["IOBlockStorageDriver", "AppleEmbeddedNVMeController", "IOPCIDevice", "ApplePCIEHostBridge", "IOPCIDevice", "AppleT8011PCIe", "IOPMrootDomain", "IORootParent", "IORegistryEntry"]);
+        // The controller's power children: both storage drivers.
+        let ctl = t.iter().position(|n| n.class == "AppleEmbeddedNVMeController").unwrap() as u32;
+        let kids: Vec<u32> = down(ctl).unwrap().iter().flat_map(|&c| down(c).unwrap()).collect();
+        assert_eq!(kids.iter().map(|&i| class(i)).collect::<Vec<_>>(), ["IOBlockStorageDriver", "IOBlockStorageDriver"]);
+        // Nothing else of the storage is in the plane; a connection is in
+        // no other plane.
+        let ns = t.iter().position(|n| n.name == "NS_01").unwrap() as u32;
+        assert_eq!(links(&t, ns, Plane::Power, true), Ok(vec![]));
+        assert_eq!(provider(&t, c[0]), Ok(None));
+        // The dictionaries.
+        let pm = |i: u32| lookup(&t, i, "IOPowerManagement");
+        assert_eq!(pm(rd), Ok(Some(serialize_prop(&super::super::iopower::root_domain()))));
+        assert_eq!(pm(drv), Ok(Some(serialize_prop(&super::super::iopower::joined_without_driver()))));
+        assert!(pm(rp[0]).is_err());
+        assert_eq!(pm(ns), Ok(None));
+        let io = t.iter().position(|n| n.class == "AppleT8011IO").unwrap() as u32;
+        assert_eq!(pm(io), Ok(Some(serialize_prop(&super::super::iopower::clamped_without_driver()))));
+        // The root domain is the platform expert's child and registered.
+        assert_eq!(provider(&t, rd).map(|p| p.map(class)), Ok(Some("AppleARMPE")));
+        assert_eq!(super::super::iomatch::registration_order(&t).iter().filter(|&&i| class(i) == "IOPMrootDomain").count(), 1);
+    }
+
+    #[test]
+    fn the_controllers_other_children_register_with_their_tables() {
+        use super::super::osserialize::{Graph, Obj};
+        let mut b = Vec::new();
+        node(&mut b, "device-tree", &[("compatible", b"J120AP\0iPad7,1\0AppleARM\0")], 1);
+        node(&mut b, "arm-io", &[("compatible", b"arm-io,t8011\0")], 1);
+        node(&mut b, "apcie", &[("compatible", b"apcie,t8011\0")], 1);
+        node(&mut b, "pci-bridge0", &[("compatible", b"apcie-bridge\0"), ("AAPL,unit-string", b"00000000")], 1);
+        node(&mut b, "s3e", &[("AAPL,unit-string", b"00000000")], 0);
+        let t = build(&b).unwrap();
+        let find = |class: &str| t.iter().position(|n| n.class == class).unwrap() as u32;
+        let p = |i: u32, k: &str| properties(&t, i).into_iter().find(|(pk, _)| pk == k).map(|(_, v)| v);
+        let sensor = find("AppleEmbeddedNVMeTemperatureSensor");
+        assert_eq!(p(sensor, "LocationID"), Some(Prop::Num(0x544e_306e, 32)));
+        assert_eq!(properties_missing(&t, sensor), None);
+        // NS_06's characteristics are the effaceable device's, and its
+        // write cache state is false.
+        let ns6 = t.iter().position(|n| n.name == "NS_06").unwrap() as u32;
+        assert!(matches!(p(ns6, "Device Characteristics"), Some(Prop::Dict(d)) if d[0] == ("Vendor Name".to_string(), Prop::Str("Apple".to_string())) && d[1].1 == Prop::Str("Effaceable".to_string())));
+        assert_eq!(lookup(&t, ns6, "WriteCacheState"), Ok(Some(serialize_prop(&Prop::Bool(false)))));
+        let ns7 = t.iter().position(|n| n.name == "NS_07").unwrap() as u32;
+        assert_eq!(p(ns7, "EmbeddedDeviceTypePanicLog"), Some(Prop::Bool(true)));
+        // They register: the sensor matches as IOHIDEventService by its
+        // usage page and location (a unique ID decides it), and its class.
+        let by = |entries: &[(&str, Obj)]| {
+            let mut g = Graph::default();
+            let d = g.add(Obj::Dict(Vec::new()));
+            for (k, v) in entries {
+                let v = g.add(v.clone());
+                g.dict_set(d, k.as_bytes(), v);
+            }
+            super::super::iomatch::existing(&t, &g, d, false)
+        };
+        let s = |v: &str| Obj::String(v.as_bytes().to_vec());
+        assert_eq!(by(&[("IOProviderClass", s("AppleEmbeddedNVMeTemperatureSensor"))]), Ok(vec![sensor]));
+        assert_eq!(by(&[("IOProviderClass", s("AppleEmbeddedNVMeTemperatureSensor")), ("PrimaryUsagePage", Obj::Number { size: 32, value: 0xff00 }), ("DeviceUsagePage", Obj::Number { size: 32, value: 0xff00 })]), Ok(vec![sensor]));
+        assert_eq!(by(&[("IOProviderClass", s("AppleEmbeddedNVMeTemperatureSensor")), ("DeviceUsagePage", Obj::Number { size: 32, value: 0xff00 }), ("DeviceUsage", Obj::Number { size: 32, value: 4 })]), Ok(vec![]));
+        assert_eq!(by(&[("IOProviderClass", s("AppleEmbeddedNVMeTemperatureSensor")), ("ProductID", s("*"))]), Ok(vec![sensor]));
+        assert_eq!(by(&[("IOProviderClass", s("AppleEmbeddedNVMeTemperatureSensor")), ("ProductIDArray", Obj::Array(Vec::new()))]), Ok(vec![]));
+        assert_eq!(by(&[("IOProviderClass", s("AppleEmbeddedNVMeNVRAM"))]), Ok(vec![find("AppleEmbeddedNVMeNVRAM")]));
+        assert_eq!(by(&[("IOProviderClass", s("AppleDiagnosticDataAccessReadOnly"))]), Ok(vec![find("AppleDiagnosticDataAccessReadOnly")]));
     }
 
     /// device-tree { chosen { memory-map }, arm-io }, under the root.
@@ -1748,17 +1971,19 @@ mod tests {
         assert_eq!(conforms(&t, up[4], "IODTPlatformExpert"), Ok(true));
         assert_eq!(conforms(&t, up[2], "AppleARMIO"), Ok(true));
         assert_eq!(links(&t, sgx, Plane::Service, true), Ok(vec![up[2]]));
-        // The device tree plane is as it was; the drivers' other nubs and
-        // the entries no driver here published are not known.
+        // The device tree plane is as it was. arm-io's driver makes a nub
+        // of each of arm-io's children; the platform expert none of the
+        // excluded top-level entries.
         assert_eq!(links(&t, sgx, Plane::DeviceTree, true), Ok(vec![arm_io]));
-        assert!(class(&t, uart).is_err() && provider(&t, uart).is_err() && provider(&t, chosen).is_err());
+        assert_eq!((class(&t, uart), provider(&t, uart)), (Ok("AppleARMIODevice"), Ok(Some(up[2]))));
+        assert!(provider(&t, chosen).is_err());
         assert!(links(&t, arm_io, Plane::Service, false).is_err() && links(&t, up[2], Plane::Service, false).is_err());
         // Properties a driver here may have set are reported, but for
         // IOClassNameOverride; a plain device tree entry has only its own.
         assert!(property_unknown(&t, accel, "PerformanceStatistics") && property_unknown(&t, sgx, "IODeviceMemory"));
         assert!(!property_unknown(&t, accel, "IOClassNameOverride") && !property_unknown(&t, up[4], "IOClassNameOverride") && !property_unknown(&t, 0, "IOClassNameOverride"));
         assert!(property_unknown(&t, 0, "IOPlatformSerialNumber"));
-        assert!(!property_unknown(&t, uart, "anything") && property_unknown(&t, root, "IOKitBuildVersion") && !property_unknown(&t, root, "anything"));
+        assert!(!property_unknown(&t, chosen, "anything") && property_unknown(&t, root, "IOKitBuildVersion") && !property_unknown(&t, root, "anything"));
         // The display's framebuffer on disp0's nub, a nub of arm-io's
         // driver as the GPU's is.
         let mut b = Vec::new();
@@ -1833,5 +2058,8 @@ mod tests {
         assert_eq!(matching(&[("IOProviderClass", "IOResources")]), Ok(vec![resources]));
         assert_eq!(matching(&[("IOProviderClass", "IOResources"), ("IOResourceMatch", "IOBSD")]), Ok(vec![resources]));
         assert!(matching(&[("IOProviderClass", "IOResources"), ("IOResourceMatch", "IONVRAM")]).is_err());
+        // IOSurface.framework's name match: only the root bears the name.
+        assert_eq!(matching(&[("IONameMatch", "IOCoreSurfaceRoot")]), Ok(vec![surface]));
+        assert!(matching(&[("IONameMatch", "IOResources")]).is_err());
     }
 }

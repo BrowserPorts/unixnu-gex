@@ -6,12 +6,15 @@
 //! Root                    IORegistryEntry
 //!   J120AP                IOPlatformExpertDevice (the device tree's root)
 //!     AppleARMPE          the platform expert
+//!       IOPMrootDomain    the root power domain (`super::iopower`)
+//!       cpu0 .. cpus ..   IOPlatformDevice nubs of /cpus's children and of
+//!                         the root's children, arm-io among them
 //!       arm-io            IOPlatformDevice, a nub of the device tree's arm-io
 //!         AppleT8011IO    arm-io's driver
-//!           sgx           AppleARMIODevice, a nub of arm-io's sgx
-//!             (the GPU's accelerator, `super::accel`)
-//!           disp0         AppleARMIODevice, a nub of arm-io's disp0
-//!             (the display's framebuffer, `super::iomfb`)
+//!           ...           AppleARMIODevice, a nub of each of arm-io's children:
+//!           sgx           (the GPU's accelerator, `super::accel`)
+//!           disp0         (the display's framebuffer, `super::iomfb`)
+//!           apcie         (the PCIe root complex, `super::storagestack`)
 //! ```
 //!
 //! - The platform expert. `AppleARMPE` (com.apple.driver.AppleARMPlatform)
@@ -59,9 +62,10 @@
 //!   none).
 //! - `IOProbeScore`, a 32-bit number of the probe's score (`probeCandidates`).
 //!
-//! What each driver's start then sets is its own and not modelled: such a
-//! property is reported when read. So are these drivers' other nubs and
-//! clients, which are their children in the `IOService` plane.
+//! What the drivers' starts set is in [`add`]; what the drivers matched on
+//! the nubs set on them is not modelled, and is reported when read. So are
+//! the platform expert's other children (IOSystemStateNotification, the
+//! PCIe MSI controller) and the drivers' clients.
 //!
 //! The resources nub. `IOService::initialize` makes `IOResources` (its
 //! `resources()`, inlined at 0xfffffff0077c8ec0, keeps it in gIOResources,
@@ -147,6 +151,21 @@ pub fn superclasses(class: &str) -> &'static [&'static str] {
     }
 }
 
+/// Whether a driver of `class` here registers itself: the platform expert
+/// does at the end of its start (0xfffffff00598f964), arm-io's driver after
+/// publishing its nubs (0xfffffff006c41910).
+pub fn registers(class: &str) -> Option<bool> {
+    matches!(class, PE | ARM_IO).then_some(true)
+}
+
+/// A property of entry `i` the platform's drivers changed in a way not
+/// modelled: the root's clock-frequency, which `IOPlatformExpert::start`
+/// (0xfffffff00780b1dc) replaces in place with the bus clock, the running
+/// CPU's bus-frequency, which iBoot fills in the device tree.
+pub fn property_override(t: &[Node], i: u32, name: &str) -> Option<String> {
+    (i == 0 && name == "clock-frequency" && t.iter().any(|n| n.class == PE)).then(|| "the root's clock-frequency (the bus clock: cpu0's bus-frequency, which iBoot fills)".to_string())
+}
+
 /// Whether `class` is one of the drivers here, whose children in the
 /// `IOService` plane are not all modelled.
 pub fn is_driver(class: &str) -> bool {
@@ -170,13 +189,46 @@ fn skipped(n: &Node) -> bool {
     n.props.iter().any(|(k, v)| k == "AAPL,ignore" || (k == "device_type" && v.as_slice() == b"associated-service\0"))
 }
 
+/// `IODTFindMatchingEntries(parent, kIODTExclusive, excluded)`: the
+/// children of `parent` in the device tree, in its order, less those it
+/// passes over and those whose names include one of `excluded`.
+pub(crate) fn matching(t: &[Node], parent: u32, excluded: &[&str]) -> Vec<u32> {
+    t[parent as usize].children.iter().copied().filter(|&c| {
+        let n = &t[c as usize];
+        !skipped(n) && !excluded.iter().any(|x| names(n, x))
+    }).collect()
+}
+
 /// The child of `parent` in the device tree that `IODTFindMatchingEntries`
 /// gives and whose names include `name`, less the names `excluded`.
 pub(crate) fn child(t: &[Node], parent: u32, name: &str, excluded: &[&str]) -> Option<u32> {
-    t[parent as usize].children.iter().copied().find(|&c| {
-        let n = &t[c as usize];
-        !skipped(n) && !excluded.contains(&n.name.as_str()) && names(n, name)
-    })
+    matching(t, parent, excluded).into_iter().find(|&c| names(&t[c as usize], name))
+}
+
+/// The platform expert's `excludeList` (0xfffffff00598fee8).
+const EXCLUDED: [&str; 4] = ["chosen", "memory", "options", "aliases"];
+
+/// Make device tree entry `entry` a nub of class `class` that driver
+/// `driver` published, with the device memory its first matching gives it
+/// (`getResources`, before probing: `IODTPlatformExpert::getNubResources`
+/// for an `IOPlatformDevice`, AppleARMIODevice's 0xfffffff00598cf80 for
+/// one of arm-io's, both `IODTResolveAddressing(nub, "reg", NULL)`, as
+/// arm-io's driver keeps no device memory of its own). A range the
+/// unfilled template gives as empty (iBoot fills it) is not answered.
+fn make_nub(t: &mut [Node], entry: u32, class: &'static str, driver: u32) {
+    t[entry as usize].nub = Some((class, driver));
+    if t[entry as usize].service_props.iter().any(|(k, _)| k == "IODeviceMemory") {
+        return;
+    }
+    match super::iodt::device_memory(t, entry) {
+        Ok(Some(Prop::Array(ranges))) if ranges.iter().all(|r| !is_empty_range(r)) => t[entry as usize].service_props.push(("IODeviceMemory".to_string(), Prop::Array(ranges))),
+        _ => {}
+    }
+}
+
+/// Whether a serialized device memory range has length 0.
+fn is_empty_range(r: &Prop) -> bool {
+    matches!(r, Prop::Array(a) if a.iter().any(|d| matches!(d, Prop::Dict(e) if e.iter().any(|(k, v)| k == "length" && *v == Prop::Num(0, 64)))))
 }
 
 /// A driver's properties from its personality and matching (see the
@@ -202,31 +254,82 @@ pub(crate) fn driver_props(bundle: &str, class: &str, provider: &str, matched: O
     p
 }
 
-/// Publish the platform expert and arm-io's driver, and make arm-io the
-/// nub it is; arm-io's driver's entry, when the device tree has arm-io.
-/// `t[0]` is the device tree's root, the `IOPlatformExpertDevice`.
+/// Publish the platform expert and arm-io's driver, and make the device
+/// tree's entries the nubs they are; arm-io's driver's entry, when the
+/// device tree has arm-io. `t[0]` is the device tree's root, the
+/// `IOPlatformExpertDevice`.
+///
+/// The platform expert's table: its personality's and matching's keys,
+/// then "Platform Memory Ranges" (`IOPlatformExpert::start`,
+/// 0xfffffff00780b228: an `IORangeAllocator` of one free range, 0 to
+/// 0xffffffff, which serializes as its start and end, 64-bit numbers,
+/// 0xfffffff007808454; nothing allocates from it on arm64),
+/// "IOPlatformMaxBusDelay" (`setPlatform`, 0xfffffff0077c9d10: the live
+/// numbers of the CPUs' latency, not modelled) and, once `configure` has
+/// published the nubs, "IOFunctionParent00000001" (empty data:
+/// AppleARMPlatform's helper 0xfffffff005988104 of the root's phandle).
+///
+/// `configure`'s `processTopLevel` makes an `IOPlatformDevice` of each of
+/// /cpus's children (each also given its "logical-cpu-id" and
+/// "logical-cluster-id", 32-bit numbers: on the T8011, with no clusters,
+/// its `reg` and 0), then of each of the root's children less the
+/// excluded ones. arm-io's driver's start (AppleT801xIO's,
+/// 0xfffffff006c41408) sets, after its personality's and matching's keys,
+/// IOPowerManagement (AppleARMIO's PMinit) and "IOFunctionParent0000001C"
+/// (arm-io's phandle), then publishes an `AppleARMIODevice` of each of
+/// arm-io's children (0xfffffff00598c1d4: its delete and exclude lists are
+/// empty).
 pub fn add(t: &mut Vec<Node>) -> Option<u32> {
     let root = t.first()?;
     if !names(root, "AppleARM") {
         return None;
     }
-    let driver = |name: &str, class: &'static str, parent: u32, service_props| Node { name: name.to_string(), props: Vec::new(), class, service_props, parent: Some(parent), children: Vec::new(), kernel_only: false, nub: None, dt: None, table: super::iokit::Table::Drivers };
+    let driver = |name: &str, class: &'static str, parent: u32, service_props| Node { name: name.to_string(), props: Vec::new(), class, service_props, parent: Some(parent), children: Vec::new(), kernel_only: false, nub: None, dt: None, table: super::iokit::Table::Drivers, power: None };
     let pe = t.len() as u32;
     // The personality "AppleARMPE": IONameMatch "AppleARM", IOProbeScore
     // 1000 (a 64-bit number, which the probe's 32-bit score replaces).
-    let props = driver_props("com.apple.driver.AppleARMPlatform", PE, "IOPlatformExpertDevice", Some("AppleARM"), "IODefaultMatchCategory", 1000, vec![("IONameMatch".to_string(), Prop::Str("AppleARM".to_string()))]);
+    let mut props = driver_props("com.apple.driver.AppleARMPlatform", PE, "IOPlatformExpertDevice", Some("AppleARM"), "IODefaultMatchCategory", 1000, vec![("IONameMatch".to_string(), Prop::Str("AppleARM".to_string()))]);
+    props.push(("Platform Memory Ranges".to_string(), Prop::Array(vec![Prop::Num(0, 64), Prop::Num(0xffff_ffff, 64)])));
+    props.push((function_parent(t, 0), Prop::Data(Vec::new())));
     t.push(driver(PE, PE, 0, props));
-    let arm_io = child(t, 0, "arm-io,t8011", &["chosen", "memory", "options", "aliases"])?;
-    t[arm_io as usize].nub = Some((PLATFORM_DEVICE, pe));
+    if let Some(cpus) = child(t, 0, "cpus", &[]) {
+        for c in matching(t, cpus, &[]) {
+            make_nub(t, c, PLATFORM_DEVICE, pe);
+            let reg = t[c as usize].props.iter().find(|(k, _)| k == "reg").and_then(|(_, v)| v.get(..4)).map_or(0, |v| u32::from_le_bytes(v.try_into().unwrap()));
+            let n = &mut t[c as usize];
+            n.service_props.push(("logical-cpu-id".to_string(), Prop::Num(u64::from(reg), 32)));
+            n.service_props.push(("logical-cluster-id".to_string(), Prop::Num(0, 32)));
+        }
+    }
+    for c in matching(t, 0, &EXCLUDED) {
+        make_nub(t, c, PLATFORM_DEVICE, pe);
+    }
+    let arm_io = child(t, 0, "arm-io,t8011", &EXCLUDED)?;
     let io = t.len() as u32;
     // The personality "AppleT8011IO": IONameMatch "arm-io,t8011",
     // IOPlatformActiveAction 80000.
-    let props = driver_props("com.apple.driver.AppleT8011", ARM_IO, PLATFORM_DEVICE, Some("arm-io,t8011"), "IODefaultMatchCategory", 0, vec![
+    let mut props = driver_props("com.apple.driver.AppleT8011", ARM_IO, PLATFORM_DEVICE, Some("arm-io,t8011"), "IODefaultMatchCategory", 0, vec![
         ("IONameMatch".to_string(), Prop::Str("arm-io,t8011".to_string())),
         ("IOPlatformActiveAction".to_string(), Prop::Num(80000, 64)),
     ]);
+    // AppleARMIO's start (0xfffffff00598c0b4): PMinit (0xfffffff00598c0f0)
+    // and temporaryPowerClampOn (0xfffffff00598c100), before what
+    // AppleT801xIO's start sets; it never joins the power plane.
+    props.push((super::iopower::KEY.to_string(), super::iopower::clamped_without_driver()));
+    props.push((function_parent(t, arm_io), Prop::Data(Vec::new())));
     t.push(driver(ARM_IO, ARM_IO, arm_io, props));
+    for c in matching(t, arm_io, &[]) {
+        make_nub(t, c, ARM_IO_DEVICE, io);
+    }
     Some(io)
+}
+
+/// The key AppleARMPlatform's helper (0xfffffff005988104) sets on a driver
+/// of device tree entry `entry`: "IOFunctionParent" and the entry's
+/// `AAPL,phandle` as `"%08X"`.
+pub(crate) fn function_parent(t: &[Node], entry: u32) -> String {
+    let ph = t[entry as usize].props.iter().find(|(k, _)| k == "AAPL,phandle").and_then(|(_, v)| v.get(..4)).map_or(0, |v| u32::from_le_bytes(v.try_into().unwrap()));
+    format!("IOFunctionParent{ph:08X}")
 }
 
 /// The `AppleARMIODevice` nub arm-io's driver `io` publishes for its
@@ -234,7 +337,7 @@ pub fn add(t: &mut Vec<Node>) -> Option<u32> {
 pub fn arm_io_nub(t: &mut [Node], io: u32, name: &str) -> Option<u32> {
     let arm_io = t[io as usize].parent?;
     let nub = child(t, arm_io, name, &[])?;
-    t[nub as usize].nub = Some((ARM_IO_DEVICE, io));
+    make_nub(t, nub, ARM_IO_DEVICE, io);
     Some(nub)
 }
 
@@ -243,6 +346,6 @@ pub fn arm_io_nub(t: &mut [Node], io: u32, name: &str) -> Option<u32> {
 pub fn add_resources(t: &mut Vec<Node>) -> u32 {
     let published = |key: &str| (key.to_string(), Prop::Sym("IOService".to_string()));
     let at = t.len() as u32;
-    t.push(Node { name: RESOURCES.to_string(), props: Vec::new(), class: RESOURCES, service_props: vec![published("IOKit"), published("IOBSD")], parent: None, children: Vec::new(), kernel_only: false, nub: None, dt: None, table: super::iokit::Table::Drivers });
+    t.push(Node { name: RESOURCES.to_string(), props: Vec::new(), class: RESOURCES, service_props: vec![published("IOKit"), published("IOBSD")], parent: None, children: Vec::new(), kernel_only: false, nub: None, dt: None, table: super::iokit::Table::Drivers, power: None });
     at
 }

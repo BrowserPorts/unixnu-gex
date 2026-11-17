@@ -199,7 +199,7 @@ fn equal(a: V<'_>, b: V<'_>) -> bool {
 /// class's `getProperty` override: `Err` for one that may be the device's
 /// but is not here.
 fn copy_property(t: &[Node], i: u32, name: &str) -> Result<Option<Prop>, String> {
-    if let Some(what) = super::storagestack::property_override(t, i, name) {
+    if let Some(what) = super::storagestack::property_override(t, i, name).or_else(|| super::platform::property_override(t, i, name)) {
         return Err(what);
     }
     let n = &t[i as usize];
@@ -357,6 +357,12 @@ fn registered(t: &[Node], i: u32) -> Result<bool, String> {
     if n.class == super::accel::CLASS || n.class == super::iomfb::CLASS || n.class == super::iosurface::CLASS {
         return Ok(true);
     }
+    if let Some(r) = super::platform::registers(n.class) {
+        return Ok(r);
+    }
+    if let Some(r) = super::iopower::registers(n.class) {
+        return Ok(r);
+    }
     if let Some(r) = super::storagestack::registers(n.class) {
         return Ok(r);
     }
@@ -371,32 +377,147 @@ fn chain(t: &[Node], i: u32) -> Vec<&'static str> {
     iokit::class(t, i).ok().and_then(iokit::class_chain).unwrap_or_default()
 }
 
+/// Whether entry `i` is a driver: a service matching attached to its
+/// provider, which `probeCandidates` gives its match category
+/// (`inst->setProperty(gIOMatchCategoryKey, category)`) and its probe's
+/// score. Every other service is a nub its provider's driver published.
+fn is_driver(n: &Node) -> bool {
+    !n.class.is_empty() && n.service_props.iter().any(|(k, _)| k == key::MATCH_CATEGORY)
+}
+
+/// The services entry `i` has in the `IOService` plane, in the order they
+/// were attached: the device tree entries a driver made nubs of (in the
+/// device tree's order, the order `IODTFindMatchingEntries` gives them to
+/// the publishing loop), then the services whose provider it is.
+fn service_children(t: &[Node], i: u32) -> Vec<u32> {
+    let nubs = t.iter().enumerate().filter(|(_, n)| n.class.is_empty() && n.nub.is_some_and(|(_, p)| p == i)).map(|(j, _)| j as u32);
+    let services = t.iter().enumerate().filter(|(_, n)| !n.class.is_empty() && n.parent == Some(i)).map(|(j, _)| j as u32);
+    nubs.chain(services).collect()
+}
+
+/// The order the registered services here were registered in at boot: the
+/// order `doServiceMatch` added each to its metaclass's instances
+/// (`getMetaClass()->addInstance(this)`, on the service's first matching),
+/// which is the order `copyExistingServices` gives them in.
+///
+/// The boot registers them as follows, and so does this model:
+/// - The platform expert device registers first
+///   (`IOPlatformExpertDevice::startIOServiceMatching`).
+/// - A driver's start registers the nubs it publishes in the order it
+///   publishes them and, if it registers itself, itself at its end:
+///   `IOPCIBridge::start` after `probeBus`, `IOBlockStorageDriver::start`
+///   after `handleStart` publishes its medium, `IOMediaBSDClient::start`
+///   after `createNodes`, AppleAPFSContainer's start after its volumes
+///   (0xfffffff00666b24c).
+/// - Each of those `registerService` calls (but the platform expert
+///   device's) is asynchronous: it queues the service's matching for the
+///   configuration threads, which run it after the call returns, so a
+///   driver's start has registered its nubs and itself before any driver
+///   starts on those nubs.
+/// - On a registered nub the drivers that match start in the order they
+///   were attached, each driver category's best first (`probeCandidates`
+///   starts the categories in the order of their best probe score, and
+///   `startCandidate` attaches the driver before it stalls for any
+///   `IOResourceMatch`).
+/// - The platform expert's start publishes IOResources (IOPMrootDomain's
+///   start, from `PMInstantiatePowerDomains`, publishes the IOKit
+///   resource), and the root domain registers itself at the end of that
+///   start (0xfffffff0078629f8), before `configure` publishes the
+///   top-level nubs. The
+///   services matched on IOResources wait for their resources (IOSurfaceRoot
+///   for IOBSD, which `bsd_init` publishes): they come last here.
+///
+/// The configuration threads are several, so the matching queued for
+/// different nubs runs concurrently, and the order of registrations in
+/// different branches of the plane relative to each other is the boot's.
+/// This model runs the matching of a driver's nubs one after the other, in
+/// the order they were registered, each with all the registrations it
+/// causes. Of the services whose order a matching answer shows (the
+/// classes whose every instance is here), that orders the storage's media,
+/// and the BSD clients that give them their minors, as the media order's
+/// stand-in states ([`super::storage::media_order`]); [`existing`] fails
+/// loudly where a measured media order disagrees with it.
+pub fn registration_order(t: &[Node]) -> Vec<u32> {
+    fn emit(t: &[Node], i: u32, out: &mut Vec<u32>) {
+        if registered(t, i) == Ok(true) && !out.contains(&i) {
+            out.push(i);
+        }
+    }
+    /// The drivers matched on the registered nub `i` start.
+    fn matched(t: &[Node], i: u32, out: &mut Vec<u32>) {
+        for c in service_children(t, i) {
+            if is_driver(&t[c as usize]) {
+                start(t, c, out);
+            }
+        }
+    }
+    fn start(t: &[Node], d: u32, out: &mut Vec<u32>) {
+        if t[d as usize].class == super::platform::PE {
+            if let Some(r) = t.iter().position(|n| n.class == super::platform::RESOURCES) {
+                emit(t, r as u32, out);
+            }
+            if let Some(r) = t.iter().position(|n| n.class == super::iopower::ROOT_DOMAIN) {
+                emit(t, r as u32, out);
+            }
+        }
+        let children = service_children(t, d);
+        let nubs: Vec<u32> = children.iter().copied().filter(|&c| !is_driver(&t[c as usize])).collect();
+        for &c in &nubs {
+            emit(t, c, out);
+        }
+        emit(t, d, out);
+        // Drivers matched on this driver itself, once it is registered.
+        matched(t, d, out);
+        for &c in &nubs {
+            matched(t, c, out);
+        }
+    }
+    let mut out = Vec::new();
+    if t.first().is_some_and(|n| n.class.is_empty()) && t.iter().any(|n| n.class == super::platform::PE) {
+        emit(t, 0, &mut out);
+        matched(t, 0, &mut out);
+    }
+    // Trees with no platform (the storage stack alone): each service with no
+    // provider is registered in the order it was made.
+    for (i, n) in t.iter().enumerate() {
+        if !n.class.is_empty() && n.parent.is_none() && n.class != super::platform::RESOURCES && n.class != "IORegistryEntry" {
+            emit(t, i as u32, &mut out);
+            matched(t, i as u32, &mut out);
+        }
+    }
+    if let Some(r) = t.iter().position(|n| n.class == super::platform::RESOURCES) {
+        emit(t, r as u32, &mut out);
+        matched(t, r as u32, &mut out);
+    }
+    out
+}
+
 /// `applyToInstances` of `class`'s metaclass over the entries `members`
 /// (each of the class, registered): its set holds its own instances and,
 /// for each subclass, that subclass's set, each where it was added
 /// (`OSMetaClass::addInstance`: a subclass's set joins its superclass's
-/// when its first instance registers), walked depth first. An entry's
-/// registration is its place in the registry here.
-fn instance_order(t: &[Node], class: &str, members: &[u32]) -> Vec<u32> {
+/// when its first instance registers), walked depth first. `rank` is each
+/// entry's place in the [`registration_order`].
+fn instance_order(t: &[Node], class: &str, members: &[u32], rank: &dyn Fn(u32) -> usize) -> Vec<u32> {
     enum Slot {
         One(u32),
         Sub(&'static str, Vec<u32>),
     }
-    let mut slots: Vec<(u32, Slot)> = Vec::new();
+    let mut slots: Vec<(usize, Slot)> = Vec::new();
     for &m in members {
         let c = chain(t, m);
         let Some(p) = c.iter().position(|&x| x == class) else { continue };
         if p == 0 {
-            slots.push((m, Slot::One(m)));
+            slots.push((rank(m), Slot::One(m)));
             continue;
         }
         let sub = c[p - 1];
         match slots.iter_mut().find(|(_, s)| matches!(s, Slot::Sub(name, _) if *name == sub)) {
             Some((first, Slot::Sub(_, v))) => {
-                *first = (*first).min(m);
+                *first = (*first).min(rank(m));
                 v.push(m);
             }
-            _ => slots.push((m, Slot::Sub(sub, vec![m]))),
+            _ => slots.push((rank(m), Slot::Sub(sub, vec![m]))),
         }
     }
     slots.sort_by_key(|(at, _)| *at);
@@ -404,10 +525,24 @@ fn instance_order(t: &[Node], class: &str, members: &[u32]) -> Vec<u32> {
     for (_, s) in slots {
         match s {
             Slot::One(m) => out.push(m),
-            Slot::Sub(name, v) => out.extend(instance_order(t, name, &v)),
+            Slot::Sub(name, v) => out.extend(instance_order(t, name, &v, rank)),
         }
     }
     out
+}
+
+/// Whether the media's registration in [`registration_order`] is the order
+/// [`super::storage::media_order`] gives them their minors in (each
+/// medium's BSD client starts as its medium is matched); `Err` naming the
+/// difference when a measured media order disagrees with the model.
+fn media_order_agrees(t: &[Node], order: &[u32]) -> Result<(), String> {
+    let modelled: Vec<_> = order.iter().filter_map(|&i| super::storagestack::medium_of(&t[i as usize])).collect();
+    let wanted: Vec<_> = super::storage::media_order().into_iter().filter(|m| modelled.contains(m)).collect();
+    if modelled == wanted {
+        Ok(())
+    } else {
+        Err(format!("the services' registration order: the media order {wanted:?} differs from the order the modelled matching registers them in, {modelled:?}"))
+    }
 }
 
 /// `copyExistingServices(matching, kIOServiceMatchedState, once ?
@@ -426,9 +561,11 @@ pub fn existing(t: &[Node], g: &Graph, table: Id, once: bool) -> Result<Vec<u32>
     let class = provider.and_then(|p| as_string(g, p)).map(|s| String::from_utf8_lossy(s).into_owned());
     let base = class.as_deref().unwrap_or("IOService");
     let members: Vec<u32> = (0..t.len() as u32).filter(|&i| chain(t, i).contains(&base)).collect();
+    let order = registration_order(t);
+    let rank = |i: u32| order.iter().position(|&o| o == i).unwrap_or(usize::MAX);
     let mut found = Vec::new();
     let mut gap: Option<String> = None;
-    for i in instance_order(t, base, &members) {
+    for i in instance_order(t, base, &members, &rank) {
         match registered(t, i) {
             Ok(true) => {}
             Ok(false) => continue,
@@ -461,11 +598,22 @@ pub fn existing(t: &[Node], g: &Graph, table: Id, once: bool) -> Result<Vec<u32>
     if once {
         found.truncate(1);
     }
+    // The order of several media, or of their BSD clients, is the media
+    // order's.
+    if found.len() > 1 && found.iter().any(|&i| super::storagestack::medium_of(&t[i as usize]).is_some() || chain(t, i).contains(&super::storagestack::BSD_CLIENT)) {
+        media_order_agrees(t, &order)?;
+    }
     // Which of the class's services the device has beyond these is known
     // only for the classes whose every service is here; else a match by a
     // key no other service can share (a BSD name, a registry entry ID of
     // the registry here) or by a device tree path is still the answer.
-    let complete = class.as_deref().is_some_and(class_complete);
+    // So it is when the dictionary's IONameMatch names only names whose
+    // every service is here (a matching service must bear one).
+    let names_complete = get(g, table, key::NAME_MATCH).is_some_and(|n| {
+        let names = names_of(g, n);
+        !names.is_empty() && names.iter().all(|x| name_complete(&String::from_utf8_lossy(x)))
+    });
+    let complete = class.as_deref().is_some_and(class_complete) || names_complete;
     let unique = (get(g, table, key::BSD_NAME).is_some() && !found.is_empty()) || get(g, table, key::REGISTRY_ENTRY_ID).is_some();
     match gap {
         Some(e) if !(unique && !found.is_empty()) => Err(e),
@@ -479,7 +627,14 @@ pub fn existing(t: &[Node], g: &Graph, table: Id, once: bool) -> Result<Vec<u32>
 /// root, `IOPlatformExpertDevice::initWithArgs`).
 fn class_complete(class: &str) -> bool {
     class == "IOPlatformExpertDevice"
-        || super::storagestack::class_complete(class) || super::accel::class_complete(class) || super::iosurface::class_complete(class) || super::iomfb::class_complete(class)
+        || super::storagestack::class_complete(class) || super::iopower::class_complete(class) || super::accel::class_complete(class) || super::iosurface::class_complete(class) || super::iomfb::class_complete(class)
+}
+
+/// Whether every registered service named `name` is in the registry here:
+/// IOSurfaceRoot's name is its own ([`super::iosurface::name_complete`]);
+/// a device tree nub's names are its device tree's, all here.
+fn name_complete(name: &str) -> bool {
+    super::iosurface::name_complete(name)
 }
 
 /// `OSDictionary::getCount`.
@@ -668,6 +823,146 @@ fn compare_property(t: &[Node], i: u32, g: &Graph, table: Id, k: &str) -> Result
     Ok(copy_property(t, i, k)?.is_some_and(|p| equal(V::G(g, v), V::P(&p))))
 }
 
+/// `MatchPropertyTable` of IOHIDFamily (0xfffffff005ae2154), which
+/// `IOHIDEventService::matchPropertyTable` (0xfffffff005aec640) asks after
+/// IOService's: each of the table's keys it compares, with the table's
+/// value the receiver, must equal the service's (a key the table lacks
+/// passes, one the service lacks fails): PrimaryUsagePage, PrimaryUsage,
+/// each of the table's DeviceUsagePairs until one passes `CompareDeviceUsage`,
+/// `CompareDeviceUsage` of the table itself (which fails a service with no
+/// DeviceUsagePairs array), Transport, LocationID, VendorID, the product
+/// ID (`CompareProductID`), ModelNumber, VersionNumber, Manufacturer,
+/// SerialNumber, PhysicalDeviceUniqueID and BootProtocol. A table with
+/// HIDDefaultBehavior or HIDCompatibilityInterface needs the service to
+/// have it, and one with IOUserClass a CFBundleIdentifier string beginning
+/// "com.apple." (0xfffffff005ae2324).
+fn hid_match(t: &[Node], i: u32, g: &Graph, table: Id) -> Result<bool, String> {
+    let has = |k: &str| get(g, table, k);
+    let num = |p: &Option<Prop>| match p {
+        Some(Prop::Num(v, _)) => Some(*v),
+        _ => None,
+    };
+    // CompareDeviceUsage of `m` (the table, or one of its pairs).
+    let usage = |m: Id| -> Result<bool, String> {
+        let page = get(g, m, "DeviceUsagePage").filter(|&v| matches!(g.get(v), Obj::Number { .. }));
+        let use_ = get(g, m, "DeviceUsage").filter(|&v| matches!(g.get(v), Obj::Number { .. }));
+        let Some(Prop::Array(pairs)) = copy_property(t, i, "DeviceUsagePairs")? else { return Ok(false) };
+        let mut matches = true;
+        if page.is_some() || use_.is_some() {
+            for pair in &pairs {
+                let Prop::Dict(d) = pair else { continue };
+                let field = |k: &str| d.iter().find(|(n, _)| n == k).map(|(_, v)| v).filter(|v| matches!(v, Prop::Num(..)));
+                let (Some(p), Some(pp)) = (page, field("DeviceUsagePage")) else { continue };
+                matches = equal(V::G(g, p), V::P(pp));
+                if !matches {
+                    continue;
+                }
+                // A score is always asked for: a page alone decides.
+                let Some(u) = use_ else { break };
+                let Some(pu) = field("DeviceUsage") else { continue };
+                matches = equal(V::G(g, u), V::P(pu));
+                if matches {
+                    break;
+                }
+            }
+        }
+        Ok(matches)
+    };
+    for k in ["PrimaryUsagePage", "PrimaryUsage"] {
+        if !compare_property(t, i, g, table, k)? {
+            return Ok(false);
+        }
+    }
+    if let Some(pairs) = has("DeviceUsagePairs") {
+        if let Obj::Array(e) = g.get(pairs) {
+            let mut matches = true;
+            for &p in e {
+                if !matches!(g.get(p), Obj::Dict(_)) {
+                    continue;
+                }
+                matches = usage(p)?;
+                if matches {
+                    break;
+                }
+            }
+            if !matches {
+                return Ok(false);
+            }
+        }
+    }
+    if !usage(table)? {
+        return Ok(false);
+    }
+    for k in ["Transport", "LocationID", "VendorID"] {
+        if !compare_property(t, i, g, table, k)? {
+            return Ok(false);
+        }
+    }
+    // CompareProductID: the first of its four ways that matched with a
+    // score; else whether none failed (the table has no such key).
+    let pid = copy_property(t, i, "ProductID")?;
+    let table_pid = has("ProductID");
+    let mask = has("ProductIDMask").filter(|&m| matches!(g.get(m), Obj::Number { .. })).and_then(|m| g.u64_value(m)).map(|m| m as u32);
+    let array = has("ProductIDArray").and_then(|a| match g.get(a) {
+        Obj::Array(e) => Some(e.clone()),
+        _ => None,
+    });
+    let wildcard = table_pid.is_some_and(|p| matches!(g.get(p), Obj::String(s) | Obj::Symbol(s) if s == b"*"));
+    let (pid_match, pid_scored) = if wildcard { (true, true) } else {
+        match table_pid {
+            None => (true, false),
+            Some(p) => {
+                let m = pid.as_ref().is_some_and(|q| equal(V::G(g, p), V::P(q)));
+                (m, m)
+            }
+        }
+    };
+    let pid_num = num(&pid).map(|v| v as u32);
+    let (array_match, array_scored) = match &array {
+        None => (true, false),
+        Some(e) => {
+            let m = pid.as_ref().is_some_and(|q| matches!(q, Prop::Num(..)) && e.iter().any(|&a| matches!(g.get(a), Obj::Number { .. }) && equal(V::G(g, a), V::P(q))));
+            (m, m)
+        }
+    };
+    let table_pid_num = table_pid.filter(|&p| matches!(g.get(p), Obj::Number { .. })).and_then(|p| g.u64_value(p)).map(|v| v as u32);
+    let (mask_match, mask_scored) = match (table_pid_num, mask) {
+        (Some(v), Some(m)) => {
+            let ok = pid_num.is_some_and(|r| r & m == v & m);
+            (ok, ok)
+        }
+        _ => (true, false),
+    };
+    let (mask_array_match, mask_array_scored) = match (&array, mask) {
+        (Some(e), Some(m)) => {
+            let ok = pid_num.is_some_and(|r| e.iter().any(|&a| matches!(g.get(a), Obj::Number { .. }) && g.u64_value(a).is_some_and(|v| r & m == v as u32 & m)));
+            (ok, ok)
+        }
+        _ => (true, false),
+    };
+    let product = (pid_match && pid_scored) || (array_match && array_scored) || (mask_match && mask_scored) || (mask_array_match && mask_array_scored) || (pid_match && array_match && mask_match && mask_array_match);
+    if !product {
+        return Ok(false);
+    }
+    for k in ["ModelNumber", "VersionNumber", "Manufacturer", "SerialNumber", "PhysicalDeviceUniqueID", "BootProtocol"] {
+        if !compare_property(t, i, g, table, k)? {
+            return Ok(false);
+        }
+    }
+    for k in ["HIDDefaultBehavior", "HIDCompatibilityInterface"] {
+        if has(k).is_some() && copy_property(t, i, k)?.is_none() {
+            return Ok(false);
+        }
+    }
+    if has("IOUserClass").is_some() {
+        let apple = has("CFBundleIdentifier").is_some_and(|b| matches!(g.get(b), Obj::String(s) | Obj::Symbol(s) if s.starts_with(b"com.apple.")));
+        if !apple {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// The entry's `matchPropertyTable(table, score)` (slot 0x328), by its
 /// class:
 /// - `IOService`'s calls the one-argument form (slot 0x330), true but for
@@ -679,12 +974,12 @@ fn compare_property(t: &[Node], i: u32, g: &Graph, table: Id, k: &str) -> Result
 ///   (`matchNubWithPropertyTable`, slot 0x5a0, IOPCIBridge's for every
 ///   bridge here: `pciMatchNub` against the configuration registers, then
 ///   the tunnel checks, which no nub here is subject to).
-/// - `IOHIDEventService`'s is its own (0xfffffff005aec640), not followed.
+/// - `IOHIDEventService`'s is its own (0xfffffff005aec640, [`hid_match`]).
 /// - The other classes here keep IOService's.
 fn match_property_table(t: &[Node], i: u32, g: &Graph, table: Id) -> Result<bool, String> {
     let c = chain(t, i);
     if c.contains(&"IOHIDEventService") {
-        return Err(format!("IOHIDEventService's matchPropertyTable on {}", iokit::name(t, i)));
+        return hid_match(t, i, g, table);
     }
     if c.contains(&"IOMedia") {
         for k in ["Content", "Content Hint", "Ejectable", "Leaf", "Open", "Preferred Block Size", "Removable", "Size", "UUID", "Whole", "Writable"] {

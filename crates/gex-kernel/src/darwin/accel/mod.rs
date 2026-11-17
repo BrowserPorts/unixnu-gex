@@ -125,13 +125,14 @@ pub fn add_service(t: &mut Vec<Node>, gpu: u32) {
         ("KDebugVersion".to_string(), Prop::Num(KDEBUG_VERSION, 64)),
         ("SCMVersionNumber".to_string(), sym("")),
         ("SCMBuildTime".to_string(), sym("")),
+        (super::iopower::KEY.to_string(), super::iopower::gpu()),
         ("AGXTraceCodeVersion".to_string(), sym("3.33.11")),
         ("GPURawCounterBundleName".to_string(), sym("AGXGPURawCounterBundle")),
         ("GPURawCounterPluginClassName".to_string(), sym("AGXGPURawCounterSourceGroup")),
         ("MetalPluginClassName".to_string(), sym("AGXA10XDevice")),
         ("MetalStatisticsName".to_string(), sym("AGXMetalStatisticsExternalA10X")),
     ];
-    t.push(Node { name: CLASS.to_string(), props: Vec::new(), class: CLASS, service_props, parent: Some(gpu), children: Vec::new(), kernel_only: false, nub: None, dt: None, table: crate::darwin::iokit::Table::Drivers });
+    t.push(Node { name: CLASS.to_string(), props: Vec::new(), class: CLASS, service_props, parent: Some(gpu), children: Vec::new(), kernel_only: false, nub: None, dt: None, table: crate::darwin::iokit::Table::Drivers, power: None });
 }
 
 /// A user client of the accelerator.

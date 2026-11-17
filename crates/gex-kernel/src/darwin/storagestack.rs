@@ -735,7 +735,8 @@ fn add_storage(t: &mut Vec<Node>, controller: Option<u32>) {
 /// IOEmbeddedNVMeBlockDevice, 0xfffffff006a954d8, 0xfffffff006a95e10,
 /// 0xfffffff006a70014 and 0xfffffff006a97a20): IOBlockStorageDevice::init's
 /// device type, its unit, Identify Namespace's EUI64 and NSID, its
-/// reporters' legend, the transfer limits, Encryption, its type's key
+/// reporters' legend, the transfer limits (its type's,
+/// [`NAMESPACE_MAX_BYTES`]), Encryption, its type's key
 /// (from the table at 0xfffffff007c17c08: the root's EmbeddedDeviceTypeRoot,
 /// the firmware's EmbeddedDeviceTypeFirmware, ...) and, but on the root,
 /// autodiskmount false; its storage features (Unmap from ONCS Dataset
@@ -748,6 +749,7 @@ fn add_storage(t: &mut Vec<Node>, controller: Option<u32>) {
 fn namespace_props(nsid: u32, eui64: u64, block: u64) -> Vec<(String, Prop)> {
     let n = super::storage::nvme();
     let ty = namespace_type(nsid);
+    let max = u64::from(NAMESPACE_MAX_BYTES[ty as usize]);
     let mut p = vec![
         key("device-type", sym("Generic")),
         key("IOUnit", num32(u64::from(nsid))),
@@ -755,15 +757,15 @@ fn namespace_props(nsid: u32, eui64: u64, block: u64) -> Vec<(String, Prop)> {
         key("NamespaceID", num32(u64::from(nsid))),
         key("IOReportLegend", namespace_legend()),
         key("IOReportLegendPublic", Prop::Bool(true)),
-        key("IOMaximumSegmentCountRead", num32(256)),
-        key("IOMaximumSegmentCountWrite", num32(256)),
-        key("IOMaximumSegmentByteCountRead", num32(0x10_0000)),
-        key("IOMaximumSegmentByteCountWrite", num32(0x10_0000)),
+        key("IOMaximumSegmentCountRead", num32(max >> 12)),
+        key("IOMaximumSegmentCountWrite", num32(max >> 12)),
+        key("IOMaximumSegmentByteCountRead", num32(max)),
+        key("IOMaximumSegmentByteCountWrite", num32(max)),
         key("IOMinimumSegmentAlignmentByteCount", num32(4096)),
-        key("IOMaximumByteCountRead", num32(0x10_0000)),
-        key("IOMaximumByteCountWrite", num32(0x10_0000)),
-        key("IOMaximumBlockCountRead", num32(256)),
-        key("IOMaximumBlockCountWrite", num32(256)),
+        key("IOMaximumByteCountRead", num32(max)),
+        key("IOMaximumByteCountWrite", num32(max)),
+        key("IOMaximumBlockCountRead", num32(max >> 12)),
+        key("IOMaximumBlockCountWrite", num32(max >> 12)),
         key("Encryption", Prop::Bool(true)),
         key(NAMESPACE_TYPE_KEYS[ty as usize], Prop::Bool(true)),
     ];
@@ -790,6 +792,12 @@ fn namespace_props(nsid: u32, eui64: u64, block: u64) -> Vec<(String, Prop)> {
     }
     p
 }
+
+/// The most a namespace's transfer may be, in bytes, by its type
+/// (0xfffffff007c17d38): the namespace's publishing (0xfffffff006a70014)
+/// takes it as its byte counts and a segment's size, and its 4096-byte
+/// blocks as its block and segment counts.
+const NAMESPACE_MAX_BYTES: [u32; 14] = [0, 0x10_0000, 0x10_0000, 0x1000, 0x1000, 0x2000, 0x1000, 0, 0x10_0000, 0x10_0000, 0x10_0000, 0x10_0000, 0x10_0000, 0x10_0000];
 
 /// The namespaces' types' keys (0xfffffff007c17c08), by type.
 const NAMESPACE_TYPE_KEYS: [&str; 14] = [

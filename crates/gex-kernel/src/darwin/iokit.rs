@@ -1648,6 +1648,9 @@ mod tests {
         // The controller's legend and its PCI match's score.
         assert_eq!(p(ctl, "IOProbeScore"), Some(Prop::Num(1000, 32)));
         assert!(matches!(p(ctl, "IOReportLegend"), Some(Prop::Array(a)) if a.len() == 1));
+        // NS_06's transfers are of its type's 4 KiB at most.
+        assert_eq!(p(ns6, "IOMaximumByteCountRead"), Some(Prop::Num(4096, 32)));
+        assert_eq!(p(ns6, "IOMaximumSegmentCountRead"), Some(Prop::Num(1, 32)));
     }
 
     #[test]

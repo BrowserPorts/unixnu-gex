@@ -9,9 +9,12 @@
 //! its container sizing (0x100010208), metadata zone (0x100013fac,
 //! 0x1000140b0), and what `-C` writes, checked byte for byte against what
 //! that binary writes ([`container`]), and its transactions as they run
-//! on a mounted container ([`tx`]).
+//! on a mounted container ([`tx`]). The GPT is MediaKit's ([`gpt`]); the
+//! restore's steps are [`restore`]'s.
 
 pub mod container;
+pub mod gpt;
+pub mod restore;
 pub mod tx;
 
 use super::apfsread::Medium;

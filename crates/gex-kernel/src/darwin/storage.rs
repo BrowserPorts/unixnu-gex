@@ -160,14 +160,13 @@ pub fn nvme() -> Nvme {
 pub const GPT_MEASUREMENT: &str = "the UUID of disk0's IOGUIDPartitionScheme and the Base, Size, UUID and GPT Attributes of its partition (a sysdiagnose's ioreg IOMedia entries)";
 
 /// What stands in for [`Facts::gpt`]: GUIDs that say they are not the
-/// device's (the restore makes them at random), and the partition over the
-/// whole of what a GPT of 128 entries of 128 bytes leaves of the disk at
-/// [`nvme`]'s block size (the first usable LBA after the header and the
-/// entries, the last before their backups), with no attributes.
+/// device's (the restore makes them at random), and the partition MediaKit
+/// lays out for the restore over the whole disk at [`nvme`]'s geometry
+/// ([`super::apfswrite::gpt::Map`]), with no attributes.
 pub fn stand_in_gpt() -> Gpt {
     let n = nvme();
-    let entries = (128 * 128u64).div_ceil(u64::from(n.block_size));
-    Gpt { disk_guid: uuid("00000000-0000-4000-8000-000000000001"), first_lba: 2 + entries, last_lba: n.blocks - 2 - entries, partition_guid: uuid("00000000-0000-4000-8000-000000000002"), attributes: 0 }
+    let m = super::apfswrite::gpt::Map::new(u64::from(n.block_size), n.blocks);
+    Gpt { disk_guid: uuid("00000000-0000-4000-8000-000000000001"), first_lba: m.first, last_lba: m.last, partition_guid: uuid("00000000-0000-4000-8000-000000000002"), attributes: 0 }
 }
 
 /// The GPT in force: the device's, or the stand-in.
@@ -445,25 +444,21 @@ const fn uuid(s: &str) -> [u8; 16] {
     out
 }
 
-/// A volume's UUID. newfs_apfs gives the volumes the restore adds (`-D`,
-/// no `-T`) the UUID `uuid_from_role` makes of their role:
-/// 61706673-7575-6964-RRRR-766f6c756d00 ("apfsuuid", the role, "volum").
-/// The System volume is then ASR's restore of the system image's volume,
-/// whose UUID is 04769D26-2CA0-4825-B443-E2E5F88300F2 (044-76040-038.dmg);
-/// whether ASR keeps it or the volume's own is not yet traced, and the
-/// image's stands in (a reported shortcut).
+/// A volume's UUID. newfs_apfs 2236.140.6 gives every volume it adds the
+/// UUID `uuid_from_role` makes (on unless `-T`; the restore's `-D` asks for
+/// it again): "apfsuuid", the role big-endian, "volum" and the volume's
+/// slot, 61706673-7575-6964-RRRR-766f6c756dII (0x10001b554; the kernel's
+/// volume creation, 0xfffffff006672cc8, sets the same last byte). The
+/// System volume keeps its own: `apfs_invert`, which makes the system
+/// image's volume of the file ASR wrote into it, keeps the outer volume's
+/// UUID (its superblock update, 0x100006d00).
 pub fn volume_uuid(index: u32) -> [u8; 16] {
     let Some(v) = volume(index) else { return [0; 16] };
-    if v.role == role::SYSTEM {
-        return SYSTEM_IMAGE_UUID;
-    }
     let mut u = uuid("61706673-7575-6964-0000-766f6c756d00");
     u[8..10].copy_from_slice(&v.role.to_be_bytes());
+    u[15] = v.index as u8;
     u
 }
-
-/// The system image's volume's UUID (044-76040-038.dmg).
-pub const SYSTEM_IMAGE_UUID: [u8; 16] = uuid("04769D26-2CA0-4825-B443-E2E5F88300F2");
 
 
 /// The name of the System volume's sealed snapshot the restore makes and
@@ -510,8 +505,9 @@ mod tests {
 
     #[test]
     fn volumes_take_their_roles_uuids() {
-        assert_eq!(volume_uuid(4), uuid("61706673-7575-6964-0010-766f6c756d00"), "Preboot");
-        assert_eq!(volume_uuid(3), uuid("61706673-7575-6964-0140-766f6c756d00"), "Hardware");
-        assert_eq!(volume_uuid(0), SYSTEM_IMAGE_UUID);
+        assert_eq!(volume_uuid(4), uuid("61706673-7575-6964-0010-766f6c756d04"), "Preboot");
+        assert_eq!(volume_uuid(3), uuid("61706673-7575-6964-0140-766f6c756d03"), "Hardware");
+        assert_eq!(volume_uuid(0), uuid("61706673-7575-6964-0001-766f6c756d00"), "System");
+        assert_eq!(volume_uuid(1), uuid("61706673-7575-6964-0040-766f6c756d01"), "Data");
     }
 }

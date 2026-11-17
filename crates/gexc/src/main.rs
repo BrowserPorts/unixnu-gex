@@ -24,6 +24,7 @@ mod host_thread_time;
 mod host_walk;
 mod darwin_run;
 mod dsc_info;
+mod darwin_disk;
 #[cfg(feature = "webmetal")]
 mod host_webmetal;
 
@@ -98,6 +99,7 @@ fn real_main() -> Result<ExitCode> {
         "closure" => cmd_closure(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "pe-info" => pe_info::cmd_pe_info(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "dsc-info" => dsc_info::cmd(&argv[2..]),
+        "darwin-disk0" => darwin_disk::cmd(&argv[2..]),
         "webmetal-info" => cmd_webmetal_info(),
         "units" => units::cmd_units(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "profile" => cmd_profile(&argv[2..]).map(|_| ExitCode::SUCCESS),
@@ -212,6 +214,8 @@ usage:
                                    different programs add up (--split DIR:
                                    one file per object instead of -o)
   gexc profile show [--top N] IN   summarise a profile
+  gexc darwin-disk0 <out>          write the web device's disk0 as its erase
+                                   restore makes it (exit 2: steps missing)
   gexc webmetal-info               the WebGPU implementation the Darwin
                                    personality's GPU runs on (the `webmetal`
                                    build), or why there is none

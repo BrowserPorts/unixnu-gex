@@ -934,6 +934,18 @@ impl Kernel {
         if ipc.port(port).receiver == Receiver::Kernel {
             let owner = ipc.port(port).owner;
             if owner != 0 && owner != ipc.task {
+                // mach_vm_read_overwrite of another task: its copy is made
+                // into the caller's map (current_map()), which is this
+                // kernel's, so the routine runs here, the other map reached
+                // for its copyin.
+                if matches!(ipc.port(port).kobject, Some(super::ipc::Kobject::Task | super::ipc::Kobject::TaskRead)) && matches!(kmsg.id, 4808 | 3809) {
+                    if let Some(pid) = ipc.links.get(&owner).map(|l| l.pid) {
+                        self.dtask.read_from = Some(pid);
+                        let r = self.kobject_send(port, kmsg, options, timeout_zero);
+                        self.dtask.read_from = None;
+                        return r;
+                    }
+                }
                 // ipc_kobject_server, for another task's object: its kernel
                 // holds the object's state, and serves the request.
                 let caller = ipc.task;

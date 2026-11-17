@@ -1370,8 +1370,13 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
         },
         // mach_vm_read_overwrite and vm_read_overwrite: into this task's
         // memory at `data`.
-        (Kobject::Task, 4808 | 3809) => match (arg64(req, 0), arg64(req, 2), arg64(req, 4)) {
+        // (vm_map_read_t: the read port's map will do.)
+        (Kobject::Task | Kobject::TaskRead, 4808 | 3809) => match (arg64(req, 0), arg64(req, 2), arg64(req, 4)) {
             (Some(address), Some(size), Some(data)) => {
+                // Another task's map, read by the caller's kernel.
+                if let Some(pid) = k.dtask.read_from {
+                    return k.darwin_vm_copyin_other(pid, address, size).and_then(|b| k.darwin_vm_copy_overwrite_from(data, &b, Some(address))).map_or_else(|r| r, |()| Reply::ok(size.to_le_bytes().to_vec()));
+                }
                 // The copy goes to the caller's map (current_map()), which
                 // is this task's only when the caller is.
                 if req.sender.audit[5] as i32 != k.pid {

@@ -1368,6 +1368,59 @@ impl Kernel {
         self.darwin_own_memory(|_, m| m.read(addr, size as usize).map(<[u8]>::to_vec))?.map_err(|_| Reply::err(KERN_INVALID_ADDRESS))
     }
 
+    /// `vm_map_copyin` of process `pid`'s map (another task's) at `addr`:
+    /// its memory map held while the range is checked as this task's is
+    /// and the bytes copied. A copy small enough for a kernel buffer
+    /// (`msg_ool_size_small`) is that map's `copyin`, whose faults enter
+    /// the pages it reads in that map's pmap; a page whose object has none
+    /// to give (a file's past its end) fails it. A larger copy is a copy on
+    /// write of the entries, which enters nothing.
+    pub(crate) fn darwin_vm_copyin_other(&mut self, pid: i32, addr: u64, size: u64) -> Result<Vec<u8>, super::kobject::Reply> {
+        use super::kobject::Reply;
+        const KERN_INVALID_ADDRESS: i32 = 1;
+        const KERN_PROTECTION_FAILURE: i32 = 2;
+        const MSG_OOL_SIZE_SMALL: u64 = 32 << 10;
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+        let end = addr.checked_add(size).ok_or_else(|| Reply::err(KERN_INVALID_ADDRESS))?;
+        let Ok(peer) = self.procs.vm(pid) else { return Err(Reply::err(KERN_INVALID_ADDRESS)) };
+        let mut out: Result<Vec<u8>, Reply> = Err(Reply::err(KERN_INVALID_ADDRESS));
+        peer.mem.with_guest(&mut |g| {
+            let mut mm = peer.mm.lock();
+            let (first, stop) = (addr & !PAGE_MASK, (end + PAGE_MASK) & !PAGE_MASK);
+            let mut at = first;
+            while at < stop {
+                let Some(v) = mm.vma_at(at) else {
+                    out = Err(Reply::err(KERN_INVALID_ADDRESS));
+                    return;
+                };
+                if v.prot & crate::mem::prot::READ == 0 {
+                    out = Err(Reply::err(KERN_PROTECTION_FAILURE));
+                    return;
+                }
+                at = v.end;
+            }
+            let small = size <= MSG_OOL_SIZE_SMALL;
+            if small && (first..stop).step_by((PAGE_MASK + 1) as usize).any(|p| mm.is_absent(p >> gex_abi::PERM_PAGE_SHIFT)) {
+                out = Err(Reply::err(KERN_INVALID_ADDRESS));
+                return;
+            }
+            out = g.kernel().read(addr, size as usize).map(<[u8]>::to_vec).map_err(|_| Reply::err(KERN_INVALID_ADDRESS));
+            if small {
+                let mut p = first;
+                while p < stop {
+                    mm.enter_page(p >> gex_abi::PERM_PAGE_SHIFT);
+                    p += PAGE_MASK + 1;
+                }
+                for (page, bytes) in mm.take_perm_writes() {
+                    let _ = g.kernel().write(gex_abi::PERM_TABLE64 + page, &bytes);
+                }
+            }
+        });
+        out
+    }
+
     /// A routine's `copyout` of `data` to this task's `dst`: the range must
     /// be mapped (KERN_INVALID_ADDRESS) and writable
     /// (KERN_PROTECTION_FAILURE); the pages it writes are entered.

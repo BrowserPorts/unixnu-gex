@@ -241,6 +241,10 @@ pub struct Task {
     /// The task whose request to one of this task's kernel objects is
     /// being served (0: this task's own).
     pub kcaller: ipc::TaskKey,
+    /// While this task's own kernel serves its `mach_vm_read_overwrite` of
+    /// another task's map (whose copy is made into this map, the caller's
+    /// `current_map()`): that task's process.
+    pub read_from: Option<i32>,
     /// The send rights the next child task inherits (`ipc_task_init`):
     /// its special ports by kind, its registered ports, and its exception
     /// actions.

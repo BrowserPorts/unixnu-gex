@@ -169,6 +169,8 @@ impl Kernel {
         const RLIMIT_WAKEUPS_MONITOR: i32 = 1;
         const RLIMIT_CPU_USAGE_MONITOR: i32 = 2;
         const RLIMIT_THREAD_CPULIMITS: i32 = 3;
+        const RLIMIT_FOOTPRINT_INTERVAL: i32 = 4;
+        const FOOTPRINT_INTERVAL_RESET: u32 = 0x1;
         const CPUMON_MAKE_FATAL: u32 = 0x1000;
         let (pid, flavor, arg) = (a[0] as i32, a[1] as i32, a[2]);
         if pid != -1 && pid != self.pid {
@@ -202,8 +204,19 @@ impl Kernel {
                 self.darwin_unimplemented("proc_rlimit_control RLIMIT_THREAD_CPULIMITS (a thread blocked at its limit)".into());
                 Err(Errno::EINVAL)
             }
-            // CONFIG_LEDGER_INTERVAL_MAX is not in a device's kernel, and so
-            // not RLIMIT_FOOTPRINT_INTERVAL.
+            // CONFIG_LEDGER_INTERVAL_MAX (21H461's proc_rlimit_control at
+            // 0xfffffff00763bf98): FOOTPRINT_INTERVAL_RESET, the only
+            // option, begins a new interval of the phys_footprint ledger's
+            // peak; the ledger's own result is not looked at.
+            RLIMIT_FOOTPRINT_INTERVAL => {
+                if arg as u32 & FOOTPRINT_INTERVAL_RESET == 0 {
+                    return Err(Errno::EINVAL);
+                }
+                if let Some(l) = self.procs.jetsam().ledgers.get_mut(&self.pid) {
+                    l.get_interval_max(true);
+                }
+                Ok(0)
+            }
             _ => Err(Errno::EINVAL),
         }
     }

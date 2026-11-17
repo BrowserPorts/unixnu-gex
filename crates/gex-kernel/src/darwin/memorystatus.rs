@@ -271,8 +271,9 @@ fn default_task_limit(p: &Memstat) -> i32 {
     if p.entitled.legacy_footprint {
         limit = limit.max(MAX_TASK_FOOTPRINT_MB + LEGACY_FOOTPRINT_BONUS_MB);
     }
-    // ios13extended_footprint is only for 2 GB devices; this one has 4.
-    let max_mem: u64 = 4 << 30;
+    // ios13extended_footprint is only for 2 GB devices: max_mem, the
+    // memory the kernel manages (iBoot's memSize), from 1500 MB to 2 GB.
+    let max_mem = super::mig::machine::MEM_SIZE;
     if p.entitled.ios13extended_footprint && (1500 << 20..=2 << 30).contains(&max_mem) {
         limit = limit.max(IOS13EXTENDED_FOOTPRINT_LIMIT_MB);
     }

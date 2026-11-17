@@ -558,6 +558,9 @@ pub struct Ipc {
     next_task_hint: TaskKey,
     /// Every task's link, while this task holds the table.
     pub links: HashMap<TaskKey, Arc<TaskLink>>,
+    /// While a thread call runs: the processes it told of something
+    /// (what it woke there is not counted as an interrupt wakeup).
+    pub callout_remotes: Mutex<Option<Vec<i32>>>,
     /// This task's own link, kept for emptying its mailbox.
     pub link: Option<Arc<TaskLink>>,
     /// The kernel's own objects every task names alike (the host, host
@@ -826,6 +829,9 @@ impl Ipc {
     /// on it (a task that has ended hears nothing).
     pub fn remote(&self, task: TaskKey, r: Remote) -> bool {
         let Some(l) = self.links.get(&task) else { return false };
+        if let Some(v) = self.callout_remotes.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            v.push(l.pid);
+        }
         l.mailbox.lock().unwrap_or_else(|e| e.into_inner()).push(r);
         l.bell.ring();
         true

@@ -331,10 +331,11 @@ impl Kernel {
             // The ids and start time a fork chose for its child; a spawn's
             // child takes new ones.
             ..match t.fork_ids.lock().unwrap_or_else(|e| e.into_inner()).take() {
-                Some((uniqueid, pidversion, start)) => super::Task { uniqueid, pidversion, start, ..super::Task::default() },
+                Some((uniqueid, pidversion, start, abs)) => super::Task::forked_process(uniqueid, pidversion, start, abs),
                 None => super::Task::new_process(),
             }
         }
+        .with_wire_ledger()
     }
 
     /// `fork1`'s checks before it makes a process: the table not full
@@ -382,7 +383,8 @@ impl Kernel {
         // coalitions.
         super::coalition::fork(self.pid, pid);
         // forkproc's ids and start time for the child, which its task takes.
-        let ids = (super::next_uniqueid(), super::next_pidversion(), super::procinfo::microtime());
+        let (start, abs) = super::start_times();
+        let ids = (super::next_uniqueid(), super::next_pidversion(), start, abs);
         *self.dtask.fork_ids.lock().unwrap_or_else(|e| e.into_inner()) = Some(ids);
         // The child runs this image: its entitlements are these.
         let mut j = self.procs.jetsam();

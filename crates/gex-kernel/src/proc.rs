@@ -433,6 +433,9 @@ struct Proc {
     dead_cpu: (u64, u64),
     /// Its reaped children's (`p_stats->p_cru`'s times).
     children_cpu: (u64, u64),
+    /// Its ended threads' runnable time (`task->total_runnable_time`), in
+    /// Mach time units.
+    dead_runnable: u64,
     /// Darwin's `p_persona`'s id: the id it is counted against
     /// (`chgproccnt`) instead of its real uid.
     persona: Option<u32>,
@@ -852,6 +855,7 @@ impl ProcTable {
                     exit_reason: None,
                     dead_cpu: (0, 0),
                     children_cpu: (0, 0),
+                    dead_runnable: 0,
                     persona: None,
                     child_end: None,
                     execed: false,
@@ -947,6 +951,7 @@ impl ProcTable {
             exit_reason: None,
             dead_cpu: (0, 0),
             children_cpu: (0, 0),
+            dead_runnable: 0,
             persona,
             child_end: None,
             execed: false,
@@ -1253,6 +1258,11 @@ impl ProcTable {
     /// `pid` ends with `status` kept for its parent; `word` is the same end
     /// as a wait status, which says whether it is a crash.
     fn end(&self, pid: i32, status: i32, word: i32) {
+        // proc_exit's stash of a Darwin process's usage in p_ru, for
+        // proc_pid_rusage of the zombie.
+        if let Some(p) = self.darwin(pid).and_then(|(r, _)| r.downcast::<crate::darwin::procinfo::Public>().ok()) {
+            crate::darwin::rusage::proc_exit(self, pid, &p);
+        }
         // proc_exit's memorystatus_remove.
         self.jetsam().remove(pid);
         // Its threads are not runnable any more.
@@ -1428,7 +1438,15 @@ impl ProcTable {
         let ended = {
             let t = self.lock();
             t.procs.iter().find(|p| p.pid == pid).map(|p| {
-                let rollup = t.procs.iter().find(|q| q.pid == p.ppid).is_some_and(|q| !q.nocldwait);
+                let parent = t.procs.iter().find(|q| q.pid == p.ppid);
+                let rollup = parent.is_some_and(|q| !q.nocldwait);
+                // update_rusage_info_child, whatever the parent's
+                // P_NOCLDWAIT: for one that has it, proc_exit added the
+                // child once already.
+                if let (Some(child), Some(parent)) = (p.darwin.clone().and_then(|r| r.downcast::<crate::darwin::procinfo::Public>().ok()), parent.and_then(|q| q.darwin.clone()).and_then(|r| r.downcast::<crate::darwin::procinfo::Public>().ok())) {
+                    let times = if rollup { 1 } else { 2 };
+                    crate::darwin::rusage::reaped(&child, &parent, times);
+                }
                 (p.ppid, (p.dead_cpu.0 + p.children_cpu.0, p.dead_cpu.1 + p.children_cpu.1), p.darwin.clone(), rollup)
             })
         };
@@ -1758,7 +1776,7 @@ impl ProcTable {
     }
 
     /// `pid`'s task policy, a zombie's too.
-    pub fn task_policy(&self, pid: i32) -> Option<Arc<Mutex<crate::darwin::taskpolicy::TaskPolicy>>> {
+    pub fn task_policy(&self, pid: i32) -> Option<Arc<crate::darwin::taskpolicy::PolicyCell>> {
         self.lock().procs.iter().find(|p| p.pid == pid).map(|p| Arc::clone(&p.child.policy))
     }
 
@@ -1971,6 +1989,18 @@ impl ProcTable {
             p.dead_cpu.0 += user;
             p.dead_cpu.1 += sys;
         }
+    }
+
+    /// Add a thread's final runnable time to `pid`'s ended threads'.
+    pub fn add_dead_runnable(&self, pid: i32, runnable: u64) {
+        if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == pid) {
+            p.dead_runnable += runnable;
+        }
+    }
+
+    /// `pid`'s ended threads' runnable time.
+    pub fn dead_runnable(&self, pid: i32) -> u64 {
+        self.lock().procs.iter().find(|p| p.pid == pid).map_or(0, |p| p.dead_runnable)
     }
 
     /// `pid`'s reaped children's user and system time.

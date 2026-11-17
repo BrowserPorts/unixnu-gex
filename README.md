@@ -671,15 +671,30 @@ is the reference (search `crates/gex-kernel/src/` for
   facts the kernel does not have, some `sandbox_check` filter types,
   `sandbox_check` of another process's operation, and Sandbox's other
   `__mac_syscall` calls.
-- **IOKit.** The registry holds the device tree, the APFS services,
-  IOSurfaceRoot, the GPU's accelerator and the display's framebuffer, with
-  the drivers and nubs on their paths to the root.
+- **IOKit.** The registry holds the device tree, the internal storage's
+  stack (the PCIe root complex and root port, the NVMe controller, its
+  root namespace, its block storage driver, disk0, the GPT and its
+  partition, APFS's scheme, medium, container and volumes, and each
+  medium's BSD client, with the media wired into the `IODeviceTree` plane
+  as the drivers wire them), IOSurfaceRoot, the GPU's accelerator and the
+  display's framebuffer, with the drivers and nubs on their paths to the
+  root. Facts only the device gives (the NVMe controller's strings and
+  geometry, the GPT's GUIDs and layout, the container's UUID) are
+  stand-ins that gexc names on stderr at start.
   These are reported:
   - opening any other driver;
   - those drivers' other nubs and clients;
   - device tree entries no driver here made a nub of, as `IOService`
     entries;
-  - properties those drivers set in their start or probe;
+  - properties those drivers set in their start or probe, and an entry's
+    whole table (`io_registry_entry_get_properties_bin_buf`) where it
+    lacks them: the storage media's tables are whole (their open state
+    live), but the volumes lack what their superblocks give, the PCI nubs
+    what their configuration space gives, the controller what its
+    registers and NAND commands give, and the drivers their I/O counters;
+    the controller's other namespaces and objects are not modelled;
+    `IOClassNameOverride`, which only IOSkywalkFamily sets, is missing
+    everywhere;
   - IOGPU selectors and traps that make IOGPU objects, and AGXG9G's own
     selectors;
   - the framebuffer's user client selectors other than the swap's (begin,
@@ -749,12 +764,12 @@ is the reference (search `crates/gex-kernel/src/` for
   `RENAME_SECLUDE`, and opening a device whose driver is not modelled.
 - **Storage (reported shortcuts).** The volumes and their indexes are the
   erase restore's (System 0, Data 1, xART 2, Hardware 3, Preboot 4,
-  Update 5, User 6), but two facts of a 64 GB J120 are unmeasured and
+  Update 5, User 6), but facts of a 64 GB J120 are unmeasured and
   answered with stand-ins, which gexc names on stderr at start: the
   storage's BSD units (stand-ins disk0 and disk1, so volumes are
   `disk1s<index+1>`; measured from a sysdiagnose's ioreg IOMedia entries)
-  and disk0's capacity (measured the same way, or `ideviceinfo -q
-  com.apple.disk_usage`). APFS volumes' statfs counts are the stand-in
+  and disk0's capacity and the NVMe controller's identity (measured the
+  same way). APFS volumes' statfs counts are the stand-in
   numbers; exact ones need the capacity and APFS's space accounting
   (spaceman) after the restore and first boot. Volumes have the UUIDs newfs_apfs gives their roles; the System
   volume has the system image's, as ASR's restore of it, whether ASR keeps
@@ -806,6 +821,13 @@ is the reference (search `crates/gex-kernel/src/` for
   first, until `sysctl.name2oid` of it on the device measures it. APFS's `fsctl`s
   other than `APFSIOC_GET_DEV_BY_ROLE` and the virtual-interface query
   are reported.
+- **Memory size.** The device's DRAM (iBoot's `memSizeActual`:
+  `hw.memsize_physical`, `scale_setup`, the mbuf pool's tier that sets
+  `udp_recvspace`, IOGPU's sizes) and the memory the kernel manages, the
+  DRAM less iBoot's carveouts (`memSize`, `max_mem`: `hw.memsize`,
+  `host_basic_info`, memorystatus, the user wire limit, IOSurface's
+  allocation limit) are 4 GiB each until `sysctl hw.memsize_physical
+  hw.memsize` on the device measures them.
 - **Sockets.** Interface `ioctl`s know only `lo0`. An inet6 socket's
   protocol calls (binding, connecting, sending, receiving, its name,
   `shutdown`, `fstat`, the `IPPROTO_IPV6` and protocol-level options),
@@ -827,10 +849,20 @@ is the reference (search `crates/gex-kernel/src/` for
   task-wide CPU limit, the wakeups monitor, workloop CPU limits, and the
   pmap's and compressor's ledgers in `TASK_VM_INFO` (resident, internal,
   external, reusable and compressed sizes and their peaks, the footprint's
-  peak, decompressions, swap-ins). On a host without per-thread clocks,
-  the virtual timers, `RLIMIT_CPU`, the CPU monitor, the workqueue's
-  quantum and `getrusage`'s times are reported; on one that cannot say
-  which pages are a task's, `phys_footprint` is.
+  peak, decompressions, swap-ins), and `proc_pid_rusage`'s fields that
+  need them: the interrupt wakeups that a thread call's signal or message
+  to another task made, wakeups in the platform-idle state,
+  page-ins, resident pages, disk I/O, logical
+  writes, the CPMU's instructions and cycles, CLPC's energy, another live
+  process's footprint, the footprint's peaks, and the bank's bills once an
+  account names the process (its time and that time by each thread's
+  effective QoS, its other wakeups from interrupt context, runnable time,
+  wirings, own
+  footprint, start, end and reaped children's sums are kept). On a host
+  without per-thread clocks, the virtual timers, `RLIMIT_CPU`, the CPU
+  monitor, the workqueue's quantum and `getrusage`'s and
+  `proc_pid_rusage`'s times are reported; on one that cannot say which
+  pages are a task's, `phys_footprint` is.
 - **Terminals.** Terminal `ioctl`s not handled, an `fcntl` that would sleep
   in the driver, calls that would wait for a revoke to finish, and parts of
   `revoke` itself. The console's window size (`km`'s, from the boot video

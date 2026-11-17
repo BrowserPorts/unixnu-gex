@@ -172,7 +172,7 @@ fn skipped(n: &Node) -> bool {
 
 /// The child of `parent` in the device tree that `IODTFindMatchingEntries`
 /// gives and whose names include `name`, less the names `excluded`.
-fn child(t: &[Node], parent: u32, name: &str, excluded: &[&str]) -> Option<u32> {
+pub(crate) fn child(t: &[Node], parent: u32, name: &str, excluded: &[&str]) -> Option<u32> {
     t[parent as usize].children.iter().copied().find(|&c| {
         let n = &t[c as usize];
         !skipped(n) && !excluded.contains(&n.name.as_str()) && names(n, name)
@@ -181,19 +181,23 @@ fn child(t: &[Node], parent: u32, name: &str, excluded: &[&str]) -> Option<u32> 
 
 /// A driver's properties from its personality and matching (see the
 /// module's documentation): its bundle, class, provider class, the name it
-/// matched, its category and score.
-fn driver_props(bundle: &str, class: &str, provider: &str, matched: &str, category: &str, score: u64, mut personality: Vec<(String, Prop)>) -> Vec<(String, Prop)> {
+/// matched (a personality by name), its category and score.
+pub(crate) fn driver_props(bundle: &str, class: &str, provider: &str, matched: Option<&str>, category: &str, score: u64, mut personality: Vec<(String, Prop)>) -> Vec<(String, Prop)> {
     let sym = |s: &str| Prop::Sym(s.to_string());
     let mut p = vec![
         ("CFBundleIdentifier".to_string(), sym(bundle)),
         ("CFBundleIdentifierKernel".to_string(), sym(bundle)),
         ("IOClass".to_string(), sym(class)),
         ("IOProviderClass".to_string(), sym(provider)),
-        ("IONameMatched".to_string(), Prop::Str(matched.to_string())),
+    ];
+    if let Some(m) = matched {
+        p.push(("IONameMatched".to_string(), Prop::Str(m.to_string())));
+    }
+    p.extend([
         ("IOMatchedAtBoot".to_string(), Prop::Bool(true)),
         ("IOMatchCategory".to_string(), sym(category)),
         ("IOProbeScore".to_string(), Prop::Num(score, 32)),
-    ];
+    ]);
     p.append(&mut personality);
     p
 }
@@ -206,18 +210,18 @@ pub fn add(t: &mut Vec<Node>) -> Option<u32> {
     if !names(root, "AppleARM") {
         return None;
     }
-    let driver = |name: &str, class: &'static str, parent: u32, service_props| Node { name: name.to_string(), props: Vec::new(), class, service_props, parent: Some(parent), children: Vec::new(), kernel_only: false, nub: None };
+    let driver = |name: &str, class: &'static str, parent: u32, service_props| Node { name: name.to_string(), props: Vec::new(), class, service_props, parent: Some(parent), children: Vec::new(), kernel_only: false, nub: None, dt: None, table: super::iokit::Table::Drivers };
     let pe = t.len() as u32;
     // The personality "AppleARMPE": IONameMatch "AppleARM", IOProbeScore
     // 1000 (a 64-bit number, which the probe's 32-bit score replaces).
-    let props = driver_props("com.apple.driver.AppleARMPlatform", PE, "IOPlatformExpertDevice", "AppleARM", "IODefaultMatchCategory", 1000, vec![("IONameMatch".to_string(), Prop::Str("AppleARM".to_string()))]);
+    let props = driver_props("com.apple.driver.AppleARMPlatform", PE, "IOPlatformExpertDevice", Some("AppleARM"), "IODefaultMatchCategory", 1000, vec![("IONameMatch".to_string(), Prop::Str("AppleARM".to_string()))]);
     t.push(driver(PE, PE, 0, props));
     let arm_io = child(t, 0, "arm-io,t8011", &["chosen", "memory", "options", "aliases"])?;
     t[arm_io as usize].nub = Some((PLATFORM_DEVICE, pe));
     let io = t.len() as u32;
     // The personality "AppleT8011IO": IONameMatch "arm-io,t8011",
     // IOPlatformActiveAction 80000.
-    let props = driver_props("com.apple.driver.AppleT8011", ARM_IO, PLATFORM_DEVICE, "arm-io,t8011", "IODefaultMatchCategory", 0, vec![
+    let props = driver_props("com.apple.driver.AppleT8011", ARM_IO, PLATFORM_DEVICE, Some("arm-io,t8011"), "IODefaultMatchCategory", 0, vec![
         ("IONameMatch".to_string(), Prop::Str("arm-io,t8011".to_string())),
         ("IOPlatformActiveAction".to_string(), Prop::Num(80000, 64)),
     ]);
@@ -239,6 +243,6 @@ pub fn arm_io_nub(t: &mut [Node], io: u32, name: &str) -> Option<u32> {
 pub fn add_resources(t: &mut Vec<Node>) -> u32 {
     let published = |key: &str| (key.to_string(), Prop::Sym("IOService".to_string()));
     let at = t.len() as u32;
-    t.push(Node { name: RESOURCES.to_string(), props: Vec::new(), class: RESOURCES, service_props: vec![published("IOKit"), published("IOBSD")], parent: None, children: Vec::new(), kernel_only: false, nub: None });
+    t.push(Node { name: RESOURCES.to_string(), props: Vec::new(), class: RESOURCES, service_props: vec![published("IOKit"), published("IOBSD")], parent: None, children: Vec::new(), kernel_only: false, nub: None, dt: None, table: super::iokit::Table::Drivers });
     at
 }

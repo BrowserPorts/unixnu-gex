@@ -621,6 +621,8 @@ pub struct ThreadSig {
     exit_reason: Mutex<Option<Note>>,
     /// Its processor time.
     pub cpu: crate::cpu::ThreadCpu,
+    /// A Darwin thread's part in its task's time by effective QoS.
+    pub qos: std::sync::Mutex<crate::darwin::rusage::QosThread>,
 }
 
 impl std::fmt::Debug for ThreadSig {
@@ -647,6 +649,7 @@ impl ThreadSig {
             name: Mutex::new(None),
             exit_reason: Mutex::new(None),
             cpu: crate::cpu::ThreadCpu::default(),
+            qos: Default::default(),
         }
     }
 

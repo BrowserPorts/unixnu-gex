@@ -46,6 +46,9 @@ const ROOT_SIZE: u64 = 64;
 pub struct Ledger {
     pub balance: i64,
     pub lifetime_max: i64,
+    /// `le_interval_max` (CONFIG_LEDGER_INTERVAL_MAX, which the device's
+    /// kernel has: `ledger_get_interval_max` at 0xfffffff00721986c).
+    pub interval_max: i64,
     pub limit: i64,
     /// `le_warn_percent`: the warning level in 16.16, or none.
     warn_percent: u32,
@@ -63,7 +66,7 @@ pub struct Ledger {
 /// warning level, neither active nor fatal.
 impl Default for Ledger {
     fn default() -> Ledger {
-        let mut l = Ledger { balance: 0, lifetime_max: 0, limit: LIMIT_INFINITY, warn_percent: PERCENT_NONE, called_back: false, warned: false, memlimit_active: false, memlimit_fatal: false, exc_active: false, exc_inactive: false };
+        let mut l = Ledger { balance: 0, lifetime_max: 0, interval_max: 0, limit: LIMIT_INFINITY, warn_percent: PERCENT_NONE, called_back: false, warned: false, memlimit_active: false, memlimit_fatal: false, exc_active: false, exc_inactive: false };
         l.set_limit(MAX_TASK_FOOTPRINT, PHYS_FOOTPRINT_WARNING_LEVEL);
         l
     }
@@ -118,6 +121,7 @@ impl Ledger {
     pub fn balance_is(&mut self, balance: i64) -> Option<Crossing> {
         self.balance = balance;
         self.lifetime_max = self.lifetime_max.max(balance);
+        self.interval_max = self.interval_max.max(balance);
         if !self.limit_exceeded() {
             if self.warn_level_exceeded() {
                 if !self.warned {
@@ -135,6 +139,16 @@ impl Ledger {
         }
         self.called_back = true;
         Some(Crossing::Exceeded)
+    }
+
+    /// `ledger_get_interval_max(..., reset)`: the peak since the last
+    /// reset, and with `reset` the next interval begun at the balance.
+    pub fn get_interval_max(&mut self, reset: bool) -> i64 {
+        let max = self.interval_max;
+        if reset {
+            self.interval_max = self.balance;
+        }
+        max
     }
 
     /// `task_has_triggered_exc_resource`, and its mark.
@@ -395,6 +409,12 @@ mod tests {
         assert_eq!(l.balance_is(100 << 20), None);
         assert_eq!(l.balance_is(3200 << 20), None);
         assert_eq!(l.lifetime_max, 3200 << 20);
+        // The interval's peak, until a reset begins the next at the balance.
+        assert_eq!(l.get_interval_max(true), 3200 << 20);
+        assert_eq!(l.get_interval_max(false), 3200 << 20);
+        assert_eq!(l.balance_is(100 << 20), None);
+        assert_eq!(l.get_interval_max(true), 3200 << 20);
+        assert_eq!((l.get_interval_max(false), l.lifetime_max), (100 << 20, 3200 << 20));
     }
 
     #[test]

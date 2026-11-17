@@ -175,7 +175,7 @@ mod config {
 
 /// The memory the configuration's sizes derive from: `hw.memsize_physical`,
 /// which IOGPU::start reads (0xfffffff005bd4494) into +696.
-const MEMSIZE: u64 = super::super::mig::machine::MEMORY;
+const MEMSIZE: u64 = super::super::mig::machine::MEM_ACTUAL;
 const PAGE: u64 = super::super::mig::machine::PAGE_SIZE as u64;
 
 /// +272, the shared (wired) memory limit: AGXG9G's 0xfffffff005be6774,

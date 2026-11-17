@@ -85,9 +85,44 @@ pub struct Facts {
     /// The order the storage's media took their BSD minors in
     /// ([`media_order`]).
     pub media_order: Option<[Media; MEDIA]>,
-    /// The size in bytes of disk0, the main namespace (its IOMedia's
-    /// "Size", 4096-byte blocks).
-    pub disk0_bytes: Option<u64>,
+    /// What the NVMe controller and its main namespace report of
+    /// themselves.
+    pub nvme: Option<Nvme>,
+    /// The GPT the restore wrote on disk0.
+    pub gpt: Option<Gpt>,
+    /// The container's `nx_uuid`, which newfs_apfs made at the restore.
+    pub container_uuid: Option<[u8; 16]>,
+}
+
+/// What the internal storage's NVMe controller answers of itself (Identify
+/// Controller: the model, serial and firmware strings, trailing spaces
+/// trimmed, and ONCS) and of its main namespace, NSID 1 (Identify
+/// Namespace: the current LBA format's size, NCAP and EUI64), as
+/// IONVMeFamily reads them (0xfffffff006a85d58, 0xfffffff006a954d8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Nvme {
+    pub model: &'static str,
+    pub serial: &'static str,
+    pub firmware: &'static str,
+    /// ONCS bit 2, Dataset Management: whether the namespace can unmap.
+    pub dataset_management: bool,
+    /// The LBA size, 512 to 4096 bytes.
+    pub block_size: u32,
+    /// NCAP, in blocks: disk0's size.
+    pub blocks: u64,
+    pub eui64: u64,
+}
+
+/// disk0's GPT: its disk GUID, and its one entry's first and last LBA,
+/// unique GUID and attributes (the restore made the partition "Container",
+/// of type Apple_APFS).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Gpt {
+    pub disk_guid: [u8; 16],
+    pub first_lba: u64,
+    pub last_lba: u64,
+    pub partition_guid: [u8; 16],
+    pub attributes: u64,
 }
 
 /// The BSD unit numbers ([`Facts::units`]).
@@ -100,13 +135,72 @@ pub struct Units {
 /// The web device's facts. Unset until measured on a 64 GB J120 erase-
 /// restored with 21H461; each, once measured, is set here with the
 /// measurement cited.
-pub const DEVICE: Facts = Facts { units: None, media_order: None, disk0_bytes: None };
+pub const DEVICE: Facts = Facts { units: None, media_order: None, nvme: None, gpt: None, container_uuid: None };
 
 /// What measures [`Facts::units`].
 pub const UNITS_MEASUREMENT: &str = "the BSD names of the main NVMe namespace's IOMedia and of the AppleAPFSMedia (a sysdiagnose's ioreg IOMedia entries)";
 
-/// What measures [`Facts::disk0_bytes`].
-pub const CAPACITY_MEASUREMENT: &str = "the Size of the main NVMe namespace's IOMedia (a sysdiagnose's ioreg IOMedia entries, or TotalDiskCapacity of `ideviceinfo -q com.apple.disk_usage`)";
+/// What measures [`Facts::nvme`].
+pub const NVME_MEASUREMENT: &str = "disk0's IOMedia's name, Size and Preferred Block Size, its NVMe namespace's NamespaceUUID, Device Characteristics and IOStorageFeatures (a sysdiagnose's ioreg IOService plane)";
+
+/// What stands in for [`Facts::nvme`] while it is unset: a 64 GB disk
+/// (64,000,000,000 bytes) of 4096-byte blocks, the size every other
+/// namespace of the device tree's `namespaces` must have (IONVMeFamily's
+/// namespace size check, 0xfffffff006a604a8), able to unmap, no EUI64,
+/// and strings that say what they are. A reported shortcut
+/// ([`unmeasured`]), not a fact of the device.
+pub const STAND_IN_NVME: Nvme = Nvme { model: "APPLE SSD (unmeasured)", serial: "(unmeasured)", firmware: "(unmeasured)", dataset_management: true, block_size: 4096, blocks: 15_625_000, eui64: 0 };
+
+/// The NVMe facts in force: the device's, or the stand-in.
+pub fn nvme() -> Nvme {
+    DEVICE.nvme.unwrap_or(STAND_IN_NVME)
+}
+
+/// What measures [`Facts::gpt`].
+pub const GPT_MEASUREMENT: &str = "the UUID of disk0's IOGUIDPartitionScheme and the Base, Size, UUID and GPT Attributes of its partition (a sysdiagnose's ioreg IOMedia entries)";
+
+/// What stands in for [`Facts::gpt`]: GUIDs that say they are not the
+/// device's (the restore makes them at random), and the partition over the
+/// whole of what a GPT of 128 entries of 128 bytes leaves of the disk at
+/// [`nvme`]'s block size (the first usable LBA after the header and the
+/// entries, the last before their backups), with no attributes.
+pub fn stand_in_gpt() -> Gpt {
+    let n = nvme();
+    let entries = (128 * 128u64).div_ceil(u64::from(n.block_size));
+    Gpt { disk_guid: uuid("00000000-0000-4000-8000-000000000001"), first_lba: 2 + entries, last_lba: n.blocks - 2 - entries, partition_guid: uuid("00000000-0000-4000-8000-000000000002"), attributes: 0 }
+}
+
+/// The GPT in force: the device's, or the stand-in.
+pub fn gpt() -> Gpt {
+    DEVICE.gpt.unwrap_or_else(stand_in_gpt)
+}
+
+/// What measures [`Facts::container_uuid`].
+pub const CONTAINER_UUID_MEASUREMENT: &str = "the UUID of the AppleAPFSMedia (a sysdiagnose's ioreg IOMedia entries, or `diskutil apfs list`'s container reference UUID)";
+
+/// What stands in for [`Facts::container_uuid`]: a UUID that says it is
+/// not the device's.
+pub const STAND_IN_CONTAINER_UUID: [u8; 16] = uuid("00000000-0000-4000-8000-000000000003");
+
+/// The container's `nx_uuid` in force: the device's, or the stand-in.
+pub fn container_uuid() -> [u8; 16] {
+    DEVICE.container_uuid.unwrap_or(STAND_IN_CONTAINER_UUID)
+}
+
+/// disk0's size in bytes: its namespace's blocks.
+pub fn disk0_bytes() -> u64 {
+    let n = nvme();
+    n.blocks * u64::from(n.block_size)
+}
+
+/// The container partition's offset and size in bytes on disk0
+/// (IOGUIDPartitionScheme's Base and Size: its first LBA, and its last
+/// less its first plus one, in disk0's blocks).
+pub fn partition_extent() -> (u64, u64) {
+    let g = gpt();
+    let b = u64::from(nvme().block_size);
+    (g.first_lba * b, (g.last_lba + 1 - g.first_lba) * b)
+}
 
 /// What stands in for [`Facts::units`] while it is unset: the main
 /// namespace the first whole disk, the container the next. A reported
@@ -231,17 +325,12 @@ pub fn volume_unencrypted(index: u32) -> Option<bool> {
     }
 }
 
-/// Whether the volumes' IOMedia are writable (`IOMedia::isWritable`, the
-/// `isWritable` APFS gives `IOMedia::init`, which it calls only through
-/// the vtable, 0xfffffff006f27da0): unmeasured. Stand-in: writable.
-pub const VOLUMES_WRITABLE: bool = true;
-
-/// What measures [`VOLUMES_WRITABLE`].
-pub const VOLUMES_WRITABLE_MEASUREMENT: &str = "the \"Writable\" property of the AppleAPFSVolume entries (a sysdiagnose's ioreg IOMedia entries)";
-
-/// Whether a volume's IOMedia is writable ([`VOLUMES_WRITABLE`]).
+/// Whether a volume's IOMedia is writable: `AppleAPFSVolume::init` gives
+/// `IOMedia::init` its container medium's `isWritable` (0xfffffff00666d52c,
+/// the `AppleAPFSMedia` the container is on), which is disk0's
+/// ([`disk_writable`]).
 pub fn volume_writable() -> bool {
-    VOLUMES_WRITABLE
+    disk_writable()
 }
 
 /// Whether iBoot's `/chosen` names the System volume as the one booted:
@@ -256,25 +345,23 @@ pub const BOOT_UUID_MATCHES: bool = false;
 /// What measures [`BOOT_UUID_MATCHES`].
 pub const BOOT_UUID_MEASUREMENT: &str = "`statfs(\"/\")`'s f_mntfromname on the device: \"com.apple.os.update-...@/dev/disk1s1\" for no match, a snapshot device's path for one";
 
-/// Whether the NVMe namespace reports itself write-protected: its
-/// `IONVMeBlockStorageDevice::reportWriteProtection` (0xfffffff006a96f7c,
-/// slot 0x5a8 of its vtable 0xfffffff006fab200) answers bit 0 of the
-/// controller's byte +0x189, which the controller sets at run time. disk0's
-/// IOMedia is writable when it is not (IOBlockStorageDriver.cpp
-/// `instantiateMediaObject`: `!_writeProtected`), and the GPT partition
-/// (IOGUIDPartitionScheme.cpp) and the container's `AppleAPFSMedia` (the
-/// container scheme's start, 0xfffffff0066829d4, `isWritable()` of the
-/// partition at 0xfffffff006682de4) are writable as it is. Unmeasured.
-/// Stand-in: writable.
-pub const DISK_WRITABLE: bool = true;
-
-/// What measures [`DISK_WRITABLE`].
-pub const DISK_WRITABLE_MEASUREMENT: &str = "the \"Writable\" property of disk0's IOMedia (a sysdiagnose's ioreg IOMedia entries)";
-
-/// Whether disk0, its partition and the container's medium are writable
-/// ([`DISK_WRITABLE`]).
+/// Whether disk0, its partition and the container's medium are writable.
+/// disk0's IOMedia is writable when its NVMe namespace does not report
+/// itself write-protected (IOBlockStorageDriver.cpp `instantiateMediaObject`:
+/// `!_writeProtected`), and the GPT partition (IOGUIDPartitionScheme.cpp)
+/// and the container's `AppleAPFSMedia` (the container scheme's start,
+/// `isWritable()` of the partition at 0xfffffff006682de4) are writable as
+/// it is. The namespace's `IONVMeBlockStorageDevice::reportWriteProtection`
+/// (0xfffffff006a96f7c, slot 0x5a8 of its vtable 0xfffffff006fab200)
+/// answers bit 8 of its controller's flags (+0x188). Only
+/// `IONVMeController`'s handler of the SMART log's critical warning (slot
+/// 0x628, 0xfffffff006a86214) sets that bit, from the warning's read-only
+/// bit, and `AppleEmbeddedNVMeController`, the internal storage's
+/// controller, replaces that handler with one that clears the bit and
+/// succeeds (0xfffffff006a5cd90, in its vtable 0xfffffff006f9fab0): the
+/// namespace is never write-protected.
 pub fn disk_writable() -> bool {
-    DISK_WRITABLE
+    true
 }
 
 /// The facts still unset, each with what measures it, as the line gexc
@@ -296,11 +383,18 @@ pub fn unmeasured() -> Option<String> {
     gaps.push(super::preboot::NEXT_OBJ_ID_STAND_IN.to_string());
     gaps.push(super::kern::DEVFS_STAT_STAND_IN.to_string());
     gaps.push(super::kern::PREBOOT_BOOTED_FLAGS_STAND_IN.to_string());
+    gaps.push(super::mig::machine::MEM_ACTUAL_STAND_IN.to_string());
+    gaps.push(super::mig::machine::MEM_SIZE_STAND_IN.to_string());
     gaps.push(format!("whether iBoot's /chosen boot-uuid or apfs-preboot-uuid names the System volume (stand-in {BOOT_UUID_MATCHES}: the root mounted from its snapshot by name, with a new fsid; measure {BOOT_UUID_MEASUREMENT})"));
-    gaps.push(format!("whether the volumes' IOMedia are writable (stand-in {VOLUMES_WRITABLE}; measure {VOLUMES_WRITABLE_MEASUREMENT})"));
-    gaps.push(format!("whether disk0 is write-protected (stand-in writable: {DISK_WRITABLE}; measure {DISK_WRITABLE_MEASUREMENT})"));
-    if DEVICE.disk0_bytes.is_none() {
-        gaps.push(format!("disk0's capacity (APFS statfs counts are stand-ins; measure {CAPACITY_MEASUREMENT})"));
+    if DEVICE.nvme.is_none() {
+        let n = STAND_IN_NVME;
+        gaps.push(format!("the NVMe controller's identity and disk0's geometry (stand-in model {:?}, {} blocks of {} bytes, unmap {}, no EUI64; APFS statfs counts are stand-ins too; measure {NVME_MEASUREMENT})", n.model, n.blocks, n.block_size, n.dataset_management));
+    }
+    if DEVICE.gpt.is_none() {
+        gaps.push(format!("disk0's GPT GUIDs and layout (stand-in: unmeasured GUIDs, the partition over all usable blocks; measure {GPT_MEASUREMENT})"));
+    }
+    if DEVICE.container_uuid.is_none() {
+        gaps.push(format!("the container's nx_uuid (stand-in 00000000-0000-4000-8000-000000000003; measure {CONTAINER_UUID_MEASUREMENT})"));
     }
     (!gaps.is_empty()).then(|| format!("unmeasured facts of a 64 GB J120 answered with stand-ins: {}", gaps.join("; ")))
 }

@@ -553,6 +553,7 @@ impl Kernel {
                 main.policy.relpri = 0;
             }
             let main_qos = pp::from_qos(main.policy.qos, 0, 0);
+            self.darwin_qos_note(self.tid);
             out[16..24].copy_from_slice(&main_qos.to_le_bytes());
             out[36..44].copy_from_slice(&reg.stack_addr_hint.to_le_bytes());
             // `pthread_mutex_default_policy`: 0 unless a boot-arg sets it,
@@ -660,6 +661,7 @@ impl Kernel {
             thread.suspend = 1;
             thread.unstarted = Some(req);
             self.dtask.threads.map.insert(req.tid, thread);
+            self.darwin_qos_note(req.tid);
             // Made and not started: TH_WAIT | TH_UNINT until it is.
             self.procs.sched.set_state(self.pid, req.tid, RunState::Unint);
             return Ok(None);
@@ -667,6 +669,7 @@ impl Kernel {
         // thread_create_running: started, in TH_RUN.
         thread.sched_seen = true;
         self.dtask.threads.map.insert(req.tid, thread);
+        self.darwin_qos_note(req.tid);
         self.procs.sched.set_state(self.pid, req.tid, RunState::Run);
         Ok(Some(req))
     }

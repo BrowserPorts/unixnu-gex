@@ -35,8 +35,22 @@ pub(crate) const MIG_BAD_ARGUMENTS: i32 = -304;
 pub mod machine {
     /// J120's device tree: `cpu0`..`cpu2` (`#main-cpus` 3).
     pub const NCPUS: u32 = 3;
-    /// The iPad Pro (12.9-inch, 2nd generation)'s 4 GiB.
-    pub const MEMORY: u64 = 4 << 30;
+    /// iBoot's `memSizeActual`, the DRAM's size: `mem_actual` and
+    /// `max_mem_actual` (`arm_vm_init`), which `hw.memsize_physical`,
+    /// `scale_setup`, the mbuf pool's tier and IOGPU read. The iPad Pro
+    /// (12.9-inch, 2nd generation)'s 4 GiB, unmeasured ([`MEM_ACTUAL_STAND_IN`]).
+    pub const MEM_ACTUAL: u64 = 4 << 30;
+    /// iBoot's `memSize`, the DRAM less the carveouts iBoot keeps at its
+    /// top, rounded down to the page: `mem_size` and `max_mem`
+    /// (`arm_vm_init`, with no `maxmem` boot argument), which `hw.memsize`,
+    /// `host_basic_info`, memorystatus and the user wire limit read.
+    /// Unmeasured: the stand-in is [`MEM_ACTUAL`]'s, where the device's is
+    /// below it by the carveouts ([`MEM_SIZE_STAND_IN`]).
+    pub const MEM_SIZE: u64 = MEM_ACTUAL;
+    /// The stand-in [`MEM_ACTUAL`] is, as gexc reports it.
+    pub const MEM_ACTUAL_STAND_IN: &str = "the device's DRAM size (iBoot's memSizeActual: mem_actual and max_mem_actual, hw.memsize_physical, and the mbuf pool's tier that sets udp_recvspace) (stand-in 4 GiB, so a 96 MB pool and udp_recvspace 786896; under 4 GiB the pool is 64 MB and udp_recvspace 196724; measure `sysctl hw.memsize_physical net.inet.udp.recvspace` on the device)";
+    /// The stand-in [`MEM_SIZE`] is, as gexc reports it.
+    pub const MEM_SIZE_STAND_IN: &str = "the memory the kernel manages (iBoot's memSize: mem_size and max_mem, hw.memsize, host_basic_info's memory_size and max_mem, the user wire limit, IOSurface's allocation limit) (stand-in 4 GiB, the DRAM's, where the device's is below it by iBoot's carveouts; memorystatus's ios13extended_footprint answer is the same for any size above 2 GB; measure `sysctl hw.memsize` on the device)";
     /// `task_threadmax` after `scale_setup`: `CONFIG_TASK_MAX` is 512 for
     /// the xsmall memory tag, and a machine with at least 3 GiB (and under
     /// 8) doubles it.
@@ -322,7 +336,7 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             // An OSString's bytes and its NUL, an OSBoolean's "Yes" or "No",
             // an OSNumber's or OSData's bytes; a collection is not bytes.
             let live = super::iokit::live_prop(super::iokit::tree(), *i, &name);
-            let typed = live.as_ref().or_else(|| node.service_props.iter().find(|(k, _)| *k == name).map(|(_, p)| p)).map(super::iokit::prop_bytes);
+            let typed = live.as_ref().or_else(|| super::iokit::service_prop(node, &name)).map(super::iokit::prop_bytes);
             let value = match (typed, node.props.iter().find(|(k, _)| *k == name)) {
                 (Some(Some(v)), _) => v,
                 (Some(None), _) => return Reply::err(K_IO_RETURN_BAD_ARGUMENT),
@@ -368,27 +382,37 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             if k.darwin_mac_check_iokit_get_property(super::iokit::sb_entry(*i), super::iokit::is_nvram(*i), name) != 0 {
                 return Reply::err(super::iokit::ret::NOT_PERMITTED);
             }
-            let Some(node) = super::iokit::tree().get(*i as usize) else { return bad() };
+            let t = super::iokit::tree();
+            if t.get(*i as usize).is_none() {
+                return bad();
+            }
             let name = String::from_utf8_lossy(name).into_owned();
-            if options as u32 & K_IO_REGISTRY_ITERATE_RECURSIVELY != 0 && !plane.is_empty() || name == "IORegistryEntryPropertyKeys" {
+            if name == "IORegistryEntryPropertyKeys" {
                 let mut r = Reply::err(K_IO_RETURN_NOT_FOUND);
-                r.unimplemented = Some(format!("io_registry_entry_get_property_bin_buf of {name} (recursion or the property keys)"));
+                r.unimplemented = Some(format!("io_registry_entry_get_property_bin_buf of {name} (the property keys)"));
                 return r;
             }
-            let bin = if let Some(p) = super::iokit::live_prop(super::iokit::tree(), *i, &name) {
-                super::iokit::serialize_prop(&p)
-            } else if let Some((_, p)) = node.service_props.iter().find(|(k, _)| *k == name) {
-                super::iokit::serialize_prop(p)
-            } else if let Some((_, value)) = node.props.iter().find(|(k, _)| *k == name) {
-                super::iokit::serialize_data(if node.kernel_only { &[] } else { value })
+            let found = if options as u32 & K_IO_REGISTRY_ITERATE_RECURSIVELY != 0 && !plane.is_empty() {
+                let plane = match super::iokit::plane(plane) {
+                    Ok(p) => p,
+                    Err(what) => {
+                        let mut r = Reply::err(K_IO_RETURN_NOT_FOUND);
+                        r.unimplemented = Some(format!("io_registry_entry_get_property_bin_buf of {name} over {what}"));
+                        return r;
+                    }
+                };
+                super::iokit::search(t, *i, plane, options as u32, &name, |e| k.darwin_mac_check_iokit_get_property(super::iokit::sb_entry(e), super::iokit::is_nvram(e), name.as_bytes()) == 0)
             } else {
-                // The platform expert device has the platform's properties
-                // besides the device tree's.
-                let mut r = Reply::err(K_IO_RETURN_NOT_FOUND);
-                if super::iokit::property_unknown(super::iokit::tree(), *i, &name) {
-                    r.unimplemented = Some(format!("the {} property {name:?}", super::iokit::name(super::iokit::tree(), *i)));
+                super::iokit::lookup(t, *i, &name).map(|v| (v, false))
+            };
+            let bin = match found {
+                Ok((Some(bin), _)) => bin,
+                Ok((None, refused)) => return Reply::err(if refused { super::iokit::ret::NOT_PERMITTED } else { K_IO_RETURN_NOT_FOUND }),
+                Err(what) => {
+                    let mut r = Reply::err(K_IO_RETURN_NOT_FOUND);
+                    r.unimplemented = Some(what);
+                    return r;
                 }
-                return r;
             };
             let mut out = NDR_RECORD.to_vec();
             if buf != 0 && bin.len() as u64 <= bufsize {
@@ -408,6 +432,44 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
                 r.ports.push(PortOut::Ool(bin));
                 r
             }
+        }
+        // io_registry_entry_get_properties_bin_buf(entry, buf, bufsize) ->
+        // properties, bufsize: the entry's whole table in OSSerializeBinary,
+        // into `buf` when it fits, else out of line. Sandbox's filter
+        // (mac_iokit_check_filter_properties' editor) drops each key its
+        // iokit-get-properties check refuses.
+        (Kobject::IoEntry(i), 2888) => {
+            let (Some(buf), Some(bufsize)) = (arg64(req, 0), arg64(req, 2)) else { return bad() };
+            let t = super::iokit::tree();
+            if t.get(*i as usize).is_none() {
+                return bad();
+            }
+            let mut props = super::iokit::properties(t, *i);
+            let entry = super::iokit::sb_entry(*i);
+            let nvram = super::iokit::is_nvram(*i);
+            props.retain(|(name, _)| k.darwin_mac_check_iokit_get_property(entry.clone(), nvram, name.as_bytes()) == 0);
+            let bin = super::iokit::serialize_prop(&super::iokit::Prop::Dict(props));
+            let mut out = NDR_RECORD.to_vec();
+            let mut r = if buf != 0 && bin.len() as u64 <= bufsize {
+                if let Err(r) = k.darwin_vm_copy_overwrite(buf, &bin) {
+                    return r;
+                }
+                out.extend_from_slice(&(bin.len() as u64).to_le_bytes());
+                out.extend_from_slice(&0u32.to_le_bytes());
+                let mut r = Reply::ok(out);
+                r.ports.push(PortOut::Ool(Vec::new()));
+                r
+            } else {
+                out.extend_from_slice(&0u64.to_le_bytes());
+                out.extend_from_slice(&(bin.len() as u32).to_le_bytes());
+                let mut r = Reply::ok(out);
+                r.ports.push(PortOut::Ool(bin));
+                r
+            };
+            if let Some(missing) = super::iokit::properties_missing(t, *i) {
+                r.unimplemented = Some(format!("io_registry_entry_get_properties_bin_buf of {}: {missing} not modelled", super::iokit::name(t, *i)));
+            }
+            r
         }
         // io_service_get_matching_services_bin(main_port, matching, cnt) ->
         // existing: an iterator of what the dictionary matches.
@@ -545,6 +607,9 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             }
             match super::iokit::plane(plane) {
                 Ok(super::iokit::Plane::DeviceTree) if *i == 0 => Reply::ok(io_name_reply(&t[0].name)),
+                // A service a driver attached in the device tree plane has
+                // the name it gave it there.
+                Ok(super::iokit::Plane::DeviceTree) if t.get(*i as usize).is_some_and(|n| n.dt.is_some()) => Reply::ok(io_name_reply(&t[*i as usize].dt.as_ref().unwrap().name)),
                 Ok(_) => Reply::ok(io_name_reply(&super::iokit::name(t, *i))),
                 Err(what) => {
                     let mut r = Reply::err(0xe00002c7_u32 as i32);
@@ -554,10 +619,13 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             }
         }
         // io_registry_entry_get_location_in_plane(entry, plane) -> location:
-        // a volume's index in its container.
+        // the location the entry was given in the plane, else its own (a
+        // volume's index in its container, a partition's number).
         (Kobject::IoEntry(i), 2854) => {
             let Some(node) = super::iokit::tree().get(*i as usize) else { return bad() };
-            match super::iokit::location(node) {
+            let Some((plane, _)) = inline_cstr(req, 0, 128) else { return bad() };
+            let plane = if plane.is_empty() { None } else { super::iokit::plane(plane).ok() };
+            match super::iokit::location_in(node, plane) {
                 Some(l) => Reply::ok(io_name_reply(&l)),
                 None => Reply::err(0xe00002f0_u32 as i32),
             }
@@ -1357,7 +1425,10 @@ fn host_info(flavor: i32, count: u32) -> Reply {
     const HOST_SEMAPHORE_TRAPS: i32 = 7;
     const HOST_MACH_MSG_TRAP: i32 = 8;
     const HOST_PREFERRED_USER_ARCH: i32 = 12;
-    let mem32 = MEMORY.min(u64::from(u32::MAX)) as u32;
+    // machine_conf's `(uint32_t)mem_size`: the device's mem_size is below
+    // 4 GiB, so the cast keeps it whole; the 4 GiB stand-in is held at the
+    // largest 32-bit size rather than wrapped to 0, which no device gives.
+    let mem32 = MEM_SIZE.min(u64::from(u32::MAX)) as u32;
     match flavor {
         // max_cpus, avail_cpus, memory_size, cpu_type, cpu_subtype, then
         // with room cpu_threadtype, physical_cpu, physical_cpu_max,
@@ -1368,7 +1439,7 @@ fn host_info(flavor: i32, count: u32) -> Reply {
             }
             let mut w = vec![NCPUS, NCPUS, mem32, CPU_TYPE_ARM64, machine::CPU_SUBTYPE];
             if count >= 12 {
-                w.extend([0, NCPUS, NCPUS, NCPUS, NCPUS, MEMORY as u32, (MEMORY >> 32) as u32]);
+                w.extend([0, NCPUS, NCPUS, NCPUS, NCPUS, MEM_SIZE as u32, (MEM_SIZE >> 32) as u32]);
             }
             Reply::ok(words(&w))
         }
@@ -2090,13 +2161,13 @@ fn connect_routine(k: &mut Kernel, req: &Kmsg, id: u32, n: i32) -> Reply {
         2800 | 2810 => Reply::ok(io_name_reply(c.class)),
         2801 => match inline_cstr(req, 0, 128) {
             Some((name, _)) => {
-                let chain = super::iokit::superclasses(c.class);
-                if chain.is_empty() {
-                    let mut r = Reply::err(ret::UNSUPPORTED);
-                    r.unimplemented = Some(format!("the superclasses of the user client class {}", c.class));
-                    r
-                } else {
-                    Reply::ok(u32::from(chain.contains(&String::from_utf8_lossy(name).as_ref())).to_le_bytes().to_vec())
+                match super::iokit::class_chain(c.class) {
+                    None => {
+                        let mut r = Reply::err(ret::UNSUPPORTED);
+                        r.unimplemented = Some(format!("the superclasses of the user client class {}", c.class));
+                        r
+                    }
+                    Some(chain) => Reply::ok(u32::from(chain.contains(&String::from_utf8_lossy(name).as_ref())).to_le_bytes().to_vec()),
                 }
             }
             None => bad(),

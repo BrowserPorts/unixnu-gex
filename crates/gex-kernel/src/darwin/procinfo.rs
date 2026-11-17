@@ -52,6 +52,8 @@ pub struct Public {
     pub p_name: super::reason::PName,
     /// Its signal dispositions, real timer and accounting flags.
     pub live: Arc<super::kinfo::Live>,
+    /// What `proc_pid_rusage` reads of it beyond the rest.
+    pub rusage: Arc<super::rusage::Shared>,
 }
 
 impl Public {
@@ -84,6 +86,7 @@ impl Public {
             sandbox: Default::default(),
             p_name: Default::default(),
             live: Default::default(),
+            rusage: super::rusage::Shared::new(0),
         }
     }
 }
@@ -321,6 +324,7 @@ impl Kernel {
             sandbox: Arc::clone(&self.dtask.sandbox),
             p_name: self.dtask.p_name,
             live: Arc::clone(&self.dtask.live),
+            rusage: Arc::clone(&self.dtask.rusage),
         }
     }
 
@@ -404,8 +408,9 @@ impl Kernel {
             11 => self.darwin_listcoalitions(m, pid, fl as i32, buf, size),
             12 => self.darwin_can_use_foreground_hw(m, pid, buf, size),
             call::PIDFILEPORTINFO => self.darwin_proc_pidfileportinfo(m, pid, fl, arg as u32, buf, size),
-            // KERNMSGBUF, PIDRUSAGE, PIDDYNKQUEUEINFO, TERMINATE_RSR.
-            4 | 9 | 13 | 16 => {
+            call::PIDRUSAGE => self.darwin_proc_pid_rusage(m, pid, fl, buf),
+            // KERNMSGBUF, PIDDYNKQUEUEINFO, TERMINATE_RSR.
+            4 | 13 | 16 => {
                 self.darwin_unimplemented(format!("proc_info call {callnum} (flavor {fl})"));
                 Err(e::EINVAL)
             }
@@ -778,7 +783,7 @@ impl Kernel {
     /// (Sandbox's operation for the call), then for most flavors the
     /// caller's euid the target's, or the privilege to see other users'
     /// processes.
-    fn darwin_proc_info_policy(&mut self, target: Option<&Public>, callnum: u64, same_user: bool) -> Result<(), i32> {
+    pub(crate) fn darwin_proc_info_policy(&mut self, target: Option<&Public>, callnum: u64, same_user: bool) -> Result<(), i32> {
         let op = match callnum {
             call::LISTPIDS => 127,
             call::PIDINFO => 128,

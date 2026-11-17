@@ -185,6 +185,68 @@ pub struct TaskPolicy {
     pub game_mode: bool,
 }
 
+/// A task's policy as the tasks that may change it share it, with its
+/// CPU time by its threads' effective QoS (`cpu_time_eqos_stats`). A change
+/// to the policy's part of its threads' effective QoS (its QoS clamp and
+/// ceiling, DARWIN_BG, termination) is settled as the guard goes: each
+/// thread's time so far is credited to the QoS it had, as
+/// `task_policy_update_complete_unlocked` updates each thread's policy
+/// (`thread_policy_update_spinlocked`, `thread_update_qos_cpu_time_locked`).
+#[derive(Debug, Default)]
+pub struct PolicyCell {
+    policy: std::sync::Mutex<TaskPolicy>,
+    pub qos_time: super::rusage::QosTime,
+}
+
+impl PolicyCell {
+    pub fn new(p: TaskPolicy) -> PolicyCell {
+        PolicyCell { policy: std::sync::Mutex::new(p), qos_time: Default::default() }
+    }
+
+    /// The policy, held until the guard goes.
+    pub fn lock(&self) -> std::sync::LockResult<PolicyGuard<'_>> {
+        match self.policy.lock() {
+            Ok(g) => Ok(self.guard(g)),
+            Err(e) => Err(std::sync::PoisonError::new(self.guard(e.into_inner()))),
+        }
+    }
+
+    fn guard<'a>(&'a self, g: std::sync::MutexGuard<'a, TaskPolicy>) -> PolicyGuard<'a> {
+        let before = g.effective;
+        PolicyGuard { cell: self, g, before }
+    }
+}
+
+/// A held [`PolicyCell`].
+pub struct PolicyGuard<'a> {
+    cell: &'a PolicyCell,
+    g: std::sync::MutexGuard<'a, TaskPolicy>,
+    before: Effective,
+}
+
+impl std::ops::Deref for PolicyGuard<'_> {
+    type Target = TaskPolicy;
+    fn deref(&self) -> &TaskPolicy {
+        &self.g
+    }
+}
+
+impl std::ops::DerefMut for PolicyGuard<'_> {
+    fn deref_mut(&mut self) -> &mut TaskPolicy {
+        &mut self.g
+    }
+}
+
+impl Drop for PolicyGuard<'_> {
+    fn drop(&mut self) {
+        let after = self.g.effective;
+        let part = |e: &Effective| (e.qos_clamp, e.qos_ceiling, e.darwinbg, e.terminated);
+        if part(&self.before) != part(&after) {
+            self.cell.qos_time.task_changed(&self.before, &after);
+        }
+    }
+}
+
 impl Default for TaskPolicy {
     /// `default_task_requested_policy` and `default_task_effective_policy`,
     /// at a user task's priority (`task_create_internal`).

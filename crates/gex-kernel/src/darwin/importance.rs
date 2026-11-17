@@ -21,13 +21,13 @@
 
 use super::ipc::msg::Kmsg;
 use super::ipc::{Ipc, ObjId, Receiver, TaskKey};
-use super::taskpolicy::{Importance, TaskPolicy};
+use super::taskpolicy::Importance;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// A task's policy, shared by its process.
-pub type Policy = Arc<Mutex<TaskPolicy>>;
+pub type Policy = Arc<super::taskpolicy::PolicyCell>;
 
 /// A live donor's donor mark changed with its effective policy: its
 /// importance is to be propagated ([`Ipc::importance_settle`]).

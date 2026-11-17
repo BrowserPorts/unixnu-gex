@@ -107,12 +107,11 @@ impl Proto {
     }
 
     /// The buffers `soreserve` gives the attached socket, receive and send:
-    /// `udp_recvspace` (`udp_init`'s for a pool of 96 MB or more of
-    /// clusters, as the inet sockets here take it) and `udp_sendspace`, or
-    /// `tcp_recvspace` and `tcp_sendspace`.
+    /// [`udp_recvspace`] and `udp_sendspace`, or `tcp_recvspace` and
+    /// `tcp_sendspace`.
     fn hiwat(self) -> (u64, u64) {
         match self {
-            Proto::Udp => (786896, 9216),
+            Proto::Udp => (udp_recvspace(), 9216),
             Proto::Tcp => (1448 * 384, 1448 * 256),
         }
     }
@@ -316,8 +315,45 @@ mod class {
     }
 }
 
-/// `lo0`'s interface index: `loopattach` attaches it first.
+/// `lo0`'s interface index: `if_next_index` gives the first interface
+/// attached 1, and `bsd_init`'s `loopattach` (after `bsd_autoconf`) is the
+/// first `ifnet_attach`: IONetworkingFamily's IONetworkStack attaches no
+/// published interface until configd's InterfaceNamer names it
+/// (`interfacePublished` leaves it in `_ifListNaming`), and gif and the
+/// other cloned interfaces are made later.
 pub const LO0_INDEX: u16 = 1;
+
+/// `udp_recvspace` once `udp_init` has run: 786896 for an mbuf pool
+/// (`nmbclusters` 2 KB clusters) of 96 MB or more, else its initial
+/// `187 * (1024 + sizeof(struct sockaddr_in6))`. With no `ncl` or
+/// `mbuf_pool` boot argument, `bsd_mbuf_cluster_reserve` sizes the pool by
+/// `mbuf_default_ncl(mem_actual)` (`ncl_table`), rounded down to whole
+/// 16 KiB pages of clusters; `mem_actual` is iBoot's `memSizeActual`, a
+/// fact of the device answered with the 4 GiB stand-in
+/// ([`super::mig::machine::MEM_ACTUAL`]).
+pub fn udp_recvspace() -> u64 {
+    const MB: u64 = 1 << 20;
+    const GB: u64 = 1 << 30;
+    const MCLSHIFT: u32 = 11;
+    const NCLPG: u64 = 16384 >> MCLSHIFT;
+    // ncl_table: (nt_maxmem, nt_mbpool).
+    const NCL_TABLE: [(u64, u64); 5] = [(GB, 64 * MB), (4 * GB, 96 * MB), (8 * GB, 128 * MB), (16 * GB, 256 * MB), (32 * GB, 512 * MB)];
+    let mem = super::mig::machine::MEM_ACTUAL;
+    let mut pool = NCL_TABLE[0].1;
+    for (maxmem, mbpool) in NCL_TABLE {
+        if mem < maxmem {
+            break;
+        }
+        pool = mbpool;
+    }
+    let nmbclusters = (pool >> MCLSHIFT) / NCLPG * NCLPG;
+    if (nmbclusters << MCLSHIFT) >> 20 >= 96 {
+        786896
+    } else {
+        187 * (1024 + 28)
+    }
+}
+
 
 /// The zone embedded in a scoped address (`ntohs(s6_addr16[1])`).
 fn zone(a: &[u8; 16]) -> u16 {
@@ -1057,6 +1093,12 @@ mod tests {
         c[112..120].copy_from_slice(&[0xff; 8]);
         c[120..].fill(0);
         assert_eq!(AliasReq::read(&c, false), r);
+    }
+
+    #[test]
+    fn udp_recvspace_follows_the_mbuf_pool() {
+        assert_eq!(udp_recvspace(), 786896);
+        assert_eq!(187 * (1024 + 28), 196724);
     }
 
     #[test]

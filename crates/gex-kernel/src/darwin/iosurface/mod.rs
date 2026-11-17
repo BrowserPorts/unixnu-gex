@@ -237,7 +237,7 @@ fn root<R>(f: impl FnOnce(&mut Root) -> R) -> R {
             displayed: [None; 8],
             displayed_bytes: 0,
             default_temp: None,
-            params: surface::RootParams { row_mask: (line - 1) | 0xf, offset_mask: (line - 1) | 0x3fff, max_alloc: super::mig::machine::MEMORY >> 2, debug: DEBUG_DEFAULT, page_size: super::mach::PAGE_MASK + 1 },
+            params: surface::RootParams { row_mask: (line - 1) | 0xf, offset_mask: (line - 1) | 0x3fff, max_alloc: super::mig::machine::MEM_SIZE >> 2, debug: DEBUG_DEFAULT, page_size: super::mach::PAGE_MASK + 1 },
         };
         r.grow();
         r.default_temp();

@@ -95,12 +95,15 @@ impl Kernel {
         if saved.is_some() {
             th.policy.qos = qos::UNSPECIFIED;
             th.policy.relpri = 0;
+            self.darwin_qos_note(tid);
         }
         let kr = self.thread_policy_set_internal(tid, caller, flavor, info);
+        self.darwin_qos_note(tid);
         if let (Some((q, r)), true) = (saved, kr != 0) {
             let p = &mut self.dtask.threads.map.entry(tid).or_default().policy;
             p.qos = q;
             p.relpri = r;
+            self.darwin_qos_note(tid);
         }
         kr
     }

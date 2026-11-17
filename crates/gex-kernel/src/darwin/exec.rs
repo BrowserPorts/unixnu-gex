@@ -584,6 +584,7 @@ impl Kernel {
         let main = self.darwin_me();
         main.policy.qos = q;
         main.policy.relpri = 0;
+        self.darwin_qos_note(self.tid);
         let mut s = match strings {
             Some(s) => s,
             None => {

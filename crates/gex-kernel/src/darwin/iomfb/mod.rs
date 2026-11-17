@@ -92,7 +92,7 @@ pub fn add_service(t: &mut Vec<Node>, nub: u32) {
         ("IOProbeScore".to_string(), Prop::Num(1, 32)),
         ("BacklightMatching".to_string(), backlight),
     ];
-    t.push(Node { name: CLASS.to_string(), props: Vec::new(), class: CLASS, service_props, parent: Some(nub), children: Vec::new(), kernel_only: false, nub: None });
+    t.push(Node { name: CLASS.to_string(), props: Vec::new(), class: CLASS, service_props, parent: Some(nub), children: Vec::new(), kernel_only: false, nub: None, dt: None, table: crate::darwin::iokit::Table::Drivers });
 }
 
 /// Property names no driver sets on the framebuffer (entry `i`, the

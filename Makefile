@@ -109,16 +109,23 @@ MESA_CHECKOUT = git -C $(ROOT) submodule update --init third_party/mesa third_pa
 # vite and the page's other npm packages, at package-lock.json's versions
 NPM_CI = [ $(ROOT)/page/node_modules/.package-lock.json -nt $(ROOT)/page/package-lock.json ] || (cd $(ROOT)/page && npm ci --no-audit --no-fund)
 # The page's guest-side cross compilers (toolchain/pins), unpacked once in
-# CACHE/toolchains; GEX_TOOLCHAIN= / GEX_X86_TOOLCHAIN= name others.
+# CACHE/toolchains; GEX_TOOLCHAIN= / GEX_X86_TOOLCHAIN= name others. Their
+# programs are i386 Linux ones: a host that does not run those (any but x86
+# Linux) uses each one's target files with its own clang and lld
+# (toolchain/musl-cross-clang.sh: TOOLCHAIN.clang).
 TC := $(CACHE)/toolchains
-GEX_TOOLCHAIN ?= $(TC)/aarch64-linux-musl-cross
-GEX_X86_TOOLCHAIN ?= $(TC)/x86_64-linux-musl-cross
+TC_HOST := $(if $(filter Linux-x86_64 Linux-i%86,$(shell uname -s)-$(shell uname -m)),,.clang)
+GEX_TOOLCHAIN ?= $(TC)/aarch64-linux-musl-cross$(TC_HOST)
+GEX_X86_TOOLCHAIN ?= $(TC)/x86_64-linux-musl-cross$(TC_HOST)
 export GEX_TOOLCHAIN GEX_X86_TOOLCHAIN
-toolchains: $(TC)/aarch64-linux-musl-cross/.pinned $(TC)/x86_64-linux-musl-cross/.pinned
+toolchains: $(foreach a,aarch64 x86_64,$(TC)/$(a)-linux-musl-cross/.pinned $(if $(TC_HOST),$(TC)/$(a)-linux-musl-cross.clang/.made))
 $(TC)/%-linux-musl-cross/.pinned:
 	$(ROOT)/wine/dl.sh $(MUSL_CROSS_$(call upper,$*)_URL) $(MUSL_CROSS_$(call upper,$*)_SHA256) $(CACHE)/dl
 	rm -rf $(TC)/$*-linux-musl-cross && mkdir -p $(TC) && tar -C $(TC) -xzf $(CACHE)/dl/$*-linux-musl-cross.tgz
 	echo $(MUSL_CROSS_$(call upper,$*)_SHA256) > $@
+$(TC)/%-linux-musl-cross.clang/.made: $(TC)/%-linux-musl-cross/.pinned $(ROOT)/toolchain/musl-cross-clang.sh
+	$(ROOT)/toolchain/musl-cross-clang.sh $(TC)/$*-linux-musl-cross
+	touch $@
 upper = $(subst x86_64,X86_64,$(subst aarch64,AARCH64,$(1)))
 
 # emcc from EMSDK at toolchain/pins' EMSCRIPTEN_VERSION, first on PATH

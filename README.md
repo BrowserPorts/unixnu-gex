@@ -671,9 +671,16 @@ is the reference (search `crates/gex-kernel/src/` for
   facts the kernel does not have, some `sandbox_check` filter types,
   `sandbox_check` of another process's operation, and Sandbox's other
   `__mac_syscall` calls.
-- **IOKit.** The registry holds the device tree, the APFS services,
-  IOSurfaceRoot, the GPU's accelerator and the display's framebuffer, with
-  the drivers and nubs on their paths to the root.
+- **IOKit.** The registry holds the device tree, the internal storage's
+  stack (the PCIe root complex and root port, the NVMe controller, its
+  root namespace, its block storage driver, disk0, the GPT and its
+  partition, APFS's scheme, medium, container and volumes, and each
+  medium's BSD client, with the media wired into the `IODeviceTree` plane
+  as the drivers wire them), IOSurfaceRoot, the GPU's accelerator and the
+  display's framebuffer, with the drivers and nubs on their paths to the
+  root. Facts only the device gives (the NVMe controller's strings and
+  geometry, the GPT's GUIDs and layout, the container's UUID) are
+  stand-ins that gexc names on stderr at start.
   These are reported:
   - opening any other driver;
   - those drivers' other nubs and clients;
@@ -681,11 +688,13 @@ is the reference (search `crates/gex-kernel/src/` for
     entries;
   - properties those drivers set in their start or probe, and an entry's
     whole table (`io_registry_entry_get_properties_bin_buf`) where it
-    lacks them: the APFS media have IOMedia's flags, content and BSD
-    keys, and the volumes their names, roles and locations, but not the
-    sizes, UUIDs, open state, the NVMe device's storage features or what
-    the superblocks give; `IOClassNameOverride`, which only
-    IOSkywalkFamily sets, is missing everywhere;
+    lacks them: the storage media's tables are whole (their open state
+    live), but the volumes lack what their superblocks give, the PCI nubs
+    what their configuration space gives, the controller what its
+    registers and NAND commands give, and the drivers their I/O counters;
+    the controller's other namespaces and objects are not modelled;
+    `IOClassNameOverride`, which only IOSkywalkFamily sets, is missing
+    everywhere;
   - IOGPU selectors and traps that make IOGPU objects, and AGXG9G's own
     selectors;
   - the framebuffer's user client selectors other than the swap's (begin,
@@ -755,12 +764,12 @@ is the reference (search `crates/gex-kernel/src/` for
   `RENAME_SECLUDE`, and opening a device whose driver is not modelled.
 - **Storage (reported shortcuts).** The volumes and their indexes are the
   erase restore's (System 0, Data 1, xART 2, Hardware 3, Preboot 4,
-  Update 5, User 6), but two facts of a 64 GB J120 are unmeasured and
+  Update 5, User 6), but facts of a 64 GB J120 are unmeasured and
   answered with stand-ins, which gexc names on stderr at start: the
   storage's BSD units (stand-ins disk0 and disk1, so volumes are
   `disk1s<index+1>`; measured from a sysdiagnose's ioreg IOMedia entries)
-  and disk0's capacity (measured the same way, or `ideviceinfo -q
-  com.apple.disk_usage`). APFS volumes' statfs counts are the stand-in
+  and disk0's capacity and the NVMe controller's identity (measured the
+  same way). APFS volumes' statfs counts are the stand-in
   numbers; exact ones need the capacity and APFS's space accounting
   (spaceman) after the restore and first boot. Volumes have the UUIDs newfs_apfs gives their roles; the System
   volume has the system image's, as ASR's restore of it, whether ASR keeps

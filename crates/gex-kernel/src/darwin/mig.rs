@@ -336,7 +336,7 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             // An OSString's bytes and its NUL, an OSBoolean's "Yes" or "No",
             // an OSNumber's or OSData's bytes; a collection is not bytes.
             let live = super::iokit::live_prop(super::iokit::tree(), *i, &name);
-            let typed = live.as_ref().or_else(|| node.service_props.iter().find(|(k, _)| *k == name).map(|(_, p)| p)).map(super::iokit::prop_bytes);
+            let typed = live.as_ref().or_else(|| super::iokit::service_prop(node, &name)).map(super::iokit::prop_bytes);
             let value = match (typed, node.props.iter().find(|(k, _)| *k == name)) {
                 (Some(Some(v)), _) => v,
                 (Some(None), _) => return Reply::err(K_IO_RETURN_BAD_ARGUMENT),
@@ -382,27 +382,37 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             if k.darwin_mac_check_iokit_get_property(super::iokit::sb_entry(*i), super::iokit::is_nvram(*i), name) != 0 {
                 return Reply::err(super::iokit::ret::NOT_PERMITTED);
             }
-            let Some(node) = super::iokit::tree().get(*i as usize) else { return bad() };
+            let t = super::iokit::tree();
+            if t.get(*i as usize).is_none() {
+                return bad();
+            }
             let name = String::from_utf8_lossy(name).into_owned();
-            if options as u32 & K_IO_REGISTRY_ITERATE_RECURSIVELY != 0 && !plane.is_empty() || name == "IORegistryEntryPropertyKeys" {
+            if name == "IORegistryEntryPropertyKeys" {
                 let mut r = Reply::err(K_IO_RETURN_NOT_FOUND);
-                r.unimplemented = Some(format!("io_registry_entry_get_property_bin_buf of {name} (recursion or the property keys)"));
+                r.unimplemented = Some(format!("io_registry_entry_get_property_bin_buf of {name} (the property keys)"));
                 return r;
             }
-            let bin = if let Some(p) = super::iokit::live_prop(super::iokit::tree(), *i, &name) {
-                super::iokit::serialize_prop(&p)
-            } else if let Some((_, p)) = node.service_props.iter().find(|(k, _)| *k == name) {
-                super::iokit::serialize_prop(p)
-            } else if let Some((_, value)) = node.props.iter().find(|(k, _)| *k == name) {
-                super::iokit::serialize_data(if node.kernel_only { &[] } else { value })
+            let found = if options as u32 & K_IO_REGISTRY_ITERATE_RECURSIVELY != 0 && !plane.is_empty() {
+                let plane = match super::iokit::plane(plane) {
+                    Ok(p) => p,
+                    Err(what) => {
+                        let mut r = Reply::err(K_IO_RETURN_NOT_FOUND);
+                        r.unimplemented = Some(format!("io_registry_entry_get_property_bin_buf of {name} over {what}"));
+                        return r;
+                    }
+                };
+                super::iokit::search(t, *i, plane, options as u32, &name, |e| k.darwin_mac_check_iokit_get_property(super::iokit::sb_entry(e), super::iokit::is_nvram(e), name.as_bytes()) == 0)
             } else {
-                // The platform expert device has the platform's properties
-                // besides the device tree's.
-                let mut r = Reply::err(K_IO_RETURN_NOT_FOUND);
-                if super::iokit::property_unknown(super::iokit::tree(), *i, &name) {
-                    r.unimplemented = Some(format!("the {} property {name:?}", super::iokit::name(super::iokit::tree(), *i)));
+                super::iokit::lookup(t, *i, &name).map(|v| (v, false))
+            };
+            let bin = match found {
+                Ok((Some(bin), _)) => bin,
+                Ok((None, refused)) => return Reply::err(if refused { super::iokit::ret::NOT_PERMITTED } else { K_IO_RETURN_NOT_FOUND }),
+                Err(what) => {
+                    let mut r = Reply::err(K_IO_RETURN_NOT_FOUND);
+                    r.unimplemented = Some(what);
+                    return r;
                 }
-                return r;
             };
             let mut out = NDR_RECORD.to_vec();
             if buf != 0 && bin.len() as u64 <= bufsize {
@@ -597,6 +607,9 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             }
             match super::iokit::plane(plane) {
                 Ok(super::iokit::Plane::DeviceTree) if *i == 0 => Reply::ok(io_name_reply(&t[0].name)),
+                // A service a driver attached in the device tree plane has
+                // the name it gave it there.
+                Ok(super::iokit::Plane::DeviceTree) if t.get(*i as usize).is_some_and(|n| n.dt.is_some()) => Reply::ok(io_name_reply(&t[*i as usize].dt.as_ref().unwrap().name)),
                 Ok(_) => Reply::ok(io_name_reply(&super::iokit::name(t, *i))),
                 Err(what) => {
                     let mut r = Reply::err(0xe00002c7_u32 as i32);
@@ -606,10 +619,13 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             }
         }
         // io_registry_entry_get_location_in_plane(entry, plane) -> location:
-        // a volume's index in its container.
+        // the location the entry was given in the plane, else its own (a
+        // volume's index in its container, a partition's number).
         (Kobject::IoEntry(i), 2854) => {
             let Some(node) = super::iokit::tree().get(*i as usize) else { return bad() };
-            match super::iokit::location(node) {
+            let Some((plane, _)) = inline_cstr(req, 0, 128) else { return bad() };
+            let plane = if plane.is_empty() { None } else { super::iokit::plane(plane).ok() };
+            match super::iokit::location_in(node, plane) {
                 Some(l) => Reply::ok(io_name_reply(&l)),
                 None => Reply::err(0xe00002f0_u32 as i32),
             }

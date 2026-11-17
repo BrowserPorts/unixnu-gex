@@ -218,7 +218,7 @@ mod tests {
         let dir = std::env::var("GEX_DARWIN_BOOT").expect("GEX_DARWIN_BOOT");
         let dt = std::fs::read(format!("{dir}/DeviceTree")).unwrap();
         let mut t = crate::darwin::iokit::parse(&dt).unwrap();
-        crate::darwin::iokit::add_volumes(&mut t);
+        crate::darwin::storagestack::add(&mut t, None);
         let name = |i: u32| format!("diskTs{}", i + 1);
         let Ok(Fstab::Size(n)) = edt_fstab_in(&t, 0, &name) else { panic!() };
         assert_eq!(n, 7 * 0xec, "max_fs_entries 7");

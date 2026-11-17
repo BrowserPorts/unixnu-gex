@@ -131,7 +131,7 @@ pub fn add_service(t: &mut Vec<Node>, gpu: u32) {
         ("MetalPluginClassName".to_string(), sym("AGXA10XDevice")),
         ("MetalStatisticsName".to_string(), sym("AGXMetalStatisticsExternalA10X")),
     ];
-    t.push(Node { name: CLASS.to_string(), props: Vec::new(), class: CLASS, service_props, parent: Some(gpu), children: Vec::new(), kernel_only: false, nub: None });
+    t.push(Node { name: CLASS.to_string(), props: Vec::new(), class: CLASS, service_props, parent: Some(gpu), children: Vec::new(), kernel_only: false, nub: None, dt: None, table: crate::darwin::iokit::Table::Drivers });
 }
 
 /// A user client of the accelerator.

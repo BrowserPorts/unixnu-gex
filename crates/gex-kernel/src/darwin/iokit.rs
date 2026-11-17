@@ -24,6 +24,36 @@ pub struct Node {
     /// A device tree entry a driver made a nub of: the nub's class, and its
     /// provider in the `IOService` plane.
     pub nub: Option<(&'static str, u32)>,
+    /// A service a driver also attached in the `IODeviceTree` plane.
+    pub dt: Option<DtLink>,
+    /// What the service's property table has of the device's.
+    pub table: Table,
+}
+
+/// A service's link in the `IODeviceTree` plane (`attachToParent(parent,
+/// gIODTPlane)`): its parent there, and the name and location it was given
+/// in that plane (`setName`/`setLocation` with the plane, which key its
+/// registry table by the plane's `pathNameKey` and `pathLocationKey`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DtLink {
+    pub parent: u32,
+    pub name: String,
+    pub location: String,
+}
+
+/// What a service's property table has of the device's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Table {
+    /// What its drivers set beyond what is here is not modelled
+    /// ([`property_unknown`]'s rules).
+    Drivers,
+    /// All of it.
+    Complete,
+    /// All but these keys, each with why it is not here (its value is set
+    /// at run time, or by code not followed).
+    Lacks(Vec<(&'static str, &'static str)>),
+    /// Some of it: what this says is not modelled, which may be any key.
+    Partial(String),
 }
 
 /// A property of a service, as `OSSerialize` writes it.
@@ -39,18 +69,20 @@ pub enum Prop {
     Sym(String),
     /// An `OSDictionary` of named values, in its order.
     Dict(Vec<(String, Prop)>),
+    /// An `OSArray`.
+    Array(Vec<Prop>),
+    /// In a dictionary, the very object an earlier key of it holds (one
+    /// object set under two keys, which `OSSerialize` writes once and then
+    /// refers to).
+    SameAs(String),
 }
 
 /// The classes a service belongs to, most derived first.
 pub fn superclasses(class: &str) -> &'static [&'static str] {
+    if let s @ [_, ..] = super::storagestack::superclasses(class) {
+        return s;
+    }
     match class {
-        "AppleAPFSVolume" => &["AppleAPFSVolume", "IOMedia", "IOStorage", "IOService", "IORegistryEntry"],
-        // The metaclasses' parents (AppleAPFS's constructors): the scheme
-        // is an IOStorage, the container an IOPartitionScheme.
-        "AppleAPFSContainerScheme" => &["AppleAPFSContainerScheme", "IOStorage", "IOService", "IORegistryEntry"],
-        "AppleAPFSMedia" => &["AppleAPFSMedia", "IOMedia", "IOStorage", "IOService", "IORegistryEntry"],
-        "AppleAPFSContainer" => &["AppleAPFSContainer", "IOPartitionScheme", "IOStorage", "IOService", "IORegistryEntry"],
-        "IOMedia" => &["IOMedia", "IOStorage", "IOService", "IORegistryEntry"],
         "IOPlatformExpertDevice" => &["IOPlatformExpertDevice", "IOService", "IORegistryEntry"],
         "IORegistryEntry" => &["IORegistryEntry"],
         "IOUserClient" => &["IOUserClient", "IOService", "IORegistryEntry"],
@@ -86,7 +118,7 @@ pub fn parse(b: &[u8]) -> Result<Vec<Node>, String> {
         let name = props.iter().find(|(k, _)| k == "name").map_or(String::new(), |(_, v)| String::from_utf8_lossy(&v[..v.iter().position(|&c| c == 0).unwrap_or(v.len())]).into_owned());
         let id = out.len() as u32;
         let kernel_only = props.iter().any(|(k, _)| k == "kernel-only");
-        out.push(Node { name, props, class: "", service_props: Vec::new(), parent, children: Vec::new(), kernel_only, nub: None });
+        out.push(Node { name, props, class: "", service_props: Vec::new(), parent, children: Vec::new(), kernel_only, nub: None, dt: None, table: Table::Drivers });
         for _ in 0..nchildren {
             let c = node(b, at, Some(id), out)?;
             out[id as usize].children.push(c);
@@ -99,12 +131,13 @@ pub fn parse(b: &[u8]) -> Result<Vec<Node>, String> {
     Ok(out)
 }
 
-/// Install the device tree the boot payload carries, and the volumes its
-/// file system table names as the services APFS publishes for them.
+/// Install the device tree the boot payload carries, and the services
+/// published over it: the platform's, the GPU's, the display's and the
+/// storage's ([`super::storagestack`]).
 pub fn set_tree(b: &[u8]) -> Result<(), String> {
     let mut t = parse(b)?;
-    add_volumes(&mut t);
-    if let Some(io) = super::platform::add(&mut t) {
+    let io = super::platform::add(&mut t);
+    if let Some(io) = io {
         if let Some(gpu) = super::platform::arm_io_nub(&mut t, io, "gpu,t8011") {
             super::accel::add_service(&mut t, gpu);
         }
@@ -112,6 +145,7 @@ pub fn set_tree(b: &[u8]) -> Result<(), String> {
             super::iomfb::add_service(&mut t, disp);
         }
     }
+    super::storagestack::add(&mut t, io);
     let resources = super::platform::add_resources(&mut t);
     super::iosurface::add_service(&mut t, resources);
     add_root(&mut t);
@@ -122,7 +156,7 @@ pub fn set_tree(b: &[u8]) -> Result<(), String> {
 /// `IORegistryEntry::initialize`: the registry's root, "Root"; the device
 /// tree hangs from it in the `IODeviceTree` plane.
 fn add_root(t: &mut Vec<Node>) {
-    t.push(Node { name: "Root".to_string(), props: Vec::new(), class: "IORegistryEntry", service_props: Vec::new(), parent: None, children: vec![0], kernel_only: false, nub: None });
+    t.push(Node { name: "Root".to_string(), props: Vec::new(), class: "IORegistryEntry", service_props: Vec::new(), parent: None, children: vec![0], kernel_only: false, nub: None, dt: None, table: Table::Drivers });
 }
 
 /// Whether the kernel sets the root entry's property `name`: the planes
@@ -178,10 +212,13 @@ pub fn links(t: &[Node], i: u32, plane: Plane, parents: bool) -> Result<Vec<u32>
             (Plane::Service, false) => Err("the registry root's children in the IOService plane (IOResources, IOUserResources and the platform)".to_string()),
         };
     }
+    // The services a driver attached below an entry in the IODeviceTree
+    // plane, after the device tree's own children.
+    let dt_children = || t.iter().enumerate().filter(|(_, c)| c.dt.as_ref().is_some_and(|d| d.parent == i)).map(|(c, _)| c as u32);
     if n.class.is_empty() {
         return match (plane, parents) {
             (Plane::DeviceTree, true) => Ok(vec![n.parent.unwrap_or(root)]),
-            (Plane::DeviceTree, false) => Ok(n.children.clone()),
+            (Plane::DeviceTree, false) => Ok(n.children.iter().copied().chain(dt_children()).collect()),
             (Plane::Service, true) => provider(t, i).map(|p| p.into_iter().collect()),
             (Plane::Service, false) if i == 0 => Err("the platform expert device's children in the IOService plane (its drivers)".to_string()),
             (Plane::Service, false) if n.nub.is_some() => Err(format!("the drivers matched on {} (its children in the IOService plane)", n.name)),
@@ -189,14 +226,18 @@ pub fn links(t: &[Node], i: u32, plane: Plane, parents: bool) -> Result<Vec<u32>
         };
     }
     match (plane, parents) {
-        (Plane::DeviceTree, _) => Ok(Vec::new()),
+        (Plane::DeviceTree, true) => Ok(n.dt.iter().map(|d| d.parent).collect()),
+        (Plane::DeviceTree, false) => Ok(dt_children().collect()),
         (Plane::Service, true) => provider(t, i).map(|p| p.into_iter().collect()),
         // The user clients a service has opened are attached to it, and
         // they are not registry entries here.
         (Plane::Service, false) if n.class == super::accel::CLASS || n.class == super::iomfb::CLASS => Err(format!("the user clients of {} as its children in the IOService plane", n.name)),
         (Plane::Service, false) if super::platform::is_driver(n.class) => Err(format!("the nubs and clients of {} (its children in the IOService plane)", n.name)),
         (Plane::Service, false) if n.class == super::platform::RESOURCES => Err("the services matched on IOResources (its children in the IOService plane)".to_string()),
-        (Plane::Service, false) => Ok(n.children.clone()),
+        (Plane::Service, false) => match super::storagestack::children_unknown(n.class) {
+            Some(what) => Err(format!("{what} (children of {} in the IOService plane)", n.name)),
+            None => Ok(n.children.clone()),
+        },
     }
 }
 
@@ -254,105 +295,18 @@ pub fn class(t: &[Node], i: u32) -> Result<&'static str, String> {
     Err(format!("the class of the device tree entry {}", n.name))
 }
 
-/// The storage's IOMedia tree as the device registers it
-/// ([`super::storage`]): the GPT partition "Container" of the main
-/// namespace's disk, its AppleAPFSContainerScheme, the AppleAPFSMedia that
-/// is the container's synthesized whole disk, its AppleAPFSContainer, and an
-/// AppleAPFSVolume for each volume by slot (the order the container
-/// publishes them). Each medium has what `IOMediaBSDClient::createNodes`
-/// sets on it: its "BSD Name" (the device's units',
-/// [`super::storage::units`]), and as 32-bit numbers its "BSD Unit" (its
-/// whole disk's anchor), "BSD Major" and "BSD Minor".
-pub(crate) fn add_volumes(t: &mut Vec<Node>) {
-    use super::storage::Media;
-    let named = |m: Media| {
-        let name = super::storage::media_bsd_name(m);
-        let minor = super::storage::media_by_name(&name).map_or(0, |(_, minor)| minor);
-        let unit = if m == Media::Partition { super::storage::units().main } else { super::storage::units().container };
-        vec![
-            ("BSD Name".to_string(), Prop::Sym(name)),
-            ("BSD Unit".to_string(), Prop::Num(u64::from(unit), 32)),
-            ("BSD Major".to_string(), Prop::Num(u64::from(super::storage::DISK_MAJOR), 32)),
-            ("BSD Minor".to_string(), Prop::Num(u64::from(minor), 32)),
-        ]
-    };
-    let service = |name: &str, class: &'static str, parent: Option<u32>, service_props: Vec<(String, Prop)>| Node {
-        name: name.to_string(),
-        props: Vec::new(),
-        class,
-        service_props,
-        parent,
-        children: Vec::new(),
-        kernel_only: false,
-        nub: None,
-    };
-    // IOMedia::init's keys as each medium's maker gives them (0xfffffff005977630:
-    // Content and Content Hint as OSSymbols, the flags as OSBooleans), less
-    // the sizes and Open, which are not modelled.
-    let medium = |hint: &str, leaf: bool, whole: bool, writable: bool| {
-        vec![
-            ("Content".to_string(), Prop::Sym(hint.to_string())),
-            ("Leaf".to_string(), Prop::Bool(leaf)),
-            ("Content Hint".to_string(), Prop::Sym(hint.to_string())),
-            ("Ejectable".to_string(), Prop::Bool(false)),
-            ("Removable".to_string(), Prop::Bool(false)),
-            ("Whole".to_string(), Prop::Bool(whole)),
-            ("Writable".to_string(), Prop::Bool(writable)),
-        ]
-    };
-    let with = |mut a: Vec<(String, Prop)>, b: Vec<(String, Prop)>| {
-        a.extend(b);
-        a
-    };
-    let store = t.len() as u32;
-    // The GPT partition: the scheme it holds has no Content Mask, so its
-    // Content stays its hint; not a leaf once the scheme attaches.
-    t.push(service("Container", "IOMedia", None, with(medium(CONTAINER_PARTITION_HINT, false, false, super::storage::disk_writable()), named(Media::Partition))));
-    let scheme = t.len() as u32;
-    t.push(service("AppleAPFSContainerScheme", "AppleAPFSContainerScheme", Some(store), Vec::new()));
-    t[store as usize].children.push(scheme);
-    let media = t.len() as u32;
-    // AppleAPFSMedia::init (0xfffffff006682168): whole, writable as the
-    // partition is; not a leaf once AppleAPFSContainer (IOMatchCategory
-    // IOStorage) attaches.
-    t.push(service("AppleAPFSMedia", "AppleAPFSMedia", Some(scheme), with(medium(APFS_CONTAINER_HINT, false, true, super::storage::disk_writable()), named(Media::Container))));
-    t[scheme as usize].children.push(media);
-    let container = t.len() as u32;
-    t.push(service("AppleAPFSContainer", "AppleAPFSContainer", Some(media), Vec::new()));
-    t[media as usize].children.push(container);
-    for v in super::storage::VOLUMES {
-        let mut service_props = with(medium(APFS_VOLUME_HINT, true, false, super::storage::volume_writable()), named(Media::Volume(v.index)));
-        service_props.push(("FullName".to_string(), Prop::Sym(v.name.to_string())));
-        service_props.push(("RoleValue".to_string(), Prop::Num(u64::from(v.role), 32)));
-        if let Some(r) = apfs_role_name(v.role) {
-            service_props.push(("Role".to_string(), Prop::Strs(vec![r.to_string()])));
-        }
-        let id = t.len() as u32;
-        t.push(service(v.name, "AppleAPFSVolume", Some(container), service_props));
-        t[container as usize].children.push(id);
-    }
-}
-
-/// The GPT partition type of an APFS container, the AppleAPFSMedia's
-/// content, and an APFS volume's.
-const CONTAINER_PARTITION_HINT: &str = "7C3457EF-0000-11AA-AA11-00306543ECAC";
-const APFS_CONTAINER_HINT: &str = "EF57347C-0000-11AA-AA11-00306543ECAC";
-const APFS_VOLUME_HINT: &str = "41504653-0000-11AA-AA11-00306543ECAC";
-
 /// What entry `i`'s whole property table lacks of the device's, for
 /// `io_registry_entry_get_properties_bin_buf`; none when the entry has
-/// only what is modelled ([`property_unknown`] of no name).
+/// all of it.
 pub fn properties_missing(t: &[Node], i: u32) -> Option<String> {
     let n = t.get(i as usize)?;
-    if !property_unknown(t, i, "") {
-        return None;
+    match &n.table {
+        Table::Complete => None,
+        Table::Lacks(keys) => Some(keys.iter().map(|(k, why)| format!("{k} ({why})")).collect::<Vec<_>>().join(", ")),
+        Table::Partial(what) => Some(what.clone()),
+        Table::Drivers if !property_unknown(t, i, "") => None,
+        Table::Drivers => Some("the properties its drivers set".to_string()),
     }
-    Some(match n.class {
-        "AppleAPFSMedia" => "Physical Block Size, Logical Block Size and Preferred Block Size (min(nx_block_size, 4096)), IOStorageFeatures (the NVMe device's dictionary), EncryptionBlockSize (disk0's preferred block size), Open, Size (the partition's) and UUID (the container's nx_uuid)".to_string(),
-        "AppleAPFSVolume" => "the IOMedia sizes, Open, UUID, CaseSensitive, FormattedBy, IncompatibleFeatures, VolGroupUUID, the encryption keys, autodiskmount, Sealed, Status and Statistics (AppleAPFSVolume::init's, from the volume superblock)".to_string(),
-        "IOMedia" if n.name == "Container" => "Base, Size, Preferred Block Size, Open, Partition ID, UUID, GPT Attributes and TierType (IOGUIDPartitionScheme's and AppleAPFSContainerScheme's)".to_string(),
-        _ => "the properties its drivers set".to_string(),
-    })
 }
 
 /// Entry `i`'s properties in its table's order, the device tree's first
@@ -376,7 +330,10 @@ pub fn properties(t: &[Node], i: u32) -> Vec<(String, Prop)> {
 }
 
 /// Whether a property entry `i` lacks may yet be one the device's entry
-/// has, which is reported rather than answered missing:
+/// has, which is reported rather than answered missing (`""` asking
+/// whether any may be):
+/// - An entry whose whole table is here has no other; one that lacks
+///   only some keys may have those ([`Table`]).
 /// - The registry's root has only the properties [`root_has`] names.
 /// - A device tree entry that no driver here made a nub of has only its
 ///   own, and IOSurfaceRoot only those it is given
@@ -396,6 +353,12 @@ pub fn property_unknown(t: &[Node], i: u32, name: &str) -> bool {
     if name == "IOClassNameOverride" {
         return false;
     }
+    match &n.table {
+        Table::Complete => return false,
+        Table::Lacks(keys) => return name.is_empty() || keys.iter().any(|(k, _)| *k == name),
+        Table::Partial(_) => return true,
+        Table::Drivers => {}
+    }
     if i as usize + 1 == t.len() {
         return root_has(name);
     }
@@ -413,9 +376,14 @@ pub fn property_unknown(t: &[Node], i: u32, name: &str) -> bool {
 }
 
 /// A property entry `i`'s driver keeps and may change while it runs,
-/// ahead of its fixed ones: the framebuffer's published runtime properties
-/// ([`super::iomfb::rtprop`]) and its console mode (`SystemConsoleMode`).
+/// ahead of its fixed ones: a medium's open state
+/// ([`super::storagestack::live_prop`]), the framebuffer's published
+/// runtime properties ([`super::iomfb::rtprop`]) and its console mode
+/// (`SystemConsoleMode`).
 pub fn live_prop(t: &[Node], i: u32, name: &str) -> Option<Prop> {
+    if let Some(p) = super::storagestack::live_prop(t, i, name) {
+        return Some(p);
+    }
     if t.get(i as usize)?.class != super::iomfb::CLASS {
         return None;
     }
@@ -423,6 +391,68 @@ pub fn live_prop(t: &[Node], i: u32, name: &str) -> Option<Prop> {
         return super::iomfb::swap::console_property().map(Prop::Bool);
     }
     super::iomfb::rtprop::published(name)
+}
+
+/// The service's own property `name`, a key that shares another's object
+/// giving that object.
+pub fn service_prop<'a>(n: &'a Node, name: &str) -> Option<&'a Prop> {
+    let find = |name: &str| n.service_props.iter().find(|(k, _)| *k == name).map(|(_, p)| p);
+    match find(name)? {
+        Prop::SameAs(other) => find(other),
+        p => Some(p),
+    }
+}
+
+/// Entry `i`'s property `name` serialized, as `IOCopyPropertyCompatible`
+/// copies it (`copyProperty`, then the entry's IOUserServiceProperties or
+/// IOCompatibilityProperties, which no entry here has): a live value, the
+/// service's, else the device tree's (empty for a kernel-only entry's).
+/// `Err` names a property that is absent here but may be the device's
+/// ([`property_unknown`]).
+pub fn lookup(t: &[Node], i: u32, name: &str) -> Result<Option<Vec<u8>>, String> {
+    let Some(node) = t.get(i as usize) else { return Ok(None) };
+    if let Some(p) = live_prop(t, i, name) {
+        return Ok(Some(serialize_prop(&p)));
+    }
+    if let Some(p) = service_prop(node, name) {
+        return Ok(Some(serialize_prop(p)));
+    }
+    if let Some((_, value)) = node.props.iter().find(|(k, _)| *k == name) {
+        return Ok(Some(serialize_data(if node.kernel_only { &[] } else { value })));
+    }
+    if let Table::Lacks(keys) = &node.table {
+        if let Some((_, why)) = keys.iter().find(|(k, _)| *k == name) {
+            return Err(format!("the {} property {name:?} ({why})", self::name(t, i)));
+        }
+    }
+    if property_unknown(t, i, name) {
+        return Err(format!("the {} property {name:?}", self::name(t, i)));
+    }
+    Ok(None)
+}
+
+/// `is_io_registry_entry_get_property_bin_buf`'s recursive search: the
+/// entry's own property, else the first an `IORegistryIterator` over its
+/// links in `plane` with `options` finds (depth first; its parents with
+/// `kIORegistryIterateParents`), passing over each entry whose value
+/// `allowed` (the MAC check of that entry) refuses. The value, and whether
+/// a refusal passed one over (kIOReturnNotPermitted rather than
+/// kIOReturnNotFound when none is found).
+pub fn search(t: &[Node], i: u32, plane: Plane, options: u32, name: &str, mut allowed: impl FnMut(u32) -> bool) -> Result<(Option<Vec<u8>>, bool), String> {
+    if let Some(v) = lookup(t, i, name)? {
+        return Ok((Some(v), false));
+    }
+    let mut it = RegistryIter::new(i, plane, options);
+    let mut refused = false;
+    while let Some(e) = it.next(t)? {
+        let Some(v) = lookup(t, e, name)? else { continue };
+        if !allowed(e) {
+            refused = true;
+            continue;
+        }
+        return Ok((Some(v), refused));
+    }
+    Ok((None, refused))
 }
 
 /// The services a matching dictionary asks for: `IOProviderClass` by class
@@ -491,7 +521,7 @@ pub fn matching(tree: &[Node], dict: &[(String, DictValue)]) -> Result<Vec<u32>,
     // GPU, one accelerator). Of the classes above them (and of services by
     // property alone) the storage drivers' and the whole disk's are not, so
     // those are answered only by a BSD name found here.
-    let complete = matches!(class, Some("AppleAPFSVolume" | "AppleAPFSContainer" | "AppleAPFSMedia" | "AppleAPFSContainerScheme")) || class.is_some_and(super::accel::class_complete) || class.is_some_and(super::iosurface::class_complete) || class.is_some_and(super::iomfb::class_complete);
+    let complete = class.is_some_and(super::storagestack::class_complete) || class.is_some_and(super::accel::class_complete) || class.is_some_and(super::iosurface::class_complete) || class.is_some_and(super::iomfb::class_complete);
     let by_name = props.iter().any(|&(k, _)| k == "BSD Name");
     if !complete && !(by_name && !found.is_empty()) {
         return Err(format!("the services of class {class:?} with {props:?}: the drivers' own are not here"));
@@ -510,15 +540,18 @@ pub fn conforms(t: &[Node], i: u32, class: &str) -> Result<bool, String> {
     }
 }
 
-/// `IORegistryEntry::getLocation`: of a volume, `"%d"` of its slot plus
-/// one (`AppleAPFSVolume::init`'s `setLocation`, 0xfffffff00666d684); of
-/// the GPT partition, its partition number (`IOGUIDPartitionScheme`'s
-/// `"%d"` of the entry's index plus one: the first).
+/// `IORegistryEntry::getLocation`: the location a driver gave the entry
+/// ([`super::storagestack::location`]).
 pub fn location(n: &Node) -> Option<String> {
-    match n.class {
-        "AppleAPFSVolume" => super::storage::VOLUMES.iter().find(|v| v.name == n.name).map(|v| (v.index + 1).to_string()),
-        "IOMedia" if n.name == "Container" => Some("1".to_string()),
-        _ => None,
+    super::storagestack::location(n)
+}
+
+/// `IORegistryEntry::getLocation(plane)`: the location the entry was given
+/// in that plane, else its own ([`location`]).
+pub fn location_in(n: &Node, plane: Option<Plane>) -> Option<String> {
+    match (&n.dt, plane) {
+        (Some(d), Some(Plane::DeviceTree)) => Some(d.location.clone()),
+        _ => location(n),
     }
 }
 
@@ -883,7 +916,7 @@ pub fn serialize_prop(p: &Prop) -> Vec<u8> {
             b.push(0);
             b.resize((b.len() + 3) & !3, 0);
         }
-        Prop::Dict(_) => {
+        Prop::Dict(_) | Prop::Array(_) | Prop::SameAs(_) => {
             let mut g = super::osserialize::Graph::default();
             let root = prop_object(&mut g, p);
             return super::osserialize::serialize_binary(&g, root);
@@ -918,11 +951,19 @@ fn prop_object(g: &mut super::osserialize::Graph, p: &Prop) -> super::osserializ
         Prop::Dict(entries) => {
             let d = g.add(Obj::Dict(Vec::new()));
             for (k, v) in entries {
-                let id = prop_object(g, v);
+                let id = match v {
+                    Prop::SameAs(other) => g.lookup(d, other.as_bytes()).unwrap_or_else(|| panic!("{k} shares {other}, which its dictionary does not hold before it")),
+                    v => prop_object(g, v),
+                };
                 g.dict_set(d, k.as_bytes(), id);
             }
             d
         }
+        Prop::Array(items) => {
+            let ids = items.iter().map(|v| prop_object(g, v)).collect();
+            g.add(Obj::Array(ids))
+        }
+        Prop::SameAs(other) => panic!("a property shares {other} outside a dictionary"),
     }
 }
 
@@ -1377,7 +1418,7 @@ pub fn prop_bytes(p: &Prop) -> Option<Vec<u8>> {
         Prop::Bool(b) => Some(if *b { b"Yes\0".to_vec() } else { b"No\0".to_vec() }),
         Prop::Data(d) => Some(d.clone()),
         Prop::Num(v, bits) => Some(v.to_le_bytes()[..((*bits as usize + 7) / 8).min(8)].to_vec()),
-        Prop::Strs(_) | Prop::Dict(_) => None,
+        Prop::Strs(_) | Prop::Dict(_) | Prop::Array(_) | Prop::SameAs(_) => None,
     }
 }
 
@@ -1518,13 +1559,14 @@ mod tests {
     fn the_apfs_entries_are_as_appleapfs_makes_them() {
         use super::*;
         let mut t = Vec::new();
-        add_volumes(&mut t);
+        super::super::storagestack::add(&mut t, None);
         let find = |name: &str| t.iter().position(|n| n.name == name).unwrap() as u32;
         let media = find("AppleAPFSMedia");
-        // No storage entry has IOClassNameOverride; other names may be the
-        // drivers'.
+        // No storage entry has IOClassNameOverride; the container's medium
+        // has its whole table.
         assert!(!property_unknown(&t, media, "IOClassNameOverride"));
-        assert!(property_unknown(&t, media, "IOStorageFeatures"));
+        assert!(!property_unknown(&t, media, "IOStorageFeatures"));
+        assert_eq!(properties_missing(&t, media), None);
         assert!(superclasses("AppleAPFSContainer").contains(&"IOPartitionScheme"));
         assert!(!superclasses("AppleAPFSContainerScheme").contains(&"IOPartitionScheme"));
         // A volume's location is its slot plus one; its role by name.
@@ -1534,14 +1576,36 @@ mod tests {
         assert!(system.service_props.contains(&("Role".to_string(), Prop::Strs(vec!["System".to_string()]))));
         assert_eq!(apfs_role_name(0x140), Some("Hardware"));
         assert_eq!(apfs_role_name(0x3), None);
-        // The medium's table in IOMedia::init's order, then the BSD keys.
-        let keys: Vec<String> = properties(&t, media).into_iter().map(|(k, _)| k).collect();
-        assert_eq!(&keys[..3], &["Content", "Leaf", "Content Hint"]);
-        assert!(keys.iter().any(|k| k == "BSD Name"));
-        assert!(properties_missing(&t, media).unwrap().contains("IOStorageFeatures"));
+        // AppleAPFSMedia::init's dictionary, then IOMedia::init's keys,
+        // then the UUID and the BSD keys.
+        let props = properties(&t, media);
+        let keys: Vec<&str> = props.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(&keys[..7], &["Physical Block Size", "Logical Block Size", "IOStorageFeatures", "EncryptionBlockSize", "Content", "Leaf", "Open"]);
+        assert!(keys.iter().any(|k| *k == "BSD Name") && keys.iter().any(|k| *k == "UUID"));
+        // The two block sizes are one number, written once.
+        let bin = serialize_prop(&Prop::Dict(props.clone()));
+        let g = super::super::osserialize::unserialize_binary(&bin).unwrap().0;
+        assert_eq!(g.objs.iter().filter(|o| matches!(o, super::super::osserialize::Obj::Number { value: 4096, size: 32 })).count(), 2, "Physical/Logical Block Size shared, EncryptionBlockSize its own");
         // An OSSymbol's string matches as an OSString's does.
         let bsd = super::super::storage::container_bsd_name();
         assert_eq!(matching(&t, &[("BSD Name".to_string(), DictValue::Str(bsd))]), Ok(vec![media]));
+        // Up the IOService plane from the medium to the namespace, which
+        // has no provider here (no platform).
+        let mut up = vec![media];
+        while let Ok(Some(p)) = provider(&t, *up.last().unwrap()) {
+            up.push(p);
+        }
+        let classes: Vec<&str> = up.iter().map(|&i| t[i as usize].class).collect();
+        assert_eq!(classes, ["AppleAPFSMedia", "AppleAPFSContainerScheme", "IOMedia", "IOGUIDPartitionScheme", "IOMedia", "IOBlockStorageDriver", "IOEmbeddedNVMeBlockDevice"]);
+        assert!(provider(&t, *up.last().unwrap()).is_err());
+        // Each medium's children: its storage driver, then its BSD client.
+        let disk0 = up[4];
+        let kids: Vec<&str> = links(&t, disk0, Plane::Service, false).unwrap().iter().map(|&i| t[i as usize].class).collect();
+        assert_eq!(kids, ["IOGUIDPartitionScheme", "IOMediaBSDClient"]);
+        // A recursive search up the parents finds the namespace's
+        // characteristics.
+        let (found, refused) = search(&t, media, Plane::Service, 3, "Protocol Characteristics", |_| true).unwrap();
+        assert!(found.is_some() && !refused);
     }
 
     #[test]

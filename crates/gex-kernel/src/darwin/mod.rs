@@ -97,6 +97,7 @@ pub mod rusage;
 pub mod sandbox;
 pub mod shregion;
 pub mod storage;
+pub mod storagestack;
 pub mod sandboxes;
 pub mod sched;
 pub mod thinfo;

@@ -24,6 +24,10 @@ gex-kernel.workspace = true
 gex-eject = { workspace = true, features = ["build"] }
 gex-cache = { workspace = true, features = ["compile"] }
 anyhow = "1"
+# The web device's keys: its root's and its Cryptex1 manifest key's RSA key
+# pairs, made and used to sign by `gexc darwin-web-device` and
+# `gexc darwin-web-ticket` (src/darwin_web.rs).
+rsa = { version = "0.9", default-features = false, features = ["std", "u64_digit", "getrandom", "sha2"] }
 # The WebMetal host executor (third_party/WebMetal), over a native WebGPU
 # implementation chosen at build time: WEBGPU_NATIVE (`dawn` or
 # `wgpu-native`) and WEBGPU_NATIVE_DIR (its install root).

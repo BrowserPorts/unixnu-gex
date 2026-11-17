@@ -54,7 +54,8 @@ crates/gex-kernel/src/darwin/xz.rs
     "This file has been put into the public domain. You can do whatever
     you want with this file."
 
-The gex-kernel tests of the web device's chain and tickets
+crates/gexc (`gexc darwin-web-device`, `gexc darwin-web-ticket`) and the
+gex-kernel tests of the web device's chain and tickets
     Built with the RustCrypto rsa crate 0.9 (RSA key pairs and PKCS #1
     v1.5 signatures) from crates.io, and the crates it builds with: pkcs1,
     pkcs8, spki, der, const-oid, base64ct, signature, zeroize,

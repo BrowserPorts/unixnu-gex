@@ -950,6 +950,7 @@ dependencies = [
  "gex-units",
  "gex-xlate",
  "libc",
+ "rsa",
  "webmetal-host",
  "webmetal-wire",
 ]

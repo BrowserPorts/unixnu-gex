@@ -269,6 +269,30 @@ impl Tree {
         }
     }
 
+    /// The record with the least key above `key` (the lookup's GT mode,
+    /// 0x10002ceec).
+    pub fn get_gt(&self, st: &mut dyn Store, key: &[u8]) -> Result<Option<(Vec<u8>, Option<Vec<u8>>)>, String> {
+        self.gt_in(st, self.root, key)
+    }
+
+    fn gt_in(&self, st: &mut dyn Store, id: u64, key: &[u8]) -> Result<Option<(Vec<u8>, Option<Vec<u8>>)>, String> {
+        let s = &self.shape;
+        let n = st.get(id)?;
+        let (i, f) = search(s, &n, self.cmp, key);
+        if n.is_leaf() {
+            let j = if f { i + 1 } else { i };
+            return Ok((j < n.nkeys()).then(|| (n.key(s, j).to_vec(), n.val(s, j).map(|v| v.to_vec()))));
+        }
+        // The child holding keys at or below `key`, then those after it.
+        let first = if f || i == 0 { i } else { i - 1 };
+        for c in first..n.nkeys() {
+            if let Some(r) = self.gt_in(st, self.child_of(&n, c), key)? {
+                return Ok(Some(r));
+            }
+        }
+        Ok(None)
+    }
+
     /// Every record in key order.
     pub fn records(&self, st: &mut dyn Store) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>, String> {
         let mut out = Vec::new();

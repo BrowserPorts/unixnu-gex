@@ -237,6 +237,9 @@ pub struct Nx<'a> {
     /// The open transaction's operation count (`tx + 0x20`: one per
     /// `tx_enter` that opened or joined it).
     tx_ops: u64,
+    /// Whether the device is solid state (DKIOCISSOLIDSTATE, a failed
+    /// query counting as yes): the object cache's limit of changed objects.
+    solid_state: bool,
 }
 
 /// The container's reaper (`nx_reaper_phys_t`): its lists, and the entry
@@ -377,6 +380,7 @@ impl<'a> Nx<'a> {
             alloc_delta: BTreeMap::new(),
             precounted: Default::default(),
             tx_ops: 0,
+            solid_state: true,
         })
     }
 
@@ -397,6 +401,12 @@ impl<'a> Nx<'a> {
         } else {
             self.age_limit = 8;
         }
+    }
+
+    /// Whether the device answers DKIOCISSOLIDSTATE with true (a regular
+    /// file's ENOTTY counts as true, the default).
+    pub fn set_solid_state(&mut self, solid: bool) {
+        self.solid_state = solid;
     }
 
     /// The read-write mount: block 0 rewritten (its last state, not
@@ -523,29 +533,39 @@ impl<'a> Nx<'a> {
     /// blocks are under a 32nd of the device; a free queue past its node
     /// threshold); else it stays open for the next caller to join.
     pub fn leave(&mut self, flags: u32) -> Result<(), String> {
+        if self.close_due(flags)? {
+            self.commit()?;
+        }
+        Ok(())
+    }
+
+    /// Whether `tx_leave` with `flags` closes the open transaction (see
+    /// [`Nx::leave`]); a caller still holding it commits when it leaves
+    /// last.
+    pub fn close_due(&mut self, flags: u32) -> Result<bool, String> {
         if !self.in_tx {
-            return Ok(());
+            return Ok(false);
         }
         let mut close = flags & 4 != 0 || self.tx_ops > 100_000;
-        // The cache's changed virtual and physical objects (cache+0x374,
-        // +0x378): the objects this model keeps, and at most the chunk-info
-        // blocks, bitmaps and the pool's bitmap besides; 1,024 on a solid
-        // state device (a regular file's ENOTTY counts as one), 256 else.
-        let low = (self.virt_dirty.len() + self.phys_dirty.len()) as u64;
-        let high = low + self.cib_dirty.iter().filter(|d| **d).count() as u64 + self.chunks.iter().filter(|c| c.dirty).count() as u64 + 1;
-        let limit = if self.mode == Mode::Kernel { 256 } else { 1024 };
-        if high >= limit {
-            return Err("not implemented: a transaction the object cache's count of changed objects may close (its counting of chunk-info blocks and bitmaps, and the kernel's limit)".into());
+        // The cache's changed objects (cache+0x374 virtual, +0x378
+        // physical: raised by obj_dirty and by a physical object's
+        // copy-on-write, lowered by the flush and by deleting one): the
+        // virtual and physical objects changed here, each chunk-info block
+        // and chunk bitmap copied in this transaction and the pool's bitmap
+        // block; ephemeral objects never count (I:0x100036ccc). 1,024 on a
+        // solid-state device (the device's dev+0x74, the kernel's dev+0x504;
+        // any failure of the query, a regular file's ENOTTY included,
+        // counts as one), 256 else.
+        let dirty = (self.virt_dirty.len() + self.phys_dirty.len()) as u64 + self.cib_dirty.iter().filter(|d| **d).count() as u64 + self.chunks.iter().filter(|c| c.dirty).count() as u64 + u64::from(self.ipbm_xid == self.xid);
+        if dirty >= if self.solid_state { 1024 } else { 256 } {
+            close = true;
         }
         let main = self.fq[FQ_MAIN].count;
         let shift = if self.sm_free < self.l.blocks / 32 { 1 } else { 0 };
         if main > self.sm_free || main > self.main_count_limit >> shift || self.fq_too_big(FQ_IP, false)? || self.fq_too_big(FQ_MAIN, false)? {
             close = true;
         }
-        if close {
-            self.commit()?;
-        }
-        Ok(())
+        Ok(close)
     }
 
     /// The blocks the space manager can still give
@@ -1187,13 +1207,17 @@ impl<'a> Nx<'a> {
             self.phys_dirty.retain(|&p| p != oid);
             return self.fs_free(vol, oid, n);
         }
+        // A virtual object's obj_modify only reserves space (I:0x10003ae80):
+        // a changed one still names its last mapping, which goes; one made
+        // in this transaction has none and only leaves the cache.
         let owner = vol.map_or(Owner::Container, Owner::Volume);
-        if self.virt_dirty.contains(&(owner, oid)) {
-            return Err(format!("not implemented: deleting virtual object {oid:#x} changed in this transaction"));
-        }
+        self.virt_dirty.retain(|&o| o != (owner, oid));
+        self.precounted.remove(&(owner, oid));
         let vo = self.virt.remove(&(owner, oid)).ok_or_else(|| format!("no virtual object {oid:#x}"))?;
-        let (mxid, paddr) = vo.mapped.ok_or_else(|| format!("not implemented: deleting virtual object {oid:#x} never placed"))?;
-        self.omap_delete(owner, oid, mxid, paddr, n)
+        match vo.mapped {
+            Some((mxid, paddr)) => self.omap_delete(owner, oid, mxid, paddr, n),
+            None => Ok(()),
+        }
     }
 
     /// `omap_delete` (I:0x10003eedc) with flag 1 (an object's deletion) of
@@ -1218,17 +1242,17 @@ impl<'a> Nx<'a> {
             k.extend_from_slice(&x.to_le_bytes());
             k
         };
-        let mut st = PhysStore { nx: self, subtype: otype::OMAP_TREE_SUBTYPE, class: 2, vol: None };
+        let mut st = PhysStore { nx: self, subtype: otype::OMAP_TREE_SUBTYPE, class: 2, vol };
         let marker = vol.is_some() && xid_old != 0 && om.tree.get_le(&mut st, &key(oid, xid_old - 1))?.is_some_and(|(k, _)| u64a(&k, 0) == oid);
         if marker {
             let mut v = omap_val::DELETED.to_le_bytes().to_vec();
             v.extend_from_slice(&(n as u32 * self.l.bs as u32).to_le_bytes());
             v.extend_from_slice(&paddr.to_le_bytes());
-            let mut st = PhysStore { nx: self, subtype: otype::OMAP_TREE_SUBTYPE, class: 2, vol: None };
+            let mut st = PhysStore { nx: self, subtype: otype::OMAP_TREE_SUBTYPE, class: 2, vol };
             om.tree.insert(&mut st, &key(oid, xid), Some(&v))?;
         }
         if !(xid_old == xid && marker) {
-            let mut st = PhysStore { nx: self, subtype: otype::OMAP_TREE_SUBTYPE, class: 2, vol: None };
+            let mut st = PhysStore { nx: self, subtype: otype::OMAP_TREE_SUBTYPE, class: 2, vol };
             om.tree.remove(&mut st, &key(oid, xid_old))?.ok_or_else(|| format!("no mapping of {oid:#x} at {xid_old}"))?;
         }
         let root = om.tree.root;
@@ -1256,6 +1280,17 @@ impl<'a> Nx<'a> {
         }
         sb.put64(0x420, xid);
         *self.alloc_delta.entry(v).or_default() -= n as i64;
+        Ok(())
+    }
+
+    /// A volume's file data freed (`apfs_free_data_blocks` K 0x66f6fe8):
+    /// `spaceman_free` of `n` blocks at `paddr` for volume `vol`, then its
+    /// `total_blocks_freed` raised by them.
+    pub fn free_data(&mut self, vol: usize, paddr: u64, n: u64) -> Result<(), String> {
+        self.fs_free(Some(vol), paddr, n)?;
+        let sb = self.vol_sb(vol)?;
+        let freed = u64a(sb, 0xe8);
+        sb.put64(0xe8, freed + n);
         Ok(())
     }
 
@@ -2155,7 +2190,12 @@ impl Store for VirtStore<'_, '_> {
         Ok(self.nx.virt_create(self.owner, b))
     }
     fn delete(&mut self, id: u64) -> Result<(), String> {
-        Err(format!("not implemented: deleting virtual object {id:#x}"))
+        let vol = match self.owner {
+            Owner::Volume(i) => Some(i),
+            Owner::Container => None,
+        };
+        let size = self.nx.l.bs as u32;
+        self.nx.obj_delete(otype::BTREE_NODE, size, vol, id)
     }
 }
 

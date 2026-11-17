@@ -100,6 +100,7 @@ pub fn build_disk0_with(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() ->
     // The free queues' age limit follows the container device's
     // DK_FEATURE_BARRIER (0xfffffff00674d5f4 reads it at +0x4f8).
     nx.set_barrier(crate::darwin::storagestack::container_barrier());
+    nx.set_solid_state(crate::darwin::storagestack::container_solid_state());
     nx.mount_rw()?;
     let kv = key_os_version(RESTORE_BUILD)?;
     let add = |nx: &mut Nx<'_>, name: &str, role: u16, size_bytes: Option<u64>, now: &mut dyn FnMut() -> u64| -> Result<u64, String> {
@@ -522,6 +523,73 @@ mod tests {
             let _ = std::fs::remove_file(&ctr_path);
         }
         assert!(diffs.is_empty(), "{} blocks differ: {:?}", diffs.len(), &diffs[..diffs.len().min(40)]);
+    }
+
+    /// fixup_var's removals from System after the invert and the reaper
+    /// (GEX_TEST_FSCK: the device's host-runnable fsck_apfs, with
+    /// GEX_TEST_UDIF and GEX_TEST_SCRATCH): 4,244 files and 6,636
+    /// directories go (measured on the image), the moved trees are gone,
+    /// and the device's and the host's fsck_apfs find the container
+    /// consistent.
+    #[test]
+    fn removals_leave_a_consistent_container() {
+        let (Ok(dmg), Ok(dir), Ok(fsck)) = (std::env::var("GEX_TEST_UDIF"), std::env::var("GEX_TEST_SCRATCH"), std::env::var("GEX_TEST_FSCK")) else { return };
+        let f = std::fs::File::open(&dmg).unwrap();
+        let len = f.metadata().unwrap().len();
+        let image = std::sync::Arc::new(crate::darwin::udif::Udif::open(std::sync::Arc::new(super::super::HostFile(f, len))).unwrap());
+        let partition = image.partition("Apple_APFS").unwrap();
+        let os = OsImage { image: std::sync::Arc::clone(&image), partition };
+        let size = storage::disk0_bytes();
+        let dir = std::path::Path::new(&dir);
+        let disk_path = dir.join(format!("gex-rm-disk-{}", std::process::id()));
+        let ctr_path = dir.join(format!("gex-rm-ctr-{}", std::process::id()));
+        let f = std::fs::OpenOptions::new().create(true).truncate(true).read(true).write(true).open(&disk_path).unwrap();
+        f.set_len(size).unwrap();
+        let disk = std::sync::Arc::new(super::super::HostFile(f, size));
+        let (base, psize) = storage::partition_extent();
+        // Clocks before the checkers' own: fsck warns of times to come.
+        let mut t = 1_700_000_000_000_000_000u64;
+        let mut now = move || {
+            t += 1000;
+            t
+        };
+        let mut counts = Vec::new();
+        let mut after = |nx: &mut Nx<'_>| -> Result<bool, String> {
+            let mut clock = 1_710_000_000_000_000_000u64;
+            let mut now = || {
+                clock += 1000;
+                clock
+            };
+            nx.remount(Mode::Kernel)?;
+            nx.reaper_run()?;
+            let q = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+            let sb = nx.vol_sb(0)?.clone();
+            counts.push((q(&sb, 0xb8), q(&sb, 0xc0)));
+            fsops::remove_moved_trees(nx, 0, &mut now)?;
+            let sb = nx.vol_sb(0)?.clone();
+            counts.push((q(&sb, 0xb8), q(&sb, 0xc0)));
+            let mut var = 2;
+            for n in ["private", "var"] {
+                var = fsops::lookup(nx, 0, var, n)?.unwrap();
+            }
+            assert!(fsops::lookup(nx, 0, var, "staged_system_apps")?.is_none());
+            let ma = fsops::lookup(nx, 0, var, "MobileAsset")?.unwrap();
+            assert!(fsops::lookup(nx, 0, ma, "PreinstalledAssetsV2")?.is_none());
+            nx.unmount()?;
+            Ok(false)
+        };
+        build_disk0_with(disk.clone(), &mut now, Some(&os), &mut || Ok(()), &mut after, None).unwrap();
+        assert_eq!((counts[0].0 - counts[1].0, counts[0].1 - counts[1].1), (4_244, 6_636));
+        disk.0.sync_all().unwrap();
+        copy_container(&disk_path, &ctr_path, base, psize);
+        let dev = std::process::Command::new(&fsck).args(["-n", "-W", "-s"]).arg(&ctr_path).output().unwrap();
+        let host = std::process::Command::new("/sbin/fsck_apfs").args(["-n", "-s"]).arg(&ctr_path).output().unwrap();
+        if std::env::var("GEX_TEST_KEEP").is_err() {
+            let _ = std::fs::remove_file(&disk_path);
+            let _ = std::fs::remove_file(&ctr_path);
+        }
+        assert!(dev.status.success(), "device fsck: {}{}", String::from_utf8_lossy(&dev.stdout), String::from_utf8_lossy(&dev.stderr));
+        assert!(host.status.success(), "host fsck: {}{}", String::from_utf8_lossy(&host.stdout), String::from_utf8_lossy(&host.stderr));
     }
 
     #[test]

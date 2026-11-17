@@ -566,3 +566,352 @@ pub fn lookup(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str) -> Result<Op
     let (t, mut st): (Tree, _) = nx.fs_tree(vol)?;
     Ok(t.get(&mut st, &drec_key(parent, name))?.map(|v| u64a(&v, 0)))
 }
+
+/// What the removals take from the run that only the device has: the
+/// clock at each read (the parent's and the child's times, every
+/// `fs_tx_leave`), the access-time marks reads leave (K 0x670e2f4, applied
+/// at the next rewrite of a marked inode; the /mnt1 mount's atime flags
+/// were not found), and the Data copy's writes that share their
+/// transactions (BOM writes each file to /mnt2 before its unlink).
+pub const REMOVE_STAND_IN: &str = "the clock readings of restored_external's removals from System, the access times its reads would mark, and the Data copy's writes in the same transactions (stand-in: the clock of the machine building the image; no access time written; the removals' transactions holding nothing else)";
+
+const J_XATTR: u64 = 4;
+const XATTR_DATA_STREAM: u16 = 0x1;
+const SB_TOTAL_FILES_KEY: usize = SB_NUM_FILES;
+/// `j_inode_val_t` fields.
+const INO_MOD_TIME: usize = 0x18;
+const INO_CHANGE_TIME: usize = 0x20;
+const INO_INTERNAL_FLAGS: usize = 0x30;
+const INO_NCHILDREN: usize = 0x38;
+const INO_WRITE_GEN: usize = 0x40;
+const INO_MODE: usize = 0x50;
+/// `INODE_IS_APFS_PRIVATE`, `INODE_MAINTAIN_DIR_STATS`, the purgeable
+/// flag (K 0x66fd850 C0) and the file-info flag (C5).
+const INODE_IS_APFS_PRIVATE: u64 = 0x1;
+const INODE_MAINTAIN_DIR_STATS: u64 = 0x2;
+const INODE_PURGEABLE: u64 = 0x80000;
+const INODE_HAS_FILE_INFO: u64 = 0x1000_0000;
+
+fn get_rec(nx: &mut Nx<'_>, vol: usize, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
+    let (t, mut st) = nx.fs_tree(vol)?;
+    t.get(&mut st, key)
+}
+
+fn put_rec(nx: &mut Nx<'_>, vol: usize, key: &[u8], val: &[u8]) -> Result<(), String> {
+    let (mut t, mut st) = nx.fs_tree(vol)?;
+    t.insert(&mut st, key, Some(val))?;
+    nx.set_fs_tree(vol, t);
+    Ok(())
+}
+
+fn remove_rec(nx: &mut Nx<'_>, vol: usize, key: &[u8]) -> Result<(), String> {
+    let (mut t, mut st) = nx.fs_tree(vol)?;
+    t.remove(&mut st, key)?.ok_or("a record to remove is not in the tree")?;
+    nx.set_fs_tree(vol, t);
+    Ok(())
+}
+
+/// A directory's records in key order (what `apfs_vnop_readdir` K
+/// 0x6695ebc and `getattrlistbulk` return): each child's key, inode
+/// number and `DT_` type.
+pub fn read_dir(nx: &mut Nx<'_>, vol: usize, dir: u64) -> Result<Vec<(Vec<u8>, u64, u16)>, String> {
+    let (t, mut st) = nx.fs_tree(vol)?;
+    let mut out = Vec::new();
+    // Below every record of the directory: a hash and name length of 0.
+    let mut key = (dir | J_DIR_REC << 60).to_le_bytes().to_vec();
+    key.extend_from_slice(&0u32.to_le_bytes());
+    while let Some((k, v)) = t.get_gt(&mut st, &key)? {
+        if u64a(&k, 0) != (dir | J_DIR_REC << 60) {
+            break;
+        }
+        let v = v.ok_or("a directory record with no value")?;
+        out.push((k.clone(), u64a(&v, 0), u16::from_le_bytes([v[16], v[17]]) & 0xf));
+        key = k;
+    }
+    Ok(out)
+}
+
+/// `fs_tx_leave` inside an operation that still holds the transaction:
+/// the volume's last change, and whether `tx_leave` marked it closing.
+fn fs_tx_leave_nested(nx: &mut Nx<'_>, vol: usize, now: &mut dyn FnMut() -> u64) -> Result<bool, String> {
+    fs_tx_leave(nx, vol, now)?;
+    nx.close_due(0)
+}
+
+/// The operation's last `fs_tx_leave`: the transaction commits when it
+/// was marked closing while held or `tx_leave` closes it now.
+fn fs_tx_leave_last(nx: &mut Nx<'_>, vol: usize, closing: bool, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    fs_tx_leave(nx, vol, now)?;
+    if nx.close_due(0)? || closing {
+        nx.commit()?;
+    }
+    Ok(())
+}
+
+/// The removal of a directory entry (`remove_dir_entry` K 0x66fd1ac):
+/// the record goes, then the parent's modification and change times (one
+/// clock reading), child count and write generation.
+fn remove_dir_entry(nx: &mut Nx<'_>, vol: usize, dir: u64, drec: &[u8], now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    remove_rec(nx, vol, drec)?;
+    let tp = now();
+    let mut d = get_rec(nx, vol, &inode_key(dir))?.ok_or("the parent has no inode")?;
+    if u64a(&d, INO_INTERNAL_FLAGS) & INODE_MAINTAIN_DIR_STATS != 0 {
+        return Err("not implemented: a removal from a directory keeping directory statistics".into());
+    }
+    d.put64(INO_MOD_TIME, tp);
+    d.put64(INO_CHANGE_TIME, tp);
+    let n = i32::from_le_bytes(d[INO_NCHILDREN..INO_NCHILDREN + 4].try_into().unwrap());
+    d.put32(INO_NCHILDREN, (n - 1) as u32);
+    let g = u32::from_le_bytes(d[INO_WRITE_GEN..INO_WRITE_GEN + 4].try_into().unwrap());
+    d.put32(INO_WRITE_GEN, g.wrapping_add(1));
+    put_rec(nx, vol, &inode_key(dir), &d)
+}
+
+/// The extent-removal loop for a stream truncated to nothing (K
+/// 0x66fe9bc): the stream's file extents last to first in one batch of
+/// at most 1,000, each record removed and its blocks' reference dropped
+/// and freed (`_remove_extents_of_file_cb` K 0x66ff120,
+/// `apfs_update_phys_range` K 0x66f61b4), in its own nested transaction
+/// entry; `rewrite` is called before the batch's `fs_tx_leave` with the
+/// logical address of the last extent handled. Whether the transaction
+/// was marked closing.
+fn remove_extents(nx: &mut Nx<'_>, vol: usize, oid: u64, rewrite: &mut dyn FnMut(&mut Nx<'_>, u64) -> Result<(), String>, now: &mut dyn FnMut() -> u64) -> Result<bool, String> {
+    let bs = nx.block_size();
+    let last_key = fext_key(oid, 0xffff_ffff_ffff_fffe);
+    let last = {
+        let (t, mut st) = nx.fs_tree(vol)?;
+        t.get_le(&mut st, &last_key)?
+    };
+    match &last {
+        Some((k, _)) if u64a(k, 0) == (oid | J_FILE_EXTENT << 60) => {}
+        _ => return Ok(false),
+    }
+    fs_tx_enter(nx, vol)?;
+    let mut count = 0;
+    let mut alloced = None;
+    loop {
+        let rec = {
+            let (t, mut st) = nx.fs_tree(vol)?;
+            t.get_le(&mut st, &last_key)?
+        };
+        let Some((k, v)) = rec else { break };
+        if u64a(&k, 0) != (oid | J_FILE_EXTENT << 60) {
+            break;
+        }
+        if count == 1000 {
+            return Err("not implemented: a stream of more than 1,000 extents (the removal's further batches)".into());
+        }
+        let v = v.ok_or("a file extent with no value")?;
+        let (logical, len, phys) = (u64a(&k, 8), u64a(&v, 0) & 0x00ff_ffff_ffff_ffff, u64a(&v, 8));
+        if phys == 0 {
+            return Err("not implemented: removing a sparse extent (update_sparse_bytes, K 0x66ff7c0)".into());
+        }
+        if u64a(&v, 16) != 0 {
+            return Err("not implemented: removing an extent with a crypto identifier".into());
+        }
+        remove_rec(nx, vol, &k)?;
+        if len != 0 {
+            let n = len / bs;
+            let key = (phys | J_EXTENT << 60).to_le_bytes().to_vec();
+            let (mut t, mut st) = nx.extentref_tree(vol)?;
+            let pv = t.get(&mut st, &key)?.ok_or("not implemented: freeing an extent the extent-reference tree has no exact record of")?;
+            if u64a(&pv, 0) & OBJ_MASK != n || i32::from_le_bytes(pv[16..20].try_into().unwrap()) != 1 {
+                return Err("not implemented: freeing part of a referenced extent, or a shared one".into());
+            }
+            t.remove(&mut st, &key)?;
+            nx.set_extentref_tree(vol, t)?;
+            nx.free_data(vol, phys, n)?;
+        }
+        alloced = Some(logical);
+        count += 1;
+    }
+    if let Some(a) = alloced {
+        rewrite(nx, a)?;
+    }
+    fs_tx_leave_nested(nx, vol, now)
+}
+
+/// `unlink` of regular file `ino`, the only link to it and not open,
+/// whose entry in directory `dir` is the record `drec`
+/// (`apfs_vnop_remove` K 0x6691810, `fs_delete_inode_with_xid` K
+/// 0x66fd850): in one transaction, the entry and the parent's update, the
+/// file's change time read and its link count dropped, the files
+/// counted down; its extended attributes in name order (an embedded one's
+/// record; a stream's extents, then its record); its data stream's
+/// reference dropped in place, its extents, the inode rewritten with the
+/// stream's allocated size dropped, the stream's record; the inode.
+pub fn unlink(nx: &mut Nx<'_>, vol: usize, dir: u64, drec: &[u8], ino: u64, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    check_volume(nx, vol)?;
+    fs_tx_enter(nx, vol)?;
+    let mut f = get_rec(nx, vol, &inode_key(ino))?.ok_or("the file has no inode")?;
+    if u16::from_le_bytes([f[INO_MODE], f[INO_MODE + 1]]) & S_IFMT != S_IFREG {
+        return Err("not implemented: unlink of a file that is not regular".into());
+    }
+    if i32::from_le_bytes(f[INO_NCHILDREN..INO_NCHILDREN + 4].try_into().unwrap()) != 1 {
+        return Err("not implemented: unlink of a hard-linked file".into());
+    }
+    let iflags = u64a(&f, INO_INTERNAL_FLAGS);
+    if iflags & (INODE_PURGEABLE | INODE_MAINTAIN_DIR_STATS | INODE_HAS_FILE_INFO) != 0 {
+        return Err(format!("not implemented: unlink of a file with internal flags {iflags:#x}"));
+    }
+    if xfields(&f)?.iter().any(|x| x.0 == 1 || x.0 == 3 || x.0 == 10) {
+        return Err("not implemented: unlink of a file with sibling, document or directory-statistics fields".into());
+    }
+    remove_dir_entry(nx, vol, dir, drec, now)?;
+    let tc = now();
+    f.put64(INO_CHANGE_TIME, tc);
+    f.put32(INO_NCHILDREN, 0);
+    if iflags & INODE_IS_APFS_PRIVATE == 0 {
+        let sb = nx.vol_sb(vol)?;
+        let n = u64a(sb, SB_TOTAL_FILES_KEY);
+        sb.put64(SB_TOTAL_FILES_KEY, n - 1);
+    }
+    let mut closing = false;
+    // The extended attributes, by name.
+    let mut key = inode_key(ino);
+    loop {
+        let next = {
+            let (t, mut st) = nx.fs_tree(vol)?;
+            t.get_gt(&mut st, &key)?
+        };
+        let Some((k, v)) = next else { break };
+        if u64a(&k, 0) != (ino | J_XATTR << 60) {
+            break;
+        }
+        let v = v.ok_or("an extended attribute with no value")?;
+        if u16::from_le_bytes([v[0], v[1]]) & XATTR_DATA_STREAM != 0 {
+            let xoid = u64a(&v, 4);
+            closing |= remove_extents(nx, vol, xoid, &mut |_, _| Ok(()), now)?;
+        }
+        remove_rec(nx, vol, &k)?;
+        key = k;
+    }
+    // The data stream.
+    if let Some(ds) = dstream_of(&f)?.filter(|d| d.oid != 0) {
+        let idk = (ds.oid | J_DSTREAM_ID << 60).to_le_bytes().to_vec();
+        let mut idv = get_rec(nx, vol, &idk)?.ok_or("a data stream with no reference record")?;
+        if u32::from_le_bytes(idv[0..4].try_into().unwrap()) != 1 {
+            return Err("not implemented: unlink of a file sharing its data stream (a clone)".into());
+        }
+        idv.put32(0, 0);
+        put_rec(nx, vol, &idk, &idv)?;
+        let mut rewrite = |nx: &mut Nx<'_>, alloced: u64| -> Result<(), String> {
+            let x: Vec<(u8, u8, Vec<u8>)> = xfields(&f)?
+                .into_iter()
+                .map(|(t, fl, mut d)| {
+                    if t == INO_EXT_TYPE_DSTREAM {
+                        d.put64(8, alloced);
+                    }
+                    (t, fl, d)
+                })
+                .collect();
+            let v = with_xfields(&f, &x);
+            if v.len() != f.len() {
+                return Err("an inode rewrite changing its length".into());
+            }
+            put_rec(nx, vol, &inode_key(ino), &v)
+        };
+        closing |= remove_extents(nx, vol, ds.oid, &mut rewrite, now)?;
+        remove_rec(nx, vol, &idk)?;
+    }
+    remove_rec(nx, vol, &inode_key(ino))?;
+    fs_tx_leave_last(nx, vol, closing, now)
+}
+
+/// `rmdir` of empty directory `ino` whose entry in `dir` is `drec`
+/// (`apfs_vnop_rmdir_with_flags` K 0x66a2df4): in one transaction, the
+/// entry and the parent's update, the inode, the directories counted
+/// down.
+pub fn rmdir(nx: &mut Nx<'_>, vol: usize, dir: u64, drec: &[u8], ino: u64, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    check_volume(nx, vol)?;
+    fs_tx_enter(nx, vol)?;
+    let g = get_rec(nx, vol, &inode_key(ino))?.ok_or("the directory has no inode")?;
+    if u16::from_le_bytes([g[INO_MODE], g[INO_MODE + 1]]) & S_IFMT != S_IFDIR {
+        return Err("rmdir of a file that is not a directory".into());
+    }
+    if i32::from_le_bytes(g[INO_NCHILDREN..INO_NCHILDREN + 4].try_into().unwrap()) != 0 {
+        return Err("not implemented: rmdir of a directory that is not empty (K 0x6766a50)".into());
+    }
+    if u64a(&g, INO_INTERNAL_FLAGS) & (INODE_MAINTAIN_DIR_STATS | INODE_PURGEABLE) != 0 || u64a(&g, 0x08) != ino {
+        return Err("not implemented: rmdir of a directory with statistics, purgeability or a data stream".into());
+    }
+    remove_dir_entry(nx, vol, dir, drec, now)?;
+    let next = {
+        let (t, mut st) = nx.fs_tree(vol)?;
+        t.get_gt(&mut st, &inode_key(ino))?
+    };
+    if next.is_some_and(|(k, _)| u64a(&k, 0) & OBJ_MASK == ino) {
+        return Err("not implemented: rmdir of a directory with extended attributes".into());
+    }
+    remove_rec(nx, vol, &inode_key(ino))?;
+    let sb = nx.vol_sb(vol)?;
+    let n = u64a(sb, SB_NUM_DIRECTORIES);
+    sb.put64(SB_NUM_DIRECTORIES, n - 1);
+    fs_tx_leave_last(nx, vol, false, now)
+}
+
+/// The trees restored_external's fixup_var moves from System to Data
+/// (RE@0x10002f15c..0x10002f358), relative to /private/var, in its list's
+/// order.
+pub const MOVED_FROM_VAR: [&str; 3] = ["MobileAsset/PreinstalledAssets", "MobileAsset/PreinstalledAssetsV2", "staged_system_apps"];
+
+/// fixup_var's removals from System (volume `vol`): BOM's copy of
+/// /private/var (one thread, each directory read in key order and a
+/// subdirectory descended into where it comes) unlinks each regular file
+/// under a moved tree once it is copied (the handler RE@0x10003ca5c);
+/// then `removefile(REMOVEFILE_RECURSIVE)` of each moved tree (fts,
+/// physical, no comparator) removes its directories after their
+/// contents. The copy's writes to Data are not made here.
+pub fn remove_moved_trees(nx: &mut Nx<'_>, vol: usize, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    const DT_DIR: u16 = 4;
+    const DT_REG: u16 = 8;
+    let mut var = 2;
+    for n in ["private", "var"] {
+        var = lookup(nx, vol, var, n)?.ok_or_else(|| format!("no {n} on the way to /private/var"))?;
+    }
+    fn under(rel: &str) -> bool {
+        MOVED_FROM_VAR.iter().any(|m| rel == *m || rel.starts_with(&format!("{m}/")))
+    }
+    fn copy(nx: &mut Nx<'_>, vol: usize, dir: u64, rel: &str, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+        for (k, ino, ty) in read_dir(nx, vol, dir)? {
+            let nl = (u32::from_le_bytes(k[8..12].try_into().unwrap()) & 0x3ff) as usize;
+            let name = std::str::from_utf8(&k[12..12 + nl - 1]).map_err(|_| "a name that is not UTF-8")?;
+            let path = if rel.is_empty() { name.to_string() } else { format!("{rel}/{name}") };
+            match ty {
+                DT_DIR => copy(nx, vol, ino, &path, now)?,
+                DT_REG if under(&path) => unlink(nx, vol, dir, &k, ino, now)?,
+                DT_REG => {}
+                _ if under(&path) => return Err(format!("not implemented: moving a file of type {ty} from /private/var/{path}")),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+    copy(nx, vol, var, "", now)?;
+    fn remove_tree(nx: &mut Nx<'_>, vol: usize, dir: u64, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+        for (k, ino, ty) in read_dir(nx, vol, dir)? {
+            if ty != DT_DIR {
+                return Err("not implemented: removefile meeting a file the copy left".into());
+            }
+            remove_tree(nx, vol, ino, now)?;
+            rmdir(nx, vol, dir, &k, ino, now)?;
+        }
+        Ok(())
+    }
+    for m in MOVED_FROM_VAR {
+        let (parent, name) = m.rsplit_once('/').map_or(("", m), |(p, n)| (p, n));
+        let mut pdir = var;
+        let mut found = true;
+        for c in parent.split('/').filter(|c| !c.is_empty()) {
+            match lookup(nx, vol, pdir, c)? {
+                Some(i) => pdir = i,
+                None => found = false,
+            }
+        }
+        let Some(top) = found.then(|| lookup(nx, vol, pdir, name)).transpose()?.flatten() else { continue };
+        remove_tree(nx, vol, top, now)?;
+        let k = drec_key(pdir, name);
+        rmdir(nx, vol, pdir, &k, top, now)?;
+    }
+    Ok(())
+}

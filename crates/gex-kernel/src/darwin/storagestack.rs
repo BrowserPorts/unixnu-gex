@@ -1124,7 +1124,7 @@ fn namespace_props(nsid: u32, eui64: u64, block: u64) -> Vec<(String, Prop)> {
             key("Vendor Name", string("")),
             key("Product Name", string(n.model)),
             key("Product Revision Level", string(n.firmware)),
-            key("Medium Type", string("Solid State")),
+            key("Medium Type", string(MEDIUM_TYPE)),
             key("Serial Number", string(n.serial)),
         ])),
         key("Protocol Characteristics", Prop::Dict(vec![key("Physical Interconnect", string("PCI-Express")), key("Physical Interconnect Location", string("Internal"))])),
@@ -1308,6 +1308,16 @@ fn storage_features() -> Prop {
 /// Whether the APFS container's medium has Barrier in its
 /// IOStorageFeatures (what the APFS device layer's features query reads,
 /// 0xfffffff006650c78 into its +0x4f8).
+/// The namespaces' `Medium Type` (their Device Characteristics).
+pub const MEDIUM_TYPE: &str = "Solid State";
+
+/// Whether the container's device answers DKIOCISSOLIDSTATE with true
+/// (its namespace's Medium Type), as APFS reads it at mount (K
+/// 0xfffffff006650c78 into dev+0x504).
+pub fn container_solid_state() -> bool {
+    MEDIUM_TYPE == "Solid State"
+}
+
 pub fn container_barrier() -> bool {
     matches!(storage_features(), Prop::Dict(d) if d.iter().any(|(k, v)| k == "Barrier" && matches!(v, Prop::Bool(true))))
 }

@@ -1606,6 +1606,42 @@ mod tests {
         assert_eq!(p(2, "IOPCIConfigured"), Some(Prop::Bool(true)));
     }
 
+    #[test]
+    fn the_controller_has_every_namespace() {
+        let mut b = Vec::new();
+        node(&mut b, "device-tree", &[("compatible", b"J120AP\0iPad7,1\0AppleARM\0")], 1);
+        node(&mut b, "arm-io", &[("compatible", b"arm-io,t8011\0")], 1);
+        node(&mut b, "apcie", &[("compatible", b"apcie,t8011\0")], 1);
+        node(&mut b, "pci-bridge0", &[("compatible", b"apcie-bridge\0"), ("AAPL,unit-string", b"00000000")], 1);
+        node(&mut b, "s3e", &[("AAPL,unit-string", b"00000000")], 0);
+        let mut t = parse(&b).unwrap();
+        let io = super::super::platform::add(&mut t).unwrap();
+        super::super::storagestack::add(&mut t, Some(io));
+        add_root(&mut t);
+        let ctl = t.iter().position(|n| n.class == super::super::storagestack::CONTROLLER).unwrap() as u32;
+        let kids: Vec<String> = links(&t, ctl, Plane::Service, false).unwrap().iter().map(|&k| name(&t, k)).collect();
+        assert_eq!(kids, ["AppleEmbeddedNVMeTemperatureSensor", "AppleEmbeddedNVMeNVRAM", "NS_01", "NS_02", "AppleEmbeddedNVMeDiagnostics", "NS_06", "NS_07"]);
+        // NS_02: the firmware type's keys, no barrier, its own whole disk.
+        let ns2 = t.iter().position(|n| n.name == "NS_02").unwrap() as u32;
+        let p = |i: u32, k: &str| properties(&t, i).into_iter().find(|(pk, _)| pk == k).map(|(_, v)| v);
+        assert_eq!(p(ns2, "EmbeddedDeviceTypeFirmware"), Some(Prop::Bool(true)));
+        assert_eq!(p(ns2, "autodiskmount"), Some(Prop::Bool(false)));
+        assert!(p(ns2, "IOCFPlugInTypes").is_none() && !property_unknown(&t, ns2, "IOCFPlugInTypes"));
+        assert_eq!(location(&t[ns2 as usize]).as_deref(), Some("2"));
+        let fw = super::super::storage::media_bsd_name(super::super::storage::Media::Firmware);
+        let disk = t.iter().position(|n| n.service_props.iter().any(|(k, v)| k == "BSD Name" && *v == Prop::Sym(fw.clone()))).unwrap() as u32;
+        assert_eq!(p(disk, "Size"), Some(Prop::Num(8 << 20, 64)));
+        assert_eq!(p(disk, "Leaf"), Some(Prop::Bool(true)));
+        assert_eq!(t[disk as usize].dt.as_ref().map(|d| d.location.as_str()), Some("2:0"));
+        // NS_06 has AppleEffaceableBlockDevice and no medium.
+        let ns6 = t.iter().position(|n| n.name == "NS_06").unwrap() as u32;
+        let below: Vec<&str> = links(&t, ns6, Plane::Service, false).unwrap().iter().map(|&k| t[k as usize].class).collect();
+        assert_eq!(below, ["AppleEffaceableBlockDevice"]);
+        // The controller's legend and its PCI match's score.
+        assert_eq!(p(ctl, "IOProbeScore"), Some(Prop::Num(1000, 32)));
+        assert!(matches!(p(ctl, "IOReportLegend"), Some(Prop::Array(a)) if a.len() == 1));
+    }
+
     /// device-tree { chosen { memory-map }, arm-io }, under the root.
     fn small_tree() -> Vec<Node> {
         let mut b = Vec::new();

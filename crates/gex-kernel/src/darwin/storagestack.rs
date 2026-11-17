@@ -91,6 +91,13 @@ pub const APFS_CONTAINER: &str = "AppleAPFSContainer";
 pub const APFS_VOLUME: &str = "AppleAPFSVolume";
 pub const APFS_MEDIA_BSD: &str = "AppleAPFSMediaBSDClient";
 pub const APFS_VOLUME_BSD: &str = "AppleAPFSVolumeBSDClient";
+pub const TEMP_SENSOR: &str = "AppleEmbeddedNVMeTemperatureSensor";
+pub const NVRAM: &str = "AppleEmbeddedNVMeNVRAM";
+pub const DIAGNOSTICS: &str = "AppleEmbeddedNVMeDiagnostics";
+pub const DIAG_DRIVER: &str = "AppleDiagnosticDataAccessReadOnly";
+pub const EFFACEABLE: &str = "IONVMeEffaceableDevice";
+pub const EFFACEABLE_DRIVER: &str = "AppleEffaceableBlockDevice";
+pub const NAMESPACE_DEVICE: &str = "AppleNVMeNamespaceDevice";
 
 /// The classes here, most derived first (to `IORegistryEntry`), from their
 /// metaclasses' constructors: AppleT8011PCIe's (0xfffffff007c186e8,
@@ -118,6 +125,13 @@ pub fn superclasses(class: &str) -> &'static [&'static str] {
         APFS_VOLUME => &[APFS_VOLUME, "IOMedia", "IOStorage", "IOService", "IORegistryEntry"],
         APFS_MEDIA_BSD => &[APFS_MEDIA_BSD, BSD_CLIENT, "IOService", "IORegistryEntry"],
         APFS_VOLUME_BSD => &[APFS_VOLUME_BSD, BSD_CLIENT, "IOService", "IORegistryEntry"],
+        TEMP_SENSOR => &[TEMP_SENSOR, "AppleEmbeddedHIDEventService", "IOHIDEventService", "IOService", "IORegistryEntry"],
+        NVRAM => &[NVRAM, "IONVRAMController", "IOService", "IORegistryEntry"],
+        DIAGNOSTICS => &[DIAGNOSTICS, "AppleNANDConfigAccess", "IOService", "IORegistryEntry"],
+        DIAG_DRIVER => &[DIAG_DRIVER, "IOService", "IORegistryEntry"],
+        EFFACEABLE => &[EFFACEABLE, BLOCK_DEVICE, "IONVMeBlockStorageDevice", "IOBlockStorageDevice", "IOService", "IORegistryEntry"],
+        EFFACEABLE_DRIVER => &[EFFACEABLE_DRIVER, "AppleEffaceableStorage", "IOService", "IORegistryEntry"],
+        NAMESPACE_DEVICE => &[NAMESPACE_DEVICE, "IOService", "IORegistryEntry"],
         _ => &[],
     }
 }
@@ -129,7 +143,7 @@ pub fn superclasses(class: &str) -> &'static [&'static str] {
 pub fn children_unknown(class: &str) -> Option<&'static str> {
     match class {
         T8011_PCIE => Some("the root complex's other ports (pci-bridge2, whose port is enabled by hand)"),
-        CONTROLLER => Some("the controller's temperature sensor, NVRAM and namespaces other than NSID 1"),
+        TEMP_SENSOR | NVRAM | DIAG_DRIVER | EFFACEABLE_DRIVER | NAMESPACE_DEVICE => Some("the clients its family attaches, not followed"),
         _ => None,
     }
 }
@@ -138,7 +152,10 @@ pub fn children_unknown(class: &str) -> Option<&'static str> {
 /// objects are one each but for the media, BSD clients and drivers the
 /// controller's other namespaces add.
 pub fn class_complete(class: &str) -> bool {
-    matches!(class, APFS_SCHEME | APFS_MEDIA | APFS_CONTAINER | APFS_VOLUME | APFS_MEDIA_BSD | APFS_VOLUME_BSD | GPT | HOST_BRIDGE | T8011_PCIE)
+    matches!(
+        class,
+        APFS_SCHEME | APFS_MEDIA | APFS_CONTAINER | APFS_VOLUME | APFS_MEDIA_BSD | APFS_VOLUME_BSD | GPT | HOST_BRIDGE | T8011_PCIE | CONTROLLER | "AppleNVMeController" | "IONVMeController" | BLOCK_DEVICE | EFFACEABLE | "IONVMeBlockStorageDevice" | "IOBlockStorageDevice" | DRIVER | "IOMedia" | BSD_CLIENT | "IOPartitionScheme" | NAMESPACE_DEVICE | DIAGNOSTICS
+    )
 }
 
 /// A string as an `OSSymbol` (`setProperty(const char *, const char *)`,
@@ -207,6 +224,7 @@ fn bsd_keys(m: Media) -> Vec<(String, Prop)> {
     let unit = match m {
         Media::Whole | Media::Partition => super::storage::units().main,
         Media::Container | Media::Volume(_) => super::storage::units().container,
+        Media::Firmware => super::storage::units().firmware,
     };
     vec![key("BSD Name", Prop::Sym(name)), key("BSD Unit", num32(u64::from(unit))), key("BSD Major", num32(u64::from(super::storage::DISK_MAJOR))), key("BSD Minor", num32(u64::from(minor)))]
 }
@@ -474,6 +492,9 @@ pub fn pci_facts() -> PciFacts {
 /// The facts here still unset, as lines for gexc's report at start.
 pub fn unmeasured() -> Vec<String> {
     let mut gaps = Vec::new();
+    if FIRMWARE_EUI64.is_none() {
+        gaps.push(format!("NS_02's EUI64 (stand-in 0) and that no partition scheme recognizes the firmware namespace's contents (stand-in: a leaf with no content); measure {FIRMWARE_EUI64_MEASUREMENT} and its IOMedia's Content"));
+    }
     if CONTAINER_STATUS.is_none() {
         gaps.push(format!("the AppleAPFSContainer's Status (stand-in {STAND_IN_CONTAINER_STATUS:?}; measure {CONTAINER_STATUS_MEASUREMENT})"));
     }
@@ -593,39 +614,12 @@ fn add_storage(t: &mut Vec<Node>, controller: Option<u32>) {
     // strings; the vendor name empty) and protocol characteristics (found
     // up the plane, the controller personality's), and on NSID 1 the SMART
     // plug-in.
-    let ns_props = vec![
-        key("device-type", sym("Generic")),
-        key("IOUnit", num32(1)),
-        key("NamespaceUUID", num64(n.eui64)),
-        key("NamespaceID", num32(1)),
-        key("IOReportLegend", namespace_legend()),
-        key("IOReportLegendPublic", Prop::Bool(true)),
-        key("IOMaximumSegmentCountRead", num32(256)),
-        key("IOMaximumSegmentCountWrite", num32(256)),
-        key("IOMaximumSegmentByteCountRead", num32(0x10_0000)),
-        key("IOMaximumSegmentByteCountWrite", num32(0x10_0000)),
-        key("IOMinimumSegmentAlignmentByteCount", num32(4096)),
-        key("IOMaximumByteCountRead", num32(0x10_0000)),
-        key("IOMaximumByteCountWrite", num32(0x10_0000)),
-        key("IOMaximumBlockCountRead", num32(256)),
-        key("IOMaximumBlockCountWrite", num32(256)),
-        key("Encryption", Prop::Bool(true)),
-        key("EmbeddedDeviceTypeRoot", Prop::Bool(true)),
-        key("IOStorageFeatures", storage_features()),
-        key("ThermalThrottlingSupported", Prop::Bool(true)),
-        key("Physical Block Size", num32(block)),
-        key("Logical Block Size", num32(block)),
-        key("Device Characteristics", Prop::Dict(vec![
-            key("Vendor Name", string("")),
-            key("Product Name", string(n.model)),
-            key("Product Revision Level", string(n.firmware)),
-            key("Medium Type", string("Solid State")),
-            key("Serial Number", string(n.serial)),
-        ])),
-        key("Protocol Characteristics", Prop::Dict(vec![key("Physical Interconnect", string("PCI-Express")), key("Physical Interconnect Location", string("Internal"))])),
-        key("IOCFPlugInTypes", Prop::Dict(vec![key("AA0FA6F9-C2D6-457F-B10B-59A13253292F", string("NVMeSMARTLib.plugin"))])),
-        key("NVMe SMART Capable", Prop::Bool(true)),
-    ];
+    // The controller's children before it, in the order its start makes
+    // them: its temperature sensor, then its NVRAM (NSID 5).
+    if let Some(c) = controller {
+        add_controller_objects(t, c);
+    }
+    let ns_props = namespace_props(1, n.eui64, block);
     let ns = push(t, service("NS_01", BLOCK_DEVICE, controller, ns_props, Table::Complete));
     // IOBlockStorageDriver's personality; its init's statistics (live,
     // [`stats`]).
@@ -715,13 +709,176 @@ fn add_storage(t: &mut Vec<Node>, controller: Option<u32>) {
     add_bsd_client(t, media, APFS_MEDIA_BSD);
     add_bsd_client(t, part, BSD_CLIENT);
     add_bsd_client(t, whole, BSD_CLIENT);
+    add_namespaces(t, controller, dt_parent);
+}
+
+/// A namespace's properties (IONVMeBlockStorageDevice and
+/// IOEmbeddedNVMeBlockDevice, 0xfffffff006a954d8, 0xfffffff006a95e10,
+/// 0xfffffff006a70014 and 0xfffffff006a97a20): IOBlockStorageDevice::init's
+/// device type, its unit, Identify Namespace's EUI64 and NSID, its
+/// reporters' legend, the transfer limits, Encryption, its type's key
+/// (from the table at 0xfffffff007c17c08: the root's EmbeddedDeviceTypeRoot,
+/// the firmware's EmbeddedDeviceTypeFirmware, ...) and, but on the root,
+/// autodiskmount false; its storage features (Unmap from ONCS Dataset
+/// Management, gNVMeDebug's bit 0x200 being clear and no vendor quirk;
+/// Priority, the controller's slot 0x5b0 answering 1; Barrier, flags bit
+/// 4, always set here, on NSID 1 only), its throttling, the block sizes,
+/// its characteristics (the controller's strings; the vendor name empty)
+/// and protocol characteristics (found up the plane, the controller
+/// personality's), and on NSID 1 the SMART plug-in.
+fn namespace_props(nsid: u32, eui64: u64, block: u64) -> Vec<(String, Prop)> {
+    let n = super::storage::nvme();
+    let ty = namespace_type(nsid);
+    let mut p = vec![
+        key("device-type", sym("Generic")),
+        key("IOUnit", num32(u64::from(nsid))),
+        key("NamespaceUUID", num64(eui64)),
+        key("NamespaceID", num32(u64::from(nsid))),
+        key("IOReportLegend", namespace_legend()),
+        key("IOReportLegendPublic", Prop::Bool(true)),
+        key("IOMaximumSegmentCountRead", num32(256)),
+        key("IOMaximumSegmentCountWrite", num32(256)),
+        key("IOMaximumSegmentByteCountRead", num32(0x10_0000)),
+        key("IOMaximumSegmentByteCountWrite", num32(0x10_0000)),
+        key("IOMinimumSegmentAlignmentByteCount", num32(4096)),
+        key("IOMaximumByteCountRead", num32(0x10_0000)),
+        key("IOMaximumByteCountWrite", num32(0x10_0000)),
+        key("IOMaximumBlockCountRead", num32(256)),
+        key("IOMaximumBlockCountWrite", num32(256)),
+        key("Encryption", Prop::Bool(true)),
+        key(NAMESPACE_TYPE_KEYS[ty as usize], Prop::Bool(true)),
+    ];
+    if ty != 1 {
+        p.push(key("autodiskmount", Prop::Bool(false)));
+    }
+    p.extend([
+        key("IOStorageFeatures", features(nsid == 1)),
+        key("ThermalThrottlingSupported", Prop::Bool(true)),
+        key("Physical Block Size", num32(block)),
+        key("Logical Block Size", num32(block)),
+        key("Device Characteristics", Prop::Dict(vec![
+            key("Vendor Name", string("")),
+            key("Product Name", string(n.model)),
+            key("Product Revision Level", string(n.firmware)),
+            key("Medium Type", string("Solid State")),
+            key("Serial Number", string(n.serial)),
+        ])),
+        key("Protocol Characteristics", Prop::Dict(vec![key("Physical Interconnect", string("PCI-Express")), key("Physical Interconnect Location", string("Internal"))])),
+    ]);
+    if nsid == 1 {
+        p.push(key("IOCFPlugInTypes", Prop::Dict(vec![key("AA0FA6F9-C2D6-457F-B10B-59A13253292F", string("NVMeSMARTLib.plugin"))])));
+        p.push(key("NVMe SMART Capable", Prop::Bool(true)));
+    }
+    p
+}
+
+/// The namespaces' types' keys (0xfffffff007c17c08), by type.
+const NAMESPACE_TYPE_KEYS: [&str; 14] = [
+    "NULL",
+    "EmbeddedDeviceTypeRoot",
+    "EmbeddedDeviceTypeFirmware",
+    "EmbeddedDeviceTypeSysConfig",
+    "EmbeddedDeviceTypeControlBits",
+    "EmbeddedDeviceTypeNVRAM",
+    "EmbeddedDeviceTypeEffaceable",
+    "EmbeddedDeviceTypeCalibration",
+    "EmbeddedDeviceTypePanicLog",
+    "EmbeddedDeviceTypeAHCI",
+    "EmbeddedDeviceTypeBIS",
+    "EmbeddedDeviceTypeME",
+    "EmbeddedDeviceTypeLifeboat",
+    "EmbeddedDeviceTypeEAN",
+];
+
+/// A namespace's type: the device tree's `namespaces` (s3e), entries of
+/// NSID, type and size in blocks: (1, 1, 0), (2, 2, 2048), (3, 3, 32),
+/// (4, 4, 2), (5, 5, 2), (6, 6, 1), (7, 8, 256); a restored device's
+/// Identify Namespace answers them (`CreateNamespaces` made them so).
+fn namespace_type(nsid: u32) -> u32 {
+    match nsid {
+        7 => 8,
+        n => n,
+    }
+}
+
+/// The firmware namespace's size in blocks of 4096 bytes: the device
+/// tree's, which IONVMeFamily enforces (`ValidateNamespaceSize`,
+/// 0xfffffff006a604a8, panics on any other NCAP or LBA size).
+pub const FIRMWARE_BLOCKS: u64 = 2048;
+
+/// The firmware namespace's Identify Namespace EUI64: the device's, once
+/// measured; zero (as the main namespace's stand-in) meanwhile, a reported
+/// shortcut.
+pub const FIRMWARE_EUI64: Option<u64> = None;
+
+/// What measures [`FIRMWARE_EUI64`].
+pub const FIRMWARE_EUI64_MEASUREMENT: &str = "the NamespaceUUID of NS_02 (a sysdiagnose's ioreg IOService plane)";
+
+/// The controller's objects made before its namespaces (InitializeController,
+/// 0xfffffff006a5b640, then slot 0x930, 0xfffffff006a5ecc4): its
+/// temperature sensor, an `AppleEmbeddedNVMeTemperatureSensor` (an
+/// IOHIDEventService), and its NVRAM, an `AppleEmbeddedNVMeNVRAM` on NSID 5.
+/// Neither is given a name (each is its class's) or a location. Their
+/// tables are their families': not followed.
+fn add_controller_objects(t: &mut Vec<Node>, controller: u32) {
+    push(t, service(TEMP_SENSOR, TEMP_SENSOR, Some(controller), Vec::new(), Table::Partial("the HID event service's properties (IOHIDEventService and AppleEmbeddedHIDEventService), not followed".to_string())));
+    push(t, service(NVRAM, NVRAM, Some(controller), Vec::new(), Table::Partial("the NVRAM controller's properties (IONVRAMController and AppleEmbeddedNVMeNVRAM), not followed".to_string())));
+}
+
+/// The namespaces after the root (`AllocateNodes`, 0xfffffff006a5e35c,
+/// NSID 2 on, but the types it makes elsewhere, 4 and 5):
+/// - NSID 2, the firmware, an `IOEmbeddedNVMeBlockDevice` "NS_02" at "2":
+///   IOBlockStorageDriver matches it as NSID 1's, and its whole disk, of
+///   2048 blocks, no partition scheme claims (its contents are the
+///   firmware's, not a partition map: a stand-in, [`unmeasured`]), so it is
+///   a leaf with no content; attached in the `IODeviceTree` plane as
+///   "disk" at "2:0".
+/// - NSID 3, `AppleEmbeddedNVMeDiagnostics` (an AppleNANDConfigAccess),
+///   on which AppleDiagnosticDataAccessReadOnly's personality
+///   AppleNANDDiagnosticDataAccess matches (score 99, its own category).
+/// - NSID 6, an `IONVMeEffaceableDevice` "NS_06" at "6": both
+///   AppleEffaceableBlockDevice's "-NVMe" personality and
+///   IOBlockStorageDriver's match it, in the default category at score 0;
+///   `IOCatalogue::findDrivers` adds the most derived provider class's
+///   personalities first and `OSOrderedSet` keeps equal scores in order, so
+///   AppleEffaceableBlockDevice is tried, and taken, first: no IOMedia.
+/// - NSID 7 (type 8, the panic log), an `AppleNVMeNamespaceDevice` "NS_07"
+///   (0xfffffff006a7d7a0).
+fn add_namespaces(t: &mut Vec<Node>, controller: Option<u32>, dt_parent: Option<u32>) {
+    let Some(c) = controller else { return };
+    let n = super::storage::nvme();
+    let block = 4096;
+    let eui = FIRMWARE_EUI64.unwrap_or(0);
+    let ns = push(t, service("NS_02", BLOCK_DEVICE, Some(c), namespace_props(2, eui, block), Table::Complete));
+    let mut props = driver("com.apple.iokit.IOStorageFamily", DRIVER, "IOBlockStorageDevice", None, "IODefaultMatchCategory", 0, vec![key("IOPropertyMatch", Prop::Dict(vec![key("device-type", string("Generic"))]))]);
+    props.push(key("Statistics", stats::driver(2)));
+    let drv = push(t, service(DRIVER, DRIVER, Some(ns), props, Table::Complete));
+    let mut props = medium("", "", true, block, FIRMWARE_BLOCKS * block, true, super::storage::disk_writable());
+    props.push(key("IOMediaIcon", Prop::Dict(vec![key("CFBundleIdentifier", string("com.apple.iokit.IOStorageFamily")), key("IOBundleResourceFile", string("Internal.icns"))])));
+    props.extend(bsd_keys(Media::Firmware));
+    let mut whole = service(&format!("{} Media", n.model), "IOMedia", Some(drv), props, Table::Complete);
+    whole.dt = dt_parent.map(|p| DtLink { parent: p, name: "disk".to_string(), location: "2:0".to_string() });
+    let whole = push(t, whole);
+    add_bsd_client(t, whole, BSD_CLIENT);
+    let diag = push(t, service(DIAGNOSTICS, DIAGNOSTICS, Some(c), Vec::new(), Table::Partial("the diagnostics access's properties (AppleNANDConfigAccess and AppleEmbeddedNVMeDiagnostics), not followed".to_string())));
+    let props = driver("com.apple.driver.AppleDiagnosticDataAccessReadOnly", DIAG_DRIVER, "AppleNANDConfigAccess", None, "AppleDiagnosticDataAccess", 99, Vec::new());
+    push(t, service(DIAG_DRIVER, DIAG_DRIVER, Some(diag), props, Table::Partial("what AppleDiagnosticDataAccessReadOnly's start sets, not followed".to_string())));
+    let eff = push(t, service("NS_06", EFFACEABLE, Some(c), namespace_props(6, 0, block), Table::Partial("what IONVMeEffaceableDevice adds to or changes of IOEmbeddedNVMeBlockDevice's properties, and NSID 6's EUI64, not followed".to_string())));
+    let props = driver("com.apple.driver.AppleEffaceableBlockDevice", EFFACEABLE_DRIVER, EFFACEABLE, None, "IODefaultMatchCategory", 0, Vec::new());
+    push(t, service(EFFACEABLE_DRIVER, EFFACEABLE_DRIVER, Some(eff), props, Table::Partial("what AppleEffaceableBlockDevice's start sets, not followed".to_string())));
+    push(t, service("NS_07", NAMESPACE_DEVICE, Some(c), Vec::new(), Table::Partial("the panic log namespace's properties (AppleNVMeNamespaceDevice), not followed".to_string())));
 }
 
 /// The namespace's IOStorageFeatures, a dictionary of three booleans in
 /// this order (0xfffffff006a97a20).
 fn storage_features() -> Prop {
+    features(true)
+}
+
+/// A namespace's IOStorageFeatures, Barrier only on NSID 1.
+fn features(barrier: bool) -> Prop {
     let n = super::storage::nvme();
-    Prop::Dict(vec![key("Unmap", Prop::Bool(n.dataset_management)), key("Priority", Prop::Bool(true)), key("Barrier", Prop::Bool(true))])
+    Prop::Dict(vec![key("Unmap", Prop::Bool(n.dataset_management)), key("Priority", Prop::Bool(true)), key("Barrier", Prop::Bool(barrier))])
 }
 
 /// A medium's BSD client of `class`: its personality's properties; neither
@@ -750,7 +907,7 @@ fn add_bsd_client(t: &mut Vec<Node>, medium: u32, class: &'static str) {
 pub fn registers(class: &str) -> Option<bool> {
     match class {
         GPT | APFS_SCHEME => Some(false),
-        T8011_PCIE | PCI_DEVICE | HOST_BRIDGE | CONTROLLER | BLOCK_DEVICE | DRIVER | "IOMedia" | BSD_CLIENT | APFS_MEDIA | APFS_CONTAINER | APFS_VOLUME | APFS_MEDIA_BSD | APFS_VOLUME_BSD => Some(true),
+        T8011_PCIE | PCI_DEVICE | HOST_BRIDGE | CONTROLLER | BLOCK_DEVICE | EFFACEABLE | DRIVER | "IOMedia" | BSD_CLIENT | APFS_MEDIA | APFS_CONTAINER | APFS_VOLUME | APFS_MEDIA_BSD | APFS_VOLUME_BSD | DIAGNOSTICS | NAMESPACE_DEVICE => Some(true),
         _ => None,
     }
 }
@@ -804,7 +961,7 @@ pub fn location(n: &Node) -> Option<String> {
     match n.class {
         APFS_VOLUME => super::storage::VOLUMES.iter().find(|v| v.name == n.name).map(|v| (v.index + 1).to_string()),
         "IOMedia" if n.name == PARTITION_NAME => Some("1".to_string()),
-        BLOCK_DEVICE => Some("1".to_string()),
+        BLOCK_DEVICE | EFFACEABLE => n.name.strip_prefix("NS_").and_then(|d| d.parse::<u32>().ok()).map(|nsid| format!("{nsid:x}")),
         PCI_DEVICE => n.dt.as_ref().map(|d| d.location.clone()),
         _ => None,
     }

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Wine's build trees for 32-bit Wine:
 #
 #   wine32/wine-build.sh tools SRC TOOLS

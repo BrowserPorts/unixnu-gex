@@ -4064,6 +4064,11 @@ impl PathIo<'_> {
         }
         put32(&mut out, 128, (st.rdev >> 8) as u32);
         put32(&mut out, 132, (st.rdev & 0xff) as u32);
+        // stx_dev_major and stx_dev_minor, split as glibc's major() and
+        // minor() split a 64-bit dev_t (every bit lands in one of them, so
+        // two devices stay two after the libc joins them again).
+        put32(&mut out, 136, (((st.dev >> 8) & 0xfff) | ((st.dev >> 32) & !0xfff)) as u32);
+        put32(&mut out, 140, ((st.dev & 0xff) | ((st.dev >> 12) & !0xff)) as u32);
         m.write(buf, &out)?;
         Ok(0)
     }
@@ -12885,6 +12890,7 @@ impl Kernel {
 
     pub(crate) fn stat_from(md: &crate::vfs::Metadata) -> Stat {
         Stat {
+            dev: md.dev,
             ino: md.ino,
             mode: md.file_type.mode_bits() | md.mode,
             nlink: md.nlink.max(1),

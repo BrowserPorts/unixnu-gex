@@ -281,6 +281,7 @@ impl PageFs {
             mtime: u64_at(b, 16) as i64,
             nlink: if ft == FileType::Directory { 2 } else { 1 },
             rdev: 0,
+            dev: 0,
             times: Default::default(),
         }
     }

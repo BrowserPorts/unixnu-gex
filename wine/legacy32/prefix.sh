@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # 32-bit Wine prefixes:
 #
 #   wine32/prefix.sh install BAREPFX DIST GEXC OUT

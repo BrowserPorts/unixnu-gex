@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # libc++, libc++abi and libunwind for gexcc's Windows target (Windows x64
 # programs as native wasm): Wine's C runtime headers, the win32 thread API,
 # wasm exception handling, from a checkout of toolchain/pins' LLVM_COMMIT.

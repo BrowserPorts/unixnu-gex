@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Link 64-bit Wine's loader: 64-bit native Wine's Unix side (loader/main.o and
 # ntdll's Unix objects, LP64 wasm64 lowered to wasm32) as one closed-world
 # program, the ELF64 container gexc runs, flagged as running x86-64 Windows

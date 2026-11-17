@@ -92,6 +92,7 @@ impl FileHandle for DevHandle {
             mtime: 0,
             nlink: 1,
             rdev: rdev_of(self.device),
+            dev: 0,
             times: Default::default(),
         })
     }
@@ -208,6 +209,7 @@ impl DevFs {
             mtime: 0,
             nlink: 1,
             rdev,
+            dev: 0,
             times: Default::default(),
         })
     }
@@ -337,6 +339,7 @@ impl FileSystem for DevFs {
                 mtime: 0,
                 nlink: 1,
                 rdev: rdev_of(device),
+                dev: 0,
                 times: Default::default(),
             });
         }
@@ -369,6 +372,7 @@ impl FileSystem for DevFs {
                 mtime: 0,
                 nlink: 1,
                 rdev: 0,
+                dev: 0,
                 times: Default::default(),
             });
         }
@@ -686,6 +690,7 @@ mod tests {
                     mtime: 0,
                     nlink: 1,
                     rdev: 0,
+                    dev: 0,
                     times: Default::default(),
                 })
             }

@@ -1102,6 +1102,7 @@ impl FileHandle for UnixSocket {
             mtime: 0,
             nlink: 1,
             rdev: 0,
+            dev: 0,
             times: Default::default(),
         })
     }
@@ -1661,6 +1662,7 @@ impl FileHandle for UnixDgram {
             mtime: 0,
             nlink: 1,
             rdev: 0,
+            dev: 0,
             times: Default::default(),
         })
     }
@@ -2216,6 +2218,7 @@ impl FileHandle for MemFd {
             mtime: 0,
             nlink: 1,
             rdev: 0,
+            dev: 0,
             times: Default::default(),
         })
     }
@@ -2573,6 +2576,7 @@ impl FileHandle for EpollSet {
             mtime: 0,
             nlink: 1,
             rdev: 0,
+            dev: 0,
             times: Default::default(),
         })
     }
@@ -2886,6 +2890,7 @@ impl crate::vfs::FileHandle for RemoteUnix {
             mtime: 0,
             nlink: 1,
             rdev: 0,
+            dev: 0,
             times: Default::default(),
         })
     }

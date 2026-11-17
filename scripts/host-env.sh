@@ -20,7 +20,7 @@
 # since macOS sets it to the internal disk, and XDG_CACHE_HOME always the shared one.
 #
 # Homebrew: bash coreutils findutils gnu-sed gnu-tar grep gawk make libtool bison flock
-# llvm@22 lld@22 wasm-tools xkbcomp. GNU binutils stay off PATH: their ar writes archives
+# llvm@22 lld@22 wabt wasm-tools xkbcomp. GNU binutils stay off PATH: their ar writes archives
 # the host's linker rejects, and the guest toolchains bring their own. Python:
 # GEX_SHARED/py, a venv with meson at MESON_VERSION (wine/libs.pins), mako, pyyaml and
 # packaging.
@@ -61,7 +61,7 @@ gex_host_env() {
     *[[:space:]]*) echo "host-env: GEX_SHARED has a space in it: $shared" >&2; return 1 ;;
     esac
     GEX_MINGW=${GEX_MINGW:-$shared/mingw/bin}
-    GEX_PATH=$HOME/.cargo/bin:$shared/py/bin:$hb/opt/llvm@22/bin:$hb/opt/lld@22/bin
+    GEX_PATH=$HOME/.cargo/bin:$shared/py/bin:$hb/opt/llvm@22/bin:$hb/opt/lld@22/bin:$hb/opt/wabt/bin
     for d in coreutils findutils gnu-sed gnu-tar grep gawk make libtool; do
         GEX_PATH=$GEX_PATH:$hb/opt/$d/libexec/gnubin
     done

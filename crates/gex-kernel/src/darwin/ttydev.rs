@@ -209,6 +209,7 @@ pub fn node_metadata(node: Node, dev: u32) -> Metadata {
         mtime,
         nlink: 1,
         rdev: linux_rdev(dev),
+        dev: 0,
         times,
     }
 }

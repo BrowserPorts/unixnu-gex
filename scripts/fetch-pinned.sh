@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # A pinned source tree from a persistent bare mirror, never a fresh clone.
 # Called by: make sysroot, make sysroot64, make gexcc, make wine (the
 # top-level Makefile).

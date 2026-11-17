@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # A 32-bit Wine install and its prefixes, built from a given Wine checkout, as
 # wine64-dist.sh is for 64-bit Wine (`make wine32` builds the one wine/wine.pins' WINE_COMMIT names):
 #

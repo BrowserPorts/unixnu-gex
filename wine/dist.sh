@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # A 64-bit Wine install and a win64 prefix for it,
 # built from a Wine tree with the 64-bit Wine work (wine/wine.pins names the
 # commit; another is built too, with a note):
@@ -226,6 +226,26 @@ without="--without-x --without-freetype --without-gstreamer --without-pulse --wi
   --without-sane --without-gphoto --without-v4l2 --without-wayland --without-vulkan --without-opengl --without-dbus
   --without-krb5 --without-gssapi --without-netapi --without-pcap --without-usb --without-sdl --without-oss
   --without-udev --without-capi --without-inotify --without-gnutls --without-ffmpeg --without-fontconfig"
+# The trees with a native Unix side (pe64's, and wwl's and wgs's, which share
+# its configure): the host's own on x86-64 Linux. On macOS an x86-64 macOS
+# one, Wine's supported macOS build (its PE side is x86-64's anyway), built
+# as a cross build: nothing of it runs here, the prefix is made under gexc
+# (PG below). Less the Mac drivers and DiskArbitration, which it would only
+# compile.
+UNIXCONF=()
+if [ "$(uname -s)" = Darwin ]; then
+	UNIXCONF=(--build="$(uname -m | sed s/arm64/aarch64/)-apple-darwin" --host=x86_64-apple-darwin
+		CC="clang -arch x86_64" CXX="clang++ -arch x86_64"
+		--disable-winemac.drv --without-coreaudio --without-opencl ac_cv_header_DiskArbitration_DiskArbitration_h=no)
+	P=$P-mac$(printf '%s\n' "${UNIXCONF[@]}" | sha256sum | cut -c1-4)
+fi
+# Who makes the prefix (pfx64, pfs64): the PE tree's native Wine where this
+# host runs it (x86-64 Linux), else the install's own Wine under gexc (GEXC,
+# default this tree's x86 gexc), once the install is made. WINE64_PREFIX_GEX=1
+# or 0 says which.
+PG=${WINE64_PREFIX_GEX:-}
+[ -n "$PG" ] || case $(uname -s)-$(uname -m) in Linux-x86_64) PG=0 ;; *) PG=1 ;; esac
+GEXC=${GEXC:-$here/../target/x86/release/gexc}
 step() { # NAME CMD...: run CMD in a fresh CACHE/NAME (build trees name their own path, so in place)
 	local n=$1 d=$C/$1; shift
 	[ -e "$d/.done" ] && return 0
@@ -235,7 +255,12 @@ step() { # NAME CMD...: run CMD in a fresh CACHE/NAME (build trees name their ow
 }
 
 tools_build() {
-	"$W/configure" --enable-archs= --without-mingw --disable-tests $without
+	# (Wine's configure wants a PE arch on macOS and ARM hosts, even for a
+	# tree only the tools are made in: x86_64's there, MinGW's, which
+	# __tooldeps__ does not build)
+	local pe=(--enable-archs= --without-mingw)
+	case $(uname -s)-$(uname -m) in Linux-x86_64|Linux-i?86) ;; *) pe=(--enable-archs=x86_64) ;; esac
+	"$W/configure" "${pe[@]}" --disable-tests $without
 	nice -n 10 make -j"$J" __tooldeps__ nls/locale.nls
 }
 log "tools ($TP)"; step tools-$TP tools_build
@@ -261,7 +286,7 @@ pe_build() {
 		flock 9
 		[ "${WINE64_PE_FRESH:-0}" = 1 ] && rm -rf "$WK"
 		mkdir -p "$WK"; cd "$WK"
-		[ -f Makefile ] || "$W/configure" --enable-archs=$ARCHS --with-wine-tools="$T" --disable-tests $without "${CF32[@]}"
+		[ -f Makefile ] || "$W/configure" --enable-archs=$ARCHS --with-wine-tools="$T" --disable-tests $without "${CF32[@]}" "${UNIXCONF[@]}"
 		nice -n 10 make -k -j"$J" || nice -n 10 make -j"$J"
 		rm -rf install; nice -n 10 make install prefix="$WK/install"
 		cp -a --reflink=auto install "$out/install"
@@ -280,7 +305,7 @@ N=$C/pe64-$P/install
 # tree of its own, configured with the module enabled, makes the PE files
 # alone; the Unix half is the loader's (link-wine64.sh, with its WoW64 table).
 wwl_build() {
-	"$W/configure" --enable-archs=i386,x86_64 --enable-winewayland.drv --with-wine-tools="$T" --disable-tests $without "${CF32[@]}"
+	"$W/configure" --enable-archs=i386,x86_64 --enable-winewayland.drv --with-wine-tools="$T" --disable-tests $without "${CF32[@]}" "${UNIXCONF[@]}"
 	nice -n 10 make -j"$J" dlls/winewayland.drv/i386-windows/winewayland.drv dlls/winewayland.drv/x86_64-windows/winewayland.drv
 }
 WD=; WL=; if [ "$WOW" != 0 ]; then
@@ -288,7 +313,7 @@ WD=; WL=; if [ "$WOW" != 0 ]; then
 fi
 # winegstreamer's PE halves the same way (its Unix half is the side module)
 wgs_build() {
-	"$W/configure" --enable-archs=$ARCHS --enable-winegstreamer --with-wine-tools="$T" --disable-tests $without "${CF32[@]}"
+	"$W/configure" --enable-archs=$ARCHS --enable-winegstreamer --with-wine-tools="$T" --disable-tests $without "${CF32[@]}" "${UNIXCONF[@]}"
 	local a t=""; for a in ${ARCHS//,/ }; do t="$t dlls/winegstreamer/$a-windows/winegstreamer.dll"; done
 	# shellcheck disable=SC2086
 	nice -n 10 make -j"$J" $t
@@ -297,25 +322,45 @@ GS=; if [ "$MEDIA" != 0 ]; then
 	log "winegstreamer's PE halves ($P)"; step wgs-$P wgs_build; GS=$C/wgs-$P/dlls/winegstreamer
 fi
 
+# The prefixes (made here where the native Wine makes them, after the
+# install where gex's does: PG above)
+# Wine in prefix PFX, stopped after S seconds, with K=V more environment:
+# the native one (N's, then its server waited for, which writes the
+# registry), or the install's under gexc (which returns once every process
+# of the run, the server's too, has exited). No display either way.
+wine_in() { # PFX S [K=V...] -- ARGS...
+	local pfx=$1 s=$2 e=() ge=() k; shift 2
+	while [ "$1" != -- ]; do e+=("$1"); shift; done; shift
+	if [ "$PG" = 0 ]; then
+		env WINEPREFIX="$pfx" WINEDEBUG=-all DISPLAY= WAYLAND_DISPLAY= "${e[@]}" timeout "$s" nice -n 10 "$N/bin/wine" "$@" &&
+			env WINEPREFIX="$pfx" "$N/bin/wineserver" -w
+	else
+		[ "$WOW" = 0 ] || e+=(WINEGEX_WOW64=1)
+		for k in WINEPREFIX="$pfx" WINEDEBUG=-all "${e[@]}"; do ge+=(--env "$k"); done
+		# (slower than natively: a wineboot -i translates every program it runs)
+		timeout -k 10 $((s * 6)) $GEXC run "${ge[@]}" "$DIST/lib/wine/x86_64-unix/wine" "$@"
+	fi
+}
+prefix_steps() {
 pfx_make() {
 	# The native Wine makes the prefix; a bare server of its own, no display.
 	# As the page's user (gex), with an empty home: the profile then has no
 	# link to the build machine's user folders (Downloads -> ~/Downloads).
 	mkdir -p home
-	env WINEPREFIX="$PWD/pfx" WINEARCH=win64 WINEDEBUG=-all DISPLAY= WAYLAND_DISPLAY= \
-		USER=gex LOGNAME=gex HOME="$PWD/home" XDG_CONFIG_HOME="$PWD/home/.config" \
-		timeout 900 nice -n 10 "$N/bin/wine" wineboot -i
-	env WINEPREFIX="$PWD/pfx" "$N/bin/wineserver" -w
+	# (each check returns: step runs this where set -e is off, so a
+	# wineboot that wrote nothing passed before)
+	wine_in "$PWD/pfx" 900 WINEARCH=win64 USER=gex LOGNAME=gex HOME="$PWD/home" XDG_CONFIG_HOME="$PWD/home/.config" -- wineboot -i || { echo "wineboot -i failed"; return 1; }
 	rm -rf home
-	grep -q '^#arch=win64' pfx/system.reg
+	grep -q '^#arch=win64' pfx/system.reg || { echo "wineboot made no win64 prefix (pfx/system.reg)"; return 1; }
 	: > pfx/.gex-dists
 }
 # Each prefix keeps the keys of the installs it was made for (.gex-dists,
 # prefix-key.sh's): those this script prints it with. One without the file
 # predates the keys, so it is made again, never taken as it is.
 fresh() { [ -f "$C/$1/pfx/.gex-dists" ] || rm -f "$C/$1/.done"; }
-# -gex: made as user gex (before, as the build machine's user).
-PX=$P-gex
+# -gex: made as user gex (before, as the build machine's user). Made under
+# gexc, by the install it was made with too (-in: its name's hash).
+PX=$P-gex; [ "$PG" = 0 ] || PX=$PX-in$(printf %s "${DIST##*/}" | sha256sum | cut -c1-8)
 fresh pfx64-$PX
 log "win64 prefix ($PX)"; step pfx64-$PX pfx_make
 
@@ -338,14 +383,14 @@ log "win64 prefix ($PX)"; step pfx64-$PX pfx_make
 # without a Unix side), by the native Wine's regsvr32 of each arch.
 R=$( (cat "$here"/session.reg "$here"/wine64-session.reg "$here"/reg-apply.py; echo ShowCrashDialog=0; [ -z "$WD" ] || echo wwl; [ -z "$GS" ] || echo wgs; [ "$PADS" = 0 ] || echo pads) | sha256sum | cut -c1-10)
 pfs_make() {
-	cp -a "$C/pfx64-$PX/pfx" pfx
+	cp -a "$C/pfx64-$PX/pfx" pfx || return 1
 	[ -z "$WD" ] || cp -p "$WL/i386-windows/winewayland.drv" pfx/drive_c/windows/syswow64/
 	[ -z "$WD" ] || cp -p "$WL/x86_64-windows/winewayland.drv" pfx/drive_c/windows/system32/
 	if [ "$WOW" != 0 ]; then
 		printf '[HKEY_LOCAL_MACHINE\\Software\\Wow6432Node\\Microsoft\\Windows NT\\CurrentVersion\\AeDebug]\n"Debugger"=-\n' > aedebug32.reg
 		python3 "$here/reg-apply.py" pfx/system.reg aedebug32.reg && rm -f aedebug32.reg || return 1
 	fi
-	if [ "$PADS" = 0 ]; then python3 "$here/reg-apply.py" pfx/system.reg "$here/session.reg" "$here/wine64-session.reg"
+	if [ "$PADS" = 0 ]; then python3 "$here/reg-apply.py" pfx/system.reg "$here/session.reg" "$here/wine64-session.reg" || return 1
 	else
 		# winebus's root device kept, its driver started on demand only
 		{ grep -v -i '^\[-HKEY_LOCAL_MACHINE\\System\\CurrentControlSet\\Enum\\ROOT\\WINE\\WINEBUS\]' "$here/session.reg"
@@ -356,18 +401,14 @@ pfs_make() {
 	fi
 	if [ -n "$GS" ]; then
 		cp -p "$GS/x86_64-windows/winegstreamer.dll" pfx/drive_c/windows/system32/
-		env WINEPREFIX="$PWD/pfx" WINEDEBUG=-all DISPLAY= WAYLAND_DISPLAY= \
-			timeout 300 nice -n 10 "$N/bin/wine" regsvr32 /s winegstreamer.dll
+		wine_in "$PWD/pfx" 300 -- regsvr32 /s winegstreamer.dll || return 1
 		if [ "$WOW" != 0 ]; then
 			cp -p "$GS/i386-windows/winegstreamer.dll" pfx/drive_c/windows/syswow64/
-			env WINEPREFIX="$PWD/pfx" WINEDEBUG=-all DISPLAY= WAYLAND_DISPLAY= \
-				timeout 300 nice -n 10 "$N/bin/wine" 'C:\windows\syswow64\regsvr32.exe' /s winegstreamer.dll
+			wine_in "$PWD/pfx" 300 -- 'C:\windows\syswow64\regsvr32.exe' /s winegstreamer.dll || return 1
 		fi
 	fi
-	env WINEPREFIX="$PWD/pfx" WINEDEBUG=-all DISPLAY= WAYLAND_DISPLAY= \
-		timeout 300 nice -n 10 "$N/bin/wine" reg add 'HKCU\Software\Wine\WineDbg' /v ShowCrashDialog /t REG_DWORD /d 0 /f
-	env WINEPREFIX="$PWD/pfx" "$N/bin/wineserver" -w
-	grep -q '^"ShowCrashDialog"=dword:00000000' pfx/user.reg
+	wine_in "$PWD/pfx" 300 -- reg add 'HKCU\Software\Wine\WineDbg' /v ShowCrashDialog /t REG_DWORD /d 0 /f || return 1
+	grep -q '^"ShowCrashDialog"=dword:00000000' pfx/user.reg || { echo "reg add left no ShowCrashDialog in pfx/user.reg"; return 1; }
 	[ -z "$GS" ] || [ "$(grep -c 'winegstreamer.dll"$' pfx/system.reg)" -ge 10 ] || { echo "winegstreamer was not registered"; return 1; }
 	: > pfx/.gex-dists
 }
@@ -391,6 +432,8 @@ builtins_list() { # PFX [NAME...]: N's lib/wine/*-windows names, and each NAME i
 [ -f "$C/pfx64-$PX/pfx/.gex-builtins" ] || builtins_list "$C/pfx64-$PX/pfx"
 # shellcheck disable=SC2046
 [ -f "$C/pfs64-$PX-$R/pfx/.gex-builtins" ] || builtins_list "$C/pfs64-$PX-$R/pfx" $([ -z "$GS" ] || echo winegstreamer.dll) $([ -z "$WD" ] || echo winewayland.drv)
+}
+[ "$PG" != 0 ] || prefix_steps
 
 deps64_build() {
 	WINE32_DL_SEED="${WINE32_DL_SEED:-} ${WINE32_CACHE:-$HOME/.cache/gex/wine32}/dl" JOBS=$J nice -n 10 "$here/deps64.sh" "$PWD" "$C/dl"
@@ -520,7 +563,7 @@ pe_native() {
 		# machine code, which native_make's scan refuses
 		( cd "$b" && nice -n 10 make -k -j"$J" ) || true
 		sp=$(cd "$b" && ls dlls/*/*.so.r.o programs/*/*.so.r.o 2>/dev/null | sed 's#.*/##; s#\.so\.r\.o$##' | sort -u |
-			while read -r m; do case " $D " in *" $m "*) continue ;; esac; [ -e "$DIST/lib/wine/x86_64-windows/$m" ] && echo "$m"; done)
+			while read -r m; do case " $D " in (*" $m "*) continue ;; esac; [ -e "$DIST/lib/wine/x86_64-windows/$m" ] && echo "$m"; done)
 	fi
 	for dll in $sp; do t="$t $(pe_target "$b" "$dll")"; done
 	# shellcheck disable=SC2086
@@ -577,7 +620,7 @@ b32_build() {
 pe_native32() {
 	local b=$C/b32-$K-$B32K sp
 	sp=$(cd "$b" && ls dlls/*/*.so.r.o programs/*/*.so.r.o 2>/dev/null | sed 's#.*/##; s#\.so\.r\.o$##' | sort -u |
-		while read -r m; do case " $D32 " in *" $m "*) continue ;; esac; [ -e "$DIST/lib/wine/i386-windows/$m" ] && echo "$m"; done)
+		while read -r m; do case " $D32 " in (*" $m "*) continue ;; esac; [ -e "$DIST/lib/wine/i386-windows/$m" ] && echo "$m"; done)
 	echo "$sp" > split.txt
 	# shellcheck disable=SC2086
 	GEX_WASM_SYSROOT=$SR32 stage_split --i386 "$b" "$W" "$PWD/native" $D32
@@ -678,6 +721,7 @@ if [ "${WINE64_TWIN:-0}" != 0 ]; then
 	log "twin native PE core ($K, $NK, $MK)"; step pen64-$K-$NK-twin$MK twin_native
 	NATIVE=$C/pen64-$K-$NK-twin$MK
 fi
+[ "$PG" = 0 ] || prefix_steps
 for d in "$BASE" "$DIST"; do "$here/prefix-key.sh" --add "$C/pfs64-$PX-$R/pfx" "$d" || exit 1; done
 echo "WINE64_DIST=$DIST"
 echo "WINE64_PREFIX=$C/pfs64-$PX-$R/pfx"

@@ -32,6 +32,7 @@ ok(Object.fromEntries(OPTIONS.map((k) => [k, undefined])));
 ok({ filesystem: 'memory' });
 ok({ filesystem: { kind: 'memory', max: 1 << 30 } });
 ok({ filesystem: { kind: 'opfs', name: 'debian-1', cache: 512 } });
+ok({ hostCalls: { 'game-state': () => true, notify: async () => null } });
 no({ filesystem: 'opfs' }, "start({ filesystem: \"opfs\" }): 'memory', { kind: 'memory', max }, or { kind: 'opfs', name, cache }");
 no({ filesystem: { kind: 'opfs' } }, "{ kind: 'opfs', name, cache }");
 no({ filesystem: { kind: 'opfs', name: 'a/b' } }, "{ kind: 'opfs', name, cache }");
@@ -56,6 +57,9 @@ no({ persist: { dir: '/home', db: 'x' } }, "filesystem: { kind: 'opfs', name }")
 no({ onExit: 'done' }, 'start({ onExit: "done" }): a function');
 no({ uid: -1 }, 'a user id');
 no({ cwd: 5 }, 'start({ cwd: 5 }): a string');
+no({ hostCalls: { 'game state': () => true } }, 'each name without spaces');
+no({ hostCalls: { notify: 'x' } }, 'an object, {name: function}');
+no({ hostCalls: () => true }, 'an object, {name: function}');
 no(null, 'options is an object');
 
 console.log(failed ? `${failed} failed` : 'start options: all checks pass');

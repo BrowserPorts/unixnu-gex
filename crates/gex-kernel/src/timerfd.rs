@@ -163,6 +163,7 @@ impl FileHandle for TimerFd {
             mtime: 0,
             nlink: 1,
             rdev: 0,
+            dev: 0,
             times: Default::default(),
         })
     }

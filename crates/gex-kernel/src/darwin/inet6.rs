@@ -188,7 +188,7 @@ impl FileHandle for Inet6Socket {
 
     /// `soo_stat`'s mode for a socket that can still receive and send.
     fn metadata(&self) -> Result<Metadata, Errno> {
-        Ok(Metadata { file_type: FileType::Socket, size: 0, mode: 0o666, ino: 0, mtime: 0, nlink: 0, rdev: 0, times: Default::default() })
+        Ok(Metadata { file_type: FileType::Socket, size: 0, mode: 0o666, ino: 0, mtime: 0, nlink: 0, rdev: 0, dev: 0, times: Default::default() })
     }
 
     fn is_stream(&self) -> bool {

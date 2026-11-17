@@ -391,6 +391,7 @@ impl crate::vfs::FileHandle for RemotePty {
             mtime: 0,
             nlink: 1,
             rdev,
+            dev: 0,
             times: Default::default(),
         })
     }

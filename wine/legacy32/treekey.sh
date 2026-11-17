@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # The tree hash of a git worktree as it is on disk: committed, staged and
 # unstaged changes and untracked (not ignored) files, through a scratch copy
 # of its index, so the worktree's own index is never touched. Only files

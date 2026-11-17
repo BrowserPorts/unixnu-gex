@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Wine Mono into a 32-bit Wine dist (wine/legacy32/wine32.pins' WINE_MONO_*): the pinned tarball, kept
 # once in DL and checked against its sha256 (wine32/dl.sh), unpacked at
 # DIST/share/wine/mono/wine-mono-VERSION, where mscoree looks through

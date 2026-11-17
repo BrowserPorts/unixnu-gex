@@ -356,6 +356,7 @@ pub fn metadata(n: &'static Node) -> Metadata {
         mtime,
         nlink: 1,
         rdev: super::ttydev::linux_rdev(dev),
+        dev: 0,
         times,
     }
 }
@@ -373,6 +374,7 @@ pub fn root_metadata() -> Metadata {
         mtime,
         nlink: 3,
         rdev: 0,
+        dev: 0,
         times,
     }
 }

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # A pinned download, kept once and checked against its sha256.
 #
 #   wine32/dl.sh URL SHA256 DIR        -> DIR/<basename of URL>

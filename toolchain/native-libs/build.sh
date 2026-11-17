@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # A native library: Debian's zlib as an LP64 wasm library that
 # replaces libz.so.1 under an aarch64 program. Compiled for wasm64 (LP64:
 # long, pointers and size_t 64-bit, as aarch64's), linked position-

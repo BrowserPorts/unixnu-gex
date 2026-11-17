@@ -87,7 +87,11 @@ const WVEK_LEN: usize = 0x28;
 /// encrypted volume: its wrapped keys, and the ciphertext the storage
 /// controller's inline AES gives the keybag block and the volume's
 /// encrypted objects.
-pub const KEYS_STAND_IN: &str = "the encrypted volumes' keys and ciphertext (device-only: AppleKeyStore's wrapped volume keys of 0x28 bytes, the shared data volume's wrapped VEK, the keybag wrapping key in effaceable storage, and the inline AES the storage controller applies to the container keybag and to Data's and User's encrypted objects) (stand-in: each wrapped key the bytes \"KEY-STAND-IN\" repeated, the wrapped VEK 0x28 bytes long, everything written in plaintext; measure the container keybag's entry lengths on the device)";
+pub const KEYS_STAND_IN: &str = "the encrypted volumes' keys and ciphertext (device-only: AppleKeyStore's wrapped volume keys of 0x28 bytes, the shared data volume's wrapped VEK and its rewrap for the user's protection, the user's volume cookie, the keybag wrapping key in effaceable storage, and the inline AES the storage controller applies to the container keybag and to Data's and User's encrypted objects) (stand-in: each wrapped key and the cookie the bytes \"KEY-STAND-IN\" repeated, the wrapped VEK and its rewrap 0x28 bytes long, the cookie 0x28 bytes long, everything written in plaintext; measure the container keybag's entry lengths on the device)";
+
+/// The user's volume cookie's length (AKSIdentityCopyVolumeCookie's
+/// answer from the Secure Enclave, at most 0x800): KEYS_STAND_IN.
+const COOKIE_LEN: usize = 0x28;
 
 fn key_stand_in(len: usize) -> Vec<u8> {
     b"KEY-STAND-IN".iter().copied().cycle().take(len).collect()
@@ -290,6 +294,10 @@ pub struct Nx<'a> {
     /// entries in order: volume UUID, tag, key data.
     keylocker: Option<(u64, u64)>,
     keybag: Vec<([u8; 16], u16, Vec<u8>)>,
+    /// The temporary inode each mounted volume's pfkur thread holds
+    /// (`apfs + 0x1f00`), by slot: made at the read-write mount of a
+    /// volume it runs on, removed when the unmount stops the thread.
+    pub pfkur_tmp: BTreeMap<usize, u64>,
 }
 
 /// The container's reaper (`nx_reaper_phys_t`): its lists, and the entry
@@ -434,6 +442,7 @@ impl<'a> Nx<'a> {
             alloc_log: None,
             keylocker: None,
             keybag: Vec::new(),
+            pfkur_tmp: BTreeMap::new(),
         })
     }
 
@@ -568,6 +577,22 @@ impl<'a> Nx<'a> {
             if self.free_completed(FQ_MAIN)? == 0 {
                 break;
             }
+        }
+        Ok(())
+    }
+
+    /// The space manager's free blocks, the blocks the volumes' reserves
+    /// still hold back from them, and the container's blocks.
+    pub fn space_counts(&self) -> (u64, u64, u64) {
+        (self.sm_free, self.reserve.0.saturating_sub(self.reserve.1), self.l.blocks)
+    }
+
+    /// `tx_finish(nx, 0x11)` (K:0xfffffff00675c500) as F_FULLFSYNC calls it:
+    /// the open transaction closed and committed, the caller waiting for
+    /// its checkpoint; with none open only the device's flush, no write.
+    pub fn tx_finish(&mut self) -> Result<(), String> {
+        if self.in_tx {
+            self.commit()?;
         }
         Ok(())
     }
@@ -919,14 +944,30 @@ impl<'a> Nx<'a> {
     /// (I:0x100046580..0x100046c00). Where they go and how many: fewer
     /// than asked when nothing larger is free.
     pub fn alloc_data(&mut self, count: u64) -> Result<(u64, u64), String> {
-        let (start, got) = self.alloc_data_placed(count)?;
+        let (start, got) = self.alloc_data_placed(count, true)?;
         if let Some(log) = self.alloc_log.as_mut() {
             log.push((count, start, got, self.rove));
         }
         Ok((start, got))
     }
 
-    fn alloc_data_placed(&mut self, count: u64) -> Result<(u64, u64), String> {
+    /// A data allocation with no count out (`spaceman_alloc` without
+    /// 0x1000, as `alloc_space` asks for CONTIG and ALL together,
+    /// K:0xfffffff006707c7c): `count` contiguous blocks or nothing; its
+    /// first block, or ENOSPC (an `Ok(Err(28))`) when the free-extent cache
+    /// holding every free block has no run that long.
+    pub fn alloc_data_contig(&mut self, count: u64) -> Result<Result<u64, i32>, String> {
+        let (start, got) = self.alloc_data_placed(count, false)?;
+        if got == 0 {
+            return Ok(Err(28));
+        }
+        if let Some(log) = self.alloc_log.as_mut() {
+            log.push((count, start, got, self.rove));
+        }
+        Ok(Ok(start))
+    }
+
+    fn alloc_data_placed(&mut self, count: u64, partial: bool) -> Result<(u64, u64), String> {
         if count == 0 {
             return Err("a data allocation of no blocks".into());
         }
@@ -941,6 +982,9 @@ impl<'a> Nx<'a> {
         }
         let bpc = self.l.blocks_per_chunk;
         let fxc_full = self.fxc.as_ref().is_some_and(|f| f.full());
+        if !partial && (1..=4).contains(&count) {
+            return Err("not implemented: a non-partial data allocation of 1 to 4 blocks (the zone path's ENOSPC)".into());
+        }
         if (1..=4).contains(&count) && self.zones[count as usize - 1].enabled {
             let z = count as usize - 1;
             let c = (self.zones[z].start / bpc) as usize;
@@ -970,8 +1014,15 @@ impl<'a> Nx<'a> {
         if f.total() != self.sm_free {
             return Err("not implemented: a data allocation with a free-extent cache that does not hold every free block (its rescan heuristic, I:0x10000db70)".into());
         }
-        let found = f.search(0, count, fxc::flags::PARTIAL | fxc::flags::AVOID, &clip)?;
-        let (start, got) = found.map_err(|_| "not implemented: a data allocation the free-extent cache cannot place (the chunk scan and the free queues' drain)".to_string())?;
+        let found = f.search(0, count, if partial { fxc::flags::PARTIAL } else { 0 } | fxc::flags::AVOID, &clip)?;
+        let (start, got) = match found {
+            Ok(x) => x,
+            // A cache holding every free block found no run that long: with
+            // nothing to rescan, the tier loop's next tier and the
+            // avoid-off retry (3.5) are left.
+            Err(_) if !partial => return Err("not implemented: a non-partial data allocation the free-extent cache has no run for (the next tier and the avoid-off retry, re-alloc 3.5)".into()),
+            Err(_) => return Err("not implemented: a data allocation the free-extent cache cannot place (the chunk scan and the free queues' drain)".into()),
+        };
         if got == 0 {
             return Err("not implemented: a data allocation the free-extent cache gives nothing for (the chunk scan)".into());
         }
@@ -2258,10 +2309,34 @@ impl<'a> Nx<'a> {
     /// transaction, type 'keys'; no counter is raised on this path);
     /// `nx_keylocker` names it from the next checkpoint on.
     fn keybag_add(&mut self, uuid: [u8; 16], tag: u16, key: Vec<u8>) -> Result<(), String> {
+        if key.is_empty() {
+            return Err("a keybag entry added with no key".into());
+        }
+        self.keybag_operation(uuid, tag, key)
+    }
+
+    /// `keybag_operation` with an entry (K:0xfffffff006657cc0 →
+    /// K:0xfffffff0066588b0): the entry of the same volume and tag replaced
+    /// in place when the sizes rounded to 16 match; else the entries after
+    /// it moved down over it and the new one appended at the end, or, for a
+    /// key of no bytes, the entry deleted; a new entry appended. Then the
+    /// keybag written as [`Nx::keybag_add`] describes.
+    fn keybag_operation(&mut self, uuid: [u8; 16], tag: u16, key: Vec<u8>) -> Result<(), String> {
         self.enter()?;
-        match self.keybag.iter_mut().find(|e| e.0 == uuid && e.1 == tag) {
-            Some(e) => e.2 = key,
+        let size = |len: usize| if len == 0 { 0 } else { (len + 0x18).div_ceil(16) * 16 };
+        match self.keybag.iter().position(|e| e.0 == uuid && e.1 == tag) {
+            Some(i) if size(self.keybag[i].2.len()) == size(key.len()) => self.keybag[i].2 = key,
+            Some(i) => {
+                self.keybag.remove(i);
+                if !key.is_empty() {
+                    self.keybag.push((uuid, tag, key));
+                }
+            }
+            None if key.is_empty() => return Err(format!("deleting keybag entry tag {tag:#x} that is not there (ENOENT)")),
             None => self.keybag.push((uuid, tag, key)),
+        }
+        if self.keybag.is_empty() {
+            return Err("not implemented: the container keybag's removal when its last entry goes (K:0xfffffff006658ce0)".into());
         }
         let bs = self.l.bs as usize;
         let nbytes: usize = 0x10 + self.keybag.iter().map(|e| (e.2.len() + 0x18).div_ceil(16) * 16).sum::<usize>();
@@ -2294,6 +2369,76 @@ impl<'a> Nx<'a> {
         self.sink.write_at(paddr * self.l.bs, &b)?;
         // tx_leave(nx, tx, 0): the transaction joined stays open.
         Ok(())
+    }
+
+    /// Whether the container keybag has an entry for volume `uuid` with
+    /// `tag` (a `keybag_operation` lookup: no write).
+    fn keybag_has(&self, uuid: [u8; 16], tag: u16) -> bool {
+        self.keybag.iter().any(|e| e.0 == uuid && e.1 == tag)
+    }
+
+    /// Volume `index`'s UUID (its superblock's `apfs_vol_uuid`).
+    fn vol_uuid(&self, index: usize) -> Result<[u8; 16], String> {
+        Ok(self.vol_sb_read(index)?.0[0xf0..0x100].try_into().unwrap())
+    }
+
+    /// `APFSVolumeEnableUserProtectionWithOptions(vol, user, no data, 8)`:
+    /// the container user client's selector 0x14, apfs_vek_set_protection
+    /// (K:0xfffffff006679080; drafts/s21/re-data.md 2.3): the volume's
+    /// wrapped VEK (tag 10) read and no stale proposed one (tag 0xb), the
+    /// Secure Enclave's rewrap of it for the user (KEYS_STAND_IN: the same
+    /// bytes' length), then in the open container transaction
+    /// apfs_commit_update_volume_key (K:0xfffffff00665c030): the rewrap
+    /// added as the proposed key, the Secure Enclave's commit, the VEK
+    /// entry replaced, the proposed one deleted, each a keybag rewrite;
+    /// `tx_leave(nx, xid, 5)` closes the transaction and waits for its
+    /// checkpoint.
+    pub fn vek_set_protection(&mut self, index: usize) -> Result<(), String> {
+        let (sb, _) = self.vol_sb_read(index)?;
+        if u64a(sb, 0x38) & 0x20 != 0 {
+            return Err("protecting a sealed volume (EPERM)".into());
+        }
+        if u64a(sb, 0x108) & 0x100 == 0 {
+            return Err("not implemented: user protection of a volume without a VEK".into());
+        }
+        let uuid = self.vol_uuid(index)?;
+        if !self.keybag_has(uuid, 10) {
+            return Err("the volume's wrapped VEK is not in the container keybag (ENOENT)".into());
+        }
+        if self.keybag_has(uuid, 0xb) {
+            return Err("not implemented: removing a stale proposed VEK (K:0xfffffff00665c030 with no key)".into());
+        }
+        let rewrapped = key_stand_in(WVEK_LEN);
+        self.enter()?;
+        self.keybag_operation(uuid, 0xb, rewrapped.clone())?;
+        self.keybag_operation(uuid, 10, rewrapped)?;
+        self.keybag_operation(uuid, 0xb, Vec::new())?;
+        self.leave(5)
+    }
+
+    /// `APFSVolumePayloadSet(vol, type, data)` as AKSVolumeMap makes it
+    /// (the container user client's selector 0xa, K:0xfffffff006678cfc;
+    /// drafts/s21/re-data.md 2.5) with the user's volume cookie
+    /// (KEYS_STAND_IN): an encrypted volume, a type under 8, at most 0x800
+    /// bytes; the entry of tag 0xf8 + type added by a `keybag_operation`
+    /// with no transaction of the caller's, which opens or joins the
+    /// container's and, holding one of its own, ends with `tx_leave(..., 5)`:
+    /// a checkpoint.
+    pub fn volume_payload_set(&mut self, index: usize, ty: u16) -> Result<(), String> {
+        let cookie = key_stand_in(COOKIE_LEN);
+        let (sb, _) = self.vol_sb_read(index)?;
+        if u64a(sb, 0x108) & APFS_FS_UNENCRYPTED != 0 {
+            return Err("a volume payload on an unencrypted volume (EINVAL)".into());
+        }
+        if ty >= 8 || cookie.len() > 0x800 {
+            return Err("a volume payload of type 8 or more, or over 0x800 bytes (EINVAL)".into());
+        }
+        let uuid = self.vol_uuid(index)?;
+        if self.keybag_has(uuid, 0xf8 + ty) {
+            return Err("not implemented: replacing a volume payload (APFSVolumePayloadGet found one)".into());
+        }
+        self.keybag_operation(uuid, 0xf8 + ty, cookie)?;
+        self.leave(5)
     }
 
     /// `apfs_newfs`: a volume added (`newfs_apfs -A`), in its own
@@ -2477,6 +2622,29 @@ impl<'a> Nx<'a> {
         let oid = *self.fs_oid.get(index).filter(|&&o| o != 0).ok_or_else(|| format!("no volume in slot {index}"))?;
         self.virt_modify(Owner::Container, oid);
         Ok(&mut self.virt.get_mut(&(Owner::Container, oid)).ok_or_else(|| format!("volume {index}'s superblock not in the cache"))?.b)
+    }
+
+    /// Volume `index`'s superblock as it stands, read without changing it,
+    /// and the transaction the kernel's in-memory object last saw it
+    /// dirtied in or written by (`obj + 0x90`, else the block's `o_xid`):
+    /// the open transaction when it was changed in it, else the checkpoint
+    /// that last wrote it.
+    pub fn vol_sb_read(&self, index: usize) -> Result<(&[u8], u64), String> {
+        let oid = *self.fs_oid.get(index).filter(|&&o| o != 0).ok_or_else(|| format!("no volume in slot {index}"))?;
+        let o = self.virt.get(&(Owner::Container, oid)).ok_or_else(|| format!("volume {index}'s superblock not in the cache"))?;
+        let xid = if self.in_tx && self.virt_dirty.contains(&(Owner::Container, oid)) {
+            self.xid
+        } else {
+            o.mapped.map_or_else(|| u64a(&o.b, 0x10), |m| m.0)
+        };
+        Ok((&o.b, xid))
+    }
+
+    /// The level and key count of the physical B-tree node at `paddr`
+    /// (`btn_level`, `btn_nkeys`).
+    pub fn phys_node_counts(&mut self, paddr: u64) -> Result<(u16, u32), String> {
+        let o = self.phys_obj(paddr)?;
+        Ok((u16::from_le_bytes([o.b[0x22], o.b[0x23]]), u32a(&o.b, 0x24)))
     }
 
     /// Volume `index`'s file-system tree and the store of its nodes.

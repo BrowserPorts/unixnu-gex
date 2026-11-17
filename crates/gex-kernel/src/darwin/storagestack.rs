@@ -1322,6 +1322,13 @@ pub fn container_barrier() -> bool {
     matches!(storage_features(), Prop::Dict(d) if d.iter().any(|(k, v)| k == "Barrier" && matches!(v, Prop::Bool(true))))
 }
 
+/// Whether the APFS container's medium has Unmap in its IOStorageFeatures
+/// (DKIOCGETFEATURES' DK_FEATURE_UNMAP, which APFS keeps at dev+0x4f8 with
+/// the barrier, 0xfffffff006650c78).
+pub fn container_unmap() -> bool {
+    matches!(storage_features(), Prop::Dict(d) if d.iter().any(|(k, v)| k == "Unmap" && matches!(v, Prop::Bool(true))))
+}
+
 /// A namespace's IOStorageFeatures, Barrier only on NSID 1.
 fn features(barrier: bool) -> Prop {
     let n = super::storage::nvme();

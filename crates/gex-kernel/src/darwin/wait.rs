@@ -132,8 +132,9 @@ impl Kernel {
         slot.waiting = false;
         slot.result = Some(result);
         let word = slot.word;
-        if self.dtask.in_callout | self.dtask.callout_woken.remove(&tid) {
-            self.darwin_interrupt_wakeup();
+        let woken = self.dtask.callout_woken.remove(&tid);
+        if self.dtask.in_callout || woken.is_some() {
+            self.darwin_interrupt_wakeup(self.dtask.in_callout && self.dtask.callout_pidle || woken == Some(true));
         }
         let mut k = m.kernel();
         let v = k.read_u32(word).unwrap_or(0).wrapping_add(1);
@@ -156,9 +157,12 @@ impl Kernel {
         let res = match r {
             Err(e) if e == Errno::EINTR => WaitResult::Interrupted,
             // thread_timer_expire: the wait's timer, from the timer
-            // interrupt, makes it runnable.
+            // interrupt, makes it runnable; in the platform-idle state if
+            // no processor ran a thread then (this one was still
+            // waiting).
             _ if own_deadline => {
-                self.dtask.rusage.interrupt_wkups.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                let pidle = self.procs.sched.processors_idle(Some(tid), 0);
+                self.dtask.rusage.interrupt_wakeup(pidle);
                 WaitResult::TimedOut
             }
             _ => {

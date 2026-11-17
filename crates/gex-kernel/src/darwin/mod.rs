@@ -262,10 +262,13 @@ pub struct Task {
     pub workq_wake: Vec<i32>,
     /// A thread call is running (`THREAD_TAG_CALLOUT` with
     /// `callout_woken_from_icontext`): the threads it wakes are interrupt
-    /// wakeups. And the workqueue threads it woke whose wake is yet to be
-    /// done.
+    /// wakeups; with `callout_woken_from_platform_idle` (every processor
+    /// idle at the timer interrupt that woke it), platform-idle wakeups
+    /// too. And the workqueue threads it woke whose wake is yet to be
+    /// done, each with that platform-idle state.
     pub in_callout: bool,
-    pub callout_woken: std::collections::HashSet<i32>,
+    pub callout_pidle: bool,
+    pub callout_woken: std::collections::HashMap<i32, bool>,
     pub workq_creator_pending: Option<u32>,
     /// Every thread request: the workqueue's (`workq_kernreturn`'s) and
     /// the kqueues' (`kqwq_request`, `kqwl_request`).

@@ -159,6 +159,10 @@ impl Kernel {
             // interrupt event source's work-loop thread's, not a callout's.
             let action = self.dtask.timers.armed.remove(&key).expect("first key");
             self.dtask.in_callout = action != Action::Iomfb;
+            // ml_get_power_state at that interrupt: whether every processor
+            // was idle (cpu_idle_count == real_ncpus), this call's thread
+            // not yet running.
+            self.dtask.callout_pidle = self.dtask.in_callout && self.procs.sched.processors_idle(None, 1);
             self.darwin_ipc_callout(true);
             match action {
                 Action::MkTimer(port) => self.mk_timer_expire(m, port, key),
@@ -176,6 +180,7 @@ impl Kernel {
             }
             self.darwin_ipc_callout(false);
             self.dtask.in_callout = false;
+            self.dtask.callout_pidle = false;
         };
         match (own, jetsam) {
             (Some(a), Some(b)) => Some(a.min(b)),

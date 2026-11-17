@@ -16,8 +16,10 @@
 // added twice (at the child's exit and at the system's reap). The time by
 // effective QoS: a thread's time goes to the QoS it ran at (utility, then
 // background), and the seven sum to the task's time. Each sleep that its
-// deadline timer ends is a wakeup from interrupt context. The energy
-// fields are 0 (no energy counter on this SoC). The footprint's
+// deadline timer ends is a wakeup from interrupt context, and a
+// platform-idle one when no thread was on a processor then (none while a
+// thread of its own spins); the energy fields are 0 (no energy counter on
+// this SoC). The footprint's
 // peaks: pages touched then unmapped are in the lifetime peak, the
 // footprint after is below it, and TASK_VM_INFO's ledger peak is the same
 // ledger's; an interval reset begins the interval's peak at the footprint
@@ -33,6 +35,8 @@
 #include <pthread.h>
 #include <pthread/qos.h>
 #include <signal.h>
+#include <stdatomic.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -53,6 +57,16 @@ static int bad(const char *what, long got, long want) {
 }
 
 static volatile uint64_t sink;
+
+// A thread that keeps a processor until told to stop.
+static atomic_bool spinning_stop, spinning_started;
+
+static void *spinning(void *arg) {
+    (void)arg;
+    atomic_store(&spinning_started, true);
+    while (!atomic_load(&spinning_stop)) sink++;
+    return NULL;
+}
 
 static void spin(uint64_t ns) {
     uint64_t until = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) + ns;
@@ -251,6 +265,26 @@ int main(int argc, char **argv) {
     for (int i = 0; i < 5; i++) usleep(2000);
     proc_pid_rusage(getpid(), RUSAGE_INFO_V0, &w1);
     if (w1.ri_interrupt_wkups - w0.ri_interrupt_wkups < 5) return bad("interrupt wakeups of five sleeps", (long)(w1.ri_interrupt_wkups - w0.ri_interrupt_wkups), 5);
+    // Platform-idle wakeups are interrupt wakeups made while every
+    // processor was idle: never more than those, and (nothing else runs
+    // here) the sleeps of a process with no other thread on a processor
+    // end in that state.
+    uint64_t idle = w1.ri_pkg_idle_wkups - w0.ri_pkg_idle_wkups;
+    if (idle > w1.ri_interrupt_wkups - w0.ri_interrupt_wkups) return bad("platform-idle wakeups over the interrupt wakeups", (long)idle, (long)(w1.ri_interrupt_wkups - w0.ri_interrupt_wkups));
+    if (idle < 5) return bad("platform-idle wakeups of five sleeps alone", (long)idle, 5);
+    // A thread of its own spinning on a processor meanwhile: no sleep
+    // ends with every processor idle.
+    struct rusage_info_v6 s0, s1;
+    pthread_t spinner;
+    if (pthread_create(&spinner, NULL, spinning, NULL) != 0) return bad("pthread_create", errno, 0);
+    while (!atomic_load(&spinning_started)) ;
+    proc_pid_rusage(getpid(), RUSAGE_INFO_V0, &s0);
+    for (int i = 0; i < 5; i++) usleep(2000);
+    proc_pid_rusage(getpid(), RUSAGE_INFO_V0, &s1);
+    atomic_store(&spinning_stop, true);
+    pthread_join(spinner, NULL);
+    if (s1.ri_interrupt_wkups - s0.ri_interrupt_wkups < 5) return bad("interrupt wakeups of five sleeps beside a spinning thread", (long)(s1.ri_interrupt_wkups - s0.ri_interrupt_wkups), 5);
+    if (s1.ri_pkg_idle_wkups != s0.ri_pkg_idle_wkups) return bad("platform-idle wakeups beside a spinning thread", (long)(s1.ri_pkg_idle_wkups - s0.ri_pkg_idle_wkups), 0);
 
     // Wirings: three 16 KiB pages, then none.
     uint64_t wired0 = r.ri_wired_size;

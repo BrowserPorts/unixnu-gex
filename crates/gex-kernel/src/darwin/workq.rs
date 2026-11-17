@@ -2067,7 +2067,7 @@ impl Kernel {
     fn workq_thread_wakeup(&mut self, tid: i32) {
         self.dtask.workq_wake.push(tid);
         if self.dtask.in_callout {
-            self.dtask.callout_woken.insert(tid);
+            self.dtask.callout_woken.insert(tid, self.dtask.callout_pidle);
         }
     }
 
@@ -2085,8 +2085,8 @@ impl Kernel {
             match t.unstarted.take() {
                 Some(req) => {
                     self.dtask.spawns.push(req);
-                    if self.dtask.callout_woken.remove(&tid) {
-                        self.darwin_interrupt_wakeup();
+                    if let Some(pidle) = self.dtask.callout_woken.remove(&tid) {
+                        self.darwin_interrupt_wakeup(pidle);
                     }
                 }
                 None => {

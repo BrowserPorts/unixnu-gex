@@ -44,7 +44,10 @@
 //! a thread's QoS inputs or its task's policy change, as it ends and as it
 //! is read); the wakeups from interrupt context (`interrupt_wakeups`: a
 //! wait's deadline timer, and what a thread call wakes, its thread woken by
-//! the delayed timer's interrupt); each thread's runnable time; the map's
+//! the delayed timer's interrupt), and of them the platform-idle ones
+//! (`platform_idle_wakeups`: no thread on any of the three processors at
+//! that interrupt, [`super::sched::Sched::processors_idle`]); each
+//! thread's runnable time; the map's
 //! user wirings (`wired_mem`); the pmap's `phys_mem` ledger (every page
 //! it has entered) and the `phys_footprint` ledger's balance and its
 //! lifetime and interval peaks, the process's pages looked at as the
@@ -57,14 +60,15 @@
 //! merchant's ledgers as the account goes). What needs counters that are
 //! not kept is given as 0
 //! and reported: the wakeups a thread call's signal or message to another
-//! task made, wakeups in the platform-idle state (every processor idle at
-//! the interrupt), VM page-ins (the guest's page faults are the host's,
-//! and the device's page cache is not modelled), disk I/O (which reads miss the buffer cache and the UBC),
-//! logical writes (the UBC's copies, write faults on shared file pages,
-//! AppleAPFS's own), the CPMU's instructions (XNU's own among them) and
-//! cycles, the footprint where the host keeps no view of the process's
-//! memory (the browser's), and a bill while a thread that has it runs
-//! (the device credits it at quantum ends).
+//! task made, VM page-ins (the device's page cache, and the first faults on
+//! the shared cache's pages and on code, which are not seen), disk I/O
+//! (which reads and writes reach `spec_strategy` through the buffer cache,
+//! the UBC and APFS), logical writes (the UBC's copies, first write faults
+//! on vnode pages, AppleAPFS's metadata objects), the CPMU's instructions
+//! (XNU's own among them) and cycles (at CLPC's frequencies), the footprint
+//! where the host keeps no view of the process's memory (the browser's),
+//! and a bill while a thread that has it runs (the device credits it at
+//! quantum ends).
 
 use crate::syscalls::Kernel;
 use crate::GuestMem;
@@ -128,24 +132,24 @@ pub mod ri {
 /// Each field that can go unkept: its name, and what it needs.
 const UNKEPT: [(usize, &str, &str); 21] = [
     (ri::USER_TIME, "ri_user_time", "per-thread clocks on the host"),
-    (ri::PKG_IDLE_WKUPS, "ri_pkg_idle_wkups", "the platform_idle_wakeups ledger: whether every processor was idle at the interrupt (cpu_idle_count == real_ncpus), which the device's own kernel threads and interrupts decide"),
+    (ri::PKG_IDLE_WKUPS, "ri_pkg_idle_wkups", "the platform_idle_wakeups ledger: what a signal a thread call posted woke, or a thread call's message to another task's port"),
     (ri::INTERRUPT_WKUPS, "ri_interrupt_wkups", "the interrupt_wakeups ledger: what a signal a thread call posted woke, or a thread call's message to another task's port"),
-    (ri::PAGEINS, "ri_pageins", "the task's VM page-ins: its page faults, which the host takes, and the device's page cache"),
+    (ri::PAGEINS, "ri_pageins", "VM_PAGE_COUNT_AS_PAGEIN at the task's faults (vm_fault_page, vm_fault_enter_prepare): the device's page cache (which file pages are resident, which came in clustered and are not yet mapped) and every first fault on a file page, the shared cache's included, whose nested pmap is not modelled, and instruction fetches, which are not seen"),
     (ri::RESIDENT_SIZE, "ri_resident_size", "a look at the process's pages, which the host keeps no view of"),
     (ri::PHYS_FOOTPRINT, "ri_phys_footprint", "a look at the process's pages, which the host keeps no view of"),
     (ri::CHILD_PKG_IDLE_WKUPS, "ri_child_pkg_idle_wkups", "the reaped children's platform-idle wakeups"),
     (ri::CHILD_INTERRUPT_WKUPS, "ri_child_interrupt_wkups", "the reaped children's interrupt wakeups"),
     (ri::CHILD_PAGEINS, "ri_child_pageins", "the reaped children's page-ins"),
     (ri::CHILD_USER_TIME, "ri_child_user_time", "the reaped children's times on a host without per-thread clocks"),
-    (ri::DISKIO_BYTESREAD, "ri_diskio_bytesread", "task_io_stats at spec_strategy: the reads that miss the buffer cache and the UBC"),
-    (ri::DISKIO_BYTESWRITTEN, "ri_diskio_byteswritten", "task_io_stats at spec_strategy: the writes that reach the disk"),
+    (ri::DISKIO_BYTESREAD, "ri_diskio_bytesread", "task_io_stats at spec_strategy (its one caller of thread_update_io_stats): the reads that miss the buffer cache and the UBC, cluster read-ahead and APFS's own metadata reads, by the thread that issues them"),
+    (ri::DISKIO_BYTESWRITTEN, "ri_diskio_byteswritten", "task_io_stats at spec_strategy: the writes that reach the disk, by the thread that issues them (write-behind, APFS's flushes)"),
     (ri::CPU_TIME_QOS, "ri_cpu_time_qos_*", "per-thread clocks on the host"),
     (ri::BILLED_SYSTEM_TIME, "ri_billed_system_time", "a bill one of whose adopting threads runs at the read (the device credits it at quantum ends), or whose time could not be read"),
     (ri::SERVICED_SYSTEM_TIME, "ri_serviced_system_time", "a bill one of whose adopting threads runs at the read (the device credits it at quantum ends), or whose time could not be read"),
-    (ri::LOGICAL_WRITES, "ri_logical_writes", "the logical_writes ledger: cluster_write's copies into the UBC, the first write faults on shared file pages, AppleAPFS's own"),
+    (ri::LOGICAL_WRITES, "ri_logical_writes", "the logical_writes ledger: cluster_write's copies into the UBC and direct writes, the first write fault on each vnode page, dirty pages discarded, and AppleAPFS's obj_dirty (once per metadata object a transaction first dirties)"),
     (ri::LIFETIME_MAX_PHYS_FOOTPRINT, "ri_lifetime_max_phys_footprint", "a look at the process's pages, which the host keeps no view of"),
-    (ri::INSTRUCTIONS, "ri_instructions", "the CPMU's instruction counts, XNU's own on the thread's behalf among them"),
-    (ri::CYCLES, "ri_cycles", "the CPMU's cycle counts"),
+    (ri::INSTRUCTIONS, "ri_instructions", "PMC1 at every switch and quantum expiry (recount_snapshot): the program's retired instructions and XNU's own at EL1 while the thread is on core"),
+    (ri::CYCLES, "ri_cycles", "PMC0: the core's cycles while the thread is on core, at the frequency CLPC set"),
     (ri::INTERVAL_MAX_PHYS_FOOTPRINT, "ri_interval_max_phys_footprint", "a look at the process's pages, which the host keeps no view of"),
     (ri::RUNNABLE_TIME, "ri_runnable_time", "per-thread clocks on the host"),
 ];
@@ -269,6 +273,12 @@ pub struct Shared {
     /// deadline timer), or by a thread-call thread the delayed timer woke
     /// from there (`callout_woken_from_icontext`).
     pub interrupt_wkups: AtomicU64,
+    /// The `platform_idle_wakeups` ledger: those of the interrupt wakeups
+    /// made while every processor was idle (`ml_get_power_state`'s
+    /// `pidle`, [`super::sched::Sched::processors_idle`]), or by a
+    /// thread-call thread that such an interrupt woke
+    /// (`callout_woken_from_platform_idle`).
+    pub pkg_idle_wkups: AtomicU64,
     /// A thread call did what may have woken one of its threads in a way
     /// not counted here: a signal it posted, or a message it sent to a
     /// port another task receives.
@@ -285,6 +295,15 @@ impl Shared {
     /// A new process's, forked at Mach time `start`.
     pub fn new(start: u64) -> Arc<Shared> {
         Arc::new(Shared { start_abstime: AtomicU64::new(start), ..Shared::default() })
+    }
+
+    /// `thread_unblock`'s credits of a wakeup from interrupt context:
+    /// `interrupt_wakeups`, and `platform_idle_wakeups` with `pidle`.
+    pub fn interrupt_wakeup(&self, pidle: bool) {
+        self.interrupt_wkups.fetch_add(1, Ordering::AcqRel);
+        if pidle {
+            self.pkg_idle_wkups.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     pub fn child(&self) -> Child {
@@ -439,8 +458,9 @@ pub struct Input {
     /// `cpu_time_eqos_stats` (`fill_task_qos_rusage`), by `THREAD_QOS_*`, in
     /// Mach time units; none without the host's clocks.
     pub qos: Option<[u64; 7]>,
-    /// The `interrupt_wakeups` ledger's balance, where it is kept.
-    pub interrupt_wkups: Option<u64>,
+    /// The `interrupt_wakeups` and `platform_idle_wakeups` ledgers'
+    /// balances, where they are kept.
+    pub wakeups: Option<(u64, u64)>,
     /// `proc_exit`'s gathering at this Mach time: the map is gone, so
     /// nothing is wired or resident, and the footprint is set to 0.
     pub exit_abstime: Option<u64>,
@@ -464,11 +484,17 @@ pub fn gather(i: &Input) -> Record {
         Some(ns) => w[ri::USER_TIME] = mach_of_ns(ns),
         None => mark(ri::USER_TIME),
     }
-    match i.interrupt_wkups {
-        Some(n) => w[ri::INTERRUPT_WKUPS] = n,
-        None => mark(ri::INTERRUPT_WKUPS),
+    match i.wakeups {
+        Some((interrupt, pkg_idle)) => {
+            w[ri::INTERRUPT_WKUPS] = interrupt;
+            w[ri::PKG_IDLE_WKUPS] = pkg_idle;
+        }
+        None => {
+            mark(ri::INTERRUPT_WKUPS);
+            mark(ri::PKG_IDLE_WKUPS);
+        }
     }
-    for f in [ri::PKG_IDLE_WKUPS, ri::PAGEINS, ri::DISKIO_BYTESREAD, ri::DISKIO_BYTESWRITTEN, ri::LOGICAL_WRITES, ri::INSTRUCTIONS, ri::CYCLES] {
+    for f in [ri::PAGEINS, ri::DISKIO_BYTESREAD, ri::DISKIO_BYTESWRITTEN, ri::LOGICAL_WRITES, ri::INSTRUCTIONS, ri::CYCLES] {
         mark(f);
     }
     match i.footprint_peaks {
@@ -559,7 +585,7 @@ fn input(procs: &crate::proc::ProcTable, pid: i32, p: &super::procinfo::Public) 
         child: s.child(),
         bills: None,
         qos,
-        interrupt_wkups: (!s.wkups_unkept.load(Ordering::Acquire)).then(|| s.interrupt_wkups.load(Ordering::Acquire)),
+        wakeups: (!s.wkups_unkept.load(Ordering::Acquire)).then(|| (s.interrupt_wkups.load(Ordering::Acquire), s.pkg_idle_wkups.load(Ordering::Acquire))),
         exit_abstime: None,
     }
 }
@@ -686,9 +712,11 @@ impl Kernel {
     }
 
     /// One of this task's threads was made runnable from interrupt
-    /// context (`ledger_credit_thread(..., interrupt_wakeups, 1)`).
-    pub(crate) fn darwin_interrupt_wakeup(&self) {
-        self.dtask.rusage.interrupt_wkups.fetch_add(1, Ordering::AcqRel);
+    /// context (`ledger_credit_thread(..., interrupt_wakeups, 1)`), and
+    /// with `pidle` in the platform-idle state (`platform_idle_wakeups`
+    /// too), `thread_unblock` (`sched_prim.c:943`).
+    pub(crate) fn darwin_interrupt_wakeup(&self, pidle: bool) {
+        self.dtask.rusage.interrupt_wakeup(pidle);
     }
 
 }
@@ -829,13 +857,18 @@ mod tests {
     }
 
     #[test]
-    fn kept_interrupt_wakeups_fill_their_field() {
+    fn kept_wakeups_fill_their_fields() {
         let mut i = live();
-        i.interrupt_wkups = Some(9);
+        i.wakeups = Some((9, 4));
         let r = gather(&i);
-        assert_eq!(r.w[ri::INTERRUPT_WKUPS], 9);
+        assert_eq!((r.w[ri::INTERRUPT_WKUPS], r.w[ri::PKG_IDLE_WKUPS]), (9, 4));
         let v0 = r.unkept_within(SIZES[0]).join(" ");
-        assert!(!v0.contains("ri_interrupt_wkups") && v0.contains("ri_pkg_idle_wkups"));
+        assert!(!v0.contains("ri_interrupt_wkups") && !v0.contains("ri_pkg_idle_wkups") && v0.contains("ri_pageins"));
+        // A reaped child's are its parent's sums, kept as its own were.
+        let mut c = Child::default();
+        i.exit_abstime = Some(5000);
+        c.add(&gather(&i));
+        assert_eq!((c.interrupt_wkups, c.pkg_idle_wkups, c.unkept & (1 << ri::CHILD_PKG_IDLE_WKUPS)), (9, 4, 0));
     }
 
     #[test]

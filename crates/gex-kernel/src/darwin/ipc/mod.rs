@@ -647,6 +647,9 @@ pub enum Remote {
     PsetKnote(ObjId, ObjId),
     /// A request to one of its kernel objects, from task `caller`.
     Kobject { kmsg: Box<msg::Kmsg>, options: u64, caller: TaskKey },
+    /// One of its kernel objects' ports lost its last send right in
+    /// another task's call: the no-senders notification its kernel owes.
+    KobjectNoSenders { port: ObjId, mscount: u32 },
     /// What the host executor left for one of its WebMetal connections.
     Accel(super::accel::wire::Note),
     /// The outcome of a user client method that answers later

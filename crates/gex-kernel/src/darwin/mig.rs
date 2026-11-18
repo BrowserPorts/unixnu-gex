@@ -184,6 +184,21 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
     // conversion finds no task. A routine not served here goes on as the
     // control port's would.
     use super::kobject::flavor;
+    // A corpse's ports convert only to routines that take its read, inspect
+    // or name flavor (PORT_INTRANS_ALLOW_CORPSE_TASK), and to none while
+    // its ports are disabled (from task_mark_corpse to its last thread's
+    // ipc_task_enable): the routine's conversion finds no task or thread.
+    if k.dtask.corpse.is_some() {
+        let null = |id: i32| Reply::err(if (3200..3300).contains(&id) { KERN_INVALID_TASK } else { KERN_INVALID_ARGUMENT });
+        let key = k.ipc().task;
+        let active = k.ipc().task_ipc_active(key);
+        match obj {
+            Kobject::Task | Kobject::TaskRead | Kobject::TaskInspect | Kobject::TaskName if !active => return null(req.id),
+            Kobject::Task if task_routine_flavor(req.id).is_none_or(|n| n == flavor::CONTROL) => return null(req.id),
+            Kobject::Thread(_) if thread_routine_flavor(req.id).is_none_or(|n| n == flavor::CONTROL) => return Reply::err(KERN_INVALID_ARGUMENT),
+            _ => {}
+        }
+    }
     let as_control;
     let obj = match obj {
         Kobject::TaskRead | Kobject::TaskInspect | Kobject::ThreadRead(_) | Kobject::ThreadInspect(_) => {
@@ -1029,6 +1044,27 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
         },
         // task_threads(task) -> act_list[]: the thread ports of the flavor
         // of the task port it was asked by.
+        // task_generate_corpse(task) -> corpse_task_port: a corpse fork.
+        (Kobject::Task, 3442) => {
+            let mut r = Reply::err(KERN_FAILURE);
+            r.unimplemented = Some("task_generate_corpse (task_generate_corpse_internal's corpse fork: vm_map_fork of a live task, VM_MAP_FORK_CORPSE_FOOTPRINT, into one whose duplicated threads never run)".into());
+            r
+        }
+        // task_map_corpse_info_64(task, corpse_task) -> kcd_addr_begin,
+        // kcd_size, and task_map_corpse_info's narrower size. The corpse's
+        // right is the routine's when it succeeds.
+        (Kobject::Task, id @ (3443 | 3450)) => match desc_port(req, 0) {
+            Some((right, disp)) => {
+                let r = k.darwin_task_map_corpse_info(right, id == 3443);
+                if r.ret == 0 {
+                    if let Some(c) = right {
+                        k.ipc().object_destroy(c, disp);
+                    }
+                }
+                r
+            }
+            None => bad(),
+        },
         (Kobject::Task | Kobject::TaskRead | Kobject::TaskInspect, 3402) => {
             let f = match obj {
                 Kobject::TaskRead => flavor::READ,
@@ -1701,6 +1737,8 @@ fn task_routine_flavor(id: i32) -> Option<u8> {
         4816 | 3824 | 3800 | 4804 | 3805 | 4808 | 3809 => READ,
         4803 | 3804 | 4810 | 3811 | 4806 | 3807 | 4807 | 3808 | 4809 | 3810 | 4812 | 3813 => CONTROL,
         3403 | 3404 | 3410 | 3413 | 3414 | 3415 | 3418 | 3419 | 3420 | 3203 | 3207 | 5404 | 8000 => CONTROL,
+        // task_map_corpse_info and _64: the task mapped into is a task_t.
+        3442 | 3443 | 3450 => CONTROL,
         _ => return None,
     })
 }
@@ -1740,7 +1778,9 @@ fn task_threads(k: &mut Kernel, f: u8) -> Reply {
                 k.ipc().make_send(p);
                 p
             }
-            flavor::CONTROL if !super::kobject::DEVELOPER_MODE || !k.darwin_read_conversion_ok() => {
+            // (task_conversion_eval: a corpse's control ports are another
+            // task's to have without Developer Mode.)
+            flavor::CONTROL if !(super::kobject::DEVELOPER_MODE || k.dtask.corpse.is_some()) || !k.darwin_read_conversion_ok() => {
                 rights.push((None, super::ipc::PORT_DEAD));
                 continue;
             }

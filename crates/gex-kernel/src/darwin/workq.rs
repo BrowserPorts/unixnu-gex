@@ -480,6 +480,30 @@ impl Kernel {
         self.dtask.threads.map.get(&tid).is_some_and(|t| t.wq.is_some())
     }
 
+    /// `fill_procworkqueue`: the workqueue's threads, the active ones (the
+    /// manager's counted apart), the scheduled ones that are not, and
+    /// whether its limits are reached (`struct proc_workqueueinfo`); none
+    /// (EINVAL) for a process with no workqueue.
+    pub(crate) fn darwin_fill_procworkqueue(&mut self) -> Option<[u32; 4]> {
+        const WQ_EXCEEDED_CONSTRAINED_THREAD_LIMIT: u32 = 0x1;
+        const WQ_EXCEEDED_TOTAL_THREAD_LIMIT: u32 = 0x2;
+        let act = self.dtask.workq.as_ref()?.thactive;
+        let (mut active, _, _) = self.thactive_aggregate_downto(act, QOS_MIN, false);
+        if act & Self::thactive_offset(QOS_MANAGER) != 0 {
+            active += 1;
+        }
+        let wq = self.wq();
+        let l = limits();
+        let mut state = 0;
+        if u32::from(wq.constrained_threads_scheduled) >= l.max_constrained {
+            state |= WQ_EXCEEDED_CONSTRAINED_THREAD_LIMIT;
+        }
+        if u32::from(wq.nthreads) >= l.max_threads {
+            state |= WQ_EXCEEDED_TOTAL_THREAD_LIMIT;
+        }
+        Some([u32::from(wq.nthreads), active, u32::from(wq.threads_scheduled).wrapping_sub(active), state])
+    }
+
     // -- wq_thactive --------------------------------------------------------
 
     fn thactive_offset(q: u8) -> u128 {

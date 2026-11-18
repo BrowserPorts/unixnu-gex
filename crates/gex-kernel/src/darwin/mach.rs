@@ -1293,7 +1293,8 @@ impl Kernel {
     /// none on a host whose processes cannot see each other's.
     pub(crate) fn darwin_own_memory<R>(&mut self, f: impl FnOnce(&mut Kernel, &mut GuestMem<'_>) -> R) -> Result<R, super::kobject::Reply> {
         const KERN_FAILURE: i32 = 5;
-        let peer = match self.procs.vm(self.pid) {
+        // A corpse's map outlives its process.
+        let peer = match self.procs.vm(self.pid).or_else(|e| self.dtask.corpse.as_ref().and_then(|c| c.vm.clone()).ok_or(e)) {
             Ok(p) => p,
             Err(e) => {
                 let mut r = super::kobject::Reply::err(KERN_FAILURE);
@@ -1384,7 +1385,8 @@ impl Kernel {
             return Ok(Vec::new());
         }
         let end = addr.checked_add(size).ok_or_else(|| Reply::err(KERN_INVALID_ADDRESS))?;
-        let Ok(peer) = self.procs.vm(pid) else { return Err(Reply::err(KERN_INVALID_ADDRESS)) };
+        // A corpse's map, which outlives its process, else the process's.
+        let Some(peer) = super::corpse::vm_of_pid(pid).or_else(|| self.procs.vm(pid).ok()) else { return Err(Reply::err(KERN_INVALID_ADDRESS)) };
         let mut out: Result<Vec<u8>, Reply> = Err(Reply::err(KERN_INVALID_ADDRESS));
         peer.mem.with_guest(&mut |g| {
             let mut mm = peer.mm.lock();

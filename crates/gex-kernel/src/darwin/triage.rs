@@ -52,7 +52,7 @@ pub struct Triage {
     pub codes: [i64; 2],
     pub count: u32,
     /// The next level to try: thread, task, host.
-    level: u8,
+    pub(crate) level: u8,
     pub then: Then,
     /// Raised by `task_exception_notify`, whose thread waits at
     /// `THREAD_UNINT` for it.
@@ -62,11 +62,23 @@ pub struct Triage {
 /// A delivery waiting for its handler's reply.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Pending {
-    t: Triage,
+    pub(crate) t: Triage,
     id: i32,
     /// The reply carries a state, and it is set.
     state: bool,
     set_state: bool,
+}
+
+impl Triage {
+    /// An exception of type `exc` with `codes` (at most two), from its
+    /// first level.
+    pub(crate) fn new(exc: usize, codes: &[i64], then: Then, unint: bool) -> Triage {
+        let mut c = [0i64; 2];
+        for (d, s) in c.iter_mut().zip(codes) {
+            *d = *s;
+        }
+        Triage { exc, codes: c, count: codes.len().min(2) as u32, level: 0, then, unint }
+    }
 }
 
 impl Pending {
@@ -77,7 +89,7 @@ impl Pending {
 }
 
 /// One level's delivery: done with a result, or sent and awaited.
-enum Delivered {
+pub(crate) enum Delivered {
     Done(u64),
     Sent(Pending),
 }
@@ -95,11 +107,7 @@ impl Kernel {
     }
 
     fn darwin_triage_at(&mut self, m: &mut GuestMem<'_>, exc: usize, codes: &[i64], then: Then, unint: bool) -> SyscallOutcome {
-        let mut c = [0i64; 2];
-        for (d, s) in c.iter_mut().zip(codes) {
-            *d = *s;
-        }
-        self.darwin_triage_from(m, Triage { exc, codes: c, count: codes.len().min(2) as u32, level: 0, then, unint })
+        self.darwin_triage_from(m, Triage::new(exc, codes, then, unint))
     }
 
     /// The levels from `t.level` on, until one takes the exception.
@@ -126,12 +134,12 @@ impl Kernel {
                 Delivered::Sent(p) => return self.darwin_exc_await(m, p),
             }
         }
-        self.darwin_triage_end(m, t.then, last)
+        self.darwin_triage_end(m, &t, last)
     }
 
     /// `check_exc_receiver_dependency`: an EXC_CRASH is not sent to a
     /// handler in the crashing task's own space.
-    fn darwin_exc_receiver_independent(&mut self, ty: usize, actions: &ExcActions) -> bool {
+    pub(crate) fn darwin_exc_receiver_independent(&mut self, ty: usize, actions: &ExcActions) -> bool {
         if ty != exc::EXC_CRASH {
             return true;
         }
@@ -140,23 +148,18 @@ impl Kernel {
         !(ipc.port(p).owner == ipc.task && matches!(ipc.port(p).receiver, Receiver::Space(_)))
     }
 
-    fn darwin_triage_end(&mut self, _m: &mut GuestMem<'_>, then: Then, kr: u64) -> SyscallOutcome {
-        match then {
+    fn darwin_triage_end(&mut self, _m: &mut GuestMem<'_>, t: &Triage, kr: u64) -> SyscallOutcome {
+        match t.then {
             Then::Return => SyscallOutcome::Continue,
             Then::Exit { signal, core } => {
-                // No handler took it: a corpse, for its notification
-                // handler (with none, the corpse goes unseen).
-                if kr != kr::SUCCESS && self.darwin_task_exc_handled(exc::EXC_CORPSE_NOTIFY) {
-                    self.darwin_unimplemented("a corpse of a crashed task for its EXC_CORPSE_NOTIFY handler (corpses)".into());
-                }
-                // The rest of proc_prepareexit: P_REF_DEAD.
+                // The rest of proc_prepareexit: a corpse if no handler took
+                // it, then P_REF_DEAD.
+                self.darwin_prepareexit_corpse(kr, t.codes[0], t.codes[1]);
                 self.procs.set_exited(self.pid);
                 SyscallOutcome::Killed { signal, core }
             }
             Then::Exited(code) => {
-                if kr != kr::SUCCESS && self.darwin_task_exc_handled(exc::EXC_CORPSE_NOTIFY) {
-                    self.darwin_unimplemented("a corpse of a crashed task for its EXC_CORPSE_NOTIFY handler (corpses)".into());
-                }
+                self.darwin_prepareexit_corpse(kr, t.codes[0], t.codes[1]);
                 self.procs.set_exited(self.pid);
                 SyscallOutcome::Exit(code)
             }
@@ -164,7 +167,7 @@ impl Kernel {
     }
 
     /// `exception_deliver` at one level.
-    fn darwin_exception_deliver(&mut self, m: &mut GuestMem<'_>, t: &Triage, a: &ExcAction) -> Delivered {
+    pub(crate) fn darwin_exception_deliver(&mut self, m: &mut GuestMem<'_>, t: &Triage, a: &ExcAction) -> Delivered {
         let Some(Carried::Port(port)) = a.port else { return Delivered::Done(KERN_FAILURE) };
         let ux = self.ipc().global_port(Kobject::UxHandler);
         if port == ux {
@@ -199,10 +202,10 @@ impl Kernel {
         let mut descs = Vec::new();
         if identity {
             // The thread's and the task's ports: their read ports without
-            // Developer Mode (convert_*_read_to_port), else their control
-            // ports.
+            // Developer Mode (convert_*_read_to_port), else, or for a
+            // corpse, their control ports.
             use super::kobject::{flavor, DEVELOPER_MODE};
-            let (thread, task) = if DEVELOPER_MODE {
+            let (thread, task) = if DEVELOPER_MODE || self.dtask.corpse.is_some() {
                 let (tp, _) = self.darwin_thread_ports(self.tid);
                 let kp = self.darwin_task_port();
                 self.ipc().make_send(tp);
@@ -236,7 +239,7 @@ impl Kernel {
         self.darwin_exc_send(port, id, body, descs);
         // A state identity handler's state is set only through a control
         // port to the thread.
-        let set_state = behavior == exc::EXCEPTION_STATE || super::kobject::DEVELOPER_MODE;
+        let set_state = behavior == exc::EXCEPTION_STATE || super::kobject::DEVELOPER_MODE || self.dtask.corpse.is_some();
         Delivered::Sent(Pending { t: *t, id, state, set_state })
     }
 
@@ -304,7 +307,7 @@ impl Kernel {
         self.ipc().kmsg_destroy(k, true);
         self.darwin_ipc_settle(m);
         if r == kr::SUCCESS || r == RCV_PORT_DIED {
-            return Some(self.darwin_triage_end(m, p.t.then, r));
+            return Some(self.darwin_triage_end(m, &p.t, r));
         }
         Some(self.darwin_triage_from(m, p.t))
     }
@@ -312,7 +315,7 @@ impl Kernel {
     /// The MIG client's check of a reply, and for a state behavior the new
     /// state set (`thread_setstatus_from_user`, but not for a corpse
     /// notification).
-    fn darwin_exc_reply(&mut self, m: &mut GuestMem<'_>, p: &Pending, k: &Kmsg) -> u64 {
+    pub(crate) fn darwin_exc_reply(&mut self, m: &mut GuestMem<'_>, p: &Pending, k: &Kmsg) -> u64 {
         let err = |e: i32| e as u32 as u64;
         if k.id != p.id + 100 {
             return err(if k.id == NOTIFY_SEND_ONCE { MIG_SERVER_DIED } else { MIG_REPLY_MISMATCH });

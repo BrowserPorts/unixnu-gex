@@ -264,7 +264,8 @@ impl Kernel {
     /// until it stops.
     pub(crate) fn darwin_thread_state(&mut self, tid: i32, fl: i32, count: u32, set: Option<Vec<u32>>) -> super::kobject::Reply {
         use super::kobject::Reply;
-        if !self.darwin_thread_alive(tid) {
+        // A corpse's thread (thread->inspection) is read as it stands.
+        if !self.darwin_thread_alive(tid) && !(set.is_none() && self.darwin_thread_inspection(tid)) {
             return Reply::err(KERN_TERMINATED);
         }
         let held = tid != self.tid && !self.darwin_offcpu(tid);
@@ -282,10 +283,11 @@ impl Kernel {
     /// The state read or written, the thread stopped.
     pub(crate) fn darwin_thread_state_now(&mut self, m: &mut GuestMem<'_>, tid: i32, fl: i32, count: u32, set: Option<Vec<u32>>) -> super::kobject::Reply {
         use super::kobject::Reply;
-        if !self.darwin_thread_alive(tid) {
+        if !self.darwin_thread_alive(tid) && !(set.is_none() && self.darwin_thread_inspection(tid)) {
             return Reply::err(KERN_TERMINATED);
         }
-        let Some(c) = self.dtask.threads.map.get(&tid).map(|t| t.ctx_addr).filter(|&c| c != 0) else {
+        let corpse_ctx = self.dtask.corpse.as_ref().filter(|c| c.thread == tid).map(|c| c.ctx);
+        let Some(c) = self.dtask.threads.map.get(&tid).map(|t| t.ctx_addr).filter(|&c| c != 0).or(corpse_ctx) else {
             let mut r = Reply::err(KERN_INVALID_ARGUMENT);
             r.unimplemented = Some(format!("thread_get_state of thread {tid}, whose register context is not known"));
             return r;

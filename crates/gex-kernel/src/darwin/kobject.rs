@@ -287,7 +287,9 @@ impl Kernel {
         }
         if let Some((kport, pport)) = self.dtask.kports.threads.remove(&tid) {
             let ipc = &mut self.ipc();
-            for p in [kport, pport] {
+            // (A corpse's thread's control port is its self port too.)
+            let ports = if kport == pport { vec![kport] } else { vec![kport, pport] };
+            for p in ports {
                 ipc.port_mut(p).kobject = None;
                 ipc.port_mut(p).pinned = false;
                 ipc.port_destroy(p);
@@ -307,18 +309,50 @@ impl Kernel {
     /// `proc_prepareexit` first (`P_REF_DEAD`, if its end did not say so
     /// already), so `proc_find` no longer finds it, as XNU's exit
     /// terminates the task only after that.
+    ///
+    /// A corpse's process ends here too, but not its task:
+    /// `task_terminate_internal` refuses a task whose corpse report is
+    /// pending, and the task (its map, threads, ports and handlers) stays
+    /// until the corpse's port has no senders
+    /// ([`Self::darwin_corpse_terminate`]); its threads' sends still
+    /// waiting for room are abandoned as they end.
     pub fn darwin_task_terminate(&mut self) {
         if !self.darwin || self.dtask.ipc_raw.ended {
             return;
         }
         self.procs.set_exited(self.pid);
-        // coalitions_remove_task, launchd told of those it emptied.
-        self.darwin_coalitions_task_end();
         // proc_exit's gathering of its bank figures, its bank context still
         // there: a bill one of its threads still had as its bank ledger is
         // not known (the exiting thread's last stretch is credited after).
         let bills = self.darwin_bank_bills(self.pid, self.dtask.uniqueid, &std::sync::Arc::clone(&self.dtask.rusage));
         *self.dtask.rusage.exit_bills.lock().unwrap_or_else(|e| e.into_inner()) = Some(bills);
+        if self.dtask.corpse.as_ref().is_some_and(|c| c.pending_report) {
+            self.darwin_pending_sends_abandon();
+            self.darwin_ipc_leave();
+            return;
+        }
+        self.darwin_task_terminate_internal();
+    }
+
+    /// The threads' sends still waiting for room, abandoned.
+    fn darwin_pending_sends_abandon(&mut self) {
+        let waiting: Vec<(i32, Box<Kmsg>)> = self.dtask.pending_send.drain().collect();
+        for (tid, kmsg) in waiting {
+            let ipc = self.ipc();
+            let port = kmsg.dest;
+            let me = ipc.waiter(tid);
+            ipc.mqueue_cancel_room(port, me);
+            ipc.release(port);
+            ipc.kmsg_destroy(kmsg, true);
+        }
+    }
+
+    /// `task_terminate_internal`'s and `task_deallocate`'s IPC and the rest
+    /// of the task's end, for a task whose process has ended (a corpse's
+    /// once its port has no senders).
+    pub(crate) fn darwin_task_terminate_internal(&mut self) {
+        // coalitions_remove_task, launchd told of those it emptied.
+        self.darwin_coalitions_task_end();
         // Its threads' vouchers, its importance (ipc_importance_disconnect_task)
         // and its bank context (task_bank_reset).
         self.darwin_threads_vouchers_release();
@@ -331,15 +365,7 @@ impl Kernel {
         for p in semas {
             self.semaphore_destroy_internal(None, p);
         }
-        let waiting: Vec<(i32, Box<Kmsg>)> = self.dtask.pending_send.drain().collect();
-        for (tid, kmsg) in waiting {
-            let ipc = self.ipc();
-            let port = kmsg.dest;
-            let me = ipc.waiter(tid);
-            ipc.mqueue_cancel_room(port, me);
-            ipc.release(port);
-            ipc.kmsg_destroy(kmsg, true);
-        }
+        self.darwin_pending_sends_abandon();
         let tids: Vec<i32> = self.dtask.kports.threads.keys().copied().collect();
         for t in tids {
             self.darwin_thread_ports_terminate(t);
@@ -347,7 +373,7 @@ impl Kernel {
         let flavored = self.darwin_flavor_ports_take();
         let k = std::mem::take(&mut self.dtask.kports);
         let name = self.ipc().task_name_port_take();
-        let task_ports: Vec<ObjId> = k.task.map(|(a, b)| vec![a, b]).unwrap_or_default().into_iter().chain(name).chain(k.resume).chain(flavored).collect();
+        let task_ports: Vec<ObjId> = k.task.map(|(a, b)| if a == b { vec![a] } else { vec![a, b] }).unwrap_or_default().into_iter().chain(name).chain(k.resume).chain(flavored).collect();
         let watch = self.dtask.pending_watchports.take().map(|(w, _)| w).unwrap_or_default();
         let sends: Vec<ObjId> = k.special.values().copied().chain(k.registered.into_iter().flatten()).chain(watch.into_iter().flatten()).collect();
         let ipc = self.ipc();
@@ -498,6 +524,9 @@ impl Kernel {
             Some(Kobject::NamedEntry(id)) => super::vmentry::no_senders(id),
             Some(Kobject::Eventlink(..)) => self.darwin_eventlink_no_senders(port),
             Some(Kobject::TaskRead | Kobject::TaskInspect | Kobject::ThreadRead(_) | Kobject::ThreadInspect(_)) => self.darwin_flavor_port_no_senders(port),
+            // task_port_no_senders: only a corpse's control port asks for
+            // it (convert_corpse_to_port_and_nsrequest).
+            Some(Kobject::Task) => self.darwin_task_port_no_senders(port, mscount),
             other => self.darwin_unimplemented(format!("no-senders for kernel object {other:?}")),
         }
     }
@@ -638,13 +667,28 @@ impl Kernel {
     }
 
     /// Whether thread `tid` is still there (`thread->active`).
+    ///
+    /// A corpse's threads are not (they are kept for inspection only:
+    /// [`Self::darwin_thread_inspection`]).
     pub(crate) fn darwin_thread_alive(&self, tid: i32) -> bool {
+        if self.dtask.corpse.is_some() {
+            return false;
+        }
         self.dtask.threads.map.contains_key(&tid) || self.thread_signals.contains(tid)
+    }
+
+    /// `thread->inspection`: thread `tid` is a corpse's, kept for its
+    /// state and information to be read.
+    pub(crate) fn darwin_thread_inspection(&self, tid: i32) -> bool {
+        self.dtask.corpse.as_ref().is_some_and(|c| c.inspection.contains(&tid))
     }
 
     /// Whether thread `tid` is off its CPU: not started, parked, waiting
     /// in a call, or gone.
     pub(crate) fn darwin_offcpu(&self, tid: i32) -> bool {
+        if self.darwin_thread_inspection(tid) {
+            return true;
+        }
         match self.dtask.threads.map.get(&tid) {
             Some(t) => t.offcpu || t.unstarted.is_some(),
             None => !self.thread_signals.contains(tid),

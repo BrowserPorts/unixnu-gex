@@ -2001,6 +2001,13 @@ fn run_process(
         k.darwin_task_terminate();
         k.close_all_fds();
     }
+    // A corpse's task outlives its process; the first process's end was
+    // published above, another's is by its parent's side once this returns.
+    gex_kernel::darwin::corpse::hold(&spawn.kernel);
+    let pid = spawn.kernel.lock().unwrap_or_else(|e| e.into_inner()).pid;
+    if pid == gex_kernel::INIT_PID {
+        gex_kernel::darwin::corpse::exited(pid);
+    }
     // (A thread that cannot be made drops it here, with its closure.)
     let rest = (store, linker, spawn, memory, shared);
     let _ = std::thread::Builder::new().name("gex-reap".into()).spawn(move || drop(rest));
@@ -3544,6 +3551,7 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
                         k.darwin_task_terminate();
                         k.close_all_fds();
                     }
+                    gex_kernel::darwin::corpse::hold(&kernel);
                     (127, 127 << 8)
                 }
             };
@@ -3580,7 +3588,10 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
                 k.darwin_task_terminate();
                 k.close_all_fds();
             }
+            gex_kernel::darwin::corpse::hold(&kernel);
             procs.exit(pid, wstatus);
+            // proc_exit is done: a corpse's notification goes out.
+            gex_kernel::darwin::corpse::exited(pid);
             usage::forget(pid);
             let (st, done) = status;
             *st.lock().unwrap_or_else(|e| e.into_inner()) = Some(wstatus);
@@ -4431,6 +4442,7 @@ fn start_darwin_spawn(cx: &SpawnContext, mut child: Kernel) -> std::result::Resu
                 };
                 procs.set_uid(pid, creds.uid());
                 procs.exit(pid, wstatus);
+                gex_kernel::darwin::corpse::exited(pid);
                 *status.lock().unwrap_or_else(|e| e.into_inner()) = Some(wstatus);
                 done.notify_all();
             }

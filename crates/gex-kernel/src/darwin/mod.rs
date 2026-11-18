@@ -39,6 +39,7 @@ pub mod ttydev;
 pub mod km;
 pub mod cpumon;
 pub mod cred;
+pub mod corpse;
 pub mod critexit;
 pub mod errno;
 pub mod exec;
@@ -421,6 +422,13 @@ pub struct Task {
     pub syscall_exit: bool,
     /// The EXC_CRASH code and subcode a death owes its handlers.
     pub crash_notify: Option<(i64, i64)>,
+    /// The task is a corpse (`TFRO_CORPSE`), with what it keeps.
+    pub corpse: Option<Box<corpse::Corpse>>,
+    /// `vm_map_set_corpse_source`: a fatal memory limit's kill is to make
+    /// the task a corpse whatever its EXC_CRASH handlers do.
+    pub corpse_source: bool,
+    /// The `vm_fault` result of the fault being raised as a signal.
+    pub fault_code: Option<i64>,
     /// Each thread's kernel reply port, and a reply that came to it.
     pub rpc_reply: std::collections::HashMap<i32, ipc::ObjId>,
     pub rpc_replies: std::collections::HashMap<i32, Box<ipc::msg::Kmsg>>,

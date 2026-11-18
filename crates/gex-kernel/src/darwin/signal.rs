@@ -861,15 +861,18 @@ impl Kernel {
             return;
         }
         use super::exception as exc;
+        let th = self.dtask.threads.map.get(&self.tid).map(|t| (t.uu_exception, t.uu_code, t.uu_subcode)).unwrap_or_default();
+        let code = (i64::from(d & 0xff) << 24) | (i64::from(th.0 & 0x0f) << 20) | (th.1 & 0xfffff);
         if self.darwin_exc_handled(exc::EXC_CRASH) {
-            let th = self.dtask.threads.map.get(&self.tid).map(|t| (t.uu_exception, t.uu_code, t.uu_subcode)).unwrap_or_default();
-            let code = (i64::from(d & 0xff) << 24) | (i64::from(th.0 & 0x0f) << 20) | (th.1 & 0xfffff);
             if self.dtask.syscall_exit {
                 self.dtask.crash_notify = Some((code, th.2));
             } else {
                 self.darwin_unimplemented(format!("telling the EXC_CRASH handler of a death by Darwin signal {d} taken outside a call"));
             }
+            return;
         }
+        // task_exception_notify finds no handler (KERN_FAILURE): a corpse.
+        self.darwin_prepareexit_corpse(5, code, th.2);
     }
 
     /// `exit(rval)`'s `proc_prepareexit` (status `W_EXITCODE(rval, 0)`):
@@ -1009,6 +1012,9 @@ impl Kernel {
                 crate::signal::sig::SIGBUS
             }
         };
+        // vm_fault's KERN_INVALID_ADDRESS where nothing is mapped, else
+        // KERN_PROTECTION_FAILURE.
+        self.dtask.fault_code = Some(if prot.is_none() { 1 } else { 2 });
         (self.raise_fault(m, l, pc, addr), l)
     }
 
@@ -1020,6 +1026,8 @@ impl Kernel {
     fn darwin_absent_fault(&mut self, m: &mut GuestMem<'_>, pc: u64, addr: u64, write: bool) -> (Delivery, u32) {
         let need = if write { crate::mem::prot::WRITE } else { crate::mem::prot::READ };
         let allowed = self.mem.lock().vma_at(addr).is_some_and(|v| v.prot & need != 0);
+        // KERN_MEMORY_ERROR, or KERN_PROTECTION_FAILURE.
+        self.dtask.fault_code = Some(if allowed { 10 } else { 2 });
         if allowed {
             if let Some(e) = self.dtask.vm.at_or_after(addr).filter(|e| e.start <= addr) {
                 let shared = e.attrs.kind == super::vm::kind::FILE_SHARED && !e.attrs.cow;
@@ -1050,6 +1058,31 @@ impl Kernel {
         if let Some(ty) = ty.filter(|&t| self.darwin_exc_handled(t)) {
             self.darwin_unimplemented(format!("sending exception {ty} (Darwin signal {d}) to its exception handler (exception_triage)"));
         }
+        // handle_ux_exception's uu_exception, uu_code and uu_subcode, which
+        // a death of the signal reports to EXC_CRASH handlers and a corpse:
+        // a bad access's vm_fault result and address.
+        // An undefined instruction's (handle_uncategorized): EXC_ARM_UNDEFINED
+        // and the instruction, or a GDB trap's breakpoint.
+        let code = self.dtask.fault_code.take();
+        let codes = match (ty, code) {
+            (Some(exc::EXC_BAD_ACCESS), Some(code)) => Some((exc::EXC_BAD_ACCESS, code, fault_address as i64)),
+            (Some(exc::EXC_BAD_INSTRUCTION), _) => m.kernel().read_u32(pc).ok().map(|instr| {
+                const EXC_ARM_UNDEFINED: i64 = 1;
+                const EXC_ARM_BREAKPOINT: i64 = 1;
+                if instr == 0xe7ff_defe || instr == 0xe7ff_deff {
+                    (exc::EXC_BREAKPOINT, EXC_ARM_BREAKPOINT, i64::from(instr))
+                } else {
+                    (exc::EXC_BAD_INSTRUCTION, EXC_ARM_UNDEFINED, i64::from(instr))
+                }
+            }),
+            _ => None,
+        };
+        if let Some((e, c, sub)) = codes {
+            let th = self.dtask.threads.map.entry(self.tid).or_default();
+            th.uu_exception = e as i32;
+            th.uu_code = c;
+            th.uu_subcode = sub;
+        }
         // threadsignal: the thread's exit reason, if it has none, is the
         // signal, sent by this process as "exc handler".
         if let Some(ts) = self.thread_signals.get(self.tid) {
@@ -1061,6 +1094,11 @@ impl Kernel {
         // threadsignal of a blocked or ignored fault: the thread would take
         // it again on return, so it ends the process as the default does.
         if handler == SIG_DFL || handler == SIG_IGN || blocked {
+            // The death's report carries the codes: known here for a bad
+            // access only.
+            if let Some(ty) = ty.filter(|_| codes.is_none()) {
+                self.darwin_unimplemented(format!("the codes of exception {ty} (Darwin signal {d}) a fault raised, which its death reports (handle_ux_exception's uu_code and uu_subcode)"));
+            }
             self.darwin_signal_exit(d);
             return Delivery::Terminate { signal: l, core: false };
         }

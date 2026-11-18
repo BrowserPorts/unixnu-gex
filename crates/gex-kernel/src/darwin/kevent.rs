@@ -439,6 +439,14 @@ pub struct Kevents {
     pub(super) select: HashMap<i32, super::select::Select>,
 }
 
+impl Kevents {
+    /// What `kevent_proc_copy_uptrs` counts: the knotes on the descriptor
+    /// list and in the knote hash, and the dynamic workloops.
+    pub(crate) fn uptrs_count(&self) -> usize {
+        self.knlist.values().map(Vec::len).sum::<usize>() + self.knhash.values().map(Vec::len).sum::<usize>() + self.kqhash.len()
+    }
+}
+
 /// `struct pollfd`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PollFd {

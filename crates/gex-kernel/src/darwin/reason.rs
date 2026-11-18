@@ -344,7 +344,7 @@ impl crate::syscalls::Kernel {
         }
         let r = OsReason::userspace(m, a[0] as u32, a[1], a[2], a[3] as u32, a[4], a[5] | flag::ABORT);
         if user_fault {
-            self.darwin_unimplemented(format!("os_fault_with_payload's simulated EXC_GUARD (task_violated_guard, a corpse) for namespace {} code {:#x}", r.namespace, r.code));
+            self.darwin_unimplemented(format!("os_fault_with_payload's simulated EXC_GUARD for namespace {} code {:#x} (task_violated_guard's task_enqueue_exception_with_corpse: a lightweight corpse for a backtrace-preferring handler, else a corpse fork, a copy of the live task that never runs)", r.namespace, r.code));
             return Err(super::errno::errno_of(16));
         }
         self.darwin_psignal_try_thread(dsig::SIGABRT, Some(Arc::new(r)));

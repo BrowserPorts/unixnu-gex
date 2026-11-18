@@ -131,6 +131,11 @@ impl Kernel {
 
     /// Fire every thread call that is due; the next deadline.
     fn darwin_thread_calls_body(&mut self, m: &mut GuestMem<'_>) -> Option<Instant> {
+        // A corpse whose process has ended has only other tasks' requests
+        // and its notification to see to.
+        if self.darwin_corpse_thread_calls(m) {
+            return None;
+        }
         // Other tasks' IPC with this one's threads and ports.
         self.darwin_ipc_remote(m);
         // Signals posted, and pipes changed, from outside a call: their

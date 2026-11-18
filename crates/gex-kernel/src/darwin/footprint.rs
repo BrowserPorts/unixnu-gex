@@ -329,6 +329,12 @@ impl Pmap {
         p.reusable = p.reusable.max(n.reusable);
     }
 
+    /// Its `page_table` ledger: the root table and the leaf and twig
+    /// tables.
+    pub fn page_table(&self) -> u64 {
+        ROOT_SIZE + (self.leaves.len() + self.twigs.len()) as u64 * PAGE
+    }
+
     /// The `phys_footprint` it makes: its own pages, the root table, the
     /// leaf and twig tables.
     pub fn balance(&self) -> i64 {
@@ -781,10 +787,16 @@ impl Kernel {
             // PROC_CROSSED_HIGH_WATERMARK__SEND_EXC_RESOURCE_AND_SUSPEND,
             // for a task that is not traced (none here is) and not launchd:
             // a fatal limit's EXC_RESOURCE is the corpse its kill makes
-            // (corpse_for_fatal_memkill), a soft one's a forked corpse's.
-            // Either reaches only a corpse notification handler.
-            if !triggered && self.pid != 1 && self.darwin_task_exc_handled(EXC_CORPSE_NOTIFY) {
-                self.darwin_unimplemented(format!("a corpse's EXC_RESOURCE for a crossed memory limit of {} MB (corpses)", l.limit >> 20));
+            // (corpse_for_fatal_memkill: the map is marked a corpse source,
+            // and proc_prepareexit makes the corpse, its codes the
+            // EXC_RESOURCE's), a soft one's a forked corpse's, which reaches
+            // only a corpse notification handler.
+            if !triggered && self.pid != 1 {
+                if fatal {
+                    self.dtask.corpse_source = true;
+                } else if self.darwin_task_exc_handled(EXC_CORPSE_NOTIFY) {
+                    self.darwin_unimplemented(format!("a forked corpse's EXC_RESOURCE for a crossed memory limit of {} MB (task_enqueue_exception_with_corpse's corpse fork: vm_map_fork of a live task into one that never runs)", l.limit >> 20));
+                }
             }
         }
         // memorystatus_on_ledger_footprint_exceeded.

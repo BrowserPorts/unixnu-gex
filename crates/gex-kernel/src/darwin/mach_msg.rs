@@ -1631,6 +1631,7 @@ impl Kernel {
                     self.tid = tid;
                     self.dtask.kcaller = kcaller;
                 }
+                super::ipc::Remote::KobjectNoSenders { port, mscount } => self.kobject_no_senders(port, mscount),
                 super::ipc::Remote::Accel(note) => self.darwin_accel_note(m, note),
                 // A method another task's kernel finished for one of this
                 // task's routines that answer later.

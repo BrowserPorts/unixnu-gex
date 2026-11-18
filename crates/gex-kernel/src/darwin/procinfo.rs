@@ -1400,7 +1400,7 @@ fn ipc_name(name: &str, len: usize) -> Vec<u8> {
 }
 
 /// `proc_piduniqidentifierinfo` (56 bytes).
-fn uniqidentifierinfo(p: &Public) -> [u8; 56] {
+pub(crate) fn uniqidentifierinfo(p: &Public) -> [u8; 56] {
     let mut b = [0u8; 56];
     b[..16].copy_from_slice(&p.uuid);
     b[16..24].copy_from_slice(&p.uniqueid.to_le_bytes());

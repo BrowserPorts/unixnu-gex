@@ -268,6 +268,18 @@ pub struct Task {
     /// Threads made by a call (resumed, or the workqueue's) for the host to
     /// start after it ([`crate::syscalls::Kernel::take_spawns`]).
     pub spawns: Vec<crate::syscalls::SpawnRequest>,
+    /// A blocking `connect` whose socket is connecting: `connectit`'s
+    /// sleep, from the call to its wait, and from the wait to the
+    /// `so_error` it reports.
+    pub connect_wait: Option<std::sync::Arc<crate::net::Socket>>,
+    pub connect_waited: Option<std::sync::Arc<crate::net::Socket>>,
+    /// The process's TCP sockets, whose timers its thread calls run
+    /// (`Kernel::darwin_tcp_timers`), as of the descriptor table's
+    /// generation; whether they are counted in the pipe watch, so that a
+    /// change another process makes to one wakes the thread calls.
+    pub tcp_socks: Vec<std::sync::Weak<crate::net::Socket>>,
+    pub tcp_socks_gen: Option<u64>,
+    pub tcp_watch: bool,
     /// `GEX_DARWIN_STRICT=1`: stop the process at the first thing it asks
     /// for that this kernel does not do.
     pub strict: bool,

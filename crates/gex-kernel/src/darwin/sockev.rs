@@ -16,17 +16,19 @@
 //! - `socantrcvmore`: SO_FILT_HINT_CANTRCVMORE;
 //! - a TCP reset taken (`tcp_input`'s RST in SYN_SENT, ESTABLISHED,
 //!   FIN_WAIT_1, CLOSE_WAIT or FIN_WAIT_2): SO_FILT_HINT_CONNRESET;
-//! - a TCP connection its retransmission timer dropped:
+//! - a TCP connection its retransmission or keepalive timer dropped:
 //!   SO_FILT_HINT_TIMEOUT;
+//! - a TCP keepalive probe received (`tcp_input`'s duplicate segment one
+//!   byte before what it acknowledged): SO_FILT_HINT_KEEPALIVE;
 //! - `soisdisconnected`: SO_FILT_HINT_DISCONNECTED |
 //!   SO_FILT_HINT_CONNINFO_UPDATED.
 //!
 //! The socket is looked at before a knote is attached to it and whenever
 //! its knotes are told it may have changed, so a knote is posted every
 //! hint made after it was attached, as `so_klist`'s are. The other hints
-//! (NOSRCADDR, IFDENIED, SUSPEND, RESUME, KEEPALIVE, the adaptive
-//! timeouts, NOTIFY_ACK, WAKE_PKT) come from TCP timers, interface
-//! policy, flow advisories and acknowledgement markers, none of which a
+//! (NOSRCADDR, IFDENIED, SUSPEND, RESUME, the adaptive timeouts,
+//! NOTIFY_ACK, WAKE_PKT) come from interface policy, flow advisories,
+//! TCP options not ported and acknowledgement markers, none of which a
 //! connection here goes through; where a socket's protocol would post an
 //! event this kernel does not carry, its state says so and the knote's
 //! process is told when it is seen.
@@ -94,11 +96,12 @@ struct Seen {
     timeouts: u32,
     cantrcv: bool,
     cantsend: bool,
+    keepalives: u32,
 }
 
 impl Seen {
     fn of(st: &crate::vfs::SoState) -> Seen {
-        Seen { connects: st.conn.connects, disconnects: st.conn.disconnects, resets: st.conn.resets, timeouts: st.conn.timeouts, cantrcv: st.cantrcv, cantsend: st.cantsend }
+        Seen { connects: st.conn.connects, disconnects: st.conn.disconnects, resets: st.conn.resets, timeouts: st.conn.timeouts, cantrcv: st.cantrcv, cantsend: st.cantsend, keepalives: st.conn.keepalives }
     }
 
     /// The `soevent` hints the changes from `old` to `self` are.
@@ -118,6 +121,9 @@ impl Seen {
         }
         if self.timeouts > old.timeouts {
             h |= hint::TIMEOUT;
+        }
+        if self.keepalives > old.keepalives {
+            h |= hint::KEEPALIVE;
         }
         if self.disconnects > old.disconnects {
             h |= hint::DISCONNECTED | hint::CONNINFO_UPDATED;
@@ -172,6 +178,42 @@ impl SoEv {
 }
 
 impl Kernel {
+    /// The TCP timers of this process's sockets (`tcp_run_timerlist`):
+    /// those due run, with the wakeups and events they make; when the next
+    /// is due. The sockets are counted in the pipe watch while there are
+    /// any, so a change another process makes to one of their connections
+    /// (which may arm a timer here) wakes the thread calls.
+    pub(crate) fn darwin_tcp_timers(&mut self) -> Option<std::time::Instant> {
+        let gen = self.fds.generation();
+        if self.dtask.tcp_socks_gen != Some(gen) {
+            self.dtask.tcp_socks = self
+                .fds
+                .entries()
+                .into_iter()
+                .filter_map(|(_, f, _)| std::sync::Arc::clone(&f.handle).as_inet_socket())
+                .filter(|s| s.kind == crate::net::Kind::Tcp)
+                .map(|s| std::sync::Arc::downgrade(&s))
+                .collect();
+            self.dtask.tcp_socks_gen = Some(gen);
+            let want = !self.dtask.tcp_socks.is_empty();
+            if want != self.dtask.tcp_watch {
+                self.dtask.tcp_watch = want;
+                if want {
+                    self.dtask.kevents.pipe_watch.fetch_add(1, std::sync::atomic::Ordering::Release);
+                } else {
+                    self.dtask.kevents.pipe_watch.fetch_sub(1, std::sync::atomic::Ordering::Release);
+                }
+            }
+        }
+        let mut next: Option<std::time::Instant> = None;
+        for w in &self.dtask.tcp_socks {
+            if let Some(d) = w.upgrade().and_then(|s| s.tcp_deadline()) {
+                next = Some(next.map_or(d, |n| n.min(d)));
+            }
+        }
+        next
+    }
+
     /// Look at a socket knote's socket ([`SoEv::look`]): its state, and the
     /// posts made so far.
     fn sockev_look(&mut self, n: KnId) -> (crate::vfs::SoState, u64) {

@@ -7,7 +7,10 @@
 // FIOSETOWN and SIOCSPGRP, kept as given, and sowakeup's SIGIO to it. TCP
 // urgent data on loopback: the mark (SIOCATMARK), the byte read apart with
 // MSG_OOB or in line with SO_OOBINLINE, SIGURG to the owner and
-// EVFILT_EXCEPT's NOTE_OOB.
+// EVFILT_EXCEPT's NOTE_OOB. TCP's timers on loopback: keepalive probes
+// (NOTE_KEEPALIVE at the peer, the connection kept by its answers),
+// FIN_WAIT_2's timeout (the dropped end's reset at the peer) and
+// TIME_WAIT. connectit: EISCONN, EINPROGRESS, EADDRINUSE, EOPNOTSUPP.
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -22,6 +25,7 @@
 #include <string.h>
 #include <sys/event.h>
 #include <sys/socket.h>
+#include <sys/sysctl.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -32,6 +36,7 @@
 #define NOTE_WRITECLOSED 0x00000004
 #define NOTE_TIMEOUT 0x00000008
 #define NOTE_RESUME 0x00000080
+#define NOTE_KEEPALIVE 0x00000100
 #define NOTE_CONNECTED 0x00000800
 #define NOTE_DISCONNECTED 0x00001000
 #define NOTE_CONNINFO_UPDATED 0x00002000
@@ -444,7 +449,9 @@ static int inherit(void) {
     return 0;
 }
 
-// soshutdown's SHUT_RD: sorflush drops what is buffered and what arrives.
+// soshutdown's SHUT_RD: sorflush drops what is buffered and sets
+// SS_CANTRCVMORE; data arriving after it makes tcp_input close the
+// connection and reset the sender (tcp_input.c's "rcvafterclose").
 static int shutrd(void) {
     struct sockaddr_in in;
     char b[8];
@@ -459,9 +466,12 @@ static int shutrd(void) {
     if (write(c, "def", 3) != 3) return bad("the peer's write after SHUT_RD", errno, 3);
     usleep(10000);
     if (read(s, b, sizeof b) != 0) return bad("what arrived after SHUT_RD", errno, 0);
+    if (getint(s, SOL_SOCKET, SO_ERROR) != 0) return bad("the closed end's so_error", getint(s, SOL_SOCKET, SO_ERROR), 0);
+    if (read(c, b, sizeof b) != -1 || errno != ECONNRESET) return bad("the sender's reset", errno, ECONNRESET);
+    // tcp_close disconnected it: no shutdown is left.
     if (shutdown(s, SHUT_RD) != -1 || errno != ENOTCONN) return bad("SHUT_RD again", errno, ENOTCONN);
     if (shutdown(s, SHUT_RDWR) != -1 || errno != ENOTCONN) return bad("SHUT_RDWR after SHUT_RD", errno, ENOTCONN);
-    if (shutdown(s, SHUT_WR) || shutdown(s, SHUT_WR) != -1 || errno != ENOTCONN) return bad("SHUT_WR twice", errno, ENOTCONN);
+    if (shutdown(s, SHUT_WR) != -1 || errno != ENOTCONN) return bad("SHUT_WR after the reset", errno, ENOTCONN);
     close(s);
     close(c);
     close(l);
@@ -524,8 +534,201 @@ static int oobmsg(void) {
     return 0;
 }
 
+static int setint(int s, int level, int name, int v) {
+    return setsockopt(s, level, name, &v, sizeof v);
+}
+
+// A connected pair on loopback: the connecting end, the accepted one.
+static int pair(int l, struct sockaddr_in *in, int *c, int *s) {
+    *c = socket(AF_INET, SOCK_STREAM, 0);
+    if (connect(*c, (struct sockaddr *)in, sizeof *in)) return bad("connect", errno, 0);
+    *s = accept(l, NULL, NULL);
+    if (*s < 0) return bad("accept", errno, 0);
+    return 0;
+}
+
+// TCPT_KEEP: with SO_KEEPALIVE and a TCP_KEEPALIVE of one second, an idle
+// connection's probes reach the peer (tcp_input's one-byte duplicate:
+// NOTE_KEEPALIVE) and each answer sets the idle time going again, so the
+// probes come a second apart and the connection outlives TCP_KEEPALIVE +
+// TCP_KEEPCNT * TCP_KEEPINTVL. Without SO_KEEPALIVE the timer sends
+// nothing. TCP_KEEPALIVE rearms the timer from when it is set, and a
+// connection idle past the probes' time by then is dropped (ETIMEDOUT,
+// NOTE_TIMEOUT).
+static int keepalive(void) {
+    struct sockaddr_in in;
+    struct kevent ev;
+    char b[4];
+    int l = listener(&in), c, s;
+    if (l < 0 || pair(l, &in, &c, &s)) return 1;
+    int kq = kqueue(), kc = kqueue();
+    if (add(kq, s, EVFILT_SOCK, EV_CLEAR, NOTE_KEEPALIVE) || add(kc, c, EVFILT_SOCK, EV_CLEAR, NOTE_TIMEOUT | NOTE_CONNRESET | NOTE_DISCONNECTED)) return bad("EVFILT_SOCK", errno, 0);
+    if (setint(c, SOL_SOCKET, SO_KEEPALIVE, 1) || setint(c, IPPROTO_TCP, TCP_KEEPINTVL, 1) || setint(c, IPPROTO_TCP, TCP_KEEPCNT, 2) || setint(c, IPPROTO_TCP, TCP_KEEPALIVE, 1)) return bad("the keepalive options", errno, 0);
+    if (getint(c, IPPROTO_TCP, TCP_KEEPALIVE) != 1 || getint(c, IPPROTO_TCP, TCP_KEEPINTVL) != 1 || getint(c, IPPROTO_TCP, TCP_KEEPCNT) != 2) return bad("the keepalive options read back", getint(c, IPPROTO_TCP, TCP_KEEPALIVE), 1);
+    if (next(kq, &ev, 700)) return bad("a probe before TCP_KEEPALIVE", ev.fflags, 0);
+    for (int i = 0; i < 4; i++) {
+        if (!next(kq, &ev, 1500)) return bad("a probe", i, 4);
+        if (ev.fflags != NOTE_KEEPALIVE || ev.filter != EVFILT_SOCK) return bad("the probe's fflags", ev.fflags, NOTE_KEEPALIVE);
+    }
+    // Four seconds on, past 1 + 2 * 1: still up, nothing at the prober.
+    if (next(kc, &ev, 0)) return bad("an event at the probing end", ev.fflags, 0);
+    if (getint(c, SOL_SOCKET, SO_ERROR) != 0) return bad("so_error after the probes", getint(c, SOL_SOCKET, SO_ERROR), 0);
+    if (write(c, "k", 1) != 1 || read(s, b, sizeof b) != 1 || b[0] != 'k') return bad("data after the probes", errno, 0);
+    setint(c, SOL_SOCKET, SO_KEEPALIVE, 0);
+    while (next(kq, &ev, 0)) {
+    }
+    if (next(kq, &ev, 2200)) return bad("a probe without SO_KEEPALIVE", ev.fflags, 0);
+    // Turned on again it waits for the timer armed without it
+    // (TCP_CONN_KEEPIDLE was the system's two hours then).
+    setint(c, SOL_SOCKET, SO_KEEPALIVE, 1);
+    if (next(kq, &ev, 1500)) return bad("a probe on the timer armed without SO_KEEPALIVE", ev.fflags, 0);
+    // TCP_KEEPALIVE rearms it; when it fires, nothing has arrived since
+    // the data above, more than TCP_KEEPALIVE + TCP_KEEPCNT * TCP_KEEPINTVL
+    // ago, so it drops the connection without a probe (tcp_timers'
+    // dropit): NOTE_TIMEOUT and ETIMEDOUT here, the drop's reset there.
+    setint(c, IPPROTO_TCP, TCP_KEEPALIVE, 1);
+    if (!next(kc, &ev, 2000)) return bad("the keepalive drop", 0, 1);
+    if (ev.fflags != (NOTE_TIMEOUT | NOTE_DISCONNECTED) || !(ev.flags & EV_EOF) || ev.data != ETIMEDOUT) return bad("the keepalive drop's fflags", ev.fflags, NOTE_TIMEOUT | NOTE_DISCONNECTED);
+    // The peer's knote, which asked for NOTE_KEEPALIVE alone: no probe,
+    // the reset's so_error (filt_sockev's EV_EOF).
+    if (!next(kq, &ev, 100) || ev.fflags != 0 || !(ev.flags & EV_EOF) || ev.data != ECONNRESET) return bad("the peer's knote after the drop", ev.fflags, 0);
+    if (read(s, b, sizeof b) != -1 || errno != ECONNRESET) return bad("the peer's read after the drop", errno, ECONNRESET);
+    if (read(c, b, sizeof b) != -1 || errno != ETIMEDOUT) return bad("the dropped end's read", errno, ETIMEDOUT);
+    if (getint(c, SOL_SOCKET, SO_ERROR) != 0) return bad("SO_ERROR after the read", getint(c, SOL_SOCKET, SO_ERROR), 0);
+    close(kq);
+    close(kc);
+    close(c);
+    close(s);
+    close(l);
+    return 0;
+}
+
+// TCPT_2MSL in FIN_WAIT_2: an end that shut its reading and then its
+// writing can receive nothing more once its FIN is acknowledged
+// (soisdisconnected), and its timer (tcp_fin_timeout, or TCP_KEEPCNT *
+// TCP_KEEPINTVL when that is less) drops it with no error; the drop's
+// reset is the peer's ECONNRESET and NOTE_CONNRESET. An orphan's timer
+// runs the same, net.inet.tcp.fin_timeout's when that is less.
+static int finwait(void) {
+    struct sockaddr_in in;
+    struct kevent ev;
+    char b[4];
+    int l = listener(&in), c, s;
+    if (l < 0 || pair(l, &in, &c, &s)) return 1;
+    if (setint(c, IPPROTO_TCP, TCP_KEEPINTVL, 1) || setint(c, IPPROTO_TCP, TCP_KEEPCNT, 1)) return bad("TCP_KEEPINTVL", errno, 0);
+    int kq = kqueue(), kc = kqueue();
+    add(kq, s, EVFILT_SOCK, EV_CLEAR, NOTE_CONNRESET | NOTE_DISCONNECTED);
+    add(kc, c, EVFILT_SOCK, EV_CLEAR, NOTE_DISCONNECTED | NOTE_TIMEOUT);
+    if (shutdown(c, SHUT_RD) || shutdown(c, SHUT_WR)) return bad("shutdown", errno, 0);
+    if (!next(kc, &ev, 1000) || ev.fflags != NOTE_DISCONNECTED) return bad("FIN_WAIT_2 with nothing to read", ev.fflags, NOTE_DISCONNECTED);
+    if (read(s, b, sizeof b) != 0) return bad("the FIN", errno, 0);
+    if (next(kq, &ev, 600)) return bad("an event at the peer before the timeout", ev.fflags, 0);
+    if (!next(kq, &ev, 1500)) return bad("the timeout's reset", 0, 1);
+    if (ev.fflags != (NOTE_CONNRESET | NOTE_DISCONNECTED) || !(ev.flags & EV_EOF) || ev.data != ECONNRESET) return bad("the reset at the peer", ev.fflags, NOTE_CONNRESET | NOTE_DISCONNECTED);
+    if (read(s, b, sizeof b) != -1 || errno != ECONNRESET) return bad("the peer's read", errno, ECONNRESET);
+    // tcp_drop(tp, 0): no error, no NOTE_TIMEOUT; the PCB is dead.
+    if (getint(c, SOL_SOCKET, SO_ERROR) != 0) return bad("the dropped end's so_error", getint(c, SOL_SOCKET, SO_ERROR), 0);
+    // tcp_close's soisdisconnected is a level event already delivered.
+    if (next(kc, &ev, 100)) return bad("an event at the dropped end", ev.fflags, 0);
+    if (connect(c, (struct sockaddr *)&in, sizeof in) != -1 || errno != EINVAL) return bad("connect on the dead PCB", errno, EINVAL);
+    close(c);
+    close(s);
+
+    // An orphan: its timer runs on with no descriptor (TCP_KEEPINTVL and
+    // TCP_KEEPCNT of one again).
+    int fin = -1, v = 500;
+    size_t fl = sizeof fin;
+    if (sysctlbyname("net.inet.tcp.fin_timeout", &fin, &fl, NULL, 0) || fin != 60000) return bad("net.inet.tcp.fin_timeout", fin, 60000);
+    if (pair(l, &in, &c, &s)) return 1;
+    setint(c, IPPROTO_TCP, TCP_KEEPINTVL, 1);
+    setint(c, IPPROTO_TCP, TCP_KEEPCNT, 1);
+    close(kq);
+    kq = kqueue();
+    add(kq, s, EVFILT_SOCK, EV_CLEAR, NOTE_CONNRESET);
+    close(c);
+    if (read(s, b, sizeof b) != 0) return bad("the orphan's FIN", errno, 0);
+    if (next(kq, &ev, 600)) return bad("the orphan's reset before its timeout", ev.fflags, 0);
+    if (!next(kq, &ev, 1500) || ev.fflags != NOTE_CONNRESET) return bad("the orphan's reset", ev.fflags, NOTE_CONNRESET);
+    close(s);
+    // net.inet.tcp.fin_timeout: written by the superuser alone (sysctl_root's
+    // proc_suser for a node without CTLFLAG_ANYBODY); half a second for an
+    // orphan, then -1 for TCPTV_FINWAIT2 again.
+    if (getuid() != 0) {
+        if (sysctlbyname("net.inet.tcp.fin_timeout", NULL, NULL, &v, sizeof v) != -1 || errno != EPERM) return bad("setting net.inet.tcp.fin_timeout as a user", errno, EPERM);
+    } else {
+        if (sysctlbyname("net.inet.tcp.fin_timeout", NULL, NULL, &v, sizeof v)) return bad("setting net.inet.tcp.fin_timeout", errno, 0);
+        if (pair(l, &in, &c, &s)) return 1;
+        close(kq);
+        kq = kqueue();
+        add(kq, s, EVFILT_SOCK, EV_CLEAR, NOTE_CONNRESET);
+        close(c);
+        if (read(s, b, sizeof b) != 0) return bad("the orphan's FIN", errno, 0);
+        if (next(kq, &ev, 250)) return bad("the orphan's reset before fin_timeout", ev.fflags, 0);
+        if (!next(kq, &ev, 1500) || ev.fflags != NOTE_CONNRESET) return bad("the orphan's reset after fin_timeout", ev.fflags, NOTE_CONNRESET);
+        v = -1;
+        if (sysctlbyname("net.inet.tcp.fin_timeout", NULL, NULL, &v, sizeof v)) return bad("restoring net.inet.tcp.fin_timeout", errno, 0);
+        fl = sizeof fin;
+        if (sysctlbyname("net.inet.tcp.fin_timeout", &fin, &fl, NULL, 0) || fin != 60000) return bad("net.inet.tcp.fin_timeout restored", fin, 60000);
+        close(s);
+    }
+    close(kq);
+    close(kc);
+    close(l);
+    return 0;
+}
+
+// connectit and soconnectlock: TCP connects once (EISCONN, whether the
+// socket blocks or not, through CLOSE_WAIT too); a non-blocking connect
+// returns while the SYN's answer is on its way (EINPROGRESS) and the
+// connection is then up; a listener does not connect (EOPNOTSUPP); a
+// connection a reset closed reports its so_error once, then EINVAL; one in
+// TIME_WAIT still holds its address (EADDRINUSE).
+static int isconn(void) {
+    struct sockaddr_in in;
+    struct kevent ev;
+    int l = listener(&in), c, s;
+    if (l < 0 || pair(l, &in, &c, &s)) return 1;
+    if (connect(c, (struct sockaddr *)&in, sizeof in) != -1 || errno != EISCONN) return bad("connect again", errno, EISCONN);
+    fcntl(c, F_SETFL, O_NONBLOCK);
+    if (connect(c, (struct sockaddr *)&in, sizeof in) != -1 || errno != EISCONN) return bad("a non-blocking connect again", errno, EISCONN);
+    int n = socket(AF_INET, SOCK_STREAM, 0);
+    fcntl(n, F_SETFL, O_NONBLOCK);
+    if (connect(n, (struct sockaddr *)&in, sizeof in) != -1 || errno != EINPROGRESS) return bad("a non-blocking connect", errno, EINPROGRESS);
+    int kq = kqueue();
+    add(kq, n, EVFILT_WRITE, 0, 0);
+    if (!next(kq, &ev, 1000)) return bad("the non-blocking connect's writability", 0, 1);
+    if (getint(n, SOL_SOCKET, SO_ERROR) != 0) return bad("its so_error", getint(n, SOL_SOCKET, SO_ERROR), 0);
+    if (connect(n, (struct sockaddr *)&in, sizeof in) != -1 || errno != EISCONN) return bad("connect after it", errno, EISCONN);
+    int t = accept(l, NULL, NULL);
+    if (t < 0 || write(n, "n", 1) != 1) return bad("the non-blocking connection", errno, 0);
+    if (connect(l, (struct sockaddr *)&in, sizeof in) != -1 || errno != EOPNOTSUPP) return bad("connect on a listener", errno, EOPNOTSUPP);
+    // CLOSE_WAIT is still connected; the reset its write meets closes it.
+    close(s);
+    if (connect(c, (struct sockaddr *)&in, sizeof in) != -1 || errno != EISCONN) return bad("connect in CLOSE_WAIT", errno, EISCONN);
+    if (write(c, "x", 1) != 1) return bad("the write after the peer's close", errno, 0);
+    usleep(10000);
+    if (connect(c, (struct sockaddr *)&in, sizeof in) != -1 || errno != ECONNRESET) return bad("connect after the reset", errno, ECONNRESET);
+    if (connect(c, (struct sockaddr *)&in, sizeof in) != -1 || errno != EINVAL) return bad("connect after that", errno, EINVAL);
+    close(kq);
+    close(c);
+    close(n);
+    close(t);
+    // Both FINs, this end's first: TIME_WAIT, whose connection still holds
+    // the address (tcp_connect's lookup finds it).
+    char b[4];
+    if (pair(l, &in, &c, &s)) return 1;
+    shutdown(c, SHUT_WR);
+    shutdown(s, SHUT_WR);
+    if (read(c, b, sizeof b) != 0) return bad("the peer's FIN", errno, 0);
+    if (connect(c, (struct sockaddr *)&in, sizeof in) != -1 || errno != EADDRINUSE) return bad("connect in TIME_WAIT", errno, EADDRINUSE);
+    close(c);
+    close(s);
+    close(l);
+    return 0;
+}
+
 int main(void) {
-    if (tcp() || unixstream() || except() || owner() || oob() || inherit() || shutrd() || dgdrop() || oobmsg()) return 1;
+    if (tcp() || unixstream() || except() || owner() || oob() || inherit() || shutrd() || dgdrop() || oobmsg() || isconn() || finwait() || keepalive()) return 1;
     printf("evsock ok\n");
     return 0;
 }

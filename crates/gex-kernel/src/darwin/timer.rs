@@ -145,6 +145,9 @@ impl Kernel {
         }
         // Other tasks' IPC with this one's threads and ports.
         self.darwin_ipc_remote(m);
+        // The TCP timers of the process's sockets, ahead of the look at
+        // their knotes.
+        let tcp = self.darwin_tcp_timers();
         // Signals posted, and pipes changed, from outside a call: their
         // knotes are told.
         if self.darwin_signal_knotes() | self.darwin_pipe_knotes() | self.darwin_vnode_knotes() | self.darwin_proc_knotes() {
@@ -194,10 +197,7 @@ impl Kernel {
             self.dtask.in_callout = false;
             self.dtask.callout_pidle = false;
         };
-        match (own, jetsam) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        [own, jetsam, tcp].into_iter().flatten().min()
     }
 
     /// A thread call begins (`true`) or ends: the processes it told of

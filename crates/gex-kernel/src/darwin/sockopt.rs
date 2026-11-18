@@ -8,6 +8,7 @@
 use crate::errno::Errno;
 use crate::syscalls::Kernel;
 use crate::vfs::SoState;
+use crate::tcploop::sysctl as tcp_sysctl;
 use crate::GuestMem;
 
 /// `SOL_SOCKET`.
@@ -19,12 +20,8 @@ const TCP_NODELAY: u32 = 1;
 const TCP_KEEPALIVE: u32 = 0x10;
 const TCP_KEEPINTVL: u32 = 0x101;
 const TCP_KEEPCNT: u32 = 0x102;
-/// `TCP_RETRANSHZ`, and the defaults `tcp_keepidle`, `tcp_keepintvl`,
-/// `tcp_keepcnt` (TCPTV_KEEP_IDLE, TCPTV_KEEPINTVL, TCPTV_KEEPCNT).
+/// `TCP_RETRANSHZ`: TCP's times are kept in its ticks, milliseconds.
 pub const TCP_RETRANSHZ: u32 = 1000;
-pub const TCPTV_KEEP_IDLE: u32 = 120 * 60 * TCP_RETRANSHZ;
-pub const TCPTV_KEEPINTVL: u32 = 75 * TCP_RETRANSHZ;
-pub const TCPTV_KEEPCNT: u32 = 8;
 /// `TF_NODELAY`, the `t_flags` bit TCP_NODELAY reads back as.
 const TF_NODELAY: u32 = 0x4;
 
@@ -81,6 +78,8 @@ pub struct SockOpts {
     pub keepidle: u32,
     pub keepintvl: u32,
     pub keepcnt: u32,
+    /// The receive buffer's SB_USRSIZE: SO_RCVBUF set its size.
+    pub rcv_usrsize: bool,
 }
 
 impl SockOpts {
@@ -101,6 +100,7 @@ impl SockOpts {
             keepidle: 0,
             keepintvl: 0,
             keepcnt: 0,
+            rcv_usrsize: false,
         }
     }
 
@@ -124,13 +124,27 @@ impl SockOpts {
             keepidle: 0,
             keepintvl: head.keepintvl,
             keepcnt: head.keepcnt,
+            rcv_usrsize: head.rcv_usrsize,
         }
     }
 
     /// `soreserve`'s for a socket that has set none: buffers of the given
     /// sizes, a receive low-water mark of 1 and a send one of MCLBYTES.
     pub fn reserved(snd_hiwat: u32, rcv_hiwat: u32) -> SockOpts {
-        SockOpts { options: 0, linger: 0, rcv_hiwat, snd_hiwat, rcv_lowat: 1, snd_lowat: MCLBYTES.min(snd_hiwat), tcp_nodelay: false, nosigpipe: false, keepidle: 0, keepintvl: 0, keepcnt: 0 }
+        SockOpts { options: 0, linger: 0, rcv_hiwat, snd_hiwat, rcv_lowat: 1, snd_lowat: MCLBYTES.min(snd_hiwat), tcp_nodelay: false, nosigpipe: false, keepidle: 0, keepintvl: 0, keepcnt: 0, rcv_usrsize: false }
+    }
+
+    /// What of these options a TCP connection's control block reads.
+    pub fn tcp(&self) -> crate::tcploop::TcpOpts {
+        crate::tcploop::TcpOpts {
+            keepalive: self.options & so::KEEPALIVE != 0,
+            keepidle: self.keepidle,
+            keepintvl: self.keepintvl,
+            keepcnt: self.keepcnt,
+            rcv_hiwat: self.rcv_hiwat,
+            rcv_lowat: self.rcv_lowat,
+            rcv_usrsize: self.rcv_usrsize,
+        }
     }
 }
 
@@ -227,11 +241,11 @@ impl Kernel {
             }
             so::DEBUG | so::KEEPALIVE | so::DONTROUTE | so::USELOOPBACK | so::BROADCAST | so::REUSEADDR | so::REUSEPORT | so::OOBINLINE => {
                 let on = i32::from_le_bytes(copyin(4)?[..4].try_into().unwrap()) != 0;
-                // TCP's keepalive timer (TCPT_KEEP: probes after the idle
-                // time, the peer's SO_FILT_HINT_KEEPALIVE, a reset from an
-                // orphan gone) is not run here.
-                if on && name == so::KEEPALIVE && self.darwin_sock_proto(fd) == Some(super::sockerr::Proto::Tcp) && st.conn.connected {
-                    self.darwin_unimplemented("SO_KEEPALIVE on a TCP socket (TCPT_KEEP's probes and the peer's SO_FILT_HINT_KEEPALIVE)".into());
+                // TCP's keepalive timer (TCPT_KEEP) runs here for a
+                // connection between two sockets here; the host's TCP
+                // sends its own connections' probes, or none.
+                if on && name == so::KEEPALIVE && self.darwin_sock_proto(fd) == Some(super::sockerr::Proto::Tcp) && std::sync::Arc::clone(&file.handle).as_inet_socket().is_some_and(|s| !s.tcp_here()) {
+                    self.darwin_unimplemented("SO_KEEPALIVE on a TCP connection the host or the global kernel carries (TCPT_KEEP's probes and the peer's SO_FILT_HINT_KEEPALIVE)".into());
                     return Err(Errno::ENOPROTOOPT);
                 }
                 if on && name == so::DONTROUTE {
@@ -271,6 +285,7 @@ impl Kernel {
                         if !sbreserve(&mut o.rcv_hiwat, &mut o.rcv_lowat, v) {
                             return Err(Errno::ENOBUFS);
                         }
+                        o.rcv_usrsize = true;
                         file.handle.xnu_reserve(false, o.rcv_hiwat as usize);
                     }
                     so::SNDLOWAT => {
@@ -293,10 +308,6 @@ impl Kernel {
             }
             n if n == TCP_NODELAY | TCP_LEVEL => o.tcp_nodelay = i32::from_le_bytes(copyin(4)?[..4].try_into().unwrap()) != 0,
             // tcp_ctloutput: seconds, kept in TCP_RETRANSHZ ticks.
-            n if (n == TCP_KEEPALIVE | TCP_LEVEL || n == TCP_KEEPINTVL | TCP_LEVEL || n == TCP_KEEPCNT | TCP_LEVEL) && o.options & so::KEEPALIVE != 0 && st.conn.connected => {
-                self.darwin_unimplemented("TCP_KEEPALIVE, TCP_KEEPINTVL or TCP_KEEPCNT with SO_KEEPALIVE on (TCPT_KEEP's probes)".into());
-                return Err(Errno::ENOPROTOOPT);
-            }
             n if n == TCP_KEEPALIVE | TCP_LEVEL || n == TCP_KEEPINTVL | TCP_LEVEL => {
                 let v = i32::from_le_bytes(copyin(4)?[..4].try_into().unwrap());
                 if v < 0 || v as u32 > u32::MAX / TCP_RETRANSHZ {
@@ -318,7 +329,23 @@ impl Kernel {
             so::NOSIGPIPE => o.nosigpipe = i32::from_le_bytes(copyin(4)?[..4].try_into().unwrap()) != 0,
             _ => unreachable!("an option kept here"),
         }
+        let change = match name {
+            n if n == TCP_KEEPALIVE | TCP_LEVEL => crate::tcploop::OptChange::KeepIdle,
+            n if n == TCP_KEEPINTVL | TCP_LEVEL || n == TCP_KEEPCNT | TCP_LEVEL => crate::tcploop::OptChange::KeepIntvlOrCnt,
+            _ => crate::tcploop::OptChange::Kept,
+        };
+        if change != crate::tcploop::OptChange::Kept && !crate::tcploop::offsets_fit(&o.tcp()) {
+            self.darwin_unimplemented("a TCP keepalive time whose timer offset is 2^31 ms or more (tcp_now's 32-bit wraparound)".into());
+            return Err(Errno::ENOPROTOOPT);
+        }
         Self::darwin_store_sockopts(&file, o);
+        // tcp_ctloutput's change to the connection's timers.
+        if let Some(s) = std::sync::Arc::clone(&file.handle).as_inet_socket() {
+            if s.kind == crate::net::Kind::Tcp {
+                s.xnu_tcp_opts_changed(change);
+                self.dtask.timers.bell().ring();
+            }
+        }
         Ok(0)
     }
 
@@ -377,9 +404,11 @@ impl Kernel {
             so::SNDLOWAT => o.snd_lowat.to_le_bytes().to_vec(),
             so::RCVLOWAT => o.rcv_lowat.to_le_bytes().to_vec(),
             n if n == TCP_NODELAY | TCP_LEVEL => (if o.tcp_nodelay { TF_NODELAY } else { 0 }).to_le_bytes().to_vec(),
-            n if n == TCP_KEEPALIVE | TCP_LEVEL => ((if o.keepidle > 0 { o.keepidle } else { TCPTV_KEEP_IDLE }) / TCP_RETRANSHZ).to_le_bytes().to_vec(),
-            n if n == TCP_KEEPINTVL | TCP_LEVEL => ((if o.keepintvl > 0 { o.keepintvl } else { TCPTV_KEEPINTVL }) / TCP_RETRANSHZ).to_le_bytes().to_vec(),
-            n if n == TCP_KEEPCNT | TCP_LEVEL => (if o.keepcnt > 0 { o.keepcnt } else { TCPTV_KEEPCNT }).to_le_bytes().to_vec(),
+            // tcp_ctloutput: the socket's, else the system's (int
+            // division, as XNU's).
+            n if n == TCP_KEEPALIVE | TCP_LEVEL => (if o.keepidle > 0 { (o.keepidle / TCP_RETRANSHZ) as i32 } else { tcp_sysctl::get(&tcp_sysctl::KEEPIDLE) / TCP_RETRANSHZ as i32 }).to_le_bytes().to_vec(),
+            n if n == TCP_KEEPINTVL | TCP_LEVEL => (if o.keepintvl > 0 { (o.keepintvl / TCP_RETRANSHZ) as i32 } else { tcp_sysctl::get(&tcp_sysctl::KEEPINTVL) / TCP_RETRANSHZ as i32 }).to_le_bytes().to_vec(),
+            n if n == TCP_KEEPCNT | TCP_LEVEL => (if o.keepcnt > 0 { o.keepcnt as i32 } else { tcp_sysctl::get(&tcp_sysctl::KEEPCNT) }).to_le_bytes().to_vec(),
             // so_flags & SOF_NOSIGPIPE, which is 1.
             so::NOSIGPIPE => i32::from(o.nosigpipe).to_le_bytes().to_vec(),
             _ => return Err(Errno::ENOPROTOOPT),
@@ -413,19 +442,27 @@ impl Kernel {
     }
 
     /// Whether a connect of `fd` to the address at `addr` would carry
-    /// SO_KEEPALIVE onto a connection: a TCP socket asking for it, to an
-    /// AF_INET address (the host's probes are not TCP's; loopback's
-    /// TCPT_KEEP is not run).
+    /// keepalive (SO_KEEPALIVE, or net.inet.tcp.always_keepalive) onto a
+    /// TCP connection whose TCP is not this kernel's: one the host or the
+    /// global kernel carries, whose probes are not XNU's TCPT_KEEP's.
     pub(crate) fn darwin_keepalive_off_host(&mut self, m: &GuestMem<'_>, fd: i32, addr: u64, len: u64) -> bool {
         const AF_INET: u8 = 2;
         let Ok((file, st)) = self.darwin_socket_opts(fd) else { return false };
-        if st.unix_stream || Self::darwin_sockopts(&file, &st).options & so::KEEPALIVE == 0 || len < 8 {
+        let always = tcp_sysctl::get(&tcp_sysctl::ALWAYS_KEEPALIVE) != 0;
+        if st.unix_stream || (Self::darwin_sockopts(&file, &st).options & so::KEEPALIVE == 0 && !always) || len < 8 {
             return false;
         }
-        // Loopback's too: TCP's keepalive timer is not run here.
+        let Some(s) = std::sync::Arc::clone(&file.handle).as_inet_socket() else { return false };
+        if s.kind != crate::net::Kind::Tcp {
+            return false;
+        }
         match m.read(addr, 8) {
-            Ok(b) => b[1] == AF_INET,
-            Err(_) => false,
+            Ok(b) if b[1] == AF_INET => {
+                let port = u16::from_be_bytes([b[2], b[3]]);
+                let ip = u32::from_be_bytes([b[4], b[5], b[6], b[7]]);
+                !s.connects_here(ip, port)
+            }
+            _ => false,
         }
     }
 

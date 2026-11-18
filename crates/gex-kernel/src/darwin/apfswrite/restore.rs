@@ -57,11 +57,10 @@ pub const RUN_STAND_IN: &str = "the erase restore's clock readings, transaction 
 /// Every stand-in the build takes, for the caller to report: the image
 /// is the device's only where these are.
 pub fn stand_ins(os: bool, boot: bool) -> Vec<&'static str> {
-    let mut v = vec![RUN_STAND_IN, HOST_UUID_STAND_IN, GIGALOCKER_STAND_IN, fsops::UNWRITTEN_STAND_IN, NSIH_STAND_IN];
+    let mut v = vec![RUN_STAND_IN, HOST_UUID_STAND_IN, GIGALOCKER_STAND_IN, CLUSTER_STAND_IN, NSIH_STAND_IN];
     if boot {
         v.push(TICKET_STAND_IN);
         v.push(RESTORE_HOST_STAND_IN);
-        v.push(CLUSTER_STAND_IN);
     }
     if os {
         v.push(fsops::FILE_INODE_STAND_IN);
@@ -793,7 +792,8 @@ pub const GIGALOCKER_STAND_IN: &str = "the records the Secure Enclave writes int
 /// preallocates 6 MiB (`F_PREALLOCATE` {F_ALLOCATEALL, F_PEOFPOSMODE, 0,
 /// 0x600000}, the size already a multiple of the volume's block and the
 /// page size), grows the file to it and closes it, whose fsync zero-fills
-/// the range; then the Secure Enclave call (selector 0x2c) opens the file
+/// the range in the cluster layer's block maps (drafts/s27/re-zerofill.md:
+/// /mnt7's I/O attributes come from its volume node as /mnt9's do); then the Secure Enclave call (selector 0x2c) opens the file
 /// and its raw device (no file-system write: GIGALOCKER_STAND_IN).
 fn gigalocker_init(nx: &mut Nx<'_>, xart: usize, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     const SIZE: u64 = 0x60_0000;
@@ -809,7 +809,8 @@ fn gigalocker_init(nx: &mut Nx<'_>, xart: usize, now: &mut dyn FnMut() -> u64) -
         return Err(format!("the gigalocker preallocation got {got} bytes of {SIZE} (F_ALLOCATEALL fails)"));
     }
     fsops::truncate_grow(nx, xart, ino, SIZE, now)?;
-    fsops::close_after_grow(nx, xart, ino)
+    let (c, m) = cluster_sizes();
+    fsops::close_after_grow(nx, xart, ino, c, m, now)
 }
 
 /// The IPSW's boot objects the host personalizes for install_kernel_cache's
@@ -827,7 +828,7 @@ pub struct BootObjects {
 }
 
 impl BootObjects {
-    /// The four objects from an IPSW extracted at `dir`.
+    /// The objects from an IPSW extracted at `dir`.
     pub fn read(dir: &std::path::Path) -> Result<Self, String> {
         let r = |p: &str| std::fs::read(dir.join(p)).map_err(|e| format!("{}: {e}", dir.join(p).display()));
         Ok(BootObjects { kernelcache: r("kernelcache.release.ipad7")?, devicetree: r("Firmware/all_flash/DeviceTree.j120ap.im4p")?, iboot: r("Firmware/all_flash/iBoot.j120.RELEASE.im4p")?, root_hash: r("Firmware/044-76040-038.dmg.root_hash")? })
@@ -910,9 +911,33 @@ fn install_kernel_cache(nx: &mut Nx<'_>, v: Volumes, boot: &BootObjects, pushes:
     Ok(())
 }
 
-/// What decides how XNU's cluster layer pushes a large file's data that
-/// only the device answers.
-pub const CLUSTER_STAND_IN: &str = "how the cluster layer pushes install_kernel_cache's large files (drafts/s26/re-cluster.md): the main namespace's limit table index (the byte at its object's +0x1f0) that sets IOMaximumByteCountWrite, and the controller's IOMinimumSaturationByteCount, throttling and any syncer push, which only move the pushes in time (stand-in: the table's type-1 limits, 1 MiB, so 1 MiB clusters and block maps; the write-behind leaving its last four clusters to the close, the pushes ordered by offset; measure the kernelcache's file extents on the device's Preboot)";
+/// What decides how XNU's cluster layer pushes a file's data on disk0's
+/// volumes that only the device answers.
+pub const CLUSTER_STAND_IN: &str = "how the cluster layer pushes the gigalocker file's close-time zero fill and install_kernel_cache's large files (drafts/s26/re-cluster.md, drafts/s27/re-zerofill.md): the main namespace's limit table index (the byte at its object's +0x1f0) that sets IOMaximumByteCountWrite, and the controller's IOMinimumSaturationByteCount, throttling and any syncer push, which only move the pushes in time (stand-in: the table's type-1 limits, 1 MiB, so 1 MiB clusters and block maps: six for the 6 MiB fill, the first adding a PREV_FSIZE field of 0x100000 the close's fsync removes; the write-behind leaving its last four clusters to the close, the pushes ordered by offset; measure the kernelcache's file extents on the device's Preboot and the xART volume's last_mod_time against the gigalocker file's times)";
+
+/// A disk0 volume's cluster size C and block-map length M
+/// (drafts/s26/re-cluster.md): the mount's I/O attributes from the volume
+/// node's limits (vfs_init_io_attributes X 0xfffffff0073742f4: Wc the
+/// byte count, or the block count's bytes when fewer, 64 MiB with
+/// neither; the segment count, else Wc / 16 KiB, at most 0xffff), C =
+/// cluster_max_io_size (X 0xfffffff00735ee9c: min(segments, 4096) pages or
+/// Wc, a 16 KiB multiple, at least 1 MiB) and M (Wc to a 16 KiB multiple).
+fn cluster_sizes() -> (u64, u64) {
+    const PAGE: u64 = 16 << 10;
+    let bs = u64::from(storage::nvme().block_size);
+    let (w, b, sg) = crate::darwin::storagestack::disk0_write_limits();
+    let mut wc = if w != 0 { w.min(u64::from(u32::MAX)) } else { 64 << 20 };
+    if b != 0 && (b * bs).min(u64::from(u32::MAX)) < wc {
+        wc = (b * bs).min(u64::from(u32::MAX));
+    }
+    let sc = if sg != 0 { sg.min(0xffff) } else { (wc / PAGE).min(0xffff) };
+    let c = ((sc.min(4096) * PAGE).min(wc) & !(PAGE - 1)).max(1 << 20);
+    let m = match wc & !(PAGE - 1) {
+        0 => PAGE,
+        x => x,
+    };
+    (c, m)
+}
 
 /// The pushes of one `write(2)` of `n` bytes from offset 0 into a new file
 /// on a disk0 volume (drafts/s26/re-cluster.md): the mount's I/O
@@ -932,17 +957,7 @@ fn cluster_pushes(n: u64) -> Result<fsops::Pushes, String> {
     const PAGE: u64 = 16 << 10;
     const MAX_CLUSTERS: usize = 4;
     let bs = u64::from(storage::nvme().block_size);
-    let (w, b, sg) = crate::darwin::storagestack::disk0_write_limits();
-    let mut wc = if w != 0 { w.min(u64::from(u32::MAX)) } else { 64 << 20 };
-    if b != 0 && (b * bs).min(u64::from(u32::MAX)) < wc {
-        wc = (b * bs).min(u64::from(u32::MAX));
-    }
-    let sc = if sg != 0 { sg.min(0xffff) } else { (wc / PAGE).min(0xffff) };
-    let c = ((sc.min(4096) * PAGE).min(wc) & !(PAGE - 1)).max(1 << 20);
-    let m = match wc & !(PAGE - 1) {
-        0 => PAGE,
-        x => x,
-    };
+    let (c, m) = cluster_sizes();
     let end16 = n.div_ceil(PAGE) * PAGE;
     let hole = n.div_ceil(bs) * bs;
     let clusters = end16.div_ceil(c);
@@ -2305,6 +2320,69 @@ mod tests {
         assert!(dev.status.success(), "device fsck: {}{}", String::from_utf8_lossy(&dev.stdout), String::from_utf8_lossy(&dev.stderr));
         assert!(host.status.success(), "host fsck: {}{}", String::from_utf8_lossy(&host.stdout), String::from_utf8_lossy(&host.stderr));
     }
+    /// The gigalocker file's close-time zero fill (drafts/s27/re-zerofill.md)
+    /// on a fresh xART-role volume: with 1 MiB block maps the first adds a
+    /// PREV_FSIZE field and the close's fsync removes it, two file-system
+    /// transactions (two clock readings, the last the volume's last
+    /// modification); one 6 MiB block map changes nothing; the inode and
+    /// records end as the truncate left them, the blocks zeroed; the
+    /// device's and the host's fsck.
+    #[test]
+    fn gigalocker_zero_fill_follows_its_block_maps() {
+        let (Ok(dir), Ok(fsck)) = (std::env::var("GEX_TEST_SCRATCH"), std::env::var("GEX_TEST_FSCK")) else { return };
+        let dir = std::path::Path::new(&dir);
+        for (c, m, reads) in [(1u64 << 20, 1u64 << 20, 2u64), (6 << 20, 6 << 20, 0)] {
+            let path = dir.join(format!("gex-gl-{}-{m}", std::process::id()));
+            let blocks = 15_625_000u64;
+            let f = std::fs::OpenOptions::new().create(true).truncate(true).read(true).write(true).open(&path).unwrap();
+            f.set_len(blocks * 4096).unwrap();
+            let sink = super::super::HostFile(f, blocks * 4096);
+            let uuid = *b"gex-gigalocker-t";
+            let fm = container::format(&sink, 4096, blocks, uuid).unwrap();
+            let mut nx = Nx::formatted(&sink, &fm, uuid, Mode::Kernel).unwrap();
+            nx.mount_rw().unwrap();
+            let clock = std::cell::Cell::new(1_700_000_000_000_000_000u64);
+            let mut now = || {
+                clock.set(clock.get() + 1000);
+                clock.get()
+            };
+            let q = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+            let kv = key_os_version(RESTORE_BUILD).unwrap();
+            let times = VolumeTimes { formatted: now(), root: now(), private: now(), modified: now() };
+            let o = nx.create_volume(&NewVolume { name: "xART".into(), role: storage::role::XART, encrypted: false, e_apfs: true, times, uid: 0, gid: 0, key_os_version: kv, size_bytes: Some(10_485_760) }).unwrap();
+            nx.commit().unwrap();
+            let vol = nx.fs_oid.iter().position(|&x| x == o).unwrap();
+            fsops::mount_rw(&mut nx, vol, &mut now).unwrap();
+            let ino = fsops::create(&mut nx, vol, ROOT_INO, "gl", 0o600, 0, 0, &mut now).unwrap().unwrap();
+            assert_eq!(fsops::preallocate(&mut nx, vol, ino, 0x60_0000, &mut now).unwrap(), 0x60_0000);
+            fsops::truncate_grow(&mut nx, vol, ino, 0x60_0000, &mut now).unwrap();
+            let before = fsops::inode(&mut nx, vol, ino).unwrap();
+            let recs_before = { let (t, mut st) = nx.fs_tree(vol).unwrap(); t.records(&mut st).unwrap() };
+            let lm_before = q(nx.vol_sb(vol).unwrap(), 0x100);
+            let t0 = clock.get();
+            fsops::close_after_grow(&mut nx, vol, ino, c, m, &mut now).unwrap();
+            assert_eq!((clock.get() - t0) / 1000, reads, "clock readings of the close (m {m})");
+            let lm = q(nx.vol_sb(vol).unwrap(), 0x100);
+            assert_eq!(lm, if reads == 0 { lm_before } else { clock.get() });
+            assert_eq!(fsops::inode(&mut nx, vol, ino).unwrap(), before);
+            let recs_after = { let (t, mut st) = nx.fs_tree(vol).unwrap(); t.records(&mut st).unwrap() };
+            assert!(recs_after == recs_before);
+            let ext: Vec<(u64, u64)> = recs_after.iter().filter(|(k, _)| k.len() == 16 && q(k, 0) == (ino | 8 << 60)).map(|(_, v)| (q(v.as_ref().unwrap(), 0) & 0x00ff_ffff_ffff_ffff, q(v.as_ref().unwrap(), 8))).collect();
+            assert_eq!(ext.len(), 1);
+            let mut b = vec![0xffu8; 0x60_0000];
+            std::os::unix::fs::FileExt::read_exact_at(&sink.0, &mut b, ext[0].1 * 4096).unwrap();
+            assert!(b.iter().all(|&x| x == 0));
+            nx.commit().unwrap();
+            nx.unmount().unwrap();
+            sink.0.sync_all().unwrap();
+            let dev = std::process::Command::new(&fsck).args(["-n", "-W", "-s"]).arg(&path).output().unwrap();
+            let host = std::process::Command::new("/sbin/fsck_apfs").args(["-n", "-s"]).arg(&path).output().unwrap();
+            let _ = std::fs::remove_file(&path);
+            assert!(dev.status.success(), "device fsck: {}{}", String::from_utf8_lossy(&dev.stdout), String::from_utf8_lossy(&dev.stderr));
+            assert!(host.status.success(), "host fsck: {}{}", String::from_utf8_lossy(&host.stdout), String::from_utf8_lossy(&host.stderr));
+        }
+    }
+
 
     #[test]
     fn os_version_encoding() {

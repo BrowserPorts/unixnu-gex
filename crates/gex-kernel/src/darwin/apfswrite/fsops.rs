@@ -1466,35 +1466,83 @@ fn trim_active_file(nx: &mut Nx<'_>, vol: usize, ino: u64, now: &mut dyn FnMut()
     fs_tx_leave(nx, vol, now)
 }
 
-/// The data blocks a file's allocated-but-unwritten range has, zero-filled
-/// by the close after a size grown into a preallocation (VNOP_CLOSE's
-/// `VNOP_FSYNC` → apfs_flush_allocated_unwritten_ranges K 0x66a1a98:
-/// cluster_write with IO_HEADZEROFILL into the file's existing extents),
-/// with no metadata change when one block map covers the range (a
-/// transient PREV_FSIZE field otherwise, removed again at the inactive:
-/// UNWRITTEN_STAND_IN).
-pub fn close_after_grow(nx: &mut Nx<'_>, vol: usize, ino: u64) -> Result<(), String> {
+/// The close of a file whose size was grown into its preallocation
+/// (drafts/s27/re-zerofill.md): VNOP_CLOSE's `VNOP_FSYNC(MNT_NOWAIT)` (K
+/// 0x6690bb4) → apfs_flush_allocated_unwritten_ranges (K 0x66a1a98):
+/// `cluster_write(vp, NULL, size, size, 0, 0, 0xb80)` zero-fills the
+/// file's unwritten range [0, size) in clusters of `c` bytes, each pushed
+/// as block maps of at most `m` bytes, stopping at the extents' ends, all
+/// in file order (the write-behind pushes the lowest cluster at the fifth
+/// and sixth, the flush's push the rest). Each block map takes the
+/// extent's no-copy-on-write path (K 0x6708ce4: no transaction, no
+/// change) and trims the range from its front; fs_update_prev_fsize (K
+/// 0x670ad18) then records the start of what is left as a PREV_FSIZE
+/// field when the inode has none or a larger one: so the first block map,
+/// when others follow, adds PREV_FSIZE = its end in its own file-system
+/// transaction (K 0x670add0), and the fsync, after the flush, removes it
+/// in another (K 0x66a17f0 → K 0x6766d4c); the inode's size, times and
+/// write generation are not touched. The zeros reach the blocks with the
+/// pushes.
+pub fn close_after_grow(nx: &mut Nx<'_>, vol: usize, ino: u64, c: u64, m: u64, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    const PAGE: u64 = 16 << 10;
     let bs = nx.l.bs;
     let v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
     let ds = dstream_of(&v)?.ok_or("a close-time zero fill of a file with no data stream")?;
+    if xfields(&v)?.iter().any(|f| f.0 == INO_EXT_TYPE_PREV_FSIZE) {
+        return Err("not implemented: a close-time zero fill of an inode with a PREV_FSIZE field".into());
+    }
+    if ds.size % PAGE != 0 || c == 0 || m == 0 || c % PAGE != 0 || m % bs != 0 {
+        return Err(format!("not implemented: a zero fill of {} bytes in clusters of {c} and block maps of {m} (page-partial UPLs and cluster_io's partial runs)", ds.size));
+    }
     let (t, mut st) = nx.fs_tree(vol)?;
     let recs = t.records(&mut st)?;
     drop(st);
-    let mut covered = 0;
+    let mut extents = Vec::new();
     for (k, val) in recs.iter().filter(|(k, _)| k.len() == 16 && u64a(k, 0) == (ds.oid | J_FILE_EXTENT << 60)) {
         let val = val.as_ref().ok_or("a file extent with no value")?;
         let (logical, len, phys) = (u64a(k, 8), u64a(val, 0) & 0x00ff_ffff_ffff_ffff, u64a(val, 8));
-        if phys == 0 {
-            return Err("not implemented: a zero fill over a sparse extent".into());
+        if phys == 0 || u64a(val, 0) >> 56 != 0 {
+            return Err("not implemented: a zero fill over a sparse or flagged extent".into());
         }
-        let end = (logical + len).min(ds.size.div_ceil(bs) * bs);
-        if end > logical {
-            nx.write_data(phys, &vec![0u8; (end - logical) as usize])?;
-            covered += end - logical;
-        }
+        extents.push((logical, len, phys));
     }
-    if covered != ds.size.div_ceil(bs) * bs {
-        return Err("not implemented: a zero fill of a file whose extents do not cover its size".into());
+    // The block maps: per cluster of `c`, runs of at most `m` that end
+    // where the extent holding them does.
+    let mut maps = Vec::new();
+    let mut start = 0;
+    while start < ds.size {
+        let stop = (start + c).min(ds.size);
+        let mut off = start;
+        while off < stop {
+            let want = m.min(stop - off);
+            let &(l, len, p) = extents.iter().find(|&&(l, len, _)| l <= off && off < l + len).ok_or_else(|| format!("not implemented: a zero fill at {off:#x} past the file's extents"))?;
+            let run = want.min(l + len - off);
+            maps.push((off, run, p + (off - l) / bs));
+            off += run;
+        }
+        start = stop;
+    }
+    let zeros = vec![0u8; m as usize];
+    for (i, &(off, run, paddr)) in maps.iter().enumerate() {
+        if i == 0 && maps.len() > 1 {
+            // fs_update_prev_fsize: the remaining range's start.
+            fs_tx_enter(nx, vol)?;
+            let v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
+            let mut x = xfields(&v)?;
+            x.push((INO_EXT_TYPE_PREV_FSIZE, 0, (off + run).to_le_bytes().to_vec()));
+            put_rec(nx, vol, &inode_key(ino), &with_xfields(&v, &x))?;
+            fs_tx_leave_last(nx, vol, false, now)?;
+        }
+        nx.write_data(paddr, &zeros[..run as usize])?;
+    }
+    if maps.len() > 1 {
+        // The fsync's removal after the flush.
+        fs_tx_enter(nx, vol)?;
+        let v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
+        let mut x = xfields(&v)?;
+        x.retain(|f| f.0 != INO_EXT_TYPE_PREV_FSIZE);
+        put_rec(nx, vol, &inode_key(ino), &with_xfields(&v, &x))?;
+        fs_tx_leave_last(nx, vol, false, now)?;
     }
     Ok(())
 }
@@ -1642,12 +1690,6 @@ pub fn write_new_file(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str, mode
     Ok(ino)
 }
 
-/// The cluster I/O size of the close-time zero fill is the device's: one
-/// block map over the whole range adds nothing to the inode; several add a
-/// PREV_FSIZE field after the first and the inactive removes it, an inode
-/// rewrite and two more file-system transactions (each a clock reading)
-/// in the same container transaction.
-pub const UNWRITTEN_STAND_IN: &str = "how many block maps the kernel's zero fill of a preallocated file's unwritten range makes (the device's cluster I/O size) (stand-in: one, so no transient PREV_FSIZE field and its two extra file-system transactions; the records end the same either way; measure the xART volume's last_mod_time against the gigalocker file's times on the device)";
 
 /// A new physical extent of a data stream in the volume's extent-reference
 /// tree (`apfs_update_phys_range` K 0x66f61b4 → `insert_phys_extent` K

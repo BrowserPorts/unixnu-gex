@@ -2255,10 +2255,18 @@ pub fn chmod(nx: &mut Nx<'_>, vol: usize, ino: u64, mode: u16, now: &mut dyn FnM
     if (cur ^ mode) & 0o7777 != 0 {
         return setattr(nx, vol, ino, SetAttr { mode: Some(mode), ..Default::default() }, now);
     }
-    let t = now();
-    let m = nx.jobj_times.get(&(vol, ino)).map_or(u64a(&v, INO_MOD_TIME), |p| p.0);
-    nx.jobj_times.insert((vol, ino), (m, t));
+    chmod_same(nx, vol, ino, &v, now);
     Ok(())
+}
+
+/// apfs_vnop_setattr's fast path for a mode alone and unchanged (K
+/// 0x668f290 → K 0x668f348) on the inode whose record is `v`: the change
+/// time read from the clock (K 0x668f35c) into the in-memory object, marked
+/// dirty, nothing written (`nx.jobj_times` holds it for the next write).
+fn chmod_same(nx: &mut Nx<'_>, vol: usize, ino: u64, v: &[u8], now: &mut dyn FnMut() -> u64) {
+    let t = now();
+    let m = nx.jobj_times.get(&(vol, ino)).map_or(u64a(v, INO_MOD_TIME), |p| p.0);
+    nx.jobj_times.insert((vol, ino), (m, t));
 }
 
 /// The inode `ino` as its in-memory object holds it, for a rewrite
@@ -2377,9 +2385,8 @@ fn check_setattr_volume(nx: &mut Nx<'_>, vol: usize) -> Result<(), String> {
 
 /// `setattr` of `a` on `ino` (apfs_vnop_setattr K 0x668e4a0's general
 /// path, drafts/s23/re-user-copy.md 2.4): nothing to set writes nothing; a
-/// mode alone and unchanged takes the fast path (the change time in memory
-/// only: every one here is overwritten by the next write, so it is not
-/// kept); else in one file-system transaction owner and group (counted
+/// mode alone and unchanged takes the fast path ([`chmod_same`]: the change
+/// time read into memory only); else in one file-system transaction owner and group (counted
 /// even when unchanged), the mode bits, the access time (not counted), the
 /// modification time, the creation time lowered to the modification time
 /// when later and a time was given (K 0x668f6c4), the change time read
@@ -2395,6 +2402,7 @@ pub fn setattr(nx: &mut Nx<'_>, vol: usize, ino: u64, a: SetAttr, now: &mut dyn 
     if a.uid.is_none() && a.gid.is_none() && a.mtime.is_none() && a.atime.is_none() {
         let m = a.mode.unwrap();
         if (m ^ cur) & 0o7777 == 0 {
+            chmod_same(nx, vol, ino, &v, now);
             return Ok(());
         }
     }
@@ -2445,14 +2453,16 @@ fn name_of(v: &[u8]) -> Result<String, String> {
 /// `ftruncate(fd, 0)` of an empty regular file with no data stream
 /// (apfs_truncate_locked K 0x66a6bbc's equal-size branch; drafts/s23/
 /// re-user-copy.md 2.5): in one file-system transaction the modification
-/// and change times (one reading), the inode rewritten; no data stream.
+/// and change times (one reading), the inode rewritten from its in-memory
+/// object; no data stream.
 pub fn truncate_same(nx: &mut Nx<'_>, vol: usize, ino: u64, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     check_setattr_volume(nx, vol)?;
-    let mut v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
+    let v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
     if u16::from_le_bytes([v[INO_MODE], v[INO_MODE + 1]]) & S_IFMT != S_IFREG || dstream_of(&v)?.is_some() {
         return Err("not implemented: a truncate to 0 of other than an empty file with no data stream".into());
     }
     fs_tx_enter(nx, vol)?;
+    let mut v = in_memory_inode(nx, vol, ino)?;
     let t = now();
     v.put64(INO_MOD_TIME, t);
     v.put64(INO_CHANGE_TIME, t);
@@ -2464,7 +2474,7 @@ pub fn truncate_same(nx: &mut Nx<'_>, vol: usize, ino: u64, now: &mut dyn FnMut(
 /// file not yet compressed (apfs_setxattr_internal K 0x6765cc4; drafts/
 /// s23/re-user-copy.md 2.6): the attribute embedded in its record
 /// (XATTR_DATA_EMBEDDED) in one file-system transaction, the file's change
-/// time read, the inode rewritten.
+/// time read, the inode rewritten from its in-memory object.
 pub fn set_decmpfs_xattr(nx: &mut Nx<'_>, vol: usize, ino: u64, data: &[u8], now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     const NAME: &str = "com.apple.decmpfs";
     check_setattr_volume(nx, vol)?;
@@ -2478,12 +2488,13 @@ pub fn set_decmpfs_xattr(nx: &mut Nx<'_>, vol: usize, ino: u64, data: &[u8], now
     if data.len() + 4 >= 0xedd || k.len() + val.len() > 0xedd {
         return Err("not implemented: a decmpfs attribute too large to embed (the stream form, K 0x665e120)".into());
     }
-    let mut v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
+    let v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
     if u32::from_le_bytes(v[0x44..0x48].try_into().unwrap()) & 0x20 != 0 || get_rec(nx, vol, &k)?.is_some() {
         return Err("not implemented: setting the decmpfs attribute of a compressed file or over an existing one".into());
     }
     fs_tx_enter(nx, vol)?;
     put_rec(nx, vol, &k, &val)?;
+    let mut v = in_memory_inode(nx, vol, ino)?;
     v.put64(INO_CHANGE_TIME, now());
     put_rec(nx, vol, &inode_key(ino), &v)?;
     fs_tx_leave(nx, vol, now)
@@ -2710,10 +2721,11 @@ pub fn setxattr_rsrc_fork(nx: &mut Nx<'_>, vol: usize, ino: u64, pos: u64, data:
 /// size; then, the flags being `expected`, in one file-system transaction
 /// the flags set, the change time read, and for a regular file becoming
 /// compressed the decmpfs header's uncompressed size in j_inode_val +0x54
-/// with INODE_HAS_UNCOMPRESSED_SIZE (0x40000), the inode rewritten.
+/// with INODE_HAS_UNCOMPRESSED_SIZE (0x40000), the inode rewritten from
+/// its in-memory object (any times it held unwritten with it).
 pub fn cas_bsdflags(nx: &mut Nx<'_>, vol: usize, ino: u64, expected: u32, new: u32, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     check_setattr_volume(nx, vol)?;
-    let v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
+    get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
     let compressing = new & 0x20 != 0 && expected & 0x20 == 0;
     let mut usize_ = 0;
     if compressing {
@@ -2731,8 +2743,7 @@ pub fn cas_bsdflags(nx: &mut Nx<'_>, vol: usize, ino: u64, expected: u32, new: u
         usize_ = u64a(d, 8);
         truncate_same(nx, vol, ino, now)?;
     }
-    let mut v = if compressing { get_rec(nx, vol, &inode_key(ino))?.ok_or("no inode")? } else { v };
-    let flags = u32::from_le_bytes(v[0x44..0x48].try_into().unwrap());
+    let flags = u32::from_le_bytes(get_rec(nx, vol, &inode_key(ino))?.ok_or("no inode")?[0x44..0x48].try_into().unwrap());
     if flags & 0x3fff_ffff != expected {
         return Err("not implemented: a flags compare-and-swap that does not match".into());
     }
@@ -2740,6 +2751,7 @@ pub fn cas_bsdflags(nx: &mut Nx<'_>, vol: usize, ino: u64, expected: u32, new: u
         return Err("not implemented: changing BSD flags other than UF_COMPRESSED".into());
     }
     fs_tx_enter(nx, vol)?;
+    let mut v = in_memory_inode(nx, vol, ino)?;
     v.put32(0x44, (flags & 0xc000_0000) | (new & 0x3fff_ffff));
     v.put64(INO_CHANGE_TIME, now());
     if compressing && u16::from_le_bytes([v[INO_MODE], v[INO_MODE + 1]]) & S_IFMT == S_IFREG && usize_ != 0 {

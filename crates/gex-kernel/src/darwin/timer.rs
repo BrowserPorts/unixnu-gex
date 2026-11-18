@@ -138,6 +138,8 @@ impl Kernel {
         }
         // Other tasks' IPC with this one's threads and ports.
         self.darwin_ipc_remote(m);
+        // Lightweight corpses' deliveries, the kernel daemon's.
+        self.darwin_bt_deliveries(m);
         // Signals posted, and pipes changed, from outside a call: their
         // knotes are told.
         if self.darwin_signal_knotes() | self.darwin_pipe_knotes() | self.darwin_vnode_knotes() | self.darwin_proc_knotes() {

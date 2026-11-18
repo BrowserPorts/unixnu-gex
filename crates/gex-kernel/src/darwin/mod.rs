@@ -41,6 +41,7 @@ pub mod cpumon;
 pub mod cred;
 pub mod corpse;
 pub mod corpsefork;
+pub mod lwcorpse;
 pub mod critexit;
 pub mod errno;
 pub mod exec;
@@ -438,6 +439,9 @@ pub struct Task {
     pub corpse_forks: std::collections::VecDeque<corpsefork::Request>,
     /// The return codes of the corpse forks threads' calls wait for.
     pub corpse_fork_results: std::collections::HashMap<i32, u64>,
+    /// Lightweight corpses' deliveries (`thread_backtrace_enqueue`), for
+    /// the task's thread calls ([`lwcorpse`]).
+    pub bt_deliveries: std::collections::VecDeque<lwcorpse::Delivery>,
     /// `vm_map_set_corpse_source`: a fatal memory limit's kill is to make
     /// the task a corpse whatever its EXC_CRASH handlers do.
     pub corpse_source: bool,

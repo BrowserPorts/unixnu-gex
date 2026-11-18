@@ -245,7 +245,7 @@ impl Kernel {
 
     /// The request, with a copy of the handler's send right and a
     /// send-once right to the thread's reply port, as the kernel sends it.
-    fn darwin_exc_send(&mut self, port: ObjId, id: i32, body: Vec<u8>, descs: Vec<Desc>) {
+    pub(crate) fn darwin_exc_send(&mut self, port: ObjId, id: i32, body: Vec<u8>, descs: Vec<Desc>) {
         let reply = self.darwin_rpc_reply_port();
         let ipc = self.ipc();
         ipc.copy_send(port);

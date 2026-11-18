@@ -12,7 +12,12 @@
 // os_fault_with_payload makes a fork corpse for the child's EXC_CORPSE_NOTIFY
 // handler, its codes {EXC_GUARD, 0}, its crash information the simulated
 // guard's codes and the reason's snapshot; a second fault while the first
-// is held is refused (one user fault in flight).
+// is held is refused (one user fault in flight). For a handler that
+// prefers backtraces (MACH_EXCEPTION_BACKTRACE_PREFERRED, as launchd sets
+// its children's), the fault is a lightweight corpse instead:
+// mach_exception_raise_backtrace with a kcdata object, which
+// task_map_kcdata_object_64 maps (TASK_BTINFO_*: the faulting thread's
+// backtrace, ids, codes, reason and image infos).
 
 #include <errno.h>
 #include <fcntl.h>
@@ -132,6 +137,15 @@ static int child(const char *how) {
             }
         }
     }
+    if (!strcmp(how, "lw")) {
+        thread_identifier_info_data_t a;
+        mach_port_t me = mach_thread_self();
+        if (thread_ident(me, &a)) return 13;
+        int r = os_fault_with_payload(FAULT_NS, FAULT_CODE, NULL, 0, "corpsefork", 0);
+        child_say(r ? errno : 0);
+        child_say((int)a.thread_id);
+        return child_cmd() == 'x' ? 0 : 14;
+    }
     if (!strcmp(how, "fault")) {
         int r = os_fault_with_payload(FAULT_NS, FAULT_CODE, NULL, 0, "corpsefork", 0);
         child_say(r ? errno : 0);
@@ -150,7 +164,13 @@ typedef struct {
 
 // A child running `how`, its EXC_CORPSE_NOTIFY handler `exc` and its
 // bootstrap port `boot` (either may be null).
+static int spawn_child_bt(const char *how, mach_port_t exc, mach_port_t boot, kid_t *k, exception_behavior_t behavior);
+
 static int spawn_child(const char *how, mach_port_t exc, mach_port_t boot, kid_t *k) {
+    return spawn_child_bt(how, exc, boot, k, EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES);
+}
+
+static int spawn_child_bt(const char *how, mach_port_t exc, mach_port_t boot, kid_t *k, exception_behavior_t behavior) {
     int to[2], from[2];
     if (pipe(to) || pipe(from)) return -1;
     // Above 4, so that neither dup2 overwrites the other's source.
@@ -170,7 +190,7 @@ static int spawn_child(const char *how, mach_port_t exc, mach_port_t boot, kid_t
     posix_spawn_file_actions_adddup2(&fa, to[0], 4);
     posix_spawnattr_t at;
     posix_spawnattr_init(&at);
-    if (exc) posix_spawnattr_setexceptionports_np(&at, EXC_MASK_CORPSE_NOTIFY, exc, EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES, 0);
+    if (exc) posix_spawnattr_setexceptionports_np(&at, EXC_MASK_CORPSE_NOTIFY, exc, behavior, 0);
     if (boot) posix_spawnattr_setspecialport_np(&at, boot, TASK_BOOTSTRAP_PORT);
     char *args[] = {self, "child", (char *)how, NULL};
     char *env[] = {"MallocNanoZone=0", NULL};
@@ -489,6 +509,87 @@ static int fault(void) {
     return 0;
 }
 
+#pragma pack(4)
+typedef struct {
+    mach_msg_header_t head;
+    mach_msg_body_t body;
+    mach_msg_port_descriptor_t obj;
+    NDR_record_t ndr;
+    exception_type_t exc;
+    mach_msg_type_number_t code_count;
+    int64_t code[2];
+    mach_msg_trailer_t trailer;
+} bt_request_t;
+#pragma pack()
+
+// The array of element type `ty` in a kcdata buffer: its elements and count.
+static const uint8_t *array(const uint8_t *b, uint64_t len, uint32_t ty, uint32_t *count) {
+    uint64_t at = 0;
+    while (at + 16 <= len) {
+        uint32_t t, s;
+        uint64_t flags;
+        memcpy(&t, b + at, 4);
+        memcpy(&s, b + at + 4, 4);
+        memcpy(&flags, b + at + 8, 8);
+        if (t == 0xF19158EDu) return NULL;
+        if ((t & ~0xfu) == 0x20 && (flags >> 32) == ty) {
+            *count = (uint32_t)flags;
+            return b + at + 16;
+        }
+        at += 16 + s;
+    }
+    return NULL;
+}
+
+static int lightweight(void) {
+    mach_port_t port = new_port();
+    kid_t k;
+    if (spawn_child_bt("lw", port, 0, &k, EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES | MACH_EXCEPTION_BACKTRACE_PREFERRED)) return bad("spawning", 0, 0);
+    int r = heard(&k);
+    if (r != 0) return bad("os_fault_with_payload for a backtrace handler", r, 0);
+    int tid = heard(&k);
+    bt_request_t req;
+    memset(&req, 0, sizeof req);
+    kern_return_t kr = mach_msg(&req.head, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof req, port, 20000, MACH_PORT_NULL);
+    if (kr) return bad("receiving the backtrace", kr, 0);
+    if (req.head.msgh_id != 2409) return bad("message id", req.head.msgh_id, 2409);
+    if (req.exc != EXC_CORPSE_NOTIFY || req.code_count != 2) return bad("exception", req.exc, EXC_CORPSE_NOTIFY);
+    if (req.code[0] != EXC_GUARD || req.code[1] != 0) return bad("the backtrace's codes", req.code[0], EXC_GUARD);
+    mach_vm_address_t kcd = 0;
+    mach_vm_size_t size = 0;
+    kr = task_map_kcdata_object_64(mach_task_self(), req.obj.name, &kcd, &size);
+    if (kr) return bad("task_map_kcdata_object_64", kr, 0);
+    if (size != 0x5000) return bad("btinfo size", size, 0x5000);
+    const uint8_t *b = (const uint8_t *)kcd;
+    if (u32_at(b) != 0x46414E47u) return bad("TASK_BTINFO_BEGIN", u32_at(b), 0x46414E47u);
+    // The flags first (reserved), then the backtrace.
+    if (u32_at(b + 16) != 0xAFF) return bad("the first item", u32_at(b + 16), 0xAFF);
+    uint32_t n = 0, sz;
+    const uint8_t *p = array(b, size, 0xA25, &n);
+    if (!p || n < 2 || u64_at(p) == 0) return bad("TASK_BTINFO_BACKTRACE64", n, 2);
+    p = item(b, size, 0xA01, &sz);
+    if (!p || (pid_t)u32_at(p) != k.pid) return bad("TASK_BTINFO_PID", p ? u32_at(p) : -1, k.pid);
+    p = item(b, size, 0xA0A, &sz);
+    if (!p || u32_at(p) != EXC_GUARD) return bad("TASK_BTINFO_EXCEPTION_TYPE", p ? u32_at(p) : -1, EXC_GUARD);
+    p = item(b, size, 0xA09, &sz);
+    if (!p || u64_at(p) != ((3ull << 61) | FAULT_NS) || u64_at(p + 8) != FAULT_CODE) return bad("TASK_BTINFO_EXCEPTION_CODES", p ? u64_at(p) : -1, (3ull << 61) | FAULT_NS);
+    p = item(b, size, 0x1001, &sz);
+    if (!p || u32_at(p) != FAULT_NS || u64_at(p + 4) != FAULT_CODE) return bad("EXIT_REASON_SNAPSHOT", p ? u64_at(p + 4) : -1, FAULT_CODE);
+    p = item(b, size, 0xA20, &sz);
+    if (!p || u64_at(p) != (uint64_t)tid) return bad("TASK_BTINFO_THREAD_ID", p ? u64_at(p) : -1, tid);
+    p = item(b, size, 0xA22, &sz);
+    if (!p || u32_at(p) != ARM_THREAD_STATE || u32_at(p + 4) != ARM_UNIFIED_THREAD_STATE_COUNT) return bad("TASK_BTINFO_THREAD_STATE", p ? u32_at(p + 4) : -1, ARM_UNIFIED_THREAD_STATE_COUNT);
+    if (!item(b, size, 0xA2A, &sz) || !array(b, size, 0x31, &n) || n == 0) return bad("the image infos", n, 1);
+    vm_deallocate(mach_task_self(), (vm_address_t)kcd, (vm_size_t)size);
+    reply((request_t *)&req);
+    mach_port_deallocate(mach_task_self(), req.obj.name);
+    int st = 0;
+    if (tell(&k, 'x') || waitpid(k.pid, &st, 0) != k.pid || !WIFEXITED(st) || WEXITSTATUS(st) != 0) return bad("the child's end", st, 0);
+    mach_port_mod_refs(mach_task_self(), port, MACH_PORT_RIGHT_RECEIVE, -1);
+    mach_port_deallocate(mach_task_self(), port);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc > 2 && !strcmp(argv[1], "child")) return child(argv[2]);
     signal(SIGPIPE, SIG_IGN);
@@ -498,6 +599,7 @@ int main(int argc, char **argv) {
     if (own()) return 1;
     if (limit()) return 1;
     if (fault()) return 1;
+    if (lightweight()) return 1;
     printf("corpsefork ok\n");
     return 0;
 }

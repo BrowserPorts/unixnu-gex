@@ -268,6 +268,9 @@ pub enum Kobject {
     /// IKOT_NAMED_ENTRY: a named memory entry, by its number
     /// ([`super::vmentry`]).
     NamedEntry(u64),
+    /// IKOT_KCDATA: a kcdata object, by its number
+    /// ([`super::lwcorpse`]).
+    KcdataObject(u64),
 }
 
 /// A port's reply semantics (`ip_reply_port_semantics`).

@@ -811,7 +811,7 @@ impl Kernel {
                     // thread is known to have made it: the copy of the
                     // first is the crashed thread.
                     self.darwin_unimplemented("the crashed thread of a soft memory limit's corpse fork (the thread whose page fault credited phys_footprint past the limit, ledger_ast's task_footprint_exceeded: no fault marks a first store here)".into());
-                    let req = super::corpsefork::Request { etype: super::exception::EXC_RESOURCE, code, subcode: 0, reason: None, current: None, origin: super::corpsefork::Origin::ThreadCall };
+                    let req = super::corpsefork::Request { etype: super::exception::EXC_RESOURCE, code, subcode: 0, reason: None, current: None, origin: super::corpsefork::Origin::ThreadCall, lightweight: None };
                     // A host that cannot make it has said so.
                     let _ = self.darwin_corpse_fork_queue(req);
                 }

@@ -1054,7 +1054,7 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             use super::corpsefork::{Origin, Request};
             let own = k.dtask.kcaller == 0 || k.dtask.kcaller == k.ipc().task;
             let token = super::corpsefork::next_token();
-            let req = Request { etype: 0, code: 0, subcode: 0, reason: None, current: own.then_some(k.tid), origin: Origin::Generate(token) };
+            let req = Request { etype: 0, code: 0, subcode: 0, reason: None, current: own.then_some(k.tid), origin: Origin::Generate(token), lightweight: None };
             match k.darwin_corpse_fork_queue(req) {
                 Ok(()) => {
                     let mut r = Reply::ok(Vec::new());
@@ -1064,6 +1064,20 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
                 Err(kr) => Reply::err(kr as i32),
             }
         }
+        // task_map_kcdata_object_64(task, kcdata_object) -> kcd_addr_begin,
+        // kcd_size. The object's right is the routine's when it succeeds.
+        (Kobject::Task, 3464) => match desc_port(req, 0) {
+            Some((right, disp)) => {
+                let r = k.darwin_task_map_kcdata_object(right);
+                if r.ret == 0 {
+                    if let Some(c) = right {
+                        k.ipc().object_destroy(c, disp);
+                    }
+                }
+                r
+            }
+            None => bad(),
+        },
         // task_map_corpse_info_64(task, corpse_task) -> kcd_addr_begin,
         // kcd_size, and task_map_corpse_info's narrower size. The corpse's
         // right is the routine's when it succeeds.

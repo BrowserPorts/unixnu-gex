@@ -84,6 +84,18 @@ pub struct Request {
     pub reason: Option<Arc<super::reason::OsReason>>,
     pub current: Option<i32>,
     pub origin: Origin,
+    /// A lightweight corpse in place of the fork: the handlers' send
+    /// rights that prefer backtraces (thread, task, host), its throttle
+    /// slot taken.
+    pub lightweight: Option<[Option<super::ipc::ObjId>; 3]>,
+}
+
+impl Request {
+    /// Whether it is a lightweight corpse's, made with the task's threads
+    /// held ([`Kernel::darwin_corpse_lightweight`]) instead of a fork.
+    pub fn is_lightweight(&self) -> bool {
+        self.lightweight.is_some()
+    }
 }
 
 /// A corpse fork that failed before its corpse was made: who waits, and
@@ -119,6 +131,10 @@ impl Kernel {
     pub(crate) fn darwin_corpse_fork_queue(&mut self, req: Request) -> Result<(), u64> {
         if !HOST_FORKS_CORPSES.load(Ordering::Acquire) {
             self.darwin_unimplemented("a corpse fork on a host that cannot copy a live task (corpsefork::set_host_forks_corpses)".into());
+            if let Some(ports) = req.lightweight {
+                super::lwcorpse::throttle_release();
+                self.darwin_lw_ports_release(ports);
+            }
             return Err(KERN_FAILURE);
         }
         self.dtask.corpse_forks.push_back(req);
@@ -138,7 +154,8 @@ impl Kernel {
     /// host copies them ([`Kernel::darwin_corpse_fork_vm`] then enters
     /// them in the corpse's map) and enables the corpse ([`enable`]).
     pub fn darwin_corpse_fork_build(&mut self, m: &mut GuestMem<'_>, req: Request) -> Result<Build, Failed> {
-        let Request { etype, code, subcode, reason, current, origin } = req;
+        let Request { etype, code, subcode, reason, current, origin, lightweight } = req;
+        debug_assert!(lightweight.is_none(), "a lightweight corpse is no fork");
         // corpses_enabled(): no -no_corpses boot argument here.
         // task_corpse_forking_disabled(): TF_NO_CORPSE_FORKING is set only
         // by task_set_corpse_forking_behavior, a DEVELOPMENT || DEBUG
@@ -510,26 +527,30 @@ impl Kernel {
     /// reason, lightweight)` from a call of this thread: the corpse fork
     /// queued, the thread waiting for it (`Some`), or its return code.
     pub(crate) fn darwin_enqueue_exception_with_corpse(&mut self, m: &mut GuestMem<'_>, etype: usize, code: [i64; 2], reason: Option<Arc<super::reason::OsReason>>, lightweight: bool) -> Result<crate::syscalls::SyscallOutcome, u64> {
-        if lightweight && self.darwin_lightweight_corpse_ports() {
-            self.darwin_unimplemented("a lightweight corpse for an EXC_CORPSE_NOTIFY handler that prefers backtraces (MACH_EXCEPTION_BACKTRACE_PREFERRED: current_thread_collect_backtrace_info, a kcdata object, exception_deliver_backtrace)".into());
-            return Err(KERN_FAILURE);
-        }
         let tid = self.tid;
-        let req = Request { etype, code: code[0], subcode: code[1], reason, current: Some(tid), origin: Origin::Call(tid) };
+        // task_should_generate_lightweight_corpse, then its throttle slot.
+        let lw = if lightweight { self.darwin_lightweight_corpse_ports() } else { None };
+        if let Some(ports) = lw {
+            if let Err(kr) = super::lwcorpse::throttle_get() {
+                self.darwin_lw_ports_release(ports);
+                return Err(kr);
+            }
+        }
+        let req = Request { etype, code: code[0], subcode: code[1], reason, current: Some(tid), origin: Origin::Call(tid), lightweight: lw };
         self.darwin_corpse_fork_queue(req)?;
         Ok(self.darwin_block(m, super::wait::Wait { deadline: None, cont: super::thread::Finish::CorpseFork }))
     }
 
-    /// `task_should_generate_lightweight_corpse` for this task's current
-    /// thread (lw_corpses_enabled on an embedded kernel): a thread, task
-    /// or host EXC_CORPSE_NOTIFY handler that prefers backtraces.
-    fn darwin_lightweight_corpse_ports(&mut self) -> bool {
-        use super::exception::EXC_CORPSE_NOTIFY;
-        const MACH_EXCEPTION_BACKTRACE_PREFERRED: i32 = 0x2000_0000;
-        let thread = self.dtask.kports.thread_exc.get(&self.tid).map(|a| a[EXC_CORPSE_NOTIFY]);
-        let task = Some(self.dtask.kports.exc[EXC_CORPSE_NOTIFY]);
-        let host = Some(self.ipc().host_exc[EXC_CORPSE_NOTIFY]);
-        [thread, task, host].into_iter().flatten().any(|a| a.port.is_some() && a.behavior & MACH_EXCEPTION_BACKTRACE_PREFERRED != 0)
+    /// A lightweight corpse's request, made with this task's threads held
+    /// still by the host (`m` its memory): the faulting thread's backtrace
+    /// collected and enqueued (`task_enqueue_exception_with_corpse`'s
+    /// lightweight half); who waits, and the return code.
+    pub fn darwin_corpse_lightweight(&mut self, m: &mut GuestMem<'_>, req: Request) -> (Origin, Result<Option<super::ipc::ObjId>, u64>) {
+        let Request { etype, code, subcode, reason, origin, lightweight, .. } = req;
+        let ports = lightweight.expect("a lightweight corpse's request");
+        let Origin::Call(tid) = origin else { unreachable!("a lightweight corpse is a call's") };
+        let kr = self.darwin_lw_corpse(m, tid, etype, [code, subcode], reason, ports);
+        (origin, if kr == KERN_SUCCESS { Ok(None) } else { Err(kr) })
     }
 
     /// The corpse fork a thread's call waited for is done: its return code.

@@ -68,7 +68,9 @@ The handle `start()` resolves with:
 | | What |
 | --- | --- |
 | `exited` | a promise of the exit status; it rejects if the run fails |
-| `kill()` | stop now; `exited` resolves 137 |
+| `kill({ sync })` | stop now; `exited` resolves 137. What was written goes to the filesystem's store first, for at most `sync` ms (default 5000; `0` stops at once); resolves once stopped |
+| `sync()` | what was written made durable in the filesystem's store now; rejects with the store's error (`EIO`, `ENOSPC`) |
+| `fs` | the run's filesystem (`readFile`, `writeFile`, `readdir`, `stat`, `rm`, `rename`, `mkdir`: `page/runtime/README.md`, Filesystem) until the run stops, then `null`; its files are read and written once the system runs |
 | `resize(size)` | the desktop's new size, as `size` above; returns `{w, h}` |
 | `ready()` | with `ready: 'manual'`: the start-up is over |
 | `describe()` | the desktop's windows, their titles and pixels |

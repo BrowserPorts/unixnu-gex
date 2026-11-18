@@ -457,9 +457,24 @@ fn parse_summary_line(line: &str) -> Result<(u64, Summary, Option<u32>, RegSet, 
 /// what codegen needs of `sums` to `dir`, atomically. `class32` is part of
 /// the record: the emitted C depends on it.
 pub fn write_recovery(dir: &Path, funcs: &[Function], sums: &HashMap<u64, Summary>, class32: bool) -> Result<()> {
-    let trapfree = func::trap_free(funcs, sums);
-    let touched = func::touched(funcs);
-    let guardfree = func::guard_free(funcs, sums);
+    write_recovery_by(dir, funcs, &|f| Ok(std::borrow::Cow::Borrowed(f)), sums, class32)
+}
+
+/// [`write_recovery`] for functions whose statements `ir` gives, one at a
+/// time: block shapes from a shaped recovery
+/// (`gex_xlate::func::recover_pe_shaped`). Each function is written as it
+/// comes, keeping only what the whole-image facts ([`func::trap_free`],
+/// [`func::touched`], [`func::guard_free`]) need of it, so an image of any
+/// size is written with one function's statements in memory.
+pub fn write_recovery_by<'f>(
+    dir: &Path,
+    funcs: &'f [Function],
+    ir: &dyn Fn(&'f Function) -> Result<std::borrow::Cow<'f, Function>>,
+    sums: &HashMap<u64, Summary>,
+    class32: bool,
+) -> Result<()> {
+    let known: HashSet<u64> = funcs.iter().map(|f| f.entry).collect();
+    let is_known = |t: u64| known.contains(&t);
     let parent = dir.parent().ok_or_else(|| anyhow!("{} has no parent", dir.display()))?;
     std::fs::create_dir_all(parent)?;
     let tmp = parent.join(format!(
@@ -469,6 +484,29 @@ pub fn write_recovery(dir: &Path, funcs: &[Function], sums: &HashMap<u64, Summar
     ));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp)?;
+    let mut touched_local = Vec::with_capacity(funcs.len());
+    let mut guard_local = Vec::with_capacity(funcs.len());
+    let mut trap_cand = HashMap::new();
+    {
+        let mut gir = BufWriter::new(std::fs::File::create(tmp.join("functions.gir"))?);
+        writeln!(gir, "{FORMAT}")?;
+        for f in funcs {
+            let f = ir(f)?;
+            let weight = func::frame_weight(&func::registers(&f));
+            touched_local.push((f.entry, func::touched_local(&f, &is_known)));
+            guard_local.push((f.entry, func::guard_free_local(&f, &is_known, sums, weight)));
+            if let Some(c) = func::trap_free_local(&f, &is_known, sums, &|| weight) {
+                trap_cand.insert(f.entry, c);
+            }
+            let text = gex_ir::text::print(&f);
+            writeln!(gir, "## {:x} {}", f.entry, text.len())?;
+            gir.write_all(text.as_bytes())?;
+        }
+        gir.flush()?;
+    }
+    let trapfree = func::trap_free_of(&trap_cand);
+    let touched = func::touched_of(&touched_local);
+    let guardfree = func::guard_free_of(&guard_local);
     {
         let mut meta = BufWriter::new(std::fs::File::create(tmp.join("summaries"))?);
         writeln!(meta, "{FORMAT}")?;
@@ -479,14 +517,6 @@ pub fn write_recovery(dir: &Path, funcs: &[Function], sums: &HashMap<u64, Summar
             meta.write_all(summary_line(f.entry, &s, trapfree.get(&f.entry).copied(), t, guardfree.contains(&f.entry)).as_bytes())?;
         }
         meta.flush()?;
-        let mut gir = BufWriter::new(std::fs::File::create(tmp.join("functions.gir"))?);
-        writeln!(gir, "{FORMAT}")?;
-        for f in funcs {
-            let text = gex_ir::text::print(f);
-            writeln!(gir, "## {:x} {}", f.entry, text.len())?;
-            gir.write_all(text.as_bytes())?;
-        }
-        gir.flush()?;
     }
     let _ = std::fs::remove_dir_all(dir);
     std::fs::rename(&tmp, dir).with_context(|| format!("moving the recovery into {}", dir.display()))?;
@@ -741,7 +771,7 @@ pub fn build_group_module(
 ) -> Result<ImageStats> {
     let mut rec = read_recoveries(recoveries)?;
     let hints = std::sync::Arc::new(icall_hints.clone());
-    let (big, callers) = leave_oversized(&mut rec, recoveries, stubs)?;
+    let (big, callers, leaves) = scan_recoveries(&mut rec, recoveries, stubs, read)?;
     // A function clang compiles with a shadow-stack frame cannot be spliced:
     // it becomes a stub that leaves for tier-1 (`add_leave_stub`), its own
     // export goes, and only its unit recompiles. It must not be trap-free
@@ -752,7 +782,7 @@ pub fn build_group_module(
     loop {
         // A unit clang ran out of memory on: its largest function goes to
         // tier-1 (its lifted twin is dropped), and the units build again.
-        let stats = match emit_and_link(&rec, recoveries, work, objects, out, jobs, &skip, read, &hints, providers) {
+        let stats = match emit_and_link(&rec, recoveries, work, objects, out, jobs, &skip, read, &hints, providers, &leaves) {
             Err(e) if e.downcast_ref::<UnitOutOfMemory>().is_some() => {
                 let o = e.downcast::<UnitOutOfMemory>().expect("checked");
                 eprintln!(
@@ -819,13 +849,32 @@ pub fn build_group_module(
 /// Callee -> its trap-free direct callers.
 type TrapfreeCallers = HashMap<u64, Vec<u64>>;
 
-/// The functions of `recoveries` over [`max_insns`], which become stubs
-/// that leave for tier-1 (said in the build log), and the trap-free callers
-/// of every function, for [`untrap`]. Not an export provider's stub
-/// (`stubs`), which is one already.
-fn leave_oversized(rec: &mut Recovery, recoveries: &[&Path], stubs: &HashSet<u64>) -> Result<(Vec<u64>, TrapfreeCallers)> {
+/// A small leaf every unit may copy ([`func::is_small_copyable`],
+/// `FnUnit::leaves`), with how its returns pop and its ZF-returning calls,
+/// as [`emit_and_link`] gives them to the units.
+struct Leaf {
+    f: Function,
+    pops: HashMap<u64, u64>,
+    zf: HashSet<u64>,
+}
+
+/// One pass over `recoveries`' functions before any is emitted: those over
+/// [`max_insns`], which become stubs that leave for tier-1 (said in the
+/// build log; not an export provider's stub, `stubs`, which is one already),
+/// the trap-free callers of every function, for [`untrap`], and the small
+/// leaves (when [`func::leaf_copies`]), in the recoveries' order. Every
+/// attempt at the units takes the leaves from here, so it reads the
+/// recoveries once more rather than twice.
+fn scan_recoveries(
+    rec: &mut Recovery,
+    recoveries: &[&Path],
+    stubs: &HashSet<u64>,
+    read: &(dyn Fn(u64) -> Option<u8> + Sync),
+) -> Result<(Vec<u64>, TrapfreeCallers, Vec<Leaf>)> {
     let mut big = Vec::new();
     let mut callers: TrapfreeCallers = HashMap::new();
+    let mut leaves = Vec::new();
+    let copies = func::leaf_copies();
     for recovery in recoveries {
         let mut gir = GirReader::open(recovery)?;
         while let Some(f) = gir.next()? {
@@ -839,13 +888,18 @@ fn leave_oversized(rec: &mut Recovery, recoveries: &[&Path], stubs: &HashSet<u64
                     }
                 }
             }
+            if copies && func::is_small_copyable(&f) {
+                let pops = func::ret_pops(std::slice::from_ref(&f), rec.class32, read);
+                let zf = func::zf_calls(std::slice::from_ref(&f), read);
+                leaves.push(Leaf { f, pops, zf });
+            }
         }
     }
     say_oversized(&big);
     for &(a, _) in &big {
         untrap(rec, &callers, a);
     }
-    Ok((big.into_iter().map(|(a, _)| a).collect(), callers))
+    Ok((big.into_iter().map(|(a, _)| a).collect(), callers, leaves))
 }
 
 /// `a` becomes a stub that leaves for tier-1, which must not be trap-free:
@@ -893,24 +947,19 @@ fn emit_and_link(
     read: &(dyn Fn(u64) -> Option<u8> + Sync),
     hints: &std::sync::Arc<HashMap<u64, u64>>,
     providers: &GroupProviders,
+    scanned: &[Leaf],
 ) -> Result<ImageStats> {
     std::fs::create_dir_all(work)?;
     // The small leaves every unit may copy (`FnUnit::leaves`), and how
-    // their returns pop. A stub's body is not its function's: no copy.
+    // their returns pop, from [`scan_recoveries`]. A stub's body is not its
+    // function's: no copy.
     let mut leaves = HashMap::new();
     let mut leaf_pops = HashMap::new();
     let mut leaf_zf = std::collections::HashSet::new();
-    if func::leaf_copies() {
-        for recovery in recoveries {
-            let mut gir = GirReader::open(recovery)?;
-            while let Some(f) = gir.next()? {
-                if !skip.contains(&f.entry) && func::is_small_copyable(&f) {
-                    leaf_pops.extend(func::ret_pops(std::slice::from_ref(&f), rec.class32, read));
-                    leaf_zf.extend(func::zf_calls(std::slice::from_ref(&f), read));
-                    leaves.insert(f.entry, f);
-                }
-            }
-        }
+    for l in scanned.iter().filter(|l| !skip.contains(&l.f.entry)) {
+        leaf_pops.extend(l.pops.iter().map(|(&k, &v)| (k, v)));
+        leaf_zf.extend(l.zf.iter().copied());
+        leaves.insert(l.f.entry, l.f.clone());
     }
     let leaves = std::sync::Arc::new(leaves);
     let new_unit = || {

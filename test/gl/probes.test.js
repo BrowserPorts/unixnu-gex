@@ -12,6 +12,17 @@ import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
 import { CompositorWindows } from '../../page/runtime/src/windows/compositor.js';
 import { MesaGl } from '../../page/runtime/src/gl.js';
 
+// Probes whose run here is known to end other than the native run does, by the
+// line it ends with here: that line exactly is a KNOWN, not a FAIL, so a change
+// either way -- the gap closing, or more of the probe failing -- is still seen.
+// Drop an entry when its probe passes.
+const KNOWN = {
+  'gl44-two-contexts-probe': {
+    line: 'SUMMARY cases=8 passed=7 failed=1',
+    why: "every context shares the first one's objects (CONTEXT_ADD), so an unshared context sees the other's buffer",
+  },
+};
+
 export const meta = { hosts: ['browser'], images: ['gl-probes'], timeout: 1500, html: '<canvas id="out" width="640" height="480"></canvas>' };
 
 export default async function (t) {
@@ -39,7 +50,9 @@ export default async function (t) {
     const r = await t.timeout(sys.run([`/probes/${name}`], { env: { HOME: '/' } }), 240000, name).catch((e) => ({ code: -1, stdout: '', stderr: String(e.message) }));
     const last = r.stdout.split('\n').filter((l) => l.trim()).pop() ?? '';
     const err = r.stderr.trim().split('\n').slice(-2).join(' / ');
+    const known = KNOWN[name];
     if (want === null) t.check(`${name}: exit 0 (no native reference)`, r.code === 0, `exit ${r.code}: ${last} ${err}`);
+    else if (known && r.code !== 0 && last === known.line) t.known(`${name}`, false, `exit ${r.code}: ${last}, natively ${want}`, known.why);
     else t.eq(`${name}`, [r.code, last], [0, want], err);
   }
   if (left.length && t.gpu) t.check('every probe ran on the GPU', false, `left out, needing more than GL ${have}: ${left.join(', ')}`);

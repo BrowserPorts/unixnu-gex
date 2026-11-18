@@ -1,0 +1,12 @@
+[package]
+name = "gex-store-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "store.wasm: the page's offline editor of an OPFSFilesystem's store, gex-store built alone"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+gex-store.workspace = true

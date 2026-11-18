@@ -172,6 +172,11 @@ impl Region {
         self.rects = out;
     }
 
+    /// The rectangles, in surface coordinates.
+    pub fn rects(&self) -> &[(i32, i32, i32, i32)] {
+        &self.rects
+    }
+
     /// Whether a point in surface coordinates is in the region.
     pub fn contains(&self, x: i32, y: i32) -> bool {
         self.rects.iter().any(|&(rx, ry, rw, rh)| x >= rx && x < rx + rw && y >= ry && y < ry + rh)
@@ -318,6 +323,110 @@ pub struct SurfaceInfo {
     /// A client's `zwp_locked_pointer_v1` asks for the pointer on this
     /// surface (`flags` bit 31): the host locks it when it can (pointer.rs).
     pub pointer_lock: bool,
+    /// Blur-behind and tint (`gex_glass_v1`).
+    pub glass: Glass,
+    /// The caption's icon for a frame the host draws (`gex_glass_v1.set_icon`):
+    /// the address of 16 by 16 premultiplied ARGB8888 pixels, rows top down,
+    /// which the surface's state keeps; 0 for none.
+    pub glass_icon: usize,
+}
+
+/// A surface's glass (`protocols/gex-glass-v1.xml`): where the compositor
+/// shows the blurred backdrop beneath it, and the tint.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Glass {
+    /// Up to `Glass::RECTS` rectangles in surface units; `count` 0 is no glass.
+    pub rects: [(i32, i32, i32, i32); Glass::RECTS],
+    pub count: u32,
+    /// The colorization colour, ARGB.
+    pub argb: u32,
+    /// 0..=100 each: colour over the backdrop, and how much backdrop shows.
+    pub balance: u32,
+    pub blur_balance: u32,
+    /// The afterglow colour (ARGB), laid over the backdrop by the backdrop's
+    /// own brightness, and how much of it (0..=100).
+    pub afterglow: u32,
+    pub afterglow_balance: u32,
+    /// The frame the host draws (`set_frame`): flags, and the close,
+    /// maximize and minimize buttons as (x, y, width, height, state).
+    pub frame: u32,
+    pub buttons: [(i32, i32, i32, i32, u32); 3],
+    /// With a frame: the client area (x, y, width, height), outside which
+    /// the frame is drawn over the surface.
+    pub client: (i32, i32, i32, i32),
+}
+
+impl Glass {
+    /// Rectangles a record carries. A region of more is kept as its first
+    /// `RECTS - 1` and the bounds of the rest.
+    pub const RECTS: usize = 4;
+    /// Words a record spends on glass (`R_GLASS`.. in `wl-bridge.mjs`).
+    pub const WORDS: usize = 3 + 4 * Self::RECTS + 1 + 5 * 3 + 1 + 4;
+
+    /// Null (`None`) is the whole surface: one rectangle the host clips to
+    /// the surface's size.
+    fn set_region(&mut self, region: Option<&Region>) {
+        let whole = [(0, 0, i32::MAX / 2, i32::MAX / 2)];
+        let rects = region.map_or(&whole[..], Region::rects);
+        *self = Glass {
+            argb: self.argb,
+            balance: self.balance,
+            blur_balance: self.blur_balance,
+            afterglow: self.afterglow,
+            afterglow_balance: self.afterglow_balance,
+            frame: self.frame,
+            buttons: self.buttons,
+            client: self.client,
+            ..Glass::default()
+        };
+        for (i, r) in rects.iter().enumerate() {
+            if i == Self::RECTS - 1 && rects.len() > Self::RECTS {
+                let mut rest = Region::default();
+                for &q in &rects[i..] {
+                    rest.add(q);
+                }
+                self.rects[i] = rest.bounds();
+                self.count = Self::RECTS as u32;
+                return;
+            }
+            if i == Self::RECTS {
+                break;
+            }
+            self.rects[i] = *r;
+            self.count = i as u32 + 1;
+        }
+    }
+
+    /// The glass words of a surface record: count, colour, balances (colour,
+    /// blur and afterglow, a byte each), the rectangles (x, y, width, height
+    /// each), the frame, and the afterglow colour.
+    pub fn record_words(&self) -> [i32; Glass::WORDS] {
+        let mut w = [0i32; Glass::WORDS];
+        w[0] = self.count as i32;
+        w[1] = self.argb as i32;
+        w[2] = (self.balance & 0xff | (self.blur_balance & 0xff) << 8 | (self.afterglow_balance & 0xff) << 16) as i32;
+        for (i, r) in self.rects.iter().enumerate() {
+            w[3 + 4 * i] = r.0;
+            w[4 + 4 * i] = r.1;
+            w[5 + 4 * i] = r.2;
+            w[6 + 4 * i] = r.3;
+        }
+        let f = 3 + 4 * Self::RECTS;
+        w[f] = self.frame as i32;
+        for (i, b) in self.buttons.iter().enumerate() {
+            w[f + 1 + 5 * i] = b.0;
+            w[f + 2 + 5 * i] = b.1;
+            w[f + 3 + 5 * i] = b.2;
+            w[f + 4 + 5 * i] = b.3;
+            w[f + 5 + 5 * i] = b.4 as i32;
+        }
+        w[f + 16] = self.afterglow as i32;
+        w[f + 17] = self.client.0;
+        w[f + 18] = self.client.1;
+        w[f + 19] = self.client.2;
+        w[f + 20] = self.client.3;
+        w
+    }
 }
 
 /// A placed surface's position and stacking, as its client asked for them
@@ -334,7 +443,7 @@ pub struct Placement {
     pub placed: bool,
     /// The client draws the whole window: no decoration.
     pub unmanaged: bool,
-    /// 0 normal, 1 topmost, 2 overlay (menus).
+    /// 0 normal, 1 topmost, 2 overlay (menus), 3 desktop (below the rest).
     pub layer: u32,
     /// The client's name for the surface, which other placed surfaces --
     /// of any client in the session -- use to say what they go below.
@@ -346,17 +455,30 @@ pub struct Placement {
     pub restack: u32,
     /// Bumped by every activate request: give this surface the keyboard.
     pub activate: u32,
+    /// The client grabbed the pointer for this surface (version 4): every
+    /// pointer event is its, wherever the pointer is, until it lets go.
+    pub grab: bool,
 }
 
 impl Placement {
     /// The bottom of a layer, for `below`.
     pub const BOTTOM: u32 = u32::MAX;
+    /// The desktop layer: below every other window, placed or not (a window
+    /// system's own desktop window, which draws the background and its icons).
+    pub const DESKTOP: u32 = 3;
+
+    /// Where the layer goes in the stacking, low to high: the desktop under
+    /// normal, topmost and overlay.
+    pub fn rank(&self) -> i32 {
+        if self.layer == Self::DESKTOP { -1 } else { self.layer as i32 }
+    }
 
     /// The placement words of a surface record (`R_PLACE`.. in
-    /// `wl-bridge.mjs`): flags and layer, id, below, restack, activate.
+    /// `wl-bridge.mjs`): flags (placed, unmanaged, grab) and layer, id, below,
+    /// restack, activate.
     pub fn record_words(&self) -> [i32; 5] {
         [
-            i32::from(self.placed) | (i32::from(self.unmanaged) << 1) | ((self.layer as i32 & 0xff) << 8),
+            i32::from(self.placed) | (i32::from(self.unmanaged) << 1) | (i32::from(self.grab) << 2) | ((self.layer as i32 & 0xff) << 8),
             self.id as i32,
             self.below as i32,
             self.restack as i32,
@@ -402,7 +524,7 @@ pub fn configure_states(states: i32, activated: i32) -> u32 {
 /// Words in one published surface record: the layout a host page reads
 /// (`hosts/browser/js/wl-bridge.mjs`, the same numbers by name), written by
 /// [`push_record`] for a guest's surfaces and the browser X server's alike.
-pub const REC: usize = 119;
+pub const REC: usize = REC_GLASS_ICON + 1;
 /// Where the title's UTF-8 bytes start, and how many there are room for.
 pub const REC_TITLE: usize = 38;
 pub const REC_TITLE_BYTES: usize = 256;
@@ -411,6 +533,10 @@ pub const REC_APP_ID: usize = 102;
 pub const REC_APP_ID_BYTES: usize = 64;
 /// [`SurfaceInfo::pid`].
 pub const REC_PID: usize = 118;
+/// [`Glass::record_words`] (`gex_glass_v1`), after every other word.
+pub const REC_GLASS: usize = 119;
+/// [`SurfaceInfo::glass_icon`], after the glass.
+pub const REC_GLASS_ICON: usize = REC_GLASS + Glass::WORDS;
 
 /// `text` into `words` as UTF-8, little-endian, cut on a character boundary
 /// to fit; the rest zero.
@@ -462,6 +588,11 @@ pub fn push_record(out: &mut Vec<i32>, client: u32, info: &SurfaceInfo) {
     put_text(&mut r[REC_TITLE..REC_TITLE + REC_TITLE_BYTES / 4], &info.title);
     put_text(&mut r[REC_APP_ID..REC_APP_ID + REC_APP_ID_BYTES / 4], &info.app_id);
     r[REC_PID] = info.pid as i32;
+    // Its glass, if its client asked for some (`gex_glass_v1`).
+    r[REC_GLASS..REC_GLASS + Glass::WORDS].copy_from_slice(&info.glass.record_words());
+    // The caption's icon (`gex_glass_v1.set_icon`): where its 256 pixels
+    // are in this process's memory, 0 for none.
+    r[REC_GLASS_ICON] = info.glass_icon as i32;
 }
 
 /// A window-management request a client made of the compositor.
@@ -576,13 +707,18 @@ const GLOBALS: &[(&str, u32)] = &[
     // and what it is under, and the compositor shows it there rather than
     // cascading it. See `protocols/gex-window-placement-v1.xml`. Version 2
     // adds the `origin` event: where the compositor has the surface, for
-    // turning its surface-local pointer positions into Win32's.
-    ("gex_window_placement_manager_v1", 2),
+    // turning its surface-local pointer positions into Win32's; version 3
+    // the desktop layer, under every other window; version 4 the grab, every
+    // pointer event to one surface while its client's menu or move loop runs.
+    ("gex_window_placement_manager_v1", 4),
     // Mouse look: a lock the host grants (the page's pointer lock) and the
     // movement under it (pointer.rs). Xwayland locks for an X client that
     // grabs the pointer and hides it.
     ("zwp_relative_pointer_manager_v1", 1),
     ("zwp_pointer_constraints_v1", 1),
+    // Windows 7's glass: blur-behind and tint for parts of a surface. See
+    // `protocols/gex-glass-v1.xml`.
+    ("gex_glass_manager_v1", 1),
 ];
 
 /// What an object id currently is.
@@ -625,6 +761,8 @@ enum Object {
     PointerConstraints,
     LockedPointer,
     ConfinedPointer,
+    GlassManager,
+    Glass { surface: u32 },
 }
 
 /// An `xdg_positioner`: where a popup wants to be, expressed the way the
@@ -698,6 +836,9 @@ struct BufferSpec {
 /// effect at `commit`, per Wayland's double-buffered model.
 #[derive(Clone, Debug, Default)]
 struct SurfaceState {
+    /// The caption's icon pixels (`gex_glass_v1.set_icon`); `SurfaceInfo`
+    /// carries their address.
+    glass_icon: Option<Box<[u32]>>,
     pending_buffer: Option<u32>,
     committed_buffer: Option<u32>,
     /// Frame callbacks, delivered after the commit they belong to. A client
@@ -793,6 +934,8 @@ struct SurfaceState {
     crop: Option<(i32, i32, i32, i32)>,
     /// `gex_window_placement_v1`: where the client put the surface.
     placement: Placement,
+    /// `gex_glass_v1`: blur-behind and tint.
+    glass: Glass,
     /// The last `gex_window_placement_v1.origin` sent: where the host has the
     /// surface, which the pointer positions after it are relative to.
     origin: Option<(i32, i32)>,
@@ -834,6 +977,9 @@ pub struct Client {
     /// Device pixels per surface unit: what `wl_output.scale` says. A
     /// toplevel's configure is in surface units, so `default_size / scale`.
     scale: i32,
+    /// `wl_keyboard.repeat_info`: keys a second and the delay in ms (rate 0:
+    /// the client repeats nothing, the host sends each repeat as a press).
+    key_repeat: (i32, i32),
     /// The version this client bound `xdg_wm_base` at, which its toplevels
     /// share: `configure_bounds` is only for 4 and up.
     wm_base_version: u32,
@@ -923,6 +1069,7 @@ impl Client {
             default_size: (640, 480),
             fullscreen_changes: Vec::new(),
             scale: 1,
+            key_repeat: (25, 600),
             wm_base_version: 0,
             placement_version: 0,
             positioners: HashMap::new(),
@@ -998,6 +1145,17 @@ impl Client {
         self.scale = scale.clamp(1, 8);
     }
 
+    /// The key repeat this client is told (`wl_keyboard.repeat_info`): `rate`
+    /// keys a second after `delay` ms, or none at rate 0. A host whose input
+    /// already repeats (a browser's keydowns while a key is held) says 0 and
+    /// sends each repeat as a press: a repeat timer in the client runs from
+    /// the press it saw, and when the host is late handing on the release
+    /// (a page's main thread busy) it repeats a key the user let go of.
+    /// Set before the client asks for its keyboard.
+    pub fn set_key_repeat(&mut self, rate: i32, delay: i32) {
+        self.key_repeat = (rate.max(0), delay.max(0));
+    }
+
     /// Feed bytes and descriptors that arrived together.
     pub fn receive(&mut self, bytes: &[u8], fds: &[u32], buffers: &dyn Buffers) {
         self.inbox.extend_from_slice(bytes);
@@ -1067,6 +1225,16 @@ impl Client {
 
     /// `GEX_WL_KEYTRACE=1`: every keyboard object made or released, and every
     /// enter, leave and key sent (a scripted key that a client never acts on).
+    /// `GEX_WL_CURSORTRACE`: every `wl_pointer.set_cursor`, the surface or
+    /// none (a hidden pointer), as `[wl-cursor]`: what a test of the pointer
+    /// over a client's windows reads.
+    fn cursortrace(what: &str) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ON.get_or_init(|| std::env::var_os("GEX_WL_CURSORTRACE").is_some()) {
+            eprintln!("[wl-cursor] {what}");
+        }
+    }
+
     fn keytrace(what: &str) {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *ON.get_or_init(|| std::env::var_os("GEX_WL_KEYTRACE").is_some()) {
@@ -1128,6 +1296,8 @@ impl Client {
                 Object::RelativePointer => self.relative_pointer(object, opcode),
                 Object::PointerConstraints => self.pointer_constraints(object, opcode, &mut r),
                 Object::LockedPointer | Object::ConfinedPointer => self.constrained_pointer(object, opcode, &mut r),
+                Object::GlassManager => self.glass_manager(opcode, &mut r),
+                Object::Glass { surface } => self.glass(object, surface, opcode, &mut r),
                 Object::Seat => self.seat(opcode, &mut r),
                 Object::DataDeviceManager { version } => self.data_device_manager(version, opcode, &mut r),
                 Object::DataDevice => self.data_device(object, opcode, &mut r),
@@ -1163,6 +1333,7 @@ impl Client {
                             let (_serial, cursor, hx, hy) =
                                 (r.uint(), r.object(), r.int(), r.int());
                             let cursor = cursor.unwrap_or(0);
+                            Self::cursortrace(&if cursor != 0 { format!("surface {cursor}") } else { "none".to_string() });
                             if let Some(prev) = self.cursor_surface.take() {
                                 if prev != cursor {
                                     if let Some(s) = self.surfaces.get_mut(&prev) {
@@ -1362,13 +1533,16 @@ impl Client {
             }
             "gex_window_placement_manager_v1" => {
                 self.objects.insert(id, Object::PlacementManager);
-                self.placement_version = version.min(2);
+                self.placement_version = version.min(4);
             }
             "zwp_relative_pointer_manager_v1" => {
                 self.objects.insert(id, Object::RelativePointerManager);
             }
             "zwp_pointer_constraints_v1" => {
                 self.objects.insert(id, Object::PointerConstraints);
+            }
+            "gex_glass_manager_v1" => {
+                self.objects.insert(id, Object::GlassManager);
             }
             _ => return false,
         }
@@ -2651,9 +2825,12 @@ impl Client {
                 }),
                 _ => ok = false,
             },
-            // set_layer(layer)
+            // set_layer(layer): desktop is for version 3 and up.
             2 => match r.uint() {
-                Some(layer) => apply(self, &mut |s| s.placement.layer = layer.min(2)),
+                Some(layer) => {
+                    let layer = if layer == Placement::DESKTOP && self.placement_version >= 3 { layer } else { layer.min(2) };
+                    apply(self, &mut |s| s.placement.layer = layer)
+                }
                 None => ok = false,
             },
             // set_stack_id(id)
@@ -2673,6 +2850,119 @@ impl Client {
             5 => apply(self, &mut |s| s.placement.unmanaged = true),
             // activate
             6 => apply(self, &mut |s| s.placement.activate = s.placement.activate.wrapping_add(1)),
+            // grab, release_grab (version 4): one surface of the session has
+            // the grab, which the host picks out of the scene (the last made)
+            7 if self.placement_version >= 4 => {
+                for s in self.surfaces.values_mut() {
+                    s.placement.grab = false;
+                }
+                apply(self, &mut |s| s.placement.grab = true)
+            }
+            8 if self.placement_version >= 4 => apply(self, &mut |s| s.placement.grab = false),
+            _ => ok = false,
+        }
+        ok
+    }
+
+    // -- gex_glass_v1 -------------------------------------------------------
+
+    fn glass_manager(&mut self, opcode: u16, r: &mut Reader<'_>) -> bool {
+        match opcode {
+            // destroy
+            0 => true,
+            // get_glass(id, surface)
+            1 => {
+                let (Some(id), Some(surface)) = (r.new_id(), r.object()) else {
+                    return false;
+                };
+                if !self.surfaces.contains_key(&surface) {
+                    return false;
+                }
+                self.objects.insert(id, Object::Glass { surface });
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn glass(&mut self, object: u32, surface: u32, opcode: u16, r: &mut Reader<'_>) -> bool {
+        // As with placement: a request for a surface already gone is
+        // accepted and changes nothing.
+        let mut ok = true;
+        match opcode {
+            // destroy
+            0 => {
+                if let Some(s) = self.surfaces.get_mut(&surface) {
+                    s.glass = Glass::default();
+                    s.glass_icon = None;
+                    self.dirty = true;
+                }
+                self.objects.remove(&object);
+                self.delete_id(object);
+            }
+            // set_region(region)
+            1 => match r.object() {
+                Some(region) => {
+                    let region = if region == 0 {
+                        None
+                    } else {
+                        Some(self.regions.get(&region).cloned().unwrap_or_default())
+                    };
+                    if let Some(s) = self.surfaces.get_mut(&surface) {
+                        s.glass.set_region(region.as_ref());
+                        self.dirty = true;
+                    }
+                }
+                None => ok = false,
+            },
+            // set_frame(flags, then x, y, width, height, state for close, max,
+            // min, then the client area)
+            3 => {
+                let Some(flags) = r.uint() else { return false };
+                let mut buttons = [(0, 0, 0, 0, 0); 3];
+                for b in &mut buttons {
+                    match (r.int(), r.int(), r.int(), r.int(), r.uint()) {
+                        (Some(x), Some(y), Some(w), Some(h), Some(state)) => *b = (x, y, w, h, state.min(4)),
+                        _ => return false,
+                    }
+                }
+                let (Some(cx), Some(cy), Some(cw), Some(ch)) = (r.int(), r.int(), r.int(), r.int()) else {
+                    return false;
+                };
+                if let Some(s) = self.surfaces.get_mut(&surface) {
+                    s.glass.frame = flags;
+                    s.glass.buttons = buttons;
+                    s.glass.client = (cx, cy, cw, ch);
+                    self.dirty = true;
+                }
+            }
+            // set_icon(pixels): 16 x 16 ARGB8888, or none
+            4 => match r.array() {
+                Some(a) => {
+                    let icon = (a.len() == 16 * 16 * 4).then(|| {
+                        a.chunks_exact(4).map(|p| u32::from_le_bytes([p[0], p[1], p[2], p[3]])).collect::<Box<[u32]>>()
+                    });
+                    if let Some(s) = self.surfaces.get_mut(&surface) {
+                        s.glass_icon = icon;
+                        self.dirty = true;
+                    }
+                }
+                None => ok = false,
+            },
+            // set_colorization(argb, balance, blur_balance, afterglow, afterglow_balance)
+            2 => match (r.uint(), r.uint(), r.uint(), r.uint(), r.uint()) {
+                (Some(argb), Some(balance), Some(blur_balance), Some(afterglow), Some(afterglow_balance)) => {
+                    if let Some(s) = self.surfaces.get_mut(&surface) {
+                        s.glass.argb = argb;
+                        s.glass.balance = balance.min(100);
+                        s.glass.blur_balance = blur_balance.min(100);
+                        s.glass.afterglow = afterglow;
+                        s.glass.afterglow_balance = afterglow_balance.min(100);
+                        self.dirty = true;
+                    }
+                }
+                _ => ok = false,
+            },
             _ => ok = false,
         }
         ok
@@ -2706,8 +2996,8 @@ impl Client {
                 self.send(w);
                 self.pending_keymap = Some(km);
                 // repeat_info(rate keys/s, delay ms) for v4+, so the client does
-                // not have to assume a repeat rate.
-                let w = Writer::new(id, 5).int(25).int(600);
+                // not have to assume a repeat rate (`set_key_repeat`).
+                let w = Writer::new(id, 5).int(self.key_repeat.0).int(self.key_repeat.1);
                 self.send(w);
                 true
             }
@@ -2780,6 +3070,8 @@ impl Client {
                 placement: s.placement,
                 input: s.input.clone(),
                 pointer_lock: self.wants_lock(*id),
+                glass: s.glass,
+                glass_icon: s.glass_icon.as_ref().map_or(0, |p| p.as_ptr() as usize),
             });
         }
         // A stable order, so a host that keys textures by index rather than by
@@ -3651,6 +3943,26 @@ mod tests {
         assert_eq!(r.uint(), Some(1), "pressed");
     }
 
+    /// The repeat a keyboard is told: 25 a second after 600 ms by default; a
+    /// host that sends its own repeats as presses says rate 0 (none).
+    #[test]
+    fn a_keyboard_is_told_the_hosts_key_repeat() {
+        let rate = |set: Option<(i32, i32)>| {
+            let mut c = with_seat();
+            if let Some((r, d)) = set {
+                c.set_key_repeat(r, d);
+            }
+            c.receive(&Writer::new(12, 1).new_id(13).finish(), &[], &no_pool());
+            let msgs = messages(&c.take_outgoing());
+            let info = msgs.iter().find(|(o, op, _)| *o == 13 && *op == 5).expect("repeat_info");
+            let mut fds = Vec::new();
+            let mut r = Reader::new(&info.2, &mut fds);
+            (r.int().unwrap(), r.int().unwrap())
+        };
+        assert_eq!(rate(None), (25, 600));
+        assert_eq!(rate(Some((0, 600))), (0, 600));
+    }
+
     /// A window that never commits a buffer (its pixels are the host's GL)
     /// gets the keyboard from `focus_fallback`, so scripted keys reach it.
     #[test]
@@ -4163,6 +4475,58 @@ mod tests {
         assert_eq!((s.width, s.height, s.addr), (200, 125, 0x10_0000));
     }
 
+    /// The desktop layer is for clients that bound version 3: an older one's
+    /// unknown layer is the overlay, as it always was.
+    #[test]
+    fn the_desktop_layer_needs_version_3() {
+        let pool = Placed(0x6000, 8192);
+        for (version, want) in [(3, Placement::DESKTOP), (2, 2)] {
+            let (mut c, _) = placed_window(64, 32, 256);
+            c.receive(
+                &Writer::new(2, 0).uint(10).string("gex_window_placement_manager_v1").uint(version).new_id(59).finish(),
+                &[],
+                &pool,
+            );
+            c.receive(&Writer::new(59, 1).new_id(60).object(6).finish(), &[], &pool);
+            c.receive(&Writer::new(60, 2).uint(Placement::DESKTOP).finish(), &[], &pool);
+            c.receive(&Writer::new(6, 6).finish(), &[], &pool);
+            assert!(c.failed.is_none(), "{:?}", c.failed);
+            let p = c.scene()[0].placement;
+            assert_eq!((p.layer, p.rank() < 0), (want, version == 3), "version {version}");
+        }
+    }
+
+    /// A grab (version 4) is the surface's until it lets go or its placement
+    /// goes, rides in the record's flags, and is refused to an older client.
+    #[test]
+    fn a_grab_needs_version_4_and_ends_with_release_or_destroy() {
+        let pool = Placed(0x6000, 8192);
+        for version in [4, 3] {
+            let (mut c, _) = placed_window(64, 32, 256);
+            c.receive(
+                &Writer::new(2, 0).uint(10).string("gex_window_placement_manager_v1").uint(version).new_id(59).finish(),
+                &[],
+                &pool,
+            );
+            c.receive(&Writer::new(59, 1).new_id(60).object(6).finish(), &[], &pool);
+            c.receive(&Writer::new(60, 7).finish(), &[], &pool);
+            c.receive(&Writer::new(6, 6).finish(), &[], &pool);
+            if version < 4 {
+                assert!(c.failed.is_some(), "a version 3 client's grab is not a request it has");
+                continue;
+            }
+            assert!(c.failed.is_none(), "{:?}", c.failed);
+            let p = c.scene()[0].placement;
+            assert!(p.grab);
+            assert_eq!(p.record_words()[0] & 4, 4);
+            c.receive(&Writer::new(60, 8).finish(), &[], &pool);
+            assert!(!c.scene()[0].placement.grab, "released");
+            c.receive(&Writer::new(60, 7).finish(), &[], &pool);
+            c.receive(&Writer::new(60, 0).finish(), &[], &pool);
+            assert!(!c.scene()[0].placement.grab, "gone with its placement");
+        }
+    }
+
     #[test]
     fn a_placed_window_carries_its_position_and_stacking() {
         let pool = Placed(0x6000, 8192);
@@ -4572,6 +4936,69 @@ mod tests {
         c.set_x11_identity(surface, "XTerm", 42);
         let info = c.scene().into_iter().find(|s| s.surface == surface).unwrap();
         assert_eq!((info.app_id.as_str(), info.pid), ("XTerm", 42));
+    }
+
+    #[test]
+    fn a_windows_glass_reaches_its_record_after_every_other_word() {
+        // placed_window: surface 6, wl_compositor 3. gex_glass_manager_v1 is global 13.
+        let pool = Placed(0x6000, 8192);
+        let (mut c, surface) = placed_window(64, 64, 256);
+        let title = "a window with glass";
+        c.receive(&Writer::new(8, 2).string(title).finish(), &[], &pool);
+        c.receive(&Writer::new(2, 0).uint(13).string("gex_glass_manager_v1").uint(1).new_id(20).finish(), &[], &pool);
+        c.receive(&Writer::new(20, 1).new_id(21).object(surface).finish(), &[], &pool);
+        // wl_compositor.create_region, wl_region.add: a caption band and two sides.
+        c.receive(&Writer::new(3, 1).new_id(22).finish(), &[], &pool);
+        for (x, y, w, h) in [(0, 0, 64, 20), (0, 20, 4, 44), (60, 20, 4, 44)] {
+            c.receive(&Writer::new(22, 1).int(x).int(y).int(w).int(h).finish(), &[], &pool);
+        }
+        c.receive(&Writer::new(21, 1).object(22).finish(), &[], &pool);
+        // set_colorization(argb, balance, blur_balance, afterglow, afterglow_balance)
+        c.receive(&Writer::new(21, 2).uint(0x6b74_b8fc).uint(8).uint(43).uint(0x0074_b8fc).uint(150).finish(), &[], &pool);
+        // set_frame(flags, close, max, min as x, y, w, h, state, then the client area)
+        let mut frame = Writer::new(21, 3).uint(1 | 2);
+        for (x, state) in [(15, 2u32), (-11, 1), (-37, 4)] {
+            frame = frame.int(x).int(0).int(26).int(20).uint(state);
+        }
+        c.receive(&frame.int(4).int(20).int(56).int(40).finish(), &[], &pool);
+        // set_icon: 16 x 16 ARGB8888.
+        let icon: Vec<u8> = (0..16 * 16 * 4).map(|i| i as u8).collect();
+        c.receive(&Writer::new(21, 4).array(&icon).finish(), &[], &pool);
+
+        let info = c.scene().into_iter().find(|s| s.surface == surface).unwrap();
+        let mut rec = Vec::new();
+        push_record(&mut rec, 3, &info);
+        assert_eq!(rec.len(), REC);
+        assert!(REC_GLASS > REC_PID && REC_GLASS_ICON == REC_GLASS + Glass::WORDS && REC == REC_GLASS_ICON + 1);
+        let g = &rec[REC_GLASS..REC_GLASS + Glass::WORDS];
+        assert_eq!(g[0], 3, "three rectangles");
+        assert_eq!(&g[3..15], &[0, 0, 64, 20, 0, 20, 4, 44, 60, 20, 4, 44]);
+        assert_eq!(g[1] as u32, 0x6b74_b8fc);
+        assert_eq!(g[2], 8 | 43 << 8 | 100 << 16, "the balances, a byte each, at most 100");
+        assert_eq!(g[19], 1 | 2, "the frame's flags");
+        assert_eq!(&g[20..25], &[15, 0, 26, 20, 2], "close");
+        assert_eq!(g[29], 1, "maximize's state");
+        assert_eq!(g[34], 4, "minimize's state");
+        assert_eq!(g[35] as u32, 0x0074_b8fc, "the afterglow");
+        assert_eq!(&g[36..40], &[4, 20, 56, 40], "the client area");
+        // The icon's address: a wasm32 shim's, so one word (here, a 64-bit
+        // host's, only its low half).
+        assert_ne!(info.glass_icon, 0);
+        assert_eq!(rec[REC_GLASS_ICON], info.glass_icon as i32);
+        // SAFETY: the icon lives in the client's surface state, which `c` holds.
+        let px = unsafe { std::slice::from_raw_parts(info.glass_icon as *const u8, icon.len()) };
+        assert_eq!(px, &icon[..]);
+        // The words before the glass are as they were: the title and the pid.
+        let b: Vec<u8> = rec[REC_TITLE..REC_TITLE + REC_TITLE_BYTES / 4].iter().flat_map(|w| w.to_le_bytes()).collect();
+        assert_eq!(String::from_utf8(b.into_iter().take_while(|&x| x != 0).collect()).unwrap(), title);
+        assert_eq!(rec[REC_PID], 0);
+
+        // destroy: no glass, no icon.
+        c.receive(&Writer::new(21, 0).finish(), &[], &pool);
+        let info = c.scene().into_iter().find(|s| s.surface == surface).unwrap();
+        let mut rec = Vec::new();
+        push_record(&mut rec, 3, &info);
+        assert!(rec[REC_GLASS..].iter().all(|&w| w == 0), "glass left after destroy");
     }
 
     #[test]

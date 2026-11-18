@@ -35,6 +35,7 @@
 //! the cache: a scan of blocks used once cycles through the rest.
 
 use crate::errno::Errno;
+use gex_store::alloc::Allocator;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -42,12 +43,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// `(op, offset, buf)`: done, or why not (EIO; ENOSPC for a full store).
 pub type BlockIo = fn(u32, u64, &mut [u8]) -> Result<(), Errno>;
 static IO: OnceLock<BlockIo> = OnceLock::new();
-pub const OP_READ: u32 = 1;
-pub const OP_WRITE: u32 = 2;
-/// Make the store file at least `offset` bytes long (no buffer).
-pub const OP_GROW: u32 = 4;
-/// Make what was written durable (no offset, no buffer).
-pub const OP_FLUSH: u32 = 8;
+pub use gex_store::{OP_FLUSH, OP_GROW, OP_READ, OP_WRITE};
 
 pub fn set_io(f: BlockIo) {
     let _ = IO.set(f);
@@ -153,10 +149,7 @@ const DIRECT_MAX: u64 = 64 << 20;
 /// it).
 pub fn configure(block: u32, cache: u64, inline: u64) {
     // Block 0 is the superblocks' (persist.rs).
-    {
-        let mut a = ALLOCATOR.lock().unwrap();
-        a.0 = a.0.max(1);
-    }
+    ALLOCATOR.lock().unwrap().start();
     INLINE.store(inline, Ordering::Relaxed);
     BUDGET.store(cache, Ordering::Relaxed);
     BS.store(block, Ordering::Release);
@@ -208,17 +201,15 @@ fn bump(i: usize, n: u64) {
     ST[i].fetch_add(n, Ordering::Relaxed);
 }
 
-/// The one store file's block numbers: the next never used, and the freed.
-/// The lowest freed block first, so that the store file grows only when
-/// every block below its end is in use (a block above what was ever written
-/// costs the origin's quota).
-static ALLOCATOR: Mutex<(u32, std::collections::BinaryHeap<std::cmp::Reverse<u32>>)> = Mutex::new((0, std::collections::BinaryHeap::new()));
-/// How many blocks long the store file has been made ([`OP_GROW`]): it is
-/// grown ahead, [`GROW`] at a time, so that a write-back never extends it
-/// (a sync access handle's write that has to grow the file can fail, and
-/// says so only through its count).
-static RESERVED: AtomicU64 = AtomicU64::new(0);
-const GROW: u64 = 64 << 20;
+/// The one store file's block numbers (gex-store's allocator, which the
+/// page's offline editor places its blocks with too): the lowest free
+/// first, the store file grown ahead, frees deferred while the root is kept.
+static ALLOCATOR: Mutex<Allocator> = Mutex::new(Allocator::new());
+
+/// The allocator's grow: the store file made at least `len` bytes long.
+fn grow_to(len: u64) -> Result<(), gex_store::Errno> {
+    io(OP_GROW, len, &mut []).map_err(|e| gex_store::Errno(e.0))
+}
 
 const NONE: u64 = u64::MAX;
 
@@ -875,123 +866,57 @@ impl PFile {
     }
 }
 
-/// While the root is kept across loads (persist.rs), a block freed waits
-/// here until the next generation is written: the last one written may
-/// still name it.
-static DEFER: AtomicBool = AtomicBool::new(false);
-static PENDING: Mutex<Vec<u32>> = Mutex::new(Vec::new());
-
+/// A block no longer used: free now, or, while the root is kept across loads
+/// (persist.rs), once the next generation is written (the last one written
+/// may still name it).
 fn free(p: u32) {
-    if DEFER.load(Ordering::Relaxed) {
-        PENDING.lock().unwrap().push(p);
-    } else {
-        ALLOCATOR.lock().unwrap().1.push(std::cmp::Reverse(p));
-    }
-}
-
-/// Blocks kept back for persist.rs's records: on a full store, a delete's
-/// blocks are free only once a generation that no longer names them is
-/// written, and writing it needs blocks of its own. Files never take these.
-static RESERVE: Mutex<Vec<u32>> = Mutex::new(Vec::new());
-const RESERVE_BLOCKS: usize = 64;
-
-/// The store's next block past the highest, the store grown ahead when it
-/// has none (ENOSPC when it cannot grow).
-fn grow_one(a: &mut (u32, std::collections::BinaryHeap<std::cmp::Reverse<u32>>)) -> Result<u32, Errno> {
-    let bs = block();
-    let have = RESERVED.load(Ordering::Relaxed);
-    if a.0 as u64 >= have {
-        // Grown ahead, so that a quota failure comes here, at allocation,
-        // as ENOSPC, not at a write-back; one block at a time once the room
-        // left is less than that.
-        let mut want = have.max(a.0 as u64) + (GROW / bs).max(1);
-        if io(OP_GROW, want * bs, &mut []).is_err() {
-            want = a.0 as u64 + 1;
-            if io(OP_GROW, want * bs, &mut []).is_err() {
-                return Err(Errno::ENOSPC);
-            }
-        }
-        RESERVED.store(want, Ordering::Relaxed);
-    }
-    a.0 += 1;
-    Ok(a.0 - 1)
-}
-
-/// A free block, the lowest first, else a new one.
-fn take(a: &mut (u32, std::collections::BinaryHeap<std::cmp::Reverse<u32>>)) -> Result<u32, Errno> {
-    match a.1.pop() {
-        Some(std::cmp::Reverse(p)) => Ok(p),
-        None => grow_one(a),
-    }
+    ALLOCATOR.lock().unwrap().free(p);
 }
 
 /// A place in the store for a file's block, the lowest free first, the
 /// store grown ahead when there is none; the records' reserve kept full
 /// first, while the root is kept.
 fn alloc_place() -> Result<u32, Errno> {
-    let mut a = ALLOCATOR.lock().unwrap();
-    if DEFER.load(Ordering::Relaxed) {
-        let mut r = RESERVE.lock().unwrap();
-        while r.len() < RESERVE_BLOCKS {
-            match take(&mut a) {
-                Ok(p) => r.push(p),
-                Err(_) => break,
-            }
-        }
-    }
-    take(&mut a)
+    ALLOCATOR.lock().unwrap().alloc_place(block(), &mut grow_to).map_err(Errno::from)
 }
 
 /// For persist.rs: frees wait for the next generation from now on.
 pub fn defer_frees() {
-    DEFER.store(true, Ordering::Relaxed);
+    ALLOCATOR.lock().unwrap().defer_frees();
 }
 
 /// The blocks freed since the last call (persist.rs: a generation about to
 /// be written no longer names them).
 pub fn take_pending() -> Vec<u32> {
-    std::mem::take(&mut *PENDING.lock().unwrap())
+    ALLOCATOR.lock().unwrap().take_pending()
 }
 
 /// Blocks given back to the pending list (a generation that failed).
 pub fn repend(v: Vec<u32>) {
-    PENDING.lock().unwrap().extend(v);
+    ALLOCATOR.lock().unwrap().repend(v);
 }
 
 /// Blocks free for use again now.
 pub fn release(v: impl IntoIterator<Item = u32>) {
-    let mut a = ALLOCATOR.lock().unwrap();
-    for p in v {
-        a.1.push(std::cmp::Reverse(p));
-    }
+    ALLOCATOR.lock().unwrap().release(v);
 }
 
 /// A block for persist.rs's own records, outside the cache: the reserve's
 /// when the store has no other.
 pub fn alloc_meta() -> Result<u32, Errno> {
-    let mut a = ALLOCATOR.lock().unwrap();
-    take(&mut a).or_else(|e| RESERVE.lock().unwrap().pop().ok_or(e))
+    ALLOCATOR.lock().unwrap().alloc_meta(block(), &mut grow_to).map_err(Errno::from)
 }
 
 /// How many blocks of the store are in use or free below the highest ever
 /// allocated (block 0 included).
 pub fn high() -> u32 {
-    ALLOCATOR.lock().unwrap().0
+    ALLOCATOR.lock().unwrap().high()
 }
 
 /// After a load's root was read back: `high` blocks long, those `used`
 /// taken (block 0 always), the rest free.
 pub fn rebuild(high: u32, used: &[bool]) {
-    let mut a = ALLOCATOR.lock().unwrap();
-    RESERVE.lock().unwrap().clear();
-    a.0 = high.max(1);
-    a.1.clear();
-    for p in 1..a.0 {
-        if !used.get(p as usize).copied().unwrap_or(false) {
-            a.1.push(std::cmp::Reverse(p));
-        }
-    }
-    RESERVED.store(RESERVED.load(Ordering::Relaxed).max(a.0 as u64), Ordering::Relaxed);
+    ALLOCATOR.lock().unwrap().rebuild(high, used);
 }
 
 /// A test's fresh start: nothing held, nothing allocated, frees at once.
@@ -999,11 +924,7 @@ pub fn rebuild(high: u32, used: &[bool]) {
 pub fn reset() {
     *INDEX.lock().unwrap() = None;
     PROTECTED.store(0, Ordering::Relaxed);
-    *ALLOCATOR.lock().unwrap() = (1, Default::default());
-    RESERVE.lock().unwrap().clear();
-    PENDING.lock().unwrap().clear();
-    DEFER.store(false, Ordering::Relaxed);
-    RESERVED.store(0, Ordering::Relaxed);
+    ALLOCATOR.lock().unwrap().reset();
 }
 
 /// The store read or written at `off` directly, not through the cache nor

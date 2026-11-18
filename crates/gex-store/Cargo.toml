@@ -1,0 +1,8 @@
+[package]
+name = "gex-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "gex-store: the block store an OPFSFilesystem keeps the root in, its records and its blocks"
+
+[dependencies]

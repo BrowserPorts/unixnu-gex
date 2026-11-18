@@ -60,6 +60,14 @@ static const int gexgl_glx_context_token = 0;
 static void *glx_current_display;
 static unsigned long glx_current_drawable;
 static void *glx_current_context;
+/* The EGL context behind every legacy GLX context (GEXGL_GLX_CONTEXT): made
+ * at the first glXMakeCurrent, and made current again after a release rather
+ * than made anew. EGL contexts are contexts of their own now, each with its
+ * own state (egl_context_slots), so a new one per glXMakeCurrent would start
+ * a program that releases its context between frames -- Qt does -- from the
+ * defaults every frame, and add a host context each time. One, as there has
+ * always been. */
+static void *glx_legacy_egl_context;
 
 /* A context made by glXCreateContextAttribsARB: what it asked for, kept until
  * glXMakeCurrent makes the host context. The host context is made there, not
@@ -349,7 +357,14 @@ static struct gexgl_glx_attribs_context *gexgl_glx_attribs_of(void *ctx) {
 void glXDestroyContext(void *dpy, void *ctx) {
     (void)dpy;
     struct gexgl_glx_attribs_context *c = gexgl_glx_attribs_of(ctx);
-    eglDestroyContext(NULL, ctx);
+    /* A legacy context is the EGL context made for it, which goes too, so
+       the next glXMakeCurrent starts a fresh one. */
+    if (ctx == GEXGL_GLX_CONTEXT && glx_legacy_egl_context) {
+        eglDestroyContext(NULL, glx_legacy_egl_context);
+        glx_legacy_egl_context = NULL;
+    } else {
+        eglDestroyContext(NULL, ctx);
+    }
     if (ctx == glx_current_context) glx_current_context = NULL;
     if (c) {
         c->magic = 0;
@@ -383,7 +398,10 @@ int glXMakeCurrent(void *dpy, unsigned long drawable, void *ctx) {
         context_create();
         context = (void *)3;
     } else if (!context) {
-        context = eglCreateContext(dpy, config, NULL, NULL);
+        if (!glx_legacy_egl_context ||
+            !gexgl_context_slot_of(glx_legacy_egl_context, NULL))
+            glx_legacy_egl_context = eglCreateContext(dpy, config, NULL, NULL);
+        context = glx_legacy_egl_context;
     }
     if (!eglMakeCurrent(dpy, surface, surface, context)) return 0;
     glx_current_context = ctx;

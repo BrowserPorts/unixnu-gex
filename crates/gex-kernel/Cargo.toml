@@ -21,6 +21,9 @@ num-bigint = { version = "0.4", default-features = false }
 # decomposition (NFD).
 unicode-normalization = { version = "0.1", default-features = false }
 
+# The block store's format and allocator, shared with the page's offline editor.
+gex-store.workspace = true
+
 [dev-dependencies]
 # Key pairs and signatures for the tests of the web device's chain and
 # tickets (`darwin::webdevice`); the kernel itself only verifies.

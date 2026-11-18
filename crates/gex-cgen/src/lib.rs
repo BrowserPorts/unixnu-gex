@@ -109,14 +109,27 @@ pub fn select(
             *f = one.pop().expect("an entry block forms a function");
         }
     }
+    let functions = select_shaped(functions, guarded);
+    for f in &functions {
+        check_selected(f)?;
+    }
+    Ok(functions)
+}
+
+/// What [`select`] keeps, decided from the functions' block shapes (a shaped
+/// recovery's, `gex_xlate::func::recover_pe_shaped`): memory form, and no
+/// lifted block on a `guarded` page. No intrinsics: [`select`] with none.
+/// Each kept function, given its statements, is to pass [`check_selected`].
+pub fn select_shaped(mut functions: Vec<Function>, guarded: &HashSet<u64>) -> Vec<Function> {
     functions.retain(|f| f.form == gex_ir::func::Form::Memory);
     let overlaps = |lo: u64, hi: u64| pages(lo, hi).any(|p| guarded.contains(&p));
     functions.retain(|f| !f.blocks.iter().any(|b| !b.synthetic && overlaps(b.start, b.end)));
-    for f in &functions {
-        f.verify()
-            .map_err(|e| anyhow::anyhow!("recovered function {:#x} is malformed: {e}", f.entry))?;
-    }
-    Ok(functions)
+    functions
+}
+
+/// [`select`]'s check of a function it keeps: well formed.
+pub fn check_selected(f: &Function) -> Result<()> {
+    f.verify().map_err(|e| anyhow::anyhow!("recovered function {:#x} is malformed: {e}", f.entry))
 }
 
 /// Build the function-tier version of a tier-1 module.

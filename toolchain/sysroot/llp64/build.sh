@@ -9,7 +9,7 @@
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 out=$(realpath -m "$1"); mkdir -p "$out"
-LLVM_CONFIG=${LLVM_CONFIG:-$(command -v llvm-config || command -v llvm-config-22)}
+LLVM_CONFIG=${LLVM_CONFIG:-$(command -v llvm-config-22 || command -v llvm-config)}
 inc=${CLANG_DEV_INCLUDE:-}
 if [ -z "$inc" ] && [ -f "$($LLVM_CONFIG --includedir)/clang/Basic/TargetInfo.h" ]; then
   inc=$($LLVM_CONFIG --includedir)

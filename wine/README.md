@@ -60,8 +60,9 @@ The 64-bit install has no:
 - **Gecko**: wine-gecko, the engine behind mshtml, is not shipped. Pages
   run with `mshtml=` in `WINEDLLOVERRIDES`, and HTML views (mshtml, the
   WebBrowser control, hh.exe) do not render.
-- **Mono**: wine-mono is not shipped, and pages run with `mscoree=`, so .NET
-  Framework programs do not start.
+- **Mono**: wine-mono is not shipped unless `WINE64_MONO=1` (wine.pins'
+  `WINE_MONO_*`, at `share/wine/mono`). Without it pages run with `mscoree=`,
+  so .NET Framework programs do not start.
 
 ## Legacy: 32-bit Wine
 

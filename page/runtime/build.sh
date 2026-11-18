@@ -74,6 +74,10 @@ if [ -f "$G/gex_browser.x86.shared.wasm" ]; then
     done
 fi
 [ "$n" -gt 0 ] || { echo "page/runtime/build.sh: no shim in $PUB (hosts/browser/build.sh)" >&2; exit 1; }
+# The offline store editor (src/store.js `Store`): gex-store on its own
+# (hosts/store/build.sh).
+if [ -f "$PUB/store.wasm" ]; then cp "$PUB/store.wasm" "$G/store.wasm"
+else echo "page/runtime/build.sh: no $PUB/store.wasm (hosts/store/build.sh): Store.open will not start" >&2; fi
 mkdir -p "$G/cgen/providers"
 cp "$PUB/cgen/providers/"*.wasm "$G/cgen/providers/"
 strip_wasm "$G/cgen/providers/"*.wasm
@@ -133,7 +137,7 @@ export default {
   // none inlined: the runtime fetches them.
   build: { ...base.build, outDir: '$OUT', emptyOutDir: true, modulePreload: false, assetsInlineLimit: 0,
            rollupOptions: {
-             input: { index: '$RT/src/index.js', fs: '$RT/src/fs.js', 'windows-host': '$RT/src/windows/host.js', 'windows-single': '$RT/src/windows/single.js', 'windows-compositor': '$RT/src/windows/compositor.js', 'net-wisp': '$RT/src/net/wisp.mjs', audio: '$RT/src/audio.js', gl: '$RT/src/gl.js', input: '$RT/src/input.js' },
+             input: { index: '$RT/src/index.js', fs: '$RT/src/fs.js', 'windows-host': '$RT/src/windows/host.js', 'windows-single': '$RT/src/windows/single.js', 'windows-compositor': '$RT/src/windows/compositor.js', 'net-wisp': '$RT/src/net/wisp.mjs', audio: '$RT/src/audio.js', gl: '$RT/src/gl.js', input: '$RT/src/input.js', store: '$RT/src/store.js' },
              preserveEntrySignatures: 'strict',
              output: { entryFileNames: '[name].mjs', chunkFileNames: '[name]-[hash].mjs', assetFileNames: '[name]-[hash][extname]' },
            } },
@@ -264,6 +268,7 @@ cat > "$OUT/package.json" <<PKG
     "./audio": { "types": "./audio.d.ts", "default": "./audio.mjs" },
     "./gl": { "types": "./gl.d.ts", "default": "./gl.mjs" },
     "./input": { "types": "./input.d.ts", "default": "./input.mjs" },
+    "./store": { "types": "./store.d.ts", "default": "./store.mjs" },
     "./package.json": "./package.json"
   },
   "types": "./index.d.ts",

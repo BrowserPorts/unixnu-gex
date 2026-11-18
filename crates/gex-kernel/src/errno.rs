@@ -7,6 +7,13 @@
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct Errno(pub i32);
 
+/// gex-store's failures are the kernel's errnos.
+impl From<gex_store::Errno> for Errno {
+    fn from(e: gex_store::Errno) -> Errno {
+        Errno(e.0)
+    }
+}
+
 impl Errno {
     pub const EPERM: Errno = Errno(1);
     pub const ENOENT: Errno = Errno(2);
@@ -143,5 +150,20 @@ mod tests {
         assert_eq!(encode(Ok(17)), 17);
         // A large successful return must not look like an error.
         assert_eq!(encode(Ok(0x7fff_ffff_ffff_ffff)), 0x7fff_ffff_ffff_ffff);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_errors_are_linux_numbers() {
+        let io = |c| Errno::from_io(&std::io::Error::from_raw_os_error(c));
+        assert_eq!(io(66), Errno::ENOTEMPTY);
+        assert_eq!(io(62), Errno::ELOOP);
+        assert_eq!(io(63), Errno::ENAMETOOLONG);
+        assert_eq!(io(93), Errno::ENODATA);
+        assert_eq!(io(102), Errno::EOPNOTSUPP);
+        assert_eq!(io(45), Errno::EOPNOTSUPP);
+        assert_eq!(io(35), Errno::EAGAIN);
+        assert_eq!(io(78), Errno::ENOSYS);
+        assert_eq!(io(88), Errno::EIO);
     }
 }

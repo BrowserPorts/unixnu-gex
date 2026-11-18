@@ -452,9 +452,15 @@ fn syscall_step(st: &St, acc: &mut Acc) -> (St, Option<u64>) {
 /// (`int $0x80; ret`, `syscall; ret`, `svc #0; ret`), touching no register
 /// but the stack pointer on the way. Returns how far the return moves the
 /// stack pointer.
+/// Whether `f` has the shape [`syscall_stub`] looks for: two lifted blocks,
+/// the first ending in a syscall that returns. Read from the terminators
+/// alone, so it holds of a function without its statements.
+fn stub_shaped(f: &Function) -> bool {
+    f.blocks.iter().filter(|b| !b.synthetic).count() == 2 && matches!(f.blocks[0].term, FTerm::Syscall { next: Some(_), .. })
+}
+
 fn syscall_stub(f: &Function) -> Option<i64> {
-    let lifted: Vec<&FBlock> = f.blocks.iter().filter(|b| !b.synthetic).collect();
-    if lifted.len() != 2 {
+    if !stub_shaped(f) {
         return None;
     }
     let FTerm::Syscall { next: Some(e), .. } = &f.blocks[0].term else {
@@ -1946,9 +1952,24 @@ pub fn analyze_with_guards(prog: &Program, guards: &Guards) -> Summaries {
 
 /// [`analyze_with_guards`] over any set of functions.
 pub fn analyze_functions_with_guards(functions: &BTreeMap<u64, Function>, guards: &Guards) -> Summaries {
+    analyze_functions_by(functions, guards, &|f| std::borrow::Cow::Borrowed(f))
+}
+
+/// [`analyze_functions_with_guards`] over functions whose statements `ir`
+/// gives: block shapes from a shaped recovery
+/// ([`crate::func::recover_pe_shaped`]) with
+/// [`crate::func::Materializer::function`]. The call graph is read from the
+/// shapes, and each strongly connected component's functions are given their
+/// statements while it is analysed, and dropped after.
+pub fn analyze_functions_by<'f>(
+    functions: &'f BTreeMap<u64, Function>,
+    guards: &Guards,
+    ir: &dyn Fn(&'f Function) -> std::borrow::Cow<'f, Function>,
+) -> Summaries {
     let stubs: HashMap<u64, i64> = functions
         .iter()
-        .filter_map(|(&a, f)| Some((a, syscall_stub(f)?)))
+        .filter(|(_, f)| stub_shaped(f))
+        .filter_map(|(&a, f)| Some((a, syscall_stub(&ir(f))?)))
         .collect();
     let mut site_effects: HashMap<(u64, u64), CallEffect> = HashMap::new();
     let nodes: Vec<u64> = functions.keys().copied().collect();
@@ -1981,6 +2002,7 @@ pub fn analyze_functions_with_guards(functions: &BTreeMap<u64, Function>, guards
                 map.insert(a, Summary::bottom());
             }
         }
+        let bodies: HashMap<u64, std::borrow::Cow<'f, Function>> = comp.iter().map(|&a| (a, ir(&functions[&a]))).collect();
         let mut iters = 0;
         loop {
             iters += 1;
@@ -1988,7 +2010,7 @@ pub fn analyze_functions_with_guards(functions: &BTreeMap<u64, Function>, guards
             for &a in &comp {
                 let mut sites = Vec::new();
                 let mut s = analyze_fn_full(
-                    &functions[&a],
+                    &bodies[&a],
                     &Ctx {
                         sums: &map,
                         trust_frame: false,

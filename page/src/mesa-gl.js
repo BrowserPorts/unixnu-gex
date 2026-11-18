@@ -16,6 +16,7 @@ import { assetFiles, assetUrl, pageParams } from './page-env.js';
 import { logOn } from '@gex/log.mjs';
 import { ValidationLog } from './gl-validation.js';
 import { fitReply } from './gl-reply.js';
+import { D3dPacer, d3dSwapInterval } from './d3d-pacing.js';
 
 // Header words, matching crates/gex-gl/src/proto.rs.
 const H_MAGIC = 0;
@@ -270,6 +271,8 @@ export class MesaGlDevice {
   #submit = null;
   /** The D3D device's submit, when the module has one. */
   #d3dSubmit = null;
+  /** Its presents' pacing (d3d-pacing.js), when it has one. */
+  #d3dPacer = null;
   #failed = null;
   /** WebGPU validation errors: counted, the first kept, rate-limited logs. */
   #validation = new ValidationLog();
@@ -385,6 +388,14 @@ export class MesaGlDevice {
       out.#submit = WebAssembly.promising(out.#module.gexGlSubmitRaw);
       if (out.#module.gexD3dSubmitRaw)
         out.#d3dSubmit = WebAssembly.promising(out.#module.gexD3dSubmitRaw);
+      // A module from before the count it is paced by has no pacing.
+      if (out.#d3dSubmit && out.#module._gex_gl_client_unshown) {
+        const m = out.#module;
+        out.#d3dPacer = new D3dPacer({
+          interval: d3dSwapInterval(options.env),
+          unshown: (client) => m._gex_gl_client_unshown(client >>> 0),
+        });
+      }
       if (out.#module._gex_gl_set_api)
         out.#module._gex_gl_set_api(api === 'core' ? 1 : 0, major, minor);
       // Environment for Mesa (`?mesaenv=`), before the context exists.
@@ -534,13 +545,10 @@ export class MesaGlDevice {
     this.#submits++;
     this.#bytes += tail;
     const src = new Uint8Array(memory.buffer, ring + HEADER_BYTES, tail);
-    if (!d3d && this.capture && !this.capture.record(src, replyCap) && !this.capture.posted) {
-      // Full: hand the recording to whoever serves the page (a Worker has
-      // no CDP-reachable global the page's driver can read).
-      this.capture.posted = true;
-      const bytes = this.capture.toBytes();
-      this.capture = null;
-      fetch('/__gex_capture', { method: 'POST', body: bytes }).catch(() => {});
+    if (!d3d && this.capture) {
+      this.capture.from(client);
+      // Full: hand the recording to whoever serves the page.
+      if (!this.capture.record(src, replyCap)) this.postCapture();
     }
 
     const timed = d3d && this.statsOn;
@@ -660,6 +668,14 @@ export class MesaGlDevice {
       }
       throw e;
     };
+    // A D3D client's reply waits while it is too far ahead of what the page
+    // has shown (d3d-pacing.js). After `done`, so the module is free to show
+    // frames meanwhile.
+    const paced = (rc) => {
+      const out = done(rc);
+      const hold = d3d ? this.#d3dPacer?.after(client >>> 0) : null;
+      return hold ? hold.then(() => out) : out;
+    };
     let result;
     try {
       result = (d3d ? this.#d3dSubmit : this.#submit)(ptr, tail, client >>> 0);
@@ -667,8 +683,8 @@ export class MesaGlDevice {
       return report(e);
     }
     return result instanceof Promise
-      ? result.then(done, report)
-      : done(result);
+      ? result.then(paced, report)
+      : paced(result);
   }
 
   /** What the guest says its frames belong to: see `op::SURFACE_ATTACH`.
@@ -733,6 +749,19 @@ export class MesaGlDevice {
     m._gex_gl_surface_canvas(frame >>> 0, on ? 1 : 0);
   }
 
+  /** Hand the recording (`?glcapture=1`) to whoever serves the page, a
+   *  Worker having no CDP-reachable global the page's driver can read: once,
+   *  and nothing more is recorded. When it fills, and when the last process
+   *  it recorded exits (`forgetClient`), so that a run that ends before the
+   *  ceiling saves what it recorded. */
+  postCapture() {
+    const capture = this.capture;
+    if (!capture || capture.posted || !capture.batches) return;
+    capture.posted = true;
+    this.capture = null;
+    fetch('/__gex_capture', { method: 'POST', body: capture.toBytes() }).catch(() => {});
+  }
+
   /** That process is gone: release its context, its windows and their frames.
    *
    * A client that exits says nothing -- it is not there to say it -- so the
@@ -740,6 +769,7 @@ export class MesaGlDevice {
    * compositor drawing the last picture of a window that has closed. */
   forgetClient(client) {
     const m = this.#module;
+    if (this.capture?.gone(client)) this.postCapture();
     if (!m?._gex_gl_forget_client || !client) return;
     // Not while a submit is suspended, for the reason `display` gives: it
     // would re-enter the module on this thread while the submit holds its
@@ -798,7 +828,10 @@ export class MesaGlDevice {
       this.#displayLater = true;
       return 0;
     }
-    return this.#module?._gex_gl_display?.() ?? 0;
+    const shown = this.#module?._gex_gl_display?.() ?? 0;
+    // D3D clients held for the page to show their frames (d3d-pacing.js).
+    this.#d3dPacer?.shown();
+    return shown;
   }
 
   // The rest of the renderer interface a directGl demo uses. This device

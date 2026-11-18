@@ -53,6 +53,11 @@ else
     echo "no global kernel module -- needs nightly"
 fi
 
+# The offline store editor's module (page/runtime/src/store.js): gex-store
+# on its own, with a memory of its own.
+echo "building the store editor..."
+"$ROOT/hosts/store/build.sh" "$PUB/gex/store.wasm"
+
 echo "building the seed module..."
 cargo build --release --manifest-path "$ROOT/Cargo.toml" -p gexc >/dev/null 2>&1
 "$ROOT/target/release/gexc" seed -o "$PUB/gex/seed.wasm" --no-shared-memory

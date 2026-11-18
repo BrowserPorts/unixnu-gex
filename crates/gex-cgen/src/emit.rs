@@ -212,6 +212,42 @@ pub struct FnRegs {
     pub written: BTreeSet<GuestReg>,
     /// Store only the registers that may be dirty at each write-back.
     pub clean_spills: bool,
+    /// Vector registers kept as two locals (`func::xmm_split`): the
+    /// register's own, whose lane 0 is stale, and `<name>_s`, lane 0 as an
+    /// integer of the width given here (4 or 8 bytes). Joined only where
+    /// the whole register is read or written back.
+    pub split: BTreeMap<GuestReg, u8>,
+    /// The values in split form: a split register's reads used only through
+    /// lane 0, and the lane-0 replacements of them written back to it. Each
+    /// has `<value>_s` beside it; its own C value's lane 0 is stale.
+    pub split_values: HashSet<Value>,
+}
+
+/// The C type of a split register's or value's lane 0 (`FnRegs::split`).
+fn lane_cty(w: u8) -> &'static str {
+    if w == 8 {
+        "uint64_t"
+    } else {
+        "uint32_t"
+    }
+}
+
+/// Lane 0 of the vector `v`, as [`lane_cty`] of `w`.
+fn lane0(v: &str, w: u8) -> String {
+    if w == 8 {
+        format!("(uint64_t)wasm_i64x2_extract_lane({v}, 0)")
+    } else {
+        format!("(uint32_t)wasm_i32x4_extract_lane({v}, 0)")
+    }
+}
+
+/// The vector `v` with lane 0 set to `lo`, of width `w`.
+fn with_lane0(v: &str, lo: &str, w: u8) -> String {
+    if w == 8 {
+        format!("wasm_i64x2_replace_lane({v}, 0, (int64_t){lo})")
+    } else {
+        format!("wasm_i32x4_replace_lane({v}, 0, (int32_t){lo})")
+    }
 }
 
 pub(crate) struct Emitter<'a> {
@@ -570,6 +606,52 @@ impl<'a> Emitter<'a> {
                 }
             };
             self.line(format!("{name} = {load};"));
+            if let Some(w) = self.split_width(r) {
+                let lo = if w == 8 { format!("GEX_C64({off}u)") } else { format!("GEX_C32({off}u)") };
+                self.line(format!("{name}_s = {lo};"));
+            }
+        }
+    }
+
+    /// A split register's lane width (`FnRegs::split`).
+    fn split_width(&self, r: GuestReg) -> Option<u8> {
+        self.func_regs.as_ref().and_then(|fr| fr.split.get(&r).copied())
+    }
+
+    /// Whether `v` is in split form (`FnRegs::split_values`).
+    fn is_split_value(&self, v: Value) -> bool {
+        self.func_regs.as_ref().is_some_and(|fr| fr.split_values.contains(&v))
+    }
+
+    /// A split value's lane width: that of the register it was read from or
+    /// is written to, as `func::xmm_split` matched it.
+    fn split_value_width(&self, expr: &Expr) -> u8 {
+        match expr {
+            Expr::VExtract { lane_bytes, .. } | Expr::VReplace { lane_bytes, .. } => *lane_bytes as u8,
+            _ => 4,
+        }
+    }
+
+    /// Statements that may use a split value are the forms
+    /// `func::xmm_split` matched; any other use would read its stale lane 0.
+    fn check_split_uses(&self, s: &Stmt) -> Result<()> {
+        let allowed = match s {
+            Stmt::Def { expr: Expr::VExtract { lane: 0, .. } | Expr::VReplace { lane: 0, .. }, .. } => true,
+            Stmt::WriteReg { .. } => true,
+            _ => false,
+        };
+        if allowed {
+            return Ok(());
+        }
+        let mut bad = None;
+        s.for_each_use(|v| {
+            if self.is_split_value(v) {
+                bad = Some(v);
+            }
+        });
+        match bad {
+            Some(v) => bail!("{v:?} is in split form and used whole by {s:?}"),
+            None => Ok(()),
         }
     }
 
@@ -617,7 +699,15 @@ impl<'a> Emitter<'a> {
                 match r.ty() {
                     Ty::I32 => self.line(format!("GEX_C32({off}u) = {name};")),
                     Ty::I64 => self.line(format!("GEX_C64({off}u) = {name};")),
-                    Ty::V128 => self.line(format!("GEX_CV_SET({off}u, {name});")),
+                    Ty::V128 => {
+                        self.line(format!("GEX_CV_SET({off}u, {name});"));
+                        // A split register: its lane 0 over the stale one.
+                        match self.split_width(r) {
+                            Some(8) => self.line(format!("GEX_C64({off}u) = {name}_s;")),
+                            Some(_) => self.line(format!("GEX_C32({off}u) = {name}_s;")),
+                            None => {}
+                        }
+                    }
                 }
             }
         }
@@ -884,11 +974,25 @@ impl<'a> Emitter<'a> {
     }
 
     fn stmt_inner(&mut self, s: &Stmt) -> Result<()> {
+        if self.func_regs.as_ref().is_some_and(|fr| !fr.split_values.is_empty()) {
+            self.check_split_uses(s)?;
+        }
         match s {
             Stmt::Def { dst, expr } => self.def(*dst, expr)?,
             Stmt::WriteReg { reg, val } => {
                 let v = self.v(*val);
-                self.write_reg(*reg, &v);
+                match (self.split_width(*reg), self.is_split_value(*val)) {
+                    (Some(_), true) => {
+                        self.write_reg(*reg, &v);
+                        self.line(format!("{}_s = {v}_s;", reg_name(*reg)));
+                    }
+                    (Some(w), false) => {
+                        self.write_reg(*reg, &v);
+                        self.line(format!("{}_s = {};", reg_name(*reg), lane0(&v, w)));
+                    }
+                    (None, true) => bail!("{val:?} is in split form and written to {reg:?}, which is not split"),
+                    (None, false) => self.write_reg(*reg, &v),
+                }
             }
             Stmt::Store {
                 addr,
@@ -1273,6 +1377,32 @@ impl<'a> Emitter<'a> {
             *c = is_ctx;
         }
         self.note_disp(idx, expr);
+        match expr {
+            // A split register: in split form its two locals, as they are;
+            // read whole, joined.
+            Expr::ReadReg(r) if self.split_width(*r).is_some() => {
+                let w = self.split_width(*r).unwrap();
+                let name = reg_name(*r);
+                if self.is_split_value(dst) {
+                    self.line(format!("{} = {name};", self.decl(ty, &d)));
+                    self.line(format!("{} = {name}_s;", self.decl_lane(w, &format!("{d}_s"))));
+                } else {
+                    self.line(format!("{} = {};", self.decl(ty, &d), with_lane0(&name, &format!("{name}_s"), w)));
+                }
+                return Ok(());
+            }
+            // Lane 0 of a split value replaced: the same stale vector, and
+            // the new lane 0 beside it.
+            Expr::VReplace { a, lane: 0, lane_bytes, val } if self.is_split_value(dst) => {
+                let (av, v) = (self.v(*a), self.v(*val));
+                let w = *lane_bytes as u8;
+                let cast = if w == 8 { "(uint64_t)" } else { "(uint32_t)" };
+                self.line(format!("{} = {av};", self.decl(ty, &d)));
+                self.line(format!("{} = {cast}{v};", self.decl_lane(w, &format!("{d}_s"))));
+                return Ok(());
+            }
+            _ => {}
+        }
         if let Expr::HostCall { func, args, ty } = expr {
             if *func == HostFunc::Fma && args.len() == 4 {
                 if let Some(dbl) = self.value_const[args[3].0 as usize] {
@@ -1335,6 +1465,15 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    /// [`Self::decl`] for a split value's lane 0 (`<value>_s`).
+    fn decl_lane(&self, w: u8, d: &str) -> String {
+        if self.predeclared {
+            d.to_string()
+        } else {
+            format!("const {} {d}", lane_cty(w))
+        }
+    }
+
     /// A block's statements, each through `one`. Its `Expr::Mx`s go in runs
     /// of up to [`MX_RUN`], each from its first to its last: a run tests
     /// MXCSR's rounding control once and is emitted twice, with the
@@ -1365,6 +1504,13 @@ impl<'a> Emitter<'a> {
             for s in &stmts[run.clone()] {
                 if let Stmt::Def { dst, expr } = s {
                     self.line(format!("{} {};", cty(expr.ty()), self.v(*dst)));
+                    if self.is_split_value(*dst) {
+                        let w = match expr {
+                            Expr::ReadReg(r) => self.split_width(*r).unwrap_or(4),
+                            e => self.split_value_width(e),
+                        };
+                        self.line(format!("{} {}_s;", lane_cty(w), self.v(*dst)));
+                    }
                 }
             }
             let regs = self.regs.clone();
@@ -1673,6 +1819,35 @@ impl<'a> Emitter<'a> {
                     VUnOp::ExtAddPairwiseS16 => "wasm_i32x4_extadd_pairwise_i16x8",
                 };
                 format!("{f}({})", self.v(*a))
+            }
+            Expr::VExtract {
+                a,
+                lane,
+                lane_bytes,
+                signed,
+                ty,
+            } if *lane == 0 && self.is_split_value(*a) => {
+                // The split value's lane 0, as the extract would give it.
+                let lo = format!("{}_s", self.v(*a));
+                let as_i32 = match (lane_bytes, signed) {
+                    (4, _) => format!("(uint32_t){lo}"),
+                    (8, _) => format!("(uint64_t){lo}"),
+                    _ => bail!("a {lane_bytes}-byte lane of a split value"),
+                };
+                if *lane_bytes == 8 {
+                    if *ty != Ty::I64 {
+                        bail!("64-bit lane extracted into {ty:?}");
+                    }
+                    as_i32
+                } else if *ty == Ty::I64 {
+                    if *signed {
+                        format!("(uint64_t)(int64_t)(int32_t)({as_i32})")
+                    } else {
+                        format!("(uint64_t)({as_i32})")
+                    }
+                } else {
+                    as_i32
+                }
             }
             Expr::VExtract {
                 a,

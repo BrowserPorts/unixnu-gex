@@ -430,26 +430,109 @@ pub fn seeds(
 // ---------------------------------------------------------------------------
 
 /// Lifted blocks, each lifted once at its natural length.
+///
+/// `shapes`: each block is kept without its statements (and their `pcs`),
+/// which is all discovery reads of it but the syscall number, kept beside it.
+/// A whole image's statements, held three times over while a round assembles
+/// its functions, are tens of GB for a large one; the functions recovered
+/// from shapes get theirs back from [`materialize`], one at a time.
 struct Lifter<'a> {
     code: &'a Code<'a>,
     limits: BlockLimits,
     cache: HashMap<u64, std::rc::Rc<Lifted>>,
+    shapes: bool,
+    /// With `shapes`: [`syscall_number`] of each block lifted that sets one.
+    syscall_nr: HashMap<u64, u64>,
 }
 
 impl<'a> Lifter<'a> {
+    fn new(code: &'a Code<'a>, limits: BlockLimits, shapes: bool) -> Lifter<'a> {
+        Lifter { code, limits, cache: HashMap::new(), shapes, syscall_nr: HashMap::new() }
+    }
+
     fn get(&mut self, pc: u64) -> std::rc::Rc<Lifted> {
         if let Some(l) = self.cache.get(&pc) {
             return l.clone();
         }
         let code = self.code;
-        let l = std::rc::Rc::new(arch::lift_insts(
-            &|p, b| code.fetch(p, b),
-            pc,
-            self.limits,
-            &|_| false,
-        ));
+        let mut l = arch::lift_insts(&|p, b| code.fetch(p, b), pc, self.limits, &|_| false);
+        if self.shapes {
+            if let Some(n) = syscall_number(&l) {
+                self.syscall_nr.insert(pc, n);
+            }
+            l.block.stmts = Vec::new();
+            l.pcs = Vec::new();
+        }
+        let l = std::rc::Rc::new(l);
         self.cache.insert(pc, l.clone());
         l
+    }
+
+    /// [`syscall_number`] of a block this lifter gave at its natural length.
+    fn syscall_number(&self, l: &Lifted) -> Option<u64> {
+        if self.shapes {
+            self.syscall_nr.get(&l.block.start).copied()
+        } else {
+            syscall_number(l)
+        }
+    }
+}
+
+/// The statements of a function recovered from block shapes (the functions
+/// of [`recover_pe_shaped`]): each block lifted again from its start and cut
+/// at its end, as discovery cut it, and its values renumbered as [`assemble`]
+/// numbered them. Lifting is a function of the code bytes and the limits, so
+/// this is the function a recovery that kept statements would have. A block
+/// that does not come out as recovery saw it is a broken invariant, and
+/// panics.
+fn materialize(code: &Code, limits: BlockLimits, f: &Function) -> Function {
+    let mut out = f.clone();
+    let mut base = 0u32;
+    for b in out.blocks.iter_mut().filter(|b| !b.synthetic) {
+        let full = arch::lift_insts(&|p, buf| code.fetch(p, buf), b.start, limits, &|_| false);
+        let l = if b.end < full.block.end { cut(&full, b.end) } else { full };
+        assert!(
+            l.block.end == b.end && l.insts == b.insts,
+            "function {:#x}: block {:#x} lifts to end {:#x} ({} instructions), recovery had {:#x} ({})",
+            f.entry,
+            b.start,
+            l.block.end,
+            l.insts.len(),
+            b.end,
+            b.insts.len()
+        );
+        let rn = |v: Value| Value(v.0 + base);
+        let mut stmts = l.block.stmts;
+        for s in stmts.iter_mut() {
+            for_each_use_mut(s, |v| *v = rn(*v));
+            for_each_def_mut(s, |v| *v = rn(*v));
+        }
+        b.stmts = stmts;
+        b.pcs = l.pcs;
+        base += l.block.n_values;
+    }
+    assert_eq!(base, f.n_values, "function {:#x}: its blocks define {base} values, recovery counted {}", f.entry, f.n_values);
+    out
+}
+
+/// [`materialize`] for the functions of a shaped recovery, outside it.
+pub struct Materializer<'a> {
+    code: Code<'a>,
+    limits: BlockLimits,
+}
+
+impl<'a> Materializer<'a> {
+    /// For the functions [`recover_pe_shaped`] (`elf` `None`) or
+    /// [`recover_shaped`] (the same `elf`) recovered from `image` with `opts`.
+    /// Used on the thread that recovered them, or one in the same mode
+    /// ([`crate::set_thread_compat`]).
+    pub fn new(image: &'a Image, elf: Option<&[u8]>, opts: &RecoverOptions) -> Materializer<'a> {
+        Materializer { code: Code::with_elf(image, elf), limits: opts.limits }
+    }
+
+    /// `f` with its statements.
+    pub fn function(&self, f: &Function) -> Function {
+        materialize(&self.code, self.limits, f)
     }
 }
 
@@ -701,7 +784,7 @@ fn discover(
                 None => DTerm::Indirect(target),
             },
             (Term::Syscall { next }, _) => {
-                let never = syscall_number(&l).is_some_and(arch::syscall_never_returns);
+                let never = lifter.syscall_number(&l).is_some_and(arch::syscall_never_returns);
                 DTerm::Syscall {
                     next_pc: next,
                     next: if never {
@@ -945,6 +1028,14 @@ pub(crate) fn may_return(functions: &BTreeMap<u64, Function>) -> HashMap<u64, bo
 /// `.eh_frame`); `summary` gives callee effects to the jump-table resolver
 /// when summaries exist (the second pass, see [`crate::summary::analyze`]).
 pub fn recover(image: &Image, elf: Option<&[u8]>, opts: &RecoverOptions) -> Program {
+    let code = Code::with_elf(image, elf);
+    let prog = recover_shaped(image, elf, opts);
+    whole(&code, opts, prog)
+}
+
+/// [`recover`] whose functions are block shapes, as [`recover_pe_shaped`]'s
+/// are; [`Materializer`] gives a function its statements.
+pub fn recover_shaped(image: &Image, elf: Option<&[u8]>, opts: &RecoverOptions) -> Program {
     // i386 code decodes in compatibility mode: this thread's setting until
     // its next image, which summaries read back ([`arch::compat`]).
     crate::set_thread_compat(image.class32);
@@ -960,6 +1051,14 @@ pub fn recover(image: &Image, elf: Option<&[u8]>, opts: &RecoverOptions) -> Prog
     let code = Code::with_elf(image, elf);
     let (starts, fdes) = seeds(&code, elf, opts.scan_data);
     recover_seeded(&code, starts, fdes, opts)
+}
+
+/// A shaped recovery's functions with their statements.
+fn whole(code: &Code, opts: &RecoverOptions, mut prog: Program) -> Program {
+    for f in prog.functions.values_mut() {
+        *f = materialize(code, opts.limits, f);
+    }
+    prog
 }
 
 /// Recover the function at `start` alone, from code read as it is now (the
@@ -978,7 +1077,7 @@ pub fn recover_one(
     opts: &RecoverOptions,
 ) -> Function {
     starts.entry(start).or_default().add(Source::Call);
-    let mut lifter = Lifter { code, limits: opts.limits, cache: HashMap::new() };
+    let mut lifter = Lifter::new(code, opts.limits, false);
     let mut tables: HashMap<(u64, u64), Table> = HashMap::new();
     let mut failed: HashSet<(u64, u64)> = HashSet::new();
     let leaders: HashMap<u64, BTreeSet<u64>> = HashMap::new();
@@ -1272,7 +1371,21 @@ fn pe_section_name(pe: &gex_ld::pe::PeImage, raw: &str) -> String {
 pub fn recover_pe(image: &Image, extra: &PeSeeds, opts: &RecoverOptions) -> Program {
     crate::set_thread_compat(image.class32);
     let code = Code::with_elf(image, None);
-    let (mut starts, mut fdes) = seeds(&code, None, opts.scan_data);
+    whole(&code, opts, recover_pe_from(&code, extra, opts))
+}
+
+/// [`recover_pe`] whose functions are block shapes: every block's bounds,
+/// instructions and terminator, and no statements. [`Materializer`] gives a
+/// function its statements; this is the recovery for an image too large to
+/// hold every function's statements at once.
+pub fn recover_pe_shaped(image: &Image, extra: &PeSeeds, opts: &RecoverOptions) -> Program {
+    crate::set_thread_compat(image.class32);
+    let code = Code::with_elf(image, None);
+    recover_pe_from(&code, extra, opts)
+}
+
+fn recover_pe_from(code: &Code, extra: &PeSeeds, opts: &RecoverOptions) -> Program {
+    let (mut starts, mut fdes) = seeds(code, None, opts.scan_data);
     for &(a, src) in &extra.starts {
         if code.is_code(a) {
             starts.entry(a).or_default().add(src);
@@ -1286,22 +1399,21 @@ pub fn recover_pe(image: &Image, extra: &PeSeeds, opts: &RecoverOptions) -> Prog
         }
     }
     fdes.extend(extra.fdes.iter().cloned());
-    recover_seeded(&code, starts, fdes, opts)
+    recover_seeded(code, starts, fdes, opts)
 }
 
 /// Recovery from seeds: the fixpoint of discovery, noreturn, jump tables
-/// and interior entries.
+/// and interior entries. The functions are block shapes ([`Lifter`]): what
+/// reads statements (jump tables, summaries) gets each function's from
+/// [`materialize`] as it needs them.
 fn recover_seeded(
     code: &Code,
     mut starts: BTreeMap<u64, StartInfo>,
     fdes: Vec<ehframe::Fde>,
     opts: &RecoverOptions,
 ) -> Program {
-    let mut lifter = Lifter {
-        code: &code,
-        limits: opts.limits,
-        cache: HashMap::new(),
-    };
+    let mut lifter = Lifter::new(code, opts.limits, true);
+    let ir = |f: &Function| materialize(code, opts.limits, f);
     let mut noreturn: BTreeSet<u64> = BTreeSet::new();
     let mut tables: HashMap<(u64, u64), Table> = HashMap::new();
     let mut leaders: HashMap<u64, BTreeSet<u64>> = HashMap::new();
@@ -1421,7 +1533,7 @@ fn recover_seeded(
             }
             let starts_todo: Vec<u64> = todo.iter().map(|t| t.0).collect();
             let extent = starts.get(&f.entry).and_then(|i| i.end).map(|e| (f.entry, e));
-            let found = crate::jumptable::resolve_all(f, &starts_todo, &code, opts.max_table, sums.as_ref(), extent);
+            let found = crate::jumptable::resolve_all(&ir(f), &starts_todo, code, opts.max_table, sums.as_ref(), extent);
             for ((_, t), (_, a)) in found.into_iter().zip(todo) {
                 let key = (f.entry, a);
                 match t {
@@ -1556,7 +1668,7 @@ fn recover_seeded(
     if pass >= opts.summary_passes || !unresolved {
         break 'passes;
     }
-    sums = Some(crate::summary::analyze_functions(&functions));
+    sums = Some(crate::summary::analyze_functions_by(&functions, &Default::default(), &|f| std::borrow::Cow::Owned(ir(f))));
     failed_tables.clear();
     pass += 1;
     // Only another pass if the retry finds something: run the resolver
@@ -1575,7 +1687,7 @@ fn recover_seeded(
         let starts_todo: Vec<u64> = todo.iter().map(|t| t.0).collect();
         let s = sums.as_ref().unwrap();
         let extent = starts.get(&f.entry).and_then(|i| i.end).map(|e| (f.entry, e));
-        let found = crate::jumptable::resolve_all(f, &starts_todo, &code, opts.max_table, Some(s), extent);
+        let found = crate::jumptable::resolve_all(&ir(f), &starts_todo, code, opts.max_table, Some(s), extent);
         for ((_, t), (_, a)) in found.into_iter().zip(todo) {
             match t {
                 Some(t) => {

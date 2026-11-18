@@ -17,8 +17,8 @@ use crate::emit::{self, reg_name, Emitter, FnRegs};
 use anyhow::{bail, Result};
 use gex_abi::ctx;
 use gex_ir::func::{BlockId, Callee, Edge, FBlock, FTerm, Form, Function, RegSet, Summary};
-use gex_ir::{Block, Expr, GuestReg, HostFunc, Stmt};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use gex_ir::{Block, Expr, GuestReg, HostFunc, Stmt, Ty, Value};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
 
 
@@ -780,6 +780,13 @@ impl FnUnit {
             self.no_devirt.clear();
             f
         };
+        let pruned;
+        let f = if dead_flags() {
+            pruned = drop_dead_flags(f, sums, &self.zf_calls);
+            &pruned
+        } else {
+            f
+        };
         let dummy = Block::new(f.entry);
         let owned = HashSet::new();
         let mut e = Emitter::new(&dummy, &owned);
@@ -790,6 +797,9 @@ impl FnUnit {
         e.resize(f.n_values as usize);
         let mut regs = registers(f);
         regs.clean_spills = clean_spills();
+        let (split, split_values) = xmm_split(f);
+        regs.split = split;
+        regs.split_values = split_values;
         self.live = if live_writebacks() { live_in_with(f, sums, &self.zf_calls) } else { vec![RegSet::ALL; f.blocks.len()] };
         self.carry = if regs.clean_spills { self.carried(f, known, sums, trapfree) } else { HashMap::new() };
         let dirty = if regs.clean_spills { dirty_in(f, &self.carry) } else { Vec::new() };
@@ -810,6 +820,9 @@ impl FnUnit {
         let _ = writeln!(fhead, "{force}{}int {name}(int ctx, int32_t depth, uint32_t need, uint64_t ret) {{", self.storage());
         for r in &used {
             let _ = writeln!(fhead, "  {} {};", emit::reg_cty(*r, self.class32), reg_name(*r));
+        }
+        for (r, w) in &e.func_regs.as_ref().expect("set above").split {
+            let _ = writeln!(fhead, "  {} {}_s;", if *w == 8 { "uint64_t" } else { "uint32_t" }, reg_name(*r));
         }
         let _ = writeln!(fhead, "  int32_t poll = {LOOP_POLL};");
         // Set when a poll expires anywhere: the next outermost back-edge
@@ -871,6 +884,10 @@ impl FnUnit {
             let in_loop = |i: usize| lp.body.contains(&i);
             let mut lregs = registers_in(f, &in_loop);
             lregs.clean_spills = clean_spills();
+            if let Some(fr) = &e.func_regs {
+                lregs.split = fr.split.iter().filter(|(r, _)| lregs.used.contains(r)).map(|(r, w)| (*r, *w)).collect();
+                lregs.split_values = fr.split_values.clone();
+            }
             let lused: Vec<GuestReg> = lregs.used.iter().copied().collect();
             let ldirty = if lregs.clean_spills {
                 dirty_in_from(f, lp.header, &in_loop, &self.carry)
@@ -885,6 +902,9 @@ impl FnUnit {
             );
             for r in &lused {
                 let _ = writeln!(head, "  {} {};", emit::reg_cty(*r, self.class32), reg_name(*r));
+            }
+            for (r, w) in &le.func_regs.as_ref().expect("set above").split {
+                let _ = writeln!(head, "  {} {}_s;", if *w == 8 { "uint64_t" } else { "uint32_t" }, reg_name(*r));
             }
             let _ = writeln!(head, "  int32_t poll = {LOOP_POLL};");
             let _ = writeln!(head, "  int hot = 0; (void)hot;");
@@ -1887,7 +1907,126 @@ pub fn registers_in(f: &Function, keep: &dyn Fn(usize) -> bool) -> FnRegs {
         used,
         written,
         clean_spills: false,
+        split: BTreeMap::new(),
+        split_values: HashSet::new(),
     }
+}
+
+/// The vector registers `f` uses through lane 0 (scalar SSE), to be kept as
+/// a scalar local beside the rest of the register (`FnRegs::split`), and the
+/// values in that form (`FnRegs::split_values`).
+///
+/// A register is split when it has a read used only through lane 0 at one
+/// width (4 or 8 bytes): extracted, or the base of a lane-0 replacement that
+/// is written back to the same register and nowhere else, which stays in
+/// split form. Its reads used any other way are joined, which is allowed only
+/// outside loops (a zero idiom before one, say); inside a loop that would add
+/// lane operations to packed code, and the register stays whole. Any write
+/// is taken: a split value sets both locals, any other its lane 0 extracted.
+/// Each scalar operation is then the arithmetic on lane 0 alone, where a
+/// whole register is an extract, the operation and a replace; a loop's
+/// write-backs (its poll, its exits) join the halves, on their own paths.
+/// `GEX_CGEN_EXP=NOXMMSPLIT` turns it off (pricing; not in the unit key).
+pub fn xmm_split(f: &Function) -> (BTreeMap<GuestReg, u8>, HashSet<Value>) {
+    let mut regs = BTreeMap::new();
+    let mut values = HashSet::new();
+    if !gex_abi::X86 || exp("NOXMMSPLIT") {
+        return (regs, values);
+    }
+    let mut in_loop = vec![false; f.blocks.len()];
+    for lp in outer_loops(f) {
+        for &i in &lp.body {
+            in_loop[i] = true;
+        }
+    }
+    // Every definition, and every use of each value: by which statement.
+    #[derive(Clone, Copy)]
+    enum Use {
+        Def(Value),
+        Write(GuestReg),
+        Other,
+    }
+    let mut def: HashMap<Value, (usize, &Expr)> = HashMap::new();
+    let mut uses: HashMap<Value, Vec<Use>> = HashMap::new();
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for st in &b.stmts {
+            match st {
+                Stmt::Def { dst, expr } => {
+                    def.insert(*dst, (bi, expr));
+                    expr.for_each_use(|v| uses.entry(v).or_default().push(Use::Def(*dst)));
+                }
+                Stmt::WriteReg { reg, val } => uses.entry(*val).or_default().push(Use::Write(*reg)),
+                _ => st.for_each_use(|v| uses.entry(v).or_default().push(Use::Other)),
+            }
+        }
+        b.term.for_each_use(|v| uses.entry(v).or_default().push(Use::Other));
+        for e in b.term.edges() {
+            for &v in &e.args {
+                uses.entry(v).or_default().push(Use::Other);
+            }
+        }
+    }
+    // For a read of `r`, the width of its lane-0 uses when all its uses are
+    // those (with each replacement written to `r` only), and the
+    // replacements: `None` when it is used any other way.
+    let lane0_uses = |v: Value, r: GuestReg| -> Option<(Option<u8>, Vec<Value>)> {
+        let mut w = None;
+        let mut reps = Vec::new();
+        for u in uses.get(&v).map(|u| u.as_slice()).unwrap_or(&[]) {
+            let Use::Def(d) = u else { return None };
+            let k = match def.get(d)?.1 {
+                Expr::VExtract { a, lane: 0, lane_bytes: k @ (4 | 8), .. } if *a == v => *k as u8,
+                Expr::VReplace { a, lane: 0, lane_bytes: k @ (4 | 8), val } if *a == v && *val != v => {
+                    if !matches!(uses.get(d).map(|u| u.as_slice()), Some([Use::Write(t)]) if *t == r) {
+                        return None;
+                    }
+                    reps.push(*d);
+                    *k as u8
+                }
+                _ => return None,
+            };
+            if w.is_some_and(|w| w != k) {
+                return None;
+            }
+            w = Some(k);
+        }
+        Some((w, reps))
+    };
+    // Per register: its width, whether a read is lane-0 only, and whether a
+    // read used whole sits in a loop.
+    let mut seen: BTreeMap<GuestReg, (Option<u8>, bool, bool, Vec<Value>)> = BTreeMap::new();
+    let mut ok: BTreeMap<GuestReg, bool> = BTreeMap::new();
+    for (&v, &(bi, expr)) in &def {
+        let Expr::ReadReg(r) = expr else { continue };
+        if r.ty() != Ty::V128 {
+            continue;
+        }
+        let e = seen.entry(*r).or_insert((None, false, false, Vec::new()));
+        let good = ok.entry(*r).or_insert(true);
+        match lane0_uses(v, *r) {
+            Some((Some(k), reps)) => {
+                if e.0.is_some_and(|w| w != k) {
+                    *good = false;
+                }
+                e.0 = Some(k);
+                e.1 = true;
+                e.3.push(v);
+                e.3.extend(reps);
+            }
+            _ => {
+                if in_loop[bi] {
+                    *good = false;
+                }
+            }
+        }
+    }
+    for (r, (w, scalar, _, vals)) in seen {
+        if let (Some(w), true, true) = (w, scalar, ok[&r]) {
+            regs.insert(r, w);
+            values.extend(vals);
+        }
+    }
+    (regs, values)
 }
 
 /// Clean-spill elision is on
@@ -1990,41 +2129,9 @@ pub fn live_in_with(f: &Function, sums: &HashMap<u64, Summary>, zf: &HashSet<u64
         changed = false;
         for &i in &order {
             let b = &f.blocks[i];
-            let mut l = match &b.term {
-                FTerm::Jump(e) => live[e.to.index()],
-                FTerm::Branch {
-                    taken, not_taken, ..
-                } => live[taken.to.index()].union(live[not_taken.to.index()]),
-                // The default case leaves.
-                FTerm::Switch { .. } => RegSet::ALL,
-                FTerm::Call {
-                    callee: Callee::Direct(t),
-                    ret: Some(r),
-                    ..
-                } => match sums.get(t) {
-                    Some(sm) => sm.inputs.union(live[r.to.index()]),
-                    None if flags_abi() => call_reads(zf.contains(&b.term_pc)).union(live[r.to.index()]),
-                    None => RegSet::ALL,
-                },
-                // `flags_abi`: no callee reads the flags it is entered with.
-                FTerm::Call { ret, .. } if flags_abi() => {
-                    call_reads(zf.contains(&b.term_pc)).union(ret.as_ref().map_or(RegSet::EMPTY, |r| live[r.to.index()]))
-                }
-                FTerm::TailCall { .. } if flags_abi() => non_flags(),
-                _ => RegSet::ALL,
-            };
+            let mut l = exit_live(b, &live, sums, zf);
             for s in b.stmts.iter().rev() {
-                match s {
-                    Stmt::WriteReg { reg, .. } => l.remove(*reg),
-                    Stmt::Def {
-                        expr: Expr::ReadReg(r),
-                        ..
-                    } => l.insert(*r),
-                    // A trap reads everything (on its faulting path).
-                    Stmt::Trap { .. } | Stmt::MemCheck { .. } => l = RegSet::ALL,
-                    _ if emit::clobbers(s) => l = RegSet::ALL,
-                    _ => {}
-                }
+                live_step(s, &mut l);
             }
             if l != live[i] {
                 live[i] = l;
@@ -2033,6 +2140,160 @@ pub fn live_in_with(f: &Function, sums: &HashMap<u64, Summary>, zf: &HashSet<u64
         }
     }
     live
+}
+
+/// What [`live_in_with`] takes to be live at the end of `b`, from the
+/// blocks' live-in sets `live`: what its successors read, or what its exit
+/// reads.
+fn exit_live(b: &FBlock, live: &[RegSet], sums: &HashMap<u64, Summary>, zf: &HashSet<u64>) -> RegSet {
+    match &b.term {
+        FTerm::Jump(e) => live[e.to.index()],
+        FTerm::Branch {
+            taken, not_taken, ..
+        } => live[taken.to.index()].union(live[not_taken.to.index()]),
+        // The default case leaves.
+        FTerm::Switch { .. } => RegSet::ALL,
+        FTerm::Call {
+            callee: Callee::Direct(t),
+            ret: Some(r),
+            ..
+        } => match sums.get(t) {
+            Some(sm) => sm.inputs.union(live[r.to.index()]),
+            None if flags_abi() => call_reads(zf.contains(&b.term_pc)).union(live[r.to.index()]),
+            None => RegSet::ALL,
+        },
+        // `flags_abi`: no callee reads the flags it is entered with.
+        FTerm::Call { ret, .. } if flags_abi() => {
+            call_reads(zf.contains(&b.term_pc)).union(ret.as_ref().map_or(RegSet::EMPTY, |r| live[r.to.index()]))
+        }
+        FTerm::TailCall { .. } if flags_abi() => non_flags(),
+        _ => RegSet::ALL,
+    }
+}
+
+/// [`live_in_with`]'s step back over one statement: `l`, live after `s`,
+/// becomes what is live before it.
+fn live_step(s: &Stmt, l: &mut RegSet) {
+    match s {
+        Stmt::WriteReg { reg, .. } => l.remove(*reg),
+        Stmt::Def {
+            expr: Expr::ReadReg(r),
+            ..
+        } => l.insert(*r),
+        // A trap reads everything (on its faulting path).
+        Stmt::Trap { .. } | Stmt::MemCheck { .. } => *l = RegSet::ALL,
+        _ if emit::clobbers(s) => *l = RegSet::ALL,
+        _ => {}
+    }
+}
+
+/// Whether [`drop_dead_flags`] runs: with liveness-limited write-backs
+/// ([`live_writebacks`]), unless `GEX_CGEN_EXP=KEEPDEADFLAGS` (for pricing
+/// and bisecting; not in the unit key: use a private cache).
+pub fn dead_flags() -> bool {
+    live_writebacks() && !exp("KEEPDEADFLAGS")
+}
+
+/// `f` without the flag writes [`live_in_with`] proves dead (no path from
+/// the write reads the flag before writing it again, and every exit the
+/// function does not see past, trap and clobbering host call reads it), and
+/// without the pure definitions only they used, to a fixpoint. Nothing
+/// observes such a write: write-backs are limited to what that liveness
+/// says is live, a memory fault traps out with the state of the last
+/// write-back, and a trap or clobbering host call reads every flag. So the
+/// C is the same program, without code clang would have deleted after
+/// reading it: the lifter writes every flag of every instruction, most of
+/// a function's statements. Tier-1 drops the same writes
+/// (`gex_xlate`'s `eliminate_dead_flags`).
+pub fn drop_dead_flags(f: &Function, sums: &HashMap<u64, Summary>, zf: &HashSet<u64>) -> Function {
+    let mut g = f.clone();
+    loop {
+        let live = live_in_with(&g, sums, zf);
+        let mut changed = false;
+        for i in 0..g.blocks.len() {
+            let mut l = exit_live(&g.blocks[i], &live, sums, zf);
+            let b = &g.blocks[i];
+            let mut drop = vec![false; b.stmts.len()];
+            for (k, s) in b.stmts.iter().enumerate().rev() {
+                if let Stmt::WriteReg { reg, .. } = s {
+                    if reg.is_flag() && !l.contains(*reg) {
+                        drop[k] = true;
+                        continue;
+                    }
+                }
+                live_step(s, &mut l);
+            }
+            if drop.iter().any(|&d| d) {
+                retain_stmts(&mut g.blocks[i], &drop);
+                changed = true;
+            }
+        }
+        changed |= drop_unused_defs(&mut g);
+        if !changed {
+            return g;
+        }
+    }
+}
+
+/// Drop `b`'s statements where `drop` is set, and their `pcs`.
+fn retain_stmts(b: &mut FBlock, drop: &[bool]) {
+    let mut k = 0;
+    b.stmts.retain(|_| {
+        k += 1;
+        !drop[k - 1]
+    });
+    let mut k = 0;
+    b.pcs.retain(|_| {
+        k += 1;
+        !drop[k - 1]
+    });
+}
+
+/// Delete the pure definitions (and x87 operations) no statement,
+/// terminator or edge of `f` uses, as `gex_ir::pass::dce` does for a block,
+/// over the whole function's values. Whether anything was deleted.
+fn drop_unused_defs(f: &mut Function) -> bool {
+    let mut any = false;
+    loop {
+        let mut used = vec![false; f.n_values as usize];
+        let mut mark = |v: Value| {
+            if let Some(u) = used.get_mut(v.0 as usize) {
+                *u = true;
+            }
+        };
+        for b in &f.blocks {
+            for s in &b.stmts {
+                s.for_each_use(&mut mark);
+            }
+            b.term.for_each_use(&mut mark);
+            for e in b.term.edges() {
+                for &v in &e.args {
+                    mark(v);
+                }
+            }
+        }
+        let unused = |v: &Value| !used.get(v.0 as usize).copied().unwrap_or(true);
+        let mut changed = false;
+        for b in f.blocks.iter_mut() {
+            let drop: Vec<bool> = b
+                .stmts
+                .iter()
+                .map(|s| match s {
+                    Stmt::Def { dst, expr } => expr.is_pure() && unused(dst),
+                    Stmt::X87 { outs, .. } => outs.iter().all(unused),
+                    _ => false,
+                })
+                .collect();
+            if drop.iter().any(|&d| d) {
+                retain_stmts(b, &drop);
+                changed = true;
+            }
+        }
+        if !changed {
+            return any;
+        }
+        any = true;
+    }
 }
 
 /// Every register but the flags.
@@ -2057,42 +2318,57 @@ pub fn flags_abi() -> bool {
 /// that reaches code outside `funcs`, an indirect transfer or a clobbering
 /// host call names everything.
 pub fn touched(funcs: &[Function]) -> HashMap<u64, RegSet> {
-    let idx: HashMap<u64, usize> = funcs.iter().enumerate().map(|(k, f)| (f.entry, k)).collect();
-    let mut local = vec![RegSet::EMPTY; funcs.len()];
-    let mut callees: Vec<Vec<usize>> = vec![Vec::new(); funcs.len()];
-    for (k, f) in funcs.iter().enumerate() {
-        let mut l = RegSet::EMPTY;
-        for b in &f.blocks {
-            for s in &b.stmts {
-                match s {
-                    Stmt::WriteReg { reg, .. } => l.insert(*reg),
-                    Stmt::Def { expr: Expr::ReadReg(r), .. } => l.insert(*r),
-                    // A host helper may read or write any register in the
-                    // context (x87, fxsave, cpuid), and a trap reads them all.
-                    Stmt::HostCall { .. } | Stmt::Def { expr: Expr::HostCall { .. }, .. } | Stmt::Trap { .. } | Stmt::MemCheck { .. } => l = RegSet::ALL,
-                    _ if emit::clobbers(s) => l = RegSet::ALL,
-                    _ => {}
-                }
-            }
-            match &b.term {
-                FTerm::Call { callee: Callee::Direct(t), .. } | FTerm::TailCall { callee: Callee::Direct(t) } => match idx.get(t) {
-                    Some(&c) => callees[k].push(c),
-                    None => l = RegSet::ALL,
-                },
-                FTerm::Call { .. } | FTerm::TailCall { .. } | FTerm::Unresolved { .. } | FTerm::Syscall { .. } => l = RegSet::ALL,
-                FTerm::Switch { table, .. } if !table.complete => l = RegSet::ALL,
+    let known: HashSet<u64> = funcs.iter().map(|f| f.entry).collect();
+    let local: Vec<(u64, (RegSet, Vec<u64>))> = funcs.iter().map(|f| (f.entry, touched_local(f, &|t| known.contains(&t)))).collect();
+    touched_of(&local)
+}
+
+/// [`touched`]'s fact about one function: the registers it names itself,
+/// and its direct callees among the functions `known` says are there (a call
+/// to any other names everything).
+pub fn touched_local(f: &Function, known: &dyn Fn(u64) -> bool) -> (RegSet, Vec<u64>) {
+    let mut l = RegSet::EMPTY;
+    let mut callees = Vec::new();
+    for b in &f.blocks {
+        for s in &b.stmts {
+            match s {
+                Stmt::WriteReg { reg, .. } => l.insert(*reg),
+                Stmt::Def { expr: Expr::ReadReg(r), .. } => l.insert(*r),
+                // A host helper may read or write any register in the
+                // context (x87, fxsave, cpuid), and a trap reads them all.
+                Stmt::HostCall { .. } | Stmt::Def { expr: Expr::HostCall { .. }, .. } | Stmt::Trap { .. } | Stmt::MemCheck { .. } => l = RegSet::ALL,
+                _ if emit::clobbers(s) => l = RegSet::ALL,
                 _ => {}
             }
         }
-        local[k] = l;
+        match &b.term {
+            FTerm::Call { callee: Callee::Direct(t), .. } | FTerm::TailCall { callee: Callee::Direct(t) } => {
+                if known(*t) {
+                    callees.push(*t);
+                } else {
+                    l = RegSet::ALL;
+                }
+            }
+            FTerm::Call { .. } | FTerm::TailCall { .. } | FTerm::Unresolved { .. } | FTerm::Syscall { .. } => l = RegSet::ALL,
+            FTerm::Switch { table, .. } if !table.complete => l = RegSet::ALL,
+            _ => {}
+        }
     }
-    let mut t = local.clone();
+    (l, callees)
+}
+
+/// [`touched`] from each function's [`touched_local`], in the functions'
+/// order.
+pub fn touched_of(local: &[(u64, (RegSet, Vec<u64>))]) -> HashMap<u64, RegSet> {
+    let idx: HashMap<u64, usize> = local.iter().enumerate().map(|(k, (e, _))| (*e, k)).collect();
+    let callees: Vec<Vec<usize>> = local.iter().map(|(_, (_, c))| c.iter().map(|t| idx[t]).collect()).collect();
+    let mut t: Vec<RegSet> = local.iter().map(|(_, (l, _))| *l).collect();
     let mut changed = true;
     let mut rounds = 0;
     while changed && rounds < 64 {
         changed = false;
         rounds += 1;
-        for k in 0..funcs.len() {
+        for k in 0..local.len() {
             let mut v = t[k];
             for &c in &callees[k] {
                 v = v.union(t[c]);
@@ -2106,7 +2382,7 @@ pub fn touched(funcs: &[Function]) -> HashMap<u64, RegSet> {
     if changed {
         return HashMap::new();
     }
-    funcs.iter().enumerate().map(|(k, f)| (f.entry, t[k])).collect()
+    local.iter().enumerate().map(|(k, (e, _))| (*e, t[k])).collect()
 }
 
 /// `GEX_CGEN_WB_BISECT=N`: the minimal write-back at the first N call
@@ -2126,24 +2402,42 @@ static WB_K: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0)
 /// trap-free tree must. The guard stays where a call chain can grow
 /// without bound.
 pub fn guard_free(funcs: &[Function], sums: &HashMap<u64, Summary>) -> HashSet<u64> {
-    let idx: HashMap<u64, usize> = funcs.iter().enumerate().map(|(k, f)| (f.entry, k)).collect();
-    let mut cand: Vec<Option<(u32, Vec<usize>)>> = Vec::with_capacity(funcs.len());
-    for f in funcs {
-        let ok = sums.get(&f.entry).is_some_and(|s| !s.unknown_callee && !s.may_unwind);
-        let mut callees = Vec::new();
-        let mut bad = !ok;
-        for b in &f.blocks {
-            match &b.term {
-                FTerm::Call { callee: Callee::Direct(t), .. } | FTerm::TailCall { callee: Callee::Direct(t) } => match idx.get(t) {
-                    Some(&c) => callees.push(c),
-                    None => bad = true,
-                },
-                FTerm::Call { .. } | FTerm::TailCall { .. } | FTerm::Unresolved { .. } => bad = true,
-                _ => {}
+    let known: HashSet<u64> = funcs.iter().map(|f| f.entry).collect();
+    let local: Vec<(u64, Option<(u32, Vec<u64>)>)> =
+        funcs.iter().map(|f| (f.entry, guard_free_local(f, &|t| known.contains(&t), sums, frame_weight(&registers(f))))).collect();
+    guard_free_of(&local)
+}
+
+/// [`guard_free`]'s fact about one function: `None` when it calls anything
+/// but the functions `known` says are there, or its summary says it may
+/// unwind or reach an unknown callee; else its frame's `weight`
+/// ([`frame_weight`]) and its direct callees.
+pub fn guard_free_local(f: &Function, known: &dyn Fn(u64) -> bool, sums: &HashMap<u64, Summary>, weight: u32) -> Option<(u32, Vec<u64>)> {
+    let ok = sums.get(&f.entry).is_some_and(|s| !s.unknown_callee && !s.may_unwind);
+    let mut callees = Vec::new();
+    let mut bad = !ok;
+    for b in &f.blocks {
+        match &b.term {
+            FTerm::Call { callee: Callee::Direct(t), .. } | FTerm::TailCall { callee: Callee::Direct(t) } => {
+                if known(*t) {
+                    callees.push(*t);
+                } else {
+                    bad = true;
+                }
             }
+            FTerm::Call { .. } | FTerm::TailCall { .. } | FTerm::Unresolved { .. } => bad = true,
+            _ => {}
         }
-        cand.push((!bad).then(|| (frame_weight(&registers(f)), callees)));
     }
+    (!bad).then(|| (weight, callees))
+}
+
+/// [`guard_free`] from each function's [`guard_free_local`], in the
+/// functions' order.
+pub fn guard_free_of(local: &[(u64, Option<(u32, Vec<u64>)>)]) -> HashSet<u64> {
+    let idx: HashMap<u64, usize> = local.iter().enumerate().map(|(k, (e, _))| (*e, k)).collect();
+    let cand: Vec<Option<(u32, Vec<usize>)>> =
+        local.iter().map(|(_, c)| c.as_ref().map(|(w, callees)| (*w, callees.iter().map(|t| idx[t]).collect()))).collect();
     // Depth-first, memoised; a cycle (recursion) fails every function on it.
     fn visit(k: usize, cand: &[Option<(u32, Vec<usize>)>], memo: &mut [Option<Option<u32>>], onstack: &mut [bool]) -> Option<u32> {
         if let Some(m) = memo[k] {
@@ -2164,12 +2458,12 @@ pub fn guard_free(funcs: &[Function], sums: &HashMap<u64, Summary>) -> HashSet<u
         memo[k] = Some(r);
         r
     }
-    let mut memo = vec![None; funcs.len()];
-    let mut onstack = vec![false; funcs.len()];
+    let mut memo = vec![None; local.len()];
+    let mut onstack = vec![false; local.len()];
     let mut out = HashSet::new();
-    for k in 0..funcs.len() {
+    for k in 0..local.len() {
         if visit(k, &cand, &mut memo, &mut onstack).is_some() {
-            out.insert(funcs[k].entry);
+            out.insert(local[k].0);
         }
     }
     out
@@ -2326,43 +2620,62 @@ pub fn guest_insns(f: &Function) -> usize {
 /// hold dead in locals are never seen by anyone. Its subtree must fit in
 /// `TRAPFREE_RESERVE`, since it has no depth guard.
 pub fn trap_free(funcs: &[Function], sums: &HashMap<u64, Summary>) -> HashMap<u64, u32> {
-    let by_entry: HashMap<u64, &Function> = funcs.iter().map(|f| (f.entry, f)).collect();
-    // Local conditions, and the direct callees.
-    let mut cand: HashMap<u64, (u32, Vec<u64>)> = HashMap::new();
-    'f: for f in funcs {
-        let Some(sm) = sums.get(&f.entry) else { continue };
-        if sm.may_unwind || sm.may_leave_pending || sm.unknown_callee {
-            continue;
-        }
-        let mut callees = Vec::new();
-        for b in &f.blocks {
-            if b.stmts.iter().any(|s| emit::clobbers(s) || matches!(s, Stmt::Trap { .. } | Stmt::MemCheck { .. })) {
-                continue 'f;
-            }
-            let backward = |e: &Edge| {
-                let to = &f.blocks[e.to.index()];
-                !to.synthetic && to.start <= b.start
-            };
-            match &b.term {
-                FTerm::Jump(e) if !backward(e) => {}
-                FTerm::Branch {
-                    taken, not_taken, ..
-                } if !backward(taken) && !backward(not_taken) => {}
-                FTerm::Switch { cases, table, .. }
-                    if table.complete && !cases.iter().any(|(_, e)| backward(e)) => {}
-                FTerm::Call {
-                    callee: Callee::Direct(t),
-                    ret: Some(r),
-                    ..
-                } if by_entry.contains_key(t) && !backward(r) => callees.push(*t),
-                FTerm::Return { .. } => {}
-                _ => continue 'f,
-            }
-        }
-        cand.insert(f.entry, (frame_weight(&registers(f)), callees));
+    let known: HashSet<u64> = funcs.iter().map(|f| f.entry).collect();
+    let cand: HashMap<u64, (u32, Vec<u64>)> = funcs
+        .iter()
+        .filter_map(|f| Some((f.entry, trap_free_local(f, &|t| known.contains(&t), sums, &|| frame_weight(&registers(f)))?)))
+        .collect();
+    trap_free_of(&cand)
+}
+
+/// [`trap_free`]'s fact about one function: its frame's weight
+/// (`weight`, [`frame_weight`]) and its direct callees, when its own code
+/// can neither trap, clobber, loop nor call anything but the functions
+/// `known` says are there, and its summary says it cannot unwind, leave
+/// pending or reach an unknown callee.
+pub fn trap_free_local(
+    f: &Function,
+    known: &dyn Fn(u64) -> bool,
+    sums: &HashMap<u64, Summary>,
+    weight: &dyn Fn() -> u32,
+) -> Option<(u32, Vec<u64>)> {
+    let sm = sums.get(&f.entry)?;
+    if sm.may_unwind || sm.may_leave_pending || sm.unknown_callee {
+        return None;
     }
-    // Callees trap-free too, no recursion, bounded stack: a depth-first
-    // walk that memoises the subtree's stack and treats a cycle as failure.
+    let mut callees = Vec::new();
+    for b in &f.blocks {
+        if b.stmts.iter().any(|s| emit::clobbers(s) || matches!(s, Stmt::Trap { .. } | Stmt::MemCheck { .. })) {
+            return None;
+        }
+        let backward = |e: &Edge| {
+            let to = &f.blocks[e.to.index()];
+            !to.synthetic && to.start <= b.start
+        };
+        match &b.term {
+            FTerm::Jump(e) if !backward(e) => {}
+            FTerm::Branch {
+                taken, not_taken, ..
+            } if !backward(taken) && !backward(not_taken) => {}
+            FTerm::Switch { cases, table, .. }
+                if table.complete && !cases.iter().any(|(_, e)| backward(e)) => {}
+            FTerm::Call {
+                callee: Callee::Direct(t),
+                ret: Some(r),
+                ..
+            } if known(*t) && !backward(r) => callees.push(*t),
+            FTerm::Return { .. } => {}
+            _ => return None,
+        }
+    }
+    Some((weight(), callees))
+}
+
+/// [`trap_free`] from the functions' [`trap_free_local`] facts: callees
+/// trap-free too, no recursion, bounded stack.
+pub fn trap_free_of(cand: &HashMap<u64, (u32, Vec<u64>)>) -> HashMap<u64, u32> {
+    // A depth-first walk that memoises the subtree's stack and treats a
+    // cycle as failure.
     fn visit(
         a: u64,
         cand: &HashMap<u64, (u32, Vec<u64>)>,
@@ -2390,7 +2703,7 @@ pub fn trap_free(funcs: &[Function], sums: &HashMap<u64, Summary>) -> HashMap<u6
     let mut onstack = HashSet::new();
     let keys: Vec<u64> = cand.keys().copied().collect();
     for a in keys {
-        visit(a, &cand, &mut memo, &mut onstack);
+        visit(a, cand, &mut memo, &mut onstack);
     }
     memo.into_iter().filter_map(|(a, n)| n.map(|n| (a, n))).collect()
 }

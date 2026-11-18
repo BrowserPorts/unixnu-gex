@@ -987,6 +987,15 @@ impl Gl {
                 // This host has one drawable, the pbuffer: every surface
                 // draws into it, and a frame is what it holds at a PRESENT.
                 op::SURFACE_ATTACH | op::SURFACE_CURRENT | op::SURFACE_DETACH | op::CONTEXT_DESTROY => {}
+                // One GL context serves every guest context here: asked for
+                // another, this host answers with the one it has (index 0),
+                // which the guest takes as "keep using it", and switching
+                // to it is nothing. Both still have to be read, or a
+                // program with two contexts ends its stream at the first.
+                op::CONTEXT_ADD => reply.u32(0),
+                op::CONTEXT_SET_CURRENT => {
+                    let _ = a.u32();
+                }
                 op::PRESENT => {
                     self.presents += 1;
                     present_meter(self.presents);
@@ -1970,6 +1979,37 @@ mod tests {
         let pixels = read_blob(r, &mut at);
         assert_eq!(read_u32(r, &mut at), 0, "GL reported no error");
         assert_eq!(&pixels[(2 * 64 + 2) * 4..(2 * 64 + 2) * 4 + 4], &[0, 255, 0, 255], "the indexed triangle");
+    }
+
+    /// A guest with a second EGL context sends CONTEXT_ADD and
+    /// CONTEXT_SET_CURRENT. This host has one GL context for all of them: it
+    /// answers CONTEXT_ADD with that one (index 0), switching is nothing, and
+    /// the stream goes on -- an unknown opcode would end it there.
+    #[test]
+    fn a_second_guest_context_is_the_one_context_and_the_stream_goes_on() {
+        let _serial = gl_lock();
+        let mut gl = match Gl::new(16, 16) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping: no host GL ({e})");
+                return;
+            }
+        };
+        let mut b = Batch::new();
+        b.cmd(op::CONTEXT_CREATE, &[client_api::ES, 0, 0]);
+        b.cmd(op::CONTEXT_ADD, &[]);
+        b.cmd(op::CONTEXT_SET_CURRENT, &[1]);
+        b.cmd(op::CONTEXT_SET_CURRENT, &[0]);
+        b.cmd(op::GET_ERROR, &[]);
+        let (reply, status, _) = gl.run(b.bytes());
+        assert_eq!(status, error::NONE);
+        let r = reply.bytes();
+        let mut at = 0;
+        for _ in 0..3 {
+            read_blob(r, &mut at); // vendor, renderer, version
+        }
+        assert_eq!(read_u32(r, &mut at), 0, "CONTEXT_ADD: the one context there is");
+        assert_eq!(read_u32(r, &mut at), 0, "GL reported no error");
     }
 
     /// The whole path: bring up a context, compile the application's own

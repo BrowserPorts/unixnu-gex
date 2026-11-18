@@ -423,6 +423,50 @@ them, path by path. A new tree gets a new store `name`. Nothing kept by the
 `IdbPersist` of earlier versions is read: those IndexedDB databases are left
 as they were, and a page may delete them.
 
+### Editing a store with no system (`@gexemu/runtime/store`)
+
+`Store` reads and writes an `OPFSFilesystem`'s store while no system holds
+it: a launcher's installs, saves and settings, without booting a kernel.
+Its format is the kernel's own (`crates/gex-store`, built alone as
+`gex/store.wasm`), so what it writes is what the next boot lays, and the
+records a run wrote (its deletions of the sources' paths, its modes, its
+links) are kept as they are. It runs in a dedicated Worker, which is where
+a sync access handle is had, and holds the store's Web Lock while it is
+open: a system booted meanwhile gets `EBUSY`, as one in another tab would.
+
+```js
+// in a dedicated Worker
+import { Store } from '@gexemu/runtime/store';
+
+const store = await Store.open('my-tree', { wait: true });
+await store.write('/home/user/save.dat', bytes);   // bytes, a string or a Blob
+store.list('/home/user');      // [{ path, type, size, mode, mtime }]
+store.commit();                // the next generation, as a sync writes one
+store.close();
+```
+
+A listing is the store's records, not the sources: `type` is `'file'`,
+`'directory'`, `'symlink'`, `'gone'` (a path of the sources removed),
+`'attrs'` (a file of the sources whose mode changed) or `'lazy'`. Nothing
+is kept until `commit()`, which writes the changes as a generation the
+way a sync does; `commit({ checkpoint: true })` writes every record. A
+file's bytes go into blocks no generation names, so a store left in the
+middle of a write keeps the generation before. A store none of whose
+generations reads is never written (`Store.open` fails with `EIO`), and
+one whose newest is torn opens the one before (`found` is `'fell-back'`).
+
+| Member | Does |
+| --- | --- |
+| `Store.open(name, { wait, signal, baseUrl })` | Opens it; `EBUSY` at once if another page or Worker holds it, unless `wait`. |
+| `Store.erase(name)` | Removes the store. |
+| `Store.copy(from, to, { only, compact, onProgress, signal })` | Copies a store into another, replacing it, while neither is open. Raw by default: the store file's bytes, 16 MiB at a time, written in place, so it needs no room beyond the copy. Compacting with `compact` or `only`: the records at or under `only`'s paths (all when none), their bytes packed, written as one generation; the paths left out are not in the copy. |
+| `blob(path)` | The file as a Blob of slices of the store file, read when asked. The browser refuses a slice once its file has changed: after a later `write`, `commit` or run it throws `NotReadableError`, so read it first or take `read`'s bytes. |
+| `list(prefix)`, `stat(path)`, `readlink(path)`, `read(path, { offset, length })` | The records, and a file's bytes. |
+| `write(path, data, { offset, truncate, mode, mtime })` | A file written, replaced unless `offset` or `truncate: false`. |
+| `remove(path, { hide })` | The record and everything under it gone; `hide` also removes what the sources have there. |
+| `mkdir`, `symlink`, `chmod`, `rename` | As their names say, on records. |
+| `commit({ checkpoint })`, `close()` | Writes a generation; lets the store go (what was not committed is dropped). |
+
 ## Network
 
 The guest's connections out go to the page, which carries them over whatever

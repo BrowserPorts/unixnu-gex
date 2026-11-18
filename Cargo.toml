@@ -23,6 +23,8 @@ members = [
     "crates/gex-xlate",
     "crates/gex-ld",
     "crates/gex-kernel",
+    "crates/gex-store",
+    "hosts/store",
     "crates/gex-wayland",
     "crates/gex-xwm",
     "crates/gex-gpu",
@@ -73,6 +75,7 @@ gex-kmem = { path = "crates/gex-kmem" }
 gex-xlate = { path = "crates/gex-xlate" }
 gex-ld = { path = "crates/gex-ld" }
 gex-kernel = { path = "crates/gex-kernel" }
+gex-store = { path = "crates/gex-store" }
 gex-native = { path = "hosts/native", default-features = false }
 gex-eject = { path = "crates/gex-eject", default-features = false }
 

@@ -20,3 +20,4 @@ tests/darwin/run.sh                      run the Darwin test programs under gexc
 tools/darwin-gen-sysno.py                regenerate the Darwin system call numbers from XNU's syscalls.master
 tools/darwin-sysctl-nodes.py             regenerate the Darwin sysctl nodes from a kernelcache
 tools/darwin-sandbox-blobs.py            extract the Sandbox kext's profile blobs (the boot payload's) from a kernelcache
+scripts/aero/extract-dwm-frame.py        DWM's frame atlas and parts from the user's own aero.msstyles, for /gex/aero/ (glass)

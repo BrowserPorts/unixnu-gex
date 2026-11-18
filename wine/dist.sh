@@ -122,7 +122,7 @@ V=$( { echo "$SC"; cat "$here/link-wineserver.sh"; } | sha256sum | cut -c1-6)
 # Unix-side change rebuilds only the wasm64 tree and the server.
 P=$(git -C "$W" ls-tree -r HEAD | grep -v -P '\t(dlls/[^/]+/unix/|server/|loader/)' | sha256sum | cut -c1-12)
 # The tools only by what builds them, so a DLL change keeps them.
-TP=$(git -C "$W" ls-tree -r HEAD | grep -P '\t(tools/|include/|libs/|nls/|configure|aclocal.m4|Makefile.in$)' | sha256sum | cut -c1-12)
+TP=$( { git -C "$W" ls-tree -r HEAD | grep -P '\t(tools/|include/|libs/|nls/|configure|aclocal.m4|Makefile.in$)'; echo win64; } | sha256sum | cut -c1-12)
 # The display libraries are keyed by what builds them; the wasm64 tree by
 # those, the link and gex-gl's guest library (linked into the loader).
 DH=$( { realpath "$GEX_WASM64_SYSROOT"; cat "$here"/wcc64 "$here"/../toolchain/sysroot/flags64.sh "$here"/deps64.sh "$here"/libs.pins \
@@ -216,6 +216,17 @@ WICU=; [ "${WINE_ICU:-1}" != 0 ] || WICU=-noicu
 # all: every locale, as Wine ships it (no -icuL in the name).
 ICU_LOCALES=${WINE_ICU_LOCALES:-en en_US}
 WIL=; [ -n "$WICU" ] || [ "$ICU_LOCALES" = all ] || WIL=-icuL$( { echo "$ICU_LOCALES"; cat "$here/icudat.py"; } | sha256sum | cut -c1-6)
+# WINE64_MONO=1: Wine Mono in the install, at share/wine/mono/wine-mono-VERSION,
+# where mscoree finds it through WINEDATADIR (wine.pins' WINE_MONO_*, which must
+# be the version this tree's mscoree asks for). Both halves with WoW64, the
+# x86-64 one alone without it. The install's name then gets -monoVERSION.
+MONO=${WINE64_MONO:-0}; WMONO=
+if [ "$MONO" != 0 ]; then
+	eval "$(sed -n 's/^\(WINE_MONO_[A-Z0-9_]*\) *:= *\(.*\)$/\1=\2/p' "$here/wine.pins")"
+	want=$(sed -n 's/^#define WINE_MONO_VERSION "\(.*\)"$/\1/p' "$W/dlls/mscoree/mscoree_private.h")
+	[ "$want" = "$WINE_MONO_VERSION" ] || { log "WINE64_MONO=1: $W's mscoree asks for Wine Mono ${want:-(none)}, wine.pins has $WINE_MONO_VERSION"; exit 1; }
+	WMONO=-mono$WINE_MONO_VERSION
+fi
 # WINE64_MEM64=1: the memory64 flavour: the Unix
 # side compiled with wcc64 -mgex-memory64 and left unlowered (S gets -m64),
 # for a process with a 64-bit memory (gexc run --mem64, the page's
@@ -255,12 +266,14 @@ step() { # NAME CMD...: run CMD in a fresh CACHE/NAME (build trees name their ow
 }
 
 tools_build() {
+	# 64-bit tools (--enable-win64; with no archs configure would make them
+	# -m32): a large program's link needs more than winebuild's 4 GiB
 	# (Wine's configure wants a PE arch on macOS and ARM hosts, even for a
 	# tree only the tools are made in: x86_64's there, MinGW's, which
 	# __tooldeps__ does not build)
 	local pe=(--enable-archs= --without-mingw)
 	case $(uname -s)-$(uname -m) in Linux-x86_64|Linux-i?86) ;; *) pe=(--enable-archs=x86_64) ;; esac
-	"$W/configure" "${pe[@]}" --disable-tests $without
+	"$W/configure" --enable-win64 "${pe[@]}" --disable-tests $without
 	nice -n 10 make -j"$J" __tooldeps__ nls/locale.nls
 }
 log "tools ($TP)"; step tools-$TP tools_build
@@ -497,11 +510,19 @@ dist_make() {
 	# win32u's FreeType reads them, as 32-bit Wine's wine32/stage.sh stages them):
 	# the .ttf and the raster .fon made from them
 	mkdir -p share/wine/fonts && cp -f "$W"/fonts/*.ttf "$C/fon-$F"/fon/*.fon share/wine/fonts/
+	if [ -n "$WMONO" ]; then
+		WINE32_DL_SEED="${WINE32_DL_SEED:-} ${WINE32_CACHE:-$HOME/.cache/gex/wine32}/dl" \
+			"$here/dl.sh" "$WINE_MONO_URL" "$WINE_MONO_SHA256" "$C/dl"
+		mkdir -p share/wine/mono && tar -C share/wine/mono -xf "$C/dl/$(basename "$WINE_MONO_URL")"
+		local m=share/wine/mono/wine-mono-$WINE_MONO_VERSION
+		[ -f "$m/bin/libmono-2.0-x86_64.dll" ] || { echo "wine64-dist: no $m/bin/libmono-2.0-x86_64.dll" >&2; return 1; }
+		[ "$WOW" != 0 ] || rm -rf "$m/lib/x86" "$m/bin/libmono-2.0-x86.dll"
+	fi
 	ln -sfn ../../share "$d/lib/wine/share"
 	# crypt32's root store, the first of its known locations
 	if [ "$TLS" != 0 ]; then mkdir -p etc/ssl/certs && cp -f "$DEPS/install/ca-certificates.crt" etc/ssl/certs/; fi
 }
-log "install ($K, $S, $F, $V$WS$WD$W16$WICU$WIL$WGST$PADT)"; step dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WIL$WGST$PADT dist_make
+log "install ($K, $S, $F, $V$WS$WD$W16$WICU$WIL$WGST$PADT$WMONO)"; step dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WIL$WGST$PADT$WMONO dist_make
 
 ntdll_native() {
 	# The native PE ntdll (LLP64 wasm64 behind a PE32+ skeleton), made
@@ -551,7 +572,7 @@ else
 	fi
 fi
 NK=$( { echo "$S $D${SP:+ split $SP}${SPA:+ split all$W16$WICU$WGST}$XK"; cat "$here"/pelink.py "$here"/pesym.py "$here"/stage-native.sh; } | sha256sum | cut -c1-10)
-DIST=$C/dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WIL$WGST$PADT
+DIST=$C/dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WIL$WGST$PADT$WMONO
 pe_native() {
 	# The native PE core: each DLL's relocatable object and export list
 	# from the wasm64 tree (winegcc leaves them beside the DLL), one module
@@ -680,8 +701,8 @@ STRIP=${WINE64_STRIP:-1}
 if [ "$NPE" != 0 ]; then
 	NI=-n$NK${N32:+-$N32}
 	if [ "$STRIP" = 0 ]; then NI=$NI-dbg; else NI=$NI-s$(sha256sum < "$here/../toolchain/gexcc/windows/stripnames.py" | cut -c1-6); fi
-	log "native install ($K, $NK${N32:+, $N32})"; step dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WIL$WGST$PADT$NI native_make
-	DIST=$C/dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WIL$WGST$PADT$NI
+	log "native install ($K, $NK${N32:+, $N32})"; step dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WIL$WGST$PADT$WMONO$NI native_make
+	DIST=$C/dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WIL$WGST$PADT$WMONO$NI
 fi
 # WINE64_TWIN=1: a twin install (per program): the default
 # install with the memory64 loader beside the lowered one, as

@@ -1,5 +1,7 @@
 import { requestGexDevice, textureCanvas, gpuLive } from './gpu-device.js';
 import { XGlReadback } from './xgl.js';
+import { DwmGlass, dwmGlassConstants } from './dwm-glass.js';
+import { DwmButtonFades, attachDwmIcon, drawDwmBlurBehind, drawDwmFrame, dwmFrameOf, dwmGlassClips, loadDwmFont, DWM_SHADOW } from './dwm-frame.js';
 // gex-wayland's output: a real compositor, in a worker, on WebGPU (the device Mesa uses).
 //
 // Every guest process publishes descriptors for its surfaces into a shared
@@ -107,9 +109,12 @@ struct U {
   texRect: vec4f,   // sub-rectangle of the texture to sample (0..1)
   color: vec4f,
   output: vec2f,    // output size in pixels
-  mode: u32,        // 0 = texture, 1 = solid colour
+  mode: u32,        // 0 = texture, 1 = solid colour, 3 = texture times colour
   swizzle: u32,     // 1 = the texture holds BGRA bytes (wl_shm)
-  opaque: u32,      // 1 = force alpha to 1 (XRGB has no alpha)
+  opaque: u32,      // 1 = force alpha to 1 (XRGB has no alpha), 2 = but in glass
+  glassCount: u32,
+  glass: array<vec4f, 4>, // with opaque 2: where the texture's alpha counts (output pixels)
+  client: vec4f,    // w > 0: a frame DWM draws goes over the texture outside this (output pixels)
 };
 @group(0) @binding(0) var<uniform> u: U;
 @group(0) @binding(1) var samp: sampler;
@@ -128,8 +133,25 @@ struct V { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
 @fragment fn fs(v: V) -> @location(0) vec4f {
   var c = textureSample(tex, samp, v.uv);
   if (u.mode == 1u) { return u.color; }
+  if (u.mode == 3u) { return c * u.color; }
   if (u.swizzle == 1u) { c = c.bgra; }
+  if (u.client.z > 0.0 && (any(v.pos.xy < u.client.xy) || any(v.pos.xy >= u.client.xy + u.client.zw))) {
+    return vec4f(0.0);
+  }
   if (u.opaque == 1u) { c.a = 1.0; }
+  // DWM's rule: a window's alpha counts in its glass and nowhere else (GDI
+  // leaves the alpha byte 0, so anything else would be see-through).
+  if (u.opaque == 2u) {
+    var inGlass = false;
+    for (var i = 0u; i < min(u.glassCount, 4u); i++) {
+      let g = u.glass[i];
+      inGlass = inGlass || (all(v.pos.xy >= g.xy) && all(v.pos.xy < g.xy + g.zw));
+    }
+    if (!inGlass) { c.a = 1.0; }
+  }
+  // wl_shm's pixels are premultiplied (and DWM blends a window's so); the
+  // pipeline's blend is for straight alpha.
+  if (u.swizzle == 1u && c.a > 0.0 && c.a < 1.0) { c = vec4f(min(c.rgb / c.a, vec3f(1.0)), c.a); }
   return c;
 }`;
 
@@ -219,6 +241,8 @@ class Painter {
     this.groups = new WeakMap();
     this.scene = null;
     this.keep = false;
+    /** This frame is drawn into `scene` and copied to the canvas (`begin`). */
+    this.viaScene = false;
   }
 
   #group(tex, nearest) {
@@ -228,7 +252,7 @@ class Painter {
       g = this.device.createBindGroup({
         layout: this.layout,
         entries: [
-          { binding: 0, resource: { buffer: this.uniforms, size: 80 } },
+          { binding: 0, resource: { buffer: this.uniforms, size: 160 } },
           { binding: 1, resource: nearest ? this.nearest : this.sampler },
           { binding: 2, resource: tex.createView() },
         ],
@@ -238,14 +262,16 @@ class Painter {
     return g;
   }
 
-  begin(w, h) {
+  begin(w, h, { glass = false } = {}) {
     // A WebGPU canvas is drawn straight into, in one pass: its texture is
     // written by nothing else. Once a read has asked for the output (a
     // harness, `describe`), the scene is drawn into a texture of its own and
     // copied to the canvas, so it can be read back after the canvas texture
-    // has been presented.
+    // has been presented. So is a frame with glass in it: `glass` copies
+    // what is drawn so far out of the scene to blur it.
     let target;
-    if (this.context && !this.keep) {
+    this.viaScene = !this.context || this.keep || glass;
+    if (!this.viaScene) {
       target = this.context.getCurrentTexture();
     } else {
       if (!this.scene || this.scene.width !== w || this.scene.height !== h) {
@@ -261,6 +287,7 @@ class Painter {
     this.w = w;
     this.h = h;
     this.n = 0;
+    this.dwm?.frame();
     this.encoder = this.device.createCommandEncoder();
     this.pass = this.encoder.beginRenderPass({
       colorAttachments: [{ view: target.createView(), loadOp: 'clear', storeOp: 'store',
@@ -270,7 +297,7 @@ class Painter {
     return true;
   }
 
-  #draw(x, y, w, h, tex, mode, color, swizzle, opaque, uv) {
+  #draw(x, y, w, h, tex, mode, color, swizzle, opaque, uv, glass = null, client = null) {
     if (this.n >= MAX_DRAWS) return;
     const o = (this.n * SLOT) / 4;
     const f = this.f32;
@@ -279,6 +306,12 @@ class Painter {
     f[o + 8] = color[0]; f[o + 9] = color[1]; f[o + 10] = color[2]; f[o + 11] = color[3];
     f[o + 12] = this.w; f[o + 13] = this.h;
     this.u32[o + 14] = mode; this.u32[o + 15] = swizzle; this.u32[o + 16] = opaque;
+    this.u32[o + 17] = glass ? Math.min(glass.length, 4) : 0;
+    for (let i = 0; glass && i < Math.min(glass.length, 4); i++) {
+      const g = glass[i];
+      f[o + 20 + 4 * i] = g.x; f[o + 21 + 4 * i] = g.y; f[o + 22 + 4 * i] = g.w; f[o + 23 + 4 * i] = g.h;
+    }
+    f[o + 36] = client?.x ?? 0; f[o + 37] = client?.y ?? 0; f[o + 38] = client?.w ?? 0; f[o + 39] = client?.h ?? 0;
     // 1:1 and on whole pixels: nearest, so a terminal's glyphs are the
     // client's own pixels and not a blend of two neighbours.
     const nearest = mode === 1 || (w === Math.round(w) && h === Math.round(h) && x === Math.round(x)
@@ -293,15 +326,61 @@ class Painter {
     this.#draw(x, y, w, h, this.white, 1, color, 0, 0, [0, 0, 1, 1]);
   }
 
-  textured(x, y, w, h, tex, { swizzle = 0, opaque = 0, uv = [0, 0, 1, 1] } = {}) {
+  /** `tex`'s pixels times `color` (opacity, tint): the frame artwork. */
+  tinted(x, y, w, h, tex, color, uv = [0, 0, 1, 1]) {
+    if (!tex || w <= 0 || h <= 0) return;
+    this.#draw(x, y, w, h, tex, 3, color, 0, 0, uv);
+  }
+
+  /** A part of an atlas drawn into a rectangle as a nine-grid: `src` its
+   *  [x, y, w, h] in the atlas, `m` its fixed margins [left, right, top,
+   *  bottom], the middle stretched. */
+  nineGrid(tex, src, m, x, y, w, h, color = [1, 1, 1, 1]) {
+    if (!tex || w <= 0 || h <= 0) return;
+    const [l, r, t, b] = m ?? [0, 0, 0, 0];
+    const sx = [src[0], src[0] + l, src[0] + src[2] - r, src[0] + src[2]];
+    const sy = [src[1], src[1] + t, src[1] + src[3] - b, src[1] + src[3]];
+    // Margins larger than the destination share it.
+    const dl = Math.min(l, w / 2), dr = Math.min(r, w / 2), dt = Math.min(t, h / 2), db = Math.min(b, h / 2);
+    const dx = [x, x + dl, x + w - dr, x + w];
+    const dy = [y, y + dt, y + h - db, y + h];
+    for (let j = 0; j < 3; j++) {
+      for (let i = 0; i < 3; i++) {
+        const sw = sx[i + 1] - sx[i], sh = sy[j + 1] - sy[j];
+        const ow = dx[i + 1] - dx[i], oh = dy[j + 1] - dy[j];
+        if (sw <= 0 || sh <= 0 || ow <= 0 || oh <= 0) continue;
+        this.tinted(dx[i], dy[j], ow, oh, tex, color,
+          [sx[i] / tex.width, sy[j] / tex.height, sw / tex.width, sh / tex.height]);
+      }
+    }
+  }
+
+  /** Windows 7's glass under a window, as DWM draws it (dwm-glass.js): what
+   *  is drawn so far, blurred and coloured (`c`, dwmGlassConstants'), in
+   *  `rects` (output pixels). The scene's pass ends for DWM's two passes and
+   *  resumes on the scene. */
+  glass(rects, c) {
+    if (!rects.length) return;
+    this.dwm ??= new DwmGlass(this.device, this.format);
+    this.pass.end();
+    this.dwm.encode(this.encoder, this.scene, this.w, this.h, rects, c);
+    this.pass = this.encoder.beginRenderPass({
+      colorAttachments: [{ view: this.scene.createView(), loadOp: 'load', storeOp: 'store' }],
+    });
+    this.pass.setPipeline(this.pipeline);
+  }
+
+
+
+  textured(x, y, w, h, tex, { swizzle = 0, opaque = 0, uv = [0, 0, 1, 1], glass = null, client = null } = {}) {
     if (!tex) return;
-    this.#draw(x, y, w, h, tex, 0, [0, 0, 0, 0], swizzle, opaque, uv);
+    this.#draw(x, y, w, h, tex, 0, [0, 0, 0, 0], swizzle, glass ? 2 : opaque, uv, glass, client);
   }
 
   end() {
     this.pass.end();
     if (this.n) this.device.queue.writeBuffer(this.uniforms, 0, this.data, 0, this.n * SLOT);
-    if (this.context && this.keep) {
+    if (this.context && this.viaScene) {
       const out = this.context.getCurrentTexture();
       this.encoder.copyTextureToTexture({ texture: this.scene }, { texture: out }, [this.w, this.h]);
     }
@@ -428,22 +507,24 @@ class TextCache {
     this.#device = device;
   }
 
-  get(text) {
-    let e = this.#entries.get(text);
+  get(text, color = 'white', font = null) {
+    const key = color === 'white' && !font ? text : `${color}\u0000${font}\u0000${text}`;
+    let e = this.#entries.get(key);
     if (e) return e;
     // At device pixels and drawn 1:1, so the glyphs are the browser's own
     // rendering at this density, not a resampling of it.
     const cv = new OffscreenCanvas(1, 1);
     let ctx = cv.getContext('2d');
     const px = Math.round(13 * UI);
-    ctx.font = `${px}px system-ui, sans-serif`;
+    const face = font ?? `${px}px system-ui, sans-serif`;
+    ctx.font = face;
     const width = Math.max(1, Math.ceil(ctx.measureText(text).width));
     cv.width = width;
     cv.height = Math.round(18 * UI);
     ctx = cv.getContext('2d');
-    ctx.font = `${px}px system-ui, sans-serif`;
+    ctx.font = face;
     ctx.textBaseline = 'middle';
-    ctx.fillStyle = 'white';
+    ctx.fillStyle = color;
     ctx.fillText(text, 0, cv.height / 2);
     e = { tex: canvasTexture(this.#device, cv), w: cv.width, h: cv.height };
     // A cache with no bound is a leak; titles change rarely and a session has
@@ -455,7 +536,7 @@ class TextCache {
         if (this.#entries.size <= 32) break;
       }
     }
-    this.#entries.set(text, e);
+    this.#entries.set(key, e);
     return e;
   }
 }
@@ -856,6 +937,8 @@ class Compositor {
       // A cursor's hotspot, in its surface's units (CSS pixels for the page).
       win.hotX = s.relX;
       win.hotY = s.relY;
+      // the caption's icon, where its pixels are (dwm-frame.js)
+      attachDwmIcon(s.glass, this.#pixelsOf(s));
       win.info = s;
       // A configure the client has not acked yet: an interactive resize
       // sends its next size once this clears.
@@ -884,6 +967,7 @@ class Compositor {
       }
       win.placed = s.placed;
       win.unmanaged = s.unmanaged;
+      win.grabbing = s.placed && s.grab;
       win.layer = s.layer;
       win.stackId = s.stackId;
       if (s.placed) {
@@ -1001,9 +1085,10 @@ class Compositor {
 
   /** The windows bottom to top: the stacking order, a layer at a time. */
   #stack() {
+    // The desktop layer (3) is under every other window, placed or not.
     const layer = (k) => {
       const w = this.#windows.get(k);
-      return w?.placed ? w.layer : 0;
+      return !w?.placed ? 0 : w.layer === 3 ? -1 : w.layer;
     };
     // `sort` is stable: within a layer, the stacking order stands.
     return [...this.#order].sort((a, b) => layer(a) - layer(b));
@@ -1201,7 +1286,124 @@ class Compositor {
     p.textured(b.x + Math.floor((b.w - size) / 2), b.y + Math.floor((b.h - size) / 2), size, size, x.tex);
   }
 
-  #drawSurface(k, win) {
+  /** DWM's COLORIZATIONOPACITY for `win`'s frame (0..1): the theme's
+   *  TOPFRAME, active or inactive (uDWM's GetNCAreaHelper reads it per frame
+   *  state; Aero's are 100 and 40). */
+  #colorizationOpacity(win) {
+    const g = win.info.glass;
+    const framed = (g.frame & 1) !== 0;
+    const active = framed ? (g.frame & 2) !== 0 : this.#focus === win.key;
+    const q = this.#aeroAtlas()?.parts.get(`TOPFRAME:${active ? 1 : 2}`);
+    const v = q?.properties?.COLORIZATIONOPACITY;
+    return (typeof v === 'number' ? v : active ? 100 : 40) / 100;
+  }
+
+  /** A window's glass (`gex_glass_v1`): its rectangles in output pixels,
+   *  clipped to the window, and DWM's colorization as a tint. */
+  #drawGlass(win) {
+    const g = win.info.glass;
+    const f = this.#frameOf(win);
+    const inside = [];
+    for (const r of g.rects) {
+      // a DWM frame's glass may reach outside the window (a thin frame
+      // drawn out to a thick one's size); other glass stays inside it
+      if (g.frame & 1) { if (r.w > 0 && r.h > 0) inside.push({ ...r }); continue; }
+      const x = Math.max(0, r.x), y = Math.max(0, r.y);
+      const w = Math.min(win.width, r.x + r.w) - x, h = Math.min(win.height, r.y + r.h) - y;
+      if (w > 0 && h > 0) inside.push({ x, y, w, h });
+    }
+    const rects = dwmGlassClips(g, win.width, win.height, f.x, f.y, inside);
+    this.#painter.glass(rects, dwmGlassConstants(g, this.#colorizationOpacity(win)));
+    return rects;
+  }
+
+  // -- Windows 7's frame, from the user's own aero.msstyles ----------------
+  //
+  // scripts/aero/extract-dwm-frame.py pulls DWM's frame atlas and its parts out
+  // of a Windows 7 aero.msstyles; a page that has them serves them at
+  // /gex/aero/. Without them, glass is drawn with no frame artwork.
+  #aero = null; // null: not tried; false: none; else { img, parts }
+
+  #aeroAtlas() {
+    if (this.#aero !== null) return this.#aero || null;
+    this.#aero = false;
+    (async () => {
+      const [json, png] = await Promise.all([
+        fetch('/gex/aero/dwm-parts.json').then((r) => (r.ok ? r.json() : null)),
+        fetch('/gex/aero/dwm-atlas.png').then((r) => (r.ok ? r.blob() : null)),
+        self.fonts ? loadDwmFont(self.fonts) : false,
+      ]);
+      if (!json || !png) return;
+      const img = await createImageBitmap(png, { premultiplyAlpha: 'premultiply', colorSpaceConversion: 'none' });
+      const parts = new Map();
+      for (const p of json.parts) parts.set(`${p.partName}:${p.state}`, p);
+      this.#aero = { img, parts };
+      this.#lastSig = null;
+    })().catch((e) => console.warn('[compositor] no Aero frame artwork', e));
+    return null;
+  }
+
+  /** DWM's frame on a window with glass (dwm-frame.js): drawn with a 2D
+   *  context into an OffscreenCanvas the window's size plus the shadows'
+   *  room, uploaded when it changes, and drawn under the window's client
+   *  area as DWM's frame mesh is. */
+  #drawAeroFrame(win, glass) {
+    const aero = this.#aeroAtlas();
+    if (!aero) return;
+    const g = win.info.glass;
+    const framed = (g.frame & 1) !== 0;
+    const active = framed ? (g.frame & 2) !== 0 : this.#focus === win.key;
+    const f = this.#frameOf(win);
+    const p = this.#painter;
+    const S = DWM_SHADOW;
+    const hovered = this.#hoveredButton(win);
+    const fr = framed ? dwmFrameOf(g, win.width, win.height, win.title, f.x, f.y, this.#outW, this.#outH, hovered) : null;
+    const ox = fr?.ox ?? 0, oy = fr?.oy ?? 0;
+    const W = (fr?.W ?? win.width) + S.l + S.r, H = (fr?.H ?? win.height) + S.t + S.b;
+    if (fr) {
+      win.dwmFades ??= new DwmButtonFades();
+      if (win.dwmFades.update(fr.buttons, performance.now())) this.#fading = true;
+    }
+    const sig = JSON.stringify([g, win.title, f.x, f.y, this.#outW, this.#outH, hovered && [hovered.x, hovered.y], active,
+      fr?.buttons.map((b) => b.fade?.t)]);
+    let d = win.dwmFrame;
+    if (!d || d.canvas.width !== W || d.canvas.height !== H) {
+      d?.tex.destroy();
+      d = win.dwmFrame = { canvas: new OffscreenCanvas(W, H), tex: gpuTexture(p.device, W, H), sig: null };
+    }
+    if (d.sig !== sig) {
+      d.sig = sig;
+      const ctx = d.canvas.getContext('2d');
+      ctx.clearRect(0, 0, W, H);
+      ctx.save();
+      ctx.translate(S.l, S.t);
+      if (framed) drawDwmFrame(ctx, aero, fr);
+      else {
+        drawDwmBlurBehind(ctx, aero, {
+          W: win.width, H: win.height, active,
+          rects: (glass ?? []).map((r) => ({ x: r.x - f.x, y: r.y - f.y, w: r.w, h: r.h })),
+          screen: { x: f.x, y: f.y, vx: 0, vy: 0, vcx: this.#outW, vcy: this.#outH },
+        });
+      }
+      ctx.restore();
+      p.device.queue.copyExternalImageToTexture({ source: d.canvas }, { texture: d.tex, premultipliedAlpha: false }, [W, H]);
+    }
+    p.textured(f.x + ox - S.l, f.y + oy - S.t, W, H, d.tex);
+  }
+
+  /** The caption button of a glass frame under the pointer, if any. */
+  #hoveredButton(win) {
+    const g = win.info?.glass;
+    if (!g || !(g.frame & 1)) return null;
+    const f = this.#frameOf(win);
+    const { x, y } = this.#pointer;
+    for (const b of [g.close, g.max, g.min]) {
+      if (b.state && x >= f.x + b.x && x < f.x + b.x + b.w && y >= f.y + b.y && y < f.y + b.y + b.h) return b;
+    }
+    return null;
+  }
+
+  #drawSurface(k, win, glass = null) {
     const f = this.#frameOf(win);
     // A window whose pixels are the host's GL, not the guest's memory: Mesa's
     // frame, a texture on this device (gpu-device.js textureCanvas).
@@ -1222,9 +1424,17 @@ class Compositor {
       return;
     }
     if (!t) return;
+    // With glass, an opaque window's (XRGB) alpha counts in the glass only,
+    // as under DWM; a window with alpha of its own (ARGB) keeps it.
+    const opaque = win.info?.format === 1;
+    // A frame DWM draws goes over the window outside its client area.
+    const g = win.info?.glass;
+    const c = g?.frame & 1 && g.client?.w > 0 ? g.client : null;
     this.#painter.textured(f.x, f.y, win.width, win.height, t.tex, {
       swizzle: 1,
-      opaque: win.info?.format === 1 ? 1 : 0,
+      opaque: opaque ? 1 : 0,
+      glass: opaque && glass?.length ? glass : null,
+      client: c && { x: f.x + c.x, y: f.y + c.y, w: c.w, h: c.h },
     });
   }
 
@@ -1278,6 +1488,7 @@ class Compositor {
 
   #lastSig = null;
   #skipped = 0;
+  #fading = false;
 
   // An idle frame (`#still`): what the last frame that acked its blocks
   // drew from -- each block's token and generation, the page's messages
@@ -1314,11 +1525,15 @@ class Compositor {
   #signature() {
     // Not the pointer: the cursor is the page's (`#updateCursor`), not drawn.
     const parts = [this.#outW, this.#outH, this.#focus, this.#order.join(',')];
+    // a caption button cross-fading: every frame until it ends
+    if (this.#fading) parts.push(performance.now());
     for (const [k, win] of this.#windows) {
       const f = win.role === ROLE_TOPLEVEL ? this.#frameOf(win) : null;
       parts.push(k, win.role, win.width, win.height, win.relX, win.relY, win.title, win.parent,
         win.placed ? `p${win.layer}${win.unmanaged ? 'u' : ''}` : '',
         f ? `${f.x},${f.y},${f.frameW}` : '', this.#textures.get(k)?.version ?? '-', JSON.stringify(win.info?.glRect ?? null),
+        JSON.stringify(win.info?.glass ?? null), win.info?.glass ? [win.info.glass.close, win.info.glass.max,
+          win.info.glass.min].indexOf(this.#hoveredButton(win)) : '',
         glFrameFor(win)?.serial ?? '');
     }
     return parts.join('|');
@@ -1525,11 +1740,14 @@ class Compositor {
       return;
     }
     this.#lastSig = sig;
+    this.#fading = false;
     // Marks for traces (`console.timeStamp` costs nothing unless tracing).
     console.timeStamp('gex:draw');
     // Nothing to draw into: see `Painter.begin`. The arena is still acked
     // below on the next frame that works, so a restored context catches up.
-    if (this.#painter.begin(this.#outW, this.#outH) === false) {
+    let glass = false;
+    for (const win of this.#windows.values()) glass ||= !!win.info?.glass;
+    if (this.#painter.begin(this.#outW, this.#outH, { glass }) === false) {
       this.#lastSig = null;
       return;
     }
@@ -1541,7 +1759,9 @@ class Compositor {
       const win = this.#windows.get(k);
       if (!win || (win.role !== ROLE_TOPLEVEL && !win.placed)) continue;
       if (this.#decorated(win)) this.#drawDecoration(win, this.#focus === k);
-      this.#drawSurface(k, win);
+      const glass = win.info?.glass ? this.#drawGlass(win) : null;
+      if (glass?.length || win.info?.glass?.frame & 1) this.#drawAeroFrame(win, glass);
+      this.#drawSurface(k, win, glass);
       for (const ck of this.#childrenOf(k)) {
         const child = this.#windows.get(ck);
         if (child) this.#drawSurface(ck, child);
@@ -1683,6 +1903,34 @@ class Compositor {
     sendEvent(this.#channel, win.block, EV_POINTER_CLEAR, 0, 0, 0, 0, win.client, 0);
   }
 
+  /** The placed window whose client grabbed the pointer (a Win32 menu or move
+   *  loop: gex_window_placement_v1.grab, as an X server grab), the topmost
+   *  when several say so: every pointer event is its, wherever the pointer
+   *  is, so a click on another program's window or the desktop reaches the
+   *  loop and ends it (the menu closes) rather than leaving it open. */
+  #clientGrab() {
+    const stack = this.#stack();
+    for (let i = stack.length - 1; i >= 0; i--) {
+      const win = this.#windows.get(stack[i]);
+      if (win?.grabbing) return { key: stack[i], win };
+    }
+    return null;
+  }
+
+  /** The pointer's place, to the grabbing window: it leaves whatever else had it. */
+  #toGrab(g, time) {
+    const { key, win } = g;
+    if (this.#pointer.over && this.#pointer.over !== key) {
+      const prev = this.#windows.get(this.#pointer.over);
+      if (prev && (prev.token !== win.token || prev.client !== win.client)) this.#leave(this.#pointer.over);
+    }
+    this.#pointer.over = key;
+    const at = this.#placeOf(win);
+    const k = win.cs || 1;
+    sendEvent(this.#channel, win.block, EV_MOTION, Math.floor((this.#pointer.x - at.x) / k), Math.floor((this.#pointer.y - at.y) / k),
+      time, 0, win.client, win.surface);
+  }
+
   pointerMove(x, y, time) {
     // Direct present: the page's coordinates are the GL frame's pixels.
     if (this.#direct) {
@@ -1693,6 +1941,11 @@ class Compositor {
     this.#pointer.y = y;
     if (this.#resize) {
       this.#resizeTo(x, y, false);
+      return;
+    }
+    const cg = this.#clientGrab();
+    if (cg) {
+      this.#toGrab(cg, time);
       return;
     }
     // A button held on a placed window: the motion is that window's, inside
@@ -1754,6 +2007,14 @@ class Compositor {
     this.#pointer.buttons = pressed
       ? this.#pointer.buttons | 1
       : this.#pointer.buttons & ~1;
+    const cg = !this.#resize && !this.#drag ? this.#clientGrab() : null;
+    if (cg) {
+      // at the pointer's place: the grab may have begun since its last motion
+      if (pressed) this.#toGrab(cg, time);
+      sendEvent(this.#channel, cg.win.block, EV_BUTTON, button, pressed ? 1 : 0, time, 0, cg.win.client, cg.win.surface);
+      if (!this.#pointer.buttons) this.#grab = null;
+      return;
+    }
     if (!pressed && this.#resize) {
       this.#resizeTo(this.#pointer.x, this.#pointer.y, true);
       this.#resize = null;
@@ -1844,6 +2105,11 @@ class Compositor {
   }
 
   pointerAxis(axis, value, time) {
+    const cg = this.#clientGrab();
+    if (cg) {
+      sendEvent(this.#channel, cg.win.block, EV_AXIS, axis, value, time, 0, cg.win.client, cg.win.surface);
+      return;
+    }
     const hit = this.#hit(this.#pointer.x, this.#pointer.y);
     if (!hit || hit.part !== 'content') return;
     sendEvent(this.#channel, hit.win.block, EV_AXIS, axis, value, time, 0, hit.win.client,
@@ -1861,7 +2127,7 @@ class Compositor {
     if (!this.#focus && pressed) {
       const shown = (w) => w?.role === ROLE_TOPLEVEL && (w.info?.serial ?? 0) > 0 && w.width > 0 && w.height > 0
         && w.x < this.#outW && w.y < this.#outH && w.x + w.width > 0 && w.y + w.height > 0;
-      const top = [...this.#order].reverse().find((o) => shown(this.#windows.get(o)));
+      const top = this.#stack().reverse().find((o) => shown(this.#windows.get(o)));
       if (top) {
         this.#note(`no window has the keyboard; it goes to the top one, ${top}`);
         this.#focusWindow(top);

@@ -184,7 +184,9 @@ if [ -n "$page" ]; then
   # xkb's data: the pinned xkeyboard-config's (toolchain/pins XKB_DATA), as
   # Xwayland's keymap is, the same on any host (a Mac has no /usr/share/X11)
   mkdir -p "$st/usr/share/X11"; cp -rL "$("$ROOT/toolchain/debian-package.sh" XKB_DATA)/usr/share/X11/xkb" "$st/usr/share/X11/"
-  cp -al "$(dirname "$exe")" "$st/g" 2>/dev/null || cp -a "$(dirname "$exe")" "$st/g"
+  # (hard links where the program's folder is on this volume; else a copy, made afresh: a link
+  # attempt across volumes leaves the folders it made, which cp -a would then copy into)
+  cp -al "$(dirname "$exe")" "$st/g" 2>/dev/null || { rm -rf "$st/g" && cp -a "$(dirname "$exe")" "$st/g"; }
   # With the prefix's extended attributes (Wine's DOS attributes: a
   # desktop.ini hidden and system), which page/src/tar.js reads back.
   tar -C "$st" --xattrs --xattrs-include='user.*' -cf "$rt/page/public/gex/nt/app.tar" pfx usr g; rm -rf "$st"

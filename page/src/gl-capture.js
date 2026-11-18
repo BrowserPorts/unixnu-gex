@@ -40,6 +40,19 @@ export class GlCapture {
     this.maxBytes = maxBytes;
     /** Set once the ceiling stopped a batch from being recorded. */
     this.truncated = false;
+    /** The guest processes it has batches from (`from`). */
+    this.clients = new Set();
+  }
+
+  /** A batch of `client`'s is being recorded. */
+  from(client) {
+    this.clients.add(client >>> 0);
+  }
+
+  /** `client` has exited: whether it was the last process recorded, when the
+   *  recording is as whole as it will get. */
+  gone(client) {
+    return this.clients.delete(client >>> 0) && this.clients.size === 0;
   }
 
   /**

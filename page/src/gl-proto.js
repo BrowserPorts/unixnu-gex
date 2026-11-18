@@ -196,6 +196,8 @@ export const op = {
     PUSH_ATTRIB: 198,
     POP_ATTRIB: 199,
     CLIENT_ARRAY: 200,
+    CONTEXT_ADD: 274,
+    CONTEXT_SET_CURRENT: 275,
 };
 
 export const MAGIC = 0x47584547;

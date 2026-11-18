@@ -6,9 +6,17 @@
 
 # The Wine fork: branch w64/gex-surface.
 WINE64_REPO   := https://github.com/MercuryWorkshop/wine-wasm.git
-WINE64_COMMIT := b744bc319ef2a9fed555eeeb77e2ce9acb14a8b5
+WINE64_COMMIT := a42fc652bf9de1f6fa84f0a9ec3d560657454bc7
 
 # The 32-bit Wine tree (branch wasm32-w3-next): the wineserver's build, and
 # the legacy 32-bit dist (make wine32).
 WINE_REPO   := https://github.com/MercuryWorkshop/wine-wasm.git
 WINE_COMMIT := 5ae68e95f71b4af62e080237b6a6d8172bc0b916
+
+# Wine Mono for the 64-bit install (wine/dist.sh with WINE64_MONO=1): the
+# version must be the one mscoree asks for (WINE_MONO_VERSION in
+# dlls/mscoree/mscoree_private.h), which dist.sh checks. The x86 tarball
+# carries both halves; WoW64 keeps both.
+WINE_MONO_VERSION := 11.2.0
+WINE_MONO_URL     := https://dl.winehq.org/wine/wine-mono/11.2.0/wine-mono-11.2.0-x86.tar.xz
+WINE_MONO_SHA256  := c9fb2e2823acf30b000b8806177db0f40751786136dd3f8fb2be7897b1643d06

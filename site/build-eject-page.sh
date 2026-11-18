@@ -1,7 +1,9 @@
 #!/bin/sh
 # An ejected program's web build (crates/gex-eject/README.md): gex's app
-# library (page/src/app.js) built with vite into DIR as app.mjs, its chunks
-# under assets/, and beside it under gex/ the x86 shared-memory shim, kernel
+# library (page/src/app.js) built with vite into DIR as app.mjs, and the
+# offline store editor (page/runtime/src/store.js `Store`, for a dedicated
+# Worker; its `baseUrl` is DIR) as store.mjs, their chunks
+# under assets/, and beside them under gex/ store.wasm, the x86 shared-memory shim, kernel
 # and seed (with the aarch64 set, the export providers), stripped of their
 # names and DWARF unless GEX_KEEP_NAMES=1, Mesa (the wgpu
 # replay, ports/mesa/build.sh) for programs with OpenGL, the X server
@@ -37,10 +39,11 @@ export default {
   logLevel: 'warn',
   build: { ...base.build, outDir: '$OUT', emptyOutDir: true,
            rollupOptions: {
-             input: { app: '$WEB/src/app.js' },
-             // A library: app.mjs keeps its exports (start, fromLaunch).
+             input: { app: '$WEB/src/app.js', store: '$WEB/runtime/src/store.js' },
+             // A library: app.mjs keeps its exports (start, fromLaunch),
+             // store.mjs its Store.
              preserveEntrySignatures: 'strict',
-             output: { entryFileNames: (c) => (c.name === 'app' ? 'app.mjs' : 'assets/[name]-[hash].js'),
+             output: { entryFileNames: (c) => (c.name === 'app' || c.name === 'store' ? \`\${c.name}.mjs\` : 'assets/[name]-[hash].js'),
                        inlineDynamicImports: $ONE },
            } },
 };
@@ -51,6 +54,11 @@ cp "$WEB/vendor/zstddec/zstddec-stream.mjs" "$WEB/vendor/zstddec/zstddec.wasm" "
 for f in gex_browser.x86.shared.wasm gex_kernel.x86.wasm seed.x86.shared.wasm; do
     cp "$WEB/public/gex/$f" "$OUT/gex/$f"
 done
+# The offline store editor's module (hosts/store/build.sh), which store.mjs
+# fetches from gex/ under its baseUrl.
+rm -f "$OUT/gex/store.wasm"
+if [ -f "$WEB/public/gex/store.wasm" ]; then cp "$WEB/public/gex/store.wasm" "$OUT/gex/store.wasm"
+else echo "build-eject-page: no page/public/gex/store.wasm (hosts/store/build.sh): store.mjs will not open a store" >&2; fi
 # The memory64 shim and seed, for a program that runs in a 64-bit memory
 # (runtime.js fetches them then), when this tree has them (GEX_MEM64=1
 # hosts/browser/build.sh)
@@ -111,6 +119,7 @@ rm -f "$OUT/gex/gex-wgpu-replay.deferred.wasm"
 [ ! -f "$WEB/public/gex/gex-wgpu-replay.deferred.wasm" ] ||
     cp "$WEB/public/gex/gex-wgpu-replay.deferred.wasm" "$OUT/gex/"
 [ -f "$OUT/app.mjs" ] || { echo "build-eject-page: vite wrote no app.mjs" >&2; exit 1; }
+[ -f "$OUT/store.mjs" ] || { echo "build-eject-page: vite wrote no store.mjs" >&2; exit 1; }
 # gex's test page is not part of an ejected build.
 if [ -e "$OUT/nt.html" ] || grep -rlI 'nt\.html' "$OUT" --include='*.js' --include='*.mjs' --include='*.html' --include='*.json' >/dev/null 2>&1; then
     echo "build-eject-page: the build has or names nt.html (gex's test page): $(grep -rlI 'nt\.html' "$OUT" | head -3 | tr '\n' ' ')" >&2

@@ -32,6 +32,7 @@ import { setGlobals } from './page-globals.js';
 import { pageHosts } from '../../hosts/browser/js/page-host.mjs';
 import { claimStore, storeBusy } from '../../hosts/browser/js/blocks.mjs';
 import { checkOptions, filesystemValue, sizeValue, showValue } from './start-options.js';
+import { INTERNAL } from '../runtime/src/internal.js';
 import { posixTz } from './posix-tz.js';
 import { mesaSource } from './mesa-source.js';
 import { Dropper, checkDrop, dropItems, walk } from './drop.js';
@@ -53,7 +54,13 @@ const PIECES = {
 /**
  * Start the program. Resolves once it is running, with a handle:
  *   exited    a promise of the exit status (rejects if the run fails)
- *   kill()    stop it now (`exited` resolves 137)
+ *   kill({sync})  stop it now (`exited` resolves 137), once what was written
+ *             has gone to the filesystem's store or `sync` ms (default 5000;
+ *             0: not waited for) have passed; resolves then
+ *   sync()    what was written made durable in the filesystem's store now
+ *             (rejects with the store's error: EIO, ENOSPC)
+ *   fs        the run's filesystem (page/runtime fs.js: readFile, writeFile,
+ *             readdir, rm, ...) until the run stops, else null
  *   resize(size)  the desktop's new size: 'fit' (the container's) or {w, h}
  *   state     what a driver reads (phase, out, error, session, progress, ...)
  *   describe()    the desktop's windows, titles and pixels
@@ -197,10 +204,13 @@ function progressMeter(state, onProgress) {
     elapsed: 0,
     error: null,
     fetch: null,
+    // the rest bundles' background download, once it starts: compressed bytes of this visit's, `complete` at its end
+    rest: null,
     boot: { units: { done: 0, total: 0 }, programs: { done: 0, total: 0 }, program: null, image: null },
     log: [],
   };
   state.progress = p;
+  const onReady = [];
   const log = (kind, text) => {
     p.log.push({ t: Math.round(performance.now() - t0), kind, text });
     if (p.log.length > 50) p.log.splice(0, p.log.length - 50);
@@ -318,7 +328,8 @@ function progressMeter(state, onProgress) {
           // A native module (a Wine builtin) is `providers/<name>-<fingerprint>.wasm`.
           name = unit === 'providers' ? rel.slice('providers/'.length).replace(/-[0-9a-f]+\.wasm$/i, '') : unitNames[unit] || '';
         } else {
-          try { key = decodeURIComponent(new URL(m.what, globalThis.location?.href).pathname); } catch {}
+          // (with its `#OFFSET`: a file in the rest bundle is named by it, not by the bundle)
+          try { const u = new URL(m.what, globalThis.location?.href); key = decodeURIComponent(u.pathname + u.hash); } catch {}
           const l = lazyNames.get(key);
           name = l?.name ?? key.split('/').pop();
           total = l?.size ?? 0;
@@ -363,6 +374,15 @@ function progressMeter(state, onProgress) {
       }
       if (name === 'boot') log('phase', p.compile.total ? `Compiled ${p.compile.done} units; starting the program` : 'Starting the program');
       if (name === 'first-frame') log('phase', `First window after ${secs(p.at[name])}`);
+      emit();
+      if (name === 'ready') for (const f of onReady.splice(0)) f();
+    },
+    /** `f` once the start-up is over. */
+    whenReady(f) { if (p.phase === 'ready') f(); else onReady.push(f); },
+    /** The rest bundles' background download: `done` of `total` compressed bytes, `complete` at its end. */
+    rest(done, total, complete = false) {
+      p.rest = { done, total, complete };
+      if (complete) log('phase', `The rest of the files are here (${(total / 1e6).toFixed(1)} MB downloaded)`);
       emit();
     },
     /** The run is over: 'exited' or 'failed'. */
@@ -822,6 +842,11 @@ async function begin(opts, base, at, state, meter, lets) {
       const ready = await new Promise((r) => {
         w.onmessage = ({ data: m }) => {
           if (m.kind === 'ready') r(m);
+          else if (m.kind === 'rest') meter.rest(m.done, m.total);
+          else if (m.kind === 'ahead') {
+            meter.rest(meter.p.rest?.done ?? 0, meter.p.rest?.total ?? 0, true);
+            say(`[app] rest bundle fetched ahead: ${m.frames} frames, ${(m.bytes / 1e6).toFixed(1)} MB\n`);
+          }
           else if (m.kind === 'bytes') {
             lc.net += m.net;
             lc.cached += m.cached;
@@ -836,6 +861,17 @@ async function begin(opts, base, at, state, meter, lets) {
       if (ready.ok) {
         lc.on = true;
         lazyCache = { ctl };
+        // The rest bundles downloaded in the background as soon as the title files are in (the pieces, the
+        // streamed archive), not after the start-up: the program does not wait for them, and the reads after
+        // find their frames in the owner's store (none while the page is hidden).
+        const restBundles = [...new Set(lazy.map(([, , url]) => String(url)).filter((u) => u.includes('#')).map((u) => u.slice(0, u.lastIndexOf('#'))))];
+        if (restBundles.length && sw.restahead !== '0') {
+          const paused = () => w.postMessage({ kind: 'ahead', paused: document.visibilityState === 'hidden' });
+          Promise.allSettled([pieceBufs, streamed?.done]).then(() => {
+            w.postMessage({ kind: 'ahead', bundles: restBundles, paused: document.visibilityState === 'hidden' });
+            document.addEventListener('visibilitychange', paused);
+          });
+        }
       } else {
         w.terminate();
         lc.why = ready.why;
@@ -945,6 +981,9 @@ async function begin(opts, base, at, state, meter, lets) {
     identities: b.identities ?? null,
     stateful: b.stateful ?? null,
     providerSources: b.providerSources ?? null,
+    // A Wine build run through something else (a launch script): the build's
+    // own loader is the Wine whose game controllers the run starts.
+    wine: exe !== b.exe ? b.exe : null,
     // Once the kernel has its own copy of every file, nothing here may view
     // the bundle's buffer, or it stays resident beside that copy.
     onFilesLoaded: () => {
@@ -1003,11 +1042,32 @@ async function begin(opts, base, at, state, meter, lets) {
   return {
     exited,
     state,
-    kill() {
+    async kill({ sync = 5000 } = {}) {
       if (state.phase === 'done' || state.phase === 'failed') return;
-      sys?.system.shutdown().catch(() => {});
+      // What the program wrote goes to the store first, for as long as
+      // `sync` allows: a tab closed right after keeps it.
+      const s = sys?.system;
+      if (s && sync > 0 && s.state.phase === 'running') {
+        let timer;
+        await Promise.race([s.sync().catch(() => {}), new Promise((r) => { timer = setTimeout(r, sync); })]);
+        clearTimeout(timer);
+      }
+      s?.shutdown().catch(() => {});
       globalThis.__gexSystemWorker?.terminate?.();
       settle(137);
+    },
+    /** The run's files made durable in its store (System.sync). */
+    async sync() {
+      const s = sys?.system;
+      if (!s) throw new Error('sync(): the run has no system yet');
+      await s.sync();
+    },
+    /** The run's filesystem (fs.js), from when its system is made until it
+     *  stops (its files are read and written once the system runs). */
+    get fs() {
+      const s = sys?.system;
+      const over = state.phase === 'done' || state.phase === 'failed' || s?.state.phase === 'stopped' || s?.state.phase === 'failed';
+      return s && !over ? s[INTERNAL].part('filesystem') : null;
     },
     resize(size = 'fit') {
       if (!sizeValue(size)) throw new Error(`resize(${showValue(size)}): 'fit', {w, h} or 'WxH', in pixels`);

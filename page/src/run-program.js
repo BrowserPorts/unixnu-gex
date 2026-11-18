@@ -26,6 +26,18 @@ const DEFAULT_ENV = ['PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sb
 const defined = (o) => Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined && v !== null));
 
 /**
+ * The Wine loader whose game controllers a run starts, or null: the program
+ * itself when it is Wine's loader, else `wine` (a run that starts Wine from
+ * a launch script names the loader it uses); either only with SDL beside it
+ * (`inBundle(path)`), as a 64-bit Wine with controllers has
+ * (wine/dist.sh).
+ */
+export function controllersWine(exe, wine, inBundle) {
+  const loader = /\/wine$/.test(exe) ? exe : (typeof wine === 'string' && /\/wine$/.test(wine) ? wine : null);
+  return loader && inBundle(`${loader.replace(/\/[^/]*$/, '')}/libSDL2-2.0.so.0`) ? loader : null;
+}
+
+/**
  * Options, as runProgram has always taken them:
  *   elf, args           the program's bytes and its argv (args[0] its path)
  *   files, dirs, modes, hard, symlinks, lazy, mtimes, xattrs
@@ -48,6 +60,8 @@ const defined = (o) => Object.fromEntries(Object.entries(o).filter(([, v]) => v 
  *   gl                  'compositor': the guest's GL on the windows' Mesa
  *   glLazy, glSource, glBackend, d3d    MesaGl's start, files, driver, D3D
  *   network, onNetEvent the guest's sockets (page/src/net.js `Sockets`) and their events
+ *   wine                the Wine loader whose controllers a run that is not
+ *                       Wine itself (a launch script) starts (`controllersWine`)
  *   playAudio           /dev/dsp to the speakers (default true)
  *   onFilesLoaded()     the bundle is in the kernel: its bytes can go
  *   onSystem(s)         the running system's parts: { system, host,
@@ -65,7 +79,7 @@ export async function runPreset(term, {
   env = [], cwd = '/', uid, tty = true, filesystem,
   wl = null, wlScale = 1, onDesktop = null, hostX = false,
   gl = null, glLazy = false, glSource = null, glBackend, d3d = false,
-  network = null, onNetEvent = null, playAudio = true, onFilesLoaded = null, onSystem = null,
+  network = null, onNetEvent = null, wine = null, playAudio = true, onFilesLoaded = null, onSystem = null,
   closure = null, closureBuildNumbered, fill, lazyCache, restBundle, identities, stateful, providerSources,
   preModules, lateUnits, heartbeat, recompileObjects, link,
   // Taken and not needed: the System has its own page-fs channel, and the
@@ -146,11 +160,10 @@ export async function runPreset(term, {
   if (network) i.sockets(network);
 
   // (the files are gone from `files` after the boot)
-  const sdl = `${exe.replace(/\/[^/]*$/, '')}/libSDL2-2.0.so.0`;
   const inBundle = (p) => files[p] !== undefined || !!stream?.has(p) || lazy.some(([path]) => path === p);
   await sys.boot();
   // (after the boot: a streamed bundle's files are all in by then)
-  const winePads = /\/wine$/.test(exe) && inBundle(sdl);
+  const winePads = controllersWine(exe, wine, inBundle);
   // The kernel has the files: nothing here views the bundle's bytes now.
   for (const k of Object.keys(image)) delete image[k];
   onFilesLoaded?.();
@@ -163,8 +176,8 @@ export async function runPreset(term, {
   // the page's controllers, and Wine's bus for them started once there is one.
   if (winePads) {
     const gamepads = new Gamepads(sys);
-    const wine = new WineControllers(sys, gamepads, { wine: exe, env: env.length ? env : DEFAULT_ENV });
-    wine.addEventListener('start', (e) => { if (e.code) i.say(`gex: winebus did not start (sc: ${e.code})\n`); });
+    const bus = new WineControllers(sys, gamepads, { wine: winePads, env: env.length ? env : DEFAULT_ENV });
+    bus.addEventListener('start', (e) => { if (e.code) i.say(`gex: winebus did not start (sc: ${e.code})\n`); });
   }
   const disposers = [];
   if (p.pty) {

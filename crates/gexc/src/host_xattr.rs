@@ -99,32 +99,20 @@ fn call(on: &On<'_>, op: XattrOp<'_>) -> Result<usize, Errno> {
                 // No buffer asks for the size; macOS takes one of length
                 // zero as too small.
                 let (b, l) = (if buf.is_empty() { std::ptr::null_mut() } else { buf.as_mut_ptr() as *mut libc::c_void }, buf.len());
-                match &path {
-                    Some(p) => libc::lgetxattr(p.as_ptr(), n.as_ptr(), b, l),
-                    None => libc::fgetxattr(fd, n.as_ptr(), b, l),
-                }
+                sys::get(path.as_deref(), fd, &n, b, l)
             }
             XattrOp::Set { name, value, flags } => {
                 let n = name_c(name)?;
                 let (v, l) = (value.as_ptr() as *const libc::c_void, value.len());
-                (match &path {
-                    Some(p) => libc::lsetxattr(p.as_ptr(), n.as_ptr(), v, l, flags as i32),
-                    None => libc::fsetxattr(fd, n.as_ptr(), v, l, flags as i32),
-                }) as isize
+                sys::set(path.as_deref(), fd, &n, v, l, sys::set_flags(flags)) as isize
             }
             XattrOp::List { buf } => {
                 let (b, l) = (if buf.is_empty() { std::ptr::null_mut() } else { buf.as_mut_ptr() as *mut libc::c_char }, buf.len());
-                match &path {
-                    Some(p) => libc::llistxattr(p.as_ptr(), b, l),
-                    None => libc::flistxattr(fd, b, l),
-                }
+                sys::list(path.as_deref(), fd, b, l)
             }
             XattrOp::Remove { name } => {
                 let n = name_c(name)?;
-                (match &path {
-                    Some(p) => libc::lremovexattr(p.as_ptr(), n.as_ptr()),
-                    None => libc::fremovexattr(fd, n.as_ptr()),
-                }) as isize
+                sys::remove(path.as_deref(), fd, &n) as isize
             }
         }
     };
@@ -180,4 +168,91 @@ fn call(on: &On<'_>, op: XattrOp<'_>) -> Result<usize, Errno> {
         return Err(Errno::from_host(e));
     }
     Ok(r as usize)
+}
+
+/// Linux's calls: `l*` on a path, `f*` on a descriptor.
+#[cfg(target_os = "linux")]
+mod sys {
+    use std::ffi::CStr;
+
+    /// Linux's `XATTR_CREATE` and `XATTR_REPLACE` are the guest's.
+    pub fn set_flags(flags: u32) -> i32 {
+        flags as i32
+    }
+
+    pub unsafe fn get(path: Option<&CStr>, fd: i32, n: &CStr, b: *mut libc::c_void, l: usize) -> isize {
+        match path {
+            Some(p) => libc::lgetxattr(p.as_ptr(), n.as_ptr(), b, l),
+            None => libc::fgetxattr(fd, n.as_ptr(), b, l),
+        }
+    }
+
+    pub unsafe fn set(path: Option<&CStr>, fd: i32, n: &CStr, v: *const libc::c_void, l: usize, flags: i32) -> i32 {
+        match path {
+            Some(p) => libc::lsetxattr(p.as_ptr(), n.as_ptr(), v, l, flags),
+            None => libc::fsetxattr(fd, n.as_ptr(), v, l, flags),
+        }
+    }
+
+    pub unsafe fn list(path: Option<&CStr>, fd: i32, b: *mut libc::c_char, l: usize) -> isize {
+        match path {
+            Some(p) => libc::llistxattr(p.as_ptr(), b, l),
+            None => libc::flistxattr(fd, b, l),
+        }
+    }
+
+    pub unsafe fn remove(path: Option<&CStr>, fd: i32, n: &CStr) -> i32 {
+        match path {
+            Some(p) => libc::lremovexattr(p.as_ptr(), n.as_ptr()),
+            None => libc::fremovexattr(fd, n.as_ptr()),
+        }
+    }
+}
+
+/// XNU's calls (sys/xattr.h): one call for a path and one for a
+/// descriptor, a resource-fork `position` (0 for every other attribute) and
+/// an options word, where `XATTR_NOFOLLOW` is what Linux's `l*` names mean.
+#[cfg(target_os = "macos")]
+mod sys {
+    use std::ffi::CStr;
+
+    /// The guest's `XATTR_CREATE` (1) and `XATTR_REPLACE` (2) as XNU's (2, 4).
+    pub fn set_flags(flags: u32) -> i32 {
+        let mut o = 0;
+        if flags & gex_kernel::vfs::XATTR_CREATE != 0 {
+            o |= libc::XATTR_CREATE;
+        }
+        if flags & gex_kernel::vfs::XATTR_REPLACE != 0 {
+            o |= libc::XATTR_REPLACE;
+        }
+        o
+    }
+
+    pub unsafe fn get(path: Option<&CStr>, fd: i32, n: &CStr, b: *mut libc::c_void, l: usize) -> isize {
+        match path {
+            Some(p) => libc::getxattr(p.as_ptr(), n.as_ptr(), b, l, 0, libc::XATTR_NOFOLLOW),
+            None => libc::fgetxattr(fd, n.as_ptr(), b, l, 0, 0),
+        }
+    }
+
+    pub unsafe fn set(path: Option<&CStr>, fd: i32, n: &CStr, v: *const libc::c_void, l: usize, flags: i32) -> i32 {
+        match path {
+            Some(p) => libc::setxattr(p.as_ptr(), n.as_ptr(), v, l, 0, flags | libc::XATTR_NOFOLLOW),
+            None => libc::fsetxattr(fd, n.as_ptr(), v, l, 0, flags),
+        }
+    }
+
+    pub unsafe fn list(path: Option<&CStr>, fd: i32, b: *mut libc::c_char, l: usize) -> isize {
+        match path {
+            Some(p) => libc::listxattr(p.as_ptr(), b, l, libc::XATTR_NOFOLLOW),
+            None => libc::flistxattr(fd, b, l, 0),
+        }
+    }
+
+    pub unsafe fn remove(path: Option<&CStr>, fd: i32, n: &CStr) -> i32 {
+        match path {
+            Some(p) => libc::removexattr(p.as_ptr(), n.as_ptr(), libc::XATTR_NOFOLLOW),
+            None => libc::fremovexattr(fd, n.as_ptr(), 0),
+        }
+    }
 }

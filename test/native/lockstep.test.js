@@ -19,7 +19,7 @@ import { pool } from '../lib/gexcc.mjs';
 
 export const meta = { hosts: ['node'], timeout: 1800 };
 
-const PROGRAMS = ['ack', 'bits', 'branchy'];
+const PROGRAMS = ['ack', 'bits', 'branchy', 'sse', 'x87'];
 const FIELDS = ['tid', 'pc', 'nr', 'a0', 'a1', 'a2', 'a3', 'a4', 'a5', '|', ...Array.from({ length: 31 }, (_, i) => `x${i}`), 'sp', 'flags', 'vhash'];
 
 /** Per thread, its log lines' fields, in order (`flags: false` drops `f=` fields). */

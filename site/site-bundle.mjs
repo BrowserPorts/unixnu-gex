@@ -49,7 +49,11 @@ export function stripper(work, on, names = false) {
 export function extract(tar, work) {
   const x = join(work, 'tarx');
   mkdirSync(x, { recursive: true });
-  execFileSync('tar', ['-xf', tar, '-C', x]);
+  // GNU tar sets a read-only directory's mode before extracting into it
+  // unless told to wait, and root may not write into it then where the
+  // filesystem checks (a Docker Desktop bind mount): bsdtar always waits.
+  const gnu = /GNU tar/.test(execFileSync('tar', ['--version']).toString());
+  execFileSync('tar', ['-xf', tar, '-C', x, ...(gnu ? ['--delay-directory-restore'] : [])]);
   const readOnly = [];
   const unlock = (d) => {
     for (const e of readdirSync(d, { withFileTypes: true })) {

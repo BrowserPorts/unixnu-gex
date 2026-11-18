@@ -43,6 +43,7 @@
 // the guest's GL. Such a window gets a WebGPU canvas of its own, laid over its
 // 2D one, and the renderer presents into it -- see `#drawGl` below.
 
+import { attachDwmIcon } from './dwm-frame.js';
 import {
   readScene,
   sceneMarks,
@@ -110,7 +111,7 @@ class DomWindow {
     this.decorations = s.role === ROLE_TOPLEVEL && !(s.placed && s.unmanaged) ? 'server' : 'none';
     /** Placed by its client (`gex_window_placement_v1`: a Win32 window, an X
      * menu): `relX`/`relY` are where it goes in the desktop's pixels, and
-     * `layer` (0 normal, 1 topmost, 2 menus) and `onrestack` how it stacks.
+     * `layer` (0 normal, 1 topmost, 2 menus, 3 desktop) and `onrestack` how it stacks.
      * The page does not move it. */
     this.placed = !!s.placed;
     this.layer = s.layer || 0;
@@ -128,6 +129,11 @@ class DomWindow {
      * `showGlCanvas`. */
     this.glCanvas = null;
     this.glFrame = 0;
+    /** Its glass (`gex_glass_v1`), as `readScene` gives it, or null; and
+     * `onglass`, told when that changes (dom-glass.js). */
+    this.glass = s.glass || null;
+    this.glassSig = s.glass ? JSON.stringify(s.glass) : '';
+    this.onglass = null;
     this.canvas = document.createElement('canvas');
     this.canvas.width = Math.max(1, s.width);
     this.canvas.height = Math.max(1, s.height);
@@ -209,6 +215,11 @@ class DomWindow {
   /** Give this window the keyboard. */
   focus() {
     this.#desktop.focus(this);
+  }
+
+  /** Whether this window has the keyboard. */
+  get focused() {
+    return this.#desktop.focused() === this;
   }
 
   /** Give this window a WebGPU canvas of its own for surface `uid`, which the
@@ -308,16 +319,42 @@ class DomWindow {
     }
     const out = this.#image.data;
     const stride = s.stride;
+    // DWM's rule: with glass, an opaque window's (XRGB: GDI's, which leaves
+    // the alpha byte 0) alpha counts in its glass and nowhere else. A window
+    // with alpha of its own (ARGB: per-pixel layered) keeps it everywhere.
+    // As compositor-worker.js's shader.
+    const glass = s.format === 1 && this.glass?.rects?.length ? this.glass.rects : null;
+    // And with a frame DWM draws, the frame goes over the window outside
+    // its client area: the window's own pixels there do not show.
+    const c = this.glass?.frame & 1 && this.glass.client?.w > 0 ? this.glass.client : null;
     let o = 0;
     for (let row = 0; row < h; row++) {
       let i = s.addr + (y + row) * stride + x * 4;
+      const yy = y + row;
+      const spans = glass?.filter((r) => yy >= r.y && yy < r.y + r.h);
       for (let col = 0; col < w; col++, i += 4, o += 4) {
         // shm is ARGB8888 little-endian -- B, G, R, A in memory -- and
         // `ImageData` is R, G, B, A. One swizzle, over the damage only.
         out[o] = mem[i + 2];
         out[o + 1] = mem[i + 1];
         out[o + 2] = mem[i];
-        out[o + 3] = s.format === 1 ? 255 : mem[i + 3];
+        const xx = x + col;
+        let a;
+        if (c && (xx < c.x || xx >= c.x + c.w || yy < c.y || yy >= c.y + c.h)) {
+          a = 0;
+        } else if (glass) {
+          a = spans.some((r) => xx >= r.x && xx < r.x + r.w) ? mem[i + 3] : 255;
+        } else {
+          a = s.format === 1 ? 255 : mem[i + 3];
+        }
+        out[o + 3] = a;
+        // The pixels are premultiplied (wl_shm's ARGB8888; and DWM blends a
+        // window's pixels so): ImageData wants them straight.
+        if (a < 255 && a > 0) {
+          out[o] = Math.min(255, Math.round((out[o] * 255) / a));
+          out[o + 1] = Math.min(255, Math.round((out[o + 1] * 255) / a));
+          out[o + 2] = Math.min(255, Math.round((out[o + 2] * 255) / a));
+        }
       }
     }
     ctx.putImageData(this.#image, x, y);
@@ -797,6 +834,7 @@ export class DomDesktop {
     // A popup, a subsurface or an X menu is placed by its client, not by the
     // page: say where it asked to be.
     win.placed = !!s.placed;
+    win.grabbing = !!s.placed && !!s.grab;
     win.layer = s.layer || 0;
     win.stackId = s.stackId || 0;
     if ((s.role !== ROLE_TOPLEVEL || s.placed) && (s.relX !== win.relX || s.relY !== win.relY)) {
@@ -816,6 +854,17 @@ export class DomDesktop {
     if (s.placed && s.activate !== win.activate) {
       win.activate = s.activate;
       this.focus(win);
+    }
+    // Glass changed: the page moves its panes and frame, and the whole window
+    // is copied again, since which of its pixels are see-through changed.
+    // the caption's icon, where its pixels are (dwm-frame.js)
+    attachDwmIcon(s.glass, this.#pixelsOf(s));
+    const glassSig = s.glass ? JSON.stringify(s.glass) : '';
+    if (glassSig !== win.glassSig) {
+      win.glassSig = glassSig;
+      win.glass = s.glass || null;
+      win.serial = -1;
+      win.onglass?.(win.glass);
     }
     // Nothing to copy when there is no buffer: a window whose pixels are the
     // host's GL has none, and neither has one the window manager published
@@ -985,8 +1034,28 @@ export class DomDesktop {
     }
   }
 
+  /** The placed window whose client grabbed the pointer (a Win32 menu or
+   *  move loop: gex_window_placement_v1.grab, as an X server grab), or null. */
+  #grabber() {
+    for (const w of this.#windows.values()) if (w.grabbing && w.canvas) return w;
+    return null;
+  }
+
+  /** A pointer event on another window's canvas while `g` has the grab: it is
+   *  `g`'s, at the pointer's place relative to `g` (outside it, often), so a
+   *  click on another program's window or the desktop reaches the menu loop,
+   *  which ends it rather than leaving the menu open over that window. */
+  #toGrabber(g, e, pressed) {
+    const r = g.canvas.getBoundingClientRect();
+    const t = Math.round(e.timeStamp);
+    sendEvent(this.#channel, g.block, EV_MOTION, Math.round(e.clientX - r.left), Math.round(e.clientY - r.top), t, 0, g.client, g.surface);
+    const code = BTN[e.button];
+    if (pressed !== undefined && code !== undefined) sendEvent(this.#channel, g.block, EV_BUTTON, code, pressed ? 1 : 0, t, 0, g.client, g.surface);
+  }
+
   #attach(win) {
     const c = win.canvas;
+    const grabbed = () => { const g = this.#grabber(); return g && g !== win ? g : null; };
     // Inside the window, except for a placed window while a button holds the
     // pointer (Wayland's implicit grab): Wine's own move and size loops
     // (SC_MOVE, SC_SIZE) follow the pointer past the window's edge.
@@ -1000,6 +1069,8 @@ export class DomDesktop {
       };
     };
     c.addEventListener('pointerenter', (e) => {
+      const g = grabbed();
+      if (g) { this.#toGrabber(g, e); return; }
       this.#pointerOver = win;
       const p = at(e);
       sendEvent(this.#channel, win.block, EV_MOTION, p.x, p.y, p.t, 0,
@@ -1025,6 +1096,8 @@ export class DomDesktop {
                 p.t, 0, win.client, win.surface);
     };
     c.addEventListener('pointermove', (e) => {
+      const g = grabbed();
+      if (g) { this.#toGrabber(g, e, e.button >= 0 ? (e.buttons & (BIT[e.button] ?? 0)) !== 0 : undefined); return; }
       // Locked: movement only, which the client's relative pointer takes.
       if (this.#locked === win) {
         if (e.movementX || e.movementY) {
@@ -1040,6 +1113,8 @@ export class DomDesktop {
       if (e.button >= 0) button(e, (e.buttons & (BIT[e.button] ?? 0)) !== 0, p);
     });
     c.addEventListener('pointerdown', (e) => {
+      const g = grabbed();
+      if (g) { this.#toGrabber(g, e, true); return; }
       this.#pressed = win;
       if (this.#locked === win) {
         button(e, true, { t: Math.round(e.timeStamp) });
@@ -1058,6 +1133,8 @@ export class DomDesktop {
       button(e, true, p);
     });
     c.addEventListener('pointerup', (e) => {
+      const g = grabbed();
+      if (g && !held.size) { this.#toGrabber(g, e, false); return; }
       const p = at(e);
       try { c.releasePointerCapture?.(e.pointerId); } catch { /* never held */ }
       button(e, false, p);

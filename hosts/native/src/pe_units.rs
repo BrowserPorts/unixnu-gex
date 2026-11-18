@@ -264,7 +264,7 @@ pub fn prepare_pe(pe: &gex_ld::pe::PeImage, base: u64, jobs: usize, verbose: boo
     let (image, seeds) = gex_xlate::func::pe_input(pe, base).map_err(|e| anyhow!("placing the image at {base:#x}: {e}"))?;
     let pv = provided(pe, base);
     let fresh = !cache_root()?.join(unit_key(&image, &pv)).join("c.wasm").exists();
-    let out = prepare_with(&image, &|| gex_xlate::func::recover_pe(&image, &seeds, &Default::default()), jobs, verbose, &pv)?;
+    let out = prepare_with(&image, &|| gex_xlate::func::recover_pe_shaped(&image, &seeds, &Default::default()), None, jobs, verbose, &pv)?;
     if fresh {
         prepare_own_regions(pe, base, &out, jobs, verbose)?;
     }
@@ -318,7 +318,7 @@ pub fn prepare_pe_seeded(pe: &gex_ld::pe::PeImage, base: u64, extra: &[u64], job
     }
     let pv = provided(pe, base);
     let fresh = !cache_root()?.join(unit_key(&image, &pv)).join("c.wasm").exists();
-    let out = prepare_with(&image, &|| gex_xlate::func::recover_pe(&image, &seeds, &Default::default()), jobs, verbose, &pv)?;
+    let out = prepare_with(&image, &|| gex_xlate::func::recover_pe_shaped(&image, &seeds, &Default::default()), None, jobs, verbose, &pv)?;
     if fresh {
         prepare_own_regions(pe, base, &out, jobs, verbose)?;
     }
@@ -822,12 +822,18 @@ pub fn prepare_group(members: &[GroupMember<'_>], jobs: usize) -> Result<GroupBu
 /// [`prepare_pe`] for any recovery input (no providers).
 pub fn prepare_image(image: &gex_ld::Image, seeds: &gex_xlate::func::PeSeeds, jobs: usize, verbose: bool) -> Result<std::path::PathBuf> {
     let none = Provided { providers: Vec::new(), exports: HashMap::new(), stubs: Vec::new(), twins: Vec::new() };
-    prepare_with(image, &|| gex_xlate::func::recover_pe(image, seeds, &Default::default()), jobs, verbose, &none)
+    prepare_with(image, &|| gex_xlate::func::recover_pe_shaped(image, seeds, &Default::default()), None, jobs, verbose, &none)
 }
 
+/// `recover` gives the image's functions as block shapes (a shaped
+/// recovery, from `elf` when it is an ELF file's): each function is given its
+/// statements as the summaries and the recovery's write reach it, and
+/// dropped after, so an image of any size is recovered in the memory its
+/// shapes take.
 fn prepare_with(
     image: &gex_ld::Image,
     recover: &dyn Fn() -> gex_xlate::func::Program,
+    elf: Option<&[u8]>,
     jobs: usize,
     verbose: bool,
     pv: &Provided,
@@ -851,14 +857,23 @@ fn prepare_with(
     if !recovery.join("summaries").exists() {
         let t0 = std::time::Instant::now();
         let prog = recover();
-        let summaries = gex_xlate::summary::analyze(&prog).map;
+        let opts = gex_xlate::func::RecoverOptions::default();
+        let mat = gex_xlate::func::Materializer::new(image, elf, &opts);
+        let summaries =
+            gex_xlate::summary::analyze_functions_by(&prog.functions, &Default::default(), &|f| std::borrow::Cow::Owned(mat.function(f))).map;
         let n = prog.functions.len();
-        let funcs = gex_cgen::select(
-            prog.functions.into_values().collect(),
-            &HashMap::new(),
-            &std::collections::HashSet::new(),
+        let funcs = gex_cgen::select_shaped(prog.functions.into_values().collect(), &std::collections::HashSet::new());
+        gex_cgen::image::write_recovery_by(
+            &recovery,
+            &funcs,
+            &|f| {
+                let f = mat.function(f);
+                gex_cgen::check_selected(&f)?;
+                Ok(std::borrow::Cow::Owned(f))
+            },
+            &summaries,
+            image.class32,
         )?;
-        gex_cgen::image::write_recovery(&recovery, &funcs, &summaries, image.class32)?;
         if verbose {
             eprintln!(
                 "[cgen] recovered {n} functions ({} kept) in {:.1}s",
@@ -1647,7 +1662,7 @@ pub fn elf_image(bytes: &[u8], base: u64) -> Result<gex_ld::Image> {
 pub fn prepare_elf(bytes: &[u8], base: u64, jobs: usize, verbose: bool) -> Result<std::path::PathBuf> {
     let image = elf_image(bytes, base)?;
     let none = Provided { providers: Vec::new(), exports: HashMap::new(), stubs: Vec::new(), twins: Vec::new() };
-    prepare_with(&image, &|| gex_xlate::func::recover(&image, Some(bytes), &Default::default()), jobs, verbose, &none)
+    prepare_with(&image, &|| gex_xlate::func::recover_shaped(&image, Some(bytes), &Default::default()), Some(bytes), jobs, verbose, &none)
 }
 
 /// The load bias of an ELF object one of whose executable `PT_LOAD`s was

@@ -1,7 +1,9 @@
 //! The root kept across loads in its block store (an `OPFSFilesystem`, a
 //! page's own store): what the programs changed of the tree as the sources
 //! laid it, written into the store beside the files' blocks, and laid over
-//! the sources again at the next boot.
+//! the sources again at the next boot. The store's format (its records,
+//! superblocks and chain) is gex-store's (`gex_store::format`), which the
+//! page's offline editor shares; this is the tree's side of it.
 //!
 //! The store's block 0 holds two superblocks, written in turn, each naming
 //! a generation: its number, the newest block of its records and how many
@@ -27,89 +29,41 @@ use super::{FileNode, Inner, Lazy, Node, TmpFs, META};
 use crate::errno::Errno;
 use crate::vfs::blocks;
 use crate::vfs::Metadata;
+use gex_store::format::{self, Body, Journal, Rec, Sb, Xattrs, FNV0};
+#[cfg(test)]
+use gex_store::format::HDR;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-const SB_MAGIC: &[u8; 8] = b"gexroot\x01";
-const SB_LEN: usize = 60;
-/// Superblock `g` is at `(g % 2)` halves of block 0.
-fn sb_at(gen: u64) -> u64 {
-    (gen % 2) * (blocks::block() / 2)
-}
-const CHAIN_MAGIC: u32 = 0x4252_5847; // "GXRB"
-const HDR: usize = 32;
-/// The journal is folded into a new checkpoint once its records are more
-/// bytes than the last checkpoint's, or once it takes this many blocks
-/// (each generation's segment takes a block of its own at least, written
-/// only as far as it is used): a checkpoint is written once per its own
-/// size of journal, not once per its size in generations.
-const JOURNAL_MAX: u64 = 512;
+pub use gex_store::format::{crc32, Found};
+use gex_store::format::fnv;
 
-const CRC_TABLE: [u32; 256] = {
-    let mut t = [0u32; 256];
-    let mut i = 0;
-    while i < 256 {
-        let mut c = i as u32;
-        let mut k = 0;
-        while k < 8 {
-            c = if c & 1 != 0 { 0xedb8_8320 ^ (c >> 1) } else { c >> 1 };
-            k += 1;
-        }
-        t[i] = c;
-        i += 1;
+/// The store as gex-store's generations reach it: the block layer's
+/// uncached reads and writes, and its allocator.
+struct KernelBlocks;
+
+impl format::Blocks for KernelBlocks {
+    fn block(&self) -> u64 {
+        blocks::block()
     }
-    t
-};
-
-/// CRC-32 (IEEE).
-pub fn crc32(b: &[u8]) -> u32 {
-    let mut c = !0u32;
-    for &x in b {
-        c = CRC_TABLE[((c ^ x as u32) & 0xff) as usize] ^ (c >> 8);
+    fn raw(&mut self, op: u32, off: u64, buf: &mut [u8]) -> Result<(), gex_store::Errno> {
+        blocks::raw(op, off, buf).map_err(|e| gex_store::Errno(e.0))
     }
-    !c
-}
-
-/// FNV-1a: a record's signature, which says whether it changed.
-fn fnv(h: u64, b: &[u8]) -> u64 {
-    let mut h = h;
-    for &x in b {
-        h = (h ^ x as u64).wrapping_mul(0x0100_0000_01b3);
+    fn alloc_meta(&mut self) -> Result<u32, gex_store::Errno> {
+        blocks::alloc_meta().map_err(|e| gex_store::Errno(e.0))
     }
-    h
-}
-const FNV0: u64 = 0xcbf2_9ce4_8422_2325;
-
-type Xattrs = Vec<(String, Vec<u8>)>;
-
-#[derive(Debug, Clone, PartialEq)]
-enum Body {
-    Inline(Vec<u8>),
-    /// Size and the store's blocks (each plus one, 0 a hole).
-    Blocks(u64, Vec<u32>),
-    /// A lazy file still fetched from its URL: URL and size.
-    Lazy(String, u64),
+    fn release(&mut self, v: Vec<u32>) {
+        blocks::release(v);
+    }
+    fn high(&self) -> u32 {
+        blocks::high()
+    }
+    fn flush(&mut self) -> Result<(), gex_store::Errno> {
+        blocks::flush_store().map_err(|e| gex_store::Errno(e.0))
+    }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-enum Rec {
-    /// A path of the sources removed, and all under it.
-    Gone,
-    Dir { mode: u32, mtime: i64, xattrs: Xattrs },
-    Link { target: String },
-    /// A file of the sources, its mode changed (read from older stores;
-    /// [`Rec::Attrs`] is written instead).
-    Mode { mode: u32 },
-    /// A file of the sources, its mode or extended attributes changed, its
-    /// bytes not, or a file of a layer laid after boot that has extended
-    /// attributes: laid over the sources' file, or over the layer's when it
-    /// is laid again ([`late_laid`]), so a site's newer file keeps what was
-    /// set on the old one (a `user.gex.mem64` record).
-    Attrs { mode: u32, xattrs: Xattrs },
-    /// `ino` names the file among this generation's records (hard links).
-    File { ino: u64, mode: u32, mtime: i64, body: Body, xattrs: Xattrs },
-}
 
 /// A record as the walk finds it, its file's bytes not yet taken.
 enum Pre {
@@ -120,186 +74,6 @@ enum Pre {
     File { node: Arc<FileNode>, mode: u32, xattrs: Xattrs },
 }
 
-#[derive(Default)]
-struct W(Vec<u8>);
-
-impl W {
-    fn u8(&mut self, v: u8) {
-        self.0.push(v);
-    }
-    fn u32(&mut self, v: u32) {
-        self.0.extend_from_slice(&v.to_le_bytes());
-    }
-    fn u64(&mut self, v: u64) {
-        self.0.extend_from_slice(&v.to_le_bytes());
-    }
-    fn bytes(&mut self, b: &[u8]) {
-        self.u32(b.len() as u32);
-        self.0.extend_from_slice(b);
-    }
-    fn xattrs(&mut self, x: &Xattrs) {
-        self.u32(x.len() as u32);
-        for (k, v) in x {
-            self.bytes(k.as_bytes());
-            self.bytes(v);
-        }
-    }
-    fn rec(&mut self, path: &str, r: &Rec) {
-        self.u8(TAG_PUT);
-        self.bytes(path.as_bytes());
-        match r {
-            Rec::Gone => self.u8(0),
-            Rec::Dir { mode, mtime, xattrs } => {
-                self.u8(1);
-                self.u32(*mode);
-                self.u64(*mtime as u64);
-                self.xattrs(xattrs);
-            }
-            Rec::Link { target } => {
-                self.u8(2);
-                self.bytes(target.as_bytes());
-            }
-            Rec::Mode { mode } => {
-                self.u8(3);
-                self.u32(*mode);
-            }
-            Rec::Attrs { mode, xattrs } => {
-                self.u8(5);
-                self.u32(*mode);
-                self.xattrs(xattrs);
-            }
-            Rec::File { ino, mode, mtime, body, xattrs } => {
-                self.u8(4);
-                self.u64(*ino);
-                self.u32(*mode);
-                self.u64(*mtime as u64);
-                self.xattrs(xattrs);
-                match body {
-                    Body::Inline(d) => {
-                        self.u8(0);
-                        self.bytes(d);
-                    }
-                    Body::Blocks(size, map) => {
-                        self.u8(1);
-                        self.u64(*size);
-                        self.u32(map.len() as u32);
-                        for &b in map {
-                            self.u32(b);
-                        }
-                    }
-                    Body::Lazy(url, size) => {
-                        self.u8(2);
-                        self.bytes(url.as_bytes());
-                        self.u64(*size);
-                    }
-                }
-            }
-        }
-    }
-}
-
-const TAG_MARK: u8 = 1;
-const TAG_PUT: u8 = 2;
-const TAG_DROP: u8 = 3;
-
-struct R<'a>(&'a [u8], usize);
-
-impl R<'_> {
-    fn take(&mut self, n: usize) -> Result<&[u8], Errno> {
-        let b = self.0.get(self.1..self.1 + n).ok_or(Errno::EIO)?;
-        self.1 += n;
-        Ok(b)
-    }
-    fn u8(&mut self) -> Result<u8, Errno> {
-        Ok(self.take(1)?[0])
-    }
-    fn u32(&mut self) -> Result<u32, Errno> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
-    }
-    fn u64(&mut self) -> Result<u64, Errno> {
-        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
-    }
-    fn bytes(&mut self) -> Result<Vec<u8>, Errno> {
-        let n = self.u32()? as usize;
-        Ok(self.take(n)?.to_vec())
-    }
-    fn str(&mut self) -> Result<String, Errno> {
-        String::from_utf8(self.bytes()?).map_err(|_| Errno::EIO)
-    }
-    fn xattrs(&mut self) -> Result<Xattrs, Errno> {
-        let n = self.u32()?;
-        (0..n).map(|_| Ok((self.str()?, self.bytes()?))).collect()
-    }
-    fn rec(&mut self) -> Result<Rec, Errno> {
-        Ok(match self.u8()? {
-            0 => Rec::Gone,
-            1 => Rec::Dir { mode: self.u32()?, mtime: self.u64()? as i64, xattrs: self.xattrs()? },
-            2 => Rec::Link { target: self.str()? },
-            3 => Rec::Mode { mode: self.u32()? },
-            5 => Rec::Attrs { mode: self.u32()?, xattrs: self.xattrs()? },
-            4 => {
-                let (ino, mode, mtime, xattrs) = (self.u64()?, self.u32()?, self.u64()? as i64, self.xattrs()?);
-                let body = match self.u8()? {
-                    0 => Body::Inline(self.bytes()?),
-                    1 => {
-                        let size = self.u64()?;
-                        let n = self.u32()?;
-                        Body::Blocks(size, (0..n).map(|_| self.u32()).collect::<Result<_, _>>()?)
-                    }
-                    2 => Body::Lazy(self.str()?, self.u64()?),
-                    _ => return Err(Errno::EIO),
-                };
-                Rec::File { ino, mode, mtime, body, xattrs }
-            }
-            _ => return Err(Errno::EIO),
-        })
-    }
-}
-
-/// One superblock.
-#[derive(Debug, Clone, Copy, Default)]
-struct Sb {
-    gen: u64,
-    /// The newest block of the records, plus one (0: none).
-    head: u32,
-    /// The store's blocks in use or free (`blocks::high`).
-    high: u32,
-    /// How many blocks the records take.
-    chain: u32,
-    /// The checkpoint's bytes and the journal's since.
-    ck: u64,
-    jb: u64,
-}
-
-impl Sb {
-    fn encode(&self, bs: u32) -> [u8; SB_LEN] {
-        let mut b = [0u8; SB_LEN];
-        b[0..8].copy_from_slice(SB_MAGIC);
-        b[8..12].copy_from_slice(&1u32.to_le_bytes());
-        b[12..16].copy_from_slice(&bs.to_le_bytes());
-        b[16..24].copy_from_slice(&self.gen.to_le_bytes());
-        b[24..28].copy_from_slice(&self.head.to_le_bytes());
-        b[28..32].copy_from_slice(&self.high.to_le_bytes());
-        b[32..36].copy_from_slice(&self.chain.to_le_bytes());
-        b[40..48].copy_from_slice(&self.ck.to_le_bytes());
-        b[48..56].copy_from_slice(&self.jb.to_le_bytes());
-        let c = crc32(&b[..56]);
-        b[56..60].copy_from_slice(&c.to_le_bytes());
-        b
-    }
-    /// `None`: no superblock here; `Some(Err)`: one, but torn.
-    fn decode(b: &[u8], bs: u32) -> Option<Result<Sb, ()>> {
-        if &b[0..8] != SB_MAGIC {
-            return None;
-        }
-        let u32_at = |i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap());
-        let u64_at = |i: usize| u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
-        if crc32(&b[..56]) != u32_at(56) || u32_at(8) != 1 || u32_at(12) != bs {
-            return Some(Err(()));
-        }
-        Some(Ok(Sb { gen: u64_at(16), head: u32_at(24), high: u32_at(28), chain: u32_at(32), ck: u64_at(40), jb: u64_at(48) }))
-    }
-}
 
 struct State {
     fs: TmpFs,
@@ -341,7 +115,7 @@ pub static CHECKPOINTS: AtomicU64 = AtomicU64::new(0);
 /// Commits asked for (by a sync, by the tick), paths the walks looked at,
 /// records they made, and the metadata bytes written (checkpoints among
 /// them): [`stats`].
-pub static ST: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+pub static ST: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 const S_SYNC: usize = 0;
 const S_TICK: usize = 1;
 const S_NODES: usize = 2;
@@ -349,11 +123,12 @@ const S_RECS: usize = 3;
 const S_BYTES: usize = 4;
 const S_CK_BYTES: usize = 5;
 const S_EMPTY: usize = 6;
+const S_EXIT: usize = 7;
 
 /// gens, records put, paths dropped, checkpoints; commits by a sync, by
 /// the tick; paths walked, records walked; metadata bytes, checkpoint
-/// bytes; commits with nothing changed.
-pub fn stats() -> [u64; 11] {
+/// bytes; commits with nothing changed; commits at a process's exit.
+pub fn stats() -> [u64; 12] {
     let l = |a: &AtomicU64| a.load(Ordering::Relaxed);
     [
         l(&GENS),
@@ -367,6 +142,7 @@ pub fn stats() -> [u64; 11] {
         l(&ST[S_BYTES]),
         l(&ST[S_CK_BYTES]),
         l(&ST[S_EMPTY]),
+        l(&ST[S_EXIT]),
     ]
 }
 
@@ -374,19 +150,6 @@ pub fn stats() -> [u64; 11] {
 pub static BOOT_GEN: AtomicU64 = AtomicU64::new(0);
 pub static LAST_ERR: AtomicI64 = AtomicI64::new(0);
 
-/// What a boot found in the store ([`start`]).
-#[derive(Debug, PartialEq, Clone, Copy)]
-pub enum Found {
-    /// Nothing kept: an empty store.
-    Fresh,
-    /// The newest generation, laid over the sources.
-    Restored,
-    /// The newest was torn or failed its checks: the one before it.
-    FellBack,
-    /// Something was kept, but no generation reads whole: started from
-    /// the sources alone.
-    Unreadable,
-}
 
 fn sig_dir(mode: u32, x: &Xattrs) -> u64 {
     let mut h = fnv(FNV0, &[1]);
@@ -543,6 +306,21 @@ impl State {
             }
             sigs.insert(p.clone(), s);
         }
+        // A file's other paths (hard links) are written with it, so that the
+        // generation names them as one file: a link made to a file an
+        // earlier boot kept changes only its own path's signature.
+        let linked = links(&walked);
+        if !linked.is_empty() {
+            let mut more: Vec<&str> = Vec::new();
+            for p in &changed {
+                if let Some(paths) = linked.get(p) {
+                    more.extend(paths.iter().filter(|q| **q != *p && !changed.contains(q)));
+                }
+            }
+            more.sort_unstable();
+            more.dedup();
+            changed.extend(more);
+        }
         let dropped: Vec<&String> = self.committed.keys().filter(|p| !sigs.contains_key(*p)).collect();
         if changed.is_empty() && dropped.is_empty() {
             ST[S_EMPTY].fetch_add(1, Ordering::Relaxed);
@@ -551,76 +329,47 @@ impl State {
             blocks::write_back_all()?;
             return blocks::flush_store();
         }
-        let gen = self.sb.gen + 1;
-        let mut j = W::default();
-        j.u8(TAG_MARK);
-        j.u64(gen);
-        j.u8(0);
+        let mut journal = Journal { sb: self.sb, chain: std::mem::take(&mut self.chain) };
+        let gen = journal.next_gen();
         let by_path: HashMap<&str, &Pre> = walked.iter().map(|(p, r)| (p.as_str(), r)).collect();
-        for p in &changed {
-            j.rec(p, &take(by_path[p]));
-        }
-        for p in &dropped {
-            j.u8(TAG_DROP);
-            j.bytes(p.as_bytes());
-        }
-        let room = (blocks::block() as usize - HDR) as u64;
-        let ck_blocks = self.sb.ck.div_ceil(room);
-        let journal = self.sb.chain as u64 - ck_blocks + (j.0.len() as u64).div_ceil(room);
-        let fold = self.sb.head == 0 || journal > JOURNAL_MAX || self.sb.jb + j.0.len() as u64 > self.sb.ck.max(room);
-        let payload = if fold {
-            let mut c = W::default();
-            c.u8(TAG_MARK);
-            c.u64(gen);
-            c.u8(1);
-            for (p, pre) in &walked {
-                c.rec(p, &take(pre));
-            }
-            c.0
-        } else {
-            j.0
-        };
+        let segment = format::segment(gen, changed.iter().map(|p| (*p, take(by_path[p]))), dropped.iter().map(|p| p.as_str()));
+        let fold = journal.fold(segment.len(), blocks::block());
+        let payload = if fold { format::checkpoint(gen, walked.iter().map(|(p, pre)| (p.as_str(), take(pre)))) } else { segment };
         // The files' bytes the records name, then the records.
-        blocks::write_back_all()?;
-        let prev = if fold { 0 } else { self.sb.head };
-        let new = write_chain(&payload, gen, prev)?;
+        let wrote = blocks::write_back_all().and_then(|()| journal.write(&mut KernelBlocks, &payload, fold).map_err(Errno::from));
+        self.sb = journal.sb;
+        self.chain = journal.chain;
+        wrote?;
         ST[S_BYTES].fetch_add(payload.len() as u64, Ordering::Relaxed);
         if fold {
             ST[S_CK_BYTES].fetch_add(payload.len() as u64, Ordering::Relaxed);
-        }
-        let sb = Sb {
-            gen,
-            head: *new.last().unwrap() + 1,
-            high: blocks::high(),
-            chain: if fold { new.len() as u32 } else { self.sb.chain + new.len() as u32 },
-            ck: if fold { payload.len() as u64 } else { self.sb.ck },
-            jb: if fold { 0 } else { self.sb.jb + payload.len() as u64 },
-        };
-        let wrote = (|| {
-            blocks::flush_store()?;
-            let mut b = sb.encode(blocks::block() as u32);
-            blocks::raw(blocks::OP_WRITE, sb_at(gen), &mut b)?;
-            blocks::flush_store()
-        })();
-        if let Err(e) = wrote {
-            blocks::release(new);
-            return Err(e);
-        }
-        if fold {
-            blocks::release(std::mem::replace(&mut self.chain, new));
             CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.chain.extend(new);
         }
         GENS.fetch_add(1, Ordering::Relaxed);
         PUTS.fetch_add(changed.len() as u64, Ordering::Relaxed);
         DROPS.fetch_add(dropped.len() as u64, Ordering::Relaxed);
-        self.sb = sb;
         self.committed = sigs;
         self.seen = seen;
         self.since = None;
         Ok(())
     }
+}
+
+/// Each path of a file the walk found at more than one path: those paths.
+fn links(walked: &[(String, Pre)]) -> HashMap<&str, Vec<&str>> {
+    let mut by_node: HashMap<*const FileNode, Vec<&str>> = HashMap::new();
+    for (p, pre) in walked {
+        if let Pre::File { node, .. } = pre {
+            by_node.entry(Arc::as_ptr(node)).or_default().push(p.as_str());
+        }
+    }
+    let mut out = HashMap::new();
+    for paths in by_node.into_values().filter(|v| v.len() > 1) {
+        for &p in &paths {
+            out.insert(p, paths.clone());
+        }
+    }
+    out
 }
 
 /// A record's signature: whether it changed since the last generation,
@@ -673,107 +422,6 @@ fn take(pre: &Pre) -> Rec {
     }
 }
 
-/// `payload` as a chain of blocks after `prev` (plus one, 0 none), each
-/// marked `gen`: the blocks, oldest first.
-fn write_chain(payload: &[u8], gen: u64, prev: u32) -> Result<Vec<u32>, Errno> {
-    let bs = blocks::block() as usize;
-    let room = bs - HDR;
-    let mut out: Vec<u32> = Vec::new();
-    let mut prev = prev;
-    let mut buf = vec![0u8; bs];
-    for part in payload.chunks(room) {
-        let b = match blocks::alloc_meta() {
-            Ok(b) => b,
-            Err(e) => {
-                blocks::release(out);
-                return Err(e);
-            }
-        };
-        out.push(b);
-        let n = HDR + part.len();
-        buf[..n].fill(0);
-        buf[0..4].copy_from_slice(&CHAIN_MAGIC.to_le_bytes());
-        buf[8..16].copy_from_slice(&gen.to_le_bytes());
-        buf[16..20].copy_from_slice(&prev.to_le_bytes());
-        buf[20..24].copy_from_slice(&(part.len() as u32).to_le_bytes());
-        buf[HDR..n].copy_from_slice(part);
-        let c = crc32(&buf[8..n]);
-        buf[4..8].copy_from_slice(&c.to_le_bytes());
-        if let Err(e) = blocks::raw(blocks::OP_WRITE, b as u64 * bs as u64, &mut buf[..n]) {
-            blocks::release(out);
-            return Err(e);
-        }
-        prev = b + 1;
-    }
-    Ok(out)
-}
-
-/// The records `sb` names, oldest first, and their blocks; EIO for any
-/// block that fails its checks.
-fn read_chain(sb: &Sb) -> Result<(Vec<u8>, Vec<u32>), Errno> {
-    let bs = blocks::block() as usize;
-    let mut parts: Vec<Vec<u8>> = Vec::new();
-    let mut chain = Vec::new();
-    let mut at = sb.head;
-    let mut buf = vec![0u8; bs];
-    let mut newest = true;
-    while at != 0 {
-        if chain.len() as u32 >= sb.chain || at > sb.high {
-            return Err(Errno::EIO);
-        }
-        let b = at - 1;
-        blocks::raw(blocks::OP_READ, b as u64 * bs as u64, &mut buf)?;
-        let u32_at = |i: usize| u32::from_le_bytes(buf[i..i + 4].try_into().unwrap());
-        let gen = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-        let len = u32_at(20) as usize;
-        if u32_at(0) != CHAIN_MAGIC || len > bs - HDR || crc32(&buf[8..HDR + len]) != u32_at(4) || gen > sb.gen || (newest && gen != sb.gen) {
-            return Err(Errno::EIO);
-        }
-        newest = false;
-        parts.push(buf[HDR..HDR + len].to_vec());
-        chain.push(b);
-        at = u32_at(16);
-    }
-    if chain.len() as u32 != sb.chain {
-        return Err(Errno::EIO);
-    }
-    parts.reverse();
-    chain.reverse();
-    Ok((parts.concat(), chain))
-}
-
-/// The records a stream leaves: the checkpoint's, then each segment's.
-fn replay(stream: &[u8]) -> Result<BTreeMap<String, Rec>, Errno> {
-    let mut r = R(stream, 0);
-    let mut out = BTreeMap::new();
-    let mut first = true;
-    while r.1 < stream.len() {
-        match r.u8()? {
-            TAG_MARK => {
-                let _gen = r.u64()?;
-                let ck = r.u8()?;
-                if first && ck != 1 {
-                    return Err(Errno::EIO);
-                }
-                if ck == 1 {
-                    out.clear();
-                }
-            }
-            TAG_PUT => {
-                let p = r.str()?;
-                let rec = r.rec()?;
-                out.insert(p, rec);
-            }
-            TAG_DROP => {
-                out.remove(&r.str()?);
-            }
-            _ => return Err(Errno::EIO),
-        }
-        first = false;
-    }
-    Ok(out)
-}
-
 /// Remove `p` and everything under it.
 fn remove_tree(inner: &mut Inner, p: &str) {
     let lo = format!("{p}/");
@@ -795,8 +443,9 @@ fn set_xattrs(inner: &mut Inner, ino: u64, x: &Xattrs) {
     }
 }
 
-/// Lay `recs` over the tree; the store's blocks they name marked in `used`.
-fn apply(fs: &TmpFs, recs: &BTreeMap<String, Rec>, used: &mut Vec<bool>) {
+/// Lay `recs` over the tree (the store's blocks they name are taken:
+/// `format::load` marked them).
+fn apply(fs: &TmpFs, recs: &BTreeMap<String, Rec>) {
     let mut inner = fs.inner.lock().unwrap();
     for (p, r) in recs {
         if *r == Rec::Gone {
@@ -804,15 +453,6 @@ fn apply(fs: &TmpFs, recs: &BTreeMap<String, Rec>, used: &mut Vec<bool>) {
         }
     }
     let mut files: HashMap<u64, Arc<FileNode>> = HashMap::new();
-    let mut mark = |b: u32| {
-        if b != 0 {
-            let i = (b - 1) as usize;
-            if used.len() <= i {
-                used.resize(i + 1, false);
-            }
-            used[i] = true;
-        }
-    };
     // In path order: a directory before what is in it.
     for (p, r) in recs {
         match r {
@@ -870,9 +510,6 @@ fn apply(fs: &TmpFs, recs: &BTreeMap<String, Rec>, used: &mut Vec<bool>) {
                         let f = match body {
                             Body::Inline(d) => FileNode::new(d.clone(), new, true),
                             Body::Blocks(size, map) => {
-                                for &b in map {
-                                    mark(b);
-                                }
                                 let f = FileNode::new(Vec::new(), new, true);
                                 *f.pg.lock().unwrap() = Some(blocks::PFile::from_blocks(*size, map.clone()));
                                 f
@@ -906,46 +543,17 @@ fn apply(fs: &TmpFs, recs: &BTreeMap<String, Rec>, used: &mut Vec<bool>) {
 pub fn start(fs: &TmpFs, exclude: Vec<String>) -> Found {
     let fs = TmpFs { inner: Arc::clone(&fs.inner) };
     let seed = seed_of(&fs);
-    let bs = blocks::block() as u32;
-    let mut head = vec![0u8; bs as usize];
-    let read = blocks::raw(blocks::OP_READ, 0, &mut head);
-    let slots: Vec<Option<Result<Sb, ()>>> = if read.is_ok() {
-        (0..2u64).map(|g| Sb::decode(&head[sb_at(g) as usize..sb_at(g) as usize + SB_LEN], bs)).collect()
-    } else {
-        vec![Some(Err(())), None]
-    };
-    let mut ok: Vec<Sb> = slots.iter().filter_map(|s| s.and_then(|r| r.ok())).collect();
-    ok.sort_by(|a, b| b.gen.cmp(&a.gen));
-    let torn = slots.iter().any(|s| matches!(s, Some(Err(()))));
-    let any = slots.iter().any(|s| s.is_some());
-    let max_gen = ok.first().map_or(0, |s| s.gen);
-    let mut found = if any { Found::Unreadable } else { Found::Fresh };
-    let mut st = State { fs, exclude, seed, committed: HashMap::new(), sb: Sb { gen: max_gen, ..Default::default() }, chain: Vec::new(), seen: 0, since: None };
-    let mut used = vec![true];
-    for (i, sb) in ok.iter().enumerate() {
-        let Ok((stream, chain)) = read_chain(sb) else { continue };
-        let Ok(recs) = replay(&stream) else { continue };
-        for &b in &chain {
-            let b = b as usize;
-            if used.len() <= b {
-                used.resize(b + 1, false);
-            }
-            used[b] = true;
-        }
-        apply(&st.fs, &recs, &mut used);
-        blocks::rebuild(sb.high, &used);
+    let l = format::load(&mut KernelBlocks);
+    let mut st = State { fs, exclude, seed, committed: HashMap::new(), sb: l.journal.sb, chain: l.journal.chain, seen: 0, since: None };
+    if l.found == Found::Restored || l.found == Found::FellBack {
         // The next generation goes over the other superblock: after a
         // fall back, the one that failed.
-        st.sb = *sb;
-        st.chain = chain;
-        found = if i == 0 && !torn { Found::Restored } else { Found::FellBack };
-        BOOT_GEN.store(sb.gen, Ordering::Relaxed);
-        break;
-    }
-    if found != Found::Restored && found != Found::FellBack {
+        apply(&st.fs, &l.recs);
+        blocks::rebuild(st.sb.high, &l.used);
+        BOOT_GEN.store(st.sb.gen, Ordering::Relaxed);
+    } else {
         // Fresh, or nothing whole: the store is used from block 1 up.
-        blocks::rebuild(1, &used);
-        st.sb.head = 0;
+        blocks::rebuild(1, &l.used);
     }
     // What the generation holds, as signatures of the tree now.
     let walked = st.walk();
@@ -953,7 +561,7 @@ pub fn start(fs: &TmpFs, exclude: Vec<String>) -> Found {
     st.seen = META.load(Ordering::Relaxed);
     blocks::defer_frees();
     *STATE.lock().unwrap() = Some(st);
-    found
+    l.found
 }
 
 /// `sync(2)`, `syncfs`, `fsync`, `fdatasync`, the page's sync: a generation
@@ -991,6 +599,22 @@ pub fn tick(age: u32) -> Result<u32, Errno> {
         return Ok(0);
     }
     ST[S_TICK].fetch_add(1, Ordering::Relaxed);
+    st.commit()?;
+    Ok(1)
+}
+
+/// A process has ended: when the tree changed or a block is dirty since the
+/// last generation, one is written now, before its parent hears of the
+/// exit, so what a program wrote is kept once it has ended (an installer's
+/// files, before the page can be left or reloaded), not a write-back's age
+/// later. 1 when one was written, 0 when nothing was waiting.
+pub fn exited() -> Result<u32, Errno> {
+    let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(st) = g.as_mut() else { return Ok(0) };
+    if META.load(Ordering::Relaxed) == st.seen && !blocks::aged(0) {
+        return Ok(0);
+    }
+    ST[S_EXIT].fetch_add(1, Ordering::Relaxed);
     st.commit()?;
     Ok(1)
 }
@@ -1147,6 +771,33 @@ mod tests {
         reset();
     }
 
+    /// A process's exit writes a generation when anything is waiting, so an
+    /// installer's files are kept once it has ended with no write-back tick
+    /// or sync after it; with nothing waiting it writes none.
+    #[test]
+    #[ignore]
+    fn an_exit_keeps_what_was_written() {
+        STORE_FILE.lock().unwrap().clear();
+        let fs = boot();
+        start(&fs, vec![]);
+        let gen = || STATE.lock().unwrap().as_ref().unwrap().sb.gen;
+        let g0 = gen();
+        assert_eq!(exited().unwrap(), 0, "nothing written: no generation");
+        assert_eq!(gen(), g0);
+        fs.mkdir("prog", 0o755).unwrap();
+        write(&fs, "prog/app.exe", &big(60000, 3));
+        write(&fs, "prog/small.dll", b"dll");
+        assert_eq!(exited().unwrap(), 1, "an install's files: a generation");
+        assert_eq!(gen(), g0 + 1);
+        assert_eq!(exited().unwrap(), 0, "and none again for nothing new");
+
+        // The next boot, with no tick or sync since the exit.
+        let fs = boot();
+        assert_eq!(start(&fs, vec![]), Found::Restored);
+        assert_eq!(read(&fs, "prog/app.exe").unwrap(), big(60000, 3));
+        assert_eq!(read(&fs, "prog/small.dll").unwrap(), b"dll");
+    }
+
     /// Extended attributes set on a file of the sources (a program's
     /// `user.gex.mem64` record) are kept across boots without its bytes:
     /// the next boot's sources, newer bytes, keep them, as does a written
@@ -1257,6 +908,43 @@ mod tests {
         for i in 350..400 {
             assert_eq!(read(&fs, &format!("d/f{}", i % 50)).unwrap(), big(300, i as u8));
         }
+        reset();
+    }
+
+    /// Each boot numbers the files it lays and makes afresh, and a
+    /// generation's records name files by that boot's numbers. Records from
+    /// two boots that happen to share a number are two files at the next
+    /// boot, not one file and a hard link to it; a hard link made in a later
+    /// boot to a file an earlier one kept stays a hard link.
+    #[test]
+    #[ignore]
+    fn records_of_two_boots_are_never_taken_for_hard_links() {
+        STORE_FILE.lock().unwrap().clear();
+        let fs = boot();
+        assert_eq!(start(&fs, vec![]), Found::Fresh);
+        // Made in an order other than the paths': the next boot, which lays
+        // them in path order, numbers them the other way round.
+        write(&fs, "z", b"zed");
+        write(&fs, "a", b"aye");
+        write(&fs, "m", b"em");
+        sync().unwrap();
+
+        let fs = boot();
+        assert_eq!(start(&fs, vec![]), Found::Restored);
+        // Only a and the new link to m change: their records are this
+        // boot's, beside z's and m's of the boot before.
+        write(&fs, "a", b"aye again");
+        fs.link("m", "m2").unwrap();
+        sync().unwrap();
+
+        let fs = boot();
+        assert_eq!(start(&fs, vec![]), Found::Restored);
+        assert_eq!(read(&fs, "a").unwrap(), b"aye again");
+        assert_eq!(read(&fs, "z").unwrap(), b"zed");
+        assert_eq!(read(&fs, "m").unwrap(), b"em");
+        // m and m2 are one file.
+        write(&fs, "m2", b"both");
+        assert_eq!(read(&fs, "m").unwrap(), b"both");
         reset();
     }
 }

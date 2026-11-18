@@ -4,7 +4,7 @@
 set -e
 here=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$1"
-LLVM_CONFIG=${LLVM_CONFIG:-$(command -v llvm-config || command -v llvm-config-22)}
+LLVM_CONFIG=${LLVM_CONFIG:-$(command -v llvm-config-22 || command -v llvm-config)}
 # A plugin's LLVM symbols are the loading clang's: macOS's linker is told so.
 undef=
 [ "$(uname -s)" != Darwin ] || undef="-undefined dynamic_lookup"

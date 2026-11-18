@@ -14,6 +14,16 @@
 #define GEX_X87_SE (GEX_CTX_X87_TMP + 8u)
 #define GEX_X87_SW (GEX_CTX_X87_TMP + 12u)
 
+/* The four operations the emitted C calls (gex_x87_arith, _compare,
+ * _narrow, _toint) are out of line, as GEX_MX_SLOW is: a soft-float body
+ * inlined at every x87 statement made one d3dx9_43.dll function (1,389
+ * instructions, 810 calls here) need more than clang's 1536 MiB, and left it
+ * to tier-1; out of line it compiles in 412 MB. What they share stays
+ * inlined into them: an out-pointer (gex_x87_div's, gex_x87_divlu's) must
+ * stay a register, since an out-of-line callee would put its target on the
+ * shadow stack. */
+#define GEX_X87_OP static __attribute__((noinline, unused))
+
 /* The import, for everything the fast paths leave. */
 GEX_INLINE uint64_t gex_x87_slow(int ctx, int32_t op, uint64_t asig, uint32_t ase, uint64_t bsig,
                                  uint32_t bse, uint32_t cw) {
@@ -30,7 +40,7 @@ GEX_INLINE uint32_t gex_x87_up(uint32_t cw, uint32_t sign, uint32_t rb, uint32_t
 }
 
 /* fst m32 / m64 (X87Op::Narrow): normal results, every rounding mode. */
-GEX_INLINE uint64_t gex_x87_narrow(int ctx, uint64_t sig, uint32_t se, uint32_t cw, uint32_t single) {
+GEX_X87_OP uint64_t gex_x87_narrow(int ctx, uint64_t sig, uint32_t se, uint32_t cw, uint32_t single) {
     uint32_t e = se & 0x7fff, sign = (se >> 15) & 1;
     uint32_t drop = single ? 40 : 11, frac = single ? 23 : 52, total = single ? 32 : 64;
     int32_t bias = single ? 127 : 1023;
@@ -55,7 +65,7 @@ GEX_INLINE uint64_t gex_x87_narrow(int ctx, uint64_t sig, uint32_t se, uint32_t 
 }
 
 /* fist / fisttp (X87Op::ToInt): zero, and normal |v| < 2^(bits-1). */
-GEX_INLINE uint64_t gex_x87_toint(int ctx, uint64_t sig, uint32_t se, uint32_t cw, uint32_t bits,
+GEX_X87_OP uint64_t gex_x87_toint(int ctx, uint64_t sig, uint32_t se, uint32_t cw, uint32_t bits,
                                   uint32_t trunc) {
     uint32_t e = se & 0x7fff, sign = (se >> 15) & 1;
     if (sig == 0 && e == 0) {
@@ -185,7 +195,7 @@ GEX_INLINE uint64_t gex_x87_div(int ctx, uint64_t asig, uint32_t ase, uint64_t b
  * with exponents at most 63 apart, an effective subtraction at least 2),
  * division of normal operands with a normal result, and a zero with a
  * normal operand; the rest through the import. */
-GEX_INLINE uint64_t gex_x87_arith(int ctx, uint32_t k, uint64_t asig, uint32_t ase, uint64_t bsig,
+GEX_X87_OP uint64_t gex_x87_arith(int ctx, uint32_t k, uint64_t asig, uint32_t ase, uint64_t bsig,
                                   uint32_t bse, uint32_t cw) {
     uint32_t ae = ase & 0x7fff, be = bse & 0x7fff;
     uint32_t anorm = (int64_t)asig < 0 && ae - 1 <= 0x7ffd, bnorm = (int64_t)bsig < 0 && be - 1 <= 0x7ffd;
@@ -279,7 +289,7 @@ GEX_INLINE uint64_t gex_x87_arith(int ctx, uint32_t k, uint64_t asig, uint32_t a
 /* fcom / fucom (X87Op::Compare): zeros and normal numbers inline. Returns
  * the condition codes (C0 less, C3 equal, C0|C2|C3 unordered); the status
  * bits go to the context. */
-GEX_INLINE uint32_t gex_x87_compare(int ctx, uint32_t quiet, uint64_t asig, uint32_t ase, uint64_t bsig,
+GEX_X87_OP uint32_t gex_x87_compare(int ctx, uint32_t quiet, uint64_t asig, uint32_t ase, uint64_t bsig,
                                     uint32_t bse) {
     uint32_t ae = ase & 0x7fff, be = bse & 0x7fff;
     int aok = (asig == 0 && ae == 0) | ((int64_t)asig < 0 && ae - 1 <= 0x7ffd);

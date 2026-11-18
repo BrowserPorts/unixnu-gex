@@ -68,7 +68,10 @@ pub mod caller {
 /// What ended the machine.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Kind {
-    /// `halt_all_cpus(FALSE)`: `PEHaltRestart(kPEHaltCPU)`.
+    /// `halt_all_cpus(FALSE)`: `PEHaltRestart(kPEHaltCPU)`; and
+    /// `PEHaltRestart(kPEUPSDelayHaltCPU)`, which the arm platform expert
+    /// halts with the same `PE_halt_restart(kPEHaltCPU)`
+    /// ([`super::reboot::host_reboot_kind`]).
     Halt,
     /// `halt_all_cpus(TRUE)`: `PEHaltRestart(kPERestartCPU)`.
     Restart,

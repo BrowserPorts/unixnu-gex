@@ -900,12 +900,7 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             _ => bad(),
         },
         (Kobject::HostPriv, 401) => match arg(req, 0) {
-            Some(options) => {
-                let what = k.darwin_host_reboot(options as u32);
-                let mut r = Reply::err(MIG_BAD_ID);
-                r.unimplemented = Some(what);
-                r
-            }
+            Some(options) => k.darwin_host_reboot(options as u32),
             _ => bad(),
         },
         (Kobject::HostPriv, 414) => k.darwin_exc_set(super::exception::Level::Host, 0, req, false),

@@ -353,6 +353,27 @@ pub struct ChildEnd {
     pub stopped: bool,
 }
 
+/// What `proc_shutdown`'s filters (`sd_filt1`, `sd_filt2`) read of a
+/// process on `allproc` ([`ProcTable::rebootscan`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScanProc {
+    pub pid: i32,
+    /// `p_ppid`: 0 for initproc.
+    pub ppid: i32,
+    /// `p_shutdownstate`.
+    pub shutdownstate: u8,
+    /// `P_LDELAYTERM`.
+    pub delayterm: bool,
+    /// `p_stat == SZOMB`: it has ended.
+    pub zombie: bool,
+    /// `proc_is_driver`: its task's requested apptype is
+    /// `TASK_APPTYPE_DRIVER`.
+    pub driver: bool,
+    /// `p_sigcatch`, Darwin's mask; none while its fork has not made its
+    /// record (`P_REF_NEW`).
+    pub sigcatch: Option<u32>,
+}
+
 /// A Darwin process's job control state, beside its exit status.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Job {
@@ -493,6 +514,19 @@ struct Proc {
     crash: Vec<u8>,
     /// A line gex adds to its crash's reason ([`ProcTable::add_crash_line`]).
     crash_more: Vec<u8>,
+    /// Darwin's `p_shutdownstate`: how far `proc_shutdown` has taken it
+    /// (1 SIGTERM posted, 2 SIGKILL posted, 3 made to exit).
+    shutdownstate: u8,
+    /// Darwin's `P_LIST_EXITCOUNT`: counted in `proc_shutdown_exitcount`
+    /// until its `proc_exit`.
+    exitcount: bool,
+    /// Darwin's `P_LDELAYTERM` (`kern.delayterm`): `proc_shutdown` signals
+    /// it only in its second round. A fork does not copy it.
+    delayterm: bool,
+    /// The `p_xstat` another process's `exit1` of it committed it to
+    /// (`proc_shutdown`'s `sd_callback3`): its end's status, whatever then
+    /// ends its threads.
+    forced: Option<u32>,
 }
 
 /// Another process's memory as a host holds it: bytes at a guest address,
@@ -649,6 +683,12 @@ struct Table {
     load: Load,
     /// The crashes not yet taken ([`ProcTable::take_crashes`]), oldest first.
     crashes: std::collections::VecDeque<Crash>,
+    /// Darwin's `proc_shutdown_exitcount`: the processes `proc_shutdown`
+    /// has signalled and still waits on.
+    shutdown_exitcount: u32,
+    /// How many times `proc_exit` has woken `proc_shutdown_exitcount`'s
+    /// sleeper ([`ProcTable::shutdown_wait`]).
+    shutdown_wakeups: u64,
 }
 
 impl Table {
@@ -803,6 +843,9 @@ pub struct ProcTable {
     /// Notified when a process crashes ([`ProcTable::crash_queue`]); made
     /// when first asked for, once the host's queues are there.
     crash_q: std::sync::OnceLock<crate::wait::Queue>,
+    /// `proc_shutdown_exitcount`'s sleep channel, with the table's lock as
+    /// its mutex (`proc_list_mlock`).
+    shutdown_cv: std::sync::Condvar,
 }
 
 impl std::fmt::Debug for ProcTable {
@@ -883,11 +926,18 @@ impl ProcTable {
                     usage: Usage::default(),
                     crash: Vec::new(),
                     crash_more: Vec::new(),
+                    shutdownstate: 0,
+                    exitcount: false,
+                    delayterm: false,
+                    forced: None,
                 }],
                 gone_cpu_ns: 0,
                 load: Load::default(),
                 crashes: std::collections::VecDeque::new(),
+                shutdown_exitcount: 0,
+                shutdown_wakeups: 0,
             }),
+            shutdown_cv: std::sync::Condvar::new(),
         };
         // forkproc's cloning of initproc: init is internal, in no band.
         t.jetsam().add(INIT_PID, 0, true, crate::darwin::memorystatus::relaunch::UNKNOWN);
@@ -981,6 +1031,10 @@ impl ProcTable {
             usage: Usage::default(),
             crash: Vec::new(),
             crash_more: Vec::new(),
+            shutdownstate: 0,
+            exitcount: false,
+            delayterm: false,
+            forced: None,
         });
         drop(t);
         // forkproc's memorystatus init, then memorystatus_add.
@@ -1270,6 +1324,12 @@ impl ProcTable {
     /// `pid` ends with `status` kept for its parent; `word` is the same end
     /// as a wait status, which says whether it is a crash.
     fn end(&self, pid: i32, status: i32, word: i32) {
+        // exit1 by another process (proc_shutdown's): p_xstat is what it
+        // committed the process to, whatever ended its threads.
+        let (status, word) = match self.forced_exit(pid) {
+            Some(rv) => (rv as i32, rv as i32),
+            None => (status, word),
+        };
         // proc_exit's stash of a Darwin process's usage in p_ru, for
         // proc_pid_rusage of the zombie.
         if let Some(p) = self.darwin(pid).and_then(|(r, _)| r.downcast::<crate::darwin::procinfo::Public>().ok()) {
@@ -1289,6 +1349,16 @@ impl ProcTable {
             // proc_exit's fixjobc, before its children go to init.
             if let Some((pgid, sid)) = t.procs.iter().find(|p| p.pid == pid).map(|p| (p.pgid, p.sid)) {
                 t.fixjobc(pid, pgid, sid, false, &mut jobc_orphaned);
+            }
+            // proc_exit, under the list's lock: one fewer process for
+            // proc_shutdown to wait on, and its wakeup at none.
+            if let Some(i) = t.procs.iter().position(|p| p.pid == pid && p.exitcount) {
+                t.procs[i].exitcount = false;
+                t.shutdown_exitcount = t.shutdown_exitcount.wrapping_sub(1);
+                if t.shutdown_exitcount == 0 {
+                    t.shutdown_wakeups += 1;
+                    self.shutdown_cv.notify_all();
+                }
             }
             let mut orphans = Vec::new();
             for p in t.procs.iter_mut() {
@@ -2006,6 +2076,204 @@ impl ProcTable {
         self.lock().procs.iter().find(|p| p.pid == pid).is_some_and(|p| p.reboot)
     }
 
+    /// `pid`'s `P_LDELAYTERM` (`kern.delayterm`).
+    pub fn delayterm(&self, pid: i32) -> bool {
+        self.lock().procs.iter().find(|p| p.pid == pid).is_some_and(|p| p.delayterm)
+    }
+
+    /// Set or clear `pid`'s `P_LDELAYTERM`.
+    pub fn set_delayterm(&self, pid: i32, on: bool) {
+        if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == pid) {
+            p.delayterm = on;
+        }
+    }
+
+    /// `proc_rebootscan(callout, filter)`: `proc_shutdown_exitcount`
+    /// zeroed, then `allproc` walked from its head (the latest made first)
+    /// under the list's lock, and the first process `filter` takes is given
+    /// to `callout` with the lock let go; then the walk starts again from
+    /// the head, until `filter` takes none. A process whose fork has not
+    /// made it yet (`P_REF_NEW`, no record) is waited for, as `proc_ref`
+    /// waits; so is one `filter` cannot judge before then (`None`).
+    pub fn rebootscan(&self, filter: impl Fn(&ScanProc) -> Option<bool>, mut callout: impl FnMut(i32)) {
+        let mut t = self.lock();
+        t.shutdown_exitcount = 0;
+        loop {
+            let mut next = None;
+            let mut wait = false;
+            for p in t.procs.iter().rev().filter(|p| p.zseq == 0) {
+                let record = p.darwin.as_ref().and_then(|r| Arc::clone(r).downcast::<crate::darwin::procinfo::Public>().ok());
+                let view = ScanProc {
+                    pid: p.pid,
+                    ppid: p.ppid,
+                    shutdownstate: p.shutdownstate,
+                    delayterm: p.delayterm,
+                    zombie: p.child.status.lock().map(|s| s.is_some()).unwrap_or(true),
+                    driver: p.child.policy.lock().unwrap_or_else(|e| e.into_inner()).requested.apptype == crate::darwin::taskpolicy::apptype::DRIVER,
+                    sigcatch: record.as_ref().map(|r| r.live.sigcatch.load(Ordering::Acquire)),
+                };
+                match filter(&view) {
+                    Some(false) => continue,
+                    Some(true) if record.is_some() => {
+                        next = Some(p.pid);
+                        break;
+                    }
+                    _ => {
+                        wait = true;
+                        break;
+                    }
+                }
+            }
+            if wait {
+                t = self.shutdown_cv.wait_timeout(t, std::time::Duration::from_millis(1)).unwrap_or_else(|e| e.into_inner()).0;
+                continue;
+            }
+            let Some(pid) = next else { return };
+            drop(t);
+            callout(pid);
+            t = self.lock();
+        }
+    }
+
+    /// The part of `sd_callback1`, `sd_callback2` and `sd_callback3` under
+    /// the process's lock: its `p_shutdownstate` is `state`; one not yet a
+    /// zombie (whether it is is the answer) is counted, with `count`, as a
+    /// process to wait for (`P_LIST_EXITCOUNT`, `proc_shutdown_exitcount`).
+    pub fn shutdown_mark(&self, pid: i32, state: u8, count: bool) -> bool {
+        let mut t = self.lock();
+        let Some(i) = t.procs.iter().position(|p| p.pid == pid) else { return false };
+        t.procs[i].shutdownstate = state;
+        let live = t.procs[i].child.status.lock().map(|s| s.is_none()).unwrap_or(false);
+        if live && count {
+            t.procs[i].exitcount = true;
+            t.shutdown_exitcount = t.shutdown_exitcount.wrapping_add(1);
+        }
+        live
+    }
+
+    /// `proc_shutdown`'s wait after a round that signalled `active`
+    /// processes: while `proc_shutdown_exitcount` is not zero, `msleep` on
+    /// it with the list's lock for `secs` seconds (PWAIT, so no signal ends
+    /// it); one that does not end with `proc_exit`'s wakeup (EWOULDBLOCK,
+    /// `_sleep`'s answer to THREAD_TIMED_OUT) takes `P_LIST_EXITCOUNT` off
+    /// every process, `allproc`'s and `zombproc`'s. The sleep's error.
+    pub fn shutdown_wait(&self, active: u32, secs: u64) -> i32 {
+        const EWOULDBLOCK: i32 = 35;
+        if active == 0 || self.lock().shutdown_exitcount == 0 {
+            return 0;
+        }
+        let mut t = self.lock();
+        if t.shutdown_exitcount == 0 {
+            return 0;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        let woken = t.shutdown_wakeups;
+        let error = loop {
+            if t.shutdown_wakeups != woken {
+                break 0;
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break EWOULDBLOCK;
+            }
+            t = self.shutdown_cv.wait_timeout(t, deadline - now).unwrap_or_else(|e| e.into_inner()).0;
+        };
+        if error != 0 {
+            for p in t.procs.iter_mut() {
+                p.exitcount = false;
+            }
+        }
+        error
+    }
+
+    /// The processes on `allproc` whose `p_shutdownstate` is `state`, in
+    /// its order.
+    pub fn shutdown_in_state(&self, state: u8) -> Vec<i32> {
+        self.lock().procs.iter().rev().filter(|p| p.zseq == 0 && p.shutdownstate == state).map(|p| p.pid).collect()
+    }
+
+    /// `sd_callback3`'s claim of `pid`'s exit for the calling thread of
+    /// another process (`p->exit_thread`), for `exit1(p, rv)`: false when
+    /// its exit has begun already (`P_LEXIT`: some thread is doing it).
+    /// From here its own exit is not the one it makes: it ends with `rv`
+    /// (`exit_with_reason` terminates a thread that finds another thread
+    /// its process's exit thread).
+    pub fn claim_exit(&self, pid: i32, rv: u32) -> bool {
+        let mut t = self.lock();
+        let Some(p) = t.procs.iter_mut().find(|p| p.pid == pid) else { return false };
+        if p.lexit {
+            return false;
+        }
+        p.lexit = true;
+        p.forced = Some(rv);
+        true
+    }
+
+    /// `exit1(p, rv)` of a process [`ProcTable::claim_exit`] claimed:
+    /// `p_xstat` is `rv` (a wait status) and no exit reason;
+    /// `proc_prepareexit` (`P_REF_DEAD`, its move to `zombproc`); its task
+    /// terminated, which here is its threads' SIGKILL, no signal posted
+    /// (no NOTE_SIGNAL). It ends with `rv`, which is what its own
+    /// `proc_prepareexit` tests ([`ProcTable::forced_exit`]).
+    pub fn exit_claimed(&self, pid: i32) {
+        let mut t = self.lock();
+        let Some(p) = t.procs.iter_mut().find(|p| p.pid == pid) else { return };
+        p.exit_reason = None;
+        p.pending.fetch_or(1u64 << (SIGKILL - 1), Ordering::AcqRel);
+        SIGNAL_SEQ.fetch_add(1, Ordering::Release);
+        p.queue.notify();
+        t.mark_exited(pid);
+    }
+
+    /// The `p_xstat` another process's `exit1` committed `pid` to, if one
+    /// did.
+    pub fn forced_exit(&self, pid: i32) -> Option<u32> {
+        self.lock().procs.iter().find(|p| p.pid == pid).and_then(|p| p.forced)
+    }
+
+    /// Process `pid`'s `task_suspend_internal` (`place_task_hold`, normal):
+    /// one more user stop, its threads held at their next look. False for
+    /// a task that is not active (it has ended, or has no record).
+    pub fn task_suspend_internal(&self, pid: i32) -> bool {
+        let job = {
+            let t = self.lock();
+            match t.procs.iter().find(|p| p.pid == pid) {
+                Some(p) if p.child.status.lock().map(|s| s.is_none()).unwrap_or(false) => Arc::clone(&p.child.job),
+                _ => return false,
+            }
+        };
+        job.lock().unwrap_or_else(|e| e.into_inner()).holds += 1;
+        self.job_changed(pid);
+        true
+    }
+
+    /// The processes whose threads can still run while one thread of
+    /// `pid` shuts the system down: its own other threads, and any other
+    /// live process with a thread that no hold stops. (pid, how many of
+    /// its threads).
+    pub fn runnable_besides(&self, pid: i32) -> Vec<(i32, usize)> {
+        let t = self.lock();
+        let virtual_init = self.virtual_init.load(Ordering::Acquire);
+        let mut out = Vec::new();
+        for p in t.procs.iter().filter(|p| p.zseq == 0) {
+            if p.child.status.lock().map(|s| s.is_some()).unwrap_or(true) || (virtual_init && p.pid == INIT_PID) {
+                continue;
+            }
+            let held = p.child.job.lock().unwrap_or_else(|e| e.into_inner()).holds > 0;
+            // Its first thread's id is its own; the others are the table's.
+            let mut n = t.threads.values().filter(|&&q| q == p.pid).count() + 1;
+            if p.pid == pid {
+                n -= 1;
+            } else if held {
+                continue;
+            }
+            if n > 0 {
+                out.push((p.pid, n));
+            }
+        }
+        out
+    }
+
     /// `pid`'s `p_exit_reason`, a zombie's too.
     pub fn exit_reason(&self, pid: i32) -> Option<crate::signal::Note> {
         self.lock().procs.iter().find(|p| p.pid == pid).and_then(|p| p.exit_reason.clone())
@@ -2622,6 +2890,101 @@ mod tests {
         t.set_darwin(a, Arc::new(()));
         t.jetsam_kill(a, 0, Arc::new(crate::darwin::reason::OsReason::new(1, 2)));
         assert!(matches!(t.darwin(a), Some((_, true))));
+    }
+
+    fn darwin_proc(t: &ProcTable, catch: u32) -> i32 {
+        let a = t.spawn(INIT_PID);
+        let r = crate::darwin::procinfo::Public::kernel();
+        r.live.sigcatch.store(catch, Ordering::Release);
+        t.set_darwin(a, Arc::new(r));
+        a
+    }
+
+    /// proc_rebootscan walks allproc from its latest process, starting
+    /// again after each callout, past the processes the filter refuses;
+    /// proc_shutdown_exitcount starts at zero.
+    #[test]
+    fn a_reboot_scan_walks_from_the_latest_process_and_starts_again() {
+        let t = ProcTable::new();
+        let (a, b, c) = (darwin_proc(&t, 0x4000), darwin_proc(&t, 0), darwin_proc(&t, 0x4000));
+        let mut seen = Vec::new();
+        t.rebootscan(
+            |p| Some(p.ppid != 0 && p.shutdownstate == 0 && p.sigcatch? & 0x4000 != 0),
+            |pid| {
+                seen.push(pid);
+                assert!(t.shutdown_mark(pid, 1, true));
+            },
+        );
+        assert_eq!(seen, vec![c, a]);
+        assert_eq!(t.shutdown_in_state(1), vec![c, a]);
+        assert!(t.shutdown_in_state(0).contains(&b));
+        assert_eq!(t.lock().shutdown_exitcount, 2);
+        t.rebootscan(|_| Some(false), |_| unreachable!());
+        assert_eq!(t.lock().shutdown_exitcount, 0);
+    }
+
+    /// proc_exit's drop of proc_shutdown_exitcount wakes the shutdown's
+    /// wait when it reaches none; a wait no exit ends answers EWOULDBLOCK
+    /// and takes P_LIST_EXITCOUNT off every process.
+    #[test]
+    fn the_shutdown_waits_for_the_counted_processes_to_end() {
+        let t = Arc::new(ProcTable::new());
+        let (a, b) = (darwin_proc(&t, 0), darwin_proc(&t, 0));
+        t.rebootscan(|p| Some(p.ppid != 0 && p.shutdownstate == 0), |pid| {
+            t.shutdown_mark(pid, 2, true);
+        });
+        let t2 = Arc::clone(&t);
+        let ender = std::thread::spawn(move || {
+            t2.exit(a, 9);
+            t2.exit(b, 9);
+        });
+        assert_eq!(t.shutdown_wait(2, 10), 0);
+        ender.join().unwrap();
+        // None counted now: no wait.
+        assert_eq!(t.shutdown_wait(1, 10), 0);
+        let c = darwin_proc(&t, 0);
+        t.rebootscan(|p| Some(p.pid == c && p.shutdownstate == 0), |pid| {
+            t.shutdown_mark(pid, 1, true);
+        });
+        let started = std::time::Instant::now();
+        assert_eq!(t.shutdown_wait(1, 1), 35);
+        assert!(started.elapsed() >= std::time::Duration::from_secs(1));
+        // Its count's flag is gone: its end drops nothing.
+        t.exit(c, 9);
+        assert_eq!(t.lock().shutdown_exitcount, 1);
+    }
+
+    /// exit1 by another process: the claim fails for a process whose exit
+    /// has begun; a claimed one is past proc_prepareexit at once and ends
+    /// with exit1's status, whatever ends its threads.
+    #[test]
+    fn exit1_of_another_process_ends_it_with_exit1s_status() {
+        let t = ProcTable::new();
+        let a = darwin_proc(&t, 0);
+        assert!(t.claim_exit(a, 1));
+        assert!(!t.claim_exit(a, 1), "its exit has begun");
+        t.exit_claimed(a);
+        assert!(matches!(t.darwin(a), Some((_, true))));
+        assert!(t.take_signals(a) & (1 << (SIGKILL - 1)) != 0);
+        assert_eq!(t.forced_exit(a), Some(1));
+        t.exit(a, 9);
+        assert_eq!(t.xstat(a), Some(1));
+        let h = t.handle(a).unwrap();
+        assert_eq!(*h.status.lock().unwrap(), Some(1));
+        let b = darwin_proc(&t, 0);
+        t.begin_exit(b, None);
+        assert!(!t.claim_exit(b, 1));
+    }
+
+    /// P_LDELAYTERM is the process's own: a fork does not copy it.
+    #[test]
+    fn delayterm_is_not_inherited() {
+        let t = ProcTable::new();
+        let a = darwin_proc(&t, 0);
+        t.set_delayterm(a, true);
+        let b = t.spawn(a);
+        assert!(t.delayterm(a));
+        assert!(!t.delayterm(b));
     }
 
     #[test]

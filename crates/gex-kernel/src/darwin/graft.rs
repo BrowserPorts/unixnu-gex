@@ -712,10 +712,10 @@ impl Kernel {
     /// [`Kernel::darwin_write_graft_file_xattrs`]); its device
     /// ([`graftfs::graft_devt`], EBUSY); and its volume served at the
     /// directory ([`graftfs::GraftMount`]). `FSCTL_GRAFT_PRESERVE_MOUNT`
-    /// marks the host mount a system mount (`vfs_setmntsystem`), which only
-    /// an unmount reads, and this kernel unmounts nothing; the graft's
-    /// fsevent goes to no reader, the fsevents device being reported where
-    /// it is opened.
+    /// marks the host mount a system mount (`vfs_setmntsystem`,
+    /// 0xfffffff006686e6c), which keeps it through the first of the
+    /// shutdown's `vfs_unmountall` passes; the graft's fsevent goes to no
+    /// reader, the fsevents device being reported where it is opened.
     fn darwin_apfs_graft_make(&mut self, volume: u32, file: &Found, dir: &Found, flags: u64, image: super::apfsread::Volume) -> Result<(), Errno> {
         let mnt = file.mnt.unwrap_or_else(|| super::kern::mount_of(&file.path));
         let Some(host) = super::preboot::made().filter(|_| super::kern::is_preboot(mnt)) else {
@@ -756,6 +756,9 @@ impl Kernel {
         let fs = std::sync::Arc::new(graftfs::GraftFs { vol: image, base, len, dir_ino: dir.md.ino, dir_parent_ino, devt, seal });
         self.vfs.mount(&dir.path, std::sync::Arc::new(graftfs::GraftMount(std::sync::Arc::clone(&fs))));
         graftfs::add(graftfs::Graft { host_volume: volume, host_devt, file_path: file.path.clone(), file_ino: file.md.ino, dir_path: dir.path.clone(), dir_ino: dir.md.ino, flags, fs }, devc, handed);
+        if flags & fsctl::PRESERVE_MOUNT != 0 {
+            mnt.state().kern_flag |= super::kern::MNTK_SYSTEM;
+        }
         Ok(())
     }
 

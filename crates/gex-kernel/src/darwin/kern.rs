@@ -166,15 +166,28 @@ pub struct MountState {
     /// left them: `f_blocks`, `f_bfree`, `f_bavail`, `f_files`, `f_ffree`;
     /// none before it was first refreshed.
     pub stat: Option<[u64; 5]>,
+    /// `mnt_kern_flag`'s `MNTK_SYSTEM` (kept through the shutdown's first
+    /// `vfs_unmountall`) and `MNTK_UNMOUNT`.
+    pub kern_flag: u32,
 }
 
-/// `MNT_LUNMOUNT`, `MNT_LMOUNT` (`mount_internal.h`).
+/// `MNT_LUNMOUNT`, `MNT_LFORCE`, `MNT_LMOUNT`, `MNT_LDEAD`
+/// (`mount_internal.h`).
 pub const MNT_LUNMOUNT: u32 = 0x2;
+pub const MNT_LFORCE: u32 = 0x4;
 pub const MNT_LMOUNT: u32 = 0x80;
+pub const MNT_LDEAD: u32 = 0x100;
+
+/// `MNTK_SYSTEM`, `MNTK_UNMOUNT` (`mount_internal.h`).
+pub const MNTK_SYSTEM: u32 = 0x40;
+pub const MNTK_UNMOUNT: u32 = 0x0100_0000;
+
+/// `MNT_ASYNC` (`mount.h`).
+pub const MNT_ASYNC: u32 = 0x40;
 
 impl Mount {
     pub fn new(on: &'static str, from: From, fsid: u64, flags: u32, fs: Fs, vol: Option<super::volattrs::Vol>, owner: u32, apfs_ro: Option<bool>) -> Mount {
-        Mount { on, from, fsid, fs, vol, owner, state: std::sync::Mutex::new(MountState { flags, lflag: 0, from_name: None, apfs_ro, stat: None }) }
+        Mount { on, from, fsid, fs, vol, owner, state: std::sync::Mutex::new(MountState { flags, lflag: 0, from_name: None, apfs_ro, stat: None, kern_flag: 0 }) }
     }
 
     /// `mnt_flag`.
@@ -210,9 +223,9 @@ pub enum Fs {
 /// `MNT_RDONLY`, `MNT_NOSUID`, `MNT_LOCAL`, `MNT_ROOTFS`, `MNT_DOVOLFS`,
 /// `MNT_DONTBROWSE`, `MNT_JOURNALED`, `MNT_MULTILABEL`, `MNT_NOATIME`,
 /// `MNT_SNAPSHOT`, `MNT_CPROTECT`.
-const MNT_RDONLY: u32 = 0x1;
+pub(crate) const MNT_RDONLY: u32 = 0x1;
 pub(crate) const MNT_NOSUID: u32 = 0x8;
-const MNT_LOCAL: u32 = 0x1000;
+pub(crate) const MNT_LOCAL: u32 = 0x1000;
 pub(crate) const MNT_ROOTFS: u32 = 0x4000;
 const MNT_DOVOLFS: u32 = 0x8000;
 const MNT_DONTBROWSE: u32 = 0x10_0000;
@@ -313,6 +326,9 @@ fn boot_mounts() -> Vec<Mount> {
     // devfs_mount's devfs_statfs left devfs's counts as they were at its
     // mount in bsd_init ([`DEVFS_STAT_STAND_IN`]).
     refresh_stat(&mounts[1]);
+    // devfs_kernel_mount's KERNEL_MOUNT_DEVFS: mount_common marks the
+    // kernel's devfs a system mount.
+    mounts[1].state().kern_flag |= MNTK_SYSTEM;
     if boot_state() == BootState::Booted {
         match booted_preboot_mount() {
             Ok(m) => mounts.push(m),
@@ -376,8 +392,10 @@ pub const DEVFS_STAT_STAND_IN: &str = "devfs's statfs counts as its mount at boo
 /// mount made by any. A mount's record lives as long as the system.
 static MOUNT_LIST: std::sync::RwLock<Vec<&'static Mount>> = std::sync::RwLock::new(Vec::new());
 
-/// The mounts, in the order of the mount list.
-pub fn mounts() -> Vec<&'static Mount> {
+/// Every mount ever made, in the order they were: the mount list with the
+/// mounts the shutdown's `vfs_unmountall` took off it ([`MNT_LDEAD`])
+/// still in their places, so an index into it names one mount for good.
+fn every_mount() -> Vec<&'static Mount> {
     {
         let l = MOUNT_LIST.read().unwrap_or_else(|e| e.into_inner());
         if !l.is_empty() {
@@ -391,7 +409,13 @@ pub fn mounts() -> Vec<&'static Mount> {
     l.clone()
 }
 
-/// How many mounts the list has.
+/// The mounts, in the order of the mount list (`mount_list_remove` has
+/// taken the unmounted ones off it).
+pub fn mounts() -> Vec<&'static Mount> {
+    every_mount().into_iter().filter(|m| m.state().lflag & MNT_LDEAD == 0).collect()
+}
+
+/// How many mounts have been made.
 pub fn mount_count() -> usize {
     {
         let l = MOUNT_LIST.read().unwrap_or_else(|e| e.into_inner());
@@ -399,14 +423,14 @@ pub fn mount_count() -> usize {
             return l.len();
         }
     }
-    mounts().len()
+    every_mount().len()
 }
 
-/// The mount `path` was on when the list had `seen` mounts: a vnode
+/// The mount `path` was on when [`mount_count`] was `seen`: a vnode
 /// looked up then keeps the mount it is on (`v_mount`), whatever has been
-/// mounted on its path since. The list only grows: nothing unmounts here.
+/// mounted on its path since, even once that mount is gone.
 pub fn mount_of_seen(path: &str, seen: usize) -> &'static Mount {
-    let l = mounts();
+    let l = every_mount();
     let n = seen.clamp(1, l.len());
     l[..n]
         .iter()
@@ -414,6 +438,13 @@ pub fn mount_of_seen(path: &str, seen: usize) -> &'static Mount {
         .filter(|mt| path == mt.on || path.starts_with(&format!("{}/", mt.on.trim_end_matches('/'))))
         .max_by_key(|mt| mt.on.len())
         .unwrap_or(l[0])
+}
+
+/// `mount_list_remove` at the end of an unmount: the mount is off the
+/// list, `MNT_LDEAD`, and the list's generation moves.
+pub fn mount_list_remove(mnt: &Mount) {
+    mnt.state().lflag |= MNT_LDEAD;
+    MOUNT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 }
 
 /// The mount the vnode an open file is on is on (`v_mount`): the one its
@@ -424,7 +455,7 @@ pub fn mount_of_file(file: &crate::file::OpenFile) -> &'static Mount {
 
 /// Put `mnt` at the end of the mount list (`mount_list_add`).
 pub fn mount_list_add(mnt: Mount) -> &'static Mount {
-    mounts();
+    every_mount();
     let mnt: &'static Mount = Box::leak(Box::new(mnt));
     MOUNT_LIST.write().unwrap_or_else(|e| e.into_inner()).push(mnt);
     MOUNT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -433,6 +464,12 @@ pub fn mount_list_add(mnt: Mount) -> &'static Mount {
 
 /// `mount_generation`: how many times the mount list has changed.
 static MOUNT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `mount_generation++`: an unmount under way makes the name cache's
+/// copies of mount points stale.
+pub fn bump_mount_generation() {
+    MOUNT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+}
 
 /// How many times the mount list has changed.
 pub fn mount_generation() -> u64 {
@@ -660,14 +697,15 @@ pub fn mount_of(path: &str) -> &'static Mount {
         .copied()
         .filter(|mt| path == mt.on || path.starts_with(&format!("{}/", mt.on.trim_end_matches('/'))))
         .max_by_key(|mt| mt.on.len())
-        .unwrap_or(l[0])
+        .or_else(|| l.first().copied())
+        .unwrap_or_else(|| every_mount()[0])
 }
 
 /// The mount the vnode `mnt` covers is on (`vfs_vnodecovered`'s
 /// `v_mount`): among the mounts before it in the list, the one with the
 /// longest mount point that holds its own. The root covers none: itself.
 pub fn covered_mount(mnt: &Mount) -> &'static Mount {
-    let l = mounts();
+    let l = every_mount();
     let n = l.iter().position(|m| std::ptr::eq(*m, mnt)).unwrap_or(l.len());
     l[..n]
         .iter()
@@ -929,9 +967,11 @@ impl Kernel {
             sys::MMAP => res(self.darwin_mmap(m, a)),
             sys::MADVISE => res(self.darwin_madvise(m, a)),
             sys::MSYNC | sys::MSYNC_NOCANCEL => res(self.darwin_msync(m, a)),
-            // VFS_SYNC of each mount: what a process writes goes through to
-            // its file already.
-            sys::SYNC => 0,
+            // sync: VFS_SYNC of each writable mount (super::reboot).
+            sys::SYNC => {
+                self.darwin_sync();
+                0
+            }
             sys::IOPOLICYSYS => res(self.darwin_iopolicysys(m, a[0] as i32, a[1])),
             sys::FSYNC | sys::FSYNC_NOCANCEL | sys::FDATASYNC => res(self.darwin_fsync(m, a[0] as i32)),
             sys::MOUNT => res(self.darwin_mount(m, a)),
@@ -1853,6 +1893,7 @@ impl Kernel {
             "kern.procargs2" => self.darwin_sysctl_procargs2(m, tail, req),
             "kern.osreleasetype" => self.darwin_sysctl_osreleasetype(m, req),
             "kern.initproc_spawned" => self.darwin_sysctl_initproc_spawned(m, req),
+            "kern.delayterm" => self.darwin_sysctl_delayterm(m, req),
             // sysctl_bootobjectspath: on an embedded platform, the boot
             // manifest's hash in hexadecimal.
             "kern.bootobjectspath" => match super::iokit::boot_manifest_hash() {
@@ -2048,6 +2089,27 @@ impl Kernel {
             let b = req.input(m, 4)?;
             SPAWNED.store(i32::from_le_bytes([b[0], b[1], b[2], b[3]]), Relaxed);
         }
+        Ok(())
+    }
+
+    /// `sysctl_delayterm`: the caller's `P_LDELAYTERM` as an `int`
+    /// (`sysctl_io_number` of an `int`: a 64-bit new value is taken when it
+    /// fits, ERANGE when it does not), set by any new value but 0.
+    fn darwin_sysctl_delayterm(&mut self, m: &mut GuestMem<'_>, req: &mut SysctlReq) -> Result<(), Errno> {
+        let cur = i32::from(self.procs.delayterm(self.pid));
+        req.out(m, &cur.to_le_bytes())?;
+        if req.new == 0 {
+            return Ok(());
+        }
+        let new = if req.newlen == 8 {
+            let b = req.input(m, 8)?;
+            let big = i64::from_le_bytes(b[..8].try_into().expect("8 bytes"));
+            i32::try_from(big).map_err(|_| Errno::ERANGE)?
+        } else {
+            let b = req.input(m, 4)?;
+            i32::from_le_bytes(b[..4].try_into().expect("4 bytes"))
+        };
+        self.procs.set_delayterm(self.pid, new != 0);
         Ok(())
     }
 

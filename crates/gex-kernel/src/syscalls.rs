@@ -5655,6 +5655,7 @@ impl NetIo<'_> {
                 let (ip, port) = io.inet_addr(m, a[1], a[2]).ok()?;
                 let socket = io.socket_of(a[0] as i32).ok()?;
                 let started = socket.connect(ip, port);
+                socket.started(started);
                 let waits = file.would_block() && started == Err(Errno::EINPROGRESS);
                 waits.then_some(BlockOp::Connect { socket })
             }
@@ -5747,6 +5748,9 @@ impl NetIo<'_> {
         };
         let sock = Arc::new(net::Socket::new(kind, net, Arc::clone(self.resolver), Arc::clone(self.ports), self.unix_remote));
         sock.set_self();
+        if io.darwin {
+            sock.use_xnu();
+        }
         sock.set_nonblocking(ty & SOCK_NONBLOCK != 0);
         let flags = if ty & SOCK_NONBLOCK != 0 { oflags::O_NONBLOCK } else { 0 };
         let handle: Arc<dyn crate::vfs::FileHandle> = sock.clone();
@@ -5993,10 +5997,22 @@ fn accept(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, addr: u64, len_out: u64,
     // And its new descriptor has the listener's FNONBLOCK (accept_nocancel
     // gives it the listener's file flags).
     let flags = if io.darwin && io.fds.get(fd)?.flags() & oflags::O_NONBLOCK != 0 { flags | SOCK_NONBLOCK } else { flags };
-    match unix_accept(io, m, fd, addr, len_out, flags) {
+    let r = match unix_accept(io, m, fd, addr, len_out, flags) {
         Err(Errno::ENOTSOCK) => inet_accept(io, m, fd, addr, len_out, flags),
         other => other,
+    };
+    // And its FASYNC: the new socket's SS_ASYNC and its buffers' SB_ASYNC
+    // set or cleared by it.
+    if let (true, Ok(nfd)) = (io.darwin, &r) {
+        const O_ASYNC: u64 = 0x2000;
+        let on = io.fds.get(fd)?.flags() & O_ASYNC != 0;
+        let file = io.fds.get(*nfd as i32)?;
+        file.set_flags(if on { file.flags() | O_ASYNC } else { file.flags() & !O_ASYNC });
+        if let Some((o, _)) = file.handle.so_owner() {
+            o.set_async(on);
+        }
     }
+    r
 }
 
 fn inet_accept(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, addr: u64, len_out: u64, flags: u64) -> SysResult {
@@ -6154,12 +6170,14 @@ fn getsockopt(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, level: u64, name: u6
         // A unix socket (local or the global kernel's) has no connect
         // in progress to report: zero, as for a socketpair end on Linux.
         let err = match io.socket_of(fd) {
+            // A unix datagram socket's unp_drop error.
+            Err(_) if let Ok(d) = io.dgram_of(fd) => d.take_so_error().map_or(0, |e| e.0),
             Err(_) => {
                 socket_family_type(io, fd)?;
                 0
             }
             Ok(sock) => match sock.status() {
-                net::Status::Refused => Errno::ECONNREFUSED.0,
+                net::Status::Refused => sock.refused_so_error(),
                 // A reset's error, which reading it takes.
                 _ if let Some(e) = sock.take_so_error() => e.0,
                 // Not `EINPROGRESS`. `SO_ERROR` reports how a connect
@@ -6171,6 +6189,8 @@ fn getsockopt(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, level: u64, name: u6
                 _ => 0,
             },
         };
+        // A Darwin process reads its own numbering.
+        let err = if io.darwin && err != 0 { crate::darwin::errno::to_darwin(err) } else { err };
         if val != 0 {
             m.write_u32(val, err as u32)?;
         }
@@ -12136,6 +12156,7 @@ impl Kernel {
                 // path reaches `sys_connect`, which finds the connection
                 // already under way and only reports on it.
                 let started = socket.connect(ip, port);
+                socket.started(started);
                 let waits = file.would_block() && started == Err(Errno::EINPROGRESS);
                 waits.then_some(BlockOp::Connect { socket })
             }

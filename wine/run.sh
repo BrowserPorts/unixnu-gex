@@ -157,7 +157,7 @@ if [ -n "$page" ]; then
   fi
   # The run tree, at one path per program, so the box's copy updates by difference.
   rt=$pg/tree-$name; rm -rf "$rt"; mkdir -p "$rt/page" "$rt/hosts/browser" "$rt/wine/page" "$rt/test/lib"
-  for d in page/nt.html page/vite.config.js page/package.json page/src page/runtime/src wine/page/browser-harness.mjs test/lib/cdp.mjs page/node_modules page/public page/vendor/zstddec hosts/browser/js; do
+  for d in page/nt.html page/vite.config.js page/package.json page/src page/runtime/src wine/page/browser-harness.mjs test/lib/cdp.mjs test/lib/chrome.mjs page/node_modules page/public page/vendor/zstddec hosts/browser/js; do
     mkdir -p "$rt/$(dirname "$d")"; cp -al "$page/$d" "$rt/$(dirname "$d")/" 2>/dev/null || cp -a "$page/$d" "$rt/$(dirname "$d")/"
   done
   rm -rf "$rt/page/public/gex/nt"; mkdir -p "$rt/page/public/gex/nt"
@@ -181,7 +181,9 @@ if [ -n "$page" ]; then
       done
     done
   fi
-  mkdir -p "$st/usr/share/X11"; cp -rL /usr/share/X11/xkb "$st/usr/share/X11/"
+  # xkb's data: the pinned xkeyboard-config's (toolchain/pins XKB_DATA), as
+  # Xwayland's keymap is, the same on any host (a Mac has no /usr/share/X11)
+  mkdir -p "$st/usr/share/X11"; cp -rL "$("$ROOT/toolchain/debian-package.sh" XKB_DATA)/usr/share/X11/xkb" "$st/usr/share/X11/"
   cp -al "$(dirname "$exe")" "$st/g" 2>/dev/null || cp -a "$(dirname "$exe")" "$st/g"
   # With the prefix's extended attributes (Wine's DOS attributes: a
   # desktop.ini hidden and system), which page/src/tar.js reads back.

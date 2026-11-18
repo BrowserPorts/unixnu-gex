@@ -351,11 +351,8 @@ impl Kernel {
     /// of the task's end, for a task whose process has ended (a corpse's
     /// once its port has no senders).
     pub(crate) fn darwin_task_terminate_internal(&mut self) {
-        // A lightweight corpse's delivery is the kernel daemon's, which
-        // outlives the task; here it is the task's thread calls'.
-        if !self.dtask.bt_deliveries.is_empty() {
-            self.darwin_unimplemented("a lightweight corpse's delivery still owed at its task's end (exception_deliver_backtrace runs on the kernel's backtrace daemon, which outlives the task)".into());
-        }
+        // Its identity tokens name no task from here on.
+        self.darwin_task_id_tokens_orphan();
         // coalitions_remove_task, launchd told of those it emptied.
         self.darwin_coalitions_task_end();
         // Its threads' vouchers, its importance (ipc_importance_disconnect_task)
@@ -504,6 +501,17 @@ impl Kernel {
             Some(Kobject::FilePort(id)) => super::fileport::fileport_no_senders(id),
             // kcdata_object_no_senders.
             Some(Kobject::KcdataObject(id)) => self.darwin_kcdata_object_no_senders(port, id),
+            // ipc_kobject_subst_once_no_senders: a wrapper never copied out
+            // gives back the right it held.
+            Some(Kobject::SubstOnce(target)) => {
+                let ipc = self.ipc();
+                ipc.port_mut(port).kobject = None;
+                ipc.port_destroy(port);
+                ipc.release_send(target);
+                self.darwin_ipc_notify_drain();
+            }
+            // task_id_token_no_senders.
+            Some(Kobject::TaskIdToken(id)) => self.darwin_task_id_token_no_senders(port, id),
             // The notification is freed with its port's last send right:
             // its notifier removed and the wake port's right let go.
             Some(Kobject::IoNotification(id)) => {

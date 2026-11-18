@@ -42,6 +42,7 @@ pub mod cred;
 pub mod corpse;
 pub mod corpsefork;
 pub mod lwcorpse;
+pub mod taskident;
 pub mod critexit;
 pub mod errno;
 pub mod exec;
@@ -442,6 +443,8 @@ pub struct Task {
     /// Lightweight corpses' deliveries (`thread_backtrace_enqueue`), for
     /// the task's thread calls ([`lwcorpse`]).
     pub bt_deliveries: std::collections::VecDeque<lwcorpse::Delivery>,
+    /// The task is the kernel's backtrace daemon's ([`lwcorpse`]).
+    pub bt_daemon: bool,
     /// `vm_map_set_corpse_source`: a fatal memory limit's kill is to make
     /// the task a corpse whatever its EXC_CRASH handlers do.
     pub corpse_source: bool,

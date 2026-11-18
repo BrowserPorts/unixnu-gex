@@ -3202,6 +3202,19 @@ fn make_corpse_fork(kernel: &Arc<Mutex<Kernel>>, memory: &gex_mem::GuestMemory, 
     // A lightweight corpse: the faulting thread's backtrace and the image
     // infos read with the task held (task_suspend_internal), no copy.
     if req.is_lightweight() {
+        // The kernel's backtrace daemon, made at the first need, outlives
+        // every task: its thread calls deliver what is enqueued.
+        if !gex_kernel::darwin::lwcorpse::daemon_made() {
+            let d = kernel.lock().unwrap_or_else(|e| e.into_inner()).darwin_bt_daemon_kernel();
+            match wasmtime::SharedMemory::new(&cx.engine, guest_memory_type()) {
+                Ok(shared) => {
+                    let d = Arc::new(Mutex::new(d));
+                    gex_kernel::darwin::lwcorpse::set_daemon(Arc::clone(&d));
+                    start_darwin_thread_calls(Arc::downgrade(&d), gex_mem::GuestMemory::new(shared));
+                }
+                Err(e) => eprintln!("gex: the backtrace daemon's memory could not be made: {e:#}"),
+            }
+        }
         let mut k = kernel.lock().unwrap_or_else(|e| e.into_inner());
         let mut gm = GuestMem::new(memory.bytes());
         let r = k.darwin_corpse_lightweight(&mut gm, req);

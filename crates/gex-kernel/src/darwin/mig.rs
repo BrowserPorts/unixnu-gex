@@ -1064,6 +1064,17 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
                 Err(kr) => Reply::err(kr as i32),
             }
         }
+        // task_create_identity_token(task) -> token: its port, the token's
+        // reference donated to its no-senders notification.
+        (Kobject::Task, 3457) => match k.darwin_create_identity_token() {
+            Ok(p) => Reply::port(Carried::Port(p)),
+            Err(kr) => Reply::err(kr),
+        },
+        // task_identity_token_get_task_port(token, flavor) -> task_port.
+        (Kobject::TaskIdToken(id), 3458) => match arg(req, 0) {
+            Some(flavor) => k.darwin_token_get_task_port(*id, flavor as u32),
+            None => bad(),
+        },
         // task_map_kcdata_object_64(task, kcdata_object) -> kcd_addr_begin,
         // kcd_size. The object's right is the routine's when it succeeds.
         (Kobject::Task, 3464) => match desc_port(req, 0) {
@@ -1845,11 +1856,17 @@ fn thread_get_special_port(k: &mut Kernel, t: i32, which: i32, f: u8) -> Reply {
     if which == THREAD_KERNEL_PORT && own {
         // mac_task_check_get_movable_control_port (AMFI's policy), then for
         // a control port a movable send-once substitute of it
-        // (ipc_kobject_alloc_subst_once); a read or inspect port goes on to
-        // the flavor check.
-        let mut r = Reply::err(KERN_FAILURE);
-        r.unimplemented = Some("thread_get_special_port(THREAD_KERNEL_PORT) of the task's own thread (the movable control port policy and IKOT_PORT_SUBST_ONCE)".into());
-        return r;
+        // (thread_get_non_substituted_self's ipc_kobject_alloc_subst_once);
+        // a read or inspect port goes on to the flavor check.
+        const KERN_DENIED: i32 = 53;
+        if k.darwin_mac_check_get_movable_control_port() != 0 {
+            return Reply::err(KERN_DENIED);
+        }
+        if f == flavor::CONTROL {
+            let p = k.darwin_thread_ports(t).0;
+            k.ipc().make_send(p);
+            return Reply::port(Carried::Port(k.ipc().kobject_alloc_subst_once(p)));
+        }
     }
     let allowed = match f {
         flavor::CONTROL => true,
@@ -1905,9 +1922,9 @@ fn task_get_special_port(k: &mut Kernel, which: i32, f: u8) -> Reply {
             return Reply::err(KERN_DENIED);
         }
         if f == flavor::CONTROL {
-            let mut r = Reply::err(KERN_FAILURE);
-            r.unimplemented = Some("task_get_special_port(TASK_KERNEL_PORT) of the task's own control port by a task allowed a movable one (IKOT_PORT_SUBST_ONCE)".into());
-            return r;
+            let p = k.darwin_task_port();
+            k.ipc().make_send(p);
+            return Reply::port(Carried::Port(k.ipc().kobject_alloc_subst_once(p)));
         }
     }
     if !allowed {

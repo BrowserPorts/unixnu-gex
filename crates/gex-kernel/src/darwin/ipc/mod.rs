@@ -271,6 +271,13 @@ pub enum Kobject {
     /// IKOT_KCDATA: a kcdata object, by its number
     /// ([`super::lwcorpse`]).
     KcdataObject(u64),
+    /// IKOT_TASK_ID_TOKEN: a task identity token, by its number
+    /// ([`super::taskident`]).
+    TaskIdToken(u64),
+    /// IKOT_PORT_SUBST_ONCE: a one-time wrapper of a send right to the port
+    /// it holds, which its first copyout as a send right replaces
+    /// (`ipc_kobject_alloc_subst_once`).
+    SubstOnce(ObjId),
 }
 
 /// A port's reply semantics (`ip_reply_port_semantics`).
@@ -1031,6 +1038,16 @@ impl Ipc {
     }
 
     /// A new port whose receive right is the kernel's (a kernel object).
+    /// `ipc_kobject_alloc_subst_once(target)`: a labeled port wrapping the
+    /// caller's send right to `target`, a send right to it made and its
+    /// no-senders notification armed; the send right returned.
+    pub fn kobject_alloc_subst_once(&mut self, target: ObjId) -> ObjId {
+        let w = self.kobject_port(Kobject::SubstOnce(target));
+        self.make_send(w);
+        self.port_mut(w).nsrequest_kobject = true;
+        w
+    }
+
     pub fn kobject_port(&mut self, k: Kobject) -> ObjId {
         let id = self.new_id();
         let mut p = Port::new(Receiver::Kernel);

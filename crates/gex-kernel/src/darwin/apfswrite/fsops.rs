@@ -388,7 +388,7 @@ fn create_obj(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str, mode: u16, u
     let doc_ok = !link && {
         let (sb, _) = nx.vol_sb_read(vol)?;
         match u16::from_le_bytes([sb[SB_ROLE], sb[SB_ROLE + 1]]) {
-            0x40 => dir && u64a(sb, SB_INCOMPAT) & 0x100 == 0,
+            0x40 => u64a(sb, SB_INCOMPAT) & 0x100 == 0,
             0x2 => vol_crypto(sb) == 1,
             _ => false,
         }
@@ -469,8 +469,17 @@ fn create_obj(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str, mode: u16, u
     // default class C like an unencrypted one's and a directory its
     // parent's, with no PROT_CLASS_EXPLICIT (drafts/s23/re-user-copy.md
     // 2.2, 2.3).
-    if encrypted && !dir && !link && crypto != 1 {
-        return Err("not implemented: a file made with no explicit class on a VEK volume (setup_prot_class's default there)".into());
+    // A file on a VEK volume takes its parent's class when that is a
+    // valid file class (cp_is_valid_class(1, c): 1 to 7) other than 0, with
+    // PROT_CLASS_EXPLICIT by the directory rule above (K 0x66a36c0..
+    // 0x66a3858; drafts/s26/re-aks-data.md 3.6); under a class-0 parent it
+    // would take the volume's default (fs + 0x350), not transcribed.
+    let vek_file_class = encrypted && !dir && !link && crypto == 3 && (1..=7).contains(&parent_prot);
+    if vek_file_class && (1u32 << parent_prot) & 0x97 != 0 {
+        extra |= 0x8;
+    }
+    if encrypted && !dir && !link && crypto != 1 && !vek_file_class {
+        return Err("not implemented: a file made with no explicit class on a VEK volume under a class-0 directory (setup_prot_class's volume default, fs + 0x350)".into());
     }
     if encrypted && dir && crypto != 3 && crypto != 1 {
         return Err("not implemented: a directory on an encrypted volume of crypto kind 0 or 2".into());
@@ -479,6 +488,8 @@ fn create_obj(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str, mode: u16, u
         parent_prot
     } else if link {
         0
+    } else if vek_file_class {
+        parent_prot
     } else if parent_prot != 0 {
         return Err(format!("not implemented: a file in a directory of protection class {parent_prot} (setup_prot_class's class checks, K 0x67684a0)"));
     } else {

@@ -232,13 +232,17 @@ pub fn build_disk0_with(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() ->
             Some(b) => install_kernel_cache(&mut nx, Volumes { system, xart, hardware, preboot, update }, b, &cluster_pushes, now)?,
             None => missing.push("install_kernel_cache's list (no IPSW boot objects given: the kernelcache, devicetree, iBoot and root_hash Image4 files and the AP ticket on Preboot and Hardware)".into()),
         }
+        // check_mounted (0x100018b6c): fixup_var (0x10002ef8c):
+        // MKBKeyBagCreateSystem writes nothing with enhanced APFS, then the
+        // system data volume's bootstrap.
+        aks_bootstrap_fs(&mut nx, data, now)?;
     }
     if os.is_none() {
         missing.push("the Data and User volumes (newfs_apfs -P), made after apfs_invert".into());
     }
     // 7.
     missing.push(if os.is_some() {
-        "the restore's later steps, in its order: check_mounted's fixup_var (aks_bootstrap_fs of /mnt2 and BOM's copy of /private/var interleaved with remove_moved_trees), the mountpoints (/mnt1/private/xarts, /mnt2/hardware, MobileSoftwareUpdate, internal), populate_preboot_volume, apfs_sealvolume and the update snapshot".into()
+        "the restore's later steps, in its order: check_mounted's fixup_var (BOM's copy of /private/var interleaved with remove_moved_trees), the mountpoints (/mnt1/private/xarts, /mnt2/hardware, MobileSoftwareUpdate, internal), populate_preboot_volume, apfs_sealvolume and the update snapshot".into()
     } else {
         "the restore's later writes to Preboot (install_kernel_cache's boot objects, populate_preboot_volume, install_splat's cryptex1) and Data's contents".into()
     });
@@ -960,6 +964,98 @@ fn cluster_pushes(n: u64) -> Result<fsops::Pushes, String> {
         }
     }
     Ok(fsops::Pushes { maps, before_end })
+}
+
+/// AppleKeyStore's map for the system data volume (AKS 0x308d0, 35
+/// entries; drafts/s14/restored/aks_bootstrap_map.txt): path, flags (1:
+/// set the class on a directory, 8: skipped), mode, owner and group as the
+/// ramdisk's /etc/master.passwd and /etc/group name them (root and wheel
+/// 0, daemon 1, _securityd 64, _wireless 25, _networkd 24, mobile 501;
+/// drafts/s26/re-aks-data.md 2.5), class. The flags-0x0a entries are left
+/// out: skipped.
+const SYSTEM_MAP: [(&str, u32, u16, u32, u32, u32); 27] = [
+    ("/keybags", 0x01, 0o700, 0, 0, 4),
+    ("/logs", 0x01, 0o755, 0, 0, 4),
+    ("/logs/AppleSupport", 0x01, 0o755, 0, 0, 4),
+    ("/logs/BurnIn", 0x05, 0o755, 0, 0, 4),
+    ("/log", 0x01, 0o755, 0, 0, 4),
+    ("/log/com.apple.xpc.launchd", 0x01, 0o755, 0, 0, 4),
+    ("/MobileSoftwareUpdate", 0x01, 0o755, 0, 0, 4),
+    ("/tmp", 0x01, 0o1777, 0, 0, 4),
+    ("/Keychains", 0x01, 0o755, 64, 0, 4),
+    ("/preferences", 0x01, 0o755, 0, 0, 4),
+    ("/vm", 0x01, 0o755, 0, 0, 4),
+    ("/run", 0x01, 0o775, 0, 1, 4),
+    ("/db", 0x01, 0o755, 0, 0, 4),
+    ("/db/com.apple.xpc.launchd", 0x01, 0o755, 0, 0, 4),
+    ("/wireless", 0x05, 0o755, 25, 25, 4),
+    ("/Managed Preferences", 0x01, 0o755, 0, 0, 4),
+    ("/networkd", 0x01, 0o755, 24, 24, 4),
+    ("/root", 0x01, 0o755, 0, 0, 4),
+    ("/root/Library", 0x00, 0o755, 0, 0, 0),
+    ("/root/Library/Logs", 0x01, 0o755, 0, 0, 4),
+    ("/root/Library/Preferences", 0x01, 0o755, 0, 0, 4),
+    ("/root/Library/Lockdown", 0x01, 0o700, 0, 0, 4),
+    ("/root/Library/Caches", 0x05, 0o700, 0, 0, 4),
+    ("/containers", 0x02, 0o755, 0, 0, 0),
+    ("/MobileAsset", 0x01, 0o755, 0, 0, 4),
+    ("/MobileDevice/ProvisioningProfiles", 0x01, 0o755, 0, 0, 4),
+    ("/Managed Preferences/mobile", 0x01, 0o755, 501, 501, 4),
+];
+
+/// fixup_var's `aks_bootstrap_fs("/mnt2", 1)` (AKS 0x13b1c; drafts/s26/
+/// re-aks-data.md 2-4), after `MKBKeyBagCreateSystem`, which writes nothing
+/// with enhanced APFS: with no /root/.bootstrapped, each system map entry in
+/// order (the mobile map is skipped with enhanced APFS): a missing path made
+/// by mkpath_np (missing intermediates by mkdir 0777 with no owner or class
+/// change, then the entry's mkdir with its mode masked to 0777), chmod to the
+/// entry's mode when it is 0x200 or more, chown to its owner and group; then
+/// a directory whose entry has flag 1 given the entry's class when its
+/// stored class differs. Then /root/.bootstrapped made by open(O_WRONLY |
+/// O_CREAT, 0644), which takes /root's class, and closed.
+fn aks_bootstrap_fs(nx: &mut Nx<'_>, data: usize, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    use fsops::SetAttr;
+    if let Some(root) = fsops::lookup(nx, data, ROOT_INO, "root")? {
+        if fsops::lookup(nx, data, root, ".bootstrapped")?.is_some() {
+            return Err("not implemented: aks_bootstrap_fs on a bootstrapped data volume".into());
+        }
+    }
+    let gid_of = |nx: &mut Nx<'_>, ino: u64| -> Result<u32, String> { Ok(u32::from_le_bytes(fsops::inode(nx, data, ino)?[0x4c..0x50].try_into().unwrap())) };
+    for (path, flags, mode, uid, gid, class) in SYSTEM_MAP {
+        let comps: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+        let mut dir = ROOT_INO;
+        let mut made = false;
+        for (i, c) in comps.iter().enumerate() {
+            dir = match fsops::lookup(nx, data, dir, c)? {
+                Some(x) => x,
+                None => {
+                    let last = i + 1 == comps.len();
+                    let m = if last { mode & 0o777 } else { 0o777 };
+                    let g = gid_of(nx, dir)?;
+                    let d = fsops::mkdir(nx, data, dir, c, m, 0, g, now)?.map_err(|e| format!("mkdir /mnt2{path}: errno {e}"))?;
+                    made |= last;
+                    d
+                }
+            };
+        }
+        if made {
+            if mode >= 0x200 {
+                fsops::setattr(nx, data, dir, SetAttr { mode: Some(mode), ..Default::default() }, now)?;
+            }
+            fsops::setattr(nx, data, dir, SetAttr { uid: Some(uid), gid: Some(gid), ..Default::default() }, now)?;
+        }
+        let v = fsops::inode(nx, data, dir)?;
+        if u16::from_le_bytes([v[0x50], v[0x51]]) & 0o170000 != 0o040000 {
+            return Err(format!("not implemented: a bootstrap map path that is not a directory (/mnt2{path})"));
+        }
+        if flags & 1 != 0 && u32::from_le_bytes(v[0x3c..0x40].try_into().unwrap()) != class {
+            fsops::set_dir_class(nx, data, dir, class, now)?;
+        }
+    }
+    let root = fsops::lookup(nx, data, ROOT_INO, "root")?.ok_or("no /mnt2/root after the bootstrap map")?;
+    let g = gid_of(nx, root)?;
+    fsops::create(nx, data, root, ".bootstrapped", 0o644, 0, g, now)?.map_err(|e| format!("create /mnt2/root/.bootstrapped: errno {e}"))?;
+    Ok(())
 }
 
 /// The mounts await_asr_and_retry makes after apfs_invert: xART
@@ -1822,6 +1918,11 @@ mod tests {
             let leaf = raw(vom.tree.root_oid);
             assert_eq!(u16::from_le_bytes([leaf[0x22], leaf[0x23]]), 0, "a volume object map of more than one node");
             let nk = u32::from_le_bytes(leaf[0x24..0x28].try_into().unwrap()) as usize;
+            let paddr_of = |i: usize| {
+                let vo = u16::from_le_bytes([leaf[0x38 + 4 * i + 2], leaf[0x38 + 4 * i + 3]]) as usize;
+                q(&leaf, 4096 - 0x28 - vo + 8)
+            };
+            let ids: Vec<u64> = (0..nk).flat_map(|i| per_file_ids(&raw(paddr_of(i)))).collect();
             for i in 0..nk {
                 let vo = u16::from_le_bytes([leaf[0x38 + 4 * i + 2], leaf[0x38 + 4 * i + 3]]) as usize;
                 let at = 4096 - 0x28 - vo;
@@ -1830,13 +1931,11 @@ mod tests {
                 let kstart = 0x38 + u16::from_le_bytes([leaf[0x2a], leaf[0x2b]]) as usize;
                 let oid = q(&leaf, kstart + u16::from_le_bytes([leaf[0x38 + 4 * i], leaf[0x38 + 4 * i + 1]]) as usize);
                 assert!(fl & 0x20 == 0 || unnamed.contains(&oid), "a secondary-root mapping of an object the superblock does not name");
-                let fs_root = oid == q(&sb, 0x88);
+                let _ = oid;
                 rw(paddr, &|b| {
                     let ty = u32::from_le_bytes(b[24..28].try_into().unwrap()) & !0x1000_0000;
                     b[24..28].copy_from_slice(&ty.to_le_bytes());
-                    if fs_root {
-                        per_file_ids_cleared(b);
-                    }
+                    per_file_ids_cleared(b, &ids);
                 });
             }
             rw(vom.tree.root_oid, &|b| {
@@ -1857,24 +1956,35 @@ mod tests {
     /// key's crypto-state record or the block as the VEK's tweak) set to
     /// 0, as on an unencrypted volume;
     /// the records stay.
-    fn per_file_ids_cleared(b: &mut [u8]) {
+    /// The per-file crypto identifiers an fs-tree leaf's crypto-state keys
+    /// name (all but the VEK's, 4).
+    fn per_file_ids(b: &[u8]) -> Vec<u64> {
         let q = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
-        // Per-file identifiers exist here only on Data, whose tree is one
-        // leaf (checked by the test); another volume's tree root may be an
-        // index node.
-        if u16::from_le_bytes([b[0x22], b[0x23]]) != 0 {
-            return;
+        if u16::from_le_bytes([b[0x22], b[0x23]]) != 0 || u32::from_le_bytes(b[28..32].try_into().unwrap()) != 0xe {
+            return Vec::new();
         }
         let toc = u16::from_le_bytes([b[0x2a], b[0x2b]]) as usize;
         let n = u32::from_le_bytes(b[0x24..0x28].try_into().unwrap()) as usize;
-        let vend = b.len() - 0x28;
-        let ids: Vec<u64> = (0..n)
+        (0..n)
             .filter_map(|i| {
                 let k = 0x38 + toc + u16::from_le_bytes([b[0x38 + 8 * i], b[0x38 + 8 * i + 1]]) as usize;
                 let key = q(b, k);
                 (key >> 60 == 7 && key & 0x0fff_ffff_ffff_ffff != 4).then_some(key & 0x0fff_ffff_ffff_ffff)
             })
-            .collect();
+            .collect()
+    }
+
+    /// An fs-tree leaf with the per-file identifiers `ids` (and the VEK's
+    /// tweaks) cleared from its file extents and data streams.
+    fn per_file_ids_cleared(b: &mut [u8], ids: &[u64]) {
+        let q = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+        if u16::from_le_bytes([b[0x22], b[0x23]]) != 0 || u32::from_le_bytes(b[28..32].try_into().unwrap()) != 0xe {
+            return;
+        }
+        let toc = u16::from_le_bytes([b[0x2a], b[0x2b]]) as usize;
+        let n = u32::from_le_bytes(b[0x24..0x28].try_into().unwrap()) as usize;
+        // A root node ends with the tree's info.
+        let vend = if u16::from_le_bytes([b[0x20], b[0x21]]) & 1 != 0 { b.len() - 0x28 } else { b.len() };
         for i in 0..n {
             let e = |o: usize| u16::from_le_bytes([b[0x38 + 8 * i + o], b[0x38 + 8 * i + o + 1]]) as usize;
             let (k, v, vl) = (0x38 + toc + e(0), vend - e(4), e(6));
@@ -2046,17 +2156,37 @@ mod tests {
         assert_eq!((q(&fext[0], 0), q(&fext[0], 16)), (0x0300_0000_2625_a000, q(&fext[0], 8)));
         let sb = nx.vol_sb_read(1).unwrap().0.to_vec();
         assert_eq!((q(&sb, 0xb8), q(&sb, 0xe0)), (2, 156_251));
-        // aks_bootstrap_fs("/mnt2")'s class D for /keybags (drafts/s26/
-        // re-aks-data.md 1): the inode written from its in-memory object, so
-        // with the rename's times, its change time read anew; then the
-        // general path's rewrite.
+        // fixup_var's aks_bootstrap_fs("/mnt2") (drafts/s26/re-aks-data.md): its
+        // first entry, /keybags, written from its in-memory object with the
+        // rename's times and class D; then the map's directories, owners,
+        // modes and classes, and /root/.bootstrapped taking /root's class.
         let before = fsops::inode(&mut nx, 1, keybags).unwrap();
-        fsops::set_dir_class(&mut nx, 1, keybags, 4, &mut now).unwrap();
+        let sb0 = nx.vol_sb_read(1).unwrap().0.to_vec();
+        aks_bootstrap_fs(&mut nx, 1, &mut now).unwrap();
         assert!(nx.jobj_times.is_empty());
         let kd = fsops::inode(&mut nx, 1, keybags).unwrap();
         assert_eq!((q(&kd, 0x18), u32::from_le_bytes(kd[0x3c..0x40].try_into().unwrap()), q(&kd, 0x30)), (rt.dir.0, 4, 0x8008));
         assert!(q(&kd, 0x20) > rt.dir.1);
         assert_eq!((&kd[..0x18], &kd[0x28..0x3c], &kd[0x40..]), (&before[..0x18], &before[0x28..0x3c], &before[0x40..]));
+        let sb = nx.vol_sb_read(1).unwrap().0.to_vec();
+        assert_eq!((q(&sb, 0xb0) - q(&sb0, 0xb0), q(&sb, 0xc0) - q(&sb0, 0xc0), q(&sb, 0xb8) - q(&sb0, 0xb8)), (28, 27, 1));
+        let walk = |nx: &mut Nx<'_>, p: &str| p.split('/').fold(2u64, |d, c| fsops::lookup(nx, 1, d, c).unwrap().unwrap_or_else(|| panic!("no {p}")));
+        let attrs = |nx: &mut Nx<'_>, p: &str| {
+            let ino = walk(nx, p);
+            let v = fsops::inode(nx, 1, ino).unwrap();
+            let u = |o: usize| u32::from_le_bytes(v[o..o + 4].try_into().unwrap());
+            (u16::from_le_bytes([v[0x50], v[0x51]]), u(0x48), u(0x4c), u(0x3c), q(&v, 0x30))
+        };
+        assert_eq!(attrs(&mut nx, "tmp"), (0o41777, 0, 0, 4, 0x8008));
+        assert_eq!(attrs(&mut nx, "Keychains"), (0o40755, 64, 0, 4, 0x8008));
+        assert_eq!(attrs(&mut nx, "run"), (0o40775, 0, 1, 4, 0x8008));
+        assert_eq!(attrs(&mut nx, "logs/BurnIn"), (0o40755, 0, 0, 4, 0x8008));
+        assert_eq!(attrs(&mut nx, "containers"), (0o40755, 0, 0, 0, 0x8008));
+        assert_eq!(attrs(&mut nx, "MobileDevice"), (0o40777, 0, 0, 0, 0x8008));
+        assert_eq!(attrs(&mut nx, "MobileDevice/ProvisioningProfiles"), (0o40755, 0, 0, 4, 0x8008));
+        assert_eq!(attrs(&mut nx, "Managed Preferences/mobile"), (0o40755, 501, 501, 4, 0x8008));
+        assert_eq!(attrs(&mut nx, "root/Library/Caches"), (0o40700, 0, 0, 4, 0x8008));
+        assert_eq!(attrs(&mut nx, "root/.bootstrapped"), (0o100644, 0, 0, 4, 0x8008));
         nx.commit().unwrap();
         let check = |tag: &str| {
             sink.0.sync_all().unwrap();

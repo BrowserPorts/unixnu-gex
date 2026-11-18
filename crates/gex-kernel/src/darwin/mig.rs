@@ -24,6 +24,7 @@ const KERN_TERMINATED: i32 = 37;
 const KERN_RESOURCE_SHORTAGE: i32 = 6;
 const KERN_NO_ACCESS: i32 = 8;
 const KERN_DENIED: i32 = 53;
+const KERN_INVALID_HOST: i32 = 22;
 const KERN_INVALID_RIGHT: i32 = 17;
 const KERN_INVALID_VALUE: i32 = 18;
 const KERN_INVALID_TASK: i32 = 16;
@@ -891,6 +892,22 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
         (Kobject::Thread(t), 3613) => k.darwin_exc_set(super::exception::Level::Thread, *t, req, false),
         (Kobject::Thread(t), 3614) => k.darwin_exc_get(super::exception::Level::Thread, *t, req),
         (Kobject::Thread(t), 3615) => k.darwin_exc_set(super::exception::Level::Thread, *t, req, true),
+        // host_reboot(host_priv, options): another host port converts to
+        // HOST_PRIV_NULL (KERN_INVALID_HOST); the privileged one ends the
+        // machine (0xfffffff00727eaa4).
+        (Kobject::Host, 401) => match arg(req, 0) {
+            Some(_) => Reply::err(KERN_INVALID_HOST),
+            _ => bad(),
+        },
+        (Kobject::HostPriv, 401) => match arg(req, 0) {
+            Some(options) => {
+                let what = k.darwin_host_reboot(options as u32);
+                let mut r = Reply::err(MIG_BAD_ID);
+                r.unimplemented = Some(what);
+                r
+            }
+            _ => bad(),
+        },
         (Kobject::HostPriv, 414) => k.darwin_exc_set(super::exception::Level::Host, 0, req, false),
         (Kobject::HostPriv, 415) => k.darwin_exc_get(super::exception::Level::Host, 0, req),
         (Kobject::HostPriv, 416) => k.darwin_exc_set(super::exception::Level::Host, 0, req, true),

@@ -146,6 +146,8 @@ pub struct Attr {
     pub options: u32,
     pub limits: [u32; 6],
     pub crash_behavior: u32,
+    /// `psa_crash_behavior_deadline`.
+    pub crash_behavior_deadline: u64,
     /// `psa_launch_type`.
     pub launch_type: u8,
 }
@@ -177,6 +179,7 @@ impl Attr {
             options: le32(b, 128),
             limits: [le32(b, 132), le32(b, 136), le32(b, 140), le32(b, 144), le32(b, 180), le32(b, 184)],
             crash_behavior: le32(b, 148),
+            crash_behavior_deadline: le64(b, 160),
             launch_type: b[168],
         }
     }
@@ -196,8 +199,10 @@ pub struct After {
     pub inherit: Vec<i32>,
     /// `psa_max_addr`: the highest address the new map is to have.
     pub max_addr: u64,
-    /// The crash behavior a spawn of an entitled parent asked for.
-    pub crash_behavior: u32,
+    /// The crash behavior and its deadline a spawn of an entitled parent
+    /// asked for.
+    pub crash_behavior: u8,
+    pub crash_behavior_deadline: u64,
     /// `psa_pcontrol`, when the spawn had attributes.
     pub pcontrol: Option<i32>,
     /// `psa_cpumonitor_percent` and `psa_cpumonitor_interval` (seconds).
@@ -639,9 +644,14 @@ impl Kernel {
         match spawned {
             Ok(()) => Ok(Spawned::Child(Box::new(child))),
             Err(e) => {
-                // exit1 with P_LIST_DEADPARENT: gone, unseen by its parent,
-                // and the rights it inherited with it; past
-                // proc_prepareexit first, so proc_find no longer finds it.
+                // exit1(p, 1) with P_LIST_DEADPARENT and
+                // p_posix_spawn_failed: proc_prepareexit's critical exit
+                // (a crash behavior of PANIC_ON_EXIT or _SPAWN_FAIL
+                // panics), then gone, unseen by its parent, and the rights
+                // it inherited with it; past proc_prepareexit, so
+                // proc_find no longer finds it.
+                child.dtask.spawn_failed = true;
+                child.darwin_critical_exit(1);
                 self.procs.set_exited(pid);
                 let k = std::mem::take(&mut child.dtask.kports);
                 for p in k.special.into_values().chain(k.registered.into_iter().flatten()) {
@@ -662,6 +672,17 @@ impl Kernel {
         }
     }
 
+    /// The crash behavior a spawn gives its process: the attributes' flags
+    /// (truncated to the byte `p_crash_behavior` is) and deadline when the
+    /// spawner holds com.apple.private.spawn-panic-crash-behavior
+    /// (`SPAWN_SET_PANIC_CRASH_BEHAVIOR`), else none.
+    fn darwin_spawn_crash_behavior(&self, attr: Option<&Attr>) -> (u8, u64) {
+        match attr {
+            Some(a) if self.dtask.codesign.as_ref().is_some_and(|c| c.entitled("com.apple.private.spawn-panic-crash-behavior")) => (a.crash_behavior as u8, a.crash_behavior_deadline),
+            _ => (0, 0),
+        }
+    }
+
     /// The child's half: file actions, activation, then the attributes the
     /// spawner applies.
     #[allow(clippy::too_many_arguments)]
@@ -669,7 +690,12 @@ impl Kernel {
     fn darwin_spawn_child(&mut self, m: &GuestMem<'_>, child: &mut Kernel, attr: Option<&Attr>, file_actions: Option<&[u8]>, port_actions: Option<&[u8]>, creds: &SpawnCreds, path: u64, argv: u64, envv: u64) -> Result<(), Errno> {
         let flags = attr.map_or(0, |a| a.flags);
         let policy = attr.map_or((0, 0, 0), |a| super::taskpolicy::spawn_attrs(a.apptype, a.qos_clamp, a.darwin_role));
-        let mut after = After { flags, policy, sigmask: attr.map_or(0, |a| a.sigmask), sigdefault: attr.map_or(0, |a| a.sigdefault), inherit: Vec::new(), max_addr: attr.map_or(0, |a| a.max_addr), crash_behavior: if self.dtask.codesign.as_ref().is_some_and(|c| c.entitled("com.apple.private.spawn-panic-crash-behavior")) { attr.map_or(0, |a| a.crash_behavior) } else { 0 }, pcontrol: attr.map(|a| a.pcontrol), cpumonitor: attr.map_or((0, 0), |a| (a.cpumonitor_percent, a.cpumonitor_interval)), bad_psattr: false };
+        let mut after = After { flags, policy, sigmask: attr.map_or(0, |a| a.sigmask), sigdefault: attr.map_or(0, |a| a.sigdefault), inherit: Vec::new(), max_addr: attr.map_or(0, |a| a.max_addr), crash_behavior: 0, crash_behavior_deadline: 0, pcontrol: attr.map(|a| a.pcontrol), cpumonitor: attr.map_or((0, 0), |a| (a.cpumonitor_percent, a.cpumonitor_interval)), bad_psattr: false };
+        // The new proc's p_crash_behavior and its deadline, set once it is
+        // made (before the file actions and the image's activation), so a
+        // spawn that fails after has them at its end.
+        (after.crash_behavior, after.crash_behavior_deadline) = self.darwin_spawn_crash_behavior(attr);
+        (child.dtask.crash_behavior, child.dtask.crash_behavior_deadline) = (after.crash_behavior, after.crash_behavior_deadline);
         if let Some(fa) = file_actions {
             let mut fileports = self.darwin_spawn_fileports(fa);
             after.inherit = child.darwin_file_actions(fa, flags, &mut fileports)?;
@@ -924,7 +950,8 @@ impl Kernel {
                 });
             }
         }
-        let mut after = After { flags: at.flags, policy: super::taskpolicy::spawn_attrs(at.apptype, at.qos_clamp, at.darwin_role), sigmask: at.sigmask, sigdefault: at.sigdefault, inherit: Vec::new(), max_addr: at.max_addr, crash_behavior: if self.dtask.codesign.as_ref().is_some_and(|c| c.entitled("com.apple.private.spawn-panic-crash-behavior")) { at.crash_behavior } else { 0 }, pcontrol: Some(at.pcontrol), cpumonitor: (at.cpumonitor_percent, at.cpumonitor_interval), bad_psattr: false };
+        let mut after = After { flags: at.flags, policy: super::taskpolicy::spawn_attrs(at.apptype, at.qos_clamp, at.darwin_role), sigmask: at.sigmask, sigdefault: at.sigdefault, inherit: Vec::new(), max_addr: at.max_addr, crash_behavior: 0, crash_behavior_deadline: 0, pcontrol: Some(at.pcontrol), cpumonitor: (at.cpumonitor_percent, at.cpumonitor_interval), bad_psattr: false };
+        (after.crash_behavior, after.crash_behavior_deadline) = self.darwin_spawn_crash_behavior(Some(at));
         let mut fileports = file_actions.map(|fa| self.darwin_spawn_fileports(fa)).unwrap_or_default();
         let activated = (|| {
             if let Some(fa) = file_actions {

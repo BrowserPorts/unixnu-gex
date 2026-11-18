@@ -190,7 +190,9 @@ fn usage() {
         "gex — runs Linux programs (AArch64, x86-64, i386) as WebAssembly, on its own Linux kernel ABI
 
 usage:
-  gexc run    <elf> [args...]      translate and run the program
+  gexc run    <elf> [args...]      translate and run the program (a Darwin
+                                   system that halts, restarts or panics ends
+                                   the run: exit 200, 201 or 202)
   gexc build  <elf> -o <out.wasm>  translate and write the wasm module
                                    (--exhaustive: translate every decodable
                                    address, since a built module has no

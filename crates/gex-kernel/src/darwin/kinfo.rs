@@ -25,6 +25,7 @@ mod pf {
     pub const SYSTEM: u32 = 0x200;
     pub const WEXIT: u32 = 0x2000;
     pub const EXEC: u32 = 0x4000;
+    pub const REBOOT: u32 = 0x0020_0000;
     pub const NOCLDWAIT: u32 = 0x4000_0000;
 }
 
@@ -289,6 +290,9 @@ impl Kernel {
         }
         if nocldwait {
             f |= pf::NOCLDWAIT;
+        }
+        if self.procs.reboot(pid) {
+            f |= pf::REBOOT;
         }
         f
     }

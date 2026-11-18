@@ -121,6 +121,7 @@ pub mod op {
     pub const SYSTEM_MEMORYSTATUS_CONTROL: usize = 174;
     pub const SYSTEM_PACKAGE_CHECK: usize = 177;
     pub const SYSTEM_PRIVILEGE: usize = 178;
+    pub const SYSTEM_REBOOT: usize = 179;
     pub const SYSTEM_SCHED: usize = 180;
     pub const SYSTEM_SOCKET: usize = 182;
     pub const SYSTEM_SUSPEND_RESUME: usize = 183;

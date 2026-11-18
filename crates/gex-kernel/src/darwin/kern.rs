@@ -867,6 +867,9 @@ impl Kernel {
         if let Some(r) = self.darwin_fs_call(m, raw, a) {
             return Some(res(r));
         }
+        if raw == sys::REBOOT {
+            return Some(res(self.darwin_reboot(m, a[0] as i32, a[1])));
+        }
         if let Some(r) = self.darwin_fixed_call(raw, a) {
             return Some(res(r));
         }
@@ -2037,7 +2040,6 @@ impl Kernel {
     /// `sysctl_initproc_spawned`: launchd says it has reached main, once.
     fn darwin_sysctl_initproc_spawned(&mut self, m: &mut GuestMem<'_>, req: &mut SysctlReq) -> Result<(), Errno> {
         use std::sync::atomic::Ordering::Relaxed;
-        static SPAWNED: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
         if req.new != 0 && (self.pid != 1 || SPAWNED.load(Relaxed) != 0) {
             return Err(Errno::EPERM);
         }
@@ -2688,6 +2690,14 @@ impl Kernel {
             }
         }
     }
+}
+
+/// `initproc_spawned`, which launchd sets through `kern.initproc_spawned`.
+static SPAWNED: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Whether launchd has said it reached main (`initproc_spawned != 0`).
+pub(crate) fn initproc_spawned() -> bool {
+    SPAWNED.load(std::sync::atomic::Ordering::Relaxed) != 0
 }
 
 #[cfg(test)]

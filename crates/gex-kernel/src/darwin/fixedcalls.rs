@@ -47,7 +47,6 @@ impl Kernel {
                 }
             }
             sys::ACCT => gated(self, root, "acct"),
-            sys::REBOOT => gated(self, root, "reboot"),
             sys::CHROOT => gated(self, root, "chroot"),
             sys::MICROSTACKSHOT => gated(self, root, "microstackshot"),
             sys::USRCTL => gated(self, self.pid == 1, "usrctl"),

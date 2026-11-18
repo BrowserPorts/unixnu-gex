@@ -428,6 +428,9 @@ struct Proc {
     exited: bool,
     /// Darwin's `p_exit_reason`: why it ended, set as its exit began.
     exit_reason: Option<crate::signal::Note>,
+    /// Darwin's `P_REBOOT`: it called `reboot`, which the policies let it;
+    /// no signal is sent it from then (`psignal_internal` discards them).
+    reboot: bool,
     /// The user and system time of its threads that have ended
     /// (`task->total_user_time`, `total_system_time`), in nanoseconds.
     dead_cpu: (u64, u64),
@@ -858,6 +861,7 @@ impl ProcTable {
                     lexit: false,
                     exited: false,
                     exit_reason: None,
+                    reboot: false,
                     dead_cpu: (0, 0),
                     children_cpu: (0, 0),
                     dead_runnable: 0,
@@ -955,6 +959,7 @@ impl ProcTable {
             lexit: false,
             exited: false,
             exit_reason: None,
+            reboot: false,
             dead_cpu: (0, 0),
             children_cpu: (0, 0),
             dead_runnable: 0,
@@ -1931,6 +1936,9 @@ impl ProcTable {
         {
             let mut t = self.lock();
             let Some(p) = t.procs.iter_mut().find(|p| p.pid == pid) else { return };
+            if p.reboot {
+                return;
+            }
             if let Some(v) = &mut p.posts {
                 v.push((signo, note));
             }
@@ -1946,12 +1954,12 @@ impl ProcTable {
     /// its `p_lflag` gains `flags` (the jetsam bits), it is past
     /// `proc_prepareexit` ([`ProcTable::set_exited`]) and it ends as
     /// SIGKILL ends it. No signal is posted, so its knotes hear no
-    /// NOTE_SIGNAL.
-    pub fn jetsam_kill(&self, pid: i32, flags: u32, reason: crate::signal::Note) {
+    /// NOTE_SIGNAL. Whether this was its exit (false when it had begun).
+    pub fn jetsam_kill(&self, pid: i32, flags: u32, reason: crate::signal::Note) -> bool {
         let mut t = self.lock();
-        let Some(p) = t.procs.iter_mut().find(|p| p.pid == pid) else { return };
+        let Some(p) = t.procs.iter_mut().find(|p| p.pid == pid) else { return false };
         if p.lexit || p.child.status.lock().map(|s| s.is_some()).unwrap_or(true) {
-            return;
+            return false;
         }
         p.lexit = true;
         p.exit_reason = Some(reason);
@@ -1961,6 +1969,7 @@ impl ProcTable {
         p.queue.notify();
         // exit_with_reason's proc_prepareexit, in the killer's context.
         t.mark_exited(pid);
+        true
     }
 
     /// `proc_prepareexit`'s end for `pid`: `P_REF_DEAD`, and its move to
@@ -1983,6 +1992,18 @@ impl ProcTable {
                 p.exit_reason = reason;
             }
         }
+    }
+
+    /// `reboot`'s `P_REBOOT` for `pid`: no signal reaches it from now.
+    pub fn set_reboot(&self, pid: i32) {
+        if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == pid) {
+            p.reboot = true;
+        }
+    }
+
+    /// Whether `pid` has `P_REBOOT`.
+    pub fn reboot(&self, pid: i32) -> bool {
+        self.lock().procs.iter().find(|p| p.pid == pid).is_some_and(|p| p.reboot)
     }
 
     /// `pid`'s `p_exit_reason`, a zombie's too.
@@ -2144,7 +2165,7 @@ impl ProcTable {
             let virtual_init = self.virtual_init.load(Ordering::Acquire);
             for &i in &hits {
                 let p = &mut t.procs[i];
-                if virtual_init && p.pid == INIT_PID {
+                if (virtual_init && p.pid == INIT_PID) || p.reboot {
                     continue;
                 }
                 p.killed |= bit;

@@ -184,6 +184,11 @@ overlay=
 # The status of a run GEX_DARWIN_STRICT stops at something reported: gexc's
 # for a process killed by SIGSYS.
 STRICT_STOP=159
+# gexc's statuses for a run whose system halts, restarts or panics
+# (crates/gexc/src/darwin_run.rs).
+HALT=200
+RESTART=201
+PANIC=202
 named=$#
 
 report() {
@@ -223,6 +228,51 @@ check_root() {
     # shellcheck disable=SC2086
     out=$("$GEXC" run --sysroot "$GEX_DARWIN_ROOT" ${overlay:+--overlay "$overlay"} ${as:+--uid "$as"} "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-$name" "$@" 2>/dev/null)
     report "$name" "$out" $? "$want_out" "$want_status"
+}
+
+# check_machine NAME AS WANT_OUT WANT_STATUS WANT_CONSOLE [ARGS...]: a
+# dynamic program (NAME's part before a '-'), run as AS (uid:gid, or empty
+# for the default), whose run ends with its system's halt, restart or
+# panic. Its output and gexc's status are checked as check_root checks
+# them, and the system's end must be reported once on gexc's standard
+# error; for a panic, WANT_CONSOLE is an extended regular expression the
+# console's line before that report (the paniclog's first line) must match.
+check_machine() {
+    name=$1 as=$2 want_out=$3 want_status=$4 want_console=$5
+    shift 5
+    for v in GEX_DARWIN_ROOT GEX_DARWIN_RESTORE; do
+        eval "val=\${$v:-}"
+        [ -n "$val" ] && continue
+        if [ "$named" -gt 0 ]; then
+            echo "FAIL $name: no $v (set it)"
+            fail=1
+        else
+            echo "SKIP $name (set $v)"
+        fi
+        as=
+        return
+    done
+    prog=${name%%-*}
+    mkdir -p "$GEX_DARWIN_ROOT/var/tmp"
+    place "$HERE/bin/$prog" "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-$prog"
+    err=$(mktemp "$GEX_DARWIN_ROOT/var/tmp/.gex-machine.XXXXXX")
+    # shellcheck disable=SC2086
+    out=$("$GEXC" run --sysroot "$GEX_DARWIN_ROOT" ${as:+--uid "$as"} "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-$prog" "$@" 2>"$err")
+    status=$?
+    as=
+    ended=$(grep -c '^\[gex\] the system ' "$err")
+    console=$(awk '/^\[gex\] the system /{print prev; exit} {prev=$0}' "$err")
+    if [ "$ended" -ne 1 ]; then
+        echo "FAIL $name: the system's end reported $ended times (status $status), output: $out"
+        tail -n 8 "$err" | sed 's/^/    /'
+        fail=1
+    elif [ -n "$want_console" ] && ! printf '%s\n' "$console" | grep -Eqx -- "$want_console"; then
+        echo "FAIL $name: the console's paniclog line: $console"
+        fail=1
+    else
+        report "$name" "$out" "$status" "$want_out" "$want_status"
+    fi
+    rm -f "$err"
 }
 
 # check_webmetal NAME WANT_OUT WANT_STATUS: a dynamic program that uses the
@@ -603,6 +653,47 @@ system /dev/disk1s1
 /dev/disk1s2 /private/var apfs nosuid,nodev,rw 0x40
 /dev/disk1s6 /private/var/MobileSoftwareUpdate apfs nosuid,nodev,nobrowse,rw 0xc0
 /dev/disk1s4 /private/var/hardware apfs nosuid,nodev,nobrowse,rw 0x140" 0 ;;
+    # A process spawned with a crash behavior: the ends that do not panic,
+    # the spawner without the entitlement, then each end that panics the
+    # system (proc_handle_critical_exit's message, panic_with_options'
+    # caller in proc_prepareexit).
+    crashpanic)
+        check_root crashpanic "crashpanic ok" 0
+        if [ -n "${GEX_DARWIN_ROOT:-}" ]; then
+            place "$HERE/bin/crashpanicnoent" "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-crashpanicnoent"
+        fi
+        check_root crashpanicnoent "crashpanic noent ok" 0
+        ;;
+    crashpanic-exit | crashpanic-onexit | crashpanic-deadline | crashpanic-crash | crashpanic-abort | crashpanic-terminate)
+        mode=${1#crashpanic-}
+        # The child is the run's second process after the virtual init's
+        # child (pid 2): pid 3.
+        pre='panic\(cpu 0 caller 0xfffffff0076222a8\): '
+        case $mode in
+        exit | deadline) line="${pre}gex-darwin-crashpanic\[3\] exited -- no exit reason available -- \(signal 0, exit status 3 \)" ;;
+        onexit) line="${pre}gex-darwin-crashpanic\[3\] exited -- no exit reason available -- \(signal 0, exit status 0 \)" ;;
+        crash) line="${pre} gex-darwin-crashpanic\[3\] exited -- exit reason namespace 2 subcode 0xb description: none" ;;
+        abort) line="${pre} gex-darwin-crashpanic\[3\] exited -- exit reason namespace 18 subcode 0x42 description: crashpanic abort" ;;
+        terminate) line="${pre} gex-darwin-crashpanic\[3\] exited -- exit reason namespace 18 subcode 0x43 description: crashpanic terminate" ;;
+        esac
+        check_machine "$1" "" "spawned 3" $PANIC "$line" "$mode"
+        ;;
+    # A spawn that fails after its process is made: exit1(p, 1), its name
+    # the spawner's.
+    crashpanic-spawnfail)
+        check_machine crashpanic-spawnfail "" "" $PANIC 'panic\(cpu 0 caller 0xfffffff0076222a8\): gex-darwin-crashpanic\[3\] exited -- no exit reason available -- \(signal 1, exit status 0 \)' spawnfail
+        ;;
+    # reboot(2) and host_reboot refused a user; as root, RB_PANIC refused
+    # a process not initproc (the platform profile), and each end.
+    rebootcall) check_root rebootcall "rebootcall ok" 0 ;;
+    rebootcall-panic)
+        as=0:0
+        check_root rebootcall "rebootcall panic refused" 0 panic
+        as=
+        ;;
+    rebootcall-halt) check_machine rebootcall-halt 0:0 "" $HALT "" halt ;;
+    rebootcall-restart) check_machine rebootcall-restart 0:0 "" $RESTART "" restart ;;
+    rebootcall-hostrestart) check_machine rebootcall-hostrestart 0:0 "" $RESTART "" hostrestart ;;
     *)
         echo "FAIL $1: no such program"
         fail=1
@@ -615,7 +706,7 @@ if [ "$named" -gt 0 ]; then
         run "$p"
     done
 else
-    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate thinfo tasksuspend portrefs crosstask spawnports taskname taskreg procfind debugport excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl iokit storagereg ioreg accel accelr metalwire metal iosurface iosurfacex iosurfacesplash iosurfacexpreboard iogpudev iomfb iomfbmain xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit sbxinit sbxexec sbxkill hostspecial sbxmask sbxnet sbxiokit sbxpriv sbxfile sbxscrub cfrunloop xpc-anon layout overlay stackfb launchcon shregion console owners apfsroles disknodes diskio fsfreeze fmount mntupdate fsstatwait ignition graftdmg tcload inet6 rusage vmshare remap vmwrite freezer ment ubcmap purgeable mentreuse mapfirst ignitionweb; do
+    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate thinfo tasksuspend portrefs crosstask spawnports taskname taskreg procfind debugport excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl iokit storagereg ioreg accel accelr metalwire metal iosurface iosurfacex iosurfacesplash iosurfacexpreboard iogpudev iomfb iomfbmain xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit sbxinit sbxexec sbxkill hostspecial sbxmask sbxnet sbxiokit sbxpriv sbxfile sbxscrub cfrunloop xpc-anon layout overlay stackfb launchcon shregion console owners apfsroles disknodes diskio fsfreeze fmount mntupdate fsstatwait ignition graftdmg tcload inet6 rusage vmshare remap vmwrite freezer ment ubcmap purgeable mentreuse mapfirst ignitionweb crashpanic crashpanic-exit crashpanic-onexit crashpanic-deadline crashpanic-crash crashpanic-abort crashpanic-terminate crashpanic-spawnfail rebootcall rebootcall-panic rebootcall-halt rebootcall-restart rebootcall-hostrestart; do
         run "$p"
     done
 fi

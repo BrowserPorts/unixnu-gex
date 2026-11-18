@@ -800,7 +800,10 @@ impl Kernel {
             use super::procinfo::{P_JETSAM_PID, P_LTERM_JETSAM};
             use super::reason::{flag, OsReason, JETSAM_REASON_MEMORY_PERPROCESSLIMIT};
             let reason = OsReason::jetsam(JETSAM_REASON_MEMORY_PERPROCESSLIMIT, flag::GENERATE_CRASH_REPORT);
-            self.procs.jetsam_kill(self.pid, P_LTERM_JETSAM | P_JETSAM_PID, std::sync::Arc::new(reason));
+            // exit_with_reason's proc_prepareexit, its critical exit first.
+            if self.procs.jetsam_kill(self.pid, P_LTERM_JETSAM | P_JETSAM_PID, std::sync::Arc::new(reason)) {
+                self.darwin_critical_exit(super::signal::dsig::SIGKILL);
+            }
         } else {
             self.procs.jetsam().hwm_candidates = true;
             self.darwin_warn_process(m, active, fatal, true);

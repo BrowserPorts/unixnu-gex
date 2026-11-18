@@ -647,6 +647,9 @@ pub enum Remote {
     PsetKnote(ObjId, ObjId),
     /// A request to one of its kernel objects, from task `caller`.
     Kobject { kmsg: Box<msg::Kmsg>, options: u64, caller: TaskKey },
+    /// One of its kernel objects' ports lost its last send right in
+    /// another task's call: the no-senders notification its kernel owes.
+    KobjectNoSenders { port: ObjId, mscount: u32 },
     /// What the host executor left for one of its WebMetal connections.
     Accel(super::accel::wire::Note),
     /// The outcome of a user client method that answers later
@@ -831,13 +834,19 @@ impl Ipc {
     /// Tell task `task` of `r`, and ring the bell of its thread that acts
     /// on it (a task that has ended hears nothing).
     pub fn remote(&self, task: TaskKey, r: Remote) -> bool {
-        let Some(l) = self.links.get(&task) else { return false };
+        self.remote_or_back(task, r).is_ok()
+    }
+
+    /// [`Self::remote`], with what was to be told given back when the task
+    /// has ended.
+    pub fn remote_or_back(&self, task: TaskKey, r: Remote) -> Result<(), Remote> {
+        let Some(l) = self.links.get(&task) else { return Err(r) };
         if let Some(v) = self.callout_remotes.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             v.push(l.pid);
         }
         l.mailbox.lock().unwrap_or_else(|e| e.into_inner()).push(r);
         l.bell.ring();
-        true
+        Ok(())
     }
 
     /// `ipc_task_enable`: `link`, this task's, goes in the table under its
@@ -991,14 +1000,16 @@ impl Ipc {
 
     /// The port of the kernel's object `k`, one for every task (made on
     /// first use; owned by no task, so any task's kernel serves it).
-    /// `ux_handler_setup`: the host's handler for every exception but
-    /// RPC alerts (Instruments') and guards, `EXCEPTION_DEFAULT |
-    /// MACH_EXCEPTION_CODES`, each action with a send right of its own.
+    /// `ux_handler_setup`: the host's handler for every exception of
+    /// `EXC_MASK_ALL` but RPC alerts (Instruments') and guards (not
+    /// EXC_CRASH or EXC_CORPSE_NOTIFY, which `EXC_MASK_ALL` leaves out),
+    /// `EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES`, each action with a send
+    /// right of its own.
     fn ux_handler_setup(&mut self) {
         use super::exception as exc;
         let p = self.global_port(Kobject::UxHandler);
         for t in 1..exc::EXC_TYPES_COUNT {
-            if t == exc::EXC_RPC_ALERT || t == exc::EXC_GUARD {
+            if matches!(t, exc::EXC_RPC_ALERT | exc::EXC_GUARD | exc::EXC_CRASH | exc::EXC_CORPSE_NOTIFY) {
                 continue;
             }
             self.make_send(p);

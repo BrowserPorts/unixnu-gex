@@ -43,9 +43,9 @@ pub const CODESIGNING_EXIT_REASON_LAUNCH_CONSTRAINT_VIOLATION: u64 = 4;
 
 /// `OS_REASON_BUFFER_MAX_SIZE`.
 const BUFFER_MAX_SIZE: u32 = 5120;
-/// `KCDATA_BUFFER_BEGIN_OS_REASON`, `KCDATA_TYPE_BUFFER_END`.
+/// `KCDATA_BUFFER_BEGIN_OS_REASON`.
 const BUFFER_BEGIN_OS_REASON: u32 = 0x53A2_0900;
-const TYPE_BUFFER_END: u32 = 0xF191_58ED;
+use super::kcdata::TYPE_BUFFER_END;
 /// `KCDATA_TYPE_PID`, `KCDATA_TYPE_PROCNAME`, `EXIT_REASON_USER_DESC`,
 /// `EXIT_REASON_USER_PAYLOAD`.
 const TYPE_PID: u32 = 0x36;
@@ -55,11 +55,9 @@ const USER_PAYLOAD: u32 = 0x1003;
 /// `EXIT_REASON_USER_DESC_MAX_LEN`, `EXIT_REASON_PAYLOAD_MAX_LEN`.
 const USER_DESC_MAX_LEN: usize = 1024;
 const PAYLOAD_MAX_LEN: u32 = 2048;
-/// `sizeof(struct kcdata_item)`, `KCDATA_ALIGNMENT_SIZE`,
-/// `KCDATA_FLAGS_STRUCT_HAS_PADDING`.
-const ITEM: u32 = 16;
+/// `sizeof(struct kcdata_item)`, `KCDATA_ALIGNMENT_SIZE`.
+const ITEM: u32 = super::kcdata::ITEM as u32;
 const ALIGNMENT: u32 = 16;
-const HAS_PADDING: u64 = 0x80;
 
 /// `sizeof(p_name)`: `2 * MAXCOMLEN + 1`.
 pub const P_NAME_LEN: usize = 33;
@@ -85,65 +83,11 @@ impl PName {
     }
 }
 
-/// A kcdata buffer filled with `memcpy` (`KCFLAG_USE_MEMCOPY`), its end
-/// marker kept after the last item.
-#[derive(Clone, Debug)]
-struct Kcdata {
-    buf: Vec<u8>,
-    /// `kcd_addr_end - kcd_addr_begin`.
-    end: usize,
-}
-
-/// `kcdata_calc_padding`.
-fn padding(size: u32) -> u32 {
-    size.wrapping_neg() & 0xf
-}
+use super::kcdata::Kcdata;
 
 /// `kcdata_estimate_required_buffer_size`.
 fn estimate(items: u32, payload: u32) -> u32 {
     items * (ALIGNMENT - 1) + items * ITEM + 2 * ITEM + payload
-}
-
-impl Kcdata {
-    /// `kcdata_memory_static_init`: the BEGIN item; none when `size`
-    /// cannot hold it and its end marker.
-    fn new(begin: u32, size: u32) -> Option<Kcdata> {
-        let mut k = Kcdata { buf: vec![0; size as usize], end: 0 };
-        k.item(begin, 0)?;
-        Some(k)
-    }
-
-    /// `kcdata_get_memory_addr`: an item of `size` bytes, padded to 16, and
-    /// the end marker after it; its data's offset, or none when it does
-    /// not fit (KERN_INSUFFICIENT_BUFFER_SIZE).
-    fn item(&mut self, ty: u32, size: u32) -> Option<usize> {
-        let pad = padding(size);
-        let flags = u64::from(pad & 0xf) | HAS_PADDING;
-        let padded = size + pad;
-        let total = padded + ITEM;
-        let length = self.buf.len() as u64;
-        if u64::from(total) + u64::from(ITEM) > length || length - u64::from(total + ITEM) < self.end as u64 {
-            return None;
-        }
-        let at = self.end;
-        self.buf[at..at + 4].copy_from_slice(&ty.to_le_bytes());
-        self.buf[at + 4..at + 8].copy_from_slice(&padded.to_le_bytes());
-        self.buf[at + 8..at + 16].copy_from_slice(&flags.to_le_bytes());
-        self.end += ITEM as usize;
-        let data = self.end;
-        self.buf[data + size as usize..data + padded as usize].fill(0);
-        self.end += padded as usize;
-        // kcdata_write_buffer_end.
-        let e = self.end;
-        self.buf[e..e + 16].fill(0);
-        self.buf[e..e + 4].copy_from_slice(&TYPE_BUFFER_END.to_le_bytes());
-        Some(data)
-    }
-
-    /// `kcdata_memory_get_used_bytes`: the items and the end marker.
-    fn used(&self) -> usize {
-        self.end + ITEM as usize
-    }
 }
 
 /// An `os_reason`.
@@ -172,13 +116,13 @@ impl OsReason {
         if size == 0 {
             return Ok(());
         }
-        self.kcd = Some(Kcdata::new(BUFFER_BEGIN_OS_REASON, size).ok_or(())?);
+        self.kcd = Some(Kcdata::alloc_init(BUFFER_BEGIN_OS_REASON, size as usize, 0).ok_or(())?);
         Ok(())
     }
 
     /// The buffer's used bytes, as `proc_pidexitreasoninfo` copies them out.
     pub fn data(&self) -> &[u8] {
-        self.kcd.as_ref().map_or(&[], |k| &k.buf[..k.used()])
+        self.kcd.as_ref().map_or(&[], |k| &k.bytes()[..k.used_bytes()])
     }
 
     /// `build_signal_reason(signum, procname)`, sent by process `pid` whose
@@ -191,10 +135,10 @@ impl OsReason {
             return r;
         }
         let k = r.kcd.as_mut().expect("a signal reason's buffer");
-        if let Some(at) = k.item(TYPE_PID, 4) {
-            k.buf[at..at + 4].copy_from_slice(&pid.to_le_bytes());
+        if let Ok(at) = k.get_memory_addr(TYPE_PID, 4) {
+            k.memcpy(at, &pid.to_le_bytes());
         }
-        if let Some(at) = k.item(TYPE_PROCNAME, P_NAME_LEN as u32) {
+        if let Ok(at) = k.get_memory_addr(TYPE_PROCNAME, P_NAME_LEN as u32) {
             if let Some(p) = procname {
                 // strncpy into a buffer of the name's size, its last byte
                 // NUL, then that string's length copied.
@@ -203,9 +147,9 @@ impl OsReason {
                 t[..n].copy_from_slice(&p[..n]);
                 t[P_NAME_LEN - 1] = 0;
                 let len = t.iter().position(|&c| c == 0).unwrap_or(P_NAME_LEN);
-                k.buf[at..at + len].copy_from_slice(&t[..len]);
+                k.memcpy(at, &t[..len]);
             } else if name[0] != 0 {
-                k.buf[at..at + P_NAME_LEN].copy_from_slice(name);
+                k.memcpy(at, &name[..P_NAME_LEN]);
             } else {
                 // The kernel copies the bytes of its pointer to "unknown"
                 // here (`&default_sender_procname`), not the string: a
@@ -274,8 +218,8 @@ impl OsReason {
             }
             let k = r.kcd.as_mut().expect("a userspace reason's buffer");
             if let Some(s) = desc.as_ref().filter(|s| !s.is_empty()) {
-                match k.item(USER_DESC, s.len() as u32) {
-                    Some(at) => k.buf[at..at + s.len()].copy_from_slice(s),
+                match k.get_memory_addr(USER_DESC, s.len() as u32).ok() {
+                    Some(at) => k.memcpy(at, s),
                     None => {
                         failed(&mut r);
                         return r;
@@ -284,12 +228,12 @@ impl OsReason {
             }
             if payload != 0 {
                 let k = r.kcd.as_mut().expect("a userspace reason's buffer");
-                let Some(at) = k.item(USER_PAYLOAD, payload_size) else {
+                let Some(at) = k.get_memory_addr(USER_PAYLOAD, payload_size).ok() else {
                     failed(&mut r);
                     return r;
                 };
                 match m.read(payload, payload_size as usize) {
-                    Ok(b) => k.buf[at..at + payload_size as usize].copy_from_slice(b),
+                    Ok(b) => k.memcpy(at, &b[..payload_size as usize]),
                     Err(_) => {
                         failed(&mut r);
                         return r;
@@ -308,8 +252,8 @@ impl OsReason {
         let mut r = OsReason { namespace, code, flags, kcd: None };
         if r.alloc_buffer(estimate(1, desc.len() as u32)).is_ok() {
             if let Some(k) = r.kcd.as_mut() {
-                if let Some(at) = k.item(USER_DESC, desc.len() as u32) {
-                    k.buf[at..at + desc.len()].copy_from_slice(desc);
+                if let Ok(at) = k.get_memory_addr(USER_DESC, desc.len() as u32) {
+                    k.memcpy(at, desc);
                 }
             }
         }
@@ -327,7 +271,7 @@ impl OsReason {
     /// The walk is `kcdata_iter_find_type`'s over the whole buffer
     /// (`osr_bufsize`), each item valid while it fits, to the end marker.
     pub fn user_desc(&self) -> Option<&[u8]> {
-        let b = &self.kcd.as_ref()?.buf;
+        let b = self.kcd.as_ref()?.bytes();
         let rd32 = |at: usize| u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
         let valid = |at: usize| at + ITEM as usize <= b.len() && at + ITEM as usize + rd32(at + 4) as usize <= b.len();
         if !valid(0) || rd32(0) != BUFFER_BEGIN_OS_REASON {
@@ -400,7 +344,7 @@ impl crate::syscalls::Kernel {
         }
         let r = OsReason::userspace(m, a[0] as u32, a[1], a[2], a[3] as u32, a[4], a[5] | flag::ABORT);
         if user_fault {
-            self.darwin_unimplemented(format!("os_fault_with_payload's simulated EXC_GUARD (task_violated_guard, a corpse) for namespace {} code {:#x}", r.namespace, r.code));
+            self.darwin_unimplemented(format!("os_fault_with_payload's simulated EXC_GUARD for namespace {} code {:#x} (task_violated_guard's task_enqueue_exception_with_corpse: a lightweight corpse for a backtrace-preferring handler, else a corpse fork, a copy of the live task that never runs)", r.namespace, r.code));
             return Err(super::errno::errno_of(16));
         }
         self.darwin_psignal_try_thread(dsig::SIGABRT, Some(Arc::new(r)));
@@ -533,7 +477,7 @@ mod tests {
 
     #[test]
     fn a_buffer_too_small_for_its_begin_item_is_none() {
-        assert!(Kcdata::new(BUFFER_BEGIN_OS_REASON, 31).is_none());
-        assert!(Kcdata::new(BUFFER_BEGIN_OS_REASON, 32).is_some());
+        assert!(Kcdata::alloc_init(BUFFER_BEGIN_OS_REASON, 31, 0).is_none());
+        assert!(Kcdata::alloc_init(BUFFER_BEGIN_OS_REASON, 32, 0).is_some());
     }
 }

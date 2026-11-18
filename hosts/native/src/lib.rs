@@ -1051,6 +1051,10 @@ fn run_program_with(
     xlate: &Options,
     inherited: Option<Inherited>,
 ) -> Result<(Exit, Stats)> {
+    // This host keeps a Darwin corpse's task past its process's end
+    // (corpse::hold at each task's end, corpse::exited once the end is
+    // published).
+    gex_kernel::darwin::corpse::set_host_keeps_corpses();
     let mut process = RunProcess { inherited, kernel: None, spawn: None };
     let r = run_process(program, opts, xlate, &mut process);
     if r.is_err() {
@@ -2001,6 +2005,13 @@ fn run_process(
         k.darwin_task_terminate();
         k.close_all_fds();
     }
+    // A corpse's task outlives its process; the first process's end was
+    // published above, another's is by its parent's side once this returns.
+    gex_kernel::darwin::corpse::hold(&spawn.kernel);
+    let pid = spawn.kernel.lock().unwrap_or_else(|e| e.into_inner()).pid;
+    if pid == gex_kernel::INIT_PID {
+        gex_kernel::darwin::corpse::exited(pid);
+    }
     // (A thread that cannot be made drops it here, with its closure.)
     let rest = (store, linker, spawn, memory, shared);
     let _ = std::thread::Builder::new().name("gex-reap".into()).spawn(move || drop(rest));
@@ -2115,28 +2126,39 @@ impl Drop for GatePaused<'_> {
 
 /// Bring every other guest thread to a halt after the process has exited.
 fn stop_other_threads(spawn: &SpawnContext, verbose: bool) {
+    stop_other_threads_but(spawn, 0, verbose);
+}
+
+/// [`stop_other_threads`] from a thread `own` of the running count is (a
+/// spawned thread counts itself until it returns). As XNU's exit does
+/// (`task_terminate_internal`, then the last thread's `proc_exit`), the
+/// process ends only once every other thread has: there is no time limit.
+/// A thread still running after half a second is said, once.
+fn stop_other_threads_but(spawn: &SpawnContext, own: usize, verbose: bool) {
     use std::sync::atomic::Ordering;
     let started = std::time::Instant::now();
-    spawn.stopping.store(true, Ordering::Release);
+    let already = spawn.stopping.swap(true, Ordering::AcqRel);
     {
         let k = spawn.kernel.lock().unwrap_or_else(|e| e.into_inner());
         k.futexes.wake_everything();
     }
-    let deadline = started + std::time::Duration::from_millis(500);
-    while spawn.running.load(Ordering::Acquire) > 0 && std::time::Instant::now() < deadline {
+    // A spawned thread another thread's end is stopping goes: it is one of
+    // those that one waits for.
+    if already && own > 0 {
+        return;
+    }
+    let slow = started + std::time::Duration::from_millis(500);
+    let mut said = false;
+    while spawn.running.load(Ordering::Acquire) > own {
+        if !said && std::time::Instant::now() >= slow {
+            said = true;
+            let pid = spawn.kernel.lock().unwrap_or_else(|e| e.into_inner()).pid;
+            eprintln!("[gex] pid {pid}: {} thread(s) still running 500ms after the process began to end; waiting for them", spawn.running.load(Ordering::Acquire) - own);
+        }
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
     if verbose {
-        let left = spawn.running.load(Ordering::Acquire);
-        eprintln!(
-            "[gex] stopped other threads in {:.0}ms{}",
-            started.elapsed().as_secs_f64() * 1000.0,
-            if left > 0 {
-                format!(", {left} did not stop in time")
-            } else {
-                String::new()
-            }
-        );
+        eprintln!("[gex] stopped other threads in {:.0}ms", started.elapsed().as_secs_f64() * 1000.0);
     }
 }
 
@@ -3544,6 +3566,7 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
                         k.darwin_task_terminate();
                         k.close_all_fds();
                     }
+                    gex_kernel::darwin::corpse::hold(&kernel);
                     (127, 127 << 8)
                 }
             };
@@ -3580,7 +3603,10 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
                 k.darwin_task_terminate();
                 k.close_all_fds();
             }
+            gex_kernel::darwin::corpse::hold(&kernel);
             procs.exit(pid, wstatus);
+            // proc_exit is done: a corpse's notification goes out.
+            gex_kernel::darwin::corpse::exited(pid);
             usage::forget(pid);
             let (st, done) = status;
             *st.lock().unwrap_or_else(|e| e.into_inner()) = Some(wstatus);
@@ -4431,6 +4457,7 @@ fn start_darwin_spawn(cx: &SpawnContext, mut child: Kernel) -> std::result::Resu
                 };
                 procs.set_uid(pid, creds.uid());
                 procs.exit(pid, wstatus);
+                gex_kernel::darwin::corpse::exited(pid);
                 *status.lock().unwrap_or_else(|e| e.into_inner()) = Some(wstatus);
                 done.notify_all();
             }
@@ -4475,7 +4502,8 @@ fn end_process(cx: &SpawnContext, exit: Exit) {
             *ended = Some(exit);
         }
     }
-    stop_other_threads(cx, false);
+    // The thread ending the process is one of the running.
+    stop_other_threads_but(cx, 1, false);
 }
 
 /// Instantiate every registry entry into this store, outside a wasm frame.
@@ -6292,6 +6320,24 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 let detail = format!("BUG: a guest return reached native Wine's return pad {pc:#x} (sp {sp:#x}) with no call-out catching it; call-outs open: {open:?}");
                 eprintln!("gex: {detail}");
                 caller.data_mut().exit = Some(Exit::Signal { signal: signal::SIGTRAP, pc: pc as u64, detail, internal: true });
+                return Err(StopExecution.into());
+            }
+            // A Darwin program's brk: sleh's handle_breakpoint, EXC_BREAKPOINT
+            // through exception triage to the signal it means (SIGTRAP), its
+            // handler run, or the process's end with its report.
+            if caller.data_mut().with_kernel(|k| k.darwin) {
+                let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+                let mut gm = GuestMem::new(memory.bytes());
+                let state = caller.data_mut();
+                match state.with_kernel(|k| k.raise_fault(&mut gm, signal::SIGTRAP as u32, pc as u64, pc as u64)) {
+                    gex_kernel::signal::Delivery::Resume(target) => {
+                        state.resume_cause = Some("SIGTRAP".into());
+                        state.resume_at = Some(target);
+                    }
+                    _ => {
+                        state.exit = Some(Exit::Signal { signal: signal::SIGTRAP, pc: pc as u64, detail: format!("brk #{imm}"), internal: false });
+                    }
+                }
                 return Err(StopExecution.into());
             }
             // int3: the hook sees the address after it, as hardware leaves it.

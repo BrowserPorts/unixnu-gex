@@ -150,6 +150,10 @@ pub struct Attr {
     pub crash_behavior_deadline: u64,
     /// `psa_launch_type`.
     pub launch_type: u8,
+    /// `psa_crash_count`, `psa_throttle_timeout`
+    /// (`posix_spawnattr_set_crash_count_np`).
+    pub crash_count: u32,
+    pub throttle_timeout: u32,
 }
 
 impl Attr {
@@ -181,6 +185,8 @@ impl Attr {
             crash_behavior: le32(b, 148),
             crash_behavior_deadline: le64(b, 160),
             launch_type: b[168],
+            crash_count: le32(b, 172),
+            throttle_timeout: le32(b, 176),
         }
     }
 }
@@ -203,6 +209,10 @@ pub struct After {
     /// asked for.
     pub crash_behavior: u8,
     pub crash_behavior_deadline: u64,
+    /// `p_crash_count` and `p_throttle_timeout`: the spawn's attributes',
+    /// 0 for a spawn with none.
+    pub crash_count: u32,
+    pub throttle_timeout: u32,
     /// `psa_pcontrol`, when the spawn had attributes.
     pub pcontrol: Option<i32>,
     /// `psa_cpumonitor_percent` and `psa_cpumonitor_interval` (seconds).
@@ -690,12 +700,13 @@ impl Kernel {
     fn darwin_spawn_child(&mut self, m: &GuestMem<'_>, child: &mut Kernel, attr: Option<&Attr>, file_actions: Option<&[u8]>, port_actions: Option<&[u8]>, creds: &SpawnCreds, path: u64, argv: u64, envv: u64) -> Result<(), Errno> {
         let flags = attr.map_or(0, |a| a.flags);
         let policy = attr.map_or((0, 0, 0), |a| super::taskpolicy::spawn_attrs(a.apptype, a.qos_clamp, a.darwin_role));
-        let mut after = After { flags, policy, sigmask: attr.map_or(0, |a| a.sigmask), sigdefault: attr.map_or(0, |a| a.sigdefault), inherit: Vec::new(), max_addr: attr.map_or(0, |a| a.max_addr), crash_behavior: 0, crash_behavior_deadline: 0, pcontrol: attr.map(|a| a.pcontrol), cpumonitor: attr.map_or((0, 0), |a| (a.cpumonitor_percent, a.cpumonitor_interval)), bad_psattr: false };
+        let mut after = After { flags, policy, sigmask: attr.map_or(0, |a| a.sigmask), sigdefault: attr.map_or(0, |a| a.sigdefault), inherit: Vec::new(), max_addr: attr.map_or(0, |a| a.max_addr), crash_behavior: 0, crash_behavior_deadline: 0, crash_count: attr.map_or(0, |a| a.crash_count), throttle_timeout: attr.map_or(0, |a| a.throttle_timeout), pcontrol: attr.map(|a| a.pcontrol), cpumonitor: attr.map_or((0, 0), |a| (a.cpumonitor_percent, a.cpumonitor_interval)), bad_psattr: false };
         // The new proc's p_crash_behavior and its deadline, set once it is
         // made (before the file actions and the image's activation), so a
         // spawn that fails after has them at its end.
         (after.crash_behavior, after.crash_behavior_deadline) = self.darwin_spawn_crash_behavior(attr);
         (child.dtask.crash_behavior, child.dtask.crash_behavior_deadline) = (after.crash_behavior, after.crash_behavior_deadline);
+        (child.dtask.crash_count, child.dtask.throttle_timeout) = (after.crash_count, after.throttle_timeout);
         if let Some(fa) = file_actions {
             let mut fileports = self.darwin_spawn_fileports(fa);
             after.inherit = child.darwin_file_actions(fa, flags, &mut fileports)?;
@@ -950,7 +961,7 @@ impl Kernel {
                 });
             }
         }
-        let mut after = After { flags: at.flags, policy: super::taskpolicy::spawn_attrs(at.apptype, at.qos_clamp, at.darwin_role), sigmask: at.sigmask, sigdefault: at.sigdefault, inherit: Vec::new(), max_addr: at.max_addr, crash_behavior: 0, crash_behavior_deadline: 0, pcontrol: Some(at.pcontrol), cpumonitor: (at.cpumonitor_percent, at.cpumonitor_interval), bad_psattr: false };
+        let mut after = After { flags: at.flags, policy: super::taskpolicy::spawn_attrs(at.apptype, at.qos_clamp, at.darwin_role), sigmask: at.sigmask, sigdefault: at.sigdefault, inherit: Vec::new(), max_addr: at.max_addr, crash_behavior: 0, crash_behavior_deadline: 0, crash_count: at.crash_count, throttle_timeout: at.throttle_timeout, pcontrol: Some(at.pcontrol), cpumonitor: (at.cpumonitor_percent, at.cpumonitor_interval), bad_psattr: false };
         (after.crash_behavior, after.crash_behavior_deadline) = self.darwin_spawn_crash_behavior(Some(at));
         let mut fileports = file_actions.map(|fa| self.darwin_spawn_fileports(fa)).unwrap_or_default();
         let activated = (|| {

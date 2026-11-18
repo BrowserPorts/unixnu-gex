@@ -547,6 +547,12 @@ pub struct PeerVm {
     pub mem: Arc<dyn PeerMem>,
 }
 
+impl std::fmt::Debug for PeerVm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PeerVm")
+    }
+}
+
 /// `prctl` option gex adds: the calling process has crashed (`arg2` the
 /// note's address, `arg3` its length; [`ProcTable::set_crash`]).
 pub const PR_GEX_CRASH: u64 = 0x4745_0002;

@@ -781,6 +781,26 @@ pub fn proc_exit(procs: &crate::proc::ProcTable, pid: i32, p: &super::procinfo::
     *p.rusage.exit.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
 }
 
+/// `gather_rusage_info(p, ri, RUSAGE_INFO_CURRENT)` with `ri_phys_footprint`
+/// 0, for a corpse's crash information: the task's usage as it stands (its
+/// pages looked at from outside it), with `bills` its bank figures; and,
+/// for `proc_prepareexit`'s record of an ending process (`exit`), its
+/// `ri_proc_exit_abstime` now.
+pub fn crash_record(procs: &crate::proc::ProcTable, pid: i32, p: &super::procinfo::Public, bills: Bills, exit: bool) -> Record {
+    let mut i = input(procs, pid, p);
+    let looked = footprint_from_outside(procs, pid, p);
+    i.footprint_peaks = looked.as_ref().map(|l| l.peaks);
+    i.resident = looked.as_ref().map(|l| l.resident);
+    i.footprint = Some(0);
+    i.instructions = instructions_from_outside(procs, pid, p);
+    i.bills = Some(bills);
+    let mut r = gather(&i);
+    if exit {
+        r.w[ri::PROC_EXIT_ABSTIME] = super::mach::absolute_time();
+    }
+    r
+}
+
 /// `reap_child_locked`'s `update_rusage_info_child` of a reaped child's
 /// `p_ru` into its parent's `ri_child` (whatever the parent's
 /// `P_NOCLDWAIT`); `times` is 2 for a parent with `P_NOCLDWAIT`, as

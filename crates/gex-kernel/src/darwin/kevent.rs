@@ -439,6 +439,41 @@ pub struct Kevents {
     pub(super) select: HashMap<i32, super::select::Select>,
 }
 
+/// The buckets `hashinit(CONFIG_KN_HASHSIZE)` makes for `fd_knhash` and
+/// `fd_kqhash` (`CONFIG_KQ_HASHSIZE` is the same): MASTER.arm64.iPhoneOS's
+/// KERNEL_BASE is xsmall, whose CONFIG_KN_HASHSIZE is 48, and hashinit
+/// rounds down to a power of two, 32 (mask 31).
+const KN_HASH_MASK: u64 = 31;
+
+/// `KN_HASH` and `KQ_HASH`.
+fn kn_hash(v: u64) -> u64 {
+    (v ^ (v >> 8)) & KN_HASH_MASK
+}
+
+impl Kevents {
+    /// `kevent_proc_copy_uptrs`: the knotes' user data, the descriptor
+    /// list's lists in descriptor order and then the knote hash's buckets
+    /// in order (each list newest first, `SLIST_INSERT_HEAD`), then the
+    /// dynamic workloops' ids by the workloop hash's buckets (each bucket
+    /// newest first, `LIST_INSERT_HEAD`).
+    pub(crate) fn proc_copy_uptrs(&self) -> Vec<u64> {
+        let udata = |n: &KnId| self.knotes.get(n).map_or(0, |k| k.udata);
+        let mut out = Vec::new();
+        let mut fds: Vec<&u64> = self.knlist.keys().collect();
+        fds.sort_unstable();
+        for fd in fds {
+            out.extend(self.knlist[fd].iter().map(udata));
+        }
+        let mut hashed: Vec<(u64, KnId)> = self.knhash.iter().flat_map(|(&id, l)| l.iter().map(move |&n| (kn_hash(id), n))).collect();
+        hashed.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+        out.extend(hashed.iter().map(|(_, n)| udata(n)));
+        let mut wls: Vec<(u64, KqId, u64)> = self.kqhash.iter().map(|(&id, &kq)| (kn_hash(id), kq, id)).collect();
+        wls.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+        out.extend(wls.iter().map(|w| w.2));
+        out
+    }
+}
+
 /// `struct pollfd`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PollFd {

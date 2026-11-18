@@ -39,6 +39,7 @@ pub mod ttydev;
 pub mod km;
 pub mod cpumon;
 pub mod cred;
+pub mod corpse;
 pub mod critexit;
 pub mod errno;
 pub mod exec;
@@ -138,6 +139,7 @@ pub mod threadstate;
 pub mod thread;
 pub mod timer;
 pub mod triage;
+pub mod kcdata;
 pub mod udif;
 pub mod trustcache;
 pub mod vconsole;
@@ -411,6 +413,11 @@ pub struct Task {
     /// a parent entitled to set them; an exec clears them.
     pub crash_behavior: u8,
     pub crash_behavior_deadline: u64,
+    /// `p_crash_count` and `p_throttle_timeout`: what `posix_spawn` set
+    /// (`posix_spawnattr_set_crash_count_np`), for a corpse's crash
+    /// information.
+    pub crash_count: u32,
+    pub throttle_timeout: u32,
     /// `p_posix_spawn_failed`: the spawn that made it failed.
     pub spawn_failed: bool,
     /// Its map's lowest address (`vm_map_min`): the end of the image's
@@ -420,6 +427,16 @@ pub struct Task {
     pub syscall_exit: bool,
     /// The EXC_CRASH code and subcode a death owes its handlers.
     pub crash_notify: Option<(i64, i64)>,
+    /// The task is a corpse (`TFRO_CORPSE`), with what it keeps.
+    pub corpse: Option<Box<corpse::Corpse>>,
+    /// `vm_map_set_corpse_source`: a fatal memory limit's kill is to make
+    /// the task a corpse whatever its EXC_CRASH handlers do.
+    pub corpse_source: bool,
+    /// The `vm_fault` result of the fault being raised as a signal.
+    pub fault_code: Option<i64>,
+    /// Each thread's paths XNU records kernel triage events on that this
+    /// kernel does not record ([`crate::syscalls::Kernel::darwin_ktriage_unmodelled`]).
+    pub ktriage_unmodelled: std::collections::HashMap<i32, Vec<String>>,
     /// Each thread's kernel reply port, and a reply that came to it.
     pub rpc_reply: std::collections::HashMap<i32, ipc::ObjId>,
     pub rpc_replies: std::collections::HashMap<i32, Box<ipc::msg::Kmsg>>,

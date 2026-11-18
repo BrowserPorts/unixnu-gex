@@ -444,7 +444,9 @@ export const images = {
               return lib;
             });
             const obj = join(tmp, 'main.obj');
-            execFileSync(llvm('clang-cl'), ['--target=x86_64-pc-windows-msvc', '/O1', '/GS-', '/EHa', '/c', join(src, f), `/Fo${obj}`], { stdio: ['ignore', 'ignore', 'pipe'] });
+            // (the source after --: clang-cl reads a path that starts /U, as
+            // macOS's /Users/... do, as its /U option)
+            execFileSync(llvm('clang-cl'), ['--target=x86_64-pc-windows-msvc', '/O1', '/GS-', '/EHa', '/c', `/Fo${obj}`, '--', join(src, f)], { stdio: ['ignore', 'ignore', 'pipe'] });
             execFileSync(llvm('lld-link'), ['/nodefaultlib', '/entry:entry', '/subsystem:console', '/dynamicbase', '/Brepro', obj, ...libs, `/out:${join(dir, arch, f.replace(/\.[a-z]+$/, '.exe'))}`], { stdio: ['ignore', 'ignore', 'pipe'] });
           } catch (e) {
             failed[`${arch}/${f}`] = String(e.stderr ?? e.message).split('\n').find((l) => /error/.test(l)) ?? String(e.message).split('\n')[0];

@@ -13,6 +13,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { Cdp, browserWsUrl } from '../test/lib/cdp.mjs';
+import { chromePath, hostAngle, vulkanFeature } from './lib/chrome.mjs';
 import { images, outputs } from './fixtures/images.mjs';
 import { packaged } from './lib/package.mjs';
 import { refuseStale } from '../page/build-inputs.mjs';
@@ -364,12 +365,12 @@ async function startBrowser() {
   log(`vite on ${PORT}, work ${WORK}`);
   const profile = join(WORK, 'profile');
   rmSync(profile, { recursive: true, force: true });
-  const chrome = spawn(process.env.CHROME || '/usr/bin/chromium', [
+  const chrome = spawn(chromePath(), [
     '--headless=new', `--remote-debugging-port=${PORT + 1}`, `--user-data-dir=${profile}`, '--autoplay-policy=no-user-gesture-required',
-    '--no-first-run', '--no-default-browser-check', '--enable-unsafe-webgpu', '--enable-features=Vulkan',
+    '--no-first-run', '--no-default-browser-check', '--enable-unsafe-webgpu', ...vulkanFeature,
     // The machine's GPU (--gpu), else SwiftShader. ANGLE and WebGPU on one
     // backend either way: a canvas both read needs that.
-    ...(gpu ? ['--use-angle=vulkan', '--ignore-gpu-blocklist'] : ['--use-angle=swiftshader']),
+    ...(gpu ? [hostAngle, '--ignore-gpu-blocklist'] : ['--use-angle=swiftshader']),
     '--disable-gpu-sandbox', '--no-sandbox', 'about:blank',
   ], { stdio: ['ignore', 'ignore', o.verbose ? 'inherit' : 'ignore'] });
   let ws = null;

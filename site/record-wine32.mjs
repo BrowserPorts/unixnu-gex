@@ -35,6 +35,7 @@ import http from 'node:http';
 import { tmpdir } from 'node:os';
 import { extname, join, resolve } from 'node:path';
 import { Cdp, browserWsUrl } from '../test/lib/cdp.mjs';
+import { chromePath, headlessScreen, hostAngle, vulkanFeature } from '../test/lib/chrome.mjs';
 
 const av = process.argv.slice(2);
 const opt = (n, d) => { const i = av.indexOf(n); return i >= 0 ? av[i + 1] : d; };
@@ -84,10 +85,9 @@ if (opt('--serve', null)) {
 
 const port = Number(opt('--port', '9711'));
 const profile = mkdtempSync(join(tmpdir(), 'gex-record-wine32-'));
-const chrome = spawn(opt('--chrome', process.env.CHROME || '/usr/bin/chromium'), [
+const chrome = spawn(opt('--chrome', chromePath()), [
   '--headless', '--no-sandbox', '--disable-gpu-sandbox', '--enable-unsafe-webgpu',
-  '--use-angle=vulkan', '--enable-features=Vulkan', '--ozone-platform=headless',
-  '--ozone-override-screen-size=1280,900', '--window-size=1280,900', '--disable-hang-monitor',
+  hostAngle, ...vulkanFeature, ...headlessScreen(1280, 900), '--disable-hang-monitor',
   '--no-first-run', '--no-default-browser-check', '--remote-allow-origins=*',
   `--remote-debugging-port=${port}`, `--user-data-dir=${profile}`, 'about:blank',
 ], { detached: true, stdio: 'ignore' });

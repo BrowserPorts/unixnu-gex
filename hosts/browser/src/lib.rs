@@ -10199,16 +10199,17 @@ fn carry_name(file: &gex_kernel::file::OpenFile, holder: i32) -> Option<String> 
         pty_note("hands on", id, master as i32, holder);
         return Some(file.path.clone());
     }
-    // A memfd going to a fork's child: its bytes move into the global
-    // kernel first, so the two processes share one file (and their shared
-    // mappings of it meet as any file's do); then it goes by id, below.
-    if holder >= 0 {
-        if let Some(memfd) = Arc::clone(&file.handle).as_memfd() {
-            if memfd.backing().is_none() {
-                if let Err(e) = share_memfd(&memfd) {
-                    warn_line(&format!("gex: could not share {} with a child: {e}\n", file.path));
-                    return None;
-                }
+    // A memfd going to another process, a fork's child or a receiver of
+    // SCM_RIGHTS: its bytes move into the global kernel first, so the two
+    // processes share one file (and their shared mappings of it meet as any
+    // file's do); then it goes by id, below. (By name it was lost: a
+    // wineserver whose headers have MFD_EXEC makes its sections memfds, and
+    // a process got none of them, the shared user data's first.)
+    if let Some(memfd) = Arc::clone(&file.handle).as_memfd() {
+        if memfd.backing().is_none() {
+            if let Err(e) = share_memfd(&memfd) {
+                warn_line(&format!("gex: could not share {} with another process: {e}\n", file.path));
+                return None;
             }
         }
     }

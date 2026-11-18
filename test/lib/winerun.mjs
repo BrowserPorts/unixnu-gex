@@ -423,7 +423,19 @@ function session(t, { kind, distSrc, pfxSrc, monoSrc = null, nativeSrc = null, w
       const node = single ? [...(typeof WebAssembly.Suspending !== 'function' ? ['--experimental-wasm-jspi'] : []),
         '--import', 'data:text/javascript,delete globalThis.SharedArrayBuffer'] : [];
       const rssFile = join(work, `${name}.rss`);
-      const peak = rss ? ['python3', '-c', 'import ctypes,resource,subprocess,sys; rc=subprocess.call(sys.argv[2:], preexec_fn=lambda: ctypes.CDLL(None).prctl(1, 9)); open(sys.argv[1],"w").write("%d\\n" % resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss); sys.exit(rc)', rssFile] : [];
+      // The run under a python3 that reports its peak RSS in KiB (Linux's
+      // ru_maxrss; macOS's is bytes) and takes it down with itself: Linux's
+      // PR_SET_PDEATHSIG where there is one, else a signal passed on
+      const peak = rss ? ['python3', '-c', [
+        'import resource,signal,subprocess,sys',
+        'linux = sys.platform.startswith("linux")',
+        'pre = (lambda: __import__("ctypes").CDLL(None).prctl(1, 9)) if linux else None',
+        'p = subprocess.Popen(sys.argv[2:], preexec_fn=pre)',
+        'for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP): signal.signal(s, lambda n, f: (p.kill(), sys.exit(128 + n)))',
+        'rc = p.wait()',
+        'open(sys.argv[1], "w").write("%d\\n" % (resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss // (1 if linux else 1024)))',
+        'sys.exit(rc)',
+      ].join('\n'), rssFile] : [];
       rmSync(rssFile, { force: true });
       // (the run's own kill reaches node too: its parent's death kills it)
       const argv = [...peak, process.execPath, ...node, '--max-old-space-size=8192', join(ROOT, 'hosts/browser/js/run-node.mjs'),

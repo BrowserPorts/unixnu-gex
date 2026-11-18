@@ -10,12 +10,13 @@ import { join, dirname, normalize, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { inflateSync } from 'node:zlib';
 import { Cdp, browserWsUrl } from '../../test/lib/cdp.mjs';
+import { chromePath, headlessScreen, hostAngle, vulkanFeature } from '../../test/lib/chrome.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const ROOT = join(HERE, '..', '..');
 export const WEB = join(ROOT, 'page');
 export const PREFIX = process.env.GEX_WINE_PREFIX || join(process.env.HOME, '.cache/gex/wine-11.15');
-const CHROME = process.env.CHROME || '/usr/bin/chromium';
+const CHROME = chromePath();
 const VITE_PORT = Number(process.env.GEX_WIN_VITE_PORT || 5199);
 const CHROME_PORT = Number(process.env.GEX_WIN_CHROME_PORT || 9339);
 export const STATE = join(process.env.TMPDIR || '/tmp', `gex-nt-browser-${process.getuid?.() ?? 0}`);
@@ -214,8 +215,8 @@ export async function openPage(query, { width = 1280, height = 900, shotDir = nu
   const chrome = spawn(CHROME, [
     '--headless', '--no-sandbox', '--disable-gpu-sandbox', '--enable-unsafe-swiftshader',
     '--enable-unsafe-webgpu',
-    ...(soft ? ['--use-angle=swiftshader-webgl', '--use-webgpu-adapter=swiftshader'] : ['--use-angle=vulkan', '--enable-features=Vulkan']),
-    '--ozone-platform=headless', `--ozone-override-screen-size=${width},${height}`, `--window-size=${width},${height}`,
+    ...(soft ? ['--use-angle=swiftshader-webgl', '--use-webgpu-adapter=swiftshader'] : [hostAngle, ...vulkanFeature]),
+    ...headlessScreen(width, height),
     ...(process.env.GEX_WIN_CHROME_FLAGS ? process.env.GEX_WIN_CHROME_FLAGS.split(' ') : []),
     '--enable-logging=stderr', '--disable-hang-monitor', '--no-first-run', '--no-default-browser-check', '--remote-allow-origins=*',
     `--remote-debugging-port=${CHROME_PORT}`, `--user-data-dir=${join(STATE, 'profile')}`, 'about:blank',

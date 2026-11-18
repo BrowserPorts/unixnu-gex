@@ -7,7 +7,8 @@
 // calling thread's copy the crashed one, and whose crash information says
 // it is a fork: the child's pid, exception type and codes 0, no exit time;
 // its ledgers are the child's copied ones and its audit token the child's;
-// the child goes on. A corpse's own fork is refused. At most five corpses are in flight.
+// the child goes on. A task is refused its own movable control port. A
+// corpse's own fork is refused. At most five corpses are in flight.
 // os_fault_with_payload makes a fork corpse for the child's EXC_CORPSE_NOTIFY
 // handler, its codes {EXC_GUARD, 0}, its crash information the simulated
 // guard's codes and the reason's snapshot; a second fault while the first
@@ -383,6 +384,11 @@ static int limit(void) {
 }
 
 static int own(void) {
+    // Its own control port, movable, is refused it: it is not entitled to
+    // one (com.apple.security.get-movable-control-port).
+    mach_port_t movable = MACH_PORT_NULL;
+    kern_return_t mk = task_get_special_port(mach_task_self(), TASK_KERNEL_PORT, &movable);
+    if (mk != KERN_DENIED) return bad("task_get_special_port(TASK_KERNEL_PORT) of itself", mk, KERN_DENIED);
     mach_port_t corpse = MACH_PORT_NULL;
     kern_return_t kr = generate(mach_task_self(), &corpse);
     if (kr) return bad("task_generate_corpse of itself", kr, 0);

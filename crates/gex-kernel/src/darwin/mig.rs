@@ -1879,6 +1879,23 @@ fn task_get_special_port(k: &mut Kernel, which: i32, f: u8) -> Reply {
         flavor::READ => matches!(which, TASK_READ_PORT | TASK_INSPECT_PORT | TASK_NAME_PORT),
         _ => matches!(which, TASK_INSPECT_PORT | TASK_NAME_PORT),
     };
+    // task_get_special_port_from_user: the task's own control port asked
+    // for through its own control port is the movable one only for a task
+    // the policies allow (mac_task_check_get_movable_control_port, AMFI's
+    // policy), as a send-once substitute (task_get_non_substituted_self's
+    // ipc_kobject_alloc_subst_once).
+    let own = k.dtask.kcaller == 0 || k.dtask.kcaller == k.ipc().task;
+    if which == TASK_KERNEL_PORT && own {
+        const KERN_DENIED: i32 = 53;
+        if k.darwin_mac_check_get_movable_control_port() != 0 {
+            return Reply::err(KERN_DENIED);
+        }
+        if f == flavor::CONTROL {
+            let mut r = Reply::err(KERN_FAILURE);
+            r.unimplemented = Some("task_get_special_port(TASK_KERNEL_PORT) of the task's own control port by a task allowed a movable one (IKOT_PORT_SUBST_ONCE)".into());
+            return r;
+        }
+    }
     if !allowed {
         return Reply::err(KERN_INVALID_CAPABILITY);
     }

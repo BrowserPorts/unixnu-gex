@@ -112,6 +112,18 @@ pub struct Build {
     pub corpse: Kernel,
     pub plan: Vec<ForkRange>,
     pub origin: Origin,
+    /// The ranges copied from purgeable objects
+    /// ([`Kernel::darwin_corpse_fork_vm`]).
+    pub purgeable: Vec<PurgeableCopy>,
+}
+
+/// A range of the corpse copied from a purgeable object
+/// (VM_MAP_FORK_PRESERVE_PURGEABLE): its place and the source's state.
+#[derive(Clone, Copy, Debug)]
+pub struct PurgeableCopy {
+    start: u64,
+    end: u64,
+    state: u8,
 }
 
 /// One of the corpse's threads: its thread, its register context (the
@@ -183,7 +195,7 @@ impl Kernel {
         let (special, special_dead, registered, exc) = self.darwin_inherited_ports();
         let ports = super::kobject::Kports { special, special_dead, registered, exc, ..Default::default() };
         match self.darwin_duplicate_map_and_threads(m, current, etype != 0) {
-            Ok((plan, shared, udata, dups, crashed, footprint, ledgers)) => {
+            Ok((plan, shared, udata, dups, crashed, footprint, ledgers, purgeable)) => {
                 let crashed_thread_id = dups[crashed].id;
                 // task_collect_crash_info(new_task, TRUE): no reference of
                 // its own; the fork's are given it after.
@@ -221,7 +233,7 @@ impl Kernel {
                 let record = super::rusage::crash_record(&self.procs, self.pid, &public, bills, false);
                 self.darwin_populate_corpse_crashinfo(&mut c, &public, code, subcode, &udata, reason, etype, record, current);
                 let corpse = self.darwin_corpse_kernel(c, ports, &shared, &dups);
-                Ok(Build { corpse, plan, origin })
+                Ok(Build { corpse, plan, origin, purgeable })
             }
             Err(kr) => {
                 self.darwin_corpse_ports_release(ports);
@@ -272,26 +284,26 @@ impl Kernel {
     /// the host follows, the ranges shared in place of not inherited, the
     /// user data, the threads and the crashed one's index.
     #[allow(clippy::type_complexity)]
-    fn darwin_duplicate_map_and_threads(&mut self, m: &mut GuestMem<'_>, current: Option<i32>, for_exception: bool) -> Result<(Vec<ForkRange>, Vec<(u64, u64)>, Vec<u64>, Vec<Dup>, usize, Option<corpse::Footprint>, corpse::Ledgers), u64> {
+    fn darwin_duplicate_map_and_threads(&mut self, m: &mut GuestMem<'_>, current: Option<i32>, for_exception: bool) -> Result<(Vec<ForkRange>, Vec<(u64, u64)>, Vec<u64>, Vec<Dup>, usize, Option<corpse::Footprint>, corpse::Ledgers, Vec<PurgeableCopy>), u64> {
         // map->disable_vmentry_reuse: set only by debug.toggle_address_reuse,
         // whose write this kernel does not make (it says so).
         // The footprint as it is now (get_task_phys_footprint).
         if self.procs.jetsam().ledgers.contains_key(&self.pid) && self.darwin_footprint_now(m).is_none() {
             return Err(KERN_FAILURE);
         }
-        let (plan, shared, udata, footprint, ledgers) = if self.darwin_allowed_vm_map_fork() {
-            let (plan, shared, footprint) = self.darwin_corpse_fork_map();
+        let (plan, shared, udata, footprint, ledgers, purgeable) = if self.darwin_allowed_vm_map_fork() {
+            let (plan, shared, footprint, purgeable) = self.darwin_corpse_fork_map();
             // vm_map_copy_footprint_ledgers.
             let ledgers = self.darwin_copied_ledgers();
             // kevent_proc_copy_uptrs: the buffer holds the count first
             // found and 32 more, and the count does not change in between.
             let udata = self.dtask.kevents.proc_copy_uptrs();
-            (plan, shared, udata, footprint, ledgers)
+            (plan, shared, udata, footprint, ledgers, purgeable)
         } else if !for_exception {
             return Err(KERN_NO_SPACE);
         } else {
             // The corpse keeps the empty map task_create_internal made it.
-            (self.darwin_fork_plan().into_iter().map(|r| ForkRange { how: Inherit::None, ..r }).collect(), Vec::new(), Vec::new(), None, corpse::Ledgers::default())
+            (self.darwin_fork_plan().into_iter().map(|r| ForkRange { how: Inherit::None, ..r }).collect(), Vec::new(), Vec::new(), None, corpse::Ledgers::default(), Vec::new())
         };
         // The task's active threads, in the order of its list.
         let mut tids = self.thread_signals.tids_in_order();
@@ -317,7 +329,7 @@ impl Kernel {
             }
             dups.push(Dup { tid, ctx, id, tsd: ts.as_ref().map_or(0, |t| t.tsd()), name: ts.as_ref().and_then(|t| t.name()) });
         }
-        Ok((plan, shared, udata, dups, crashed.unwrap_or(0), footprint, ledgers))
+        Ok((plan, shared, udata, dups, crashed.unwrap_or(0), footprint, ledgers, purgeable))
     }
 
     /// `memorystatus_allowed_vm_map_fork`: no jetsam purge of corpses
@@ -341,7 +353,7 @@ impl Kernel {
     /// [`super::vmobject::Pager`]) shared instead; this map's entries
     /// marked as a fork marks them, and its footprint collected for the
     /// corpse. The plan, and the ranges shared in place of not inherited.
-    fn darwin_corpse_fork_map(&mut self) -> (Vec<ForkRange>, Vec<(u64, u64)>, Option<corpse::Footprint>) {
+    fn darwin_corpse_fork_map(&mut self) -> (Vec<ForkRange>, Vec<(u64, u64)>, Option<corpse::Footprint>, Vec<PurgeableCopy>) {
         let (alias, alias_end) = (gex_abi::DARWIN_COMMPAGE_ALIAS, gex_abi::DARWIN_COMMPAGE_ALIAS + (gex_abi::DARWIN_COMMPAGE_END - gex_abi::DARWIN_COMMPAGE_RO));
         let vmas: Vec<(u64, u64, u32)> = self.mem.lock().vmas().iter().map(|v| (v.start, v.end, v.prot)).filter(|&(s, e, _)| !(s >= alias && e <= alias_end)).collect();
         let mut plan: Vec<ForkRange> = Vec::new();
@@ -368,13 +380,18 @@ impl Kernel {
                 }
             }
         }
-        // vm_map_fork_copy with VM_MAP_COPYIN_PRESERVE_PURGEABLE: a
-        // purgeable object's copy is a purgeable object of its own.
-        for &(ps, _, a, how, _) in &entries {
-            if how == Inherit::Copy && a.kind != super::vm::kind::SUBMAP && super::vmobject::with(a.obj, |o| o.purg.as_ref().is_some_and(|p| p.state != super::purgeable::state::DENY)).unwrap_or(false) {
-                self.darwin_unimplemented(format!("a corpse fork's copy of purgeable memory at {ps:#x} (VM_MAP_COPYIN_PRESERVE_PURGEABLE: a purgeable object of its own, in the source's state, owned by no one)"));
-            }
-        }
+        // vm_map_fork's copy of an entry of a purgeable object (a true
+        // share object: vm_map_fork_copy's slow path) with
+        // VM_MAP_COPYIN_PRESERVE_PURGEABLE: a purgeable object of its own
+        // ([`Kernel::darwin_corpse_fork_vm`]).
+        let purgeable: Vec<PurgeableCopy> = entries
+            .iter()
+            .filter(|e| e.3 == Inherit::Copy && e.2.kind != super::vm::kind::SUBMAP)
+            .filter_map(|&(s, e, a, _, _)| {
+                let st = super::vmobject::with(a.obj, |o| o.purg.as_ref().map(|p| p.state)).flatten()?;
+                (st != super::purgeable::state::DENY).then_some(PurgeableCopy { start: s, end: e, state: st })
+            })
+            .collect();
         // The footprint, before the entries change (vm_map_corpse_footprint_collect).
         let mut footprint = self.darwin_corpse_footprint_collect(&entries);
         // vm_map_corpse_footprint_collect_done.
@@ -388,7 +405,7 @@ impl Kernel {
         for &(s, e) in &shared {
             self.dtask.vm.update(s, e, |a| a.shared = true);
         }
-        (plan, shared, footprint)
+        (plan, shared, footprint, purgeable)
     }
 
     /// `vm_map_corpse_footprint_collect` of each entry the fork inherits
@@ -409,9 +426,10 @@ impl Kernel {
             if f.failed {
                 break;
             }
+            let wired = self.darwin_object_wired_pages(a.obj);
             let mut loud = None;
             let ok = f.collect(s, e, |va| {
-                let (d, why) = footprint_disposition(&pm, &owner, &a, va - s + off, va);
+                let (d, why) = footprint_disposition(&pm, &owner, &a, va - s + off, va, wired);
                 if why.is_some() {
                     loud = why;
                 }
@@ -491,9 +509,75 @@ impl Kernel {
     }
 
     /// The corpse's map once the host has given it this task's pages by
-    /// `plan` (`m` the corpse's memory).
-    pub fn darwin_corpse_fork_vm(&mut self, m: &mut GuestMem<'_>, plan: &[ForkRange]) {
+    /// `plan` (`m` the corpse's memory), with this task's threads still
+    /// held: each range copied from a purgeable object made one of its own
+    /// (`vm_map_copyin_internal` with VM_MAP_COPYIN_PRESERVE_PURGEABLE): a
+    /// copy of the source's pages, COPY_NONE and true share, nonvolatile
+    /// with no owner (`vm_purgeable_nonvolatile_enqueue(new_object, NULL)`,
+    /// so no task's ledgers count it), then put in the source's state from
+    /// the kernel (SET_STATE_FROM_KERNEL: a volatile one queued, an emptied
+    /// one emptied), its entry's `use_pmap` off, at offset 0.
+    pub fn darwin_corpse_fork_vm(&mut self, m: &mut GuestMem<'_>, plan: &[ForkRange], purgeable: &[PurgeableCopy]) {
+        use super::purgeable::{self as pg, state};
         self.darwin_fork_child_enter(m, plan);
+        for c in purgeable {
+            let len = c.end - c.start;
+            let Some(addr) = usize::try_from(len).ok().and_then(crate::host_hold_purgeable) else {
+                self.darwin_unimplemented(format!("a corpse fork's copy of purgeable memory of {len:#x} bytes on a host that holds no purgeable memory apart from a task's, or not so much"));
+                continue;
+            };
+            // vm_object_copy_slowly's copy of the pages as they are at the
+            // fork: the range holds them now (the host's copy of the
+            // task's), and they go into the new object's own pages.
+            let Ok(bytes) = m.kernel().read(c.start, len as usize).map(|b| b.to_vec()) else {
+                self.darwin_unimplemented(format!("a corpse fork's copy of purgeable memory at {:#x} the corpse's memory does not hold", c.start));
+                continue;
+            };
+            if !m.remap_from(c.start, addr, len, false).unwrap_or(false) {
+                self.darwin_unimplemented("a purgeable object's mapping on a host that cannot map its pages twice".into());
+                continue;
+            }
+            let _ = m.kernel().write(c.start, &bytes);
+            let hold = std::sync::Arc::new(super::vmobject::Hold { addr, len });
+            let obj = super::vmobject::allocate_owned(len, hold, pg::Purg::nonvolatile(), None);
+            if c.state != state::NONVOLATILE {
+                let mut st = i32::from(c.state);
+                let r = super::vmobject::with(obj, |o| o.purg.as_mut().map(|p| pg::control(p, obj, pg::ctl::SET_STATE_FROM_KERNEL, &mut st))).flatten();
+                if matches!(r, Some((_, pg::Purge::Pages))) && !pg::purge_pages(obj) {
+                    self.darwin_unimplemented("emptying a purgeable object on a host that cannot empty its own".into());
+                }
+            }
+            self.dtask.vm.lock().set_object(c.start, c.end, obj, 0);
+            self.dtask.vm.update(c.start, c.end, |a| {
+                a.shared = false;
+                a.alt = true;
+            });
+            super::vmobject::release(obj);
+        }
+        self.darwin_flush_perms(m);
+    }
+
+    /// `wired_page_count` of object `obj`: the pages its wired mappings in
+    /// this map hold, when every reference to it is one of those mappings
+    /// (none when another map or a memory entry holds it too, whose
+    /// wirings are not this map's to count).
+    fn darwin_object_wired_pages(&self, obj: u64) -> Option<u64> {
+        let page = super::mach::PAGE_MASK + 1;
+        let ents = self.dtask.vm.lock().of_object(obj);
+        if super::vmobject::refs(obj) != ents.len() as u64 {
+            return None;
+        }
+        let mut wired: Vec<(u64, u64)> = ents.iter().filter(|e| e.2.wired != 0 || e.2.user_wired != 0).map(|e| (e.3 / page, (e.3 + e.1 - e.0).div_ceil(page))).collect();
+        wired.sort_unstable();
+        let (mut n, mut at) = (0, 0);
+        for (s, e) in wired {
+            let s = s.max(at);
+            if e > s {
+                n += e - s;
+                at = e;
+            }
+        }
+        Some(n)
     }
 
     /// A corpse fork's outcome, given to whoever asked (`m` this task's
@@ -628,7 +712,7 @@ pub fn enable(corpse: &Arc<Mutex<Kernel>>, vm: Arc<crate::proc::PeerVm>, origin:
 /// attributes `a`, from what the task's pmap holds (`pm`) and the objects
 /// the task owns (`owner`): the page's disposition, and what this kernel
 /// cannot say of it.
-fn footprint_disposition(pm: &super::footprint::Pmap, owner: &Arc<super::purgeable::Owner>, a: &super::vm::Attrs, obj_off: u64, va: u64) -> (i32, Option<String>) {
+fn footprint_disposition(pm: &super::footprint::Pmap, owner: &Arc<super::purgeable::Owner>, a: &super::vm::Attrs, obj_off: u64, va: u64, wired: Option<u64>) -> (i32, Option<String>) {
     use super::footprint::Held;
     const PRESENT: i32 = 0x1;
     const REF: i32 = 0x4;
@@ -659,13 +743,12 @@ fn footprint_disposition(pm: &super::footprint::Pmap, owner: &Arc<super::purgeab
                 None => (0, Some(format!("a corpse fork's footprint of an object the task owns, at {va:#x}, on a host that cannot say what it holds of it"))),
             };
         }
-        // A volatile or emptied one: its first wired pages present. A
-        // purgeable object's pages are wired only by a wired mapping of it.
+        // A volatile or emptied one: its first wired pages present.
         if ours && (state == st::VOLATILE || state == st::EMPTY) {
-            if a.wired != 0 || a.user_wired != 0 {
-                return (0, Some(format!("a corpse fork's footprint of a wired volatile object the task owns, at {va:#x} (its wired_page_count)")));
-            }
-            return (0, None);
+            return match wired {
+                Some(n) => (if index < n { PRESENT } else { 0 }, None),
+                None => (0, Some(format!("a corpse fork's footprint of a volatile object the task owns at {va:#x} that another map or a memory entry holds too (its wired_page_count, which counts their wirings)"))),
+            };
         }
     }
     if a.alt && matches!(held, Held::Own | Held::Reusable) {

@@ -158,7 +158,7 @@ impl Kernel {
         if caller == 0 || caller == self.ipc().task || !self.darwin_task_platform_binary() {
             return true;
         }
-        self.ipc().links.get(&caller).and_then(|l| l.codesign.as_ref()).is_some_and(|c| c.platform != 0)
+        self.ipc().links.get(&caller).and_then(|l| l.codesign.as_ref()).is_some_and(|c| c.platform_binary)
     }
 
     /// The task's read and inspect ports, and its threads', taken for the
@@ -550,6 +550,9 @@ pub enum Deferred {
     /// ([`super::mig::later_reply`]); answered by
     /// [`Kernel::darwin_answer_later`], not by a thread stopping.
     Later(u64),
+    /// `task_generate_corpse`'s corpse fork, by its token, answered once
+    /// the host has made it ([`super::corpsefork`]).
+    CorpseFork(u64),
 }
 
 /// A request answered once a thread is off its CPU.
@@ -606,7 +609,7 @@ impl Kernel {
     /// every other thread.
     fn pending_is_ready(&self, p: &PendingReply) -> bool {
         match p.op {
-            Deferred::Later(_) => false,
+            Deferred::Later(_) | Deferred::CorpseFork(_) => false,
             Deferred::TaskWait { .. } => self.thread_signals.tids_in_order().into_iter().filter(|&t| t != p.target).all(|t| self.darwin_offcpu(t)),
             _ => p.target == self.tid || !self.darwin_thread_alive(p.target) || self.darwin_offcpu(p.target),
         }
@@ -628,7 +631,7 @@ impl Kernel {
                 Deferred::TaskWait { token: Some(port) } => Reply { ret: 0, defer: None, out: Vec::new(), ports: vec![PortOut::Right(Carried::Port(port), msgt::PORT_SEND_ONCE)], unimplemented: None },
                 Deferred::GetState { flavor, count, .. } => self.darwin_thread_state_now(m, tid, flavor, count, None),
                 Deferred::SetState { flavor, ref state, .. } => self.darwin_thread_state_now(m, tid, flavor, 0, Some(state.clone())),
-                Deferred::Later(_) => unreachable!("a method's later reply is never ready by itself"),
+                Deferred::Later(_) | Deferred::CorpseFork(_) => unreachable!("a later reply is never ready by itself"),
             };
             if matches!(p.op, Deferred::GetState { held: true, .. } | Deferred::SetState { held: true, .. }) {
                 // thread_unstop, thread_release.
@@ -651,7 +654,18 @@ impl Kernel {
     /// sent to its reply port. Nothing when no routine waits for it (it
     /// had no reply port).
     pub(crate) fn darwin_answer_later(&mut self, m: &mut crate::GuestMem<'_>, token: u64, reply: Reply) {
-        let Some(i) = self.dtask.pending_replies.iter().position(|p| p.op == Deferred::Later(token)) else { return };
+        self.darwin_answer_deferred(m, Deferred::Later(token), reply);
+    }
+
+    /// Answer the routine whose reply waits for `op`: `reply` sent to its
+    /// reply port. With none waiting (no reply port), the rights `reply`
+    /// carries go.
+    pub(crate) fn darwin_answer_deferred(&mut self, m: &mut crate::GuestMem<'_>, op: Deferred, reply: Reply) {
+        let Some(i) = self.dtask.pending_replies.iter().position(|p| p.op == op) else {
+            reply.destroy_ports(self.ipc());
+            self.darwin_ipc_notify_drain();
+            return;
+        };
         let p = self.dtask.pending_replies.remove(i);
         let k = reply.message(p.id, p.rport, p.rtype);
         self.darwin_kernel_send(Box::new(k));

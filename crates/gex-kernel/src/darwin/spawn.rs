@@ -418,6 +418,17 @@ impl Kernel {
     /// registered ports and its bootstrap and task access ports, and its
     /// exception actions (its host port follows from its identity).
     fn darwin_child_ports(&mut self) {
+        let ports = self.darwin_inherited_ports();
+        let old = self.dtask.child_ports.lock().unwrap_or_else(|e| e.into_inner()).replace(ports);
+        debug_assert!(old.is_none(), "a child's ports not taken");
+    }
+
+    /// `ipc_task_init(task, parent)`'s copies of this (the parent) task's
+    /// rights: its bootstrap and task access ports (a dead one's as dead),
+    /// its registered ports and its exception actions, privileged flag and
+    /// all.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn darwin_inherited_ports(&mut self) -> (std::collections::HashMap<i32, super::ipc::ObjId>, std::collections::HashSet<i32>, [Option<super::ipc::ObjId>; 3], super::exception::ExcActions) {
         const TASK_BOOTSTRAP_PORT: i32 = 4;
         const TASK_ACCESS_PORT: i32 = 9;
         let k = &self.dtask.kports;
@@ -441,8 +452,7 @@ impl Kernel {
         for p in registered.into_iter().flatten() {
             ipc.copy_send(p);
         }
-        let old = self.dtask.child_ports.lock().unwrap_or_else(|e| e.into_inner()).replace((special.into_iter().collect(), dead, registered, exc));
-        debug_assert!(old.is_none(), "a child's ports not taken");
+        (special.into_iter().collect(), dead, registered, exc)
     }
 
     /// The spawn attributes' credential steps for the process the spawn

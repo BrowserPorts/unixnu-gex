@@ -298,6 +298,9 @@ impl Kernel {
                 // an exception's reply is received by
                 // mach_msg_rpc_from_kernel with none (ipc_mig.c).
                 Finish::Lockf(_) | Finish::AioSuspend(_) | Finish::Sigwait { .. } | Finish::Tty | Finish::Psem(_) | Finish::Eventlink(_) | Finish::Exception(_) => Kept,
+                // task_generate_corpse_internal runs on the calling
+                // thread's own stack, in its call.
+                Finish::CorpseFork => Kept,
             };
         }
         match op {

@@ -246,6 +246,13 @@ impl Kernel {
                 }
             }
         }
+        self.darwin_fork_child_enter(m, plan);
+    }
+
+    /// The child's map by `plan`: a range not inherited a hole, every page
+    /// inherited one its new pmap has not entered, its protection table
+    /// written.
+    pub fn darwin_fork_child_enter(&mut self, m: &mut GuestMem<'_>, plan: &[ForkRange]) {
         {
             let mut mm = self.mem.lock();
             for r in plan.iter().filter(|r| r.how == Inherit::None) {

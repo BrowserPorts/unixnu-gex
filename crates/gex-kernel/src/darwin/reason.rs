@@ -330,25 +330,46 @@ impl crate::syscalls::Kernel {
     /// `abort_with_payload_internal(namespace, code, payload, payload_size,
     /// reason_string, reason_flags)`: the reason built (an abort's), then
     /// SIGABRT to this thread if it takes it, else to whichever thread
-    /// does, carrying it (`psignal_try_thread_with_reason`). For
-    /// `os_fault_with_payload` (`user_fault`), a simulated EXC_GUARD instead,
-    /// at most five a process (EQFULL after).
-    pub(crate) fn darwin_abort_with_payload(&mut self, m: &GuestMem<'_>, a: &[u64; 6], user_fault: bool) -> Result<u64, crate::Errno> {
+    /// does, carrying it (`psignal_try_thread_with_reason`).
+    pub(crate) fn darwin_abort_with_payload(&mut self, m: &GuestMem<'_>, a: &[u64; 6]) -> Result<u64, crate::Errno> {
         use super::signal::dsig;
-        const EQFULL: i32 = 106;
-        if user_fault {
-            if self.dtask.user_faults >= USER_FAULTS_PER_PROC {
-                return Err(super::errno::errno_of(EQFULL));
-            }
-            self.dtask.user_faults += 1;
-        }
         let r = OsReason::userspace(m, a[0] as u32, a[1], a[2], a[3] as u32, a[4], a[5] | flag::ABORT);
-        if user_fault {
-            self.darwin_unimplemented(format!("os_fault_with_payload's simulated EXC_GUARD for namespace {} code {:#x} (task_violated_guard's task_enqueue_exception_with_corpse: a lightweight corpse for a backtrace-preferring handler, else a corpse fork, a copy of the live task that never runs)", r.namespace, r.code));
-            return Err(super::errno::errno_of(16));
-        }
         self.darwin_psignal_try_thread(dsig::SIGABRT, Some(Arc::new(r)));
         Ok(0)
+    }
+
+    /// `os_fault_with_payload`: `abort_with_payload_internal` with
+    /// OS_REASON_IFLAG_USER_FAULT. At most five a process (EQFULL after);
+    /// the reason built (an abort's), then a simulated EXC_GUARD
+    /// (GUARD_TYPE_USER, flavor 0, the namespace its target; the reason's
+    /// code its subcode) by `task_violated_guard`, backtrace only: launchd
+    /// is immune (ENOTSUP), and any other task's fault is a corpse
+    /// (`task_enqueue_exception_with_corpse`), whose making the call waits
+    /// for. Its return code as an errno.
+    pub(crate) fn darwin_os_fault_with_payload(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> crate::syscalls::SyscallOutcome {
+        const EQFULL: i32 = 106;
+        const ENOTSUP: i32 = 45;
+        const GUARD_TYPE_USER: i64 = 0x3;
+        let done = |k: &mut Self, m: &mut GuestMem<'_>, r: Result<u64, crate::Errno>| {
+            super::thread::bsd_result(m, k.ctx_addr, r, false);
+            crate::syscalls::SyscallOutcome::Continue
+        };
+        if self.dtask.user_faults >= USER_FAULTS_PER_PROC {
+            return done(self, m, Err(super::errno::errno_of(EQFULL)));
+        }
+        self.dtask.user_faults += 1;
+        let r = OsReason::userspace(m, a[0] as u32, a[1], a[2], a[3] as u32, a[4], a[5] | flag::ABORT);
+        // EXC_GUARD_ENCODE_TYPE, _FLAVOR and _TARGET.
+        let code = (GUARD_TYPE_USER << 61) | i64::from(r.namespace);
+        let subcode = r.code as i64;
+        // PROC_VIOLATED_GUARD__SEND_EXC_GUARD: initproc is immune.
+        if self.pid == 1 {
+            return done(self, m, Err(super::errno::errno_of(ENOTSUP)));
+        }
+        match self.darwin_enqueue_exception_with_corpse(m, super::exception::EXC_GUARD, [code, subcode], Some(Arc::new(r)), true) {
+            Ok(o) => o,
+            Err(kr) => done(self, m, super::corpsefork::guard_result(kr)),
+        }
     }
 
     /// `psignal_try_thread_with_reason(p, current_thread(), d, reason)`:

@@ -1376,7 +1376,8 @@ impl Kernel {
     /// the pages it reads in that map's pmap; a page whose object has none
     /// to give (a file's past its end) fails it. A larger copy is a copy on
     /// write of the entries, which enters nothing.
-    pub(crate) fn darwin_vm_copyin_other(&mut self, pid: i32, addr: u64, size: u64) -> Result<Vec<u8>, super::kobject::Reply> {
+    pub(crate) fn darwin_vm_copyin_other(&mut self, from: (super::ipc::TaskKey, i32), addr: u64, size: u64) -> Result<Vec<u8>, super::kobject::Reply> {
+        let (task, pid) = from;
         use super::kobject::Reply;
         const KERN_INVALID_ADDRESS: i32 = 1;
         const KERN_PROTECTION_FAILURE: i32 = 2;
@@ -1385,8 +1386,9 @@ impl Kernel {
             return Ok(Vec::new());
         }
         let end = addr.checked_add(size).ok_or_else(|| Reply::err(KERN_INVALID_ADDRESS))?;
-        // A corpse's map, which outlives its process, else the process's.
-        let Some(peer) = super::corpse::vm_of_pid(pid).or_else(|| self.procs.vm(pid).ok()) else { return Err(Reply::err(KERN_INVALID_ADDRESS)) };
+        // A corpse's map (a corpse fork has no process; a corpse outlives
+        // its process), else the process's.
+        let Some(peer) = super::corpse::find(task).and_then(|r| r.vm.clone()).or_else(|| self.procs.vm(pid).ok()) else { return Err(Reply::err(KERN_INVALID_ADDRESS)) };
         let mut out: Result<Vec<u8>, Reply> = Err(Reply::err(KERN_INVALID_ADDRESS));
         peer.mem.with_guest(&mut |g| {
             let mut mm = peer.mm.lock();

@@ -434,6 +434,9 @@ pub struct Task {
     pub corpse_source: bool,
     /// The `vm_fault` result of the fault being raised as a signal.
     pub fault_code: Option<i64>,
+    /// Each thread's paths XNU records kernel triage events on that this
+    /// kernel does not record ([`crate::syscalls::Kernel::darwin_ktriage_unmodelled`]).
+    pub ktriage_unmodelled: std::collections::HashMap<i32, Vec<String>>,
     /// Each thread's kernel reply port, and a reply that came to it.
     pub rpc_reply: std::collections::HashMap<i32, ipc::ObjId>,
     pub rpc_replies: std::collections::HashMap<i32, Box<ipc::msg::Kmsg>>,

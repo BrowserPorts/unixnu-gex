@@ -8,7 +8,10 @@
 // reads the child's memory (vm_read, vm_region_64) and the crashed
 // thread's registers from the corpse, is refused what needs a control conversion, and, once it lets go
 // of the corpse's port, sees the corpse's thread port die. At most five
-// corpses are in flight: a sixth crash while five are held makes none.
+// corpses are in flight: a sixth crash while five are held makes none. A
+// brk is EXC_BREAKPOINT through triage to SIGTRAP and makes a corpse too;
+// the knotes' user data are in kevent_proc_copy_uptrs's order (descriptor
+// list, then knote hash buckets, newest first in each).
 
 #include <mach/mach.h>
 #include <mach-o/dyld.h>
@@ -17,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/event.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <limits.h>
@@ -30,11 +34,30 @@ static int bad(const char *what, long got, long want) {
 static volatile uint64_t marker = 0x5eed0fc0ffee1234ull;
 
 // The child: tells its parent where the marker is, then stores the
-// marker's address to an unmapped page, the address in x20 at the fault.
-static int crash(int fd) {
+// marker's address to an unmapped page, the address in x20 at the fault;
+// or (`trap`) runs a brk; or (`knotes`) registers knotes first.
+static int crash(int fd, const char *how) {
     uint64_t at = (uint64_t)&marker;
     if (write(fd, &at, sizeof at) != sizeof at) return 2;
     close(fd);
+    if (!strcmp(how, "trap")) __builtin_trap();
+    if (!strcmp(how, "knotes")) {
+        int a[2], b[2];
+        if (pipe(a) || pipe(b)) return 5;
+        int kq = kqueue();
+        // b's descriptors are above a's; idents 0x105, 5 and 6 hash to
+        // buckets 4, 5 and 6, and the timer on 5 is newer than the user
+        // event there.
+        struct kevent64_s ev[] = {
+            {.ident = (uint64_t)b[0], .filter = EVFILT_READ, .flags = EV_ADD, .udata = 0x2222},
+            {.ident = (uint64_t)a[0], .filter = EVFILT_READ, .flags = EV_ADD, .udata = 0x1111},
+            {.ident = 5, .filter = EVFILT_USER, .flags = EV_ADD, .udata = 0x3333},
+            {.ident = 6, .filter = EVFILT_USER, .flags = EV_ADD, .udata = 0x4444},
+            {.ident = 0x105, .filter = EVFILT_USER, .flags = EV_ADD, .udata = 0x5555},
+            {.ident = 5, .filter = EVFILT_TIMER, .flags = EV_ADD, .data = 3600000, .udata = 0x6666},
+        };
+        if (kevent64(kq, ev, 6, NULL, 0, 0, NULL) != 0) return 6;
+    }
     void *p = mmap(NULL, 0x4000, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
     if (p == MAP_FAILED) return 3;
     munmap(p, 0x4000);
@@ -68,7 +91,7 @@ static char self[PATH_MAX];
 
 // A crashing child whose task's EXC_CORPSE_NOTIFY handler is `port`; its
 // pid, and the marker's address in it.
-static pid_t spawn_crash(mach_port_t port, uint64_t *marker_at) {
+static pid_t spawn_how(mach_port_t port, uint64_t *marker_at, const char *how) {
     int fds[2];
     if (pipe(fds)) return -1;
     posix_spawn_file_actions_t fa;
@@ -80,7 +103,7 @@ static pid_t spawn_crash(mach_port_t port, uint64_t *marker_at) {
     posix_spawnattr_t at;
     posix_spawnattr_init(&at);
     posix_spawnattr_setexceptionports_np(&at, EXC_MASK_CORPSE_NOTIFY, port, EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES, 0);
-    char *args[] = {self, "crash", NULL};
+    char *args[] = {self, "crash", (char *)how, NULL};
     char *env[] = {NULL};
     pid_t pid;
     if (posix_spawn(&pid, self, &fa, &at, args, env)) return -1;
@@ -90,6 +113,10 @@ static pid_t spawn_crash(mach_port_t port, uint64_t *marker_at) {
     close(fds[0]);
     if (marker_at) *marker_at = a;
     return pid;
+}
+
+static pid_t spawn_crash(mach_port_t port, uint64_t *marker_at) {
+    return spawn_how(port, marker_at, "bad");
 }
 
 static kern_return_t receive(mach_port_t port, request_t *req, mach_msg_timeout_t timeout) {
@@ -308,12 +335,87 @@ static int limit(void) {
     return 0;
 }
 
+// A corpse made by `how`'s crash; its crash information mapped.
+static int corpse_of(const char *how, request_t *req, pid_t *pid, const uint8_t **b) {
+    mach_port_t port;
+    mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &port);
+    mach_port_insert_right(mach_task_self(), port, port, MACH_MSG_TYPE_MAKE_SEND);
+    *pid = spawn_how(port, NULL, how);
+    if (*pid < 0) return bad("spawning", *pid, 0);
+    kern_return_t kr = receive(port, req, 10000);
+    if (kr) return bad("a notification", kr, 0);
+    mach_vm_address_t kcd = 0;
+    mach_vm_size_t size = 0;
+    kr = task_map_corpse_info_64(mach_task_self(), req->task.name, &kcd, &size);
+    if (kr) return bad("task_map_corpse_info_64", kr, 0);
+    *b = (const uint8_t *)kcd;
+    reply(req);
+    mach_port_deallocate(mach_task_self(), req->task.name);
+    mach_port_deallocate(mach_task_self(), req->thread.name);
+    waitpid(*pid, NULL, 0);
+    return 0;
+}
+
+static int trap(void) {
+    request_t req;
+    pid_t pid;
+    const uint8_t *b;
+    if (corpse_of("trap", &req, &pid, &b)) return 1;
+    if (req.code[0] != EXC_CRASH || req.code[1] != ((2ll << 32) | SIGTRAP)) return bad("a brk's notification code[1]", req.code[1], (2ll << 32) | SIGTRAP);
+    uint32_t sz;
+    const uint8_t *p = item(b, 0x4000, 0x80E, &sz);
+    int64_t codes[2];
+    if (!p) return bad("a brk's TASK_CRASHINFO_EXCEPTION_CODES", 0, 1);
+    memcpy(codes, p, 16);
+    // SIGTRAP, EXC_BREAKPOINT and EXC_ARM_BREAKPOINT; the brk's pc.
+    if (codes[0] != ((SIGTRAP << 24) | (EXC_BREAKPOINT << 20) | 1)) return bad("a brk's crash code[0]", codes[0], (SIGTRAP << 24) | (EXC_BREAKPOINT << 20) | 1);
+    if (codes[1] == 0) return bad("a brk's crash code[1]", codes[1], 1);
+    vm_deallocate(mach_task_self(), (vm_address_t)b, 0x4000);
+    return 0;
+}
+
+static int knotes(void) {
+    request_t req;
+    pid_t pid;
+    const uint8_t *b;
+    if (corpse_of("knotes", &req, &pid, &b)) return 1;
+    // TASK_CRASHINFO_UDATA_PTRS: an array of 0x81c (KCDATA_TYPE_ARRAY_PAD0,
+    // the element type and count in its flags).
+    static const uint64_t want[] = {0x1111, 0x2222, 0x5555, 0x6666, 0x3333, 0x4444};
+    uint64_t at = 0;
+    const uint8_t *arr = NULL;
+    uint64_t flags = 0;
+    while (at + 16 <= 0x4000) {
+        uint32_t t, s;
+        memcpy(&t, b + at, 4);
+        memcpy(&s, b + at + 4, 4);
+        memcpy(&flags, b + at + 8, 8);
+        if (t == 0xF19158EDu) break;
+        if ((t & ~0xfu) == 0x20 && (flags >> 32) == 0x81C) {
+            arr = b + at + 16;
+            break;
+        }
+        at += 16 + s;
+    }
+    if (!arr) return bad("TASK_CRASHINFO_UDATA_PTRS", 0, 1);
+    if ((uint32_t)flags != 6) return bad("udata count", (uint32_t)flags, 6);
+    for (int i = 0; i < 6; i++) {
+        uint64_t v;
+        memcpy(&v, arr + 8 * i, 8);
+        if (v != want[i]) return bad("udata in order", v, want[i]);
+    }
+    vm_deallocate(mach_task_self(), (vm_address_t)b, 0x4000);
+    return 0;
+}
+
 int main(int argc, char **argv) {
-    if (argc > 1 && !strcmp(argv[1], "crash")) return crash(3);
+    if (argc > 2 && !strcmp(argv[1], "crash")) return crash(3, argv[2]);
     uint32_t len = sizeof self;
     if (_NSGetExecutablePath(self, &len)) return bad("own path", 0, 0);
     if (one_corpse()) return 1;
     if (limit()) return 1;
+    if (trap()) return 1;
+    if (knotes()) return 1;
     printf("corpse ok\n");
     return 0;
 }

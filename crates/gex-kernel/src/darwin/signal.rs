@@ -1041,6 +1041,13 @@ impl Kernel {
                 }
             }
         }
+        // A pager's error: vm_fault_page's, after the vnode pager's
+        // (vnode_pagein, cluster_pagein), each of which records triage
+        // events on its failures.
+        if allowed {
+            let tid = self.tid;
+            self.darwin_ktriage_unmodelled(tid, format!("a pager's error faulting at {addr:#x} (vnode_pagein's, cluster_pagein's and vm_fault_page's ktriage_record)"));
+        }
         let l = crate::signal::sig::SIGBUS;
         (self.raise_fault(m, l, pc, addr), l)
     }

@@ -133,6 +133,9 @@ pub struct Corpse {
     pub ctx: u64,
     /// The threads kept for inspection (`thread->inspection`).
     pub inspection: Vec<i32>,
+    /// `task_uniqueid`, which `task_set_uniqueid` gives the corpse (no
+    /// other task has one: 0).
+    pub task_uniqueid: u64,
     /// The notification's exception type and subcode.
     pub etype: usize,
     pub subcode: i64,
@@ -165,28 +168,43 @@ pub fn total_user_faults_count() -> u16 {
 
 /// `task_crashinfo_get_ref`: one more corpse in flight (and user fault,
 /// for `flags::USER_FAULT`), unless the limit is reached:
-/// KERN_RESOURCE_SHORTAGE. (Its `os_log` lines go to the kernel's log,
-/// which nothing here reads: `/dev/oslog` is not modelled.)
-pub fn get_ref(f: u16) -> Result<(), u64> {
+/// KERN_RESOURCE_SHORTAGE. `who` is the calling process's best name and pid
+/// for the kernel log lines it writes ([`kernel_log`]).
+pub fn get_ref(f: u16, who: (&str, i32)) -> Result<(), u64> {
+    let (name, pid) = who;
     let mut old = INFLIGHT.load(Ordering::Relaxed);
     loop {
         let (mut faults, mut corpses) = (old as u16, (old >> 16) as u16);
         if f & flags::USER_FAULT != 0 {
-            if faults >= TOTAL_USER_FAULTS_ALLOWED {
+            let had = faults;
+            faults = faults.wrapping_add(1);
+            if had >= TOTAL_USER_FAULTS_ALLOWED {
+                kernel_log(format!("{name}[{pid}] Corpse failure, too many faults {faults}"));
                 return Err(KERN_RESOURCE_SHORTAGE);
             }
-            faults += 1;
         }
-        if corpses >= TOTAL_CORPSES_ALLOWED {
+        let had = corpses;
+        corpses = corpses.wrapping_add(1);
+        if had >= TOTAL_CORPSES_ALLOWED {
+            kernel_log(format!("{name}[{pid}] Corpse failure, too many {corpses}"));
             return Err(KERN_RESOURCE_SHORTAGE);
         }
-        corpses += 1;
         let new = u32::from(faults) | (u32::from(corpses) << 16);
         match INFLIGHT.compare_exchange(old, new, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => return Ok(()),
+            Ok(_) => {
+                kernel_log(format!("{name}[{pid}] Corpse allowed {corpses} of {TOTAL_CORPSES_ALLOWED}"));
+                return Ok(());
+            }
             Err(v) => old = v,
         }
     }
+}
+
+/// A line of the kernel's log (`printf`, `os_log`), as this kernel gives
+/// it: on the host's standard error. (`os_log`'s own reader, `/dev/oslog`,
+/// is not modelled, and says so when opened.)
+pub fn kernel_log(line: String) {
+    eprintln!("{line}");
 }
 
 /// `task_crashinfo_release_ref`.
@@ -200,7 +218,10 @@ pub fn release_ref(f: u16) {
         corpses = corpses.checked_sub(1).expect("corpse in flight count over-release");
         let new = u32::from(faults) | (u32::from(corpses) << 16);
         match INFLIGHT.compare_exchange(old, new, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => return,
+            Ok(_) => {
+                kernel_log(format!("Corpse released, count at {corpses}"));
+                return;
+            }
             Err(v) => old = v,
         }
     }
@@ -210,8 +231,8 @@ pub fn release_ref(f: u16) {
 /// allocation (`task_collect_crash_info`): the reference its flags ask
 /// for taken first (none for a corpse fork, whose reference its creation
 /// took), the buffer begun with `TASK_CRASHINFO_BEGIN`.
-pub fn crashinfo_alloc_init(user_flags: u16) -> Option<Kcdata> {
-    if user_flags & flags::HAS_REF != 0 && get_ref(user_flags).is_err() {
+pub fn crashinfo_alloc_init(user_flags: u16, who: (&str, i32)) -> Option<Kcdata> {
+    if user_flags & flags::HAS_REF != 0 && get_ref(user_flags, who).is_err() {
         return None;
     }
     let k = Kcdata::alloc_init(super::kcdata::BUFFER_BEGIN_CRASHINFO, CORPSEINFO_ALLOCATION_SIZE, 0);
@@ -220,6 +241,24 @@ pub fn crashinfo_alloc_init(user_flags: u16) -> Option<Kcdata> {
     }
     k
 }
+
+/// Whether the host keeps a corpse's task past its process's end
+/// ([`set_host_keeps_corpses`]).
+static HOST_KEEPS_CORPSES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The host keeps a corpse's task (its kernel and memory) past its
+/// process's end, and calls [`hold`] and [`exited`] there.
+pub fn set_host_keeps_corpses() {
+    HOST_KEEPS_CORPSES.store(true, Ordering::Release);
+}
+
+/// `next_taskuniqueid`: `task_set_uniqueid`'s counter (OSIncrementAtomic64,
+/// which gives the value before the increment).
+static NEXT_TASKUNIQUEID: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// `KERN_NO_SPACE`, `KERN_NOT_SUPPORTED`.
+const KERN_NO_SPACE: u64 = 3;
+const KERN_NOT_SUPPORTED: u64 = 46;
 
 /// `MACH_RCV_PORT_DIED`, `KERN_FAILURE`, `KERN_TERMINATED`,
 /// `KERN_SUCCESS`, `KERN_INVALID_ARGUMENT`.
@@ -235,6 +274,8 @@ const KERN_INVALID_ARGUMENT: i32 = 4;
 #[derive(Debug)]
 pub struct Registered {
     pub pid: i32,
+    /// `task_uniqueid` (`find_corpse_task_by_uniqueid_grp`).
+    pub task_uniqueid: u64,
     pub info: Vec<u8>,
     pub vm: Option<std::sync::Arc<crate::proc::PeerVm>>,
 }
@@ -289,6 +330,23 @@ impl crate::syscalls::Kernel {
         self.thread_signals.get(tid).map_or(0, |t| t.darwin_id())
     }
 
+    /// `proc_best_name`: `p_name` when it has one, else `p_comm`.
+    pub(crate) fn darwin_best_name(&self) -> String {
+        let n = &self.dtask.p_name.0;
+        let len = n.iter().position(|&b| b == 0).unwrap_or(n.len());
+        if len > 0 {
+            return String::from_utf8_lossy(&n[..len]).into_owned();
+        }
+        self.darwin_public(self.pid).map(|p| String::from_utf8_lossy(&p.0.comm).into_owned()).unwrap_or_default()
+    }
+
+    /// A path XNU records a kernel triage event on (`ktriage_record`) was
+    /// taken by thread `tid`, the event not modelled here: what it was, for
+    /// a crash report that would carry it.
+    pub(crate) fn darwin_ktriage_unmodelled(&mut self, tid: i32, what: String) {
+        self.dtask.ktriage_unmodelled.entry(tid).or_default().push(what);
+    }
+
     /// The rest of `proc_prepareexit` once its EXC_CRASH went to its
     /// handlers (`kr` what `task_exception_notify` returned): a report no
     /// handler took (or a map marked a corpse source) makes the task a
@@ -301,10 +359,22 @@ impl crate::syscalls::Kernel {
         if !((kr != 0 || source) && current) {
             return;
         }
+        if !HOST_KEEPS_CORPSES.load(Ordering::Acquire) {
+            self.darwin_unimplemented("a corpse on a host that does not keep a task past its process's end (corpse::hold, corpse::exited)".into());
+            return;
+        }
         let r = self.darwin_task_mark_corpse();
         if r != KERN_SUCCESS {
-            // The kernel's printf of why (its console, which nothing here
-            // reads).
+            let pid = self.pid;
+            kernel_log(match r {
+                KERN_NO_SPACE => format!("Process[{pid}] has no vm space for corpse info."),
+                KERN_NOT_SUPPORTED => format!("Process[{pid}] was destined to be corpse. But corpse is disabled by config."),
+                KERN_TERMINATED => format!("Process[{pid}] has been terminated before it could be converted to a corpse."),
+                _ => {
+                    let comm = self.darwin_public(pid).map(|p| String::from_utf8_lossy(&p.0.comm).into_owned()).unwrap_or_default();
+                    format!("Process[{pid}] crashed: {comm}. Too many corpses being created.")
+                }
+            });
             return;
         }
         let (code, subcode) = self.darwin_corpse_exception_codes(code, subcode);
@@ -331,27 +401,22 @@ impl crate::syscalls::Kernel {
         (code, subcode)
     }
 
-    /// `kevent_proc_copy_uptrs` for the crash information: the knotes'
-    /// and dynamic workloops' user data, in the order of the descriptor
-    /// list and of the knote and workloop hash tables, which are not kept
-    /// here in XNU's layout: with any, reported, and none given.
+    /// `kevent_proc_copy_uptrs` for the crash information
+    /// (proc_prepareexit's buffer holds the count it first finds and 32
+    /// more, and this one's count does not change in between).
     fn darwin_corpse_uptrs(&mut self) -> Vec<u64> {
-        let n = self.dtask.kevents.uptrs_count();
-        if n != 0 {
-            self.darwin_unimplemented(format!("a corpse's TASK_CRASHINFO_UDATA_PTRS of {n} knotes and workloops (kevent_proc_copy_uptrs's order of fd_knlist, fd_knhash and fd_kqhash)"));
-        }
-        Vec::new()
+        self.dtask.kevents.proc_copy_uptrs()
     }
 
     /// `task_mark_corpse`: the crash information made (a corpse in flight
     /// counted, unless too many are), the task marked a corpse with its
-    /// report pending and the crashing thread's id, its threads kept for
-    /// inspection, its ports disabled (`ipc_task_disable`), its IPC space
-    /// ended, and the task put on the corpse list once its information is
-    /// in ([`Self::darwin_populate_corpse_crashinfo`]). (`task_set_uniqueid`'s
-    /// new `task_uniqueid` is not kept here: nothing reads one.)
+    /// report pending, the crashing thread's id and a new `task_uniqueid`,
+    /// its threads kept for inspection, its ports disabled
+    /// (`ipc_task_disable`), its IPC space ended, and the task put on the
+    /// corpse list once its information is in
+    /// ([`Self::darwin_populate_corpse_crashinfo`]).
     fn darwin_task_mark_corpse(&mut self) -> u64 {
-        let Some(info) = crashinfo_alloc_init(flags::HAS_REF) else { return KERN_FAILURE };
+        let Some(info) = crashinfo_alloc_init(flags::HAS_REF, (&self.darwin_best_name(), self.pid)) else { return KERN_FAILURE };
         if self.dtask.ipc_raw.ended {
             release_ref(flags::HAS_REF);
             return KERN_TERMINATED;
@@ -372,6 +437,8 @@ impl crate::syscalls::Kernel {
             thread: tid,
             ctx: self.ctx_addr,
             inspection,
+            // task_set_uniqueid.
+            task_uniqueid: NEXT_TASKUNIQUEID.fetch_add(1, Ordering::Relaxed) as u64,
             etype: super::exception::EXC_CRASH,
             subcode: 0,
             pending: None,
@@ -444,6 +511,11 @@ impl crate::syscalls::Kernel {
         let team = blob.and_then(|c| c.team_id.clone()).filter(|_| signed);
         let category = blob.filter(|_| csflags & (super::amfi::cs::VALID | super::amfi::cs::DEBUGGED) != 0).map_or(0, |c| c.category);
         let reason = exit_reason.or(reason);
+        let crashed_tid = self.tid;
+        if let Some(events) = self.dtask.ktriage_unmodelled.get(&crashed_tid).filter(|e| !e.is_empty()) {
+            let e = events.join("; ");
+            self.darwin_unimplemented(format!("a corpse's TASK_CRASHINFO_KERNEL_TRIAGE_INFO_V1 for a thread that took paths XNU records triage events on: {e}"));
+        }
 
         let Some(c) = self.dtask.corpse.as_mut() else { return };
         let crashed = c.crashed_thread_id;
@@ -564,9 +636,10 @@ impl crate::syscalls::Kernel {
         }
         let info = k.bytes().to_vec();
         let vm = c.vm.clone();
+        let task_uniqueid = c.task_uniqueid;
         // task_add_to_corpse_task_list.
         let key = self.ipc().task;
-        registry().insert(key, std::sync::Arc::new(Registered { pid, info, vm }));
+        registry().insert(key, std::sync::Arc::new(Registered { pid, task_uniqueid, info, vm }));
     }
 
     /// `proc_encode_exit_exception_code`: the exit reason's namespace and
@@ -925,15 +998,15 @@ mod tests {
         // One test owns the gate: the counts are the system's.
         assert_eq!(total_corpses_count(), 0);
         for _ in 0..TOTAL_CORPSES_ALLOWED {
-            get_ref(flags::HAS_REF).unwrap();
+            get_ref(flags::HAS_REF, ("test", 1)).unwrap();
         }
-        assert_eq!(get_ref(flags::HAS_REF), Err(6));
+        assert_eq!(get_ref(flags::HAS_REF, ("test", 1)), Err(6));
         release_ref(flags::HAS_REF);
-        get_ref(flags::HAS_REF | flags::USER_FAULT).unwrap();
+        get_ref(flags::HAS_REF | flags::USER_FAULT, ("test", 1)).unwrap();
         assert_eq!(total_user_faults_count(), 1);
         release_ref(flags::HAS_REF);
         // a second user fault is refused while one is in flight
-        assert_eq!(get_ref(flags::HAS_REF | flags::USER_FAULT), Err(6));
+        assert_eq!(get_ref(flags::HAS_REF | flags::USER_FAULT, ("test", 1)), Err(6));
         release_ref(flags::HAS_REF | flags::USER_FAULT);
         assert_eq!(total_corpses_count(), 3);
         for _ in 0..3 {

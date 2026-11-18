@@ -1051,6 +1051,10 @@ fn run_program_with(
     xlate: &Options,
     inherited: Option<Inherited>,
 ) -> Result<(Exit, Stats)> {
+    // This host keeps a Darwin corpse's task past its process's end
+    // (corpse::hold at each task's end, corpse::exited once the end is
+    // published).
+    gex_kernel::darwin::corpse::set_host_keeps_corpses();
     let mut process = RunProcess { inherited, kernel: None, spawn: None };
     let r = run_process(program, opts, xlate, &mut process);
     if r.is_err() {

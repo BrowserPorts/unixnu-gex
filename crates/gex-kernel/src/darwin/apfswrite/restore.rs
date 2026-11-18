@@ -2299,7 +2299,8 @@ mod tests {
     /// The encrypted Data and User volumes after the invert (GEX_TEST_UDIF,
     /// GEX_TEST_SCRATCH, GEX_TEST_FSCK): Data's superblock as the kernel's
     /// volumeCreate and read-write mount leave it (drafts/s16/re-protected.md
-    /// 2.1, drafts/s21/re-data.md 1), the pfkur thread's temporary inode,
+    /// 2.1, drafts/s21/re-data.md 1) with fixup_var's directories and copy
+    /// counted, the copy's objects by type, /internal, the pfkur thread's temporary inode,
     /// User's epoch, the container keybag's four entries; the device's and
     /// the host's fsck_apfs with -M (their keybag read needs the device's
     /// crypto I/O, drafts/s21/re-data.md 4), and the host's on a copy
@@ -2338,13 +2339,24 @@ mod tests {
         let com = c.omap().unwrap();
         let sb_paddr = com.lookup(&c, c.nx.fs_oid[1], c.xid()).unwrap().unwrap().paddr;
         let sb = c.read_raw(sb_paddr).unwrap();
-        assert_eq!((q(&sb, 0x28), q(&sb, 0x30), q(&sb, 0x38), q(&sb, 0x108), q(&sb, 0x58)), (2, 0xc, 0x2c8, 0x100, 7 + 156_250));
+        // Its block count (+0x58: the copy's data and metadata past the
+        // overprovisioning file's 156,250) is the fsck runs' below to check.
+        assert_eq!((q(&sb, 0x28), q(&sb, 0x30), q(&sb, 0x38), q(&sb, 0x108)), (2, 0xc, 0x2c8, 0x100));
+        assert!(q(&sb, 0x58) > 7 + 156_250);
         assert_eq!(&sb[0x60..0x74], &[5, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 0xcd, 0x01, 0x48, 0x15, 1, 0, 0, 0][..]);
         // The mount: the epoch, then the pfkur thread's inode 0x10; then
         // /keybags (0x11), usersession.kb (0x12) and the overprovisioning
         // file (0x13: one contiguous unwritten extent of 156,250 blocks,
-        // trimmed when the device answers DK_FEATURE_UNMAP).
-        assert_eq!((q(&sb, 0xb0), q(&sb, 0x3d8), q(&sb, 0xb8), u32::from_le_bytes(sb[0x428..0x42c].try_into().unwrap())), (0x14, 0x10, 2, 0x10));
+        // trimmed when the device answers DK_FEATURE_UNMAP); then fixup_var:
+        // aks_bootstrap_fs' 27 directories and /root/.bootstrapped
+        // (drafts/s26/re-aks-data.md), BOM's copy of the image's /private/var
+        // (drafts/s27/re-bomcopy.md 0.1: 6,719 directories, 530 plain and
+        // 3,723 compressed files, 2,041 of these with a resource-fork stream
+        // named by an object identifier of its own, one link), then
+        // create_partition_mountpoints' /internal.
+        let (files, links, forks) = (2 + 1 + 530 + 3_723, 1, 2_041);
+        let next = 0x14 + 27 + 1 + 6_719 + 530 + 3_723 + links + forks + 1;
+        assert_eq!((q(&sb, 0xb0), q(&sb, 0x3d8), q(&sb, 0xb8), q(&sb, 0xc8), u32::from_le_bytes(sb[0x428..0x42c].try_into().unwrap())), (next, 0x10, files, links, 0x10));
         let pfkur = c.read_raw(q(&sb, 0x418)).unwrap();
         assert_eq!((u32::from_le_bytes(pfkur[24..28].try_into().unwrap()), u32::from_le_bytes(pfkur[28..32].try_into().unwrap())), (0x4000_0002, 0x20));
         let usb = c.read_raw(com.lookup(&c, c.nx.fs_oid[6], c.xid()).unwrap().unwrap().paddr).unwrap();
@@ -2353,36 +2365,60 @@ mod tests {
         // 4): 18 + 34 directories, 4 files.
         assert_eq!((q(&usb, 0xb8), q(&usb, 0xc0)), (4, 52));
         assert_ne!(q(&usb, 0x448), 0);
-        // The volume's object map: one leaf, the root node's mapping (the
-        // reader refuses an encrypted mapping, so read it raw).
+        // The volume's object map and file-system tree, read raw (the reader
+        // refuses an encrypted mapping): every mapping, the root node's
+        // flagged encrypted, then every leaf record.
         let raw = |blk: u64| {
             let mut b = vec![0u8; 4096];
             super::super::HostFile(std::fs::File::open(&ctr_path).unwrap(), psize).read_at(blk * 4096, &mut b).unwrap();
             b
         };
+        let vend = |b: &[u8]| if u16::from_le_bytes([b[0x20], b[0x21]]) & 1 != 0 { 4096 - 0x28 } else { 4096 };
         let vom = Omap::open(&c, q(&sb, 0x80)).unwrap();
-        let leaf = raw(vom.tree.root_oid);
-        assert_eq!(u32::from_le_bytes(leaf[0x24..0x28].try_into().unwrap()), 1);
-        let ko = u16::from_le_bytes([leaf[0x38], leaf[0x39]]) as usize;
-        let vo = u16::from_le_bytes([leaf[0x3a], leaf[0x3b]]) as usize;
-        let toc_len = u16::from_le_bytes([leaf[0x2a], leaf[0x2b]]) as usize;
-        assert_eq!(q(&leaf, 0x38 + toc_len + ko), q(&sb, 0x88));
-        let vat = 4096 - 0x28 - vo;
-        assert_eq!(u32::from_le_bytes(leaf[vat..vat + 4].try_into().unwrap()), 4);
-        let rootb = raw(q(&leaf, vat + 8));
+        let mut map = std::collections::BTreeMap::new();
+        let mut stack = vec![vom.tree.root_oid];
+        while let Some(p) = stack.pop() {
+            let b = raw(p);
+            let kstart = 0x38 + u16::from_le_bytes([b[0x2a], b[0x2b]]) as usize;
+            for i in 0..u32::from_le_bytes(b[0x24..0x28].try_into().unwrap()) as usize {
+                let ko = u16::from_le_bytes([b[0x38 + 4 * i], b[0x38 + 4 * i + 1]]) as usize;
+                let vat = vend(&b) - u16::from_le_bytes([b[0x38 + 4 * i + 2], b[0x38 + 4 * i + 3]]) as usize;
+                if u16::from_le_bytes([b[0x22], b[0x23]]) > 0 {
+                    stack.push(q(&b, vat));
+                } else {
+                    map.insert(q(&b, kstart + ko), (u32::from_le_bytes(b[vat..vat + 4].try_into().unwrap()), q(&b, vat + 8)));
+                }
+            }
+        }
+        assert_eq!(map.get(&q(&sb, 0x88)).map(|m| m.0), Some(4));
+        let rootb = raw(map[&q(&sb, 0x88)].1);
         assert_eq!(u32::from_le_bytes(rootb[24..28].try_into().unwrap()), 0x1000_0002);
-        // The temporary inode among the root node's records: its name in
-        // the private directory, mode 0100600, class 0.
-        assert_eq!(u16::from_le_bytes([rootb[0x22], rootb[0x23]]), 0, "Data's tree in one leaf");
-        let toc = u16::from_le_bytes([rootb[0x2a], rootb[0x2b]]) as usize;
-        let recs: Vec<(Vec<u8>, Vec<u8>)> = (0..u32::from_le_bytes(rootb[0x24..0x28].try_into().unwrap()) as usize)
-            .map(|i| {
-                let e = |o: usize| u16::from_le_bytes([rootb[0x38 + 8 * i + o], rootb[0x38 + 8 * i + o + 1]]) as usize;
+        let mut recs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut stack = vec![q(&sb, 0x88)];
+        while let Some(oid) = stack.pop() {
+            let b = raw(map.get(&oid).expect("a tree node the object map does not map").1);
+            let toc = u16::from_le_bytes([b[0x2a], b[0x2b]]) as usize;
+            for i in 0..u32::from_le_bytes(b[0x24..0x28].try_into().unwrap()) as usize {
+                let e = |o: usize| u16::from_le_bytes([b[0x38 + 8 * i + o], b[0x38 + 8 * i + o + 1]]) as usize;
                 let k = 0x38 + toc + e(0);
-                let v = 4096 - 0x28 - e(4);
-                (rootb[k..k + e(2)].to_vec(), rootb[v..v + e(6)].to_vec())
-            })
-            .collect();
+                let v = vend(&b) - e(4);
+                if u16::from_le_bytes([b[0x22], b[0x23]]) > 0 {
+                    stack.push(q(&b, v));
+                } else {
+                    recs.push((b[k..k + e(2)].to_vec(), b[v..v + e(6)].to_vec()));
+                }
+            }
+        }
+        // The inodes by type: the root, the private directory and /keybags
+        // with the directories made since; the temporary inode with the
+        // counted files; the link.
+        let modes: Vec<u16> = recs.iter().filter(|(k, _)| k.len() == 8 && q(k, 0) >> 60 == 3).map(|(_, v)| u16::from_le_bytes([v[0x50], v[0x51]]) & 0o170000).collect();
+        let count = |m: u16| modes.iter().filter(|&&x| x == m).count() as u64;
+        assert_eq!((count(0o040000), count(0o100000), count(0o120000)), (3 + 27 + 6_719 + 1, 1 + files, links));
+        assert_eq!(recs.iter().filter(|(k, v)| q(k, 0) >> 60 == 4 && k.ends_with(b"com.apple.ResourceFork\0") && v[0] & 1 != 0).count() as u64, forks);
+        let internal = recs.iter().find(|(k, _)| q(k, 0) == (ROOT_INO | 9 << 60) && k.ends_with(b"internal\0")).map(|(_, v)| q(v, 0)).expect("/internal");
+        let iv = &recs.iter().find(|(k, _)| k[..] == (internal | 3 << 60).to_le_bytes()).unwrap().1;
+        assert_eq!((u16::from_le_bytes([iv[0x50], iv[0x51]]), u32::from_le_bytes(iv[0x44..0x48].try_into().unwrap())), (0o40777, 0x2_0002));
         let name = b"tmp-ino-xattr-dstream-0x0-0x10\0";
         let drec = recs.iter().find(|(k, _)| q(k, 0) == (3 | 9 << 60) && k.ends_with(name)).expect("the temporary inode's entry in the private directory");
         assert_eq!(q(&drec.1, 0), 0x10);

@@ -162,7 +162,7 @@ impl Kernel {
         };
         // task_create_internal: the corpse's task, its uniqueid the next
         // (task_set_uniqueid), its rights the parent's (ipc_task_init).
-        let task_uniqueid = corpse::next_task_uniqueid();
+        let task_uniqueid = super::next_task_uniqueid();
         let (special, special_dead, registered, exc) = self.darwin_inherited_ports();
         let ports = super::kobject::Kports { special, special_dead, registered, exc, ..Default::default() };
         match self.darwin_duplicate_map_and_threads(m, current, etype != 0) {
@@ -393,6 +393,7 @@ impl Kernel {
         let ctx = c.ctx;
         let t = super::Task {
             rusage: super::rusage::Shared::new(abs),
+            task_uniqueid: c.task_uniqueid,
             kports: ports,
             vm: self.dtask.vm.inherited_corpse(shared),
             map_max: self.dtask.map_max,

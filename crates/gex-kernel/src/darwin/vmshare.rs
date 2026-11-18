@@ -569,6 +569,17 @@ mod tests {
     use crate::darwin::vm::Attrs;
 
     #[test]
+    fn a_fork_child_task_takes_the_next_task_uniqueid() {
+        let mut k = Kernel::new(0x1000, 0x10000, "/prog".into());
+        k.darwin = true;
+        let before = crate::darwin::next_task_uniqueid();
+        let child = k.fork_kernel();
+        assert!(child.dtask.task_uniqueid > before, "task_create_internal's task_set_uniqueid");
+        let after = crate::darwin::next_task_uniqueid();
+        assert!(after > child.dtask.task_uniqueid);
+    }
+
+    #[test]
     fn a_fork_plan_follows_the_entries_inheritance() {
         let mut k = Kernel::new(0x1000, 0x10000, "/prog".into());
         k.darwin = true;

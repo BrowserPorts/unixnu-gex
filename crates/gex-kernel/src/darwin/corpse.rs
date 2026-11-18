@@ -260,15 +260,6 @@ pub fn set_host_keeps_corpses() {
     HOST_KEEPS_CORPSES.store(true, Ordering::Release);
 }
 
-/// `next_taskuniqueid`: `task_set_uniqueid`'s counter (OSIncrementAtomic64,
-/// which gives the value before the increment).
-static NEXT_TASKUNIQUEID: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-
-/// `task_set_uniqueid`'s next value.
-pub(crate) fn next_task_uniqueid() -> u64 {
-    NEXT_TASKUNIQUEID.fetch_add(1, Ordering::Relaxed) as u64
-}
-
 /// `vm_map_corpse_footprint_count`, `_size_avg`, `_size_max`, `_full` and
 /// `_no_buf` (the `vm.corpse_footprint_*` sysctls).
 static FOOTPRINT_STATS: std::sync::Mutex<[u64; 5]> = std::sync::Mutex::new([0; 5]);
@@ -672,6 +663,9 @@ impl crate::syscalls::Kernel {
         inspection.sort_unstable();
         inspection.dedup();
         let vm = self.procs.vm(self.pid).ok();
+        // task_set_uniqueid.
+        let task_uniqueid = super::next_task_uniqueid();
+        self.dtask.task_uniqueid = task_uniqueid;
         self.dtask.corpse = Some(Box::new(Corpse {
             info,
             user_flags: flags::HAS_REF,
@@ -681,8 +675,7 @@ impl crate::syscalls::Kernel {
             thread: tid,
             ctx: self.ctx_addr,
             inspection,
-            // task_set_uniqueid.
-            task_uniqueid: NEXT_TASKUNIQUEID.fetch_add(1, Ordering::Relaxed) as u64,
+            task_uniqueid,
             etype: super::exception::EXC_CRASH,
             subcode: 0,
             pending: None,

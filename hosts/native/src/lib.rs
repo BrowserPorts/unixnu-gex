@@ -1449,6 +1449,12 @@ fn run_process(
     // spawn's came with their switch to the image.
     if opts.darwin && fresh {
         kernel.dtask.pidversion = gex_kernel::darwin::next_pidversion();
+        // Its task_uniqueid as load_init_program's: initproc's
+        // cloneproc(CLONEPROC_INITPROC) took one, the execve's cloneproc
+        // another, and its exec_handle_sugid gives the task the next.
+        let _ = gex_kernel::darwin::next_task_uniqueid();
+        let _ = gex_kernel::darwin::next_task_uniqueid();
+        kernel.dtask.task_uniqueid = gex_kernel::darwin::next_task_uniqueid();
     }
     // A Darwin program other than launchd is not pid 1: dyld treats pid 1
     // as launchd and boots the system from it. Pid 1 is the kernel's own

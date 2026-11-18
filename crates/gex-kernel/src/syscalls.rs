@@ -11555,7 +11555,7 @@ impl Kernel {
                 // signing kill owes, its EXC_CRASH handlers told first;
                 // P_REF_DEAD.
                 self.procs.set_end(self.pid, a[0] as u32, self.creds.uid());
-                if let Some(out) = self.darwin_exit_prepare(m, (a[0] & 0xff) as i32) {
+                if let Some(out) = self.darwin_exit_prepare(m, a[0] as u32) {
                     return out;
                 }
                 self.procs.set_exited(self.pid);

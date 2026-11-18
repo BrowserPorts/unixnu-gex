@@ -7,11 +7,54 @@
 //! `/System/Cryptexes/OS` is a link to it), or `GEX_DARWIN_CACHE`'s. The system
 //! boots with the payload in `GEX_DARWIN_BOOT` (its trust cache bundle,
 //! the Sandbox's platform profile).
+//!
+//! The system's end is the run's: a halt, a restart or a panic
+//! (`gex_kernel::darwin::machine`) prints what the console shows of it and
+//! gex's account of it on standard error, and gexc exits with its status:
+//! [`HALT_STATUS`], [`RESTART_STATUS`] or [`PANIC_STATUS`].
 
 use crate::{choose_mem, report_exit, set_wasm_libs, RunArgs};
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+
+use gex_kernel::darwin::machine::{Cause, Event, Kind, Panic};
+
+/// gexc's status when the system halts (`halt_all_cpus(FALSE)`).
+pub const HALT_STATUS: u8 = 200;
+/// gexc's status when the system restarts (`halt_all_cpus(TRUE)`): the
+/// device's iBoot would boot it again.
+pub const RESTART_STATUS: u8 = 201;
+/// gexc's status when the system panics: the device would write its
+/// paniclog and reset, iBoot booting it again.
+pub const PANIC_STATUS: u8 = 202;
+
+/// The machine's end, as the native host takes it: the console's text (a
+/// panic's paniclog line), gex's account of the event, and the run's end
+/// with the event's status. Every guest thread ends with this process, as
+/// the hardware stops every CPU.
+fn machine_end(e: &Event) {
+    use std::io::Write;
+    let (what, status) = match &e.kind {
+        Kind::Halt => ("halted", HALT_STATUS),
+        Kind::Restart => ("restarted", RESTART_STATUS),
+        Kind::Panic(_) => ("panicked", PANIC_STATUS),
+    };
+    let cause = match e.cause {
+        Cause::Reboot { howto } => format!("reboot(2) howto {howto:#x}"),
+        Cause::HostReboot { options } => format!("host_reboot options {options:#x}"),
+        Cause::CriticalExit => "proc_prepareexit's critical exit".to_string(),
+    };
+    let mut err = std::io::stderr().lock();
+    let _ = err.write_all(&e.console());
+    let _ = writeln!(err, "[gex] the system {what}: {cause}, by pid {} ({}); gexc exits {status}", e.pid, e.name);
+    if let Kind::Panic(p) = &e.kind {
+        let _ = writeln!(err, "[gex] panic options {:#x}; not modelled: {}", p.options, Panic::UNMODELLED);
+    }
+    let _ = err.flush();
+    drop(err);
+    std::process::exit(i32::from(status));
+}
 
 
 pub fn run(mut ra: RunArgs, bytes: &[u8]) -> Result<ExitCode> {
@@ -111,6 +154,7 @@ pub fn run(mut ra: RunArgs, bytes: &[u8]) -> Result<ExitCode> {
     ra.mem64 = Some(true);
     choose_mem(&mut ra, true)?;
     set_wasm_libs()?;
+    gex_kernel::darwin::machine::set_hook(machine_end);
     let (exit, _stats) = gex_native::run_program(&program, &ra.opts, &ra.xlate)?;
     Ok(report_exit(&exit, ra.opts.verbose))
 }

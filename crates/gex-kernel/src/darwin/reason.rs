@@ -321,6 +321,30 @@ impl OsReason {
         OsReason { namespace: ns::JETSAM, code, flags, kcd: None }
     }
 
+    /// `exit_reason_get_string_desc`: the payload of the buffer's
+    /// `EXIT_REASON_USER_DESC` item, up to its NUL; none without a buffer,
+    /// for one that does not begin as an os_reason's, or without the item.
+    /// The walk is `kcdata_iter_find_type`'s over the whole buffer
+    /// (`osr_bufsize`), each item valid while it fits, to the end marker.
+    pub fn user_desc(&self) -> Option<&[u8]> {
+        let b = &self.kcd.as_ref()?.buf;
+        let rd32 = |at: usize| u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+        let valid = |at: usize| at + ITEM as usize <= b.len() && at + ITEM as usize + rd32(at + 4) as usize <= b.len();
+        if !valid(0) || rd32(0) != BUFFER_BEGIN_OS_REASON {
+            return None;
+        }
+        let mut at = 0;
+        while valid(at) && rd32(at) != TYPE_BUFFER_END {
+            if rd32(at) == USER_DESC {
+                let p = &b[at + ITEM as usize..];
+                let n = p.iter().position(|&c| c == 0).unwrap_or(p.len());
+                return Some(&p[..n]);
+            }
+            at += ITEM as usize + rd32(at + 4) as usize;
+        }
+        None
+    }
+
     /// `struct proc_exitreasonbasicinfo` (packed, 24 bytes).
     pub fn basic_info(&self) -> [u8; 24] {
         let mut b = [0u8; 24];

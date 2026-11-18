@@ -1946,12 +1946,12 @@ impl ProcTable {
     /// its `p_lflag` gains `flags` (the jetsam bits), it is past
     /// `proc_prepareexit` ([`ProcTable::set_exited`]) and it ends as
     /// SIGKILL ends it. No signal is posted, so its knotes hear no
-    /// NOTE_SIGNAL.
-    pub fn jetsam_kill(&self, pid: i32, flags: u32, reason: crate::signal::Note) {
+    /// NOTE_SIGNAL. Whether this was its exit (false when it had begun).
+    pub fn jetsam_kill(&self, pid: i32, flags: u32, reason: crate::signal::Note) -> bool {
         let mut t = self.lock();
-        let Some(p) = t.procs.iter_mut().find(|p| p.pid == pid) else { return };
+        let Some(p) = t.procs.iter_mut().find(|p| p.pid == pid) else { return false };
         if p.lexit || p.child.status.lock().map(|s| s.is_some()).unwrap_or(true) {
-            return;
+            return false;
         }
         p.lexit = true;
         p.exit_reason = Some(reason);
@@ -1961,6 +1961,7 @@ impl ProcTable {
         p.queue.notify();
         // exit_with_reason's proc_prepareexit, in the killer's context.
         t.mark_exited(pid);
+        true
     }
 
     /// `proc_prepareexit`'s end for `pid`: `P_REF_DEAD`, and its move to

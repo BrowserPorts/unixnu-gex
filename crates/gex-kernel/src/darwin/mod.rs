@@ -39,6 +39,7 @@ pub mod ttydev;
 pub mod km;
 pub mod cpumon;
 pub mod cred;
+pub mod critexit;
 pub mod errno;
 pub mod exec;
 pub mod eventlink;
@@ -126,6 +127,7 @@ pub mod spawn;
 pub mod kinfo;
 pub mod launchcon;
 pub mod lwcr;
+pub mod machine;
 pub mod sysctl;
 mod sysctl_nodes;
 pub mod sysno;
@@ -403,8 +405,13 @@ pub struct Task {
     /// Its map's highest address when an entitlement or a spawn raised it
     /// (`vm_map_set_max_addr`); 0 for [`vm::MAP_MAX`].
     pub map_max: u64,
-    /// `p_crash_behavior`, from a spawn of a parent entitled to set it.
-    pub crash_behavior: u32,
+    /// `p_crash_behavior` (a byte: `posix_spawn` truncates the
+    /// attribute's flags) and `p_crash_behavior_deadline`, from a spawn of
+    /// a parent entitled to set them; an exec clears them.
+    pub crash_behavior: u8,
+    pub crash_behavior_deadline: u64,
+    /// `p_posix_spawn_failed`: the spawn that made it failed.
+    pub spawn_failed: bool,
     /// Its map's lowest address (`vm_map_min`): the end of the image's
     /// page zero.
     pub map_min: u64,
@@ -680,8 +687,17 @@ impl crate::syscalls::Kernel {
     /// A fatal Mach port guard exception was raised: with no exception
     /// handler the task exits as `exit_with_mach_exception` makes it, killed
     /// by SIGKILL.
+    /// The end here is not `exit_with_guard_exception`'s: it makes no
+    /// OS_REASON_GUARD exit reason and runs no `proc_prepareexit`, so the
+    /// critical exit a crash behavior or initproc calls for is reported.
     pub(crate) fn darwin_guard_kill(&mut self) -> Option<crate::syscalls::SyscallOutcome> {
-        std::mem::take(&mut self.dtask.guard_kill).then_some(crate::syscalls::SyscallOutcome::Killed { signal: crate::signal::sig::SIGKILL as u32, core: false })
+        if !std::mem::take(&mut self.dtask.guard_kill) {
+            return None;
+        }
+        if self.dtask.crash_behavior != 0 || (self.pid == crate::proc::INIT_PID && !self.procs.virtual_init()) {
+            self.darwin_unimplemented("the critical exit of a process a Mach port guard kills (exit_with_guard_exception's OS_REASON_GUARD exit reason and proc_prepareexit)".into());
+        }
+        Some(crate::syscalls::SyscallOutcome::Killed { signal: crate::signal::sig::SIGKILL as u32, core: false })
     }
 }
 

@@ -836,17 +836,18 @@ impl Kernel {
         }
     }
 
-    /// `proc_prepareexit`'s crash report for an end by Darwin signal `d`
-    /// (0 for none): unless the exit reason says no report, a core signal,
+    /// `proc_prepareexit` for an end with status `rv` (`W_EXITCODE`: a
+    /// Darwin signal `d` in its low seven bits, or an exit's value above
+    /// them): the critical exit's panic, if it calls for one; then the
+    /// crash report: unless the exit reason says no report, a core signal,
     /// a code signing kill or a reason that asks for a report tells the
     /// EXC_CRASH handlers (`task_exception_notify`), its code the signal
     /// and the thread's last exception. The host's own handler takes it
     /// and nothing is seen, unless a handler was set; that one is sent it
     /// on the way out of a call.
-    pub(crate) fn darwin_prepareexit(&mut self, d: u32) {
-        if self.dtask.crash_behavior != 0 {
-            self.darwin_unimplemented(format!("a process spawned with crash behavior {:#x} ending (signal {d}): the system would panic", self.dtask.crash_behavior));
-        }
+    pub(crate) fn darwin_prepareexit(&mut self, rv: u32) {
+        self.darwin_critical_exit(rv);
+        let d = rv & 0x7f;
         use super::reason::flag;
         let flags = self.procs.exit_reason(self.pid).and_then(|n| super::reason::of(&n)).map(|r| r.flags);
         let killed = self.dtask.csflags.load(std::sync::atomic::Ordering::Acquire) & super::amfi::cs::KILLED != 0;
@@ -866,13 +867,15 @@ impl Kernel {
         }
     }
 
-    /// `exit()`'s `proc_prepareexit`: a crash report owed (a code signing
-    /// kill's, or an exit reason's that asks for one) tells the EXC_CRASH
-    /// handlers, waited for, before the process ends with status `code`;
-    /// none owed is `None`, the exit going on as it is.
-    pub(crate) fn darwin_exit_prepare(&mut self, m: &mut GuestMem<'_>, code: i32) -> Option<crate::syscalls::SyscallOutcome> {
+    /// `exit(rval)`'s `proc_prepareexit` (status `W_EXITCODE(rval, 0)`):
+    /// a crash report owed (a code signing kill's, or an exit reason's
+    /// that asks for one) tells the EXC_CRASH handlers, waited for, before
+    /// the process ends with status `rval & 0xff`; none owed is `None`,
+    /// the exit going on as it is.
+    pub(crate) fn darwin_exit_prepare(&mut self, m: &mut GuestMem<'_>, rval: u32) -> Option<crate::syscalls::SyscallOutcome> {
+        let code = (rval & 0xff) as i32;
         let was = std::mem::replace(&mut self.dtask.syscall_exit, true);
-        self.darwin_prepareexit(0);
+        self.darwin_prepareexit(rval.wrapping_shl(8));
         self.dtask.syscall_exit = was;
         let (c, sub) = self.dtask.crash_notify.take()?;
         self.map_io().flush_all_shared(m);

@@ -494,10 +494,27 @@ impl Ipc {
             self.object_destroy(c, t);
             return Err(kr::INVALID_CAPABILITY);
         }
-        // ipc_kobject_label_check: any right but a send right to a labeled
-        // control port is refused; a send right is substituted by the
-        // immovable equivalent when the space is the object's task's.
-        if let Some(alt) = self.port(port).subst {
+        // ipc_kobject_label_check: a one-time wrapper's send right is
+        // hollowed out and its own send right taken, with no further label
+        // check; any other right to it is refused.
+        let mut checked = false;
+        if let Some(super::Kobject::SubstOnce(target)) = self.port(port).kobject {
+            if t != msgt::PORT_SEND {
+                self.object_destroy(c, t);
+                return Err(kr::INVALID_CAPABILITY);
+            }
+            let p = self.port_mut(port);
+            p.kobject = None;
+            p.nsrequest_kobject = false;
+            self.release_send(port);
+            self.port_destroy(port);
+            port = target;
+            checked = true;
+        }
+        // Any right but a send right to a labeled control port is refused;
+        // a send right is substituted by the immovable equivalent when the
+        // space is the object's task's.
+        if let Some(alt) = self.port(port).subst.filter(|_| !checked) {
             if t != msgt::PORT_SEND {
                 self.object_destroy(c, t);
                 return Err(kr::INVALID_CAPABILITY);

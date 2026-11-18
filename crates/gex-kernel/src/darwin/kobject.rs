@@ -501,6 +501,15 @@ impl Kernel {
             Some(Kobject::FilePort(id)) => super::fileport::fileport_no_senders(id),
             // kcdata_object_no_senders.
             Some(Kobject::KcdataObject(id)) => self.darwin_kcdata_object_no_senders(port, id),
+            // ipc_kobject_subst_once_no_senders: a wrapper never copied out
+            // gives back the right it held.
+            Some(Kobject::SubstOnce(target)) => {
+                let ipc = self.ipc();
+                ipc.port_mut(port).kobject = None;
+                ipc.port_destroy(port);
+                ipc.release_send(target);
+                self.darwin_ipc_notify_drain();
+            }
             // task_id_token_no_senders.
             Some(Kobject::TaskIdToken(id)) => self.darwin_task_id_token_no_senders(port, id),
             // The notification is freed with its port's last send right:

@@ -1,4 +1,5 @@
-// Mach IPC between tasks: a spawned child inherits its parent's bootstrap
+// Mach IPC between tasks (a task without the entitlement is refused its own
+// movable control ports): a spawned child inherits its parent's bootstrap
 // port (ipc_task_init) and sends it a request carrying a send-once reply
 // right and a send right to a port of its own; the parent, waiting to
 // receive, is woken, answers on the reply right and sends to the child's
@@ -87,6 +88,10 @@ int main(int argc, char **argv) {
     mach_port_t task = mach_task_self(), p, n, prev;
     kern_return_t kr;
     rcv_t m;
+    // Its own control port, movable, is not for a task without the
+    // entitlement to it (mac_task_check_get_movable_control_port).
+    if ((kr = task_get_special_port(task, TASK_KERNEL_PORT, &n)) != KERN_DENIED) return bad("parent", "its own movable control port", kr, KERN_DENIED);
+    if ((kr = thread_get_special_port(mach_thread_self(), THREAD_KERNEL_PORT, &n)) != KERN_DENIED) return bad("parent", "its own thread's movable control port", kr, KERN_DENIED);
     mach_port_allocate(task, MACH_PORT_RIGHT_RECEIVE, &p);
     mach_port_insert_right(task, p, p, MACH_MSG_TYPE_MAKE_SEND);
     if ((kr = task_set_special_port(task, TASK_BOOTSTRAP_PORT, p))) return bad("parent", "setting the bootstrap port", kr, 0);

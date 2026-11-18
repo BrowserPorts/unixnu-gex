@@ -915,8 +915,8 @@ impl crate::syscalls::Kernel {
         let Some(owner) = target else { return Reply::err(KERN_INVALID_ARGUMENT) };
         // task_conversion_eval for the read flavor: a platform binary's
         // task only for a platform binary.
-        let victim_platform = self.ipc().links.get(&owner).and_then(|l| l.codesign.as_ref()).is_some_and(|c| c.platform != 0);
-        let me_platform = self.dtask.codesign.as_ref().is_some_and(|c| c.platform != 0);
+        let victim_platform = self.ipc().links.get(&owner).and_then(|l| l.codesign.as_ref()).is_some_and(|c| c.platform_binary);
+        let me_platform = self.dtask.codesign.as_ref().is_some_and(|c| c.platform_binary);
         if owner != self.ipc().task && victim_platform && !me_platform {
             return Reply::err(KERN_INVALID_ARGUMENT);
         }

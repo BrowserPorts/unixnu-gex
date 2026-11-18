@@ -158,7 +158,7 @@ impl Kernel {
         if caller == 0 || caller == self.ipc().task || !self.darwin_task_platform_binary() {
             return true;
         }
-        self.ipc().links.get(&caller).and_then(|l| l.codesign.as_ref()).is_some_and(|c| c.platform != 0)
+        self.ipc().links.get(&caller).and_then(|l| l.codesign.as_ref()).is_some_and(|c| c.platform_binary)
     }
 
     /// The task's read and inspect ports, and its threads', taken for the

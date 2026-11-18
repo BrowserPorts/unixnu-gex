@@ -413,6 +413,11 @@ pub struct Task {
     /// a parent entitled to set them; an exec clears them.
     pub crash_behavior: u8,
     pub crash_behavior_deadline: u64,
+    /// `p_crash_count` and `p_throttle_timeout`: what `posix_spawn` set
+    /// (`posix_spawnattr_set_crash_count_np`), for a corpse's crash
+    /// information.
+    pub crash_count: u32,
+    pub throttle_timeout: u32,
     /// `p_posix_spawn_failed`: the spawn that made it failed.
     pub spawn_failed: bool,
     /// Its map's lowest address (`vm_map_min`): the end of the image's

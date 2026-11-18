@@ -525,15 +525,15 @@ impl crate::syscalls::Kernel {
             k.put(t, &v.to_le_bytes());
         }
         k.put(ty::MEMORYSTATUS_EFFECTIVE_PRIORITY, &effective.to_le_bytes());
-        // ktriage_extract of the thread: no triage event is recorded on the
-        // paths this kernel takes.
+        // ktriage_extract of the thread (the current one, the crashed
+        // one's): the buffer zeroed (bzero in ktriage_extract), then its
+        // recorded events as strings. None of the paths this kernel takes
+        // records one, but those reported where taken ([`Self::darwin_ktriage_unmodelled`]).
         k.put(ty::KERNEL_TRIAGE_INFO_V1, &[0u8; TRIAGE_INFO_SIZE]);
         k.put(ty::TASK_IS_CORPSE_FORK, &u32::from(fork).to_le_bytes());
         k.put(ty::EXCEPTION_TYPE, &(etype as i32).to_le_bytes());
-        // p_crash_count, p_throttle_timeout: a spawn's crash count and
-        // throttle timeout attributes are not taken here.
-        k.put(ty::CRASH_COUNT, &0i32.to_le_bytes());
-        k.put(ty::THROTTLE_TIMEOUT, &0i32.to_le_bytes());
+        k.put(ty::CRASH_COUNT, &self.dtask.crash_count.to_le_bytes());
+        k.put(ty::THROTTLE_TIMEOUT, &self.dtask.throttle_timeout.to_le_bytes());
         let mut id = [0u8; SIGNING_ID_LEN];
         if let Some(s) = &identity {
             let n = s.len().min(SIGNING_ID_LEN - 1);

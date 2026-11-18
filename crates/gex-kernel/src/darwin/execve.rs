@@ -678,6 +678,10 @@ impl Kernel {
             map_max: spawn.map_or(0, |s| s.max_addr),
             crash_behavior: spawn.map_or(0, |s| s.crash_behavior),
             crash_behavior_deadline: spawn.map_or(0, |s| s.crash_behavior_deadline),
+            // posix_spawn sets p_crash_count and p_throttle_timeout (its
+            // attributes', or 0); an exec keeps them.
+            crash_count: spawn.map_or(old.crash_count, |s| s.crash_count),
+            throttle_timeout: spawn.map_or(old.throttle_timeout, |s| s.throttle_timeout),
             map_min: 0,
             // The new proc's p_pcaction is clear (forkproc), and its
             // P_LVMRSRCOWNER; a spawn's child has what its spawn set.

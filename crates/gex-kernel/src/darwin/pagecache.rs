@@ -87,7 +87,7 @@ pub const APFS_STAND_IN: &str = "APFS's own I/O and logical writes in a task's t
 
 /// The stand-ins of the cache's counts, for gexc's report at start.
 pub fn stand_ins() -> Vec<String> {
-    let mut v = vec![UNSEEN.to_string(), APFS_STAND_IN.to_string(), PREPARE_WRITE_STAND_IN.to_string(), super::cluster::MOUNT_STAND_IN.to_string()];
+    let mut v = vec![UNSEEN.to_string(), APFS_STAND_IN.to_string(), PREPARE_WRITE_STAND_IN.to_string(), super::cluster::MOUNT_STAND_IN.to_string(), SYNC_STAND_IN.to_string()];
     if PROBE.get().is_none() {
         v.push(HOLES_STAND_IN.to_string());
     }
@@ -133,6 +133,13 @@ pub(super) struct Object {
     /// a truncation; cleared only at reclaim): its last writer's close
     /// pushes it (`apfs_vnop_close`).
     pub(super) written: bool,
+    /// The mount its vnode is on (`v_mount`), as the first open file that
+    /// reached it here said ([`on_mount`]).
+    on: Option<&'static super::kern::Mount>,
+    /// The file's size as the last call that knew it gave it
+    /// (`ubc_getsize`): every write, read and truncation gives it, so a
+    /// vnode with a page or a cluster to push has one.
+    size: Option<u64>,
 }
 
 /// What one operation on the cache charges its task: the bytes
@@ -371,6 +378,7 @@ pub struct Fault {
 pub fn fault(key: FileKey, size: u64, offset: u64, behavior: u8, lo: u64, hi: u64, write: bool, shared: bool, backed: &dyn Fn(u64, u64) -> u64) -> Fault {
     let off = trunc(offset);
     with(key, |o| {
+        o.size = Some(size);
         let mut out = Fault::default();
         match o.pages.get(&off).copied() {
             Some(p) => {
@@ -461,7 +469,71 @@ pub fn fsync(file: &crate::file::OpenFile) {
     }
     let Some(key) = file.handle.host_id() else { return };
     let size = file.handle.metadata().map_or(0, |m| m.size);
+    on_mount(key, super::kern::mount_of_file(file));
     charge(push(key, size, true));
+}
+
+/// File `key`'s vnode is on mount `mnt` (its first word wins: a vnode's
+/// mount is its own for good).
+pub fn on_mount(key: FileKey, mnt: &'static super::kern::Mount) {
+    with(key, |o| {
+        o.on.get_or_insert(mnt);
+    });
+}
+
+/// APFS's `VFS_SYNC` of the volume mounted at `mnt` (`apfs_vfsop_sync`,
+/// 0xfffffff0066c9d80): `vnode_iterate` of its vnodes with
+/// `apfs_sync_callback` (0xfffffff0066d1748), whose data flush
+/// (0xfffffff0066a12e4) gives each regular file `cluster_push_err(vp,
+/// flags)`, `IO_SYNC` when `waitfor` has `MNT_WAIT` or `MNT_DWAIT`
+/// ([`SYNC_STAND_IN`]). What it writes, charged to the running thread's
+/// task.
+pub fn sync_mount(mnt: &super::kern::Mount, sync: bool) -> Io {
+    let mut c = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(map) = c.as_mut() else { return Io::default() };
+    let mut io = Io::default();
+    for o in map.values_mut().filter(|o| o.on.is_some_and(|m| std::ptr::eq(m, mnt))) {
+        let Some(size) = o.size else { continue };
+        let none = |_: u64, _: u64| 0;
+        let mut cx = super::cluster::Cx { size, backed: &none, io: Io::default() };
+        o.push(&mut cx, sync);
+        io.read += cx.io.read;
+        io.written += cx.io.written;
+        io.logical += cx.io.logical;
+    }
+    io
+}
+
+/// The stand-in for what APFS's sync passes over, as gexc reports it.
+pub const SYNC_STAND_IN: &str = "apfs_vfsop_sync's data flush of each vnode (0xfffffff0066a12e4): the tests of its inode's flags before the push (+0x98 bits 0, 3, 4, 24 and 46..47, +0x7c bit 5) and what it does after it for an inode with dirty file extents (+0x11c), which read APFS's inode state, not kept here (stand-in: every regular file's write-behind pushed, nothing after; measure ri_diskio_byteswritten of a process that writes a file without fsync, then calls sync, on the device)";
+
+/// `vflush(mp, NULLVP, SKIPSWAP | SKIPSYSTEM | SKIPROOT | FORCECLOSE)` at a
+/// forced unmount of `mnt`: `vclean(vp, DOCLOSE)` of each of its vnodes,
+/// in use or not, here every file whose object is kept: `VNOP_FSYNC` with
+/// `MNT_WAIT` (`apfs_vnop_fsync`'s `cluster_push_err(IO_SYNC)`), then
+/// `ubc_msync(vp, 0, ubc_getsize(vp), NULL, UBC_PUSHALL | UBC_INVALIDATE |
+/// UBC_SYNC)`; the vnode is reclaimed, its object and its pages gone. (A
+/// vnode in use is closed first, `VNOP_CLOSE` with no `FWRITE`, which
+/// pushes nothing.) What it writes, charged to the running thread's task.
+pub fn vflush(mnt: &super::kern::Mount) -> Io {
+    let mut c = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(map) = c.as_mut() else { return Io::default() };
+    let keys: Vec<FileKey> = map.iter().filter(|(_, o)| o.on.is_some_and(|m| std::ptr::eq(m, mnt))).map(|(k, _)| *k).collect();
+    let mut io = Io::default();
+    for k in keys {
+        let Some(mut o) = map.remove(&k) else { continue };
+        // A vnode no call has given a size has neither a page nor a
+        // cluster to push.
+        let Some(size) = o.size else { continue };
+        let none = |_: u64, _: u64| 0;
+        let mut cx = super::cluster::Cx { size, backed: &none, io: Io::default() };
+        o.push(&mut cx, true);
+        o.lock_request(&mut cx, 0, round(size), Msync { push_dirty: true, invalidate: true });
+        io.read += cx.io.read;
+        io.written += cx.io.written;
+        io.logical += cx.io.logical;
+    }
+    io
 }
 
 /// Charge `io` to the running thread's task.
@@ -484,6 +556,7 @@ pub fn read(key: FileKey, off: u64, n: u64, size: u64, raoff: bool, backed: &dyn
         return Io::default();
     }
     with(key, |o| {
+        o.size = Some(size);
         let mut cx = super::cluster::Cx { size, backed, io: Io::default() };
         o.read_copy(&mut cx, off, n, size, raoff);
         cx.io
@@ -499,6 +572,7 @@ pub fn write(key: FileKey, off: u64, n: u64, old_eof: u64, new_eof: u64, flags: 
         return Io::default();
     }
     with(key, |o| {
+        o.size = Some(new_eof);
         let mut cx = super::cluster::Cx { size: new_eof, backed, io: Io::default() };
         o.write(&mut cx, off, n, old_eof, new_eof, flags);
         cx.io
@@ -526,6 +600,7 @@ pub fn apfs_write(key: FileKey, off: u64, n: u64, old: u64, sync: bool, nocache:
     let tail = ((end % DEVBLOCK != 0 && end < alloc) || (new > old && new % PAGE != 0)).then(|| end.div_ceil(DEVBLOCK) * DEVBLOCK);
     let flags = WriteFlags { sync, nocache, head, tail };
     with(key, |o| {
+        o.size = Some(new);
         let mut cx = super::cluster::Cx { size: new, backed, io: Io::default() };
         o.write(&mut cx, off, n, old, new, flags);
         // The rest of the old last page, from the old end, when the write
@@ -545,6 +620,7 @@ pub const PREPARE_WRITE_STAND_IN: &str = "apfs_vnop_write's prepare_write (0xfff
 /// bytes): its write-behind clusters, or its sparse map, written.
 pub fn push(key: FileKey, size: u64, sync: bool) -> Io {
     with(key, |o| {
+        o.size = Some(size);
         let none = |_: u64, _: u64| 0;
         let mut cx = super::cluster::Cx { size, backed: &none, io: Io::default() };
         o.push(&mut cx, sync);
@@ -570,6 +646,7 @@ pub struct Msync {
 /// debit of the logical writes (`TASK_WRITE_INVALIDATED`).
 pub fn msync(key: FileKey, size: u64, start: u64, end: u64, m: Msync) -> Io {
     with(key, |o| {
+        o.size = Some(size);
         let none = |_: u64, _: u64| 0;
         let mut cx = super::cluster::Cx { size, backed: &none, io: Io::default() };
         o.lock_request(&mut cx, trunc(start), round(end), m);
@@ -615,6 +692,7 @@ pub fn open_writer(key: FileKey) {
 /// write count.
 pub fn close(key: FileKey, size: u64, writer: bool) -> Io {
     with(key, |o| {
+        o.size = Some(size);
         let mut io = Io::default();
         if writer {
             if o.written && o.writers == 1 {
@@ -634,6 +712,7 @@ pub fn close(key: FileKey, size: u64, writer: bool) -> Io {
 /// `RETURN_NONE`), each dirty one a debit of the logical writes.
 pub fn truncate(key: FileKey, size: u64) -> Io {
     with(key, |o| {
+        o.size = Some(size);
         let cut = round(size);
         let none = |_: u64, _: u64| 0;
         let mut cx = super::cluster::Cx { size, backed: &none, io: Io::default() };
@@ -707,6 +786,32 @@ mod tests {
 
     fn key(n: u64) -> FileKey {
         (0xfeed, n, 1)
+    }
+
+    fn mount(on: &'static str) -> &'static super::super::kern::Mount {
+        use super::super::kern::{Fs, From, Mount};
+        Box::leak(Box::new(Mount::new(on, From::Volume(1), 0x1a00_0042, 0, Fs::Apfs, None, 0, Some(false))))
+    }
+
+    /// A mount's sync pushes the write-behind of its own files alone; its
+    /// forced unmount's vflush pushes what is left, synchronously, and
+    /// reclaims the vnodes: their objects go.
+    #[test]
+    fn a_mounts_sync_and_vflush_push_its_own_files() {
+        let (on, other) = (mount("/private/var/sync-a"), mount("/private/var/sync-b"));
+        let (k, j) = (key(901), key(902));
+        on_mount(k, on);
+        on_mount(j, other);
+        let size = 8 * PAGE;
+        assert_eq!(write(k, 0, PAGE, size, size, super::super::cluster::WriteFlags::default(), &ALL).written, 0);
+        assert_eq!(write(j, 0, PAGE, size, size, super::super::cluster::WriteFlags::default(), &ALL).written, 0);
+        assert_eq!(sync_mount(on, false).written, PAGE);
+        assert_eq!(sync_mount(on, false).written, 0, "pushed, clean");
+        assert_eq!(vflush(on).written, 0);
+        assert_eq!(vflush(other).written, PAGE, "the other mount's file, pushed at its unmount");
+        let c = CACHE.lock().unwrap();
+        let map = c.as_ref().unwrap();
+        assert!(!map.contains_key(&k) && !map.contains_key(&j), "reclaimed");
     }
 
     #[test]

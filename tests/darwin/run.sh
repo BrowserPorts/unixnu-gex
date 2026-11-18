@@ -694,6 +694,39 @@ system /dev/disk1s1
     rebootcall-halt) check_machine rebootcall-halt 0:0 "" $HALT "" halt ;;
     rebootcall-restart) check_machine rebootcall-restart 0:0 "" $RESTART "" restart ;;
     rebootcall-hostrestart) check_machine rebootcall-hostrestart 0:0 "" $RESTART "" hostrestart ;;
+    # RB_UPSDELAY and HOST_REBOOT_UPSDELAY: the arm platform expert halts.
+    rebootcall-upsdelay) check_machine rebootcall-upsdelay 0:0 "" $HALT "" upsdelay ;;
+    rebootcall-hostupsdelay) check_machine rebootcall-hostupsdelay 0:0 "" $HALT "" hostupsdelay ;;
+    # A full shutdown (reboot_kernel without RB_QUICK): proc_shutdown's
+    # signals, waits and exit1, the second reboot's EBUSY, the shutdown log
+    # and the files' data on the disk after (see rebootcall.c). With no
+    # process to make exit, no log is written.
+    rebootcall-full | rebootcall-fullhalt)
+        log=${GEX_DARWIN_ROOT:-/nonexistent}/private/var/log/kernel-shutdown.log
+        data=${GEX_DARWIN_ROOT:-/nonexistent}/private/var/tmp/gex-rebootcall-dirty
+        rm -f "$log" "$data"
+        if [ "$1" = rebootcall-fullhalt ]; then
+            check_machine rebootcall-fullhalt 0:0 "" $HALT "" fullhalt
+            if [ -n "${GEX_DARWIN_ROOT:-}" ] && [ -e "$log" ]; then
+                echo "FAIL rebootcall-fullhalt: a shutdown log: $(cat "$log")"
+                fail=1
+            fi
+        else
+            check_machine rebootcall-full 0:0 "rebootcall full: shutting down
+rebootcall W: a second reboot: -1 EBUSY
+rebootcall W: T exit 3, SIGTERM from the rebooter; S signal 9, SIGTERM from the rebooter; I signal 9" $RESTART "" full
+            if [ -n "${GEX_DARWIN_ROOT:-}" ] && [ -n "${GEX_DARWIN_RESTORE:-}" ]; then
+                if ! grep -aq '^rebootcall dirty write$' "$data" 2>/dev/null || ! grep -aq 'rebootcall dirty map' "$data" 2>/dev/null; then
+                    echo "FAIL rebootcall-full: the file's data did not reach the disk"
+                    fail=1
+                elif ! printf '%s\n' "$(cat "$log" 2>/dev/null)" | tr '\n' '|' | grep -Eqx 'Process shutdown log\.  Current time is [0-9]+ \(in seconds\)\.\|\|gex-darwin-reboo\[[0-9]+\] had to be forced closed with exit1\(\)\.\|'; then
+                    echo "FAIL rebootcall-full: the shutdown log: $(cat "$log" 2>/dev/null)"
+                    fail=1
+                fi
+            fi
+        fi
+        rm -f "$log" "$data"
+        ;;
     *)
         echo "FAIL $1: no such program"
         fail=1
@@ -706,7 +739,7 @@ if [ "$named" -gt 0 ]; then
         run "$p"
     done
 else
-    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate thinfo tasksuspend portrefs crosstask spawnports taskname taskreg procfind debugport excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl iokit storagereg ioreg accel accelr metalwire metal iosurface iosurfacex iosurfacesplash iosurfacexpreboard iogpudev iomfb iomfbmain xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit sbxinit sbxexec sbxkill hostspecial sbxmask sbxnet sbxiokit sbxpriv sbxfile sbxscrub cfrunloop xpc-anon layout overlay stackfb launchcon shregion console owners apfsroles disknodes diskio fsfreeze fmount mntupdate fsstatwait ignition graftdmg tcload inet6 rusage vmshare remap vmwrite freezer ment ubcmap purgeable mentreuse mapfirst ignitionweb crashpanic crashpanic-exit crashpanic-onexit crashpanic-deadline crashpanic-crash crashpanic-abort crashpanic-terminate crashpanic-spawnfail rebootcall rebootcall-panic rebootcall-halt rebootcall-restart rebootcall-hostrestart; do
+    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate thinfo tasksuspend portrefs crosstask spawnports taskname taskreg procfind debugport excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl iokit storagereg ioreg accel accelr metalwire metal iosurface iosurfacex iosurfacesplash iosurfacexpreboard iogpudev iomfb iomfbmain xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit sbxinit sbxexec sbxkill hostspecial sbxmask sbxnet sbxiokit sbxpriv sbxfile sbxscrub cfrunloop xpc-anon layout overlay stackfb launchcon shregion console owners apfsroles disknodes diskio fsfreeze fmount mntupdate fsstatwait ignition graftdmg tcload inet6 rusage vmshare remap vmwrite freezer ment ubcmap purgeable mentreuse mapfirst ignitionweb crashpanic crashpanic-exit crashpanic-onexit crashpanic-deadline crashpanic-crash crashpanic-abort crashpanic-terminate crashpanic-spawnfail rebootcall rebootcall-panic rebootcall-halt rebootcall-restart rebootcall-hostrestart rebootcall-upsdelay rebootcall-hostupsdelay rebootcall-full rebootcall-fullhalt; do
         run "$p"
     done
 fi

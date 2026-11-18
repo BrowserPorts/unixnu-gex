@@ -169,6 +169,7 @@ impl OpenFile {
         }
         if let Some(key) = self.handle.host_id() {
             if !self.darwin_writer.swap(true, Ordering::AcqRel) {
+                crate::darwin::pagecache::on_mount(key, crate::darwin::kern::mount_of_file(self));
                 crate::darwin::pagecache::open_writer(key);
             }
         }
@@ -211,6 +212,7 @@ impl OpenFile {
             if let Some(key) = self.handle.host_id() {
                 let writer = self.darwin_writer.swap(false, Ordering::AcqRel);
                 let size = self.handle.metadata().map_or(0, |m| m.size);
+                crate::darwin::pagecache::on_mount(key, crate::darwin::kern::mount_of_file(self));
                 crate::darwin::pagecache::charge(crate::darwin::pagecache::close(key, size, writer));
             }
         }
@@ -447,7 +449,9 @@ impl OpenFile {
         if !crate::darwin::pagecache::on() || self.handle.is_stream() {
             return None;
         }
-        self.handle.host_id()
+        let key = self.handle.host_id()?;
+        crate::darwin::pagecache::on_mount(key, crate::darwin::kern::mount_of_file(self));
+        Some(key)
     }
 
     /// A `read` of `n` bytes at `off` through the cache (`vn_read`'s

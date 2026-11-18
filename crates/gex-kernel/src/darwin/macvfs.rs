@@ -1382,6 +1382,54 @@ impl Kernel {
 }
 
 impl Kernel {
+    /// `vnode_open(path, O_CREAT | FWRITE | O_NOFOLLOW, cmode, 0, &vp,
+    /// ctx)` in this thread's context (`vn_open_auth`), for the kernel's
+    /// own writes to a file: the lookup (a link at the end not followed);
+    /// a name to make has the create check of a regular file, then
+    /// `vn_authorize_create`, and is made with exactly `cmode` (the
+    /// caller's umask is `open1`'s, not `vnode_open`'s); a file there is
+    /// ELOOP for a link (O_NOFOLLOW), EISDIR for a directory to write and
+    /// EOPNOTSUPP for a socket, then has the open check for writing and
+    /// `vnode_authorize` of KAUTH_VNODE_WRITE_DATA. The open file holds a
+    /// writer's count, as the vnode's `vn_open` takes one.
+    pub(crate) fn darwin_vnode_open_create(&mut self, path: &str, cmode: u32) -> Result<std::sync::Arc<crate::file::OpenFile>, Errno> {
+        use crate::fs::oflags::{O_CREAT, O_EXCL, O_WRONLY};
+        const FWRITE: u32 = 2;
+        if let Some(what) = super::kern::unmodelled_files_at(path, false) {
+            self.darwin_unimplemented(format!("looking up {path}: {what}"));
+            return Err(Errno::EIO);
+        }
+        let (handle, at) = match self.darwin_sb_lookup(None, path, false, false)? {
+            Lookup::Missing { dir, name } if !name.ends_with('/') => {
+                refused(self.darwin_mac_check_vnode_create(&dir, &name, Some(vt::VREG)))?;
+                let c = self.darwin_creating(&dir, &name, super::vauth::kauth::ADD_FILE, cmode)?;
+                let h = self.vfs.open_mode(&c.path, O_WRONLY | O_CREAT | O_EXCL, cmode)?;
+                self.darwin_created(&c, Some(&*h));
+                (h, c.path)
+            }
+            Lookup::Found(f) => {
+                match f.md.file_type {
+                    FileType::Symlink => return Err(Errno::ELOOP),
+                    FileType::Directory => return Err(Errno::EISDIR),
+                    FileType::Socket => return Err(super::errno::EOPNOTSUPP),
+                    _ => {}
+                }
+                refused(self.darwin_mac_check_vnode_open(f.sb(), FWRITE))?;
+                let cred = self.dtask.cred.clone();
+                let node = self.darwin_found_node(&f);
+                self.darwin_authorize(&cred, &node, None, super::vauth::kauth::WRITE_DATA)?;
+                (self.vfs.open(&f.path, O_WRONLY, 0)?, f.path)
+            }
+            // The lookup's own error: the parent's.
+            _ => return Err(self.vfs.metadata(&crate::vfs::parent_of(path)).err().unwrap_or(Errno::ENOTDIR)),
+        };
+        let file = crate::file::OpenFile::new(handle, at, O_WRONLY, false, true);
+        file.fg_retain();
+        Ok(file)
+    }
+}
+
+impl Kernel {
     /// `mac_file_check_lock` of F_SETLK on open file `file`, a vnode: the
     /// lock check of its vnode.
     pub(crate) fn darwin_sb_setlk(&mut self, file: &std::sync::Arc<crate::file::OpenFile>) -> Result<(), Errno> {

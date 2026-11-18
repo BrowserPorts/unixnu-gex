@@ -85,6 +85,15 @@ fn console_termios(out: &mut [u8]) {
 /// IFF_MULTICAST, and `SIOCSIFADDR` adds IFF_UP and IFF_RUNNING.
 static LO0_FLAGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x8008);
 
+/// `if_down_all`'s `if_down` of each interface (`if_unroute(ifp, IFF_UP,
+/// AF_UNSPEC)`): `lo0`, the one modelled, loses IFF_UP. Its protocols'
+/// unplumbing (`dlil_proto_unplumb_all`) and the routing message
+/// (`rt_ifmsg`) are its callers' to report.
+pub fn if_down_all() {
+    const IFF_UP: u32 = 0x1;
+    LO0_FLAGS.fetch_and(!IFF_UP, std::sync::atomic::Ordering::Relaxed);
+}
+
 impl Kernel {
     /// `SIOCAIFADDR` on an AF_INET socket: an address for `lo0`, which
     /// `lo_ioctl`'s SIOCSIFADDR brings up. The address itself is not kept:

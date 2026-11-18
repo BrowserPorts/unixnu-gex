@@ -41,6 +41,7 @@ pub mod dsig {
     pub const SIGTTOU: u32 = 22;
     pub const SIGCHLD: u32 = 20;
     pub const SIGALRM: u32 = 14;
+    pub const SIGTERM: u32 = 15;
     pub const SIGXCPU: u32 = 24;
     pub const SIGVTALRM: u32 = 26;
     pub const SIGPROF: u32 = 27;
@@ -826,11 +827,15 @@ impl Kernel {
     /// its exit has begun; then `proc_prepareexit`'s report of a crash,
     /// and its end (`P_REF_DEAD`): here, or once the EXC_CRASH handler a
     /// report is sent to has answered (on the call's way out), as the
-    /// process stays found while its handler looks at it.
+    /// process stays found while its handler looks at it. A process
+    /// another one's `exit1` committed to its end (whose task's
+    /// termination is the SIGKILL here) ends with the status that `exit1`
+    /// gave it.
     fn darwin_signal_exit(&mut self, d: u32) {
         let reason = self.thread_signals.get(self.tid).and_then(|t| t.exit_reason());
         self.procs.begin_exit(self.pid, reason);
-        self.darwin_prepareexit(d);
+        let rv = self.procs.forced_exit(self.pid).unwrap_or(d);
+        self.darwin_prepareexit(rv);
         if self.dtask.crash_notify.is_none() {
             self.procs.set_exited(self.pid);
         }

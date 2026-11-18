@@ -1853,6 +1853,7 @@ impl Kernel {
             "kern.procargs2" => self.darwin_sysctl_procargs2(m, tail, req),
             "kern.osreleasetype" => self.darwin_sysctl_osreleasetype(m, req),
             "kern.initproc_spawned" => self.darwin_sysctl_initproc_spawned(m, req),
+            "kern.delayterm" => self.darwin_sysctl_delayterm(m, req),
             // sysctl_bootobjectspath: on an embedded platform, the boot
             // manifest's hash in hexadecimal.
             "kern.bootobjectspath" => match super::iokit::boot_manifest_hash() {
@@ -2048,6 +2049,27 @@ impl Kernel {
             let b = req.input(m, 4)?;
             SPAWNED.store(i32::from_le_bytes([b[0], b[1], b[2], b[3]]), Relaxed);
         }
+        Ok(())
+    }
+
+    /// `sysctl_delayterm`: the caller's `P_LDELAYTERM` as an `int`
+    /// (`sysctl_io_number` of an `int`: a 64-bit new value is taken when it
+    /// fits, ERANGE when it does not), set by any new value but 0.
+    fn darwin_sysctl_delayterm(&mut self, m: &mut GuestMem<'_>, req: &mut SysctlReq) -> Result<(), Errno> {
+        let cur = i32::from(self.procs.delayterm(self.pid));
+        req.out(m, &cur.to_le_bytes())?;
+        if req.new == 0 {
+            return Ok(());
+        }
+        let new = if req.newlen == 8 {
+            let b = req.input(m, 8)?;
+            let big = i64::from_le_bytes(b[..8].try_into().expect("8 bytes"));
+            i32::try_from(big).map_err(|_| Errno::ERANGE)?
+        } else {
+            let b = req.input(m, 4)?;
+            i32::from_le_bytes(b[..4].try_into().expect("4 bytes"))
+        };
+        self.procs.set_delayterm(self.pid, new != 0);
         Ok(())
     }
 

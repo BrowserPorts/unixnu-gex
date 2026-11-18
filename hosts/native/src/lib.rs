@@ -1055,6 +1055,9 @@ fn run_program_with(
     // (corpse::hold at each task's end, corpse::exited once the end is
     // published).
     gex_kernel::darwin::corpse::set_host_keeps_corpses();
+    // It makes a Darwin task's corpse forks too, on the task's thread-call
+    // thread (make_corpse_forks).
+    gex_kernel::darwin::corpsefork::set_host_forks_corpses();
     let mut process = RunProcess { inherited, kernel: None, spawn: None };
     let r = run_process(program, opts, xlate, &mut process);
     if r.is_err() {
@@ -1796,6 +1799,7 @@ fn run_process(
         provider_stacks: Mutex::new(Vec::new()),
     });
     note_live_process(&spawn);
+    note_spawn(&spawn);
     process.spawn = Some(Arc::clone(&spawn));
     store.data_mut().spawn = Some(Arc::clone(&spawn));
 
@@ -2031,6 +2035,21 @@ fn note_live_process(spawn: &Arc<SpawnContext>) {
     live.push(Arc::downgrade(spawn));
 }
 
+/// Every process's spawn context, by its kernel, for the work its kernel
+/// asks of its host from outside a thread of its own (a corpse fork).
+static SPAWNS: Mutex<Vec<std::sync::Weak<SpawnContext>>> = Mutex::new(Vec::new());
+
+fn note_spawn(spawn: &Arc<SpawnContext>) {
+    let mut all = SPAWNS.lock().unwrap_or_else(|e| e.into_inner());
+    all.retain(|w| w.strong_count() > 0);
+    all.push(Arc::downgrade(spawn));
+}
+
+/// The spawn context whose kernel is `kernel`.
+fn spawn_of(kernel: &Arc<Mutex<Kernel>>) -> Option<Arc<SpawnContext>> {
+    SPAWNS.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(|w| w.upgrade()).find(|s| Arc::ptr_eq(&s.kernel, kernel))
+}
+
 /// Ask every process still running to stop, as its own end would: each
 /// thread stops at its next syscall or safepoint, or wakes from a wait.
 pub(crate) fn stop_every_process() {
@@ -2087,6 +2106,23 @@ impl GuestGate {
             self.leave();
             self.enter();
         }
+    }
+
+    /// Stop every thread running guest code until the guard drops, waiting
+    /// as long as it takes: a corpse fork's copy (`task_suspend_internal`
+    /// waits for each thread to stop). The caller is no thread of the
+    /// process's.
+    fn pause_all(&self) -> GatePaused<'_> {
+        use std::sync::atomic::Ordering;
+        let mut n = self.in_guest.lock().unwrap_or_else(|e| e.into_inner());
+        while self.pausing.load(Ordering::Acquire) {
+            n = self.cv.wait(n).unwrap_or_else(|e| e.into_inner());
+        }
+        self.pausing.store(true, Ordering::Release);
+        while *n > 0 {
+            n = self.cv.wait(n).unwrap_or_else(|e| e.into_inner());
+        }
+        GatePaused(self)
     }
 
     /// Stop every other thread running guest code until the guard drops.
@@ -3110,14 +3146,144 @@ fn start_darwin_thread_calls(kernel: std::sync::Weak<Mutex<Kernel>>, memory: gex
         let seen = bell.generation();
         let next = {
             let Some(k) = kernel.upgrade() else { return };
-            let mut k = k.lock().unwrap_or_else(|e| e.into_inner());
-            let mut mem = GuestMem::new(memory.bytes());
-            k.darwin_thread_calls(&mut mem)
+            let next = {
+                let mut k = k.lock().unwrap_or_else(|e| e.into_inner());
+                let mut mem = GuestMem::new(memory.bytes());
+                k.darwin_thread_calls(&mut mem)
+            };
+            // The corpse forks a call, a thread call or a request queued,
+            // made with the kernel let go.
+            make_corpse_forks(&k, &memory);
+            next
         };
         if !bell.wait(seen, next) {
             return;
         }
     });
+}
+
+/// The corpse forks task `kernel` (its memory `memory`) has queued
+/// (`gex_kernel::darwin::corpsefork`), each made and its outcome given to
+/// whoever asked.
+fn make_corpse_forks(kernel: &Arc<Mutex<Kernel>>, memory: &gex_mem::GuestMemory) {
+    loop {
+        let req = kernel.lock().unwrap_or_else(|e| e.into_inner()).darwin_corpse_fork_take();
+        let Some(req) = req else { return };
+        let (origin, r) = make_corpse_fork(kernel, memory, req);
+        let mut k = kernel.lock().unwrap_or_else(|e| e.into_inner());
+        let mut gm = GuestMem::new(memory.bytes());
+        k.darwin_corpse_fork_done(&mut gm, origin, r);
+        k.darwin_ipc_leave();
+    }
+}
+
+/// One corpse fork: the task's threads held still for the length of the
+/// copy, its kernel's making of the corpse, the corpse's memory a copy of
+/// the task's by the fork's plan (the host's pages copied on write, or
+/// shared, where it can; a copy otherwise), the threads let go, the corpse
+/// enabled and its thread calls started. Who waits, and the corpse's port
+/// for `task_generate_corpse`, or the return code.
+#[allow(clippy::type_complexity)]
+fn make_corpse_fork(kernel: &Arc<Mutex<Kernel>>, memory: &gex_mem::GuestMemory, req: gex_kernel::darwin::corpsefork::Request) -> (gex_kernel::darwin::corpsefork::Origin, std::result::Result<Option<u64>, u64>) {
+    const KERN_FAILURE: u64 = 5;
+    const KERN_RESOURCE_SHORTAGE: u64 = 6;
+    let Some(cx) = spawn_of(kernel) else {
+        let mut k = kernel.lock().unwrap_or_else(|e| e.into_inner());
+        k.darwin_unimplemented("a corpse fork of a task whose threads this host does not run".into());
+        return (req.origin, Err(KERN_FAILURE));
+    };
+    let paused = cx.gate.pause_all();
+    let (built, regions) = {
+        let mut k = kernel.lock().unwrap_or_else(|e| e.into_inner());
+        let mut gm = GuestMem::new(memory.bytes());
+        let r = k.darwin_corpse_fork_build(&mut gm, req);
+        // What the task has mapped outside the plan (the commpage's alias),
+        // less what it is known to hold only zeros.
+        let regions: Vec<(u64, u64)> = match &r {
+            Ok(b) => {
+                let mm = k.mem.lock();
+                mm.vmas().iter().filter(|v| !b.plan.iter().any(|r| r.start < v.end && v.start < r.end)).flat_map(|v| mm.dirty_parts(v.start, v.end)).collect()
+            }
+            Err(_) => Vec::new(),
+        };
+        k.darwin_ipc_leave();
+        (r, regions)
+    };
+    let mut build = match built {
+        Ok(b) => b,
+        Err(f) => return (f.origin, Err(f.kr)),
+    };
+    let shared = match wasmtime::SharedMemory::new(&cx.engine, guest_memory_type()) {
+        Ok(s) => s,
+        Err(e) => {
+            drop(paused);
+            eprintln!("gex: a corpse fork's memory could not be made: {e:#}");
+            build.corpse.darwin_corpse_fork_abandon();
+            return (build.origin, Err(KERN_RESOURCE_SHORTAGE));
+        }
+    };
+    let corpse_mem = gex_mem::GuestMemory::new(shared);
+    let mut unshared = Vec::new();
+    {
+        let src = memory.bytes();
+        let dst = corpse_mem.bytes();
+        // The register contexts and the dispatch directory, below the
+        // executable; an M64 memory's dense tables.
+        let low = gex_abi::DISPATCH_DIR_END as usize;
+        dst[..low].copy_from_slice(&src[..low]);
+        if gex_abi::mem64() {
+            let (a, b) = gex_abi::tables64();
+            let (a, b) = (a as usize, b as usize);
+            dst[a..b].copy_from_slice(&src[a..b]);
+        }
+        let mut sparse = SparseCopy::new();
+        for (start, end) in &regions {
+            let (a, b) = (*start as usize, (*end as usize).min(src.len()));
+            if a < b {
+                sparse.copy(src, dst, a, b);
+            }
+        }
+        for r in build.plan.iter().filter(|r| r.how != gex_kernel::darwin::vmshare::Inherit::None) {
+            let (a, b) = (r.start as usize, (r.end as usize).min(src.len()));
+            if a >= b {
+                continue;
+            }
+            let copy = r.how == gex_kernel::darwin::vmshare::Inherit::Copy;
+            let (sp, dp) = (src.as_ptr() as usize, dst.as_ptr() as usize);
+            if gex_kernel::host_remap(dp + a, sp + a, b - a, copy) {
+                continue;
+            }
+            if !copy {
+                unshared.push((r.start, r.end));
+            }
+            let parts = {
+                let k = kernel.lock().unwrap_or_else(|e| e.into_inner());
+                let mm = k.mem.lock();
+                mm.dirty_parts(r.start, r.end)
+            };
+            for (pa, pb) in parts {
+                let (pa, pb) = (pa as usize, (pb as usize).min(src.len()));
+                if pa < pb {
+                    sparse.copy(src, dst, pa, pb);
+                }
+            }
+        }
+        let mut gm = GuestMem::new(dst);
+        build.corpse.darwin_corpse_fork_vm(&mut gm, &build.plan);
+    }
+    drop(paused);
+    if !unshared.is_empty() {
+        kernel.lock().unwrap_or_else(|e| e.into_inner()).darwin_fork_unshared(&unshared);
+    }
+    let origin = build.origin;
+    let corpse = Arc::new(Mutex::new(build.corpse));
+    let vm = {
+        let k = corpse.lock().unwrap_or_else(|e| e.into_inner());
+        Arc::new(gex_kernel::proc::PeerVm { mm: k.mem.shared(), mem: Arc::new(PeerMemory(corpse_mem.clone())) })
+    };
+    let port = gex_kernel::darwin::corpsefork::enable(&corpse, vm, &origin);
+    start_darwin_thread_calls(Arc::downgrade(&corpse), corpse_mem);
+    (origin, Ok(port))
 }
 
 fn start_guest_thread(cx: Arc<SpawnContext>, child: ThreadState) -> Result<()> {
@@ -3498,6 +3664,7 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         provider_stacks: Mutex::new(cx.provider_stacks.lock().unwrap_or_else(|e| e.into_inner()).clone()),
     });
     note_live_process(&child_cx);
+    note_spawn(&child_cx);
     // A Darwin child's task is enabled before its parent's fork returns
     // (fork's ipc_task_enable): its pid finds it, and its ports are made,
     // whether or not it has run yet. Its thread calls (its timers, its

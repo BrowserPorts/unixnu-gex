@@ -1298,10 +1298,9 @@ impl Kernel {
             sys::MAC_SYSCALL => res(self.darwin_mac_syscall(m, a[0], a[1], a[2])),
             // abort_with_payload: the call itself always returns 0.
             sys::ABORT_WITH_PAYLOAD => {
-                let _ = self.darwin_abort_with_payload(m, a, false);
+                let _ = self.darwin_abort_with_payload(m, a);
                 0
             }
-            sys::OS_FAULT_WITH_PAYLOAD => res(self.darwin_abort_with_payload(m, a, true)),
             sys::TERMINATE_WITH_PAYLOAD => {
                 // The seventh argument, reason_flags, is in x6.
                 let flags = m.read_u64(self.ctx_addr + gex_abi::ctx::x(6) as u64).unwrap_or(0);
@@ -1918,6 +1917,13 @@ impl Kernel {
             "kern.dyld_flags" => self.darwin_sysctl_dyld_flags(m, req),
             "kern.progressoptions" | "kern.consoleoptions" => self.darwin_sysctl_progressoptions(m, node.path, req),
             "vm.loadavg" => self.darwin_sysctl_loadavg(m, req),
+            // SYSCTL_QUADs of vm_map_corpse_footprint_count, _size_avg,
+            // _size_max, _full and _no_buf.
+            p if p.starts_with("vm.corpse_footprint_") => {
+                let v = super::corpse::footprint_stat(&p["vm.corpse_footprint_".len()..]).ok_or(Errno::ENOENT)?;
+                let b = sysctl::sized(node.path, node.kind, v.to_le_bytes().to_vec(), req.old, req.oldlen)?;
+                req.out(m, &b)
+            }
             _ => match sysctl::value(node.path) {
                 Some(_) if req.new != 0 => {
                     self.darwin_unimplemented(format!("sysctl write of {}", node.path));

@@ -40,6 +40,7 @@ pub mod km;
 pub mod cpumon;
 pub mod cred;
 pub mod corpse;
+pub mod corpsefork;
 pub mod critexit;
 pub mod errno;
 pub mod exec;
@@ -280,7 +281,7 @@ pub struct Task {
     /// While this task's own kernel serves its `mach_vm_read_overwrite` of
     /// another task's map (whose copy is made into this map, the caller's
     /// `current_map()`): that task's process.
-    pub read_from: Option<i32>,
+    pub read_from: Option<(ipc::TaskKey, i32)>,
     /// The send rights the next child task inherits (`ipc_task_init`):
     /// its special ports by kind, its registered ports, and its exception
     /// actions.
@@ -429,6 +430,11 @@ pub struct Task {
     pub crash_notify: Option<(i64, i64)>,
     /// The task is a corpse (`TFRO_CORPSE`), with what it keeps.
     pub corpse: Option<Box<corpse::Corpse>>,
+    /// Corpse forks of the task asked for, for the host to make
+    /// ([`corpsefork`]).
+    pub corpse_forks: std::collections::VecDeque<corpsefork::Request>,
+    /// The return codes of the corpse forks threads' calls wait for.
+    pub corpse_fork_results: std::collections::HashMap<i32, u64>,
     /// `vm_map_set_corpse_source`: a fatal memory limit's kill is to make
     /// the task a corpse whatever its EXC_CRASH handlers do.
     pub corpse_source: bool,

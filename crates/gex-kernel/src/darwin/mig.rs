@@ -1045,10 +1045,24 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
         // task_threads(task) -> act_list[]: the thread ports of the flavor
         // of the task port it was asked by.
         // task_generate_corpse(task) -> corpse_task_port: a corpse fork.
+        // (A corpse's port converts to no task: KERN_INVALID_ARGUMENT
+        // above.) The fork is the host's to make: the reply waits for it,
+        // the corpse's port with its no-senders notification armed. The
+        // calling thread's copy is the crashed thread when it is this
+        // task's.
         (Kobject::Task, 3442) => {
-            let mut r = Reply::err(KERN_FAILURE);
-            r.unimplemented = Some("task_generate_corpse (task_generate_corpse_internal's corpse fork: vm_map_fork of a live task, VM_MAP_FORK_CORPSE_FOOTPRINT, into one whose duplicated threads never run)".into());
-            r
+            use super::corpsefork::{Origin, Request};
+            let own = k.dtask.kcaller == 0 || k.dtask.kcaller == k.ipc().task;
+            let token = super::corpsefork::next_token();
+            let req = Request { etype: 0, code: 0, subcode: 0, reason: None, current: own.then_some(k.tid), origin: Origin::Generate(token) };
+            match k.darwin_corpse_fork_queue(req) {
+                Ok(()) => {
+                    let mut r = Reply::ok(Vec::new());
+                    r.defer = Some((k.tid, super::kobject::Deferred::CorpseFork(token)));
+                    r
+                }
+                Err(kr) => Reply::err(kr as i32),
+            }
         }
         // task_map_corpse_info_64(task, corpse_task) -> kcd_addr_begin,
         // kcd_size, and task_map_corpse_info's narrower size. The corpse's
@@ -1450,8 +1464,8 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
         (Kobject::Task | Kobject::TaskRead, 4808 | 3809) => match (arg64(req, 0), arg64(req, 2), arg64(req, 4)) {
             (Some(address), Some(size), Some(data)) => {
                 // Another task's map, read by the caller's kernel.
-                if let Some(pid) = k.dtask.read_from {
-                    return k.darwin_vm_copyin_other(pid, address, size).and_then(|b| k.darwin_vm_copy_overwrite_from(data, &b, Some(address))).map_or_else(|r| r, |()| Reply::ok(size.to_le_bytes().to_vec()));
+                if let Some(from) = k.dtask.read_from {
+                    return k.darwin_vm_copyin_other(from, address, size).and_then(|b| k.darwin_vm_copy_overwrite_from(data, &b, Some(address))).map_or_else(|r| r, |()| Reply::ok(size.to_le_bytes().to_vec()));
                 }
                 // The copy goes to the caller's map (current_map()), which
                 // is this task's only when the caller is.

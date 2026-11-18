@@ -351,6 +351,9 @@ pub enum Finish {
     Sigwait { siglist: u32, sig: u64 },
     /// A terminal call's `ttysleep` (the call is kept by its thread).
     Tty,
+    /// `task_enqueue_exception_with_corpse`'s corpse fork, made by the
+    /// host ([`super::corpsefork`]).
+    CorpseFork,
 }
 
 /// `wait_result_to_return_code` (`sys_ulock.c`).
@@ -401,6 +404,8 @@ impl Kernel {
                 Some(SyscallOutcome::Continue)
             }
             sys::BSDTHREAD_CREATE => Some(self.darwin_bsdthread_create(m, a)),
+            // os_fault_with_payload waits for its corpse fork.
+            sys::OS_FAULT_WITH_PAYLOAD => Some(self.darwin_os_fault_with_payload(m, a)),
             sys::BSDTHREAD_TERMINATE => {
                 self.darwin_bsdthread_terminate(m, a);
                 None
@@ -921,6 +926,7 @@ impl Kernel {
             Finish::Psynch(c) => self.darwin_psynch_wait_done(m, c, res),
             Finish::Sigwait { siglist, sig } => return self.darwin_sigwait_done(m, siglist, sig, res),
             Finish::Tty => return self.darwin_tty_wait_done(m, res),
+            Finish::CorpseFork => return self.darwin_corpse_fork_wait_done(m),
             Finish::Ulock { addr, no_errno } => {
                 // A waiter that was not woken is still on the queue.
                 if res != WaitResult::Awakened {

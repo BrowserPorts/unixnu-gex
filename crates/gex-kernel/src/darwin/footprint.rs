@@ -780,7 +780,6 @@ impl Kernel {
             Crossing::RoseAbove => true,
             Crossing::Exceeded => false,
         };
-        const EXC_CORPSE_NOTIFY: usize = 13;
         let (active, fatal) = (l.memlimit_active, l.memlimit_fatal);
         if !warning {
             let triggered = self.procs.jetsam().ledgers.get_mut(&self.pid).map(|l| l.exc_triggered()).unwrap_or(true);
@@ -789,13 +788,22 @@ impl Kernel {
             // a fatal limit's EXC_RESOURCE is the corpse its kill makes
             // (corpse_for_fatal_memkill: the map is marked a corpse source,
             // and proc_prepareexit makes the corpse, its codes the
-            // EXC_RESOURCE's), a soft one's a forked corpse's, which reaches
-            // only a corpse notification handler.
+            // EXC_RESOURCE's), a soft one's a corpse fork's
+            // (exc_via_corpse_forking; no audio is active here), its code
+            // the memory type, high watermark flavor and the limit in MB.
             if !triggered && self.pid != 1 {
                 if fatal {
                     self.dtask.corpse_source = true;
-                } else if self.darwin_task_exc_handled(EXC_CORPSE_NOTIFY) {
-                    self.darwin_unimplemented(format!("a forked corpse's EXC_RESOURCE for a crossed memory limit of {} MB (task_enqueue_exception_with_corpse's corpse fork: vm_map_fork of a live task into one that never runs)", l.limit >> 20));
+                } else {
+                    let mb = (l.limit >> 20) as i32;
+                    let name = self.darwin_best_name();
+                    super::corpse::kernel_log(format!("process {name} [{}] crossed memory high watermark ({mb} MB); EXC_RESOURCE ", self.pid));
+                    const RESOURCE_TYPE_MEMORY: i64 = 3;
+                    const FLAVOR_HIGH_WATERMARK: i64 = 1;
+                    let code = (RESOURCE_TYPE_MEMORY << 61) | (FLAVOR_HIGH_WATERMARK << 58) | (i64::from(mb) & 0x1fff);
+                    let req = super::corpsefork::Request { etype: super::exception::EXC_RESOURCE, code, subcode: 0, reason: None, current: None, origin: super::corpsefork::Origin::ThreadCall };
+                    // A host that cannot make it has said so.
+                    let _ = self.darwin_corpse_fork_queue(req);
                 }
             }
         }

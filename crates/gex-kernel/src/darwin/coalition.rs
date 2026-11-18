@@ -128,6 +128,8 @@ struct Table {
     /// The processes whose tasks have ended.
     ended: std::collections::HashSet<i32>,
     init: [u64; ty::NUM],
+    /// `corpse_coalition[]`: each type's corpse coalition.
+    corpse: [u64; ty::NUM],
 }
 
 /// `smrh_key_hash_u64` with no seed.
@@ -144,12 +146,12 @@ fn hash(id: u64) -> u64 {
 fn table() -> MutexGuard<'static, Table> {
     static T: OnceLock<Mutex<Table>> = OnceLock::new();
     T.get_or_init(|| {
-        let mut t = Table { coals: HashMap::new(), buckets: vec![Vec::new(); HASH_SIZE_MIN], count: 0, next_id: 1, next_tg: THREAD_GROUP_FIRST_DYNAMIC, members: HashMap::new(), ended: Default::default(), init: [0; ty::NUM] };
+        let mut t = Table { coals: HashMap::new(), buckets: vec![Vec::new(); HASH_SIZE_MIN], count: 0, next_id: 1, next_tg: THREAD_GROUP_FIRST_DYNAMIC, members: HashMap::new(), ended: Default::default(), init: [0; ty::NUM], corpse: [0; ty::NUM] };
         // coalitions_init: each type's default coalition, privileged, then
         // its corpse coalition.
         for k in 0..ty::NUM as u32 {
             t.init[k as usize] = t.create(k, role::SYSTEM, true, false);
-            t.create(k, role::SYSTEM, false, false);
+            t.corpse[k as usize] = t.create(k, role::SYSTEM, false, false);
         }
         Mutex::new(t)
     })
@@ -382,6 +384,22 @@ pub fn fork(parent: i32, child: i32) {
         _ => t.init.map(Some),
     };
     t.adopt_all(child, coals).expect("a fork's task adopts its parent's coalitions");
+}
+
+/// A corpse fork's task (`coalitions_adopt_corpse_task`): each type's
+/// corpse coalition, in place of its parent's. It has no process, so its
+/// membership is kept under `key`, a key no process has
+/// ([`corpse_member_key`]).
+pub fn adopt_corpse(key: i32) {
+    let mut t = table();
+    let coals = t.corpse.map(Some);
+    t.adopt_all(key, coals).expect("a corpse fork's task adopts the corpse coalitions");
+}
+
+/// The key a corpse fork's task's membership is kept under: from its task
+/// key, below every pid.
+pub fn corpse_member_key(task: u64) -> i32 {
+    -1 - (task as i32 & i32::MAX)
 }
 
 /// An exec's new task takes over its old one's coalitions and roles, the

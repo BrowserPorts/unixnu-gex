@@ -11132,6 +11132,14 @@ impl Kernel {
     }
 
     fn fork_kernel_inner(&self) -> Kernel {
+        // forkproc: a Darwin process's child takes what XNU copies.
+        let dtask = if self.darwin { self.darwin_fork_task() } else { crate::darwin::Task::new_process() };
+        self.fork_kernel_with(dtask)
+    }
+
+    /// A copy of this kernel's state, as a fork's child takes it, with
+    /// `dtask` its Darwin task state.
+    pub(crate) fn fork_kernel_with(&self, dtask: crate::darwin::Task) -> Kernel {
         Kernel {
             fds: Arc::new((*self.fds).clone()),
             mem: self.mem.clone(),
@@ -11196,8 +11204,7 @@ impl Kernel {
             darwin_dyld_infos_size: self.darwin_dyld_infos_size,
             darwin_dyld_final: false,
             // A new process takes the next pidversion (`forkproc`).
-            // forkproc: a Darwin process's child takes what XNU copies.
-            dtask: if self.darwin { self.darwin_fork_task() } else { crate::darwin::Task::new_process() },
+            dtask,
             darwin_arg_base: 0,
             darwin_user_stack: 0,
             darwin_finish: None,

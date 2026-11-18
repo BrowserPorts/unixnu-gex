@@ -147,6 +147,14 @@ pub struct Corpse {
     /// The corpse's address space, as other tasks' kernels reach it.
     pub vm: Option<std::sync::Arc<crate::proc::PeerVm>>,
     pub keep: Keep,
+    /// A corpse fork's notification, enqueued for its thread calls to
+    /// deliver (`thread_exception_enqueue`): its exception type.
+    pub enqueued: Option<usize>,
+    /// A corpse fork's membership key in the corpse coalitions.
+    pub coalition_key: Option<i32>,
+    /// A corpse fork's footprint, collected from its parent's pmap
+    /// (`vmmap_corpse_footprint`).
+    pub footprint: Option<Footprint>,
 }
 
 /// `union corpse_creation_gate`'s word (`inflight_corpses`): the user
@@ -256,6 +264,235 @@ pub fn set_host_keeps_corpses() {
 /// which gives the value before the increment).
 static NEXT_TASKUNIQUEID: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
+/// `task_set_uniqueid`'s next value.
+pub(crate) fn next_task_uniqueid() -> u64 {
+    NEXT_TASKUNIQUEID.fetch_add(1, Ordering::Relaxed) as u64
+}
+
+/// `vm_map_corpse_footprint_count`, `_size_avg`, `_size_max`, `_full` and
+/// `_no_buf` (the `vm.corpse_footprint_*` sysctls).
+static FOOTPRINT_STATS: std::sync::Mutex<[u64; 5]> = std::sync::Mutex::new([0; 5]);
+
+/// The `vm.corpse_footprint_*` statistic named by its sysctl's last part.
+pub fn footprint_stat(name: &str) -> Option<u64> {
+    let i = ["count", "size_avg", "size_max", "full", "no_buf"].iter().position(|&n| n == name)?;
+    Some(FOOTPRINT_STATS.lock().unwrap_or_else(|e| e.into_inner())[i])
+}
+
+/// `sizeof(struct vm_map_corpse_footprint_header)` (`vm_size_t cf_size`,
+/// `uint32_t cf_last_region`, the `cfu` union) and of the packed
+/// `struct vm_map_corpse_footprint_region` (`cfr_vaddr`, `cfr_num_pages`).
+const CF_HEADER: u32 = 16;
+const CF_REGION: u32 = 12;
+/// `effective_page_size`: MIN(PAGE_SIZE, VM_MAP_PAGE_SIZE(map)), 16 KB on
+/// this device.
+const CF_PAGE: u64 = super::mach::PAGE_MASK + 1;
+/// `VM_MAP_CORPSE_FOOTPRINT_INFO_MAX_SIZE` on an embedded kernel.
+const CF_MAX_SIZE: u64 = 256 * 1024;
+/// `VM_PAGE_QUERY_PAGE_FICTITIOUS` and `_REUSABLE`: the bit a
+/// `cf_disp_t` (a byte) keeps the second in.
+const DISP_FICTITIOUS: i32 = 0x2;
+const DISP_REUSABLE: i32 = 0x800;
+
+/// A corpse fork's footprint (`vmmap_corpse_footprint`): the page
+/// dispositions of its parent's map at the fork, packed into regions as
+/// `vm_map_corpse_footprint_collect` packs them, in a buffer of the size
+/// it gives one. `failed` once a collection found it full.
+#[derive(Debug)]
+pub struct Footprint {
+    buf: Vec<u8>,
+    cf_size: u64,
+    last_region: u32,
+    last_zeroes: u32,
+    pub failed: bool,
+}
+
+impl Footprint {
+    /// The buffer for a map of `nentries` entries mapping `size` bytes:
+    /// the header, each entry's region header with its alignment, and a
+    /// disposition a page, page rounded, at most CF_MAX_SIZE; its first
+    /// region empty. (`kmem_alloc` of it does not fail here, so
+    /// `vm_map_corpse_footprint_no_buf` stays as it is.)
+    pub fn new(nentries: u64, size: u64) -> Footprint {
+        let mut buf_size = u64::from(CF_HEADER) + nentries * (u64::from(CF_REGION) + 3) + size / CF_PAGE;
+        buf_size = (buf_size + CF_PAGE - 1) & !(CF_PAGE - 1);
+        buf_size = buf_size.min(CF_MAX_SIZE);
+        let mut f = Footprint { buf: vec![0; buf_size as usize], cf_size: buf_size, last_region: CF_HEADER, last_zeroes: 0, failed: false };
+        f.set_vaddr(CF_HEADER, 0);
+        f.set_num(CF_HEADER, 0);
+        f
+    }
+
+    fn vaddr(&self, r: u32) -> u64 {
+        u64::from_le_bytes(self.buf[r as usize..r as usize + 8].try_into().unwrap())
+    }
+
+    fn set_vaddr(&mut self, r: u32, v: u64) {
+        self.buf[r as usize..r as usize + 8].copy_from_slice(&v.to_le_bytes());
+    }
+
+    fn num(&self, r: u32) -> u32 {
+        u32::from_le_bytes(self.buf[r as usize + 8..r as usize + 12].try_into().unwrap())
+    }
+
+    fn set_num(&mut self, r: u32, n: u32) {
+        self.buf[r as usize + 8..r as usize + 12].copy_from_slice(&n.to_le_bytes());
+    }
+
+    /// `vm_map_corpse_footprint_new_region`: the last region closed (its
+    /// trailing zero dispositions dropped) and a new one begun after it,
+    /// word aligned; the last region itself if it is now empty; none past
+    /// the buffer's edge.
+    fn new_region(&mut self) -> Option<u32> {
+        let r = self.last_region;
+        let n = self.num(r) - self.last_zeroes;
+        self.set_num(r, n);
+        self.last_zeroes = 0;
+        if n == 0 {
+            return Some(r);
+        }
+        let off = (r + CF_REGION + n).next_multiple_of(4);
+        if u64::from(off) + u64::from(CF_REGION) >= self.cf_size {
+            return None;
+        }
+        self.last_region = off;
+        self.set_vaddr(off, 0);
+        self.set_num(off, 0);
+        Some(off)
+    }
+
+    /// `vm_map_corpse_footprint_collect` of an entry `[start, end)`,
+    /// `disp(va)` each page's disposition: false (counted in
+    /// `vm_map_corpse_footprint_full`) when the buffer is full.
+    pub fn collect(&mut self, start: u64, end: u64, mut disp: impl FnMut(u64) -> i32) -> bool {
+        let ok = self.collect_inner(start, end, &mut disp);
+        if !ok {
+            FOOTPRINT_STATS.lock().unwrap_or_else(|e| e.into_inner())[3] += 1;
+        }
+        ok
+    }
+
+    fn collect_inner(&mut self, start: u64, end: u64, disp: &mut dyn FnMut(u64) -> i32) -> bool {
+        let edge = self.cf_size;
+        let mut r = self.last_region;
+        if self.vaddr(r).wrapping_add(u64::from(self.num(r)) * CF_PAGE) != start {
+            // Not contiguous: zero dispositions for the gap, or a new
+            // region where they would take more room than its header (or
+            // overflow the count).
+            let num = self.num(r);
+            let delta = (start.wrapping_sub(self.vaddr(r)) / CF_PAGE).wrapping_sub(u64::from(num));
+            let kept = num - self.last_zeroes;
+            let header_delta = CF_REGION + kept.next_multiple_of(4) - kept;
+            let overflows = u64::from(num) + (delta as u32 as u64) + 1 > u64::from(u32::MAX);
+            if u64::from(header_delta) < delta || overflows {
+                let Some(n) = self.new_region() else { return false };
+                r = n;
+                self.set_vaddr(r, start);
+                self.set_num(r, 0);
+            } else {
+                for _ in 0..delta {
+                    let next = u64::from(r) + u64::from(CF_REGION) + u64::from(self.num(r));
+                    if next >= edge {
+                        return false;
+                    }
+                    let n = self.num(r) + 1;
+                    self.set_num(r, n);
+                    self.buf[next as usize] = 0;
+                    self.last_zeroes += 1;
+                }
+            }
+        }
+        let mut va = start;
+        while va < end {
+            let d = disp(va);
+            let cf = (if d & DISP_REUSABLE != 0 { d | DISP_FICTITIOUS } else { d }) as u8;
+            if cf == 0 && self.num(r) == 0 {
+                // Zero dispositions at a region's start only move it.
+                let v = self.vaddr(r) + CF_PAGE;
+                self.set_vaddr(r, v);
+                va += CF_PAGE;
+                continue;
+            }
+            if self.num(r) == u32::MAX {
+                let Some(n) = self.new_region() else { return false };
+                r = n;
+                self.set_vaddr(r, va);
+                self.set_num(r, 0);
+            }
+            let next = u64::from(r) + u64::from(CF_REGION) + u64::from(self.num(r));
+            if next >= edge {
+                return false;
+            }
+            self.buf[next as usize] = cf;
+            let n = self.num(r) + 1;
+            self.set_num(r, n);
+            if cf != 0 {
+                self.last_zeroes = 0;
+                va += CF_PAGE;
+                continue;
+            }
+            self.last_zeroes += 1;
+            let pad = if ((self.num(r) - self.last_zeroes) & 3) != 0 { 4 } else { 0 };
+            if self.last_zeroes + pad < CF_HEADER {
+                va += CF_PAGE;
+                continue;
+            }
+            // Too many zeroes in a row: a new region, past this one.
+            let Some(n) = self.new_region() else { return false };
+            r = n;
+            self.set_num(r, 0);
+            self.set_vaddr(r, va + CF_PAGE);
+            va += CF_PAGE;
+        }
+        true
+    }
+
+    /// `vm_map_corpse_footprint_collect_done`: the last region's trailing
+    /// zeroes dropped, the statistics told its size, the buffer trimmed to
+    /// it (page rounded).
+    pub fn done(&mut self) {
+        let r = self.last_region;
+        let n = self.num(r) - self.last_zeroes;
+        self.set_num(r, n);
+        self.last_zeroes = 0;
+        let actual = u64::from(r) + u64::from(CF_REGION) + u64::from(n);
+        {
+            let mut st = FOOTPRINT_STATS.lock().unwrap_or_else(|e| e.into_inner());
+            st[1] = (st[1] * st[0] + actual) / (st[0] + 1);
+            st[0] += 1;
+            st[2] = st[2].max(actual);
+        }
+        let rounded = (actual + CF_PAGE - 1) & !(CF_PAGE - 1);
+        if self.cf_size > rounded {
+            self.buf.truncate(rounded as usize);
+        }
+        self.cf_size = rounded;
+    }
+
+    /// `vm_map_corpse_footprint_query_page_info`: the disposition of the
+    /// page at `va` as collected (0 for one in no region).
+    pub fn query(&self, va: u64) -> i32 {
+        let mut off = CF_HEADER;
+        loop {
+            let (s, n) = (self.vaddr(off), self.num(off));
+            let e = s + u64::from(n) * CF_PAGE;
+            if va >= s && va < e {
+                let cf = i32::from(self.buf[(off + CF_REGION) as usize + ((va - s) / CF_PAGE) as usize]);
+                return if cf & DISP_FICTITIOUS != 0 { (cf | DISP_REUSABLE) & !DISP_FICTITIOUS } else { cf };
+            }
+            if va < e || off >= self.last_region {
+                return 0;
+            }
+            off = (off + CF_REGION + n).next_multiple_of(4);
+        }
+    }
+
+    /// The buffer's size (`cf_size`).
+    pub fn size(&self) -> u64 {
+        self.cf_size
+    }
+}
+
 /// `KERN_NO_SPACE`, `KERN_NOT_SUPPORTED`.
 const KERN_NO_SPACE: u64 = 3;
 const KERN_NOT_SUPPORTED: u64 = 46;
@@ -286,16 +523,16 @@ fn registry() -> std::sync::MutexGuard<'static, std::collections::HashMap<super:
     R.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// `task_add_to_corpse_task_list`: task `task`'s corpse, as other tasks'
+/// kernels reach it.
+pub(crate) fn register(task: super::ipc::TaskKey, r: Registered) {
+    registry().insert(task, std::sync::Arc::new(r));
+}
+
 /// Task `task` if it is a corpse (`task_is_a_corpse`), as its kernel
 /// registered it.
 pub fn find(task: super::ipc::TaskKey) -> Option<std::sync::Arc<Registered>> {
     registry().get(&task).cloned()
-}
-
-/// The address space of the corpse of process `pid`, for another task's
-/// read of its map.
-pub fn vm_of_pid(pid: i32) -> Option<std::sync::Arc<crate::proc::PeerVm>> {
-    registry().values().find(|r| r.pid == pid).and_then(|r| r.vm.clone())
 }
 
 /// `CPU_TYPE_ARM64`: `cpu_type()` with `CPU_ARCH_ABI64`, for a 64-bit
@@ -385,7 +622,14 @@ impl crate::syscalls::Kernel {
             return;
         };
         let record = super::rusage::crash_record(&self.procs, self.pid, &public, bills, true);
-        self.darwin_populate_corpse_crashinfo(&public, code, subcode, &udata, None, super::exception::EXC_CRASH, record);
+        let Some(mut c) = self.dtask.corpse.take() else { return };
+        let tid = self.tid;
+        let info = self.darwin_populate_corpse_crashinfo(&mut c, &public, code, subcode, &udata, None, super::exception::EXC_CRASH, record, Some(tid));
+        let (vm, task_uniqueid) = (c.vm.clone(), c.task_uniqueid);
+        self.dtask.corpse = Some(c);
+        // task_add_to_corpse_task_list.
+        let key = self.ipc().task;
+        register(key, Registered { pid: self.pid, task_uniqueid, info, vm });
     }
 
     /// `proc_update_corpse_exception_codes`: a process killed for its
@@ -445,6 +689,9 @@ impl crate::syscalls::Kernel {
             port: None,
             vm,
             keep: Keep::default(),
+            enqueued: None,
+            coalition_key: None,
+            footprint: None,
         }));
         let ipc = self.ipc();
         ipc.task_disable();
@@ -454,12 +701,16 @@ impl crate::syscalls::Kernel {
     }
 
     /// `populate_corpse_crashinfo` of this process (`public` its record)
-    /// into its corpse's crash information, item by item in the order the
-    /// 21H461 kernel writes them; an item that does not fit is left out.
-    /// `reason` is the corpse fork's (the process's exit reason otherwise),
-    /// `record` its usage (`rusage_info_current`, its footprint 0).
+    /// into corpse `c`'s crash information (this task's own corpse, or a
+    /// corpse fork of it, whose ledgers are this task's as they were at the
+    /// fork), item by item in the order the 21H461 kernel writes them; an
+    /// item that does not fit is left out. `reason` is a corpse fork's,
+    /// which its exit reason snapshot takes over the process's exit reason;
+    /// `record` its usage (`rusage_info_current`, its footprint 0);
+    /// `current` the calling thread if it is this task's (whose kernel
+    /// triage records the crash information holds). The information made.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn darwin_populate_corpse_crashinfo(&mut self, public: &super::procinfo::Public, code: i64, subcode: i64, udata: &[u64], reason: Option<std::sync::Arc<super::reason::OsReason>>, etype: usize, record: super::rusage::Record) {
+    pub(crate) fn darwin_populate_corpse_crashinfo(&mut self, c: &mut Corpse, public: &super::procinfo::Public, code: i64, subcode: i64, udata: &[u64], reason: Option<std::sync::Arc<super::reason::OsReason>>, etype: usize, record: super::rusage::Record, current: Option<i32>) -> Vec<u8> {
         use std::sync::atomic::Ordering::Acquire;
         let pid = self.pid;
         let ppid = self.procs.ppid(pid);
@@ -510,14 +761,16 @@ impl crate::syscalls::Kernel {
         let identity = blob.and_then(|c| c.identity.clone()).filter(|_| signed);
         let team = blob.and_then(|c| c.team_id.clone()).filter(|_| signed);
         let category = blob.filter(|_| csflags & (super::amfi::cs::VALID | super::amfi::cs::DEBUGGED) != 0).map_or(0, |c| c.category);
-        let reason = exit_reason.or(reason);
-        let crashed_tid = self.tid;
-        if let Some(events) = self.dtask.ktriage_unmodelled.get(&crashed_tid).filter(|e| !e.is_empty()) {
+        // The crashed thread's id goes unless the process's exit reason
+        // says it is irrelevant; the snapshot is of the reason given, else
+        // of the process's exit reason.
+        let no_crashed_tid = exit_reason.as_ref().is_some_and(|r| r.flags & super::reason::flag::NO_CRASHED_TID != 0);
+        let reason = reason.or(exit_reason);
+        if let Some(events) = current.and_then(|t| self.dtask.ktriage_unmodelled.get(&t)).filter(|e| !e.is_empty()) {
             let e = events.join("; ");
             self.darwin_unimplemented(format!("a corpse's TASK_CRASHINFO_KERNEL_TRIAGE_INFO_V1 for a thread that took paths XNU records triage events on: {e}"));
         }
 
-        let Some(c) = self.dtask.corpse.as_mut() else { return };
         let crashed = c.crashed_thread_id;
         let fork = c.fork;
         c.etype = etype;
@@ -527,7 +780,7 @@ impl crate::syscalls::Kernel {
         k.put(ty::EXCEPTION_CODES, &codes);
         k.put(ty::PID, &pid.to_le_bytes());
         k.put(ty::PPID, &ppid.to_le_bytes());
-        if reason.as_ref().is_none_or(|r| r.flags & super::reason::flag::NO_CRASHED_TID == 0) {
+        if !no_crashed_tid {
             k.put(ty::CRASHED_THREADID, &crashed.to_le_bytes());
         }
         k.put(ty::BSDINFOWITHUNIQID, &super::procinfo::uniqidentifierinfo(public));
@@ -597,8 +850,7 @@ impl crate::syscalls::Kernel {
             k.put(t, &v.to_le_bytes());
         }
         k.put(ty::MEMORYSTATUS_EFFECTIVE_PRIORITY, &effective.to_le_bytes());
-        // ktriage_extract of the thread (the current one, the crashed
-        // one's): the buffer zeroed (bzero in ktriage_extract), then its
+        // ktriage_extract of the current thread: the buffer zeroed (bzero in ktriage_extract), then its
         // recorded events as strings. None of the paths this kernel takes
         // records one, but those reported where taken ([`Self::darwin_ktriage_unmodelled`]).
         k.put(ty::KERNEL_TRIAGE_INFO_V1, &[0u8; TRIAGE_INFO_SIZE]);
@@ -634,12 +886,7 @@ impl crate::syscalls::Kernel {
             let b: Vec<u8> = udata.iter().flat_map(|x| x.to_le_bytes()).collect();
             k.put_array(ty::UDATA_PTRS, 8, udata.len() as u32, &b);
         }
-        let info = k.bytes().to_vec();
-        let vm = c.vm.clone();
-        let task_uniqueid = c.task_uniqueid;
-        // task_add_to_corpse_task_list.
-        let key = self.ipc().task;
-        registry().insert(key, std::sync::Arc::new(Registered { pid, task_uniqueid, info, vm }));
+        k.bytes().to_vec()
     }
 
     /// `proc_encode_exit_exception_code`: the exit reason's namespace and
@@ -708,7 +955,7 @@ impl crate::syscalls::Kernel {
     /// `ipc_thread_reset` of a corpse's thread: a new control port (its
     /// self port too), the old ports gone, the handlers not set by a
     /// privileged task released.
-    fn darwin_corpse_thread_reset(&mut self, tid: i32) {
+    pub(crate) fn darwin_corpse_thread_reset(&mut self, tid: i32) {
         use super::kobject::flavor;
         let ipc = self.ipc();
         let new = ipc.kobject_port(super::ipc::Kobject::Thread(tid));
@@ -865,15 +1112,21 @@ impl crate::syscalls::Kernel {
     /// threads no longer kept, their ports disabled), and
     /// `task_terminate_internal` with the rest of its task's end; the
     /// corpse in flight is no longer counted, and its kernel is let go.
-    fn darwin_corpse_terminate(&mut self) {
+    pub(crate) fn darwin_corpse_terminate(&mut self) {
         let key = self.ipc().task;
         registry().remove(&key);
         let Some(mut c) = self.dtask.corpse.take() else { return };
         c.pending_report = false;
         let keep = std::mem::take(&mut c.keep);
         let user_flags = c.user_flags;
+        let coalition_key = c.coalition_key;
         drop(c);
         self.darwin_task_terminate_internal();
+        // coalitions_remove_task: a corpse fork's task leaves the corpse
+        // coalitions.
+        if let Some(key) = coalition_key {
+            super::coalition::task_terminated(key);
+        }
         if user_flags & flags::HAS_REF != 0 {
             release_ref(user_flags);
         }
@@ -887,6 +1140,14 @@ impl crate::syscalls::Kernel {
             return false;
         }
         self.darwin_ipc_remote(m);
+        // thread_exception_queue_invoke: a corpse fork's notification, its
+        // threads having ended (they never ran).
+        if let Some(etype) = self.dtask.corpse.as_mut().and_then(|c| c.enqueued.take()) {
+            if let Some(c) = self.dtask.corpse.as_mut() {
+                c.etype = etype;
+            }
+            self.darwin_deliver_crash_notification(m, 0);
+        }
         self.darwin_corpse_progress(m);
         true
     }
@@ -992,6 +1253,67 @@ pub fn exited(pid: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const P: u64 = CF_PAGE;
+
+    #[test]
+    fn a_corpse_footprint_is_sized_as_xnu_sizes_it() {
+        // The header, 15 bytes an entry, a byte a page, page rounded.
+        assert_eq!(Footprint::new(2, 4 * P).size(), P);
+        // At most 256 KB on an embedded kernel.
+        assert_eq!(Footprint::new(10, 1 << 40).size(), CF_MAX_SIZE);
+    }
+
+    #[test]
+    fn a_corpse_footprint_packs_dispositions_into_regions() {
+        let a = 0x1_0000_0000;
+        let mut f = Footprint::new(2, 8 * P);
+        // A zero first only moves the region's start; a trailing zero is
+        // dropped when the collection is done.
+        let d = [0, 0xd, 0x80d, 0];
+        assert!(f.collect(a, a + 4 * P, |va| d[((va - a) / P) as usize]));
+        assert_eq!((f.vaddr(CF_HEADER), f.num(CF_HEADER), f.last_zeroes), (a + P, 3, 1));
+        // A far entry: a new region, word aligned after the last.
+        let b = a + 0x100 * P;
+        assert!(f.collect(b, b + 2 * P, |_| 0x85));
+        let second = (CF_HEADER + CF_REGION + 2).next_multiple_of(4);
+        assert_eq!(f.last_region, second);
+        assert_eq!((f.vaddr(second), f.num(second)), (b, 2));
+        let count = footprint_stat("count").unwrap();
+        f.done();
+        assert!(footprint_stat("count").unwrap() > count);
+        assert_eq!(f.size(), P);
+        // The reusable bit kept in the fictitious one, and given back.
+        assert_eq!(f.buf[(CF_HEADER + CF_REGION + 1) as usize], 0x0f);
+        assert_eq!(f.query(a + P), 0xd);
+        assert_eq!(f.query(a + 2 * P), 0x80d);
+        assert_eq!(f.query(a), 0);
+        assert_eq!(f.query(a + 3 * P), 0);
+        assert_eq!(f.query(b + P), 0x85);
+        assert_eq!(f.query(b + 2 * P), 0);
+    }
+
+    #[test]
+    fn a_corpse_footprint_fills_gaps_with_zeroes_when_cheaper() {
+        let a = 0x2_0000_0000;
+        let mut f = Footprint::new(2, 8 * P);
+        assert!(f.collect(a, a + P, |_| 0xd));
+        // Two pages of gap cost less than a region header: zeroes.
+        assert!(f.collect(a + 3 * P, a + 4 * P, |_| 0xd));
+        assert_eq!((f.last_region, f.num(CF_HEADER)), (CF_HEADER, 4));
+        assert_eq!(f.query(a + P), 0);
+        assert_eq!(f.query(a + 3 * P), 0xd);
+    }
+
+    #[test]
+    fn a_full_corpse_footprint_is_counted() {
+        let a = 0x3_0000_0000;
+        // One page of buffer for more pages than it holds.
+        let mut f = Footprint::new(1, P);
+        let full = footprint_stat("full").unwrap();
+        assert!(!f.collect(a, a + 2 * P * P, |_| 0xd));
+        assert!(footprint_stat("full").unwrap() > full);
+    }
 
     #[test]
     fn the_gate_counts_corpses_and_user_faults() {

@@ -345,6 +345,11 @@ impl Entries {
     pub fn inherited(&self) -> Entries {
         Entries::of(self.lock().inherited(), self.user_wire_limit)
     }
+
+    /// See [`Map::inherited_corpse`].
+    pub fn inherited_corpse(&self, shared: &[(u64, u64)]) -> Entries {
+        Entries::of(self.lock().inherited_corpse(shared), self.user_wire_limit)
+    }
 }
 
 impl Map {
@@ -727,23 +732,40 @@ impl Map {
     pub fn inherited(&self) -> Map {
         let mut child = Map::default();
         for (&s, &entry) in &self.ranges {
-            let mut a = entry.attrs;
-            if a.inherit != inherit::NONE {
-                // A wiring is the map's own.
-                a.wired = 0;
-                a.user_wired = 0;
-                // vm_map_entry_copy_code_signing: an iOS map allows no copy
-                // of a JIT region (VM_MAP_POLICY_ALLOW_JIT_COPY): the copy
-                // loses execute access and is no JIT region.
-                if a.jit {
-                    a.jit = false;
-                    a.max &= !4;
-                }
-                child.put(s, Entry { attrs: a, ..entry });
+            if entry.attrs.inherit != inherit::NONE {
+                child.put(s, Entry { attrs: child_attrs(entry.attrs), ..entry });
             }
         }
         child
     }
+
+    /// A corpse fork's entries (`vm_map_fork` with
+    /// VM_MAP_FORK_SHARE_IF_INHERIT_NONE): those [`Map::inherited`] gives,
+    /// and the entries not inherited that the fork shares instead (those
+    /// starting in `shared`).
+    pub fn inherited_corpse(&self, shared: &[(u64, u64)]) -> Map {
+        let mut child = self.inherited();
+        for (&s, &entry) in &self.ranges {
+            if entry.attrs.inherit == inherit::NONE && shared.iter().any(|&(a, b)| a <= s && s < b) {
+                child.put(s, Entry { attrs: child_attrs(entry.attrs), ..entry });
+            }
+        }
+        child
+    }
+}
+
+/// A fork's copy of an entry's attributes: a wiring is the map's own, and
+/// (vm_map_entry_copy_code_signing: an iOS map allows no copy of a JIT
+/// region, VM_MAP_POLICY_ALLOW_JIT_COPY) a JIT region's copy loses execute
+/// access and is no JIT region.
+fn child_attrs(mut a: Attrs) -> Attrs {
+    a.wired = 0;
+    a.user_wired = 0;
+    if a.jit {
+        a.jit = false;
+        a.max &= !4;
+    }
+    a
 }
 
 /// `vm_map_entry_is_reusable` for an entry that is not wired and whose

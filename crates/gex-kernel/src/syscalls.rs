@@ -234,8 +234,11 @@ pub mod nr {
 /// Hand a system call's result back to the guest: `x0`, or `rax` (both
 /// `x(0)`). `ret` is the kernel's own convention, `-errno` for a failure.
 /// Every place a result is written goes through here.
+/// An error carried past `NATIVE` (a host's with no Linux twin) is folded
+/// to Linux's here ([`crate::errno::linux_return`]); the Darwin personality
+/// writes its results through its own `set_result`, exactly.
 pub fn set_result(m: &mut GuestMem<'_>, ctx_addr: u64, ret: u64) -> Result<(), Errno> {
-    m.write_u64(ctx_addr + ctx::x(0) as u64, crate::gpr(ret))
+    m.write_u64(ctx_addr + ctx::x(0) as u64, crate::gpr(crate::errno::linux_return(ret)))
 }
 
 /// `*at` calls use this to mean "relative to the current directory".

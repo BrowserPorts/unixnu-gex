@@ -96,6 +96,26 @@ impl Errno {
         }
     }
 
+    /// This errno as a Linux guest is answered. A host errno with no Linux
+    /// twin is carried past [`crate::darwin::errno::NATIVE`] ([`Self::from_host`]
+    /// on a macOS host), so the Darwin personality can return it exactly;
+    /// a Linux guest gets the Linux errno XNU's number stands for, and `EIO`,
+    /// said once, where Linux has none.
+    pub fn for_linux(self) -> Errno {
+        let native = crate::darwin::errno::NATIVE;
+        if !(native + 1..native + 1000).contains(&self.0) {
+            return self;
+        }
+        let xnu = self.0 - native;
+        match xnu_to_linux(xnu) {
+            Some(l) => Errno(l),
+            None => {
+                eprintln!("gex: host errno {xnu} has no Linux errno; the guest sees EIO");
+                Errno::EIO
+            }
+        }
+    }
+
     /// Map a host I/O error onto the guest errno. The host's own number
     /// comes first: `ErrorKind` folds `EPERM` into `EACCES`.
     pub fn from_io(e: &std::io::Error) -> Errno {
@@ -116,8 +136,120 @@ impl Errno {
     }
 }
 
+/// XNU's errno numbers (sys/errno.h) as Linux's (asm-generic/errno*.h), name for name:
+/// `ENOATTR` is Linux's `ENODATA`, and XNU's discrete `EOPNOTSUPP` (102) and `ENOTSUP`
+/// (45) are both Linux's 95. `None` for XNU's own errors with no Linux name (Mach-O, RPC,
+/// power, policy).
+fn xnu_to_linux(code: i32) -> Option<i32> {
+    Some(match code {
+        1 => 1, // EPERM
+        2 => 2, // ENOENT
+        3 => 3, // ESRCH
+        4 => 4, // EINTR
+        5 => 5, // EIO
+        6 => 6, // ENXIO
+        7 => 7, // E2BIG
+        8 => 8, // ENOEXEC
+        9 => 9, // EBADF
+        10 => 10, // ECHILD
+        11 => 35, // EDEADLK
+        12 => 12, // ENOMEM
+        13 => 13, // EACCES
+        14 => 14, // EFAULT
+        15 => 15, // ENOTBLK
+        16 => 16, // EBUSY
+        17 => 17, // EEXIST
+        18 => 18, // EXDEV
+        19 => 19, // ENODEV
+        20 => 20, // ENOTDIR
+        21 => 21, // EISDIR
+        22 => 22, // EINVAL
+        23 => 23, // ENFILE
+        24 => 24, // EMFILE
+        25 => 25, // ENOTTY
+        26 => 26, // ETXTBSY
+        27 => 27, // EFBIG
+        28 => 28, // ENOSPC
+        29 => 29, // ESPIPE
+        30 => 30, // EROFS
+        31 => 31, // EMLINK
+        32 => 32, // EPIPE
+        33 => 33, // EDOM
+        34 => 34, // ERANGE
+        35 => 11, // EAGAIN
+        36 => 115, // EINPROGRESS
+        37 => 114, // EALREADY
+        38 => 88, // ENOTSOCK
+        39 => 89, // EDESTADDRREQ
+        40 => 90, // EMSGSIZE
+        41 => 91, // EPROTOTYPE
+        42 => 92, // ENOPROTOOPT
+        43 => 93, // EPROTONOSUPPORT
+        44 => 94, // ESOCKTNOSUPPORT
+        45 => 95, // ENOTSUP
+        46 => 96, // EPFNOSUPPORT
+        47 => 97, // EAFNOSUPPORT
+        48 => 98, // EADDRINUSE
+        49 => 99, // EADDRNOTAVAIL
+        50 => 100, // ENETDOWN
+        51 => 101, // ENETUNREACH
+        52 => 102, // ENETRESET
+        53 => 103, // ECONNABORTED
+        54 => 104, // ECONNRESET
+        55 => 105, // ENOBUFS
+        56 => 106, // EISCONN
+        57 => 107, // ENOTCONN
+        58 => 108, // ESHUTDOWN
+        59 => 109, // ETOOMANYREFS
+        60 => 110, // ETIMEDOUT
+        61 => 111, // ECONNREFUSED
+        62 => 40, // ELOOP
+        63 => 36, // ENAMETOOLONG
+        64 => 112, // EHOSTDOWN
+        65 => 113, // EHOSTUNREACH
+        66 => 39, // ENOTEMPTY
+        68 => 87, // EUSERS
+        69 => 122, // EDQUOT
+        70 => 116, // ESTALE
+        71 => 66, // EREMOTE
+        77 => 37, // ENOLCK
+        78 => 38, // ENOSYS
+        84 => 75, // EOVERFLOW
+        89 => 125, // ECANCELED
+        90 => 43, // EIDRM
+        91 => 42, // ENOMSG
+        92 => 84, // EILSEQ
+        93 => 61, // ENOATTR
+        94 => 74, // EBADMSG
+        95 => 72, // EMULTIHOP
+        96 => 61, // ENODATA
+        97 => 67, // ENOLINK
+        98 => 63, // ENOSR
+        99 => 60, // ENOSTR
+        100 => 71, // EPROTO
+        101 => 62, // ETIME
+        102 => 95, // EOPNOTSUPP
+        104 => 131, // ENOTRECOVERABLE
+        105 => 130, // EOWNERDEAD
+        _ => return None,
+    })
+}
+
 /// The result of a syscall that produces a value.
 pub type SysResult = Result<u64, Errno>;
+
+/// A result in the kernel's `-errno` convention as a Linux guest is to see it:
+/// an error carried past [`crate::darwin::errno::NATIVE`] folded by
+/// [`Errno::for_linux`]; anything else as it is.
+pub fn linux_return(ret: u64) -> u64 {
+    let native = crate::darwin::errno::NATIVE as i64;
+    let v = ret as i64;
+    if (-(native + 999)..=-(native + 1)).contains(&v) {
+        Errno((-v) as i32).for_linux().as_return()
+    } else {
+        ret
+    }
+}
 
 /// Convert a syscall result to the `x0` the guest expects.
 pub fn encode(r: SysResult) -> u64 {
@@ -155,7 +287,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_errors_are_linux_numbers() {
-        let io = |c| Errno::from_io(&std::io::Error::from_raw_os_error(c));
+        // A Linux guest's view: every XNU errno as a Linux one.
+        let io = |c| Errno::from_io(&std::io::Error::from_raw_os_error(c)).for_linux();
         assert_eq!(io(66), Errno::ENOTEMPTY);
         assert_eq!(io(62), Errno::ELOOP);
         assert_eq!(io(63), Errno::ENAMETOOLONG);
@@ -165,5 +298,11 @@ mod tests {
         assert_eq!(io(35), Errno::EAGAIN);
         assert_eq!(io(78), Errno::ENOSYS);
         assert_eq!(io(88), Errno::EIO);
+        assert_eq!(super::linux_return(Errno::from_host(93).as_return()), Errno::ENODATA.as_return());
+        // The Darwin personality's view: the same errors exactly as XNU numbers them.
+        let darwin = |c| crate::darwin::errno::to_darwin(Errno::from_io(&std::io::Error::from_raw_os_error(c)).0);
+        for c in [66, 62, 63, 93, 102, 45, 35, 78, 88] {
+            assert_eq!(darwin(c), c);
+        }
     }
 }

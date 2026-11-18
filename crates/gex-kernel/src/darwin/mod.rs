@@ -138,6 +138,7 @@ pub mod threadstate;
 pub mod thread;
 pub mod timer;
 pub mod triage;
+pub mod kcdata;
 pub mod udif;
 pub mod trustcache;
 pub mod vconsole;

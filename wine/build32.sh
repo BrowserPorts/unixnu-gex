@@ -40,6 +40,13 @@ case $1 in
 tools)
   src=$(realpath "$2") tools=$(realpath -m "$3")
   o="$OPTS --without-freetype --without-wayland --without-opengl"
+  # (Wine's configure wants a PE arch on macOS and ARM hosts, even for a
+  # tree only the tools are made in: x86_64's there, MinGW's, which
+  # __tooldeps__ does not build)
+  case $(uname -s)-$(uname -m) in
+  Linux-x86_64|Linux-i?86) ;;
+  *) o=$(printf %s "$o" | sed 's/--without-mingw --enable-archs= /--enable-archs=x86_64 /') ;;
+  esac
   configure "$tools" "$src $o" "$src/configure" $o
   make -C "$tools" -j"$J" __tooldeps__ > "$tools/make.log" 2>&1 || { echo "wine32/wine-build: tools make failed ($tools/make.log)" >&2; exit 1; }
   ;;

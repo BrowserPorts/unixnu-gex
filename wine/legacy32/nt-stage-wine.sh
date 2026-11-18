@@ -3,7 +3,14 @@
 # Wine's dist is staged from (wine/legacy32/stage-native.sh).
 #
 #   wine/legacy32/nt-stage-wine.sh [PREFIX]          stage (default ~/.cache/gex/wine-11.15)
-#   wine/legacy32/nt-stage-wine.sh --manifest        regenerate the manifest from the host
+#   wine/legacy32/nt-stage-wine.sh --manifest        regenerate the manifest from the package
+#
+# The files come from WineHQ's Wine 11.15 package, pinned in toolchain/pins
+# (WINEHQ_WINE, unpacked by toolchain/debian-package.sh), so every host
+# stages the same prefix; WINE_LIB and WINE_SHARE name another Wine's. Each
+# PE image is staged stripped (llvm-strip --strip-all: WineHQ ships them
+# with their symbols and DWARF, twice the size), which gives the same bytes
+# on every host.
 #
 # The prefix gets
 #   drive_c/windows/system32/  <- $WINE_LIB/x86_64-windows/*  (PE32+ processes)
@@ -18,8 +25,12 @@ set -euo pipefail
 VERSION=11.15
 HERE=$(cd "$(dirname "$0")" && pwd)
 MANIFEST="$HERE/nt-wine-$VERSION.manifest"
-WINE_LIB=${WINE_LIB:-/usr/lib/wine}
-WINE_SHARE=${WINE_SHARE:-/usr/share/wine}
+if [ -z "${WINE_LIB:-}" ] || [ -z "${WINE_SHARE:-}" ]; then
+    PKG=$("$HERE/../../toolchain/debian-package.sh" WINEHQ_WINE)/opt/wine-devel
+    WINE_LIB=${WINE_LIB:-$PKG/lib/wine}
+    WINE_SHARE=${WINE_SHARE:-$PKG/share/wine}
+fi
+STRIP=${LLVM_STRIP:-llvm-strip}
 
 # (source dir, destination dir inside the prefix, glob)
 SETS=(
@@ -31,10 +42,15 @@ SETS=(
     "$WINE_SHARE/fonts|drive_c/windows/Fonts|*"
 )
 
-host_version() {
-    local v=""
-    if command -v wine >/dev/null 2>&1; then v=$(wine --version 2>/dev/null || true); fi
-    echo "${v#wine-}"
+# SRC as staged at DST: a PE image stripped, anything else as it is
+stage_file() {
+    local src=$1 dst=$2
+    mkdir -p "$(dirname "$dst")"
+    case $src in
+    */*-windows/*) "$STRIP" --strip-all -o "$dst.tmp" "$src" 2>/dev/null || cp -f "$src" "$dst.tmp" ;;
+    *) cp -f "$src" "$dst.tmp" ;;
+    esac
+    mv -f "$dst.tmp" "$dst"
 }
 
 list_files() {
@@ -49,15 +65,14 @@ list_files() {
 }
 
 if [ "${1:-}" = "--manifest" ]; then
-    hv=$(host_version)
-    if [ "$hv" != "$VERSION" ]; then
-        echo "nt-stage-wine: host Wine is '$hv', manifest is for $VERSION" >&2
-        exit 1
-    fi
+    # Staged into a scratch folder, so the manifest is of the files as staged
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
     {
         echo "# Wine $VERSION PE files staged by wine/legacy32/nt-stage-wine.sh: <sha256> <size> <path in prefix>"
         list_files | while IFS='|' read -r src rel; do
-            printf '%s %s %s\n' "$(sha256sum "$src" | cut -d' ' -f1)" "$(stat -c %s "$src")" "$rel"
+            stage_file "$src" "$tmp/$rel"
+            printf '%s %s %s\n' "$(sha256sum "$tmp/$rel" | cut -d' ' -f1)" "$(stat -c %s "$tmp/$rel")" "$rel"
         done
     } >"$MANIFEST"
     echo "wrote $MANIFEST ($(grep -vc '^#' "$MANIFEST") files)"
@@ -84,9 +99,7 @@ while IFS='|' read -r src rel; do
     fi
     dst="$PREFIX/$rel"
     if [ ! -f "$dst" ] || [ "$(stat -c %s "$dst")" != "${want_size[$rel]}" ]; then
-        mkdir -p "$(dirname "$dst")"
-        # A hard link when the prefix is on the same filesystem, else a copy.
-        ln -f "$src" "$dst" 2>/dev/null || cp -f "$src" "$dst"
+        stage_file "$src" "$dst"
     fi
     if [ "$(sha256sum "$dst" | cut -d' ' -f1)" != "${want_sha[$rel]}" ]; then
         echo "nt-stage-wine: $rel does not match the Wine $VERSION manifest" >&2
@@ -97,11 +110,11 @@ while IFS='|' read -r src rel; do
 done < <(list_files)
 
 for rel in "${!want_sha[@]}"; do
-    echo "nt-stage-wine: $rel is in the manifest but not on this host" >&2
+    echo "nt-stage-wine: $rel is in the manifest but not in $WINE_LIB or $WINE_SHARE" >&2
     bad=$((bad + 1))
 done
 if [ "$bad" -gt 0 ]; then
-    echo "nt-stage-wine: $bad problem(s); is the host's Wine $VERSION?" >&2
+    echo "nt-stage-wine: $bad problem(s) staging from $WINE_LIB and $WINE_SHARE" >&2
     exit 1
 fi
 # The profile wineboot would make for the user "gex": programs expect its

@@ -59,6 +59,7 @@ pub const RUN_STAND_IN: &str = "the erase restore's clock readings, transaction 
 pub fn stand_ins(os: bool, boot: bool) -> Vec<&'static str> {
     let mut v = vec![RUN_STAND_IN, HOST_UUID_STAND_IN, GIGALOCKER_STAND_IN, CLUSTER_STAND_IN, NSIH_STAND_IN];
     if boot {
+        v.push(SPLAT_STAND_IN);
         v.push(TICKET_STAND_IN);
         v.push(RESTORE_HOST_STAND_IN);
     }
@@ -225,12 +226,14 @@ pub fn build_disk0_with(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() ->
         // the disk's size from the whole-disk node's block size and count.
         fsops::reserve_overprov_space(&mut nx, data, storage::disk0_bytes(), crate::darwin::storagestack::container_unmap(), now)?;
         // read_new_os_build_version only reads System; install_splat
-        // (0x1000185a8 → 0x10003af24) writes the Cryptex1 objects under
-        // Preboot's cryptex1/current.
-        missing.push("install_splat's Cryptex1 objects on Preboot (cryptex1/current: os.dmg, app.dmg, their root hashes and trust caches, the version plists, the build manifest, the cryptex1 ticket and LocalPolicy; their sources and the install handler not traced, drafts/s14/restored/slice_preboot_update.md 2.5): everything the restore writes after it is placed without them".into());
+        // (0x1000185a8 → 0x10003af24) writes the Cryptex1 under Preboot's
+        // cryptex1/current, then install_kernel_cache's list.
         match &os.boot {
-            Some(b) => install_kernel_cache(&mut nx, Volumes { system, xart, hardware, preboot, update }, b, &cluster_pushes, now)?,
-            None => missing.push("install_kernel_cache's list (no IPSW boot objects given: the kernelcache, devicetree, iBoot and root_hash Image4 files and the AP ticket on Preboot and Hardware)".into()),
+            Some(b) => {
+                install_splat(&mut nx, Volumes { system, xart, hardware, preboot, update }, b, now)?;
+                install_kernel_cache(&mut nx, Volumes { system, xart, hardware, preboot, update }, b, &cluster_pushes, now)?
+            }
+            None => missing.push("install_splat's Cryptex1 and install_kernel_cache's list (no IPSW given: the Cryptex1 components, the version files, the build manifest and the Cryptex1 ticket in Preboot's cryptex1/current; the kernelcache, devicetree, iBoot and root_hash Image4 files and the AP ticket on Preboot and Hardware)".into()),
         }
         // check_mounted (0x100018b6c): fixup_var (0x10002ef8c):
         // MKBKeyBagCreateSystem writes nothing with enhanced APFS, then the
@@ -834,13 +837,18 @@ pub struct BootObjects {
     pub iboot: Vec<u8>,
     /// `Firmware/044-76040-038.dmg.root_hash`.
     pub root_hash: Vec<u8>,
+    /// `BuildManifest.plist`, whose erase identity names install_splat's
+    /// Cryptex1 components.
+    pub manifest: Vec<u8>,
+    /// The extracted IPSW, where those components are read from.
+    pub dir: std::path::PathBuf,
 }
 
 impl BootObjects {
     /// The objects from an IPSW extracted at `dir`.
     pub fn read(dir: &std::path::Path) -> Result<Self, String> {
         let r = |p: &str| std::fs::read(dir.join(p)).map_err(|e| format!("{}: {e}", dir.join(p).display()));
-        Ok(BootObjects { kernelcache: r("kernelcache.release.ipad7")?, devicetree: r("Firmware/all_flash/DeviceTree.j120ap.im4p")?, iboot: r("Firmware/all_flash/iBoot.j120.RELEASE.im4p")?, root_hash: r("Firmware/044-76040-038.dmg.root_hash")? })
+        Ok(BootObjects { kernelcache: r("kernelcache.release.ipad7")?, devicetree: r("Firmware/all_flash/DeviceTree.j120ap.im4p")?, iboot: r("Firmware/all_flash/iBoot.j120.RELEASE.im4p")?, root_hash: r("Firmware/044-76040-038.dmg.root_hash")?, manifest: r("BuildManifest.plist")?, dir: dir.to_path_buf() })
     }
 }
 
@@ -882,6 +890,223 @@ fn img4(im4p: &[u8], ticket: &[u8]) -> Vec<u8> {
     der_len(&mut out, body.len());
     out.extend_from_slice(&body);
     out
+}
+
+/// What install_splat takes from the restore host and the device's own
+/// randomness that only a device run has (drafts/s27/re-splat.md
+/// UNSETTLED 1, 4, 5, 9, 12).
+pub const SPLAT_STAND_IN: &str = "what install_splat's Cryptex1 on Preboot takes from the restore host and the run (drafts/s27/re-splat.md): the host's SourceBootObjectV4 message sizes, which make the write(2) calls (stand-in: idevicerestore's 8192-byte FileData chunks), the time the transfer takes, which decides when the kernel's grow-ahead starts on os.dmg and app.dmg (stand-in: the model's clock), the build identity the host sends back and CoreFoundation's XML of it (stand-in: the IPSW's erase identity, written by this model's plist writer), the TSS Cryptex1 ticket (stand-in: an empty DER SEQUENCE, 30 00) and Foundation's temporary name for it (stand-in .dat.nosync0000.AAAAAA); measure /private/preboot/cryptex1/current on the device: its files' extents, BuildManifest.plist's bytes and the ticket";
+
+/// The host's FileData message size ([`SPLAT_STAND_IN`]).
+const SPLAT_HOST_CHUNK: u64 = 8192;
+/// The Cryptex1 ticket ([`SPLAT_STAND_IN`]).
+const SPLAT_TICKET: [u8; 2] = [0x30, 0x00];
+/// Foundation's temporary file for the ticket (`.dat.nosync%04x.XXXXXX`,
+/// F 0x1d63c: the process's identifier and mktemp's random characters;
+/// [`SPLAT_STAND_IN`]).
+const SPLAT_TICKET_TEMP: &str = ".dat.nosync0000.AAAAAA";
+
+/// The `write(2)` calls stdio makes of a file `fopen(dest, "wb")` gets in
+/// `chunk`-byte `fwrite`s, then `fclose` (drafts/s27/re-splat.md 1.5):
+/// the buffer is `st_blksize`, 4096 here; an `fwrite` into an empty
+/// buffer of at least its size writes the whole buffers of it at once and
+/// keeps the rest; `fclose` writes what is kept.
+fn stdio_writes(size: u64, chunk: u64) -> Result<Vec<u64>, String> {
+    const BUF: u64 = 4096;
+    let mut out = Vec::new();
+    let mut kept = 0u64;
+    let mut at = 0u64;
+    while at < size {
+        let l = chunk.min(size - at);
+        if kept != 0 {
+            return Err("not implemented: an fwrite into a partly filled stdio buffer (__sfvwrite's fill-and-flush path)".into());
+        }
+        if l >= BUF {
+            out.push(l / BUF * BUF);
+        }
+        kept = l % BUF;
+        if l < BUF {
+            kept = l;
+        }
+        at += l;
+    }
+    if kept != 0 {
+        out.push(kept);
+    }
+    Ok(out)
+}
+
+/// A file of the extracted IPSW, read as it is needed.
+struct IpswFile(std::fs::File, u64);
+
+impl fsops::Bytes for IpswFile {
+    fn len(&self) -> u64 {
+        self.1
+    }
+    fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<(), String> {
+        std::os::unix::fs::FileExt::read_exact_at(&self.0, buf, off).map_err(|e| e.to_string())
+    }
+}
+
+/// A regular file's bytes on a volume of the container (one with no
+/// hole), read through its extents.
+fn file_bytes(nx: &mut Nx<'_>, vol: usize, ino: u64) -> Result<Vec<u8>, String> {
+    let v = fsops::inode(nx, vol, ino)?;
+    let n = u16::from_le_bytes([v[0x5c], v[0x5d]]) as usize;
+    let at = (0..n).position(|i| v[0x60 + 4 * i] == 8).ok_or("not implemented: reading a file with no data stream")?;
+    let mut off = 0x60 + 4 * n;
+    for i in 0..at {
+        off += (u16::from_le_bytes([v[0x60 + 4 * i + 2], v[0x60 + 4 * i + 3]]) as usize + 7) & !7;
+    }
+    let size = u64::from_le_bytes(v[off..off + 8].try_into().unwrap());
+    let oid = u64::from_le_bytes(v[8..16].try_into().unwrap());
+    let mut out = vec![0u8; size as usize];
+    let bs = nx.block_size();
+    let mut pos = 0u64;
+    while pos < size {
+        let (l, len, p) = fsops::extent_at(nx, vol, oid, pos)?.ok_or("not implemented: reading a file's hole")?;
+        let run = (l + len - pos).min(size - pos);
+        let first = (pos - l) / bs;
+        let mut b = vec![0u8; (run + (pos - l) % bs).div_ceil(bs) as usize * bs as usize];
+        nx.read_data(p + first, &mut b)?;
+        let skip = ((pos - l) % bs) as usize;
+        out[pos as usize..(pos + run) as usize].copy_from_slice(&b[skip..skip + run as usize]);
+        pos += run;
+    }
+    Ok(out)
+}
+
+/// install_splat (0x10003af24; drafts/s27/re-splat.md), with Preboot
+/// mounted read-write at /mnt9 and System at /mnt1: the build identity's
+/// Cryptex1 components (none: nothing), then ramrod_splat_install
+/// (0x10006419c): cryptex1/current made by NSFileManager's mkpath_np
+/// (mkdirat 0777 under umask 0, so no chmod); each component of the
+/// table (0x100268528) present in the identity `fopen(dest, "wb")` (0666)
+/// and written in the host's chunks through stdio, its SHA-384 checked;
+/// RestoreVersion.plist and SystemVersion.plist copyfile'd from System
+/// (COPYFILE_ALL, no state); BuildManifest.plist by -[NSDictionary
+/// writeToFile:atomically:NO] (one write, fsync); the Cryptex1 ticket
+/// written atomically through a temporary file (write, fsync, rename). No
+/// LocalPolicy: J120's chip 0x8011 is in the restore's list of chips
+/// without one (0x10027e8d8).
+fn install_splat(nx: &mut Nx<'_>, v: Volumes, boot: &BootObjects, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    use super::super::plist::Value;
+    use super::super::preboot;
+    use fsops::SetAttr;
+    let manifest = super::super::plist::parse(&boot.manifest).map_err(|e| format!("BuildManifest.plist: {e}"))?;
+    let identity = preboot::erase_identity(&manifest, "j120ap")?;
+    let comps = identity.get("Manifest").ok_or("the build identity has no Manifest")?;
+    let Value::Dict(keys) = comps else { return Err("the build identity's Manifest is not a dictionary".into()) };
+    if !keys.iter().any(|(k, _)| k.starts_with("Cryptex1,")) {
+        return Ok(());
+    }
+    let pb = v.preboot;
+    if fsops::lookup(nx, pb, ROOT_INO, preboot::cryptex1::DIR)?.is_some() {
+        return Err("not implemented: install_splat finding a cryptex1 directory (removeItemAtPath of proposed and current)".into());
+    }
+    let root_gid = u32::from_le_bytes(fsops::inode(nx, pb, ROOT_INO)?[0x4c..0x50].try_into().unwrap());
+    let cx = fsops::mkdir(nx, pb, ROOT_INO, "cryptex1", 0o777, 0, root_gid, now)?.map_err(|e| format!("mkdir /mnt9/cryptex1: errno {e}"))?;
+    let cur = fsops::mkdir(nx, pb, cx, "current", 0o777, 0, root_gid, now)?.map_err(|e| format!("mkdir /mnt9/cryptex1/current: errno {e}"))?;
+    let gid = root_gid;
+    let (c, m) = cluster_sizes();
+    for (key, name) in preboot::cryptex1::OBJECTS {
+        let Some(comp) = comps.get(key) else { continue };
+        let path = comp.get("Info").and_then(|i| i.get("Path")).and_then(Value::as_str).ok_or_else(|| format!("the build identity's {key} has no Info.Path"))?;
+        let digest = comp.get("Digest").and_then(Value::as_data).ok_or_else(|| format!("the build identity's {key} has no Digest"))?;
+        let host = boot.dir.join(path);
+        let f = std::fs::File::open(&host).map_err(|e| format!("{}: {e}", host.display()))?;
+        let size = f.metadata().map_err(|e| e.to_string())?.len();
+        let src = IpswFile(f, size);
+        {
+            use sha2::Digest as _;
+            let mut d = sha2::Sha384::new();
+            let mut buf = vec![0u8; 8 << 20];
+            let mut at = 0;
+            while at < size {
+                let n = (size - at).min(8 << 20) as usize;
+                fsops::Bytes::read_at(&src, at, &mut buf[..n])?;
+                d.update(&buf[..n]);
+                at += n as u64;
+            }
+            if d.finalize()[..] != digest[..] {
+                return Err(format!("not implemented: install_splat's {key} whose SHA-384 is not its digest (the file left written, the restore failing)"));
+            }
+        }
+        let writes = stdio_writes(size, SPLAT_HOST_CHUNK)?;
+        if writes.len() == 1 {
+            let mut data = vec![0u8; size as usize];
+            fsops::Bytes::read_at(&src, 0, &mut data)?;
+            fsops::write_new_file(nx, pb, cur, name, 0o666, &data, &cluster_pushes, now)?;
+        } else {
+            let ino = fsops::create(nx, pb, cur, name, 0o666, 0, gid, now)?.map_err(|e| format!("open /mnt9/cryptex1/current/{name}: errno {e}"))?;
+            fsops::write_appends(nx, pb, ino, &writes, &src, c, m, now)?;
+        }
+    }
+    // The version files, copyfile'd from System's CoreServices.
+    let cs = {
+        let mut d = ROOT_INO;
+        for comp in ["System", "Library", "CoreServices"] {
+            d = fsops::lookup(nx, v.system, d, comp)?.ok_or("no /mnt1/System/Library/CoreServices")?;
+        }
+        d
+    };
+    let ids = |u: u32, g: u32| SetAttr { uid: Some(u), gid: Some(g), ..Default::default() };
+    let times = |m: u64, a: u64| SetAttr { mtime: Some(m), atime: Some(a), ..Default::default() };
+    for (_, name) in preboot::cryptex1::VERSIONS {
+        let Some(si) = fsops::lookup(nx, v.system, cs, name)? else { continue };
+        let sv = fsops::inode(nx, v.system, si)?;
+        let q = |o: usize| u64::from_le_bytes(sv[o..o + 8].try_into().unwrap());
+        let (uid, sgid, flags) = (u32::from_le_bytes(sv[0x48..0x4c].try_into().unwrap()), u32::from_le_bytes(sv[0x4c..0x50].try_into().unwrap()), u32::from_le_bytes(sv[0x44..0x48].try_into().unwrap()));
+        let mode = u16::from_le_bytes([sv[0x50], sv[0x51]]);
+        let (mtime, atime) = (q(0x18), q(0x28));
+        let xattrs = fsops::xattr_names(nx, v.system, si)?;
+        if mode & 0o170000 != 0o100000 || flags & !0x20 != 0 || xattrs.iter().any(|x| !(flags & 0x20 != 0 && x == "com.apple.decmpfs")) {
+            return Err(format!("not implemented: copyfile of a {name} with mode {mode:o}, flags {flags:#x} or attributes {xattrs:?}"));
+        }
+        let keep = flags & !preboot::cryptex1::COPYFILE_OMIT_FLAGS;
+        let f = fsops::create(nx, pb, cur, name, (mode | 0o200) & 0o7777, 0, gid, now)?.map_err(|e| format!("open /mnt9/cryptex1/current/{name}: errno {e}"))?;
+        if flags & 0x20 != 0 {
+            let hdr = fsops::xattr_embedded(nx, v.system, si, "com.apple.decmpfs")?.ok_or("a compressed version file with no decmpfs attribute")?;
+            fsops::set_decmpfs_xattr(nx, pb, f, &hdr, now)?;
+            fsops::cas_bsdflags(nx, pb, f, 0, 0x20, now)?;
+            fsops::setattr(nx, pb, f, SetAttr { mode: Some(mode & 0o7777), ..ids(uid, sgid) }, now)?;
+            fsops::setattr(nx, pb, f, times(mtime, atime), now)?;
+            fsops::setattr(nx, pb, f, ids(uid, sgid), now)?;
+            fsops::setattr(nx, pb, f, SetAttr { mode: Some(mode & 0o7777), ..Default::default() }, now)?;
+            fsops::cas_bsdflags(nx, pb, f, 0x20, keep, now)?;
+            fsops::setattr(nx, pb, f, times(mtime, atime), now)?;
+        } else {
+            let data = file_bytes(nx, v.system, si)?;
+            if data.is_empty() || data.len() as u64 > nx.block_size() {
+                return Err(format!("not implemented: copyfile of a {name} of {} bytes (copyfile_data's loop past one buffer)", data.len()));
+            }
+            // F_PREALLOCATE {0, F_PEOFPOSMODE, 0, size}: no F_ALLOCATEALL,
+            // its result unused by copyfile.
+            fsops::preallocate(nx, pb, f, data.len() as u64, now)?;
+            let (_, written) = fsops::write_into_preallocation(nx, pb, f, &data, now)?;
+            fsops::truncate_equal(nx, pb, f, written, now)?;
+            fsops::setattr(nx, pb, f, SetAttr { mode: Some(mode & 0o7777), ..ids(uid, sgid) }, now)?;
+            fsops::setattr(nx, pb, f, times(mtime, atime), now)?;
+            fsops::setattr(nx, pb, f, ids(uid, sgid), now)?;
+            fsops::setattr(nx, pb, f, SetAttr { mode: Some(mode & 0o7777), ..Default::default() }, now)?;
+            fsops::cas_bsdflags(nx, pb, f, 0, keep, now)?;
+            fsops::close_pushed(nx, pb, f, &data, now)?;
+        }
+    }
+    // BuildManifest.plist: open(0x601, 0666), write, fsync, close. The
+    // fsync (apfs_fsync_internal, no commit: drafts/s27/re-txdata.md 4)
+    // pushes the data and removes PREV_FSIZE as the close's would; the
+    // close then finds nothing to do.
+    let xml = preboot::restore_manifest(identity);
+    fsops::write_new_file(nx, pb, cur, preboot::cryptex1::MANIFEST, 0o666, &xml, &cluster_pushes, now)?;
+    // The ticket: a temporary file (open 0xa02, 0666), write, fsync, the
+    // rename onto its name, then the close, whose fsync writes the change
+    // time the rename left in the file's memory (K 0x66a1878).
+    let tname = preboot::ticket_name()?;
+    let t = fsops::write_new_file(nx, pb, cur, SPLAT_TICKET_TEMP, 0o666, &SPLAT_TICKET, &cluster_pushes, now)?;
+    let rt = fsops::rename_in_dir(nx, pb, cur, SPLAT_TICKET_TEMP, &tname, t, now)?;
+    fsops::write_times(nx, pb, t, rt.file, now)?;
+    Ok(())
 }
 
 /// install_kernel_cache's nested list (0x100018620; drafts/s23/
@@ -2674,6 +2899,7 @@ mod tests {
         assert!(dev.status.success(), "device fsck: {}{}", String::from_utf8_lossy(&dev.stdout), String::from_utf8_lossy(&dev.stderr));
         assert!(host.status.success(), "host fsck: {}{}", String::from_utf8_lossy(&host.stdout), String::from_utf8_lossy(&host.stderr));
     }
+
     /// The gigalocker file's close-time zero fill (drafts/s27/re-zerofill.md)
     /// on a fresh xART-role volume: with 1 MiB block maps the first adds a
     /// PREV_FSIZE field and the close's fsync removes it, two file-system
@@ -2737,6 +2963,133 @@ mod tests {
         }
     }
 
+    #[test]
+    fn stdio_turns_host_chunks_into_writes() {
+        assert_eq!(stdio_writes(229, 8192).unwrap(), vec![229]);
+        assert_eq!(stdio_writes(3 * 8192, 8192).unwrap(), vec![8192; 3]);
+        assert_eq!(stdio_writes(2 * 8192 + 5000, 8192).unwrap(), vec![8192, 8192, 4096, 904]);
+        assert!(stdio_writes(3 * 5000, 5000).is_err(), "a partly filled buffer before the next fwrite");
+    }
+
+    /// install_splat's kernel paths on a fresh Preboot-role volume
+    /// (drafts/s27/re-splat.md 4): a file appended to in 8 KiB writes with no
+    /// grow-ahead (the clock barely moving) and one whose clock passes a
+    /// second after its creation (grow-ahead's hole left past the pushed
+    /// end), the copyfile of a small plain file into its preallocation, a
+    /// rename and the close's time write; the records and the device's and
+    /// host's fsck.
+    #[test]
+    fn splat_files_are_written_as_the_kernel_writes_them() {
+        let (Ok(dir), Ok(fsck)) = (std::env::var("GEX_TEST_SCRATCH"), std::env::var("GEX_TEST_FSCK")) else { return };
+        let dir = std::path::Path::new(&dir);
+        let path = dir.join(format!("gex-splat-{}", std::process::id()));
+        let blocks = 15_625_000u64;
+        let f = std::fs::OpenOptions::new().create(true).truncate(true).read(true).write(true).open(&path).unwrap();
+        f.set_len(blocks * 4096).unwrap();
+        let sink = super::super::HostFile(f, blocks * 4096);
+        let uuid = *b"gex-splat-tests!";
+        let fm = container::format(&sink, 4096, blocks, uuid).unwrap();
+        let mut nx = Nx::formatted(&sink, &fm, uuid, Mode::Kernel).unwrap();
+        nx.mount_rw().unwrap();
+        let step = std::cell::Cell::new(1000u64);
+        let clock = std::cell::Cell::new(1_700_000_000_000_000_000u64);
+        let mut now = || {
+            clock.set(clock.get() + step.get());
+            clock.get()
+        };
+        let q = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+        let kv = key_os_version(RESTORE_BUILD).unwrap();
+        let times = VolumeTimes { formatted: now(), root: now(), private: now(), modified: now() };
+        let o = nx.create_volume(&NewVolume { name: "Preboot".into(), role: storage::role::PREBOOT, encrypted: false, e_apfs: true, times, uid: 0, gid: 0, key_os_version: kv, size_bytes: None }).unwrap();
+        nx.commit().unwrap();
+        let vol = nx.fs_oid.iter().position(|&x| x == o).unwrap();
+        fsops::mount_rw(&mut nx, vol, &mut now).unwrap();
+        let (c, m) = (1u64 << 20, 1u64 << 20);
+        // An inode's extended field of type `t`.
+        let xf = |v: &[u8], t: u8| -> Option<Vec<u8>> {
+            let n = u16::from_le_bytes([v[0x5c], v[0x5d]]) as usize;
+            let mut off = 0x60 + 4 * n;
+            for i in 0..n {
+                let len = u16::from_le_bytes([v[0x60 + 4 * i + 2], v[0x60 + 4 * i + 3]]) as usize;
+                if v[0x60 + 4 * i] == t {
+                    return Some(v[off..off + len].to_vec());
+                }
+                off += (len + 7) & !7;
+            }
+            None
+        };
+        let extents = |nx: &mut Nx<'_>, ino: u64| -> Vec<(u64, u64, u64)> {
+            let (tr, mut st) = nx.fs_tree(vol).unwrap();
+            tr.records(&mut st).unwrap().into_iter().filter(|(k, _)| k.len() == 16 && q(k, 0) == (ino | 8 << 60)).map(|(k, v)| (q(&k, 8), q(v.as_ref().unwrap(), 0) & 0x00ff_ffff_ffff_ffff, q(v.as_ref().unwrap(), 8))).collect()
+        };
+        for (name, n, tick) in [("steady", 6u64 << 20, 1000u64), ("grows", 6 << 20, 3_000_000)] {
+            let data: Vec<u8> = (0..n as usize).map(|i| (i * 13 + i / 4096) as u8).collect();
+            step.set(1000);
+            let ino = fsops::create(&mut nx, vol, ROOT_INO, name, 0o666, 0, 0, &mut now).unwrap().unwrap();
+            step.set(tick);
+            let writes = stdio_writes(n, 8192).unwrap();
+            fsops::write_appends(&mut nx, vol, ino, &writes, &data, c, m, &mut now).unwrap();
+            let v = fsops::inode(&mut nx, vol, ino).unwrap();
+            let ds = &xf(&v, 8).unwrap()[..];
+            assert_eq!((q(ds, 0), q(ds, 0x18)), (n, n), "{name}");
+            assert!(xf(&v, 5).is_none(), "{name}: PREV_FSIZE removed");
+            assert_eq!(u32::from_le_bytes(v[0x40..0x44].try_into().unwrap()), 1 + writes.len() as u32, "{name}: a write generation per write");
+            let ext = extents(&mut nx, ino);
+            let mut back = Vec::new();
+            for &(l, len, p) in &ext {
+                assert_eq!(l, back.len() as u64, "{name}");
+                if p == 0 {
+                    assert_eq!(l, n, "{name}: the only hole is past the pushed end");
+                    back.resize((l + len) as usize, 0);
+                    continue;
+                }
+                let mut b = vec![0u8; len as usize];
+                std::os::unix::fs::FileExt::read_exact_at(&sink.0, &mut b, p * 4096).unwrap();
+                back.extend_from_slice(&b);
+            }
+            assert_eq!(&back[..n as usize], &data[..], "{name}");
+            let hole = ext.iter().find(|e| e.2 == 0).map(|e| e.1);
+            assert_eq!(q(ds, 8), n + hole.unwrap_or(0), "{name}: allocated size");
+            assert_eq!(q(&v, 0x30), if hole.is_some() { 0x9200 } else { 0x9000 }, "{name}: internal flags");
+            assert_eq!(xf(&v, 0xd).map(|b| q(&b, 0)), hole, "{name}: the hole's sparse bytes");
+            assert_eq!(hole.is_some(), tick > 1000, "{name}: grow-ahead only after a second");
+        }
+        // A copyfile of a 574-byte plain file.
+        step.set(1000);
+        let small: Vec<u8> = (0..574).map(|i| i as u8).collect();
+        let f = fsops::create(&mut nx, vol, ROOT_INO, "SystemVersion.plist", 0o644, 0, 0, &mut now).unwrap().unwrap();
+        assert_eq!(fsops::preallocate(&mut nx, vol, f, 574, &mut now).unwrap(), 4096);
+        let (_, written) = fsops::write_into_preallocation(&mut nx, vol, f, &small, &mut now).unwrap();
+        fsops::truncate_equal(&mut nx, vol, f, written, &mut now).unwrap();
+        fsops::setattr(&mut nx, vol, f, fsops::SetAttr { mode: Some(0o444), uid: Some(0), gid: Some(0), ..Default::default() }, &mut now).unwrap();
+        fsops::setattr(&mut nx, vol, f, fsops::SetAttr { mtime: Some(1_777_573_253_000_000_000), atime: Some(1_777_573_253_000_000_000), ..Default::default() }, &mut now).unwrap();
+        fsops::cas_bsdflags(&mut nx, vol, f, 0, 0, &mut now).unwrap();
+        fsops::close_pushed(&mut nx, vol, f, &small, &mut now).unwrap();
+        let v = fsops::inode(&mut nx, vol, f).unwrap();
+        let ds = &v[v.len() - 0x28..];
+        assert_eq!((q(ds, 0), q(ds, 8), q(ds, 0x18), u32::from_le_bytes(v[0x40..0x44].try_into().unwrap()), u16::from_le_bytes([v[0x5c], v[0x5d]])), (574, 4096, 574, 2, 2));
+        assert_eq!(q(&v, 0x18), 1_777_573_253_000_000_000);
+        let ext = extents(&mut nx, f);
+        let mut b = vec![0u8; 4096];
+        std::os::unix::fs::FileExt::read_exact_at(&sink.0, &mut b, ext[0].2 * 4096).unwrap();
+        assert_eq!(&b[..574], &small[..]);
+        assert!(b[574..].iter().all(|&x| x == 0));
+        // The ticket's temporary file renamed, then its close.
+        let t = fsops::write_new_file(&mut nx, vol, ROOT_INO, SPLAT_TICKET_TEMP, 0o666, &SPLAT_TICKET, &cluster_pushes, &mut now).unwrap();
+        let rt = fsops::rename_in_dir(&mut nx, vol, ROOT_INO, SPLAT_TICKET_TEMP, "apticket.j120ap.0.im4m", t, &mut now).unwrap();
+        fsops::write_times(&mut nx, vol, t, rt.file, &mut now).unwrap();
+        assert_eq!(fsops::lookup(&mut nx, vol, ROOT_INO, "apticket.j120ap.0.im4m").unwrap(), Some(t));
+        assert_eq!(q(&fsops::inode(&mut nx, vol, t).unwrap(), 0x20), rt.file.1);
+        nx.jobj_times.remove(&(vol, ROOT_INO));
+        nx.commit().unwrap();
+        nx.unmount().unwrap();
+        sink.0.sync_all().unwrap();
+        let dev = std::process::Command::new(&fsck).args(["-n", "-W", "-s"]).arg(&path).output().unwrap();
+        let host = std::process::Command::new("/sbin/fsck_apfs").args(["-n", "-s"]).arg(&path).output().unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(dev.status.success(), "device fsck: {}{}", String::from_utf8_lossy(&dev.stdout), String::from_utf8_lossy(&dev.stderr));
+        assert!(host.status.success(), "host fsck: {}{}", String::from_utf8_lossy(&host.stdout), String::from_utf8_lossy(&host.stderr));
+    }
 
     #[test]
     fn os_version_encoding() {

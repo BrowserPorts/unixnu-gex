@@ -2692,6 +2692,15 @@ impl<'a> Nx<'a> {
         }
         self.sink.write_at(paddr * self.l.bs, buf)
     }
+
+    /// File data read from block `paddr` on.
+    pub fn read_data(&self, paddr: u64, buf: &mut [u8]) -> Result<(), String> {
+        if paddr == 0 || paddr + (buf.len() as u64).div_ceil(self.l.bs) > self.l.blocks {
+            return Err(format!("file data at block {paddr} outside the container"));
+        }
+        use crate::darwin::apfsread::Medium as _;
+        self.sink.read_at(paddr * self.l.bs, buf)
+    }
 }
 
 /// A physical tree's nodes.

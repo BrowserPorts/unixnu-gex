@@ -31,6 +31,12 @@ BUSYBOX_SHA256  := 3311dff32e746499f4df0d5df04d7eb396382d7e108bb9250e7b519b83704
 LINUX_HEADERS_URL    := https://snapshot.debian.org/archive/debian/20261115T210008Z/pool/main/l/linux/linux-libc-dev_6.12.117-1_all.deb
 LINUX_HEADERS_SHA256 := 8b4848725a2705e5b1612f2135c44300716690ba762368ab87df127e9a5ed416
 
+# Wine 11.15 as WineHQ builds it, whose PE files, NLS files and fonts the
+# legacy 32-bit Wine's prefix is staged from (wine/legacy32/nt-stage-wine.sh),
+# on any host (toolchain/debian-package.sh unpacks it)
+WINEHQ_WINE_URL    := https://dl.winehq.org/wine-builds/debian/pool/main/w/wine/wine-devel_11.15~forky-1_amd64.deb
+WINEHQ_WINE_SHA256 := 521741fe3468ac3fd9ff7a1ae439d2f19eb66d6641ce149c6f63bd2d7577de9f
+
 # xkeyboard-config's data, which Xwayland's built-in keymap is compiled from
 # and whose licence the page ships (ports/xwayland/build.sh): Debian's
 # xkb-data, through toolchain/debian-package.sh.

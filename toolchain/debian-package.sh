@@ -1,12 +1,13 @@
 #!/bin/sh
 # A pinned Debian package's files: the package toolchain/pins names as
-# NAME_URL and NAME_SHA256 (from Debian's snapshot archive), fetched by
-# digest and unpacked (its data, no install, no scripts) once into CACHE.
+# NAME_URL and NAME_SHA256 (Debian's snapshot archive, or another archive's
+# such as WineHQ's), fetched by digest and unpacked (its data, no install,
+# no scripts) once into CACHE.
 # The same files on any host, where a copy of the build machine's /usr was
 # whatever its distribution installed, and nothing on a host that is not
 # Linux.
 #
-#   toolchain/debian-package.sh NAME       -> prints the unpacked root (its usr/)
+#   toolchain/debian-package.sh NAME       -> prints the unpacked root (its usr/ or opt/)
 set -eu
 HERE=$(dirname "$(realpath "$0")")
 name=${1:?NAME}

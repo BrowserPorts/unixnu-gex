@@ -81,10 +81,22 @@ fn fs_tx_enter(nx: &mut Nx<'_>, vol: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// `fs_tx_leave`: `apfs_last_mod_time` and the last change's transaction;
-/// on a volume of a role that keeps document identifiers (no role, User,
-/// Data, Enterprise), +0x428's 0x10 too (K 0x66f70c8).
+/// `fs_tx_leave` (K 0x66f70c8): `apfs_last_mod_time` and the last
+/// change's transaction; on a volume of a role that keeps document
+/// identifiers (no role, User, Data, Enterprise), +0x428's 0x10 too; then
+/// `tx_leave(nx, xid, 0)`, whose close rule ([`Nx::close_due`], checked at
+/// every leave: drafts/s27/re-txdata.md 0.2) commits the transaction when
+/// this was its last holder.
 fn fs_tx_leave(nx: &mut Nx<'_>, vol: usize, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    fs_tx_mark(nx, vol, now)?;
+    if nx.close_due(0)? {
+        nx.commit()?;
+    }
+    Ok(())
+}
+
+/// `fs_tx_leave`'s volume fields.
+fn fs_tx_mark(nx: &mut Nx<'_>, vol: usize, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     let t = now();
     let xid = nx.xid;
     let sb = nx.vol_sb(vol)?;
@@ -2189,14 +2201,14 @@ pub fn read_dir(nx: &mut Nx<'_>, vol: usize, dir: u64) -> Result<Vec<(Vec<u8>, u
 /// `fs_tx_leave` inside an operation that still holds the transaction:
 /// the volume's last change, and whether `tx_leave` marked it closing.
 fn fs_tx_leave_nested(nx: &mut Nx<'_>, vol: usize, now: &mut dyn FnMut() -> u64) -> Result<bool, String> {
-    fs_tx_leave(nx, vol, now)?;
+    fs_tx_mark(nx, vol, now)?;
     nx.close_due(0)
 }
 
 /// The operation's last `fs_tx_leave`: the transaction commits when it
 /// was marked closing while held or `tx_leave` closes it now.
 fn fs_tx_leave_last(nx: &mut Nx<'_>, vol: usize, closing: bool, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
-    fs_tx_leave(nx, vol, now)?;
+    fs_tx_mark(nx, vol, now)?;
     if nx.close_due(0)? || closing {
         nx.commit()?;
     }

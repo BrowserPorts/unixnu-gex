@@ -396,12 +396,14 @@ fn create_obj(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str, mode: u16, u
     // inheritance (K 0x66a3a38), which needs a tombstone the restore's
     // threads do not hold (drafts/s23/re-uml-data.md 1.3), and on User
     // their inode and directory records go to the file-system tree, not
-    // the secondary one (K 0x66ed1bc; drafts/s23/re-user-copy.md 2.1).
-    let doc_ok = !link && {
+    // the secondary one (K 0x66ed1bc; drafts/s23/re-user-copy.md 2.1). A
+    // symbolic link calls fs_obj_create_name_checked directly, without
+    // fs_obj_create_do's tombstone step (drafts/s27/re-datawrite.md 6).
+    let doc_ok = {
         let (sb, _) = nx.vol_sb_read(vol)?;
         match u16::from_le_bytes([sb[SB_ROLE], sb[SB_ROLE + 1]]) {
             0x40 => u64a(sb, SB_INCOMPAT) & 0x100 == 0,
-            0x2 => vol_crypto(sb) == 1,
+            0x2 => !link && vol_crypto(sb) == 1,
             _ => false,
         }
     };
@@ -484,14 +486,17 @@ fn create_obj(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str, mode: u16, u
     // A file on a VEK volume takes its parent's class when that is a
     // valid file class (cp_is_valid_class(1, c): 1 to 7) other than 0, with
     // PROT_CLASS_EXPLICIT by the directory rule above (K 0x66a36c0..
-    // 0x66a3858; drafts/s26/re-aks-data.md 3.6); under a class-0 parent it
-    // would take the volume's default (fs + 0x350), not transcribed.
+    // 0x66a3858; drafts/s26/re-aks-data.md 3.6); under a parent of no valid
+    // file class (0) it takes the volume's default (fs + 0x350: 3, as on an
+    // unencrypted volume) with no PROT_CLASS_EXPLICIT (drafts/s27/
+    // re-bomcopy.md 4.1).
     let vek_file_class = encrypted && !dir && !link && crypto == 3 && (1..=7).contains(&parent_prot);
     if vek_file_class && (1u32 << parent_prot) & 0x97 != 0 {
         extra |= 0x8;
     }
-    if encrypted && !dir && !link && crypto != 1 && !vek_file_class {
-        return Err("not implemented: a file made with no explicit class on a VEK volume under a class-0 directory (setup_prot_class's volume default, fs + 0x350)".into());
+    let vek_default = encrypted && !dir && !link && crypto == 3 && !vek_file_class;
+    if encrypted && !dir && !link && crypto != 1 && crypto != 3 {
+        return Err("not implemented: a file on an encrypted volume of crypto kind 0 or 2".into());
     }
     if encrypted && dir && crypto != 3 && crypto != 1 {
         return Err("not implemented: a directory on an encrypted volume of crypto kind 0 or 2".into());
@@ -502,6 +507,8 @@ fn create_obj(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str, mode: u16, u
         0
     } else if vek_file_class {
         parent_prot
+    } else if vek_default {
+        DEFAULT_CP_CLASS
     } else if parent_prot != 0 {
         return Err(format!("not implemented: a file in a directory of protection class {parent_prot} (setup_prot_class's class checks, K 0x67684a0)"));
     } else {
@@ -746,6 +753,131 @@ fn dstream_of(v: &[u8]) -> Result<Option<Dstream>, String> {
     Ok(xfields(v)?.into_iter().find(|f| f.0 == INO_EXT_TYPE_DSTREAM).map(|f| Dstream { oid, size: u64a(&f.2, 0), alloced: u64a(&f.2, 8) }))
 }
 
+/// The size of the data stream an inode value `v` names (0 with none).
+pub fn dstream_size(v: &[u8]) -> Result<u64, String> {
+    Ok(dstream_of(v)?.map_or(0, |d| d.size))
+}
+
+/// How a stream's data is encrypted (drafts/s27/re-datawrite.md 0, 2): not
+/// at all (an unencrypted volume); with the volume's key (identifier 4,
+/// each data extent's crypto field its own first block, flagged
+/// FEXT_CRYPTO_ID_IS_TWEAK); or with a per-file key (identifier the
+/// stream's, a crypto-state record referenced by each data-extent record).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Crypt {
+    None,
+    Vek,
+    Key(u64),
+}
+
+impl Crypt {
+    /// The data stream's `default_crypto_id`.
+    fn id(self) -> u64 {
+        match self {
+            Crypt::None => 0,
+            Crypt::Vek => 4,
+            Crypt::Key(f) => f,
+        }
+    }
+}
+
+/// The crypt of a new data stream `oid` of an object of protection class
+/// `class` and internal flags `internal` on volume `vol` (K 0x66f441c's
+/// crypto-mode-3 branch K 0x66f44b0..0x66f4544): classes 1 and 2, an
+/// explicit class (PROT_CLASS_EXPLICIT) and class 4 (class-F keys are
+/// supported in crypto mode 3, K 0x67372d0) take a per-file key named by
+/// the stream; every other class the volume's key. Only class 4's key
+/// record is transcribed (kind 3, K 0x67072f4).
+fn stream_crypt(nx: &mut Nx<'_>, vol: usize, oid: u64, class: u32, internal: u64) -> Result<Crypt, String> {
+    let (sb, _) = nx.vol_sb_read(vol)?;
+    if u64a(sb, SB_FS_FLAGS) & 1 != 0 {
+        return Ok(Crypt::None);
+    }
+    if vol_crypto(sb) != 3 || u64a(sb, SB_INCOMPAT) & 0x100 != 0 {
+        return Err("not implemented: stream data on an encrypted volume of another crypto kind than a VEK volume's".into());
+    }
+    if class == 1 || class == 2 || internal & 0x8 != 0 || class == 4 {
+        if class != 4 {
+            return Err(format!("not implemented: a per-file key of protection class {class} (its crypto-state record's class field)"));
+        }
+        Ok(Crypt::Key(oid))
+    } else {
+        Ok(Crypt::Vek)
+    }
+}
+
+/// The crypt of regular file `v`'s (its inode value) data stream.
+fn file_crypt(nx: &mut Nx<'_>, vol: usize, v: &[u8]) -> Result<Crypt, String> {
+    stream_crypt(nx, vol, u64a(v, 0x08), u32::from_le_bytes(v[0x3c..0x40].try_into().unwrap()), u64a(v, INO_INTERNAL_FLAGS))
+}
+
+/// A data extent's value (K 0x6700a08): with the volume's key on a volume
+/// of fs_flags 0x108 the flag byte 1 (FEXT_CRYPTO_ID_IS_TWEAK) and the
+/// extent's first block as its crypto field; with a per-file key that key's
+/// identifier.
+fn data_fext_val(len: u64, phys: u64, c: Crypt) -> Vec<u8> {
+    let (flags, crypto) = match c {
+        Crypt::None => (0, 0),
+        Crypt::Vek => (1u64 << 56, phys),
+        Crypt::Key(f) => (0, f),
+    };
+    let mut v = (len | flags).to_le_bytes().to_vec();
+    v.extend_from_slice(&phys.to_le_bytes());
+    v.extend_from_slice(&crypto.to_le_bytes());
+    v
+}
+
+/// A new data-extent record's reference on its per-file key's crypto-state
+/// record (K 0x66f8ad8); the volume's key takes none.
+fn crypto_ref(nx: &mut Nx<'_>, vol: usize, c: Crypt) -> Result<(), String> {
+    if let Crypt::Key(f) = c {
+        let ck = (f | J_CRYPTO_STATE << 60).to_le_bytes();
+        let mut cs = get_rec(nx, vol, &ck)?.ok_or("a per-file key with no crypto-state record")?;
+        let n = u32::from_le_bytes(cs[0..4].try_into().unwrap());
+        cs.put32(0, n + 1);
+        put_rec(nx, vol, &ck, &cs)?;
+    }
+    Ok(())
+}
+
+/// A class-4 per-file key's crypto-state record (K 0x6734490/K 0x6734154):
+/// one reference, version 6.0, no flags, class 4 (kind 3, K 0x67072f4), the
+/// volume's OS version, revision 0, the AKS blobs' lengths and the blobs
+/// ([`PER_FILE_KEY_STAND_IN`]).
+fn class4_crypto_state(nx: &mut Nx<'_>, vol: usize) -> Result<Vec<u8>, String> {
+    let key_os_version = {
+        let (sb, _) = nx.vol_sb_read(vol)?;
+        u32::from_le_bytes(sb[0x6c..0x70].try_into().unwrap())
+    };
+    let blob = |n: usize| -> Vec<u8> { b"KEY-STAND-IN".iter().copied().cycle().take(n).collect() };
+    let (b1, b2) = (blob(0x28), blob(0x28));
+    let mut cs = 1u32.to_le_bytes().to_vec();
+    cs.extend_from_slice(&6u16.to_le_bytes());
+    cs.extend_from_slice(&0u16.to_le_bytes());
+    cs.extend_from_slice(&0u32.to_le_bytes());
+    cs.extend_from_slice(&4u32.to_le_bytes());
+    cs.extend_from_slice(&key_os_version.to_le_bytes());
+    cs.extend_from_slice(&0u16.to_le_bytes());
+    cs.extend_from_slice(&(b1.len() as u16 | (b2.len() as u16) << 8).to_le_bytes());
+    cs.extend_from_slice(&b1);
+    cs.extend_from_slice(&b2);
+    Ok(cs)
+}
+
+/// The volume checks of a data write on volume `vol`: on Data (no
+/// secondary tree) its names only, the write paths there having no
+/// document-identifier step (traced for [`write_new_protected`],
+/// drafts/s23/re-uml-data.md 3, and unchanged by the crypto kind,
+/// drafts/s27/re-datawrite.md 0); elsewhere [`check_volume`]'s.
+fn check_write_volume(nx: &mut Nx<'_>, vol: usize) -> Result<(), String> {
+    let (sb, _) = nx.vol_sb_read(vol)?;
+    if u16::from_le_bytes([sb[SB_ROLE], sb[SB_ROLE + 1]]) == 0x40 && u64a(sb, SB_INCOMPAT) & 0x100 == 0 {
+        check_names(nx, vol)
+    } else {
+        check_volume(nx, vol)
+    }
+}
+
 /// What the kernel writes for a file's inode as its size and data change
 /// that is not transcribed for asr's pwrites (prepare_write_and_lock's
 /// per-write updates: the data stream's byte counters, the times, the write
@@ -904,19 +1036,20 @@ fn blockmap_fill(nx: &mut Nx<'_>, vol: usize, ino: u64, off: u64, data: &[u8], t
         if end > ds.alloced {
             return Err("not implemented: a block map past the file's allocated size".into());
         }
+        let crypt = file_crypt(nx, vol, &v)?;
         // The sparse extent holding `pos`.
         let (t, mut st) = nx.fs_tree(vol)?;
         let recs = t.records(&mut st)?;
-        let ext: Vec<(u64, u64, u64)> = recs
+        let ext: Vec<(u64, u64, u64, Vec<u8>)> = recs
             .iter()
             .filter(|(k, _)| k.len() == 16 && u64a(k, 0) == (ds.oid | J_FILE_EXTENT << 60))
             .map(|(k, v)| {
                 let v = v.as_ref().unwrap();
-                (u64a(k, 8), u64a(v, 0) & 0x00ff_ffff_ffff_ffff, u64a(v, 8))
+                (u64a(k, 8), u64a(v, 0) & 0x00ff_ffff_ffff_ffff, u64a(v, 8), v.clone())
             })
             .collect();
         drop(st);
-        let &(hl, hlen, hphys) = ext.iter().find(|&&(l, n, _)| l <= pos && pos < l + n).ok_or("a write where the file has no extent")?;
+        let (hl, hlen, hphys) = ext.iter().find(|e| e.0 <= pos && pos < e.0 + e.1).map(|e| (e.0, e.1, e.2)).ok_or("a write where the file has no extent")?;
         if hphys != 0 {
             return Err("not implemented: a write over a file's allocated blocks".into());
         }
@@ -926,25 +1059,29 @@ fn blockmap_fill(nx: &mut Nx<'_>, vol: usize, ino: u64, off: u64, data: &[u8], t
         let n = got * bs;
         blocks_alloced(nx, vol, got)?;
         phys_extent_add(nx, vol, a, got, ds.oid)?;
-        // The file extents.
-        let (mut t, mut st) = nx.fs_tree(vol)?;
+        // The file extents (K 0x670afbc): a data extent physically
+        // continued is lengthened, its flags and crypto field kept, with no
+        // key reference; a new one takes the stream's crypto (K 0x6700a08)
+        // and a reference on a per-file key (K 0x670b3f4).
         let d = pos - hl;
-        if d == 0 {
-            let prev = ext.iter().find(|&&(l, len, p)| hl != 0 && l + len == hl && p != 0 && p + len / bs == a).copied();
-            if let Some((pl, plen, pp)) = prev {
-                t.insert(&mut st, &fext_key(ds.oid, pl), Some(&fext_val(plen + n, pp)))?;
-                t.remove(&mut st, &fext_key(ds.oid, hl))?;
-            } else {
-                t.insert(&mut st, &fext_key(ds.oid, hl), Some(&fext_val(n, a)))?;
-            }
+        let prev = (d == 0).then(|| ext.iter().find(|e| hl != 0 && e.0 + e.1 == hl && e.2 != 0 && e.2 + e.1 / bs == a)).flatten();
+        if let Some((pl, _, _, pv)) = prev {
+            let mut nv = pv.clone();
+            nv.put64(0, u64a(pv, 0) + n);
+            let (mut t, mut st) = nx.fs_tree(vol)?;
+            t.insert(&mut st, &fext_key(ds.oid, *pl), Some(&nv))?;
+            t.remove(&mut st, &fext_key(ds.oid, hl))?;
+            nx.set_fs_tree(vol, t);
         } else {
-            t.insert(&mut st, &fext_key(ds.oid, hl), Some(&fext_val(d, 0)))?;
-            t.insert(&mut st, &fext_key(ds.oid, pos), Some(&fext_val(n, a)))?;
+            if d != 0 {
+                put_rec(nx, vol, &fext_key(ds.oid, hl), &fext_val(d, 0))?;
+            }
+            put_rec(nx, vol, &fext_key(ds.oid, pos), &data_fext_val(n, a, crypt))?;
+            crypto_ref(nx, vol, crypt)?;
         }
         if pos + n < hl + hlen {
-            t.insert(&mut st, &fext_key(ds.oid, pos + n), Some(&fext_val(hl + hlen - (pos + n), 0)))?;
+            put_rec(nx, vol, &fext_key(ds.oid, pos + n), &fext_val(hl + hlen - (pos + n), 0))?;
         }
-        nx.set_fs_tree(vol, t);
         let mut v = v;
         let mut x = xfields(&v)?;
         sparse_bytes(&mut v, &mut x, -(n as i64))?;
@@ -1286,13 +1423,12 @@ pub fn write_new_protected(nx: &mut Nx<'_>, vol: usize, ino: u64, data: &[u8], n
     if data.is_empty() || data.len() as u64 >= bs {
         return Err(format!("not implemented: a first write of {} bytes (only one under a block is traced)", data.len()));
     }
-    let key_os_version = {
+    {
         let (sb, _) = nx.vol_sb_read(vol)?;
         if vol_crypto(sb) != 3 || u64a(sb, SB_INCOMPAT) & 0x100 != 0 {
             return Err("not implemented: a per-file key on a volume without a VEK".into());
         }
-        u32::from_le_bytes(sb[0x6c..0x70].try_into().unwrap())
-    };
+    }
     let v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
     if u16::from_le_bytes([v[INO_MODE], v[INO_MODE + 1]]) & S_IFMT != S_IFREG || dstream_of(&v)?.is_some() {
         return Err("not implemented: a first write into other than an empty regular file".into());
@@ -1305,21 +1441,7 @@ pub fn write_new_protected(nx: &mut Nx<'_>, vol: usize, ino: u64, data: &[u8], n
     }
     fs_tx_enter(nx, vol)?;
     let oid = u64a(&v, 0x08);
-    // The crypto-state record (K 0x6734490/K 0x6734154): one reference,
-    // version 6.0, no flags, class 4 (kind 3, K 0x67072f4), the OS version,
-    // revision 0, the blobs' lengths, the blobs.
-    let blob = |n: usize| -> Vec<u8> { b"KEY-STAND-IN".iter().copied().cycle().take(n).collect() };
-    let (b1, b2) = (blob(0x28), blob(0x28));
-    let mut cs = 1u32.to_le_bytes().to_vec();
-    cs.extend_from_slice(&6u16.to_le_bytes());
-    cs.extend_from_slice(&0u16.to_le_bytes());
-    cs.extend_from_slice(&0u32.to_le_bytes());
-    cs.extend_from_slice(&4u32.to_le_bytes());
-    cs.extend_from_slice(&key_os_version.to_le_bytes());
-    cs.extend_from_slice(&0u16.to_le_bytes());
-    cs.extend_from_slice(&(b1.len() as u16 | (b2.len() as u16) << 8).to_le_bytes());
-    cs.extend_from_slice(&b1);
-    cs.extend_from_slice(&b2);
+    let mut cs = class4_crypto_state(nx, vol)?;
     let ck = (oid | J_CRYPTO_STATE << 60).to_le_bytes();
     put_rec(nx, vol, &ck, &cs)?;
     put_rec(nx, vol, &(oid | J_DSTREAM_ID << 60).to_le_bytes(), &1u32.to_le_bytes())?;
@@ -1389,7 +1511,7 @@ pub struct RenameTimes {
     pub dir: (u64, u64),
 }
 
-/// `rename(2)` of regular file `ino` (one link) from `from` to `to` in
+/// `rename(2)` of regular file or symbolic link `ino` (one link) from `from` to `to` in
 /// directory `dir`, no file named `to` there (apfs_vnop_renamex K
 /// 0x6692440 with no flags; drafts/s23/re-uml-data.md 5.1): in one
 /// file-system transaction the old record removed and the new one
@@ -1418,8 +1540,11 @@ pub fn rename_in_dir(nx: &mut Nx<'_>, vol: usize, dir: u64, from: &str, to: &str
         return Err("not implemented: a rename onto an existing name".into());
     }
     let f = get_rec(nx, vol, &inode_key(ino))?.ok_or("the file has no inode")?;
-    if u16::from_le_bytes([f[INO_MODE], f[INO_MODE + 1]]) & S_IFMT != S_IFREG || u32::from_le_bytes(f[INO_NCHILDREN..INO_NCHILDREN + 4].try_into().unwrap()) != 1 || u32::from_le_bytes(f[0x44..0x48].try_into().unwrap()) & 0x40 != 0 {
-        return Err("not implemented: renaming other than a regular file of one link and no UF_TRACKED".into());
+    // A symbolic link's records change as a regular file's (drafts/s27/
+    // re-datawrite.md 7.1).
+    let fmt = u16::from_le_bytes([f[INO_MODE], f[INO_MODE + 1]]) & S_IFMT;
+    if (fmt != S_IFREG && fmt != S_IFLNK) || u32::from_le_bytes(f[INO_NCHILDREN..INO_NCHILDREN + 4].try_into().unwrap()) != 1 || u32::from_le_bytes(f[0x44..0x48].try_into().unwrap()) & 0x40 != 0 {
+        return Err("not implemented: renaming other than a regular file or symbolic link of one link and no UF_TRACKED".into());
     }
     if fdv.len() != 0x12 {
         return Err("not implemented: a directory record with extended fields (SIBLING_ID)".into());
@@ -1583,21 +1708,37 @@ pub struct Pushes {
     pub before_end: usize,
 }
 
-/// `open_dprotected_np(O_WRONLY | O_CREAT | O_TRUNC, class -1 (the
-/// default: no class passed), 0, mode)` (or `open` with the same flags) of
-/// a new file `name` in `parent` of an unencrypted volume, one `write` of
-/// all of `data` at offset 0, and `close` (drafts/s21/re-gigalocker.md D,
-/// drafts/s23/re-kernelcache.md 4): the file made as [`create`] makes it
-/// (O_TRUNC does nothing to a file the open made). The write's
+/// `open(O_WRONLY | O_CREAT | O_TRUNC)` of a new file `name` in `parent`,
+/// one `write` of all of `data` at offset 0, and `close` (drafts/s21/
+/// re-gigalocker.md D, drafts/s23/re-kernelcache.md 4): the file made as
+/// [`create`] makes it by root, with its parent's group (O_TRUNC does
+/// nothing to a file the open made), then [`write_first`]. The file's
+/// inode number.
+pub fn write_new_file(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str, mode: u16, data: &[u8], pushes: &dyn Fn(u64) -> Result<Pushes, String>, now: &mut dyn FnMut() -> u64) -> Result<u64, String> {
+    if data.is_empty() {
+        return Err("not implemented: an empty write".into());
+    }
+    let gid = u32::from_le_bytes(get_rec(nx, vol, &inode_key(parent))?.ok_or_else(|| format!("no inode {parent:#x}"))?[0x4c..0x50].try_into().unwrap());
+    let ino = create(nx, vol, parent, name, mode, 0, gid, now)?.map_err(|e| format!("creating {name}: errno {e}"))?;
+    write_first(nx, vol, ino, data, pushes, now)?;
+    Ok(ino)
+}
+
+/// One `write` of all of `data` at offset 0 into the new, empty regular
+/// file `ino`, and `close` (drafts/s21/re-gigalocker.md D, drafts/s23/
+/// re-kernelcache.md 4, drafts/s27/re-datawrite.md 0.1). The write's
 /// transaction (prepare_write_and_lock K 0x66a4024) makes the data stream
-/// and takes one of two paths (K 0x66a4410..0x66a4478):
+/// (on a VEK volume with its crypto identifier, [`Crypt`]: a per-file key's
+/// crypto-state record first) and takes one of two paths
+/// (K 0x66a4410..0x66a4478):
 /// - direct, for a length not a block multiple and under 0x20000: the
 ///   blocks allocated at once (alloc_space flags 8: requests for what is
 ///   left until the space manager has granted it all), each piece counted,
 ///   its file extent (extending the one before it when physically
-///   contiguous) and block references; the size, a PREV_FSIZE field of the
-///   old size 0, the write generation; the close's push writes the blocks
-///   with no transaction;
+///   contiguous, its crypto field kept; a new one referencing a per-file
+///   key's record) and block references; the size, a PREV_FSIZE field of
+///   the old size 0, the write generation; the close's push writes the
+///   blocks with no transaction;
 /// - deferred, otherwise: one sparse extent over the allocated size, the
 ///   SPARSE_BYTES field and INODE_IS_SPARSE (alloc_space flags 0x10), the
 ///   size, PREV_FSIZE, the write generation; the blocks are allocated by
@@ -1606,18 +1747,20 @@ pub struct Pushes {
 /// The write's end reads the clock for the modification and change times
 /// and counts the bytes written, in memory; the close's fsync removes the
 /// PREV_FSIZE field in its own transaction (K 0x6766d4c) whose inode write
-/// carries them. The file's inode number.
-pub fn write_new_file(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str, mode: u16, data: &[u8], pushes: &dyn Fn(u64) -> Result<Pushes, String>, now: &mut dyn FnMut() -> u64) -> Result<u64, String> {
+/// carries them.
+pub fn write_first(nx: &mut Nx<'_>, vol: usize, ino: u64, data: &[u8], pushes: &dyn Fn(u64) -> Result<Pushes, String>, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     let bs = nx.l.bs;
     let n = data.len() as u64;
     if n == 0 {
         return Err("not implemented: an empty write".into());
     }
+    check_write_volume(nx, vol)?;
     {
+        // A volume with unwritten extents (incompat 0x80, Data's) takes the
+        // same paths: neither path asks alloc_space for an unwritten extent,
+        // and the deferred path's hole is made with flags 0
+        // (K 0x6707ed0..0x6707f5c; drafts/s27/re-datawrite.md 1, 3).
         let sb = nx.vol_sb(vol)?;
-        if u64a(sb, 0x108) & 1 == 0 || u64a(sb, SB_INCOMPAT) & 0x80 != 0 {
-            return Err("not implemented: a file write on an encrypted volume or one with unwritten extents".into());
-        }
         // The volume's low-space state (fs + 0x3ac, set below the
         // thresholds at fs + 0x3b0..0x3bc) can force the direct path; its
         // thresholds are not transcribed, so only a volume without a quota
@@ -1626,16 +1769,31 @@ pub fn write_new_file(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str, mode
             return Err("not implemented: a deferred write on a volume with a quota (the low-space state at fs + 0x3ac)".into());
         }
     }
-    let ino = create(nx, vol, parent, name, mode, 0, 0, now)?.map_err(|e| format!("creating {name}: errno {e}"))?;
+    let v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
+    if u16::from_le_bytes([v[INO_MODE], v[INO_MODE + 1]]) & S_IFMT != S_IFREG || dstream_of(&v)?.is_some() {
+        return Err("not implemented: a first write into other than an empty regular file".into());
+    }
+    if u64a(&v, INO_INTERNAL_FLAGS) & 0x410 != 0 {
+        return Err("not implemented: a first write into a file with internal flags 0x410 (K 0x66a4410)".into());
+    }
+    if u32::from_le_bytes(v[0x44..0x48].try_into().unwrap()) & 0x4000_0020 == 0x4000_0020 {
+        return Err("not implemented: a data stream of its own identifier (bsd_flags 0x40000020, K 0x66fb37c)".into());
+    }
+    let crypt = file_crypt(nx, vol, &v)?;
     let blocks = n.div_ceil(bs);
     let direct = n % bs != 0 && n < 0x20000;
     // The write's transaction.
     fs_tx_enter(nx, vol)?;
-    let v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
     let oid = u64a(&v, 0x08);
-    let mut x = xfields(&v)?;
-    x.push((INO_EXT_TYPE_DSTREAM, XF_SYSTEM_FIELD, vec![0u8; 0x28]));
+    if let Crypt::Key(f) = crypt {
+        let cs = class4_crypto_state(nx, vol)?;
+        put_rec(nx, vol, &(f | J_CRYPTO_STATE << 60).to_le_bytes(), &cs)?;
+    }
     put_rec(nx, vol, &(oid | J_DSTREAM_ID << 60).to_le_bytes(), &1u32.to_le_bytes())?;
+    let mut x = xfields(&v)?;
+    let mut dsx = vec![0u8; 0x28];
+    dsx.put64(0x10, crypt.id());
+    x.push((INO_EXT_TYPE_DSTREAM, XF_SYSTEM_FIELD, dsx));
     let mut v = v;
     let mut extents: Vec<(u64, u64, u64)> = Vec::new();
     if direct {
@@ -1646,10 +1804,11 @@ pub fn write_new_file(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str, mode
             match extents.last_mut() {
                 Some((l, len, p)) if *p + *len / bs == a => {
                     *len += got * bs;
-                    put_rec(nx, vol, &fext_key(oid, *l), &fext_val(*len, *p))?;
+                    put_rec(nx, vol, &fext_key(oid, *l), &data_fext_val(*len, *p, crypt))?;
                 }
                 _ => {
-                    put_rec(nx, vol, &fext_key(oid, done * bs), &fext_val(got * bs, a))?;
+                    crypto_ref(nx, vol, crypt)?;
+                    put_rec(nx, vol, &fext_key(oid, done * bs), &data_fext_val(got * bs, a, crypt))?;
                     extents.push((done * bs, got * bs, a));
                 }
             }
@@ -1713,7 +1872,7 @@ pub fn write_new_file(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str, mode
     v.put64(INO_CHANGE_TIME, t_w);
     put_rec(nx, vol, &inode_key(ino), &v)?;
     fs_tx_leave(nx, vol, now)?;
-    Ok(ino)
+    Ok(())
 }
 
 
@@ -1892,21 +2051,29 @@ fn grow_ahead(a: u64, e: u64, bs: u64, ro_compat: u64) -> u64 {
 pub fn write_appends(nx: &mut Nx<'_>, vol: usize, ino: u64, writes: &[u64], src: &dyn Bytes, c: u64, m: u64, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     const PAGE: u64 = 16 << 10;
     let bs = nx.l.bs;
-    check_volume(nx, vol)?;
+    check_write_volume(nx, vol)?;
     let total: u64 = writes.iter().sum();
     if total != src.len() || writes.iter().any(|&w| w == 0) || c == 0 || m == 0 || c % PAGE != 0 || m % bs != 0 {
         return Err("not implemented: writes that are not the file's bytes in order, an empty write, or cluster sizes not of whole pages".into());
     }
     {
         let sb = nx.vol_sb(vol)?;
-        if u64a(sb, 0x108) & 1 == 0 || u64a(sb, SB_INCOMPAT) & 0x80 != 0 || u64a(sb, 0x50) != 0 {
-            return Err("not implemented: writes on an encrypted volume, one with unwritten extents, or one with a quota (the low-space state)".into());
+        // Unwritten extents (incompat 0x80) change nothing here (drafts/s27/
+        // re-datawrite.md 1, 3: holes made and extended with flags 0).
+        if u64a(sb, 0x50) != 0 {
+            return Err("not implemented: writes on a volume with a quota (the low-space state)".into());
         }
     }
     let v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
     if dstream_of(&v)?.is_some() || u16::from_le_bytes([v[INO_MODE], v[INO_MODE + 1]]) & S_IFMT != S_IFREG {
         return Err("not implemented: writes to a file that is not a new regular file".into());
     }
+    if u64a(&v, INO_INTERNAL_FLAGS) & 0x410 != 0 || u32::from_le_bytes(v[0x44..0x48].try_into().unwrap()) & 0x4000_0020 == 0x4000_0020 {
+        return Err("not implemented: writes to a file with internal flags 0x410 (K 0x66a4410) or bsd_flags 0x40000020 (K 0x66fb37c)".into());
+    }
+    // The stream's crypto (drafts/s27/re-datawrite.md 0.1): the first
+    // write makes a per-file key's record; the appends add none.
+    let crypt = file_crypt(nx, vol, &v)?;
     let first = writes[0];
     if first % bs != 0 && first < 0x20000 {
         return Err("not implemented: a first write on the direct path followed by more".into());
@@ -1927,7 +2094,13 @@ pub fn write_appends(nx: &mut Nx<'_>, vol: usize, ino: u64, writes: &[u64], src:
         let mut v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
         let mut x = xfields(&v)?;
         if k == 0 {
-            x.push((INO_EXT_TYPE_DSTREAM, XF_SYSTEM_FIELD, vec![0u8; 0x28]));
+            if let Crypt::Key(f) = crypt {
+                let cs = class4_crypto_state(nx, vol)?;
+                put_rec(nx, vol, &(f | J_CRYPTO_STATE << 60).to_le_bytes(), &cs)?;
+            }
+            let mut dsx = vec![0u8; 0x28];
+            dsx.put64(0x10, crypt.id());
+            x.push((INO_EXT_TYPE_DSTREAM, XF_SYSTEM_FIELD, dsx));
             put_rec(nx, vol, &(oid | J_DSTREAM_ID << 60).to_le_bytes(), &1u32.to_le_bytes())?;
             a = e.div_ceil(bs) * bs;
             put_rec(nx, vol, &fext_key(oid, 0), &fext_val(a, 0))?;
@@ -1948,8 +2121,11 @@ pub fn write_appends(nx: &mut Nx<'_>, vol: usize, ino: u64, writes: &[u64], src:
                 _ => return Err("a stream with no extent at its allocated end".into()),
             };
             let (l, len, p) = (u64a(&lk, 8), u64a(&lv, 0) & 0x00ff_ffff_ffff_ffff, u64a(&lv, 8));
-            if l + len != a || u64a(&lv, 0) >> 56 != 0 {
-                return Err("not implemented: a stream whose last extent does not end at its allocated size, or a flagged one".into());
+            // A pushed data extent with the volume's key carries
+            // FEXT_CRYPTO_ID_IS_TWEAK (flag byte 1).
+            let flags = u64a(&lv, 0) >> 56;
+            if l + len != a || !(flags == 0 || (flags == 1 && p != 0 && crypt == Crypt::Vek)) {
+                return Err("not implemented: a stream whose last extent does not end at its allocated size, or one of other flags".into());
             }
             if p == 0 {
                 put_rec(nx, vol, &lk, &fext_val(len + new_a - a, 0))?;
@@ -2313,6 +2489,221 @@ pub fn set_decmpfs_xattr(nx: &mut Nx<'_>, vol: usize, ino: u64, data: &[u8], now
     fs_tx_leave(nx, vol, now)
 }
 
+/// The key of inode `ino`'s extended attribute `name`.
+fn xattr_key(ino: u64, name: &str) -> Vec<u8> {
+    let mut k = (ino | J_XATTR << 60).to_le_bytes().to_vec();
+    k.extend_from_slice(&(name.len() as u16 + 1).to_le_bytes());
+    k.extend_from_slice(name.as_bytes());
+    k.push(0);
+    k
+}
+
+/// The value of inode `ino`'s extended attribute `name` as its record
+/// holds it (flags, length, then the data, or the stream's identifier and
+/// `j_dstream`).
+pub fn xattr_record(nx: &mut Nx<'_>, vol: usize, ino: u64, name: &str) -> Result<Option<Vec<u8>>, String> {
+    get_rec(nx, vol, &xattr_key(ino, name))
+}
+
+/// The first `size` bytes of stream `oid` on unencrypted volume `vol`,
+/// read through its extents.
+pub fn read_stream(nx: &mut Nx<'_>, vol: usize, oid: u64, size: u64) -> Result<Vec<u8>, String> {
+    let bs = nx.l.bs;
+    {
+        let (sb, _) = nx.vol_sb_read(vol)?;
+        if u64a(sb, SB_FS_FLAGS) & 1 == 0 {
+            return Err("not implemented: reading a stream of an encrypted volume".into());
+        }
+    }
+    let mut out = vec![0u8; size as usize];
+    let mut pos = 0u64;
+    while pos < size {
+        let (l, len, p) = extent_at(nx, vol, oid, pos)?.ok_or("a stream read past its extents")?;
+        let run = (l + len - pos).min(size - pos);
+        if p != 0 {
+            let first = (pos - l) / bs;
+            let skip = (pos - l) % bs;
+            let mut b = vec![0u8; ((run + skip).div_ceil(bs) * bs) as usize];
+            nx.read_data(p + first, &mut b)?;
+            out[pos as usize..(pos + run) as usize].copy_from_slice(&b[skip as usize..(skip + run) as usize]);
+        }
+        pos += run;
+    }
+    Ok(out)
+}
+
+/// `setxattr(path, "com.apple.ResourceFork", data, len, pos,
+/// XATTR_NOFOLLOW)` by root on regular file `ino`, not compressed, whose
+/// fork is absent (`pos` 0) or `pos` bytes long (an append)
+/// (apfs_vnop_setxattr K 0x6699610 → K 0x665fac0 → K 0x665d844;
+/// drafts/s27/re-datawrite.md 0.2, 5):
+/// - T1, a new stream (alloc_and_set_xattr K 0x665e120 with end 0): one
+///   file-system transaction taking the stream's identifier X from
+///   next_obj_id, its crypto by the file's class (the volume's key, or for
+///   class 4 a per-file key X with its crypto-state record, K 0x66f441c),
+///   the xattr record {DATA_STREAM, X, size 0, allocated 0, C, 0, 0}
+///   (update_parent_xattr K 0x669d8d8 mode 2), and the file's
+///   INODE_NO_RSRC_FORK cleared, the file rewritten;
+/// - T2 (K 0x665e120 again, the stream existing), when the allocation
+///   ends before the write's: alloc_space flags 0 from the allocated end
+///   (grow-ahead when at most 16 blocks are wanted, the stream is 64 KiB or
+///   more and a second has passed since its creation time 0, AS l.222-238),
+///   pieces as the space manager grants them, each counted, extending the
+///   data extent before it when physically contiguous (flags and crypto
+///   kept, no key reference) or a new data extent keyed by X (a reference on
+///   a per-file key), its block references owned by the file; the record's
+///   allocated size (mode 0: no file write);
+/// - the data pushed by the cluster layer through the allocated extents,
+///   no transaction (the last block zero-filled past the end); then one
+///   clock reading for the file's modification and change times (K
+///   0x66f3750);
+/// - T3: the record's size and bytes written (mode 1), the file's
+///   INODE_HAS_RSRC_FORK set and the file written when it was not, its
+///   write generation counted and the file written again (K 0x665e098).
+/// No j_dstream_id record and no DSTREAM field for the stream.
+pub fn setxattr_rsrc_fork(nx: &mut Nx<'_>, vol: usize, ino: u64, pos: u64, data: &[u8], now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    const NAME: &str = "com.apple.ResourceFork";
+    const INODE_HAS_RSRC_FORK: u64 = 0x4000;
+    let bs = nx.l.bs;
+    check_write_volume(nx, vol)?;
+    let k = xattr_key(ino, NAME);
+    let f = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
+    if u16::from_le_bytes([f[INO_MODE], f[INO_MODE + 1]]) & S_IFMT != S_IFREG || data.is_empty() {
+        return Err("not implemented: a resource fork set on other than a regular file, or an empty one".into());
+    }
+    if u32::from_le_bytes(f[0x44..0x48].try_into().unwrap()) & 0x20 != 0 {
+        return Err("not implemented: a resource fork set on a compressed file (K 0x6684cc8)".into());
+    }
+    let (ro_compat, quota) = {
+        let (sb, _) = nx.vol_sb_read(vol)?;
+        (u64a(sb, SB_RO_COMPAT), u64a(sb, 0x50))
+    };
+    if quota != 0 {
+        return Err("not implemented: alloc_space on a volume with a quota (the low-space state at fs + 0x3ac)".into());
+    }
+    let xval = |x: u64, size: u64, alloced: u64, c: u64, written: u64| -> Vec<u8> {
+        let mut v = XATTR_DATA_STREAM.to_le_bytes().to_vec();
+        v.extend_from_slice(&0x30u16.to_le_bytes());
+        v.extend_from_slice(&x.to_le_bytes());
+        for q in [size, alloced, c, written, 0] {
+            v.extend_from_slice(&q.to_le_bytes());
+        }
+        v
+    };
+    let (x, crypt, mut size, mut alloced, mut written) = match get_rec(nx, vol, &k)? {
+        None => {
+            if pos != 0 {
+                return Err("not implemented: a resource fork's first setxattr at a position past 0".into());
+            }
+            // T1.
+            fs_tx_enter(nx, vol)?;
+            let x = {
+                let sb = nx.vol_sb(vol)?;
+                let x = u64a(sb, SB_NEXT_OBJ_ID);
+                sb.put64(SB_NEXT_OBJ_ID, x + 1);
+                x
+            };
+            let crypt = stream_crypt(nx, vol, x, u32::from_le_bytes(f[0x3c..0x40].try_into().unwrap()), u64a(&f, INO_INTERNAL_FLAGS) & 0x8)?;
+            if let Crypt::Key(id) = crypt {
+                let cs = class4_crypto_state(nx, vol)?;
+                put_rec(nx, vol, &(id | J_CRYPTO_STATE << 60).to_le_bytes(), &cs)?;
+            }
+            put_rec(nx, vol, &k, &xval(x, 0, 0, crypt.id(), 0))?;
+            let mut fv = in_memory_inode(nx, vol, ino)?;
+            let fl = u64a(&fv, INO_INTERNAL_FLAGS);
+            if fl & INODE_NO_RSRC_FORK != 0 {
+                fv.put64(INO_INTERNAL_FLAGS, fl & !INODE_NO_RSRC_FORK);
+                put_rec(nx, vol, &inode_key(ino), &fv)?;
+            }
+            fs_tx_leave(nx, vol, now)?;
+            (x, crypt, 0, 0, 0)
+        }
+        Some(r) => {
+            if r.len() != 0x34 || u16::from_le_bytes([r[0], r[1]]) & XATTR_DATA_STREAM == 0 {
+                return Err("not implemented: a resource fork set over an embedded one".into());
+            }
+            let c = u64a(&r, 28);
+            let x = u64a(&r, 4);
+            let crypt = match c {
+                0 => Crypt::None,
+                4 => Crypt::Vek,
+                id if id == x => Crypt::Key(x),
+                id => return Err(format!("a resource fork stream of crypto identifier {id:#x}")),
+            };
+            (x, crypt, u64a(&r, 12), u64a(&r, 20), u64a(&r, 36))
+        }
+    };
+    if pos != size {
+        return Err("not implemented: a resource fork setxattr other than at the stream's end (headOff, holes)".into());
+    }
+    let end = pos + data.len() as u64;
+    let r_end = end.div_ceil(bs) * bs;
+    // T2.
+    if alloced < r_end {
+        fs_tx_enter(nx, vol)?;
+        let mut want = (r_end - alloced) / bs;
+        if want - 1 < 16 && size >= 0x10000 && now() >= 1_000_000_000 {
+            want += grow_ahead(alloced, end, bs, ro_compat) / bs;
+        }
+        let mut got_total = 0;
+        while got_total < want {
+            let (p, g) = nx.alloc_data(want - got_total)?;
+            blocks_alloced(nx, vol, g)?;
+            let logical = alloced + got_total * bs;
+            let prev = if logical == 0 { None } else { extent_at(nx, vol, x, logical - 1)? };
+            match prev {
+                Some((l, len, pp)) if pp != 0 && l + len == logical && pp + len / bs == p => {
+                    let mut v = get_rec(nx, vol, &fext_key(x, l))?.ok_or("an extent read back missing")?;
+                    let lf = u64a(&v, 0) + g * bs;
+                    v.put64(0, lf);
+                    put_rec(nx, vol, &fext_key(x, l), &v)?;
+                }
+                _ => {
+                    crypto_ref(nx, vol, crypt)?;
+                    put_rec(nx, vol, &fext_key(x, logical), &data_fext_val(g * bs, p, crypt))?;
+                }
+            }
+            phys_extent_add(nx, vol, p, g, ino)?;
+            got_total += g;
+        }
+        alloced += want * bs;
+        put_rec(nx, vol, &k, &xval(x, size, alloced, crypt.id(), written))?;
+        fs_tx_leave(nx, vol, now)?;
+    }
+    // The push: the bytes, zeros to the last block's end, through the
+    // extents.
+    let mut b = data.to_vec();
+    b.resize((r_end - pos) as usize, 0);
+    let mut off = pos;
+    while off < r_end {
+        let (l, len, p) = extent_at(nx, vol, x, off)?.ok_or("a resource fork push past its extents")?;
+        if p == 0 {
+            return Err("a resource fork push into a hole".into());
+        }
+        let run = (l + len - off).min(r_end - off);
+        nx.write_data(p + (off - l) / bs, &b[(off - pos) as usize..(off - pos + run) as usize])?;
+        off += run;
+    }
+    size = end;
+    written += data.len() as u64;
+    let c = now();
+    // T3.
+    fs_tx_enter(nx, vol)?;
+    put_rec(nx, vol, &k, &xval(x, size, alloced, crypt.id(), written))?;
+    let mut fv = in_memory_inode(nx, vol, ino)?;
+    fv.put64(INO_MOD_TIME, c);
+    fv.put64(INO_CHANGE_TIME, c);
+    let fl = u64a(&fv, INO_INTERNAL_FLAGS);
+    if fl & INODE_HAS_RSRC_FORK == 0 {
+        fv.put64(INO_INTERNAL_FLAGS, fl | INODE_HAS_RSRC_FORK);
+        put_rec(nx, vol, &inode_key(ino), &fv)?;
+    }
+    let wgc = u32::from_le_bytes(fv[INO_WRITE_GEN..INO_WRITE_GEN + 4].try_into().unwrap());
+    fv.put32(INO_WRITE_GEN, wgc.wrapping_add(1));
+    put_rec(nx, vol, &inode_key(ino), &fv)?;
+    fs_tx_leave(nx, vol, now)
+}
+
 /// FSIOC_CAS_BSDFLAGS from `expected` to `new` (handle_cas_bsdflags K
 /// 0x66e0088; drafts/s23/re-user-copy.md 2.7): setting UF_COMPRESSED on a
 /// file with a valid decmpfs attribute first truncates it to its (equal)
@@ -2331,8 +2722,11 @@ pub fn cas_bsdflags(nx: &mut Nx<'_>, vol: usize, ino: u64, expected: u32, new: u
         k.extend_from_slice(b"com.apple.decmpfs\0");
         let x = get_rec(nx, vol, &k)?.ok_or("not implemented: UF_COMPRESSED on a file without a decmpfs attribute")?;
         let d = &x[4..];
-        if x[0..2] != 2u16.to_le_bytes() || d.len() < 16 || &d[0..4] != b"fpmc" || u32::from_le_bytes(d[4..8].try_into().unwrap()) != 9 {
-            return Err("not implemented: UF_COMPRESSED with a decmpfs attribute other than an embedded type 9".into());
+        // Type 9 (the data in the header) and type 4 (in the resource fork)
+        // take the same steps (drafts/s27/re-bomcopy.md 4.5).
+        let ty = if d.len() >= 8 { u32::from_le_bytes(d[4..8].try_into().unwrap()) } else { 0 };
+        if x[0..2] != 2u16.to_le_bytes() || d.len() < 16 || &d[0..4] != b"fpmc" || (ty != 9 && ty != 4) {
+            return Err("not implemented: UF_COMPRESSED with a decmpfs attribute other than an embedded type 9 or 4".into());
         }
         usize_ = u64a(d, 8);
         truncate_same(nx, vol, ino, now)?;
@@ -2890,6 +3284,15 @@ pub fn remove_moved_trees(nx: &mut Nx<'_>, vol: usize, now: &mut dyn FnMut() -> 
         Ok(())
     }
     copy(nx, vol, var, "", now)?;
+    removefile_moved(nx, vol, var, now)
+}
+
+/// fixup_var's second removal phase on System (volume `vol`, its
+/// /private/var directory `var`): `removefile(REMOVEFILE_RECURSIVE)` of
+/// each moved tree in the list's order (fts, physical, no comparator), its
+/// directories removed after their contents; a tree not there is skipped.
+pub fn removefile_moved(nx: &mut Nx<'_>, vol: usize, var: u64, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    const DT_DIR: u16 = 4;
     fn remove_tree(nx: &mut Nx<'_>, vol: usize, dir: u64, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
         for (k, ino, ty) in read_dir(nx, vol, dir)? {
             if ty != DT_DIR {

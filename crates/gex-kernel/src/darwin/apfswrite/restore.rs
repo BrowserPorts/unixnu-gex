@@ -69,6 +69,7 @@ pub fn stand_ins(os: bool, boot: bool) -> Vec<&'static str> {
         v.push(fsops::PER_FILE_KEY_STAND_IN);
         v.push(USERSESSION_STAND_IN);
         v.push(RESTORE_OPTIONS_STAND_IN);
+        v.push(BOM_STAND_IN);
     }
     v
 }
@@ -239,15 +240,19 @@ pub fn build_disk0_with(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() ->
         // MKBKeyBagCreateSystem writes nothing with enhanced APFS, then the
         // system data volume's bootstrap.
         aks_bootstrap_fs(&mut nx, data, now)?;
+        // Then the copy of /private/var, interleaved with System's
+        // removals; restore_ota_logs (0x1000367e0) has no saved logs on a
+        // device with no previous install and touches no volume; then
+        // create_partition_mountpoints.
+        fixup_var_copy(&mut nx, system, data, now)?;
+        create_partition_mountpoints(&mut nx, system, data, &RestoreOptions::DEFAULTS, now)?;
     }
     if os.is_none() {
         missing.push("the Data and User volumes (newfs_apfs -P), made after apfs_invert".into());
     }
-    // 7. create_partition_mountpoints makes what it does not find, so it
-    // runs only on the Data volume BOM's copy leaves (/hardware is the
-    // copy's).
+    // 7.
     missing.push(if os.is_some() {
-        "the restore's later steps, in its order: check_mounted's fixup_var (BOM's copy of /private/var interleaved with remove_moved_trees), then create_partition_mountpoints' /mnt2/internal (implemented, run once the copy before it is), populate_preboot_volume, apfs_sealvolume and the update snapshot".into()
+        "the restore's later steps, in its order: populate_preboot_volume, set_autoboot_delay's sync, seal_system_volume (its unmounts and apfs_sealvolume), create_system_snapshot, migrate_user_fsevents' mounts and unmount_filesystems".into()
     } else {
         "the restore's later writes to Preboot (install_kernel_cache's boot objects, populate_preboot_volume, install_splat's cryptex1) and Data's contents".into()
     });
@@ -260,8 +265,11 @@ pub fn build_disk0_with(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() ->
     // Times the kernel still holds in memory: the next rewrite of their
     // inodes (for Data's /keybags, aks_bootstrap_fs's class change in
     // fixup_var, drafts/s26/re-aks-data.md 1) is not reached.
-    for (&(v, ino), &(m, c)) in &nx.jobj_times {
-        missing.push(format!("the times inode {ino:#x} of volume slot {v} holds in memory (modification {m}, change {c}), written by its next rewrite"));
+    let mut slots: Vec<usize> = nx.jobj_times.keys().map(|k| k.0).collect();
+    slots.dedup();
+    for v in slots {
+        let held: Vec<String> = nx.jobj_times.iter().filter(|(k, _)| k.0 == v).map(|(k, t)| format!("{:#x} ({}, {})", k.1, t.0, t.1)).collect();
+        missing.push(format!("the times {} inodes of volume slot {v} hold in memory (modification, change), written by their next rewrite, a sync pass or their vnodes' reclaim: {}", held.len(), held.join(", ")));
     }
     missing.push("nx_counters[0] and block 0's nx_newest_mounted_version as the kernel's transactions leave them (projected from newfs_apfs's three counting sites; the kext has ten)".into());
     nx.unmount()?;
@@ -1304,6 +1312,190 @@ fn aks_bootstrap_fs(nx: &mut Nx<'_>, data: usize, now: &mut dyn FnMut() -> u64) 
     let root = fsops::lookup(nx, data, ROOT_INO, "root")?.ok_or("no /mnt2/root after the bootstrap map")?;
     let g = gid_of(nx, root)?;
     fsops::create(nx, data, root, ".bootstrapped", 0o644, 0, g, now)?.map_err(|e| format!("create /mnt2/root/.bootstrapped: errno {e}"))?;
+    Ok(())
+}
+
+/// What fixup_var's copy of /private/var onto Data takes from the device
+/// run and from what is not traced (drafts/s27/re-bomcopy.md UNSETTLED,
+/// drafts/s27/re-datawrite.md UNSETTLED).
+pub const BOM_STAND_IN: &str = "what fixup_var's BOM copy of /private/var onto Data takes from the run (drafts/s27/re-bomcopy.md, re-datawrite.md): mktemp's random temporary names, which decide where their directory records sit until the rename (stand-in .BC.T_AAAAAA for files, .BC.D_AAAAAA for the link), the kernel's readdir order of a System directory whose files the copy unlinks as it goes (stand-in: key order, resumed after the last entry read), listxattr's order and its hiding of com.apple.fs.symlink (stand-in: the attribute records' key order, the link's target attribute not listed), when the change times the renames of the copied plain files leave in memory are written (a sync pass or the vnode's reclaim: listed as pending), and for the files written in several 128 KiB writes the cluster layer's sizes and pushes (as CLUSTER_STAND_IN's) and whether a second passes between a file's creation and an append, which starts grow-ahead (stand-in: the clock of the machine building the image); measure /private/var on a restored device, and a kdebug trace of the copy";
+
+/// BOM's temporary names ([`BOM_STAND_IN`]).
+const BOM_FILE_TEMP: &str = ".BC.T_AAAAAA";
+const BOM_LINK_TEMP: &str = ".BC.D_AAAAAA";
+
+/// fixup_var's copy of /mnt1/private/var onto /mnt2 (Bom's legacy engine,
+/// drafts/s27/re-bomcopy.md 0.1, 2; drafts/s27/re-datawrite.md 0) with
+/// restored's handler unlinking each copied regular file under a moved
+/// tree from System (drafts/s18/re-unlink-order.md), then removefile of
+/// the moved trees. The walk takes System's directories in readdir order
+/// onto Data's root, which is never changed itself:
+/// - a directory not on Data (only one under a directory BOM found there
+///   is looked for): mkdir 0777 (its parent's group), lchown, chmod to its
+///   mode, its contents, then setattrlist of its modification and access
+///   times; one there is walked into and left as it is;
+/// - a regular file: a temporary file opened O_CREAT|O_EXCL 0600, a plain
+///   one's data written in writes of at most 0x20000 bytes and the close,
+///   a compressed one given no data but its attributes in listxattr's
+///   order by setxattr in chunks of at most 8 MiB (the resource fork's
+///   stream, the decmpfs header embedded); lchown, chmod, setattrlist of its
+///   times; the rename into place; for a compressed one the flags'
+///   compare-and-swap to UF_COMPRESSED and its times again. A plain file
+///   keeps the change time its rename left in memory;
+/// - a symbolic link: made under a temporary name (mode 0777), renamed,
+///   lchown and lchmod.
+pub fn fixup_var_copy(nx: &mut Nx<'_>, system: usize, data: usize, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    let var = resolve(nx, system, "private/var")?.ok_or("no /mnt1/private/var")?;
+    let mut linked = std::collections::BTreeSet::new();
+    copy_dir(nx, system, data, var, ROOT_INO, "", true, &mut linked, now)?;
+    fsops::removefile_moved(nx, system, var, now)
+}
+
+/// An object's owner, group, mode, BSD flags, modification and access
+/// times and link count, as stat gives them.
+struct SrcStat {
+    uid: u32,
+    gid: u32,
+    mode: u16,
+    flags: u32,
+    mtime: u64,
+    atime: u64,
+    nlink: u32,
+}
+
+fn src_stat(nx: &mut Nx<'_>, vol: usize, ino: u64) -> Result<SrcStat, String> {
+    let v = fsops::inode(nx, vol, ino)?;
+    let q = |o: usize| u64::from_le_bytes(v[o..o + 8].try_into().unwrap());
+    let d = |o: usize| u32::from_le_bytes(v[o..o + 4].try_into().unwrap());
+    Ok(SrcStat { uid: d(0x48), gid: d(0x4c), mode: u16::from_le_bytes([v[0x50], v[0x51]]), flags: d(0x44), mtime: q(0x18), atime: q(0x28), nlink: d(0x38) })
+}
+
+/// An attribute's whole value on unencrypted volume `vol`: embedded, or
+/// read from its stream.
+fn xattr_value(nx: &mut Nx<'_>, vol: usize, ino: u64, name: &str) -> Result<Vec<u8>, String> {
+    let r = fsops::xattr_record(nx, vol, ino, name)?.ok_or_else(|| format!("no attribute {name}"))?;
+    if u16::from_le_bytes([r[0], r[1]]) & 1 != 0 {
+        let q = |o: usize| u64::from_le_bytes(r[o..o + 8].try_into().unwrap());
+        fsops::read_stream(nx, vol, q(4), q(12))
+    } else {
+        Ok(r[4..4 + u16::from_le_bytes([r[2], r[3]]) as usize].to_vec())
+    }
+}
+
+/// `__copyFromDirToDir` (BOM@0x2d714) of System's directory `sdir` (at
+/// /private/var/`rel`) onto Data's `ddir`, `preexisted` when BOM found
+/// `ddir` there ([`fixup_var_copy`]).
+#[allow(clippy::too_many_arguments)]
+fn copy_dir(nx: &mut Nx<'_>, system: usize, data: usize, sdir: u64, ddir: u64, rel: &str, preexisted: bool, linked: &mut std::collections::BTreeSet<u64>, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    use fsops::SetAttr;
+    const DT_DIR: u16 = 4;
+    const DT_REG: u16 = 8;
+    const DT_LNK: u16 = 10;
+    let ids = |s: &SrcStat| SetAttr { uid: Some(s.uid), gid: Some(s.gid), ..Default::default() };
+    let times = |s: &SrcStat| SetAttr { mtime: Some(s.mtime), atime: Some(s.atime), ..Default::default() };
+    let moved = |path: &str| fsops::MOVED_FROM_VAR.iter().any(|m| path.starts_with(&format!("{m}/")));
+    for (k, ino, ty) in fsops::read_dir(nx, system, sdir)? {
+        let nl = (u32::from_le_bytes(k[8..12].try_into().unwrap()) & 0x3ff) as usize;
+        let name = std::str::from_utf8(&k[12..12 + nl - 1]).map_err(|_| "a /private/var name that is not UTF-8")?.to_string();
+        if name.starts_with(".nfs") || name.starts_with(".afpDeleted") {
+            continue;
+        }
+        let path = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
+        if ty == DT_REG && name.starts_with("._") {
+            return Err(format!("not implemented: an AppleDouble file BOM copies after its directory (/private/var/{path})"));
+        }
+        let exists = if preexisted { fsops::lookup(nx, data, ddir, &name)? } else { None };
+        let s = src_stat(nx, system, ino)?;
+        let xattrs = fsops::xattr_names(nx, system, ino)?;
+        let pgid = u32::from_le_bytes(fsops::inode(nx, data, ddir)?[0x4c..0x50].try_into().unwrap());
+        match ty {
+            DT_DIR => {
+                if let Some(d) = exists {
+                    if u16::from_le_bytes(fsops::inode(nx, data, d)?[0x50..0x52].try_into().unwrap()) & 0o170000 != 0o040000 {
+                        return Err(format!("BOM meeting a non-directory at /mnt2/{path} (a conflict: the copy fails)"));
+                    }
+                    copy_dir(nx, system, data, ino, d, &path, true, linked, now)?;
+                    continue;
+                }
+                if !xattrs.is_empty() || s.flags != 0 || s.mode & 0o700 != 0o700 {
+                    return Err(format!("not implemented: copying a directory with extended attributes, flags or without owner rwx (/private/var/{path})"));
+                }
+                let d = fsops::mkdir(nx, data, ddir, &name, 0o777, 0, pgid, now)?.map_err(|e| format!("mkdir /mnt2/{path}: errno {e}"))?;
+                fsops::setattr(nx, data, d, ids(&s), now)?;
+                fsops::chmod(nx, data, d, s.mode & 0o7777, now)?;
+                copy_dir(nx, system, data, ino, d, &path, false, linked, now)?;
+                fsops::setattr(nx, data, d, times(&s), now)?;
+            }
+            DT_REG => {
+                if exists.is_some() {
+                    return Err(format!("not implemented: BOM meeting an existing file at /mnt2/{path}"));
+                }
+                if s.nlink > 1 && !linked.insert(ino) {
+                    return Err(format!("not implemented: a second link to a copied file (BOM's link(2) of /mnt2/{path})"));
+                }
+                let compressed = s.flags & 0x4000_0020 == 0x20;
+                if s.flags & !0x20 != 0 {
+                    return Err(format!("not implemented: copying a file with BSD flags {:#x} (/private/var/{path})", s.flags));
+                }
+                let t = fsops::create(nx, data, ddir, BOM_FILE_TEMP, 0o600, 0, pgid, now)?.map_err(|e| format!("open /mnt2/{rel}/{BOM_FILE_TEMP}: errno {e}"))?;
+                if compressed {
+                    for x in &xattrs {
+                        let value = xattr_value(nx, system, ino, x)?;
+                        match x.as_str() {
+                            "com.apple.ResourceFork" => {
+                                for (i, chunk) in value.chunks(0x80_0000).enumerate() {
+                                    fsops::setxattr_rsrc_fork(nx, data, t, (i * 0x80_0000) as u64, chunk, now)?;
+                                }
+                            }
+                            "com.apple.decmpfs" if value.len() <= 0x80_0000 => fsops::set_decmpfs_xattr(nx, data, t, &value, now)?,
+                            _ => return Err(format!("not implemented: copying the attribute {x} (/private/var/{path})")),
+                        }
+                    }
+                } else {
+                    if !xattrs.is_empty() {
+                        return Err(format!("not implemented: copying a plain file's extended attributes (/private/var/{path})"));
+                    }
+                    let sv = fsops::inode(nx, system, ino)?;
+                    let size = fsops::dstream_size(&sv)?;
+                    if size != 0 {
+                        let bytes = fsops::read_stream(nx, system, u64::from_le_bytes(sv[8..16].try_into().unwrap()), size)?;
+                        let writes: Vec<u64> = (0..size).step_by(0x20000).map(|o| (size - o).min(0x20000)).collect();
+                        if writes.len() == 1 {
+                            fsops::write_first(nx, data, t, &bytes, &cluster_pushes, now)?;
+                        } else {
+                            let (c, m) = cluster_sizes();
+                            fsops::write_appends(nx, data, t, &writes, &bytes, c, m, now)?;
+                        }
+                    }
+                }
+                fsops::setattr(nx, data, t, ids(&s), now)?;
+                fsops::chmod(nx, data, t, s.mode & 0o7777, now)?;
+                fsops::setattr(nx, data, t, times(&s), now)?;
+                let rt = fsops::rename_in_dir(nx, data, ddir, BOM_FILE_TEMP, &name, t, now)?;
+                if compressed {
+                    fsops::cas_bsdflags(nx, data, t, 0, 0x20, now)?;
+                    fsops::setattr(nx, data, t, times(&s), now)?;
+                } else {
+                    nx.jobj_times.insert((data, t), rt.file);
+                }
+                if moved(&path) {
+                    fsops::unlink(nx, system, sdir, &k, ino, now)?;
+                }
+            }
+            DT_LNK => {
+                if exists.is_some() || moved(&path) || xattrs.iter().any(|x| x != "com.apple.fs.symlink") {
+                    return Err(format!("not implemented: a link meeting an existing name, under a moved tree or with extended attributes (/private/var/{path})"));
+                }
+                let r = fsops::xattr_embedded(nx, system, ino, "com.apple.fs.symlink")?.ok_or("a symbolic link with no target")?;
+                let target = std::str::from_utf8(r.strip_suffix(&[0]).unwrap_or(&r)).map_err(|_| "a link target that is not UTF-8")?.to_string();
+                let l = fsops::symlink(nx, data, ddir, BOM_LINK_TEMP, &target, 0o777, 0, pgid, now)?.map_err(|e| format!("symlink /mnt2/{rel}/{BOM_LINK_TEMP}: errno {e}"))?;
+                fsops::rename_in_dir(nx, data, ddir, BOM_LINK_TEMP, &name, l, now)?;
+                fsops::setattr(nx, data, l, ids(&s), now)?;
+                fsops::chmod(nx, data, l, s.mode & 0o7777, now)?;
+            }
+            _ => return Err(format!("not implemented: copying an object of type {ty} (/private/var/{path})")),
+        }
+    }
     Ok(())
 }
 
@@ -2356,44 +2548,61 @@ mod tests {
                 b[0x448..0x450].fill(0);
             });
             let vom = Omap::open(&c, q(&sb, 0x80)).unwrap();
-            let leaf = raw(vom.tree.root_oid);
-            assert_eq!(u16::from_le_bytes([leaf[0x22], leaf[0x23]]), 0, "a volume object map of more than one node");
-            let nk = u32::from_le_bytes(leaf[0x24..0x28].try_into().unwrap()) as usize;
-            let paddr_of = |i: usize| {
-                let vo = u16::from_le_bytes([leaf[0x38 + 4 * i + 2], leaf[0x38 + 4 * i + 3]]) as usize;
-                q(&leaf, 4096 - 0x28 - vo + 8)
-            };
-            let ids: Vec<u64> = (0..nk).flat_map(|i| per_file_ids(&raw(paddr_of(i)))).collect();
-            for i in 0..nk {
-                let vo = u16::from_le_bytes([leaf[0x38 + 4 * i + 2], leaf[0x38 + 4 * i + 3]]) as usize;
-                let at = 4096 - 0x28 - vo;
-                let fl = u32::from_le_bytes(leaf[at..at + 4].try_into().unwrap());
-                let paddr = q(&leaf, at + 8);
+            // The object map's leaves (a root holds the tree's info at its
+            // end; an index node's values are its children's addresses).
+            let vend = |b: &[u8]| if u16::from_le_bytes([b[0x20], b[0x21]]) & 1 != 0 { 4096 - 0x28 } else { 4096 };
+            let mut leaves = Vec::new();
+            let mut stack = vec![vom.tree.root_oid];
+            while let Some(p) = stack.pop() {
+                let b = raw(p);
+                let n = u32::from_le_bytes(b[0x24..0x28].try_into().unwrap()) as usize;
+                if u16::from_le_bytes([b[0x22], b[0x23]]) == 0 {
+                    leaves.push(p);
+                    continue;
+                }
+                for i in (0..n).rev() {
+                    let vo = u16::from_le_bytes([b[0x38 + 4 * i + 2], b[0x38 + 4 * i + 3]]) as usize;
+                    stack.push(q(&b, vend(&b) - vo));
+                }
+            }
+            // Each mapping: (flags' offset in its leaf, oid, paddr).
+            let maps = |leaf: &[u8]| -> Vec<(usize, u64, u64)> {
+                let nk = u32::from_le_bytes(leaf[0x24..0x28].try_into().unwrap()) as usize;
                 let kstart = 0x38 + u16::from_le_bytes([leaf[0x2a], leaf[0x2b]]) as usize;
-                let oid = q(&leaf, kstart + u16::from_le_bytes([leaf[0x38 + 4 * i], leaf[0x38 + 4 * i + 1]]) as usize);
-                assert!(fl & 0x20 == 0 || unnamed.contains(&oid), "a secondary-root mapping of an object the superblock does not name");
-                let _ = oid;
-                rw(paddr, &|b| {
-                    let ty = u32::from_le_bytes(b[24..28].try_into().unwrap()) & !0x1000_0000;
-                    b[24..28].copy_from_slice(&ty.to_le_bytes());
-                    per_file_ids_cleared(b, &ids);
+                (0..nk)
+                    .map(|i| {
+                        let vo = u16::from_le_bytes([leaf[0x38 + 4 * i + 2], leaf[0x38 + 4 * i + 3]]) as usize;
+                        let at = vend(leaf) - vo;
+                        (at, q(leaf, kstart + u16::from_le_bytes([leaf[0x38 + 4 * i], leaf[0x38 + 4 * i + 1]]) as usize), q(leaf, at + 8))
+                    })
+                    .collect()
+            };
+            let ids: Vec<u64> = leaves.iter().flat_map(|&l| maps(&raw(l))).flat_map(|(_, _, p)| per_file_ids(&raw(p))).collect();
+            for &l in &leaves {
+                let leaf = raw(l);
+                for (at, oid, paddr) in maps(&leaf) {
+                    let fl = u32::from_le_bytes(leaf[at..at + 4].try_into().unwrap());
+                    assert!(fl & 0x20 == 0 || unnamed.contains(&oid), "a secondary-root mapping of an object the superblock does not name");
+                    rw(paddr, &|b| {
+                        let ty = u32::from_le_bytes(b[24..28].try_into().unwrap()) & !0x1000_0000;
+                        b[24..28].copy_from_slice(&ty.to_le_bytes());
+                        per_file_ids_cleared(b, &ids);
+                    });
+                }
+                rw(l, &|b| {
+                    for (at, _, _) in maps(b) {
+                        let fl = u32::from_le_bytes(b[at..at + 4].try_into().unwrap()) & !0x724;
+                        b[at..at + 4].copy_from_slice(&fl.to_le_bytes());
+                    }
                 });
             }
-            rw(vom.tree.root_oid, &|b| {
-                for i in 0..nk {
-                    let vo = u16::from_le_bytes([b[0x38 + 4 * i + 2], b[0x38 + 4 * i + 3]]) as usize;
-                    let at = 4096 - 0x28 - vo;
-                    let fl = u32::from_le_bytes(b[at..at + 4].try_into().unwrap()) & !0x724;
-                    b[at..at + 4].copy_from_slice(&fl.to_le_bytes());
-                }
-            });
         }
         (orphans, unnamed)
     }
 
     /// In the view, a one-leaf file-system tree's per-file crypto
-    /// identifiers (a data stream's default crypto identifier, the VEK's 4
-    /// or a per-file key's, and the extents' crypto field naming a per-file
+    /// identifiers (a data stream's or an attribute stream's default crypto
+    /// identifier, the VEK's 4 or a per-file key's, and the extents' crypto field naming a per-file
     /// key's crypto-state record or the block as the VEK's tweak) set to
     /// 0, as on an unencrypted volume;
     /// the records stay.
@@ -2448,6 +2657,11 @@ mod tests {
                         }
                         at += size.div_ceil(8) * 8;
                     }
+                }
+                // An attribute stream's j_xattr_dstream default crypto
+                // identifier.
+                4 if vl == 0x34 && u16::from_le_bytes([b[v], b[v + 1]]) & 1 != 0 && (ids.contains(&q(b, v + 28)) || q(b, v + 28) == 4) => {
+                    b[v + 28..v + 36].fill(0);
                 }
                 _ => {}
             }
@@ -2651,6 +2865,247 @@ mod tests {
         nx.unmount().unwrap();
         check("unmounted");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// fixup_var's copy of a small /private/var on System onto Data, with the
+    /// moved tree's removal (GEX_TEST_FSCK, GEX_TEST_SCRATCH; drafts/s27/
+    /// re-bomcopy.md, re-datawrite.md): a directory Data has left as it is
+    /// and walked into; new directories with the source's owners, modes and
+    /// times; plain files of class 3 (the volume's key: identifier 4, each
+    /// extent its own block as tweak) written once or in three appends, a
+    /// class-4 file (a per-file key, its record referenced per extent) of
+    /// two blocks, an empty file; a compressed file with its decmpfs header
+    /// and one with a resource fork stream; a symbolic link; the plain
+    /// files' rename times held in memory; the moved tree's file unlinked
+    /// and its directories removed from System. Then the device's and the
+    /// host's fsck_apfs -M and the host's on the unencrypted view.
+    #[test]
+    fn var_copy_makes_data_as_the_kernel_makes_it() {
+        let (Ok(dir), Ok(fsck)) = (std::env::var("GEX_TEST_SCRATCH"), std::env::var("GEX_TEST_FSCK")) else { return };
+        let dir = std::path::Path::new(&dir);
+        let path = dir.join(format!("gex-bom-{}", std::process::id()));
+        let blocks = 15_625_000u64;
+        let f = std::fs::OpenOptions::new().create(true).truncate(true).read(true).write(true).open(&path).unwrap();
+        f.set_len(blocks * 4096).unwrap();
+        let sink = super::super::HostFile(f, blocks * 4096);
+        let uuid = *b"gex-bom-copy-001";
+        let fm = container::format(&sink, 4096, blocks, uuid).unwrap();
+        let mut nx = Nx::formatted(&sink, &fm, uuid, Mode::Kernel).unwrap();
+        nx.mount_rw().unwrap();
+        let clock = std::cell::Cell::new(1_700_000_000_000_000_000u64);
+        let mut now = || {
+            clock.set(clock.get() + 1000);
+            clock.get()
+        };
+        let q = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+        let u = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        let kv = key_os_version(RESTORE_BUILD).unwrap();
+        let make = |nx: &mut Nx<'_>, name: &str, role: u16, encrypted: bool, now: &mut dyn FnMut() -> u64| {
+            let times = VolumeTimes { formatted: now(), root: now(), private: now(), modified: now() };
+            let o = nx.create_volume(&NewVolume { name: name.into(), role, encrypted, e_apfs: true, times, uid: 0, gid: 0, key_os_version: kv, size_bytes: None }).unwrap();
+            nx.commit().unwrap();
+            nx.fs_oid.iter().position(|&x| x == o).unwrap()
+        };
+        let pattern = |n: usize, seed: u8| -> Vec<u8> { (0..n).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed)).collect() };
+        // System's /private/var.
+        let system = make(&mut nx, "System", storage::role::SYSTEM, false, &mut now);
+        fsops::mount_rw(&mut nx, system, &mut now).unwrap();
+        let s = system;
+        let md = |nx: &mut Nx<'_>, parent: u64, name: &str, mode: u16, uid: u32, now: &mut dyn FnMut() -> u64| {
+            let d = fsops::mkdir(nx, s, parent, name, mode, 0, 0, now).unwrap().unwrap();
+            fsops::setattr(nx, s, d, fsops::SetAttr { uid: Some(uid), gid: Some(uid), ..Default::default() }, now).unwrap();
+            d
+        };
+        let private = md(&mut nx, ROOT_INO, "private", 0o755, 0, &mut now);
+        let var = md(&mut nx, private, "var", 0o755, 0, &mut now);
+        let logs = md(&mut nx, var, "logs", 0o770, 0, &mut now);
+        let a = fsops::write_new_file(&mut nx, s, logs, "a.log", 0o644, &pattern(5000, 1), &cluster_pushes, &mut now).unwrap();
+        let mobile = md(&mut nx, var, "mobile", 0o711, 501, &mut now);
+        let lib = md(&mut nx, mobile, "Library", 0o755, 501, &mut now);
+        fsops::write_new_file(&mut nx, s, lib, "small.plist", 0o644, &pattern(300, 2), &cluster_pushes, &mut now).unwrap();
+        fsops::create(&mut nx, s, lib, ".localized", 0o444, 0, 0, &mut now).unwrap().unwrap();
+        let fwd = fsops::create(&mut nx, s, mobile, ".forward", 0o444, 0, 0, &mut now).unwrap().unwrap();
+        let mut hdr9 = b"fpmc".to_vec();
+        hdr9.extend_from_slice(&9u32.to_le_bytes());
+        hdr9.extend_from_slice(&10u64.to_le_bytes());
+        hdr9.extend_from_slice(b"\xcc/dev/null\n");
+        fsops::set_decmpfs_xattr(&mut nx, s, fwd, &hdr9, &mut now).unwrap();
+        fsops::cas_bsdflags(&mut nx, s, fwd, 0, 0x20, &mut now).unwrap();
+        let db = md(&mut nx, var, "db", 0o755, 0, &mut now);
+        let tz = md(&mut nx, db, "timezone", 0o755, 0, &mut now);
+        let lt = fsops::symlink(&mut nx, s, tz, "localtime", "/var/db/timezone/zoneinfo/US/Pacific", 0o755, 0, 0, &mut now).unwrap().unwrap();
+        let ssa = md(&mut nx, var, "staged_system_apps", 0o755, 501, &mut now);
+        let app = md(&mut nx, ssa, "X.app", 0o755, 501, &mut now);
+        let big = pattern(0x40000 + 100, 3);
+        fsops::write_new_file(&mut nx, s, app, "big", 0o644, &pattern(1, 0), &cluster_pushes, &mut now).unwrap();
+        // The appended file on System: its bytes through a stream of its own.
+        let bigf = fsops::create(&mut nx, s, app, "Assets.car", 0o644, 0, 501, &mut now).unwrap().unwrap();
+        fsops::write_appends(&mut nx, s, bigf, &[0x20000, 0x20000, 100], &big, 0x10_0000, 0x10_0000, &mut now).unwrap();
+        let rf = fsops::create(&mut nx, s, app, "X", 0o755, 0, 501, &mut now).unwrap().unwrap();
+        let fork = pattern(9000, 4);
+        fsops::setxattr_rsrc_fork(&mut nx, s, rf, 0, &fork, &mut now).unwrap();
+        let mut hdr4 = b"fpmc".to_vec();
+        hdr4.extend_from_slice(&4u32.to_le_bytes());
+        hdr4.extend_from_slice(&20000u64.to_le_bytes());
+        fsops::set_decmpfs_xattr(&mut nx, s, rf, &hdr4, &mut now).unwrap();
+        fsops::cas_bsdflags(&mut nx, s, rf, 0, 0x20, &mut now).unwrap();
+        // Data, its /logs class D as aks_bootstrap_fs leaves it.
+        let data = make(&mut nx, "Data", storage::role::DATA, true, &mut now);
+        fsops::mount_rw(&mut nx, data, &mut now).unwrap();
+        let dlogs = fsops::mkdir(&mut nx, data, ROOT_INO, "logs", 0o755, 0, 0, &mut now).unwrap().unwrap();
+        fsops::set_dir_class(&mut nx, data, dlogs, 4, &mut now).unwrap();
+        nx.commit().unwrap();
+        let src = |nx: &mut Nx<'_>, ino: u64| fsops::inode(nx, s, ino).unwrap();
+        let (sa, sfwd, slt, srf, sbig) = (src(&mut nx, a), src(&mut nx, fwd), src(&mut nx, lt), src(&mut nx, rf), src(&mut nx, bigf));
+        let (smob, slib) = (src(&mut nx, mobile), src(&mut nx, lib));
+        let dlogs_before = fsops::inode(&mut nx, data, dlogs).unwrap();
+        fixup_var_copy(&mut nx, system, data, &mut now).unwrap();
+        // System: the moved tree gone, the rest there.
+        assert_eq!(fsops::lookup(&mut nx, s, var, "staged_system_apps").unwrap(), None);
+        assert!(fsops::lookup(&mut nx, s, lib, "small.plist").unwrap().is_some());
+        let walk = |nx: &mut Nx<'_>, p: &str| resolve(nx, data, p).unwrap().unwrap_or_else(|| panic!("no /mnt2/{p}"));
+        let ino = |nx: &mut Nx<'_>, p: &str| {
+            let i = walk(nx, p);
+            fsops::inode(nx, data, i).unwrap()
+        };
+        let fext = |nx: &mut Nx<'_>, oid: u64| -> Vec<(u64, Vec<u8>)> {
+            let (t, mut st) = nx.fs_tree(data).unwrap();
+            t.records(&mut st).unwrap().into_iter().filter(|(k, _)| k.len() == 16 && q(k, 0) == (oid | 8 << 60)).map(|(k, v)| (q(&k, 8), v.unwrap())).collect()
+        };
+        let ds = |v: &[u8]| -> Vec<u8> { v[v.len() - 0x28..].to_vec() };
+        let read = |nx: &mut Nx<'_>, oid: u64, size: usize| -> Vec<u8> {
+            let mut out = Vec::new();
+            for (_, v) in fext(nx, oid) {
+                let mut b = vec![0u8; (q(&v, 0) & 0x00ff_ffff_ffff_ffff) as usize];
+                if q(&v, 8) != 0 {
+                    nx.read_data(q(&v, 8), &mut b).unwrap();
+                }
+                out.extend_from_slice(&b);
+            }
+            out.truncate(size);
+            out
+        };
+        // The directory Data had: its own attributes kept; its child's
+        // create and rename counted (children, write generation +2), the
+        // rename's times held in memory.
+        let dl = fsops::inode(&mut nx, data, dlogs).unwrap();
+        assert_eq!((&dl[..0x18], &dl[0x28..0x38], &dl[0x3c..0x40], &dl[0x44..]), (&dlogs_before[..0x18], &dlogs_before[0x28..0x38], &dlogs_before[0x3c..0x40], &dlogs_before[0x44..]));
+        assert_eq!((u(&dl, 0x38), u(&dl, 0x40)), (u(&dlogs_before, 0x38) + 1, u(&dlogs_before, 0x40) + 2));
+        assert!(nx.jobj_times.contains_key(&(data, dlogs)));
+        // New directories: the source's owner, mode and times, class 0
+        // explicit under the root.
+        let m = ino(&mut nx, "mobile");
+        assert_eq!((u(&m, 0x48), u(&m, 0x4c), u16::from_le_bytes([m[0x50], m[0x51]]), u(&m, 0x3c), q(&m, 0x30)), (501, 501, 0o40711, 0, 0x8008));
+        assert_eq!((q(&m, 0x18), q(&m, 0x28)), (q(&smob, 0x18), q(&smob, 0x28)));
+        let l = ino(&mut nx, "mobile/Library");
+        assert_eq!((q(&l, 0x18), q(&l, 0x28), u(&l, 0x38)), (q(&slib, 0x18), q(&slib, 0x28), 2));
+        // A class-3 file written once: identifier 4, the block as tweak.
+        let sp = ino(&mut nx, "mobile/Library/small.plist");
+        assert_eq!((u(&sp, 0x3c), q(&sp, 0x30), q(&ds(&sp), 0), q(&ds(&sp), 0x10)), (3, 0x8000, 300, 4));
+        let e = fext(&mut nx, q(&sp, 8));
+        assert_eq!(e.len(), 1);
+        assert_eq!((q(&e[0].1, 0), q(&e[0].1, 16)), (4096 | 1 << 56, q(&e[0].1, 8)));
+        assert_eq!(read(&mut nx, q(&sp, 8), 300), pattern(300, 2));
+        assert!(get_crypto(&mut nx, data, q(&sp, 8)).is_none());
+        // Its rename's change time is held in memory, its times otherwise
+        // the source's.
+        let spi = walk(&mut nx, "mobile/Library/small.plist");
+        assert_eq!(nx.jobj_times.get(&(data, spi)).map(|t| t.0), Some(q(&sp, 0x18)));
+        let empty = ino(&mut nx, "mobile/Library/.localized");
+        assert_eq!((u16::from_le_bytes([empty[0x50], empty[0x51]]), fsops::dstream_size(&empty).unwrap()), (0o100444, 0));
+        // A class-4 file of two blocks: its own key, referenced per extent.
+        let al = ino(&mut nx, "logs/a.log");
+        assert_eq!((u(&al, 0x3c), q(&al, 0x30), q(&ds(&al), 0x10)), (4, 0x8008, q(&al, 8)));
+        let e = fext(&mut nx, q(&al, 8));
+        assert!(e.iter().all(|(_, v)| q(v, 16) == q(&al, 8) && q(v, 0) >> 56 == 0));
+        assert_eq!(u(&get_crypto(&mut nx, data, q(&al, 8)).unwrap(), 0) as usize, 1 + e.len());
+        assert_eq!(read(&mut nx, q(&al, 8), 5000), pattern(5000, 1));
+        assert_eq!((q(&al, 0x18), u(&al, 0x48)), (q(&sa, 0x18), 0));
+        // Three appends of class 3: pushed extents tweaked by their blocks.
+        let bc = walk(&mut nx, "staged_system_apps/X.app/Assets.car");
+        let b = fsops::inode(&mut nx, data, bc).unwrap();
+        assert_eq!((q(&ds(&b), 0), q(&ds(&b), 0x10), q(&ds(&b), 0x18)), (big.len() as u64, 4, big.len() as u64));
+        let e = fext(&mut nx, q(&b, 8));
+        assert!(e.iter().all(|(_, v)| q(v, 8) == 0 || (q(v, 0) >> 56 == 1 && q(v, 16) == q(v, 8))));
+        assert_eq!(read(&mut nx, q(&b, 8), big.len()), big);
+        assert_eq!((q(&b, 0x18), u(&b, 0x40)), (q(&sbig, 0x18), u(&sbig, 0x40)));
+        // The compressed files.
+        let fw = ino(&mut nx, "mobile/.forward");
+        assert_eq!((u(&fw, 0x44), q(&fw, 0x30), u(&fw, 0x3c), q(&fw, 0x54), q(&fw, 0x18)), (0x20, 0x4_8000, 3, 10, q(&sfwd, 0x18)));
+        assert_eq!({
+            let i = walk(&mut nx, "mobile/.forward");
+            fsops::xattr_embedded(&mut nx, data, i, "com.apple.decmpfs")
+        }.unwrap(), Some(hdr9.clone()));
+        let xi = walk(&mut nx, "staged_system_apps/X.app/X");
+        let x = fsops::inode(&mut nx, data, xi).unwrap();
+        assert_eq!((u(&x, 0x44), q(&x, 0x30), q(&x, 0x54), u16::from_le_bytes([x[0x50], x[0x51]])), (0x20, 0x4_4000, 20000, u16::from_le_bytes([srf[0x50], srf[0x51]])));
+        let r = fsops::xattr_record(&mut nx, data, xi, "com.apple.ResourceFork").unwrap().unwrap();
+        assert_eq!((u16::from_le_bytes([r[0], r[1]]), u16::from_le_bytes([r[2], r[3]]), q(&r, 12), q(&r, 20), q(&r, 28), q(&r, 36)), (1, 0x30, 9000, 3 * 4096, 4, 9000));
+        let e = fext(&mut nx, q(&r, 4));
+        assert!(e.iter().all(|(_, v)| q(v, 0) >> 56 == 1 && q(v, 16) == q(v, 8)));
+        assert_eq!(read(&mut nx, q(&r, 4), fork.len()), fork);
+        // The link: class 0, the source's mode, its target.
+        let lk = ino(&mut nx, "db/timezone/localtime");
+        assert_eq!((u16::from_le_bytes([lk[0x50], lk[0x51]]), u(&lk, 0x3c), q(&lk, 0x30)), (u16::from_le_bytes([slt[0x50], slt[0x51]]), 0, 0x8000));
+        assert_eq!({
+            let i = walk(&mut nx, "db/timezone/localtime");
+            fsops::xattr_embedded(&mut nx, data, i, "com.apple.fs.symlink")
+        }.unwrap().unwrap(), b"/var/db/timezone/zoneinfo/US/Pacific\0".to_vec());
+        // No temporary name left.
+        let (t, mut st) = nx.fs_tree(data).unwrap();
+        assert!(!t.records(&mut st).unwrap().iter().any(|(k, _)| q(k, 0) >> 60 == 9 && k.windows(6).any(|w| w == b".BC.T_" || w == b".BC.D_")));
+        drop(st);
+        let _ = sbig;
+        nx.commit().unwrap();
+        sink.0.sync_all().unwrap();
+        let view = dir.join(format!("gex-bom-view-{}", std::process::id()));
+        let _ = std::fs::remove_file(&view);
+        assert!(std::process::Command::new("cp").arg("-c").arg(&path).arg(&view).status().unwrap().success());
+        let run = |args: &[&str], tool: &str, p: &std::path::Path| std::process::Command::new(tool).args(args).arg(p).output().unwrap();
+        let dev = run(&["-n", "-W", "-s", "-M"], &fsck, &path);
+        let host = run(&["-n", "-s", "-M"], "/sbin/fsck_apfs", &path);
+        let (orphans, unnamed) = unencrypted_view(&view, blocks * 4096);
+        let trees = run(&["-n", "-s"], "/sbin/fsck_apfs", &view);
+        let _ = std::fs::remove_file(&view);
+        let _ = std::fs::remove_file(&path);
+        let out = String::from_utf8_lossy(&trees.stdout).to_string() + &String::from_utf8_lossy(&trees.stderr);
+        eprintln!("view fsck (orphans {orphans:x?}):\n{out}");
+        assert!(dev.status.success(), "device fsck -M: {}{}", String::from_utf8_lossy(&dev.stdout), String::from_utf8_lossy(&dev.stderr));
+        assert!(host.status.success(), "host fsck -M: {}{}", String::from_utf8_lossy(&host.stdout), String::from_utf8_lossy(&host.stderr));
+        assert!(!out.contains("skipping the fsroot tree"), "{out}");
+        let bad: Vec<&str> = out.lines().filter(|l| (l.contains("error") || l.contains("warning")) && !view_says(l, &unnamed)).collect();
+        assert!(bad.is_empty(), "{out}");
+        assert!(out.contains("appears to be OK"), "{out}");
+    }
+
+    /// A built disk0's container (GEX_TEST_DISK0_CTR: the container
+    /// partition copied out of `gexc darwin-disk0`'s image) through the host's
+    /// fsck_apfs on the unencrypted view, which checks the Data and User
+    /// trees the -M runs skip.
+    #[test]
+    fn disk0_encrypted_trees_check_through_the_view() {
+        let Ok(ctr) = std::env::var("GEX_TEST_DISK0_CTR") else { return };
+        let ctr = std::path::Path::new(&ctr);
+        let size = std::fs::metadata(ctr).unwrap().len();
+        let view = ctr.with_extension(format!("view-{}", std::process::id()));
+        let _ = std::fs::remove_file(&view);
+        assert!(std::process::Command::new("cp").arg("-c").arg(ctr).arg(&view).status().unwrap().success());
+        let (orphans, unnamed) = unencrypted_view(&view, size);
+        let trees = std::process::Command::new("/sbin/fsck_apfs").args(["-n", "-s"]).arg(&view).output().unwrap();
+        let _ = std::fs::remove_file(&view);
+        let out = String::from_utf8_lossy(&trees.stdout).to_string() + &String::from_utf8_lossy(&trees.stderr);
+        eprintln!("view fsck (orphans {orphans:x?}):\n{out}");
+        assert!(!out.contains("skipping the fsroot tree"), "{out}");
+        let bad: Vec<&str> = out.lines().filter(|l| (l.contains("error") || l.contains("warning")) && !view_says(l, &unnamed)).collect();
+        assert!(bad.is_empty(), "{out}");
+        assert_eq!(out.lines().filter(|l| l.starts_with("warning: overallocation detected")).count(), orphans.len(), "{out}");
+        assert!(out.contains("appears to be OK"), "{out}");
+    }
+
+    /// A per-file key's crypto-state record on volume `vol`.
+    fn get_crypto(nx: &mut Nx<'_>, vol: usize, id: u64) -> Option<Vec<u8>> {
+        let (t, mut st) = nx.fs_tree(vol).unwrap();
+        t.get(&mut st, &(id | 7 << 60).to_le_bytes()).unwrap()
     }
 
     /// Data's read-write mount and unmount on a container of its own

@@ -6160,6 +6160,8 @@ fn getsockopt(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, level: u64, name: u6
             }
             Ok(sock) => match sock.status() {
                 net::Status::Refused => Errno::ECONNREFUSED.0,
+                // A reset's error, which reading it takes.
+                _ if let Some(e) = sock.take_so_error() => e.0,
                 // Not `EINPROGRESS`. `SO_ERROR` reports how a connect
                 // *finished*, and Linux leaves it zero until one has; a
                 // caller is meant to learn "not yet" from the descriptor not

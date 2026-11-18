@@ -932,6 +932,9 @@ impl Kernel {
         if let Some(e) = self.darwin_sock_refused(raw, a) {
             return Some(neg(e));
         }
+        if let Some(r) = self.darwin_tcp_oob(m, raw, a) {
+            return Some(res(r));
+        }
         if let Some(write) = super::fsops::vectored(raw) {
             if let Err(e) = self.darwin_uio_check(m, write, a) {
                 return Some(neg(e));
@@ -1229,6 +1232,18 @@ impl Kernel {
             sys::CONNECT | sys::CONNECT_NOCANCEL if self.darwin_keepalive_off_host(m, a[0] as i32, a[1], a[2]) => {
                 self.darwin_unimplemented("SO_KEEPALIVE on a connection the host carries (keepalive probes)".into());
                 neg(Errno::ENOPROTOOPT)
+            }
+            // sonewconn copies the listener's so_state, SS_ASYNC with it, and
+            // not its buffers' SB_ASYNC: the new socket's SIGIO then goes with
+            // sb_notify's waiters, select records and knotes, which are not
+            // followed here.
+            sys::ACCEPT | sys::ACCEPT_NOCANCEL if self.fds.get(a[0] as i32).ok().and_then(|f| f.handle.so_owner()).is_some_and(|(o, _)| o.flags() & crate::vfs::SoOwner::SS_ASYNC != 0) => {
+                self.darwin_unimplemented("accept from an SS_ASYNC listener (the new socket's SS_ASYNC without SB_ASYNC)".into());
+                return None;
+            }
+            sys::CONNECT | sys::CONNECT_NOCANCEL if self.darwin_async_off_host(m, a[0] as i32, a[1], a[2]) => {
+                self.darwin_unimplemented("an SS_ASYNC socket's connection the host carries (its sowakeup's SIGIO)".into());
+                return None;
             }
             // A datagram to the limited broadcast address: delivery to an
             // interface's broadcast domain is not modelled.

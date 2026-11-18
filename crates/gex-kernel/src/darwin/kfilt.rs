@@ -167,7 +167,7 @@ impl Kernel {
             f if f == id(evfilt::WORKLOOP) => self.filt_wldetach(n),
             filtid::MACH_PORT | filtid::MACH_PORT_SET => self.filt_machportdetach(n),
             filtid::KQREAD => self.filt_kqdetach(n),
-            filtid::PIPE_N | filtid::PIPE_R | filtid::PIPE_W | filtid::SO_R | filtid::SO_W | filtid::PTSD | filtid::PTMX => self.filt_pipedetach(n),
+            filtid::PIPE_N | filtid::PIPE_R | filtid::PIPE_W | filtid::SO_R | filtid::SO_W | filtid::SCK | filtid::SOEXCEPT | filtid::PTSD | filtid::PTMX => self.filt_pipedetach(n),
             filtid::VN => {
                 if let Some(id) = self.knote(n).vnote.take() {
                     crate::vnote::unlisten(id);
@@ -198,8 +198,9 @@ impl Kernel {
             filtid::PIPE_N => self.filt_pipe_draincommon(n),
             filtid::PIPE_R => self.filt_piperead_common(n, None),
             filtid::PIPE_W => self.filt_pipewrite_common(n, None),
-            filtid::SO_R => self.filt_soread_common(n, None),
+            filtid::SO_R | filtid::SOEXCEPT => self.filt_soread_common(n, None),
             filtid::SO_W => self.filt_sowrite_common(n, None),
+            filtid::SCK => self.filt_sockev(n, hint),
             filtid::PTSD | filtid::PTMX => self.filt_tty_common(n, None),
             filtid::VN => self.filt_vnode_common(n, hint as u32, None),
             f if f == id(evfilt::MEMORYSTATUS) => self.filt_memorystatus(n, hint),
@@ -239,16 +240,17 @@ impl Kernel {
                     _ => self.filt_pipewrite_common(n, None),
                 }
             }
-            filtid::SO_R | filtid::SO_W => {
+            filtid::SO_R | filtid::SO_W | filtid::SOEXCEPT => {
                 let k = self.knote(n);
                 k.sdata = kev.data;
                 k.sfflags = kev.fflags;
-                if k.filtid == filtid::SO_R {
-                    self.filt_soread_common(n, None)
-                } else {
+                if k.filtid == filtid::SO_W {
                     self.filt_sowrite_common(n, None)
+                } else {
+                    self.filt_soread_common(n, None)
                 }
             }
+            filtid::SCK => self.filt_socktouch(n, kev),
             filtid::PTSD | filtid::PTMX => {
                 // The new state accepted, the fired state captured again.
                 let k = self.knote(n);
@@ -295,8 +297,9 @@ impl Kernel {
             }
             filtid::PIPE_R => self.filt_piperead_common(n, Some(kev)),
             filtid::PIPE_W => self.filt_pipewrite_common(n, Some(kev)),
-            filtid::SO_R => self.filt_soread_common(n, Some(kev)),
+            filtid::SO_R | filtid::SOEXCEPT => self.filt_soread_common(n, Some(kev)),
             filtid::SO_W => self.filt_sowrite_common(n, Some(kev)),
+            filtid::SCK => self.filt_sockprocess(n, kev),
             filtid::PTSD | filtid::PTMX => self.filt_tty_common(n, Some(kev)),
             filtid::VN => self.filt_vnode_common(n, 0, Some(kev)),
             // filt_procprocess: the collected events, the exit status as
@@ -1373,22 +1376,15 @@ impl Kernel {
         }
     }
 
-    /// `soo_kqfilter`: a socket's read and write filters, on the list of
-    /// descriptors the process looks at when they may have changed.
+    /// `soo_kqfilter`: a socket's read, write, event and exception
+    /// filters, on the list of descriptors the process looks at when they
+    /// may have changed.
     fn soo_kqfilter(&mut self, n: KnId, fp: &std::sync::Arc<crate::file::OpenFile>) -> u32 {
         let fid = match self.knote(n).filter {
             evfilt::READ => filtid::SO_R,
             evfilt::WRITE => filtid::SO_W,
-            evfilt::SOCK => {
-                self.darwin_unimplemented("kevent EVFILT_SOCK (filt_sockev: a connection's state changes)".into());
-                self.knote(n).set_error(Errno::EOPNOTSUPP);
-                return 0;
-            }
-            evfilt::EXCEPT => {
-                self.darwin_unimplemented("kevent EVFILT_EXCEPT on a socket (out-of-band data)".into());
-                self.knote(n).set_error(Errno::EOPNOTSUPP);
-                return 0;
-            }
+            evfilt::SOCK => filtid::SCK,
+            evfilt::EXCEPT => filtid::SOEXCEPT,
             _ => {
                 self.knote(n).set_error(Errno::EINVAL);
                 return 0;
@@ -1403,10 +1399,22 @@ impl Kernel {
             self.dtask.kevents.polled_knotes.insert(n);
         }
         self.dtask.kevents.pipe_watch.fetch_add(if polled { 1 + POLLED_KNOTE } else { 1 }, std::sync::atomic::Ordering::Release);
-        if fid == filtid::SO_R {
-            self.filt_soread_common(n, None)
-        } else {
-            self.filt_sowrite_common(n, None)
+        match fid {
+            filtid::SO_R | filtid::SOEXCEPT => {
+                // filt_sorattach: an EVFILT_READ asked for out-of-band
+                // results (poll's POLLPRI) keeps that in its hook, and
+                // EV_OOBAND is left for output.
+                let k = self.knote(n);
+                if k.filter == evfilt::READ && k.flags & super::kevent::EV_OOBAND != 0 {
+                    k.flags &= !super::kevent::EV_OOBAND;
+                    k.hook32 = u32::from(super::kevent::EV_OOBAND);
+                } else {
+                    k.hook32 = 0;
+                }
+                self.filt_soread_common(n, None)
+            }
+            filtid::SO_W => self.filt_sowrite_common(n, None),
+            _ => self.filt_sockattach(n),
         }
     }
 
@@ -1433,7 +1441,22 @@ impl Kernel {
         } else {
             // The bytes of data: the buffer's less its address and control.
             data = (so.rcv - so.ctl) as i64;
-            if so.cantrcv {
+            const NOTE_OOB: u32 = 0x2;
+            if self.knote(n).sfflags & NOTE_OOB != 0 {
+                if let Some(what) = so.oob_unmodelled {
+                    self.darwin_unimplemented(format!("kevent NOTE_OOB: {what}"));
+                }
+            }
+            if self.knote(n).sfflags & NOTE_OOB != 0 && (so.oobmark != 0 || so.rcvatmark) {
+                // Out-of-band data, at or ahead in the stream.
+                let k = self.knote(n);
+                k.fflags |= NOTE_OOB;
+                let d = data - so.oobmark as i64;
+                if let Some(kev) = kev {
+                    *kev = self.knote(n).fill_kevent(d);
+                }
+                return 1;
+            } else if so.cantrcv {
                 let k = self.knote(n);
                 k.flags |= ev::EOF;
                 k.fflags = so.error as u32;
@@ -1588,6 +1611,11 @@ impl Kernel {
         let mut told = false;
         for n in self.dtask.kevents.pipe_klist.clone() {
             if !self.knote_exists(n) {
+                continue;
+            }
+            // A socket's event knote is told of each soevent made since.
+            if self.knote(n).filtid == filtid::SCK {
+                told |= self.sockev_knote(n);
                 continue;
             }
             let fp = self.knote(n).fp.clone().expect("a pipe knote's file");

@@ -173,6 +173,9 @@ pub fn unbound_name() -> Vec<u8> {
 #[derive(Debug)]
 pub struct Inet6Socket {
     pub proto: Proto,
+    /// Its owner (`so_pgid`, `SS_ASYNC`): never signalled, as it is never
+    /// bound, connected or sent to.
+    pub owner: Arc<crate::vfs::SoOwner>,
 }
 
 impl FileHandle for Inet6Socket {
@@ -210,6 +213,10 @@ impl FileHandle for Inet6Socket {
         self.proto == Proto::Udp
     }
 
+    fn so_owner(&self) -> Option<(Arc<crate::vfs::SoOwner>, bool)> {
+        Some((Arc::clone(&self.owner), true))
+    }
+
     fn so_state(&self) -> Option<SoState> {
         let udp = self.proto == Proto::Udp;
         Some(SoState {
@@ -231,6 +238,11 @@ impl FileHandle for Inet6Socket {
             snd_mbmax: None,
             unp_cc: 0,
             live_hiwat: false,
+            // Never connected (its protocol's connect is not modelled).
+            conn: crate::vfs::SoConn { evconninfo: true, ..Default::default() },
+            oobmark: 0,
+            rcvatmark: false,
+            oob_unmodelled: None,
         })
     }
 
@@ -765,7 +777,7 @@ impl Kernel {
                 return Err(Errno::EPROTONOSUPPORT);
             }
         };
-        let handle: Arc<dyn FileHandle> = Arc::new(Inet6Socket { proto });
+        let handle: Arc<dyn FileHandle> = Arc::new(Inet6Socket { proto, owner: Default::default() });
         let file = crate::file::OpenFile::new(handle, "socket".to_string(), 0, true, true);
         self.fds.insert(file, false)
     }
@@ -1103,9 +1115,9 @@ mod tests {
 
     #[test]
     fn a_fresh_socket_is_in_no_state_but_its_buffers() {
-        let u = Inet6Socket { proto: Proto::Udp }.so_state().unwrap();
+        let u = Inet6Socket { proto: Proto::Udp, owner: Default::default() }.so_state().unwrap();
         assert_eq!((u.hiwat, u.can_write, u.records, u.rcv), ((786896, 9216), true, Some((0, 0)), 0));
-        let t = Inet6Socket { proto: Proto::Tcp }.so_state().unwrap();
+        let t = Inet6Socket { proto: Proto::Tcp, owner: Default::default() }.so_state().unwrap();
         assert_eq!((t.hiwat, t.can_write, t.records), ((556032, 370688), false, None));
         assert_eq!(unbound_name(), [28, 30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
     }

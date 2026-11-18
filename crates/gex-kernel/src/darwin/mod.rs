@@ -113,6 +113,7 @@ pub mod reboot;
 pub mod rlimit;
 pub mod rusage;
 pub mod sandbox;
+pub mod sockev;
 pub mod shregion;
 pub mod storage;
 pub mod storagestack;

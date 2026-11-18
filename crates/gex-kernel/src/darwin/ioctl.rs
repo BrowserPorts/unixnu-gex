@@ -35,6 +35,10 @@ pub mod cmd {
     pub const FIODTYPE: u64 = 0x4004_667a;
     pub const TIOCSPGRP: u64 = 0x8004_7476;
     pub const TIOCGPGRP: u64 = 0x4004_7477;
+    /// `bsd/sys/sockio.h`.
+    pub const SIOCATMARK: u64 = 0x4004_7307;
+    pub const SIOCSPGRP: u64 = 0x8004_7308;
+    pub const SIOCGPGRP: u64 = 0x4004_7309;
 }
 
 /// The `FCNTLFLAGS` (`FAPPEND|FASYNC|FFSYNC|FFDSYNC|FNONBLOCK`) as Darwin
@@ -237,14 +241,22 @@ impl Kernel {
         Ok(0)
     }
 
-    /// FIOSETOWN and F_SETOWN: a pipe's owner as given; another file's as
-    /// a process group (a pid's group, or the group a negative names).
+    /// FIOSETOWN and F_SETOWN: a socket's `so_pgid` and a pipe's owner as
+    /// given; another file's as a process group (a pid's group, or the
+    /// group a negative names).
     pub(crate) fn darwin_setown(&mut self, m: &mut GuestMem<'_>, file: &Arc<OpenFile>, owner: i32) -> Result<u64, Errno> {
         let mut tmp = owner;
         match self.darwin_file_kind(file) {
+            // Straight into so_pgid: no check of the process or group,
+            // which the signals find (or not) when they are sent.
             Kind::Socket => {
-                self.darwin_unimplemented("setting a socket's owner (so_pgid)".into());
-                return Err(Errno::EOPNOTSUPP);
+                let Some((o, _)) = file.handle.so_owner() else {
+                    self.darwin_unimplemented(format!("setting the owner (so_pgid) of {}, a socket the global kernel holds", file.path));
+                    return Err(Errno::EOPNOTSUPP);
+                };
+                o.set_sender(self.darwin_so_sender());
+                o.set_pgid(owner);
+                return Ok(0);
             }
             Kind::Pipe(..) => {}
             _ => {
@@ -261,11 +273,15 @@ impl Kernel {
         Ok(0)
     }
 
-    /// FIOGETOWN and F_GETOWN: TIOCGPGRP's answer, negated.
+    /// FIOGETOWN and F_GETOWN: a socket's `so_pgid` as it is; another
+    /// file's TIOCGPGRP answer, negated.
     pub(crate) fn darwin_getown(&mut self, file: &Arc<OpenFile>) -> Result<i32, Errno> {
         if matches!(self.darwin_file_kind(file), Kind::Socket) {
-            self.darwin_unimplemented("a socket's owner (so_pgid)".into());
-            return Err(Errno::EOPNOTSUPP);
+            let Some((o, _)) = file.handle.so_owner() else {
+                self.darwin_unimplemented(format!("the owner (so_pgid) of {}, a socket the global kernel holds", file.path));
+                return Err(Errno::EOPNOTSUPP);
+            };
+            return Ok(o.pgid());
         }
         let mut b = [0u8; 8];
         self.darwin_fo_ioctl(file, cmd::TIOCGPGRP, &mut b)?;
@@ -317,6 +333,7 @@ impl Kernel {
             // soo_ioctl: soioctl's MAC check first; the descriptor's
             // FNONBLOCK is what the socket here goes by.
             Kind::Socket if let Some(e) = super::mac::sb_socket(&file.handle).map(|so| self.darwin_mac_check_socket_ioctl(so, com)).filter(|&e| e != 0) => Err(super::errno::errno_of(e as i32)),
+            Kind::Socket if let Some(r) = self.darwin_soioctl_owner(file, com, data) => r,
             Kind::Socket if Arc::clone(&file.handle).as_darwin_inet6().is_some() => self.darwin_inet6_soioctl(com, data),
             Kind::Socket => match com {
                 cmd::FIONBIO => Ok(()),
@@ -418,6 +435,64 @@ impl Kernel {
                 Err(Errno::EOPNOTSUPP)
             }
         }
+    }
+
+    /// `soioctl`'s commands on the socket's owner and mark: FIOASYNC
+    /// (`SS_ASYNC` and the buffers' `SB_ASYNC`), SIOCSPGRP and SIOCGPGRP
+    /// (`so_pgid`, as it is given), SIOCATMARK (`SS_RCVATMARK`); `None`
+    /// for another command.
+    fn darwin_soioctl_owner(&mut self, file: &Arc<OpenFile>, com: u64, data: &mut [u8]) -> Option<Result<(), Errno>> {
+        if !matches!(com, cmd::FIOASYNC | cmd::SIOCSPGRP | cmd::SIOCGPGRP | cmd::SIOCATMARK) {
+            return None;
+        }
+        let Some((o, modelled)) = file.handle.so_owner() else {
+            self.darwin_unimplemented(format!("ioctl {com:#x} on {}, a socket the global kernel holds (its so_pgid and SS_ASYNC)", file.path));
+            return Some(Err(Errno::EOPNOTSUPP));
+        };
+        Some(match com {
+            cmd::FIOASYNC => {
+                let on = int(data) != 0;
+                if on && !modelled {
+                    self.darwin_unimplemented(format!("FIOASYNC on {}, a socket whose wakeups (sowakeup's SIGIO) are not XNU's here: a datagram socket, or a connection the host or the global kernel carries", file.path));
+                    return Some(Err(Errno::EOPNOTSUPP));
+                }
+                o.set_sender(self.darwin_so_sender());
+                o.set_async(on);
+                Ok(())
+            }
+            cmd::SIOCSPGRP => {
+                o.set_sender(self.darwin_so_sender());
+                o.set_pgid(int(data));
+                Ok(())
+            }
+            cmd::SIOCGPGRP => {
+                put_int(data, o.pgid());
+                Ok(())
+            }
+            _ => match file.handle.so_state() {
+                Some(st) => {
+                    if let Some(what) = st.oob_unmodelled {
+                        self.darwin_unimplemented(format!("SIOCATMARK on {}: {what}", file.path));
+                        return Some(Err(Errno::EOPNOTSUPP));
+                    }
+                    put_int(data, i32::from(st.rcvatmark));
+                    Ok(())
+                }
+                None => Err(Errno::ENOTSOCK),
+            },
+        })
+    }
+
+    /// How a socket's signals reach its owner (`pgsigio`'s `gsignal` of a
+    /// group, `proc_signal` of a process): posted with no check of who may
+    /// signal whom, from the process whose call made the wakeup.
+    pub(crate) fn darwin_so_sender(&self) -> Arc<dyn Fn(i32, u32) + Send + Sync> {
+        let procs = Arc::clone(&self.procs);
+        Arc::new(move |owner: i32, sig: u32| {
+            let l = super::kern::signal_to_linux(sig);
+            let caller = super::pipe::caller();
+            let _ = if owner < 0 { procs.kill_group(caller, -owner, l) } else { procs.kill(caller, owner, l) };
+        })
     }
 
     /// `fcntl(F_GETFL)`: `OFLAGS(f_flag)`.

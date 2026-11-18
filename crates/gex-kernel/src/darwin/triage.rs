@@ -178,10 +178,10 @@ impl Kernel {
         let base = if code64 { MACH_EXC_BASE } else { EXC_BASE };
         let state = behavior == exc::EXCEPTION_STATE || behavior == exc::EXCEPTION_STATE_IDENTITY;
         let identity = behavior == exc::EXCEPTION_DEFAULT || behavior == exc::EXCEPTION_STATE_IDENTITY;
+        if behavior == exc::EXCEPTION_IDENTITY_PROTECTED {
+            return self.darwin_exception_deliver_protected(t, port);
+        }
         if !(state || identity) {
-            if behavior == exc::EXCEPTION_IDENTITY_PROTECTED {
-                self.darwin_unimplemented(format!("exception {} to an EXCEPTION_IDENTITY_PROTECTED handler (task identity tokens)", t.exc));
-            }
             return Delivered::Done(KERN_FAILURE);
         }
         let old_state = if state {
@@ -241,6 +241,34 @@ impl Kernel {
         // port to the thread.
         let set_state = behavior == exc::EXCEPTION_STATE || super::kobject::DEVELOPER_MODE || self.dtask.corpse.is_some();
         Delivered::Sent(Pending { t: *t, id, state, set_state })
+    }
+
+    /// EXCEPTION_IDENTITY_PROTECTED (a handler set with MACH_EXCEPTION_CODES,
+    /// which setting it requires): a task identity token of the task (a
+    /// corpse's, or its process's), its port in
+    /// `mach_exception_raise_identity_protected` with the thread's id, the
+    /// exception and its codes. A task whose token cannot be made is ending:
+    /// the exception is not sent, and is taken as handled.
+    fn darwin_exception_deliver_protected(&mut self, t: &Triage, port: ObjId) -> Delivered {
+        let token = match self.darwin_create_identity_token() {
+            Ok(p) => p,
+            Err(_) => return Delivered::Done(kr::SUCCESS),
+        };
+        let thread_id = self.darwin_thread_tid(self.tid);
+        let mut body = 1u32.to_le_bytes().to_vec();
+        body.extend_from_slice(&[0u8; 12]);
+        body.extend_from_slice(&super::mig::NDR_RECORD);
+        body.extend_from_slice(&thread_id.to_le_bytes());
+        body.extend_from_slice(&(t.exc as i32).to_le_bytes());
+        body.extend_from_slice(&t.count.to_le_bytes());
+        for &c in &t.codes[..t.count as usize] {
+            body.extend_from_slice(&c.to_le_bytes());
+        }
+        let descs = vec![Desc::Port { off: 4, right: Some(Carried::Port(token)), raw: 0, disp: msgt::PORT_SEND }];
+        // MACH_EXC_BASE + 3: mach_exception_raise_identity_protected.
+        let id = MACH_EXC_BASE + 3;
+        self.darwin_exc_send(port, id, body, descs);
+        Delivered::Sent(Pending { t: *t, id, state: false, set_state: false })
     }
 
     /// The request, with a copy of the handler's send right and a

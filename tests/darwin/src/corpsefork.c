@@ -17,7 +17,13 @@
 // its children's), the fault is a lightweight corpse instead:
 // mach_exception_raise_backtrace with a kcdata object, which
 // task_map_kcdata_object_64 maps (TASK_BTINFO_*: the faulting thread's
-// backtrace, ids, codes, reason and image infos).
+// backtrace, ids, codes, reason and image infos). A crash corpse for a
+// handler registered as launchd registers its exception server
+// (0xa0000004: EXCEPTION_IDENTITY_PROTECTED) comes as
+// mach_exception_raise_identity_protected with the crashed thread's id and
+// a task identity token, which gives the corpse's control port (only that
+// flavor) to a caller entitled to corpse tokens, and finds no task once the
+// corpse is gone.
 
 #include <errno.h>
 #include <fcntl.h>
@@ -136,6 +142,12 @@ static int child(const char *how) {
                 return c == 'x' ? 0 : 4;
             }
         }
+    }
+    if (!strcmp(how, "crash")) {
+        child_say(0);
+        if (child_cmd() != 'c') return 15;
+        *(volatile int *)8 = 1;
+        return 16;
     }
     if (!strcmp(how, "lw")) {
         thread_identifier_info_data_t a;
@@ -590,6 +602,64 @@ static int lightweight(void) {
     return 0;
 }
 
+#pragma pack(4)
+typedef struct {
+    mach_msg_header_t head;
+    mach_msg_body_t body;
+    mach_msg_port_descriptor_t token;
+    NDR_record_t ndr;
+    uint64_t thread_id;
+    exception_type_t exc;
+    mach_msg_type_number_t code_count;
+    int64_t code[2];
+    mach_msg_trailer_t trailer;
+} protected_request_t;
+#pragma pack()
+
+static int protected(void) {
+    mach_port_t port = new_port();
+    kid_t k;
+    if (spawn_child_bt("crash", port, 0, &k, (exception_behavior_t)0xa0000004)) return bad("spawning", 0, 0);
+    if (heard(&k) != 0 || tell(&k, 'c')) return bad("the crashing child", 0, 0);
+    protected_request_t req;
+    memset(&req, 0, sizeof req);
+    kern_return_t kr = mach_msg(&req.head, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof req, port, 20000, MACH_PORT_NULL);
+    if (kr) return bad("receiving the protected notification", kr, 0);
+    if (req.head.msgh_id != 2408) return bad("message id", req.head.msgh_id, 2408);
+    if (req.exc != EXC_CORPSE_NOTIFY || req.code_count != 2 || req.code[0] != EXC_CRASH) return bad("the protected notification's codes", req.code[0], EXC_CRASH);
+    mach_port_t token = req.token.name, task = MACH_PORT_NULL;
+    // A corpse's token gives its control port only.
+    kr = task_identity_token_get_task_port(token, TASK_FLAVOR_READ, &task);
+    if (kr != KERN_INVALID_ARGUMENT) return bad("a corpse token's read port", kr, KERN_INVALID_ARGUMENT);
+    kr = task_identity_token_get_task_port(token, TASK_FLAVOR_CONTROL, &task);
+    if (kr) return bad("a corpse token's control port", kr, 0);
+    const uint8_t *b;
+    if (crashinfo(task, &b)) return 1;
+    uint32_t sz;
+    const uint8_t *p = item(b, 0x4000, 0x805, &sz);
+    if (!p || (pid_t)u32_at(p) != k.pid) return bad("the token's corpse's pid", p ? u32_at(p) : -1, k.pid);
+    p = item(b, 0x4000, 0x81A, &sz);
+    if (!p || u64_at(p) != req.thread_id) return bad("the notification's thread id", req.thread_id, p ? u64_at(p) : -1);
+    vm_deallocate(mach_task_self(), (vm_address_t)b, 0x4000);
+    reply((request_t *)&req);
+    int st = 0;
+    waitpid(k.pid, &st, 0);
+    // With its port's senders gone the corpse ends: its token finds none.
+    mach_port_deallocate(mach_task_self(), task);
+    for (int i = 0; i < 200; i++) {
+        mach_port_t t2 = MACH_PORT_NULL;
+        kr = task_identity_token_get_task_port(token, TASK_FLAVOR_CONTROL, &t2);
+        if (kr != KERN_SUCCESS) break;
+        mach_port_deallocate(mach_task_self(), t2);
+        usleep(10000);
+    }
+    if (kr != KERN_NOT_FOUND) return bad("the token of a corpse that has gone", kr, KERN_NOT_FOUND);
+    mach_port_deallocate(mach_task_self(), token);
+    mach_port_mod_refs(mach_task_self(), port, MACH_PORT_RIGHT_RECEIVE, -1);
+    mach_port_deallocate(mach_task_self(), port);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc > 2 && !strcmp(argv[1], "child")) return child(argv[2]);
     signal(SIGPIPE, SIG_IGN);
@@ -600,6 +670,7 @@ int main(int argc, char **argv) {
     if (limit()) return 1;
     if (fault()) return 1;
     if (lightweight()) return 1;
+    if (protected()) return 1;
     printf("corpsefork ok\n");
     return 0;
 }

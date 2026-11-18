@@ -296,6 +296,41 @@ pub fn get_task_with_flavor(caller: &Entitlements, target: &Entitlements, f: u32
     if DEVELOPER_MODE && control { Ok(()) } else { Err(1) }
 }
 
+/// `mpo_proc_check_task_id_token_get_task` (0xfffffff005ab7bb0, slot 99
+/// of AMFI's ops): the caller's entitlements, whether the token is a
+/// corpse's, the flavor. The name port always; a corpse's with
+/// com.apple.system-task-ports.token.corpse; an inspect port with
+/// token.inspect, a read (or inspect) one with token.read and not
+/// token.inspect; a control port with token.control alone, under
+/// Developer Mode. EPERM to refuse.
+pub fn task_id_token_get_task(ents: &Entitlements, corpse: bool, f: u32) -> Result<(), u32> {
+    const ENT_CORPSE: &[u8] = b"com.apple.system-task-ports.token.corpse";
+    const ENT_INSPECT: &[u8] = b"com.apple.system-task-ports.token.inspect";
+    const ENT_READ: &[u8] = b"com.apple.system-task-ports.token.read";
+    const ENT_CONTROL: &[u8] = b"com.apple.system-task-ports.token.control";
+    if f == flavor::NAME {
+        return Ok(());
+    }
+    if corpse && ents.bool_true(ENT_CORPSE) {
+        return Ok(());
+    }
+    let inspect = ents.bool_true(ENT_INSPECT);
+    let read = ents.bool_true(ENT_READ);
+    if !corpse {
+        if f >= flavor::INSPECT && inspect {
+            return Ok(());
+        }
+        if read && f != flavor::CONTROL && !inspect {
+            return Ok(());
+        }
+    }
+    if ents.bool_true(ENT_CONTROL) && !read && !inspect && DEVELOPER_MODE {
+        Ok(())
+    } else {
+        Err(1)
+    }
+}
+
 /// `mpo_proc_check_get_movable_control_port`: entitled, or Developer Mode
 /// with CS_GET_TASK_ALLOW.
 pub fn get_movable_control_port(ents: &Entitlements, csflags: u32) -> Result<(), u32> {

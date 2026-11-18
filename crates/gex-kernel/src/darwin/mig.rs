@@ -1064,6 +1064,17 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
                 Err(kr) => Reply::err(kr as i32),
             }
         }
+        // task_create_identity_token(task) -> token: its port, the token's
+        // reference donated to its no-senders notification.
+        (Kobject::Task, 3457) => match k.darwin_create_identity_token() {
+            Ok(p) => Reply::port(Carried::Port(p)),
+            Err(kr) => Reply::err(kr),
+        },
+        // task_identity_token_get_task_port(token, flavor) -> task_port.
+        (Kobject::TaskIdToken(id), 3458) => match arg(req, 0) {
+            Some(flavor) => k.darwin_token_get_task_port(*id, flavor as u32),
+            None => bad(),
+        },
         // task_map_kcdata_object_64(task, kcdata_object) -> kcd_addr_begin,
         // kcd_size. The object's right is the routine's when it succeeds.
         (Kobject::Task, 3464) => match desc_port(req, 0) {

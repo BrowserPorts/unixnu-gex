@@ -271,6 +271,9 @@ pub enum Kobject {
     /// IKOT_KCDATA: a kcdata object, by its number
     /// ([`super::lwcorpse`]).
     KcdataObject(u64),
+    /// IKOT_TASK_ID_TOKEN: a task identity token, by its number
+    /// ([`super::taskident`]).
+    TaskIdToken(u64),
 }
 
 /// A port's reply semantics (`ip_reply_port_semantics`).

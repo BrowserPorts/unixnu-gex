@@ -42,6 +42,7 @@ pub mod cred;
 pub mod corpse;
 pub mod corpsefork;
 pub mod lwcorpse;
+pub mod taskident;
 pub mod critexit;
 pub mod errno;
 pub mod exec;

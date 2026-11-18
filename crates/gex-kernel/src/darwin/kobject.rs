@@ -356,6 +356,8 @@ impl Kernel {
         if !self.dtask.bt_deliveries.is_empty() {
             self.darwin_unimplemented("a lightweight corpse's delivery still owed at its task's end (exception_deliver_backtrace runs on the kernel's backtrace daemon, which outlives the task)".into());
         }
+        // Its identity tokens name no task from here on.
+        self.darwin_task_id_tokens_orphan();
         // coalitions_remove_task, launchd told of those it emptied.
         self.darwin_coalitions_task_end();
         // Its threads' vouchers, its importance (ipc_importance_disconnect_task)
@@ -504,6 +506,8 @@ impl Kernel {
             Some(Kobject::FilePort(id)) => super::fileport::fileport_no_senders(id),
             // kcdata_object_no_senders.
             Some(Kobject::KcdataObject(id)) => self.darwin_kcdata_object_no_senders(port, id),
+            // task_id_token_no_senders.
+            Some(Kobject::TaskIdToken(id)) => self.darwin_task_id_token_no_senders(port, id),
             // The notification is freed with its port's last send right:
             // its notifier removed and the wake port's right let go.
             Some(Kobject::IoNotification(id)) => {

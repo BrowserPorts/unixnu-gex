@@ -834,13 +834,19 @@ impl Ipc {
     /// Tell task `task` of `r`, and ring the bell of its thread that acts
     /// on it (a task that has ended hears nothing).
     pub fn remote(&self, task: TaskKey, r: Remote) -> bool {
-        let Some(l) = self.links.get(&task) else { return false };
+        self.remote_or_back(task, r).is_ok()
+    }
+
+    /// [`Self::remote`], with what was to be told given back when the task
+    /// has ended.
+    pub fn remote_or_back(&self, task: TaskKey, r: Remote) -> Result<(), Remote> {
+        let Some(l) = self.links.get(&task) else { return Err(r) };
         if let Some(v) = self.callout_remotes.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             v.push(l.pid);
         }
         l.mailbox.lock().unwrap_or_else(|e| e.into_inner()).push(r);
         l.bell.ring();
-        true
+        Ok(())
     }
 
     /// `ipc_task_enable`: `link`, this task's, goes in the table under its

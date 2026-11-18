@@ -949,8 +949,15 @@ impl Kernel {
                 // ipc_kobject_server, for another task's object: its kernel
                 // holds the object's state, and serves the request.
                 let caller = ipc.task;
-                if !ipc.remote(owner, super::ipc::Remote::Kobject { kmsg, options, caller }) {
-                    unreachable!("an active kernel port's task has its link");
+                if let Err(super::ipc::Remote::Kobject { kmsg, .. }) = ipc.remote_or_back(owner, super::ipc::Remote::Kobject { kmsg, options, caller }) {
+                    // A kernel object whose task has ended: its port is dead
+                    // as that end makes it (ipc_kobject_destroy), and a
+                    // message sent to a dead port is destroyed, the send
+                    // succeeding (ipc_kmsg_send).
+                    ipc.port_mut(port).kobject = None;
+                    ipc.port_destroy(port);
+                    ipc.release(port);
+                    ipc.kmsg_destroy(kmsg, true);
                 }
                 return Ok(());
             }

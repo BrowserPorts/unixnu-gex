@@ -6,6 +6,8 @@
 // copies of the child's with ids of their own, held for inspection, the
 // calling thread's copy the crashed one, and whose crash information says
 // it is a fork: the child's pid, exception type and codes 0, no exit time;
+// a purgeable object's copy is its own, with the bytes and the volatile
+// state it had at the fork;
 // its ledgers are the child's copied ones and its audit token the child's;
 // the child goes on. An entitled task gets its own control ports movable. A
 // corpse's own fork is refused. At most five corpses are in flight.
@@ -143,6 +145,32 @@ static int child(const char *how) {
                 return c == 'x' ? 0 : 4;
             }
         }
+    }
+    if (!strcmp(how, "purg")) {
+        vm_address_t a = 0;
+        if (vm_allocate(mach_task_self(), &a, 0x8000, VM_FLAGS_ANYWHERE | VM_FLAGS_PURGABLE)) return 17;
+        memset((void *)a, 0xAB, 0x8000);
+        int st = VM_PURGABLE_VOLATILE;
+        if (vm_purgable_control(mach_task_self(), a, VM_PURGABLE_SET_STATE, &st)) return 18;
+        mach_port_t bp = MACH_PORT_NULL, corpse = MACH_PORT_NULL;
+        if (task_get_bootstrap_port(mach_task_self(), &bp) || task_generate_corpse(mach_task_self(), &corpse)) return 19;
+        hello_t m;
+        memset(&m, 0, sizeof m);
+        m.head.msgh_bits = MACH_MSGH_BITS_SET(MACH_MSG_TYPE_COPY_SEND, 0, 0, MACH_MSGH_BITS_COMPLEX);
+        m.head.msgh_size = sizeof m - sizeof m.trailer;
+        m.head.msgh_remote_port = bp;
+        m.body.msgh_descriptor_count = 1;
+        m.task.name = corpse;
+        m.task.disposition = MACH_MSG_TYPE_MOVE_SEND;
+        m.task.type = MACH_MSG_PORT_DESCRIPTOR;
+        m.addr = a;
+        if (mach_msg(&m.head, MACH_SEND_MSG, m.head.msgh_size, 0, MACH_PORT_NULL, 0, MACH_PORT_NULL)) return 20;
+        if (child_cmd() != 'w') return 21;
+        st = VM_PURGABLE_NONVOLATILE;
+        if (vm_purgable_control(mach_task_self(), a, VM_PURGABLE_SET_STATE, &st)) return 22;
+        memset((void *)a, 0xCD, 0x8000);
+        child_say(*(volatile int *)a);
+        return child_cmd() == 'x' ? 0 : 23;
     }
     if (!strcmp(how, "lwgone")) {
         int r = os_fault_with_payload(FAULT_NS, FAULT_CODE, NULL, 0, "corpsefork", 0);
@@ -402,6 +430,42 @@ static int live(void) {
     if (release(corpse, ct[0])) return 1;
     if (tell(&k, 'x')) return bad("ending the child", 0, 0);
     if (waitpid(k.pid, &st, 0) != k.pid || !WIFEXITED(st) || WEXITSTATUS(st) != 0) return bad("the child's end", st, 0);
+    return 0;
+}
+
+// A purgeable object's copy in the corpse is an object of its own: the
+// bytes it had at the fork, whatever the child writes after, and its
+// volatile state, whatever the child makes the child's.
+static int purgeable(void) {
+    mach_port_t boot = new_port();
+    kid_t k;
+    if (spawn_child("purg", 0, boot, &k)) return bad("spawning", 0, 0);
+    hello_t h;
+    memset(&h, 0, sizeof h);
+    kern_return_t kr = mach_msg(&h.head, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof h, boot, 10000, MACH_PORT_NULL);
+    if (kr) return bad("the purgeable child's corpse", kr, 0);
+    mach_port_t corpse = h.task.name;
+    int v = 0;
+    if (tell(&k, 'w') || (v = heard(&k)) != (int)0xCDCDCDCD) return bad("the child's write", v, 0xCDCDCDCD);
+    vm_offset_t data = 0;
+    mach_msg_type_number_t cnt = 0;
+    if ((kr = vm_read(corpse, h.addr, 0x8000, &data, &cnt)) || cnt != 0x8000) return bad("vm_read of the corpse's purgeable copy", kr, 0);
+    for (unsigned i = 0; i < cnt; i++) {
+        if (((uint8_t *)data)[i] != 0xAB) return bad("the corpse's purgeable bytes", ((uint8_t *)data)[i], 0xAB);
+    }
+    vm_deallocate(mach_task_self(), data, cnt);
+    // vm_map_query_volatile of the corpse's map: its copy is volatile.
+    task_vm_info_data_t vi;
+    mach_msg_type_number_t vn = TASK_VM_INFO_COUNT;
+    if ((kr = task_info(corpse, TASK_VM_INFO_PURGEABLE, (task_info_t)&vi, &vn))) return bad("TASK_VM_INFO_PURGEABLE of the corpse", kr, 0);
+    if (vi.purgeable_volatile_virtual != 0x8000) return bad("the corpse's volatile purgeable size", vi.purgeable_volatile_virtual, 0x8000);
+    thread_act_array_t ct;
+    mach_msg_type_number_t cn = 0;
+    if ((kr = task_threads(corpse, &ct, &cn)) || cn == 0) return bad("task_threads of the corpse", kr, 1);
+    for (unsigned i = 1; i < cn; i++) mach_port_deallocate(mach_task_self(), ct[i]);
+    if (release(corpse, ct[0])) return 1;
+    int st = 0;
+    if (tell(&k, 'x') || waitpid(k.pid, &st, 0) != k.pid || !WIFEXITED(st) || WEXITSTATUS(st) != 0) return bad("the child's end", st, 0);
     return 0;
 }
 
@@ -712,6 +776,7 @@ int main(int argc, char **argv) {
     if (live()) return 1;
     if (own()) return 1;
     if (limit()) return 1;
+    if (purgeable()) return 1;
     if (fault()) return 1;
     if (lightweight()) return 1;
     if (lightweight_gone()) return 1;

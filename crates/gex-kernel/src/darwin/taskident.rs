@@ -161,9 +161,27 @@ impl Kernel {
         let key = self.ipc().task;
         let ports: Vec<super::ipc::ObjId> = tokens().values().filter_map(|t| t.port).collect();
         let ipc = self.ipc();
+        let mut orphaned = Vec::new();
         for p in ports {
             if ipc.port(p).active && ipc.port(p).owner == key {
                 ipc.port_mut(p).owner = 0;
+                orphaned.push(p);
+            }
+        }
+        // Requests to them already in this task's mailbox go back to their
+        // callers' kernels, which now serve them.
+        let Some(link) = ipc.link.clone() else { return };
+        let pending: Vec<super::ipc::Remote> = {
+            let mut mb = link.mailbox.lock().unwrap_or_else(|e| e.into_inner());
+            let all = std::mem::take(&mut *mb);
+            let (back, keep): (Vec<_>, Vec<_>) = all.into_iter().partition(|r| matches!(r, super::ipc::Remote::Kobject { kmsg, .. } if orphaned.contains(&kmsg.dest)));
+            *mb = keep;
+            back
+        };
+        for r in pending {
+            let super::ipc::Remote::Kobject { kmsg, options, caller } = r else { continue };
+            if let Err(super::ipc::Remote::Kobject { kmsg, .. }) = ipc.remote_or_back(caller, super::ipc::Remote::Kobject { kmsg, options, caller }) {
+                ipc.kmsg_destroy(kmsg, true);
             }
         }
     }

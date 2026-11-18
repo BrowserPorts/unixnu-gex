@@ -3299,7 +3299,7 @@ fn make_corpse_fork(kernel: &Arc<Mutex<Kernel>>, memory: &gex_mem::GuestMemory, 
             }
         }
         let mut gm = GuestMem::new(dst);
-        build.corpse.darwin_corpse_fork_vm(&mut gm, &build.plan);
+        build.corpse.darwin_corpse_fork_vm(&mut gm, &build.plan, &build.purgeable);
     }
     drop(paused);
     if !unshared.is_empty() {

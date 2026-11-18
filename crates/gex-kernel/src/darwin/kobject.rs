@@ -351,11 +351,6 @@ impl Kernel {
     /// of the task's end, for a task whose process has ended (a corpse's
     /// once its port has no senders).
     pub(crate) fn darwin_task_terminate_internal(&mut self) {
-        // A lightweight corpse's delivery is the kernel daemon's, which
-        // outlives the task; here it is the task's thread calls'.
-        if !self.dtask.bt_deliveries.is_empty() {
-            self.darwin_unimplemented("a lightweight corpse's delivery still owed at its task's end (exception_deliver_backtrace runs on the kernel's backtrace daemon, which outlives the task)".into());
-        }
         // Its identity tokens name no task from here on.
         self.darwin_task_id_tokens_orphan();
         // coalitions_remove_task, launchd told of those it emptied.

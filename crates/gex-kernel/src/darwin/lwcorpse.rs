@@ -8,7 +8,8 @@
 //! children's), the faulting thread's backtrace and the process's crash
 //! facts in a kcdata buffer (TASK_BTINFO_*), held by a kcdata object whose
 //! port goes to the handler in `mach_exception_raise_backtrace`, in place
-//! of a corpse fork.
+//! of a corpse fork. The delivery is the kernel's backtrace daemon's, a
+//! kernel of its own here that outlives every task ([`set_daemon`]).
 //!
 //! Checked against the 21H461 kernelcache: the enqueue
 //! (0xfffffff0072871e8) takes the thread, task and host handlers' ports in
@@ -156,6 +157,41 @@ pub fn data(id: u64) -> Option<std::sync::Arc<Vec<u8>>> {
 /// as (`thread_backtrace_queue`'s daemon).
 const DAEMON_TID: i32 = i32::MIN;
 
+/// `thread_backtrace_queue`: the deliveries enqueued, for the daemon.
+static QUEUE: Mutex<std::collections::VecDeque<Delivery>> = Mutex::new(std::collections::VecDeque::new());
+
+/// The daemon's kernel (`thread_backtrace_queue`'s, the kernel's own, which
+/// outlives any task), once its host has made it ([`set_daemon`]).
+static DAEMON: Mutex<Option<std::sync::Arc<Mutex<Kernel>>>> = Mutex::new(None);
+
+/// The daemon's thread-call bell.
+static DAEMON_BELL: Mutex<Option<std::sync::Arc<super::timer::Bell>>> = Mutex::new(None);
+
+/// Whether the host has made the daemon.
+pub fn daemon_made() -> bool {
+    DAEMON.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+}
+
+/// The host's daemon kernel ([`Kernel::darwin_bt_daemon_kernel`]), kept
+/// for the system's life: its thread calls deliver the queue.
+pub fn set_daemon(k: std::sync::Arc<Mutex<Kernel>>) {
+    {
+        let mut d = k.lock().unwrap_or_else(|e| e.into_inner());
+        d.darwin_task_enable();
+        d.darwin_ipc_leave();
+        *DAEMON_BELL.lock().unwrap_or_else(|e| e.into_inner()) = Some(d.darwin_timer_bell());
+    }
+    *DAEMON.lock().unwrap_or_else(|e| e.into_inner()) = Some(k);
+}
+
+/// Wake the daemon for what was queued.
+fn daemon_ring() {
+    let bell = DAEMON_BELL.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some(b) = bell {
+        b.ring();
+    }
+}
+
 /// One `thread_backtrace_enqueue`d delivery: the object, the handlers'
 /// send rights (thread, task, host), the next to try, and whether its
 /// request waits for a reply.
@@ -278,8 +314,11 @@ impl Kernel {
         match self.darwin_collect_backtrace_info(m, tid, etype, code, reason.as_deref()) {
             Ok(k) => {
                 let obj = create(k.bytes().to_vec());
-                self.dtask.bt_deliveries.push_back(Delivery { obj, ports, at: 0, port: None, waiting: false });
-                self.dtask.timers.bell().ring();
+                if !daemon_made() {
+                    self.darwin_unimplemented("a lightweight corpse on a host that runs no backtrace daemon (lwcorpse::set_daemon)".into());
+                }
+                QUEUE.lock().unwrap_or_else(|e| e.into_inner()).push_back(Delivery { obj, ports, at: 0, port: None, waiting: false });
+                daemon_ring();
                 let name = self.darwin_best_name();
                 super::corpse::kernel_log(format!("Lightweight corpse enqueued for {name}"));
                 KERN_SUCCESS
@@ -442,6 +481,7 @@ impl Kernel {
     /// success or is gone, the reply waited for at each; then the port's
     /// send right, the handlers' rights and the object's reference let go.
     pub(crate) fn darwin_bt_deliveries(&mut self, m: &mut GuestMem<'_>) {
+        self.dtask.bt_deliveries.extend(QUEUE.lock().unwrap_or_else(|e| e.into_inner()).drain(..));
         while let Some(mut d) = self.dtask.bt_deliveries.pop_front() {
             if d.port.is_none() {
                 // kcdata_object_reference, then convert_kcdata_object_to_port
@@ -479,6 +519,19 @@ impl Kernel {
                 self.darwin_kcdata_port_destroy(port);
             }
         }
+    }
+
+    /// The backtrace daemon's kernel, made from this one's: the kernel's
+    /// own task (pid 0), with no process, descriptors or memory of a
+    /// program, whose thread calls do only the daemon's work.
+    pub fn darwin_bt_daemon_kernel(&self) -> Kernel {
+        let t = super::Task { bt_daemon: true, ..Default::default() };
+        let mut k = self.fork_kernel_with(t);
+        k.pid = 0;
+        k.ppid = 0;
+        k.tid = DAEMON_TID;
+        k.fds = std::sync::Arc::new(crate::file::FdTable::new());
+        k
     }
 
     /// `convert_kcdata_object_to_port`: a send right to the object's port,

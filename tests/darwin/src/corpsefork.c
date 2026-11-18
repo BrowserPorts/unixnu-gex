@@ -17,7 +17,8 @@
 // its children's), the fault is a lightweight corpse instead:
 // mach_exception_raise_backtrace with a kcdata object, which
 // task_map_kcdata_object_64 maps (TASK_BTINFO_*: the faulting thread's
-// backtrace, ids, codes, reason and image infos). A crash corpse for a
+// backtrace, ids, codes, reason and image infos), delivered by the
+// kernel's daemon even once the faulting task has ended. A crash corpse for a
 // handler registered as launchd registers its exception server
 // (0xa0000004: EXCEPTION_IDENTITY_PROTECTED) comes as
 // mach_exception_raise_identity_protected with the crashed thread's id and
@@ -142,6 +143,11 @@ static int child(const char *how) {
                 return c == 'x' ? 0 : 4;
             }
         }
+    }
+    if (!strcmp(how, "lwgone")) {
+        int r = os_fault_with_payload(FAULT_NS, FAULT_CODE, NULL, 0, "corpsefork", 0);
+        child_say(r ? errno : 0);
+        return 0;
     }
     if (!strcmp(how, "crash")) {
         child_say(0);
@@ -616,6 +622,34 @@ typedef struct {
 } protected_request_t;
 #pragma pack()
 
+// The kernel's daemon delivers a lightweight corpse whose task has ended.
+static int lightweight_gone(void) {
+    mach_port_t port = new_port();
+    kid_t k;
+    if (spawn_child_bt("lwgone", port, 0, &k, EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES | MACH_EXCEPTION_BACKTRACE_PREFERRED)) return bad("spawning", 0, 0);
+    int r = heard(&k);
+    if (r != 0) return bad("os_fault_with_payload before the end", r, 0);
+    int st = 0;
+    if (waitpid(k.pid, &st, 0) != k.pid || !WIFEXITED(st) || WEXITSTATUS(st) != 0) return bad("the child's end", st, 0);
+    bt_request_t req;
+    memset(&req, 0, sizeof req);
+    kern_return_t kr = mach_msg(&req.head, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof req, port, 20000, MACH_PORT_NULL);
+    if (kr) return bad("the backtrace of a task that has ended", kr, 0);
+    if (req.head.msgh_id != 2409) return bad("message id", req.head.msgh_id, 2409);
+    mach_vm_address_t kcd = 0;
+    mach_vm_size_t size = 0;
+    if ((kr = task_map_kcdata_object_64(mach_task_self(), req.obj.name, &kcd, &size))) return bad("task_map_kcdata_object_64", kr, 0);
+    uint32_t sz;
+    const uint8_t *p = item((const uint8_t *)kcd, size, 0xA01, &sz);
+    if (!p || (pid_t)u32_at(p) != k.pid) return bad("TASK_BTINFO_PID", p ? u32_at(p) : -1, k.pid);
+    vm_deallocate(mach_task_self(), (vm_address_t)kcd, (vm_size_t)size);
+    reply((request_t *)&req);
+    mach_port_deallocate(mach_task_self(), req.obj.name);
+    mach_port_mod_refs(mach_task_self(), port, MACH_PORT_RIGHT_RECEIVE, -1);
+    mach_port_deallocate(mach_task_self(), port);
+    return 0;
+}
+
 static int protected(void) {
     mach_port_t port = new_port();
     kid_t k;
@@ -670,6 +704,7 @@ int main(int argc, char **argv) {
     if (limit()) return 1;
     if (fault()) return 1;
     if (lightweight()) return 1;
+    if (lightweight_gone()) return 1;
     if (protected()) return 1;
     printf("corpsefork ok\n");
     return 0;

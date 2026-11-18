@@ -724,12 +724,12 @@ fn dstream_of(v: &[u8]) -> Result<Option<Dstream>, String> {
 }
 
 /// What the kernel writes for a file's inode as its size and data change
-/// that is not transcribed here (apfs_truncate_locked K 0x66a6bbc and the
-/// write path's inode updates: the sparse-bytes field and INODE_IS_SPARSE,
-/// the data stream's byte counters, the times and write generation): the
-/// inode keeps the fields its creation and its data stream's creation gave
-/// it, the stream's size and allocated size.
-pub const FILE_INODE_STAND_IN: &str = "the inode fields the kernel updates as a file's size and data change (sparse bytes, data-stream byte counters, times, write generation) are not transcribed (stand-in: the fields its creation and its data stream's creation give it, and the stream's sizes); for asr's image file apfs_invert retires these records whole";
+/// that is not transcribed for asr's pwrites (prepare_write_and_lock's
+/// per-write updates: the data stream's byte counters, the times, the write
+/// generation, PREV_FSIZE): the inode keeps the fields its creation, its
+/// data stream's creation, its truncate and its block maps' sparse bytes
+/// give it.
+pub const FILE_INODE_STAND_IN: &str = "the inode fields the kernel updates at each of asr's pwrites into its image file (data-stream byte counters, times, write generation, PREV_FSIZE) are not transcribed (stand-in: the fields its creation, its data stream's creation, its truncate and its block maps' sparse bytes give it, and the stream's sizes); apfs_invert retires these records whole";
 
 /// `ftruncate` growing a file with no data (apfs_vnop_setattr K 0x668e4a0
 /// → apfs_truncate_locked K 0x66a6bbc → apfs_set_file_size K 0x6766f50):
@@ -791,49 +791,98 @@ fn truncate_grow_unchecked(nx: &mut Nx<'_>, vol: usize, ino: u64, size: u64, now
     if size <= old.size || old.alloced != 0 {
         return Err("not implemented: a truncate other than growing a file with no data or into its preallocation".into());
     }
+    // alloc_space with no length (K 0x6707764): the hole extent, the
+    // allocated size, then the sparse bytes it adds (K 0x6708614 →
+    // update_sparse_bytes K 0x66ff7c0: INODE_IS_SPARSE and the
+    // SPARSE_BYTES field, appended).
     let alloced = size.div_ceil(bs) * bs;
     t.insert(&mut st, &fext_key(old.oid, 0), Some(&fext_val(alloced, 0)))?;
     let d = x.iter_mut().find(|f| f.0 == INO_EXT_TYPE_DSTREAM).unwrap();
     d.2.put64(0, size);
     d.2.put64(8, alloced);
+    sparse_bytes(&mut v, &mut x, alloced as i64)?;
     v = with_xfields(&v, &x);
     t.insert(&mut st, &inode_key(ino), Some(&v))?;
     nx.set_fs_tree(vol, t);
     fs_tx_leave(nx, vol, now)
 }
 
-/// A write into a file's sparse extent (apfs_vnop_write K 0x6691308 →
-/// cluster_write → apfs_vnop_blockmap K 0x66882ec →
-/// fs_make_hole_range_writable K 0x670afbc), `data` at byte `off` (both
-/// block multiples): for each piece the space manager grants
-/// ([`Nx::alloc_data`]), the volume's allocation count, the block
+/// `INO_EXT_TYPE_SPARSE_BYTES` and `INODE_IS_SPARSE`.
+const INO_EXT_TYPE_SPARSE_BYTES: u8 = 0xd;
+const INODE_IS_SPARSE: u64 = 0x200;
+
+/// `update_sparse_bytes` (K 0x66ff7c0) by `delta` on an inode value `v`
+/// whose extended fields are `x`: the SPARSE_BYTES field (flags 0x28)
+/// rewritten in place or appended with INODE_IS_SPARSE while the count
+/// stays above 0, else removed with the flag cleared. A decrease with no
+/// field is the kernel's error (2).
+fn sparse_bytes(v: &mut [u8], x: &mut Vec<(u8, u8, Vec<u8>)>, delta: i64) -> Result<(), String> {
+    if delta == 0 {
+        return Ok(());
+    }
+    let at = x.iter().position(|f| f.0 == INO_EXT_TYPE_SPARSE_BYTES);
+    let old = match at {
+        Some(i) => u64a(&x[i].2, 0) as i64,
+        None if delta < 0 => return Err("a sparse-bytes decrease on an inode with no SPARSE_BYTES field (update_sparse_bytes returns 2)".into()),
+        None => 0,
+    };
+    let new = old + delta;
+    let f = u64a(v, INO_INTERNAL_FLAGS);
+    if new < 1 {
+        if let Some(i) = at {
+            x.remove(i);
+        }
+        v[INO_INTERNAL_FLAGS..INO_INTERNAL_FLAGS + 8].copy_from_slice(&(f & !INODE_IS_SPARSE).to_le_bytes());
+    } else {
+        v[INO_INTERNAL_FLAGS..INO_INTERNAL_FLAGS + 8].copy_from_slice(&(f | INODE_IS_SPARSE).to_le_bytes());
+        let d = (new as u64).to_le_bytes().to_vec();
+        match at {
+            Some(i) => x[i].2 = d,
+            None => x.push((INO_EXT_TYPE_SPARSE_BYTES, 0x28, d)),
+        }
+    }
+    Ok(())
+}
+
+/// A write into a file's sparse extent, as XNU's cluster layer pushes it:
+/// one `VNOP_BLOCKMAP` of `data` at byte `off` (both block multiples)
+/// (apfs_vnop_blockmap K 0x66882ec → fs_map_file_offset_ext K 0x6708b54 →
+/// fs_make_hole_range_writable K 0x670afbc). Each piece the space manager
+/// grants ([`Nx::alloc_data`], one request per transaction: a shorter
+/// grant ends the block map and cluster_io maps the rest again) is its own
+/// file-system transaction: the volume's allocation counts, the block
 /// references (a record per physically contiguous run of the stream's
 /// blocks, merged with its neighbours, `insert_phys_extent` K 0x66f6ca0),
-/// and the file extents: a piece at the sparse extent's start replaces it
-/// or, physically following the extent before it, extends that one; any
-/// other piece splits it; what the piece leaves of it stays sparse. The
-/// blocks granted, in order.
+/// the file extents (a piece at the sparse extent's start replaces it or,
+/// physically following the extent before it, extends that one; any other
+/// piece splits it; what the piece leaves of it stays sparse), the sparse
+/// bytes lowered (K 0x670920c) and the inode rewritten from its in-memory
+/// object (K 0x6709228), with `times` (the write's modification and change
+/// times and the stream's bytes written) when the write's end has already
+/// set them there. The data reaches the blocks with each piece. The
+/// pieces granted, in order.
 pub fn write_sparse(nx: &mut Nx<'_>, vol: usize, ino: u64, off: u64, data: &[u8], now: &mut dyn FnMut() -> u64) -> Result<Vec<(u64, u64)>, String> {
     check_volume(nx, vol)?;
+    blockmap_fill(nx, vol, ino, off, data, None, now)
+}
+
+fn blockmap_fill(nx: &mut Nx<'_>, vol: usize, ino: u64, off: u64, data: &[u8], times: Option<(u64, u64)>, now: &mut dyn FnMut() -> u64) -> Result<Vec<(u64, u64)>, String> {
     let bs = nx.l.bs;
     if off % bs != 0 || data.len() as u64 % bs != 0 || data.is_empty() {
         return Err("not implemented: a write not of whole blocks".into());
-    }
-    fs_tx_enter(nx, vol)?;
-    let v = {
-        let (t, mut st) = nx.fs_tree(vol)?;
-        t.get(&mut st, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?
-    };
-    let ds = dstream_of(&v)?.ok_or("a write to a file with no data stream")?;
-    if off + data.len() as u64 > ds.size {
-        return Err("not implemented: a write past the end of a file".into());
     }
     let mut out = Vec::new();
     let mut pos = off;
     let end = off + data.len() as u64;
     while pos < end {
+        fs_tx_enter(nx, vol)?;
+        let v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
+        let ds = dstream_of(&v)?.ok_or("a write to a file with no data stream")?;
+        if end > ds.alloced {
+            return Err("not implemented: a block map past the file's allocated size".into());
+        }
         // The sparse extent holding `pos`.
-        let (mut t, mut st) = nx.fs_tree(vol)?;
+        let (t, mut st) = nx.fs_tree(vol)?;
         let recs = t.records(&mut st)?;
         let ext: Vec<(u64, u64, u64)> = recs
             .iter()
@@ -843,11 +892,11 @@ pub fn write_sparse(nx: &mut Nx<'_>, vol: usize, ino: u64, off: u64, data: &[u8]
                 (u64a(k, 8), u64a(v, 0) & 0x00ff_ffff_ffff_ffff, u64a(v, 8))
             })
             .collect();
+        drop(st);
         let &(hl, hlen, hphys) = ext.iter().find(|&&(l, n, _)| l <= pos && pos < l + n).ok_or("a write where the file has no extent")?;
         if hphys != 0 {
             return Err("not implemented: a write over a file's allocated blocks".into());
         }
-        drop(st);
         let want = (end - pos).min(hl + hlen - pos);
         let blocks = want.div_ceil(bs);
         let (a, got) = nx.alloc_data(blocks)?;
@@ -873,12 +922,23 @@ pub fn write_sparse(nx: &mut Nx<'_>, vol: usize, ino: u64, off: u64, data: &[u8]
             t.insert(&mut st, &fext_key(ds.oid, pos + n), Some(&fext_val(hl + hlen - (pos + n), 0)))?;
         }
         nx.set_fs_tree(vol, t);
+        let mut v = v;
+        let mut x = xfields(&v)?;
+        sparse_bytes(&mut v, &mut x, -(n as i64))?;
+        if let Some((t_w, written)) = times {
+            let d = x.iter_mut().find(|f| f.0 == INO_EXT_TYPE_DSTREAM).unwrap();
+            d.2.put64(0x18, written);
+            v.put64(INO_MOD_TIME, t_w);
+            v.put64(INO_CHANGE_TIME, t_w);
+        }
+        let v = with_xfields(&v, &x);
+        put_rec(nx, vol, &inode_key(ino), &v)?;
         let at = (pos - off) as usize;
         nx.write_data(a, &data[at..at + n as usize])?;
+        fs_tx_leave(nx, vol, now)?;
         out.push((a, got));
         pos += n;
     }
-    fs_tx_leave(nx, vol, now)?;
     Ok(out)
 }
 
@@ -1428,34 +1488,62 @@ pub fn close_after_grow(nx: &mut Nx<'_>, vol: usize, ino: u64) -> Result<(), Str
     Ok(())
 }
 
+/// How XNU's cluster layer pushes a new file's data written by one
+/// `write(2)` of `n` bytes from offset 0: the block maps it asks for, in
+/// order (byte offset and length, block multiples ending at the file's
+/// allocated end), and how many of them the write's own write-behind pushes
+/// before its end (the rest the close's fsync pushes).
+pub struct Pushes {
+    pub maps: Vec<(u64, u64)>,
+    pub before_end: usize,
+}
+
 /// `open_dprotected_np(O_WRONLY | O_CREAT | O_TRUNC, class -1 (the
-/// default: no class passed), 0, mode)` of a new file `name` in `parent`,
-/// one `write` of `data` (shorter than a block) at offset 0, and `close`
-/// (drafts/s21/re-gigalocker.md D): the file made as [`create`] makes it
-/// (O_TRUNC does nothing to a file the open made); the write's
-/// transaction (prepare_write_and_lock K 0x66a4024) makes the data stream,
-/// allocates its block at once (a first write under 0x20000 bytes, alloc
-/// flags 8: one block from the 1-block allocation zone), counts it, adds
-/// the file extent and its block reference, sets the size, adds a
-/// PREV_FSIZE field holding the old size 0 and raises the write
-/// generation; the write's end reads the clock for the modification and
-/// change times and counts the bytes written, in memory; the close's fsync
-/// writes the block (the data, zeros after it), removes the PREV_FSIZE
-/// field and writes the inode in its own transaction (K 0x6766d4c). The
-/// file's inode number.
-pub fn write_new_file(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str, mode: u16, data: &[u8], now: &mut dyn FnMut() -> u64) -> Result<u64, String> {
-    const INO_EXT_TYPE_PREV_FSIZE: u8 = 5;
+/// default: no class passed), 0, mode)` (or `open` with the same flags) of
+/// a new file `name` in `parent` of an unencrypted volume, one `write` of
+/// all of `data` at offset 0, and `close` (drafts/s21/re-gigalocker.md D,
+/// drafts/s23/re-kernelcache.md 4): the file made as [`create`] makes it
+/// (O_TRUNC does nothing to a file the open made). The write's
+/// transaction (prepare_write_and_lock K 0x66a4024) makes the data stream
+/// and takes one of two paths (K 0x66a4410..0x66a4478):
+/// - direct, for a length not a block multiple and under 0x20000: the
+///   blocks allocated at once (alloc_space flags 8: requests for what is
+///   left until the space manager has granted it all), each piece counted,
+///   its file extent (extending the one before it when physically
+///   contiguous) and block references; the size, a PREV_FSIZE field of the
+///   old size 0, the write generation; the close's push writes the blocks
+///   with no transaction;
+/// - deferred, otherwise: one sparse extent over the allocated size, the
+///   SPARSE_BYTES field and INODE_IS_SPARSE (alloc_space flags 0x10), the
+///   size, PREV_FSIZE, the write generation; the blocks are allocated by
+///   the block maps `pushes` gives ([`blockmap_fill`]), those after the
+///   write's end carrying its times and bytes written.
+/// The write's end reads the clock for the modification and change times
+/// and counts the bytes written, in memory; the close's fsync removes the
+/// PREV_FSIZE field in its own transaction (K 0x6766d4c) whose inode write
+/// carries them. The file's inode number.
+pub fn write_new_file(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str, mode: u16, data: &[u8], pushes: &dyn Fn(u64) -> Result<Pushes, String>, now: &mut dyn FnMut() -> u64) -> Result<u64, String> {
     let bs = nx.l.bs;
-    if data.is_empty() || data.len() as u64 >= bs {
-        return Err(format!("not implemented: a first write of {} bytes (only one under a block is traced)", data.len()));
+    let n = data.len() as u64;
+    if n == 0 {
+        return Err("not implemented: an empty write".into());
     }
     {
         let sb = nx.vol_sb(vol)?;
         if u64a(sb, 0x108) & 1 == 0 || u64a(sb, SB_INCOMPAT) & 0x80 != 0 {
             return Err("not implemented: a file write on an encrypted volume or one with unwritten extents".into());
         }
+        // The volume's low-space state (fs + 0x3ac, set below the
+        // thresholds at fs + 0x3b0..0x3bc) can force the direct path; its
+        // thresholds are not transcribed, so only a volume without a quota
+        // is taken.
+        if u64a(sb, 0x50) != 0 && (n % bs == 0 || n >= 0x20000) {
+            return Err("not implemented: a deferred write on a volume with a quota (the low-space state at fs + 0x3ac)".into());
+        }
     }
     let ino = create(nx, vol, parent, name, mode, 0, 0, now)?.map_err(|e| format!("creating {name}: errno {e}"))?;
+    let blocks = n.div_ceil(bs);
+    let direct = n % bs != 0 && n < 0x20000;
     // The write's transaction.
     fs_tx_enter(nx, vol)?;
     let v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
@@ -1463,17 +1551,34 @@ pub fn write_new_file(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str, mode
     let mut x = xfields(&v)?;
     x.push((INO_EXT_TYPE_DSTREAM, XF_SYSTEM_FIELD, vec![0u8; 0x28]));
     put_rec(nx, vol, &(oid | J_DSTREAM_ID << 60).to_le_bytes(), &1u32.to_le_bytes())?;
-    let (a, got) = nx.alloc_data(1)?;
-    if got != 1 {
-        return Err("a one-block data allocation given no block".into());
+    let mut v = v;
+    let mut extents: Vec<(u64, u64, u64)> = Vec::new();
+    if direct {
+        let mut done = 0u64;
+        while done < blocks {
+            let (a, got) = nx.alloc_data(blocks - done)?;
+            blocks_alloced(nx, vol, got)?;
+            match extents.last_mut() {
+                Some((l, len, p)) if *p + *len / bs == a => {
+                    *len += got * bs;
+                    put_rec(nx, vol, &fext_key(oid, *l), &fext_val(*len, *p))?;
+                }
+                _ => {
+                    put_rec(nx, vol, &fext_key(oid, done * bs), &fext_val(got * bs, a))?;
+                    extents.push((done * bs, got * bs, a));
+                }
+            }
+            phys_extent_add(nx, vol, a, got, oid)?;
+            done += got;
+        }
+    } else {
+        put_rec(nx, vol, &fext_key(oid, 0), &fext_val(blocks * bs, 0))?;
+        sparse_bytes(&mut v, &mut x, (blocks * bs) as i64)?;
     }
-    blocks_alloced(nx, vol, 1)?;
-    put_rec(nx, vol, &fext_key(oid, 0), &fext_val(bs, a))?;
-    phys_extent_add(nx, vol, a, 1, oid)?;
     {
         let d = x.iter_mut().find(|f| f.0 == INO_EXT_TYPE_DSTREAM).unwrap();
-        d.2.put64(0, data.len() as u64);
-        d.2.put64(8, bs);
+        d.2.put64(0, n);
+        d.2.put64(8, blocks * bs);
     }
     x.push((INO_EXT_TYPE_PREV_FSIZE, 0, 0u64.to_le_bytes().to_vec()));
     let mut v = with_xfields(&v, &x);
@@ -1481,18 +1586,42 @@ pub fn write_new_file(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str, mode
     v.put32(INO_WRITE_GEN, wgc.wrapping_add(1));
     put_rec(nx, vol, &inode_key(ino), &v)?;
     fs_tx_leave(nx, vol, now)?;
-    // The write's end (K 0x66a5c80): the times and the bytes written, in
-    // memory.
-    let t_w = now();
-    // The close: the block written, then the PREV_FSIZE field's removal.
-    let mut block = data.to_vec();
-    block.resize(bs as usize, 0);
-    nx.write_data(a, &block)?;
+    // The data as the pages hold it: the bytes, zeros to the block's end.
+    let mut padded = data.to_vec();
+    padded.resize((blocks * bs) as usize, 0);
+    let t_w = if direct {
+        // The write's end (K 0x66a5c80): the times and the bytes written,
+        // in memory; the close's push writes the blocks.
+        let t_w = now();
+        for &(l, len, p) in &extents {
+            nx.write_data(p, &padded[l as usize..(l + len) as usize])?;
+        }
+        t_w
+    } else {
+        let plan = pushes(n)?;
+        let mut t_w = None;
+        for (k, &(off, len)) in plan.maps.iter().enumerate() {
+            if k == plan.before_end {
+                t_w = Some(now());
+            }
+            blockmap_fill(nx, vol, ino, off, &padded[off as usize..(off + len) as usize], t_w.map(|t| (t, n)), now)?;
+        }
+        match t_w {
+            Some(t) => t,
+            None => now(),
+        }
+    };
+    // The close: the PREV_FSIZE field's removal.
     fs_tx_enter(nx, vol)?;
+    let v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
+    let mut x = xfields(&v)?;
+    if x.iter().any(|f| f.0 == INO_EXT_TYPE_SPARSE_BYTES) {
+        return Err("the block maps left the file sparse".into());
+    }
     x.retain(|f| f.0 != INO_EXT_TYPE_PREV_FSIZE);
     {
         let d = x.iter_mut().find(|f| f.0 == INO_EXT_TYPE_DSTREAM).unwrap();
-        d.2.put64(0x18, data.len() as u64);
+        d.2.put64(0x18, n);
     }
     let mut v = with_xfields(&v, &x);
     v.put64(INO_MOD_TIME, t_w);

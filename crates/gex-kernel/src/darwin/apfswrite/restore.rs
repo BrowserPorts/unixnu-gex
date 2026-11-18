@@ -56,8 +56,13 @@ pub const RUN_STAND_IN: &str = "the erase restore's clock readings, transaction 
 
 /// Every stand-in the build takes, for the caller to report: the image
 /// is the device's only where these are.
-pub fn stand_ins(os: bool) -> Vec<&'static str> {
+pub fn stand_ins(os: bool, boot: bool) -> Vec<&'static str> {
     let mut v = vec![RUN_STAND_IN, HOST_UUID_STAND_IN, GIGALOCKER_STAND_IN, fsops::UNWRITTEN_STAND_IN, NSIH_STAND_IN];
+    if boot {
+        v.push(TICKET_STAND_IN);
+        v.push(RESTORE_HOST_STAND_IN);
+        v.push(CLUSTER_STAND_IN);
+    }
     if os {
         v.push(fsops::FILE_INODE_STAND_IN);
         v.push(super::tx::KEYS_STAND_IN);
@@ -75,6 +80,9 @@ pub const RESTORE_BUILD: &str = "21H461";
 pub struct OsImage {
     pub image: std::sync::Arc<crate::darwin::udif::Udif>,
     pub partition: usize,
+    /// The IPSW's boot objects install_kernel_cache's list installs
+    /// (listed as missing without them).
+    pub boot: Option<BootObjects>,
 }
 
 /// Writes disk0 on `disk` (zeroed, the size of [`storage::disk0_bytes`]),
@@ -177,7 +185,7 @@ pub fn build_disk0_with(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() ->
     // committed and block 0 written (a stand-in, in RUN_STAND_IN), then the
     // tool's own mount.
     nx.unmount()?;
-    if let Some(_os) = os {
+    if let Some(os) = os {
         before_invert()?;
         let barrier = barrier.unwrap_or_else(crate::darwin::storagestack::container_barrier);
         super::invert::invert(&mut nx, system, super::asr::IMAGE_NAME, std::sync::Arc::clone(&disk), base, barrier, now)?;
@@ -216,13 +224,21 @@ pub fn build_disk0_with(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() ->
         // reserve_overprov_space (0x1000184ec → 0x10002e5bc, erase only):
         // the disk's size from the whole-disk node's block size and count.
         fsops::reserve_overprov_space(&mut nx, data, storage::disk0_bytes(), crate::darwin::storagestack::container_unmap(), now)?;
+        // read_new_os_build_version only reads System; install_splat
+        // (0x1000185a8 → 0x10003af24) writes the Cryptex1 objects under
+        // Preboot's cryptex1/current.
+        missing.push("install_splat's Cryptex1 objects on Preboot (cryptex1/current: os.dmg, app.dmg, their root hashes and trust caches, the version plists, the build manifest, the cryptex1 ticket and LocalPolicy; their sources and the install handler not traced, drafts/s14/restored/slice_preboot_update.md 2.5): everything the restore writes after it is placed without them".into());
+        match &os.boot {
+            Some(b) => install_kernel_cache(&mut nx, Volumes { system, xart, hardware, preboot, update }, b, &cluster_pushes, now)?,
+            None => missing.push("install_kernel_cache's list (no IPSW boot objects given: the kernelcache, devicetree, iBoot and root_hash Image4 files and the AP ticket on Preboot and Hardware)".into()),
+        }
     }
     if os.is_none() {
         missing.push("the Data and User volumes (newfs_apfs -P), made after apfs_invert".into());
     }
     // 7.
     missing.push(if os.is_some() {
-        "the restore's later steps, in its order: install_kernel_cache's list (kernelcache, devicetree, iBoot, root_hash Image4 files and the AP ticket on Preboot and Hardware: personalized by the host, the large files' block maps following the device's cluster I/O size, drafts/s23/re-kernelcache.md), check_mounted's fixup_var (aks_bootstrap_fs of /mnt2 and BOM's copy of /private/var interleaved with remove_moved_trees), the mountpoints (/mnt1/private/xarts, /mnt2/hardware, MobileSoftwareUpdate, internal), populate_preboot_volume, apfs_sealvolume and the update snapshot".into()
+        "the restore's later steps, in its order: check_mounted's fixup_var (aks_bootstrap_fs of /mnt2 and BOM's copy of /private/var interleaved with remove_moved_trees), the mountpoints (/mnt1/private/xarts, /mnt2/hardware, MobileSoftwareUpdate, internal), populate_preboot_volume, apfs_sealvolume and the update snapshot".into()
     } else {
         "the restore's later writes to Preboot (install_kernel_cache's boot objects, populate_preboot_volume, install_splat's cryptex1) and Data's contents".into()
     });
@@ -347,7 +363,7 @@ fn concurrent_steps(nx: &mut Nx<'_>, v: Volumes, now: &mut dyn FnMut() -> u64, m
     for name in ["OS", "App"] {
         fsops::mkdir(nx, v.preboot, cryptexes, name, 0o777, 0, 0, now)?.map_err(|e| format!("mkdir Cryptexes/{name}: errno {e}"))?;
     }
-    fsops::write_new_file(nx, v.preboot, ROOT_INO, "active", 0o644, p.as_bytes(), now)?;
+    fsops::write_new_file(nx, v.preboot, ROOT_INO, "active", 0o644, p.as_bytes(), &|n| Err(format!("a {n}-byte active file (the direct path's)")), now)?;
     // fdr_prepare's removefile walk of the empty factorydata directory and
     // the access() checks of the later steps only read.
     missing.push("the FDR local store on Hardware (libFDR's writes into /FactoryData/System/Library/Caches/com.apple.factorydata by fdr_prepare's commit, fdr_recover, fdr_auto_challenge_claim and verify_fdr_data: server and device data, file names not traced)".into());
@@ -792,6 +808,160 @@ fn gigalocker_init(nx: &mut Nx<'_>, xart: usize, now: &mut dyn FnMut() -> u64) -
     fsops::close_after_grow(nx, xart, ino)
 }
 
+/// The IPSW's boot objects the host personalizes for install_kernel_cache's
+/// list (drafts/s23/re-kernelcache.md 3): the IM4P payloads as the IPSW has
+/// them (their SHA-384 the erase identity's digests).
+pub struct BootObjects {
+    /// `kernelcache.release.ipad7`.
+    pub kernelcache: Vec<u8>,
+    /// `Firmware/all_flash/DeviceTree.j120ap.im4p`.
+    pub devicetree: Vec<u8>,
+    /// `Firmware/all_flash/iBoot.j120.RELEASE.im4p`.
+    pub iboot: Vec<u8>,
+    /// `Firmware/044-76040-038.dmg.root_hash`.
+    pub root_hash: Vec<u8>,
+}
+
+impl BootObjects {
+    /// The four objects from an IPSW extracted at `dir`.
+    pub fn read(dir: &std::path::Path) -> Result<Self, String> {
+        let r = |p: &str| std::fs::read(dir.join(p)).map_err(|e| format!("{}: {e}", dir.join(p).display()));
+        Ok(BootObjects { kernelcache: r("kernelcache.release.ipad7")?, devicetree: r("Firmware/all_flash/DeviceTree.j120ap.im4p")?, iboot: r("Firmware/all_flash/iBoot.j120.RELEASE.im4p")?, root_hash: r("Firmware/044-76040-038.dmg.root_hash")? })
+    }
+}
+
+/// The AP ticket the host sends as RootTicketData (TSS's, personalized
+/// for the device's ECID and nonces) and what the host makes of the boot
+/// objects with it.
+pub const TICKET_STAND_IN: &str = "the AP ticket (the host's RootTicketData from TSS: its bytes and length decide the personalized files' lengths and so their placement) and the host's Image4 files (KernelCacheFile, DeviceTreeFile, NorImageData's iBoot, SystemImageRootHashFile: drafts/s23/re-kernelcache.md UNSETTLED-3 and 4) (stand-in: the ticket an empty DER SEQUENCE, 30 00; each file IMG4 { \"IMG4\", the IPSW's IM4P, [0] the ticket } in DER, no IM4R; measure /private/preboot/<nsih>/System/Library/Caches/apticket.der and the files beside it on the device)";
+const TICKET: [u8; 2] = [0x30, 0x00];
+
+/// What the host answers that decides which of the list's files exist:
+/// install_device_tree runs only for a RestoreProtocolVersion of 15 or more
+/// (0x100012ce8), and the names take ".img4" when MobileGestalt's
+/// Image4Supported is true.
+pub const RESTORE_HOST_STAND_IN: &str = "the restore host's RestoreProtocolVersion (15 or more makes install_device_tree write devicetree.img4) and the ramdisk's Image4Supported answer (the .img4 names) (stand-in: 15 or more, and true, as a current host and an Image4 device give; measure /private/preboot/<nsih>/usr/standalone/firmware on the device)";
+
+/// A DER length.
+fn der_len(out: &mut Vec<u8>, n: usize) {
+    if n < 0x80 {
+        out.push(n as u8);
+    } else {
+        let b = (n as u64).to_be_bytes();
+        let skip = b.iter().position(|&x| x != 0).unwrap();
+        out.push(0x80 | (8 - skip) as u8);
+        out.extend_from_slice(&b[skip..]);
+    }
+}
+
+/// `IMG4 ::= SEQUENCE { IA5String "IMG4", IM4P, [0] EXPLICIT IM4M }` in
+/// DER (TICKET_STAND_IN: no IM4R).
+fn img4(im4p: &[u8], ticket: &[u8]) -> Vec<u8> {
+    let mut tagged = vec![0xa0];
+    der_len(&mut tagged, ticket.len());
+    tagged.extend_from_slice(ticket);
+    let mut body = vec![0x16, 4];
+    body.extend_from_slice(b"IMG4");
+    body.extend_from_slice(im4p);
+    body.extend_from_slice(&tagged);
+    let mut out = vec![0x30];
+    der_len(&mut out, body.len());
+    out.extend_from_slice(&body);
+    out
+}
+
+/// install_kernel_cache's nested list (0x100018620; drafts/s23/
+/// re-kernelcache.md 1, 2), run after install_splat with Preboot and
+/// Hardware mounted read-write: the kernel cache, device tree, iBoot and
+/// root hash, each a new file under the Preboot directory of the ticket's
+/// hash written by one `write` and closed ([`fsops::write_new_file`]), then
+/// write_ticket's AP ticket there, its symbolic link in the firmware
+/// directory and its copy on Hardware. The /mnt1 `stat`s and the
+/// `access`es only read.
+fn install_kernel_cache(nx: &mut Nx<'_>, v: Volumes, boot: &BootObjects, pushes: &dyn Fn(u64) -> Result<fsops::Pushes, String>, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    let p = nsih();
+    let dir = |nx: &mut Nx<'_>, vol: usize, path: &str| -> Result<u64, String> {
+        let mut d = ROOT_INO;
+        for c in path.split('/') {
+            d = fsops::lookup(nx, vol, d, c)?.ok_or_else(|| format!("not implemented: install_kernel_cache with no {path} (its mkdir chain)"))?;
+        }
+        Ok(d)
+    };
+    let kc = dir(nx, v.preboot, &format!("{p}/System/Library/Caches/com.apple.kernelcaches"))?;
+    fsops::write_new_file(nx, v.preboot, kc, "kernelcache", 0o644, &img4(&boot.kernelcache, &TICKET), pushes, now)?;
+    let fw = dir(nx, v.preboot, &format!("{p}/usr/standalone/firmware"))?;
+    fsops::write_new_file(nx, v.preboot, fw, "devicetree.img4", 0o644, &img4(&boot.devicetree, &TICKET), pushes, now)?;
+    fsops::write_new_file(nx, v.preboot, fw, "iBoot.img4", 0o644, &img4(&boot.iboot, &TICKET), pushes, now)?;
+    fsops::write_new_file(nx, v.preboot, fw, "root_hash.img4", 0o644, &img4(&boot.root_hash, &TICKET), pushes, now)?;
+    // write_ticket (0x1000303d8 → ramrod_ticket_write_explicit 0x1000667a4):
+    // the ticket by a plain open(O_WRONLY | O_CREAT | O_TRUNC, 0644), its
+    // link (symlink(2) by root under umask 0: ACCESSPERMS, the parent's
+    // group) to /private/preboot's path, and the Hardware copy, not linked.
+    let caches = dir(nx, v.preboot, &format!("{p}/System/Library/Caches"))?;
+    fsops::write_new_file(nx, v.preboot, caches, "apticket.der", 0o644, &TICKET, pushes, now)?;
+    let gid = u32::from_le_bytes(fsops::inode(nx, v.preboot, fw)?[0x4c..0x50].try_into().unwrap());
+    fsops::symlink(nx, v.preboot, fw, "apticket.der", &format!("/private/preboot/{p}/System/Library/Caches/apticket.der"), 0o777, 0, gid, now)?.map_err(|e| format!("symlink apticket.der: errno {e}"))?;
+    let hw = dir(nx, v.hardware, "FactoryData/System/Library/Caches")?;
+    fsops::write_new_file(nx, v.hardware, hw, "apticket.der", 0o644, &TICKET, pushes, now)?;
+    Ok(())
+}
+
+/// What decides how XNU's cluster layer pushes a large file's data that
+/// only the device answers.
+pub const CLUSTER_STAND_IN: &str = "how the cluster layer pushes install_kernel_cache's large files (drafts/s26/re-cluster.md): the main namespace's limit table index (the byte at its object's +0x1f0) that sets IOMaximumByteCountWrite, and the controller's IOMinimumSaturationByteCount, throttling and any syncer push, which only move the pushes in time (stand-in: the table's type-1 limits, 1 MiB, so 1 MiB clusters and block maps; the write-behind leaving its last four clusters to the close, the pushes ordered by offset; measure the kernelcache's file extents on the device's Preboot)";
+
+/// The pushes of one `write(2)` of `n` bytes from offset 0 into a new file
+/// on a disk0 volume (drafts/s26/re-cluster.md): the mount's I/O
+/// attributes from the volume node's limits (vfs_init_io_attributes X
+/// 0xfffffff0073742f4: Wc the byte count, or the block count's bytes when
+/// fewer, 64 MiB with neither; the segment count, else Wc / 16 KiB, at
+/// most 0xffff), the cluster size C = cluster_max_io_size (X
+/// 0xfffffff00735ee9c: min(segments, 4096) pages or Wc, a 16 KiB multiple,
+/// at least 1 MiB) and the block-map length M (Wc to a 16 KiB multiple);
+/// cluster_write_copy files the data in clusters of C up to the 16 KiB
+/// page end, each pushed as block maps of at most M; with MAX_CLUSTERS 4,
+/// the write-behind pushes the lowest cluster each time a fifth is added,
+/// so all but the last four go during the write and the close's push takes
+/// those in order. Block maps are clipped at the file's hole end (round_up
+/// to the volume's block), where APFS stops allocating.
+fn cluster_pushes(n: u64) -> Result<fsops::Pushes, String> {
+    const PAGE: u64 = 16 << 10;
+    const MAX_CLUSTERS: usize = 4;
+    let bs = u64::from(storage::nvme().block_size);
+    let (w, b, sg) = crate::darwin::storagestack::disk0_write_limits();
+    let mut wc = if w != 0 { w.min(u64::from(u32::MAX)) } else { 64 << 20 };
+    if b != 0 && (b * bs).min(u64::from(u32::MAX)) < wc {
+        wc = (b * bs).min(u64::from(u32::MAX));
+    }
+    let sc = if sg != 0 { sg.min(0xffff) } else { (wc / PAGE).min(0xffff) };
+    let c = ((sc.min(4096) * PAGE).min(wc) & !(PAGE - 1)).max(1 << 20);
+    let m = match wc & !(PAGE - 1) {
+        0 => PAGE,
+        x => x,
+    };
+    let end16 = n.div_ceil(PAGE) * PAGE;
+    let hole = n.div_ceil(bs) * bs;
+    let clusters = end16.div_ceil(c);
+    let mut maps = Vec::new();
+    let mut before_end = 0;
+    for k in 0..clusters {
+        let (start, stop) = (k * c, ((k + 1) * c).min(end16));
+        let mut off = start;
+        while off < stop {
+            let len = m.min(stop - off);
+            if off >= hole {
+                return Err(format!("not implemented: a block map past a file's hole end ({off:#x} of {n} bytes)"));
+            }
+            maps.push((off, len.min(hole - off)));
+            off += len;
+        }
+        if (k as usize) + MAX_CLUSTERS < clusters as usize {
+            before_end = maps.len();
+        }
+    }
+    Ok(fsops::Pushes { maps, before_end })
+}
+
 /// The mounts await_asr_and_retry makes after apfs_invert: xART
 /// (0x100017510 → 0x1000296c8, with `seputil --gigalocker-init` finding
 /// its file), mount_filesystems' System, Hardware and Preboot
@@ -972,7 +1142,7 @@ mod tests {
         let len = f.metadata().unwrap().len();
         let image = std::sync::Arc::new(crate::darwin::udif::Udif::open(std::sync::Arc::new(super::super::HostFile(f, len))).unwrap());
         let partition = image.partition("Apple_APFS").unwrap();
-        let os = OsImage { image: std::sync::Arc::clone(&image), partition };
+        let os = OsImage { image: std::sync::Arc::clone(&image), partition, boot: None };
         let size = storage::disk0_bytes();
         let dir = std::path::Path::new(&dir);
         let disk_path = dir.join(format!("gex-disk0-asr-{}", std::process::id()));
@@ -1053,7 +1223,7 @@ mod tests {
         let len = f.metadata().unwrap().len();
         let image = std::sync::Arc::new(crate::darwin::udif::Udif::open(std::sync::Arc::new(super::super::HostFile(f, len))).unwrap());
         let partition = image.partition("Apple_APFS").unwrap();
-        let os = OsImage { image: std::sync::Arc::clone(&image), partition };
+        let os = OsImage { image: std::sync::Arc::clone(&image), partition, boot: None };
         let size = storage::disk0_bytes();
         let dir = std::path::Path::new(&dir);
         let disk_path = dir.join(format!("gex-inv-disk-{}", std::process::id()));
@@ -1183,7 +1353,7 @@ mod tests {
         let len = f.metadata().unwrap().len();
         let image = std::sync::Arc::new(crate::darwin::udif::Udif::open(std::sync::Arc::new(super::super::HostFile(f, len))).unwrap());
         let partition = image.partition("Apple_APFS").unwrap();
-        let os = OsImage { image: std::sync::Arc::clone(&image), partition };
+        let os = OsImage { image: std::sync::Arc::clone(&image), partition, boot: None };
         let size = storage::disk0_bytes();
         let dir = std::path::Path::new(&dir);
         let disk_path = dir.join(format!("gex-reap-disk-{}", std::process::id()));
@@ -1246,7 +1416,7 @@ mod tests {
         let len = f.metadata().unwrap().len();
         let image = std::sync::Arc::new(crate::darwin::udif::Udif::open(std::sync::Arc::new(super::super::HostFile(f, len))).unwrap());
         let partition = image.partition("Apple_APFS").unwrap();
-        let os = OsImage { image: std::sync::Arc::clone(&image), partition };
+        let os = OsImage { image: std::sync::Arc::clone(&image), partition, boot: None };
         let size = storage::disk0_bytes();
         let dir = std::path::Path::new(&dir);
         let disk_path = dir.join(format!("gex-rm-disk-{}", std::process::id()));
@@ -1414,7 +1584,7 @@ mod tests {
         let len = f.metadata().unwrap().len();
         let image = std::sync::Arc::new(crate::darwin::udif::Udif::open(std::sync::Arc::new(super::super::HostFile(f, len))).unwrap());
         let partition = image.partition("Apple_APFS").unwrap();
-        let os = OsImage { image: std::sync::Arc::clone(&image), partition };
+        let os = OsImage { image: std::sync::Arc::clone(&image), partition, boot: None };
         let size = storage::disk0_bytes();
         let dir = std::path::Path::new(&dir);
         let disk_path = dir.join(format!("gex-data-disk-{}", std::process::id()));
@@ -1927,6 +2097,83 @@ mod tests {
         use crate::darwin::apfsread::Container;
         let c = Container::open(std::sync::Arc::new(super::super::HostFile(std::fs::File::open(ctr).unwrap(), psize))).unwrap();
         c.nx.xp_desc_base + i
+    }
+
+    #[test]
+    fn cluster_pushes_follow_the_cluster_layer() {
+        // drafts/s26/re-cluster.md 2's table for 1 MiB clusters and maps.
+        let p = cluster_pushes(16_243_000).unwrap();
+        let mut want: Vec<(u64, u64)> = (0..15).map(|k| (k << 20, 1 << 20)).collect();
+        want.push((15_728_640, 516_096));
+        assert_eq!((p.maps, p.before_end), (want, 12));
+        let p = cluster_pushes(600_000).unwrap();
+        assert_eq!((p.maps, p.before_end), (vec![(0, 602_112)], 0));
+    }
+
+    /// install_kernel_cache's two paths on a fresh Preboot-role volume: a
+    /// direct multi-block file and two deferred ones (one block map, and
+    /// write-behind with sixteen), their final inodes, extents and the
+    /// container's consistency.
+    #[test]
+    fn new_files_are_written_as_the_kernel_writes_them() {
+        let (Ok(dir), Ok(fsck)) = (std::env::var("GEX_TEST_SCRATCH"), std::env::var("GEX_TEST_FSCK")) else { return };
+        let dir = std::path::Path::new(&dir);
+        let path = dir.join(format!("gex-nf-{}", std::process::id()));
+        let blocks = 15_625_000u64;
+        let f = std::fs::OpenOptions::new().create(true).truncate(true).read(true).write(true).open(&path).unwrap();
+        f.set_len(blocks * 4096).unwrap();
+        let sink = super::super::HostFile(f, blocks * 4096);
+        let uuid = *b"gex-newfile-test";
+        let fm = container::format(&sink, 4096, blocks, uuid).unwrap();
+        let mut nx = Nx::formatted(&sink, &fm, uuid, Mode::Kernel).unwrap();
+        nx.mount_rw().unwrap();
+        let mut t = 1_700_000_000_000_000_000u64;
+        let mut now = || {
+            t += 1000;
+            t
+        };
+        let q = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+        let kv = key_os_version(RESTORE_BUILD).unwrap();
+        let times = VolumeTimes { formatted: now(), root: now(), private: now(), modified: now() };
+        let o = nx.create_volume(&NewVolume { name: "Preboot".into(), role: storage::role::PREBOOT, encrypted: false, e_apfs: true, times, uid: 0, gid: 0, key_os_version: kv, size_bytes: None }).unwrap();
+        nx.commit().unwrap();
+        let vol = nx.fs_oid.iter().position(|&x| x == o).unwrap();
+        fsops::mount_rw(&mut nx, vol, &mut now).unwrap();
+        let data = |n: usize| (0..n).map(|i| (i * 7 + i / 4096) as u8).collect::<Vec<u8>>();
+        for (name, n) in [("direct", 35_276usize), ("one", 600_000), ("many", 16_243_000)] {
+            let d = data(n);
+            let ino = fsops::write_new_file(&mut nx, vol, ROOT_INO, name, 0o644, &d, &cluster_pushes, &mut now).unwrap();
+            let v = fsops::inode(&mut nx, vol, ino).unwrap();
+            // NAME and DSTREAM only: no SPARSE_BYTES or PREV_FSIZE left.
+            assert_eq!((q(&v, 0x30), u32::from_le_bytes(v[0x40..0x44].try_into().unwrap()), u16::from_le_bytes([v[0x5c], v[0x5d]])), (0x9000, 2, 2), "{name}");
+            let ds = &v[v.len() - 0x28..];
+            let alloced = (n as u64).div_ceil(4096) * 4096;
+            assert_eq!((q(ds, 0), q(ds, 8), q(ds, 0x18)), (n as u64, alloced, n as u64), "{name}");
+            assert_eq!(q(&v, 0x18), q(&v, 0x20), "{name}: mod = change");
+            // The extents cover the file and hold its bytes.
+            let (tr, mut st) = nx.fs_tree(vol).unwrap();
+            let ext: Vec<(u64, u64, u64)> = tr.records(&mut st).unwrap().into_iter().filter(|(k, _)| k.len() == 16 && q(k, 0) == (ino | 8 << 60)).map(|(k, v)| (q(&k, 8), q(v.as_ref().unwrap(), 0) & 0x00ff_ffff_ffff_ffff, q(v.as_ref().unwrap(), 8))).collect();
+            drop(st);
+            assert_eq!(ext.iter().map(|e| e.1).sum::<u64>(), alloced, "{name}");
+            let mut back = Vec::new();
+            for (l, len, p) in ext {
+                assert_eq!(l, back.len() as u64);
+                assert_ne!(p, 0, "{name}: a sparse extent left");
+                let mut b = vec![0u8; len as usize];
+                std::os::unix::fs::FileExt::read_exact_at(&sink.0, &mut b, p * 4096).unwrap();
+                back.extend_from_slice(&b);
+            }
+            assert_eq!(&back[..n], &d[..], "{name}");
+            assert!(back[n..].iter().all(|&b| b == 0));
+        }
+        nx.commit().unwrap();
+        nx.unmount().unwrap();
+        sink.0.sync_all().unwrap();
+        let dev = std::process::Command::new(&fsck).args(["-n", "-W", "-s"]).arg(&path).output().unwrap();
+        let host = std::process::Command::new("/sbin/fsck_apfs").args(["-n", "-s"]).arg(&path).output().unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(dev.status.success(), "device fsck: {}{}", String::from_utf8_lossy(&dev.stdout), String::from_utf8_lossy(&dev.stderr));
+        assert!(host.status.success(), "host fsck: {}{}", String::from_utf8_lossy(&host.stdout), String::from_utf8_lossy(&host.stderr));
     }
 
     #[test]

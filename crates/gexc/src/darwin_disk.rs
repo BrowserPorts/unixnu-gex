@@ -1,26 +1,35 @@
-//! `gexc darwin-disk0 <out> [<os.dmg>]`: the web device's disk0 made as
-//! its erase restore makes it (`gex_kernel::darwin::apfswrite::restore`),
-//! written to a new sparse file of the device's size, the IPSW's operating
-//! system image (044-76040-038.dmg) restored into it when given; the
-//! restore steps it does not have yet are listed in `<out>.missing`.
+//! `gexc darwin-disk0 <out> [<os.dmg> [<ipsw-dir>]]`: the web device's
+//! disk0 made as its erase restore makes it
+//! (`gex_kernel::darwin::apfswrite::restore`), written to a new sparse file
+//! of the device's size, the IPSW's operating system image
+//! (044-76040-038.dmg) restored into it when given, and the boot objects
+//! install_kernel_cache installs read from the extracted IPSW at
+//! `<ipsw-dir>` when given; the restore steps it does not have yet are
+//! listed in `<out>.missing`.
 
 use anyhow::{anyhow, bail, Context, Result};
 use gex_kernel::darwin::{apfswrite, storage};
 use std::process::ExitCode;
 
 pub fn cmd(args: &[String]) -> Result<ExitCode> {
-    let (out, dmg) = match args {
-        [out] => (out, None),
-        [out, dmg] => (out, Some(dmg)),
-        _ => bail!("usage: gexc darwin-disk0 <out> [<os.dmg>]"),
+    let (out, dmg, ipsw) = match args {
+        [out] => (out, None, None),
+        [out, dmg] => (out, Some(dmg), None),
+        [out, dmg, ipsw] => (out, Some(dmg), Some(ipsw)),
+        _ => bail!("usage: gexc darwin-disk0 <out> [<os.dmg> [<ipsw-dir>]]"),
     };
+    let boot = match ipsw {
+        Some(d) => Some(apfswrite::restore::BootObjects::read(std::path::Path::new(d)).map_err(|e| anyhow!("{e}"))?),
+        None => None,
+    };
+    let has_boot = boot.is_some();
     let os = match dmg {
         Some(dmg) => {
             let f = std::fs::File::open(dmg).with_context(|| format!("opening {dmg}"))?;
             let len = f.metadata()?.len();
             let image = gex_kernel::darwin::udif::Udif::open(std::sync::Arc::new(apfswrite::HostFile(f, len))).map_err(|e| anyhow!("{dmg}: {e}"))?;
             let partition = image.partition("Apple_APFS").ok_or_else(|| anyhow!("{dmg}: no Apple_APFS partition"))?;
-            Some(apfswrite::restore::OsImage { image: std::sync::Arc::new(image), partition })
+            Some(apfswrite::restore::OsImage { image: std::sync::Arc::new(image), partition, boot })
         }
         None => None,
     };
@@ -32,7 +41,7 @@ pub fn cmd(args: &[String]) -> Result<ExitCode> {
     if let Some(gaps) = storage::unmeasured() {
         eprintln!("gexc: {gaps}");
     }
-    for s in apfswrite::restore::stand_ins(os.is_some()) {
+    for s in apfswrite::restore::stand_ins(os.is_some(), has_boot) {
         eprintln!("gexc: {s}");
     }
     // The kernel's clock: the time the restore runs.

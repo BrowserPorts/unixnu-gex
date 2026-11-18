@@ -991,14 +991,16 @@ impl Ipc {
 
     /// The port of the kernel's object `k`, one for every task (made on
     /// first use; owned by no task, so any task's kernel serves it).
-    /// `ux_handler_setup`: the host's handler for every exception but
-    /// RPC alerts (Instruments') and guards, `EXCEPTION_DEFAULT |
-    /// MACH_EXCEPTION_CODES`, each action with a send right of its own.
+    /// `ux_handler_setup`: the host's handler for every exception of
+    /// `EXC_MASK_ALL` but RPC alerts (Instruments') and guards (not
+    /// EXC_CRASH or EXC_CORPSE_NOTIFY, which `EXC_MASK_ALL` leaves out),
+    /// `EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES`, each action with a send
+    /// right of its own.
     fn ux_handler_setup(&mut self) {
         use super::exception as exc;
         let p = self.global_port(Kobject::UxHandler);
         for t in 1..exc::EXC_TYPES_COUNT {
-            if t == exc::EXC_RPC_ALERT || t == exc::EXC_GUARD {
+            if matches!(t, exc::EXC_RPC_ALERT | exc::EXC_GUARD | exc::EXC_CRASH | exc::EXC_CORPSE_NOTIFY) {
                 continue;
             }
             self.make_send(p);

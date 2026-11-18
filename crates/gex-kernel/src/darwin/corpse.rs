@@ -155,6 +155,29 @@ pub struct Corpse {
     /// A corpse fork's footprint, collected from its parent's pmap
     /// (`vmmap_corpse_footprint`).
     pub footprint: Option<Footprint>,
+    /// A corpse fork's ledgers: those `vm_map_copy_footprint_ledgers`
+    /// copied from its parent; every other ledger of its task holds 0 (its
+    /// pmap enters no page, it owns no object).
+    pub ledgers: Option<Ledgers>,
+    /// A corpse fork's audit token: its parent's (task_create_internal's
+    /// task_tokens).
+    pub audit: Option<[u32; 8]>,
+}
+
+/// The ledgers `vm_map_copy_footprint_ledgers` copies to a corpse fork:
+/// phys_footprint, internal, alternate_accounting, page_table, wired_mem,
+/// and of the objects owned the purgeable nonvolatile, network nonvolatile
+/// and each tag's footprint ledgers (with their compressed parts, 0 here:
+/// nothing is compressed), iokit_mapped (0: no mapping here is IOKit's
+/// accounted one).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Ledgers {
+    pub phys_footprint: i64,
+    pub internal: u64,
+    pub alternate_accounting: u64,
+    pub page_table: u64,
+    pub wired_mem: u64,
+    pub owned: super::purgeable::Owned,
 }
 
 /// `union corpse_creation_gate`'s word (`inflight_corpses`): the user
@@ -258,15 +281,6 @@ static HOST_KEEPS_CORPSES: std::sync::atomic::AtomicBool = std::sync::atomic::At
 /// process's end, and calls [`hold`] and [`exited`] there.
 pub fn set_host_keeps_corpses() {
     HOST_KEEPS_CORPSES.store(true, Ordering::Release);
-}
-
-/// `next_taskuniqueid`: `task_set_uniqueid`'s counter (OSIncrementAtomic64,
-/// which gives the value before the increment).
-static NEXT_TASKUNIQUEID: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-
-/// `task_set_uniqueid`'s next value.
-pub(crate) fn next_task_uniqueid() -> u64 {
-    NEXT_TASKUNIQUEID.fetch_add(1, Ordering::Relaxed) as u64
 }
 
 /// `vm_map_corpse_footprint_count`, `_size_avg`, `_size_max`, `_full` and
@@ -672,6 +686,9 @@ impl crate::syscalls::Kernel {
         inspection.sort_unstable();
         inspection.dedup();
         let vm = self.procs.vm(self.pid).ok();
+        // task_set_uniqueid.
+        let task_uniqueid = super::next_task_uniqueid();
+        self.dtask.task_uniqueid = task_uniqueid;
         self.dtask.corpse = Some(Box::new(Corpse {
             info,
             user_flags: flags::HAS_REF,
@@ -681,8 +698,7 @@ impl crate::syscalls::Kernel {
             thread: tid,
             ctx: self.ctx_addr,
             inspection,
-            // task_set_uniqueid.
-            task_uniqueid: NEXT_TASKUNIQUEID.fetch_add(1, Ordering::Relaxed) as u64,
+            task_uniqueid,
             etype: super::exception::EXC_CRASH,
             subcode: 0,
             pending: None,
@@ -692,6 +708,8 @@ impl crate::syscalls::Kernel {
             enqueued: None,
             coalition_key: None,
             footprint: None,
+            ledgers: None,
+            audit: None,
         }));
         let ipc = self.ipc();
         ipc.task_disable();

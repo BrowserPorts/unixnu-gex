@@ -1449,6 +1449,12 @@ fn run_process(
     // spawn's came with their switch to the image.
     if opts.darwin && fresh {
         kernel.dtask.pidversion = gex_kernel::darwin::next_pidversion();
+        // Its task_uniqueid as load_init_program's: initproc's
+        // cloneproc(CLONEPROC_INITPROC) took one, the execve's cloneproc
+        // another, and its exec_handle_sugid gives the task the next.
+        let _ = gex_kernel::darwin::next_task_uniqueid();
+        let _ = gex_kernel::darwin::next_task_uniqueid();
+        kernel.dtask.task_uniqueid = gex_kernel::darwin::next_task_uniqueid();
     }
     // A Darwin program other than launchd is not pid 1: dyld treats pid 1
     // as launchd and boots the system from it. Pid 1 is the kernel's own
@@ -3193,6 +3199,17 @@ fn make_corpse_fork(kernel: &Arc<Mutex<Kernel>>, memory: &gex_mem::GuestMemory, 
         return (req.origin, Err(KERN_FAILURE));
     };
     let paused = cx.gate.pause_all();
+    // A lightweight corpse: the faulting thread's backtrace and the image
+    // infos read with the task held (task_suspend_internal), no copy.
+    if req.is_lightweight() {
+        let mut k = kernel.lock().unwrap_or_else(|e| e.into_inner());
+        let mut gm = GuestMem::new(memory.bytes());
+        let r = k.darwin_corpse_lightweight(&mut gm, req);
+        k.darwin_ipc_leave();
+        drop(k);
+        drop(paused);
+        return r;
+    }
     let (built, regions) = {
         let mut k = kernel.lock().unwrap_or_else(|e| e.into_inner());
         let mut gm = GuestMem::new(memory.bytes());

@@ -242,6 +242,10 @@ impl Kernel {
             let _ = super::set_result(m, self.ctx_addr, Errno::ENOMEM.as_return());
             return SyscallOutcome::Continue;
         }
+        // Its new task's task_create_internal takes a task_uniqueid, which
+        // exec_handle_sugid replaces as the image is activated (and which
+        // goes with the task when the exec fails).
+        let _ = super::next_task_uniqueid();
         // The new thread is made before the image is activated.
         let thread_id = super::next_thread_id();
         match self.darwin_exec_activate(m, a[0], a[1], a[2]) {
@@ -619,6 +623,7 @@ impl Kernel {
             // exec_handle_sugid's proc_setpidversion, as the image is
             // activated (in a spawn's, its parent's call).
             pidversion: super::next_pidversion(),
+            task_uniqueid: super::next_task_uniqueid(),
             ladvlock: old.ladvlock,
             sigacts: old.sigacts,
             // exec's vm_map_set_user_wire_limit.

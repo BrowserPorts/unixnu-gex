@@ -84,6 +84,18 @@ pub struct Request {
     pub reason: Option<Arc<super::reason::OsReason>>,
     pub current: Option<i32>,
     pub origin: Origin,
+    /// A lightweight corpse in place of the fork: the handlers' send
+    /// rights that prefer backtraces (thread, task, host), its throttle
+    /// slot taken.
+    pub lightweight: Option<[Option<super::ipc::ObjId>; 3]>,
+}
+
+impl Request {
+    /// Whether it is a lightweight corpse's, made with the task's threads
+    /// held ([`Kernel::darwin_corpse_lightweight`]) instead of a fork.
+    pub fn is_lightweight(&self) -> bool {
+        self.lightweight.is_some()
+    }
 }
 
 /// A corpse fork that failed before its corpse was made: who waits, and
@@ -119,6 +131,10 @@ impl Kernel {
     pub(crate) fn darwin_corpse_fork_queue(&mut self, req: Request) -> Result<(), u64> {
         if !HOST_FORKS_CORPSES.load(Ordering::Acquire) {
             self.darwin_unimplemented("a corpse fork on a host that cannot copy a live task (corpsefork::set_host_forks_corpses)".into());
+            if let Some(ports) = req.lightweight {
+                super::lwcorpse::throttle_release();
+                self.darwin_lw_ports_release(ports);
+            }
             return Err(KERN_FAILURE);
         }
         self.dtask.corpse_forks.push_back(req);
@@ -138,7 +154,8 @@ impl Kernel {
     /// host copies them ([`Kernel::darwin_corpse_fork_vm`] then enters
     /// them in the corpse's map) and enables the corpse ([`enable`]).
     pub fn darwin_corpse_fork_build(&mut self, m: &mut GuestMem<'_>, req: Request) -> Result<Build, Failed> {
-        let Request { etype, code, subcode, reason, current, origin } = req;
+        let Request { etype, code, subcode, reason, current, origin, lightweight } = req;
+        debug_assert!(lightweight.is_none(), "a lightweight corpse is no fork");
         // corpses_enabled(): no -no_corpses boot argument here.
         // task_corpse_forking_disabled(): TF_NO_CORPSE_FORKING is set only
         // by task_set_corpse_forking_behavior, a DEVELOPMENT || DEBUG
@@ -162,11 +179,11 @@ impl Kernel {
         };
         // task_create_internal: the corpse's task, its uniqueid the next
         // (task_set_uniqueid), its rights the parent's (ipc_task_init).
-        let task_uniqueid = corpse::next_task_uniqueid();
+        let task_uniqueid = super::next_task_uniqueid();
         let (special, special_dead, registered, exc) = self.darwin_inherited_ports();
         let ports = super::kobject::Kports { special, special_dead, registered, exc, ..Default::default() };
         match self.darwin_duplicate_map_and_threads(m, current, etype != 0) {
-            Ok((plan, shared, udata, dups, crashed, footprint)) => {
+            Ok((plan, shared, udata, dups, crashed, footprint, ledgers)) => {
                 let crashed_thread_id = dups[crashed].id;
                 // task_collect_crash_info(new_task, TRUE): no reference of
                 // its own; the fork's are given it after.
@@ -194,6 +211,8 @@ impl Kernel {
                     enqueued: None,
                     coalition_key: None,
                     footprint,
+                    ledgers: Some(ledgers),
+                    audit: Some(self.darwin_audit_token()),
                 };
                 // gather_populate_corpse_crashinfo of the live process,
                 // its usage as it stands (no exit time); the ledgers copied
@@ -210,6 +229,29 @@ impl Kernel {
                 Err(Failed { origin, kr })
             }
         }
+    }
+
+    /// The ledgers `vm_map_copy_footprint_ledgers` gives a corpse fork of
+    /// this task: its own, as they stand.
+    fn darwin_copied_ledgers(&mut self) -> corpse::Ledgers {
+        let page = super::mach::PAGE_MASK + 1;
+        let phys_footprint = self.procs.jetsam().ledgers.get(&self.pid).map_or(0, |l| l.balance);
+        let alt = self.dtask.rusage.meter.alt.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let (internal, page_table, alt_pages) = {
+            let pm = self.dtask.rusage.meter.lock();
+            (pm.pages().internal * page, pm.page_table(), pm.own_in(&alt))
+        };
+        let all = match super::purgeable::owned(&self.dtask.rusage.meter.owner()) {
+            Some(o) => o,
+            None => {
+                self.darwin_unimplemented("a corpse fork's copy of the purgeable and tagged ledgers on a host that cannot say what the task's objects hold".into());
+                Default::default()
+            }
+        };
+        // The nonvolatile and footprint ledgers only (the volatile and
+        // nofootprint ones are not copied).
+        let owned = super::purgeable::Owned { purgeable_nonvolatile: all.purgeable_nonvolatile, tagged_footprint: all.tagged_footprint, network_nonvolatile: all.network_nonvolatile, media_footprint: all.media_footprint, graphics_footprint: all.graphics_footprint, neural_footprint: all.neural_footprint, ..Default::default() };
+        corpse::Ledgers { phys_footprint, internal, alternate_accounting: alt_pages * page, page_table, wired_mem: self.dtask.rusage.wired.load(Ordering::Acquire), owned }
     }
 
     /// The rights a corpse fork that failed had of its parent's, let go.
@@ -230,24 +272,26 @@ impl Kernel {
     /// the host follows, the ranges shared in place of not inherited, the
     /// user data, the threads and the crashed one's index.
     #[allow(clippy::type_complexity)]
-    fn darwin_duplicate_map_and_threads(&mut self, m: &mut GuestMem<'_>, current: Option<i32>, for_exception: bool) -> Result<(Vec<ForkRange>, Vec<(u64, u64)>, Vec<u64>, Vec<Dup>, usize, Option<corpse::Footprint>), u64> {
+    fn darwin_duplicate_map_and_threads(&mut self, m: &mut GuestMem<'_>, current: Option<i32>, for_exception: bool) -> Result<(Vec<ForkRange>, Vec<(u64, u64)>, Vec<u64>, Vec<Dup>, usize, Option<corpse::Footprint>, corpse::Ledgers), u64> {
         // map->disable_vmentry_reuse: set only by debug.toggle_address_reuse,
         // whose write this kernel does not make (it says so).
         // The footprint as it is now (get_task_phys_footprint).
         if self.procs.jetsam().ledgers.contains_key(&self.pid) && self.darwin_footprint_now(m).is_none() {
             return Err(KERN_FAILURE);
         }
-        let (plan, shared, udata, footprint) = if self.darwin_allowed_vm_map_fork() {
+        let (plan, shared, udata, footprint, ledgers) = if self.darwin_allowed_vm_map_fork() {
             let (plan, shared, footprint) = self.darwin_corpse_fork_map();
+            // vm_map_copy_footprint_ledgers.
+            let ledgers = self.darwin_copied_ledgers();
             // kevent_proc_copy_uptrs: the buffer holds the count first
             // found and 32 more, and the count does not change in between.
             let udata = self.dtask.kevents.proc_copy_uptrs();
-            (plan, shared, udata, footprint)
+            (plan, shared, udata, footprint, ledgers)
         } else if !for_exception {
             return Err(KERN_NO_SPACE);
         } else {
             // The corpse keeps the empty map task_create_internal made it.
-            (self.darwin_fork_plan().into_iter().map(|r| ForkRange { how: Inherit::None, ..r }).collect(), Vec::new(), Vec::new(), None)
+            (self.darwin_fork_plan().into_iter().map(|r| ForkRange { how: Inherit::None, ..r }).collect(), Vec::new(), Vec::new(), None, corpse::Ledgers::default())
         };
         // The task's active threads, in the order of its list.
         let mut tids = self.thread_signals.tids_in_order();
@@ -273,7 +317,7 @@ impl Kernel {
             }
             dups.push(Dup { tid, ctx, id, tsd: ts.as_ref().map_or(0, |t| t.tsd()), name: ts.as_ref().and_then(|t| t.name()) });
         }
-        Ok((plan, shared, udata, dups, crashed.unwrap_or(0), footprint))
+        Ok((plan, shared, udata, dups, crashed.unwrap_or(0), footprint, ledgers))
     }
 
     /// `memorystatus_allowed_vm_map_fork`: no jetsam purge of corpses
@@ -304,7 +348,8 @@ impl Kernel {
         let mut shared: Vec<(u64, u64)> = Vec::new();
         let mut entries = Vec::new();
         for (s, e, prot) in vmas {
-            for (ps, pe, a) in self.dtask.vm.pieces(s, e) {
+            let pieces = self.dtask.vm.lock().pieces_at(s, e);
+            for (ps, pe, a, off) in pieces {
                 let submap = a.kind == super::vm::kind::SUBMAP;
                 let how = match a.inherit {
                     _ if submap => Inherit::Copy,
@@ -316,7 +361,7 @@ impl Kernel {
                     super::vm::inherit::NONE => Inherit::None,
                     _ => Inherit::Copy,
                 };
-                entries.push((ps, pe, a, how));
+                entries.push((ps, pe, a, how, off));
                 match plan.last_mut() {
                     Some(l) if l.end == ps && l.how == how && l.own_pmap == !submap => l.end = pe,
                     _ => plan.push(ForkRange { start: ps, end: pe, how, own_pmap: !submap }),
@@ -325,7 +370,7 @@ impl Kernel {
         }
         // vm_map_fork_copy with VM_MAP_COPYIN_PRESERVE_PURGEABLE: a
         // purgeable object's copy is a purgeable object of its own.
-        for &(ps, _, a, how) in &entries {
+        for &(ps, _, a, how, _) in &entries {
             if how == Inherit::Copy && a.kind != super::vm::kind::SUBMAP && super::vmobject::with(a.obj, |o| o.purg.as_ref().is_some_and(|p| p.state != super::purgeable::state::DENY)).unwrap_or(false) {
                 self.darwin_unimplemented(format!("a corpse fork's copy of purgeable memory at {ps:#x} (VM_MAP_COPYIN_PRESERVE_PURGEABLE: a purgeable object of its own, in the source's state, owned by no one)"));
             }
@@ -349,14 +394,14 @@ impl Kernel {
     /// `vm_map_corpse_footprint_collect` of each entry the fork inherits
     /// (`entries`, with how), in map order, into a new buffer sized as
     /// XNU sizes it: the buffer, or none if the map has nothing inherited.
-    fn darwin_corpse_footprint_collect(&mut self, entries: &[(u64, u64, super::vm::Attrs, Inherit)]) -> Option<corpse::Footprint> {
+    fn darwin_corpse_footprint_collect(&mut self, entries: &[(u64, u64, super::vm::Attrs, Inherit, u64)]) -> Option<corpse::Footprint> {
         let nentries = entries.len() as u64;
         let size: u64 = entries.iter().map(|e| e.1 - e.0).sum();
         let mut fp: Option<corpse::Footprint> = None;
         let owner = self.dtask.rusage.meter.owner();
         let pm = Arc::clone(&self.dtask.rusage);
         let pm = pm.meter.lock();
-        for &(s, e, a, how) in entries {
+        for &(s, e, a, how, off) in entries {
             if how == Inherit::None {
                 continue;
             }
@@ -366,7 +411,7 @@ impl Kernel {
             }
             let mut loud = None;
             let ok = f.collect(s, e, |va| {
-                let (d, why) = footprint_disposition(&pm, &owner, &a, va);
+                let (d, why) = footprint_disposition(&pm, &owner, &a, va - s + off, va);
                 if why.is_some() {
                     loud = why;
                 }
@@ -393,6 +438,7 @@ impl Kernel {
         let ctx = c.ctx;
         let t = super::Task {
             rusage: super::rusage::Shared::new(abs),
+            task_uniqueid: c.task_uniqueid,
             kports: ports,
             vm: self.dtask.vm.inherited_corpse(shared),
             map_max: self.dtask.map_max,
@@ -481,26 +527,30 @@ impl Kernel {
     /// reason, lightweight)` from a call of this thread: the corpse fork
     /// queued, the thread waiting for it (`Some`), or its return code.
     pub(crate) fn darwin_enqueue_exception_with_corpse(&mut self, m: &mut GuestMem<'_>, etype: usize, code: [i64; 2], reason: Option<Arc<super::reason::OsReason>>, lightweight: bool) -> Result<crate::syscalls::SyscallOutcome, u64> {
-        if lightweight && self.darwin_lightweight_corpse_ports() {
-            self.darwin_unimplemented("a lightweight corpse for an EXC_CORPSE_NOTIFY handler that prefers backtraces (MACH_EXCEPTION_BACKTRACE_PREFERRED: current_thread_collect_backtrace_info, a kcdata object, exception_deliver_backtrace)".into());
-            return Err(KERN_FAILURE);
-        }
         let tid = self.tid;
-        let req = Request { etype, code: code[0], subcode: code[1], reason, current: Some(tid), origin: Origin::Call(tid) };
+        // task_should_generate_lightweight_corpse, then its throttle slot.
+        let lw = if lightweight { self.darwin_lightweight_corpse_ports() } else { None };
+        if let Some(ports) = lw {
+            if let Err(kr) = super::lwcorpse::throttle_get() {
+                self.darwin_lw_ports_release(ports);
+                return Err(kr);
+            }
+        }
+        let req = Request { etype, code: code[0], subcode: code[1], reason, current: Some(tid), origin: Origin::Call(tid), lightweight: lw };
         self.darwin_corpse_fork_queue(req)?;
         Ok(self.darwin_block(m, super::wait::Wait { deadline: None, cont: super::thread::Finish::CorpseFork }))
     }
 
-    /// `task_should_generate_lightweight_corpse` for this task's current
-    /// thread (lw_corpses_enabled on an embedded kernel): a thread, task
-    /// or host EXC_CORPSE_NOTIFY handler that prefers backtraces.
-    fn darwin_lightweight_corpse_ports(&mut self) -> bool {
-        use super::exception::EXC_CORPSE_NOTIFY;
-        const MACH_EXCEPTION_BACKTRACE_PREFERRED: i32 = 0x2000_0000;
-        let thread = self.dtask.kports.thread_exc.get(&self.tid).map(|a| a[EXC_CORPSE_NOTIFY]);
-        let task = Some(self.dtask.kports.exc[EXC_CORPSE_NOTIFY]);
-        let host = Some(self.ipc().host_exc[EXC_CORPSE_NOTIFY]);
-        [thread, task, host].into_iter().flatten().any(|a| a.port.is_some() && a.behavior & MACH_EXCEPTION_BACKTRACE_PREFERRED != 0)
+    /// A lightweight corpse's request, made with this task's threads held
+    /// still by the host (`m` its memory): the faulting thread's backtrace
+    /// collected and enqueued (`task_enqueue_exception_with_corpse`'s
+    /// lightweight half); who waits, and the return code.
+    pub fn darwin_corpse_lightweight(&mut self, m: &mut GuestMem<'_>, req: Request) -> (Origin, Result<Option<super::ipc::ObjId>, u64>) {
+        let Request { etype, code, subcode, reason, origin, lightweight, .. } = req;
+        let ports = lightweight.expect("a lightweight corpse's request");
+        let Origin::Call(tid) = origin else { unreachable!("a lightweight corpse is a call's") };
+        let kr = self.darwin_lw_corpse(m, tid, etype, [code, subcode], reason, ports);
+        (origin, if kr == KERN_SUCCESS { Ok(None) } else { Err(kr) })
     }
 
     /// The corpse fork a thread's call waited for is done: its return code.
@@ -578,7 +628,7 @@ pub fn enable(corpse: &Arc<Mutex<Kernel>>, vm: Arc<crate::proc::PeerVm>, origin:
 /// attributes `a`, from what the task's pmap holds (`pm`) and the objects
 /// the task owns (`owner`): the page's disposition, and what this kernel
 /// cannot say of it.
-fn footprint_disposition(pm: &super::footprint::Pmap, owner: &Arc<super::purgeable::Owner>, a: &super::vm::Attrs, va: u64) -> (i32, Option<String>) {
+fn footprint_disposition(pm: &super::footprint::Pmap, owner: &Arc<super::purgeable::Owner>, a: &super::vm::Attrs, obj_off: u64, va: u64) -> (i32, Option<String>) {
     use super::footprint::Held;
     const PRESENT: i32 = 0x1;
     const REF: i32 = 0x4;
@@ -599,8 +649,23 @@ fn footprint_disposition(pm: &super::footprint::Pmap, owner: &Arc<super::purgeab
         if no_footprint {
             return (0, None);
         }
-        if ours && (state == st::NONVOLATILE || (state == st::DENY && tag != 0) || state == st::VOLATILE || state == st::EMPTY) {
-            return (0, Some(format!("a corpse fork's footprint of a purgeable or ledger-tagged object the task owns, at {va:#x} (its resident, compressed and wired page counts)")));
+        let index = obj_off / super::footprint::PAGE;
+        // A nonvolatile (or tagged) object the task owns: its first
+        // resident-plus-compressed pages present (nothing is compressed
+        // here), not dirty.
+        if ours && (state == st::NONVOLATILE || (state == st::DENY && tag != 0)) {
+            return match super::purgeable::resident(a.obj) {
+                Some(bytes) => (if index < bytes / super::footprint::PAGE { PRESENT } else { 0 }, None),
+                None => (0, Some(format!("a corpse fork's footprint of an object the task owns, at {va:#x}, on a host that cannot say what it holds of it"))),
+            };
+        }
+        // A volatile or emptied one: its first wired pages present. A
+        // purgeable object's pages are wired only by a wired mapping of it.
+        if ours && (state == st::VOLATILE || state == st::EMPTY) {
+            if a.wired != 0 || a.user_wired != 0 {
+                return (0, Some(format!("a corpse fork's footprint of a wired volatile object the task owns, at {va:#x} (its wired_page_count)")));
+            }
+            return (0, None);
         }
     }
     if a.alt && matches!(held, Held::Own | Held::Reusable) {

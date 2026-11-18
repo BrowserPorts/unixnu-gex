@@ -1054,7 +1054,7 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             use super::corpsefork::{Origin, Request};
             let own = k.dtask.kcaller == 0 || k.dtask.kcaller == k.ipc().task;
             let token = super::corpsefork::next_token();
-            let req = Request { etype: 0, code: 0, subcode: 0, reason: None, current: own.then_some(k.tid), origin: Origin::Generate(token) };
+            let req = Request { etype: 0, code: 0, subcode: 0, reason: None, current: own.then_some(k.tid), origin: Origin::Generate(token), lightweight: None };
             match k.darwin_corpse_fork_queue(req) {
                 Ok(()) => {
                     let mut r = Reply::ok(Vec::new());
@@ -1064,6 +1064,20 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
                 Err(kr) => Reply::err(kr as i32),
             }
         }
+        // task_map_kcdata_object_64(task, kcdata_object) -> kcd_addr_begin,
+        // kcd_size. The object's right is the routine's when it succeeds.
+        (Kobject::Task, 3464) => match desc_port(req, 0) {
+            Some((right, disp)) => {
+                let r = k.darwin_task_map_kcdata_object(right);
+                if r.ret == 0 {
+                    if let Some(c) = right {
+                        k.ipc().object_destroy(c, disp);
+                    }
+                }
+                r
+            }
+            None => bad(),
+        },
         // task_map_corpse_info_64(task, corpse_task) -> kcd_addr_begin,
         // kcd_size, and task_map_corpse_info's narrower size. The corpse's
         // right is the routine's when it succeeds.
@@ -1879,6 +1893,23 @@ fn task_get_special_port(k: &mut Kernel, which: i32, f: u8) -> Reply {
         flavor::READ => matches!(which, TASK_READ_PORT | TASK_INSPECT_PORT | TASK_NAME_PORT),
         _ => matches!(which, TASK_INSPECT_PORT | TASK_NAME_PORT),
     };
+    // task_get_special_port_from_user: the task's own control port asked
+    // for through its own control port is the movable one only for a task
+    // the policies allow (mac_task_check_get_movable_control_port, AMFI's
+    // policy), as a send-once substitute (task_get_non_substituted_self's
+    // ipc_kobject_alloc_subst_once).
+    let own = k.dtask.kcaller == 0 || k.dtask.kcaller == k.ipc().task;
+    if which == TASK_KERNEL_PORT && own {
+        const KERN_DENIED: i32 = 53;
+        if k.darwin_mac_check_get_movable_control_port() != 0 {
+            return Reply::err(KERN_DENIED);
+        }
+        if f == flavor::CONTROL {
+            let mut r = Reply::err(KERN_FAILURE);
+            r.unimplemented = Some("task_get_special_port(TASK_KERNEL_PORT) of the task's own control port by a task allowed a movable one (IKOT_PORT_SUBST_ONCE)".into());
+            return r;
+        }
+    }
     if !allowed {
         return Reply::err(KERN_INVALID_CAPABILITY);
     }

@@ -41,6 +41,7 @@ pub mod cpumon;
 pub mod cred;
 pub mod corpse;
 pub mod corpsefork;
+pub mod lwcorpse;
 pub mod critexit;
 pub mod errno;
 pub mod exec;
@@ -430,11 +431,17 @@ pub struct Task {
     pub crash_notify: Option<(i64, i64)>,
     /// The task is a corpse (`TFRO_CORPSE`), with what it keeps.
     pub corpse: Option<Box<corpse::Corpse>>,
+    /// `task_uniqueid` ([`next_task_uniqueid`]): the task's own, not its
+    /// process's `p_uniqueid` (which `get_task_uniqueid` gives).
+    pub task_uniqueid: u64,
     /// Corpse forks of the task asked for, for the host to make
     /// ([`corpsefork`]).
     pub corpse_forks: std::collections::VecDeque<corpsefork::Request>,
     /// The return codes of the corpse forks threads' calls wait for.
     pub corpse_fork_results: std::collections::HashMap<i32, u64>,
+    /// Lightweight corpses' deliveries (`thread_backtrace_enqueue`), for
+    /// the task's thread calls ([`lwcorpse`]).
+    pub bt_deliveries: std::collections::VecDeque<lwcorpse::Delivery>,
     /// `vm_map_set_corpse_source`: a fatal memory limit's kill is to make
     /// the task a corpse whatever its EXC_CRASH handlers do.
     pub corpse_source: bool,
@@ -702,6 +709,10 @@ impl crate::syscalls::Kernel {
     /// ruid, rgid, pid, asid, pidversion. A process launchd has put in no
     /// session has the default one (`AU_DEFAUDITID`, `AU_DEFAUDITSID`).
     pub(crate) fn darwin_audit_token(&self) -> [u32; 8] {
+        // A corpse fork's is its parent's.
+        if let Some(t) = self.dtask.corpse.as_ref().and_then(|c| c.audit) {
+            return t;
+        }
         const AU_DEFAUDITID: u32 = u32::MAX;
         const AU_DEFAUDITSID: u32 = 0;
         let c = &self.dtask.cred;
@@ -732,6 +743,17 @@ impl crate::syscalls::Kernel {
 pub fn next_uniqueid() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+/// `task_set_uniqueid`: `next_taskuniqueid`, one counter for every task
+/// (OSIncrementAtomic64, which gives the value before). task_init's
+/// task_create_internal of the kernel task took 0, so the first task made
+/// here takes 1. Every task_create_internal takes one (a fork's or spawn's
+/// child, an exec's new task in cloneproc, a corpse fork), and so do
+/// exec_handle_sugid (each image activated) and task_mark_corpse.
+pub fn next_task_uniqueid() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The system's `thread_unique_id`: a new thread takes the next (the first

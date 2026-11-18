@@ -174,14 +174,11 @@ for p in sbxexec sbxstacked sbxnotstr sbxunknown; do
 done
 # The exception tests set handlers of every behavior: a platform program
 # (a hardened one) may only with the entitlement that allows it. procfind
-# sets its child's EXC_CRASH handler, corpse its children's
-# EXC_CORPSE_NOTIFY handler.
-for p in excports excdeliver readports procfind corpse; do
+# sets its child's EXC_CRASH handler, corpse and corpsefork their
+# children's EXC_CORPSE_NOTIFY handler.
+for p in excports excdeliver readports procfind corpse corpsefork; do
     codesign -s - -f --entitlements "$HERE/src/exc.entitlements" "$OUT/$p" 2>/dev/null
 done
-# corpsefork sets its children's EXC_CORPSE_NOTIFY handler, and one child
-# its own soft memory limit.
-codesign -s - -f --entitlements "$HERE/src/corpsefork.entitlements" "$OUT/corpsefork" 2>/dev/null
 # launchcon names its signing identifier, which lcok's parent constraint
 # names; its children carry their constraints on themselves, their parent
 # and their responsible process (src/<name>.<which>.plist).

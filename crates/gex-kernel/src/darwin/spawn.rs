@@ -303,6 +303,9 @@ impl Kernel {
             kports: super::kobject::Kports { special, special_dead, registered, exc, ..Default::default() },
             strict: t.strict,
             pthread: t.pthread,
+            // task_create_internal's task_set_uniqueid (a fork's child, a
+            // spawn's, an exec's new task in cloneproc).
+            task_uniqueid: super::next_task_uniqueid(),
             sigacts: t.sigacts.clone(),
             rlimits: t.rlimits,
             // forkproc: the child's RLIMIT_CPU timer runs from its limit

@@ -1292,6 +1292,15 @@ impl Kernel {
         Err(e::EPERM)
     }
 
+    /// `mac_task_check_get_movable_control_port`: AMFI's
+    /// `proc_check_get_movable_control_port` for this task's credential
+    /// (Sandbox's slot 189 of its ops, 0xfffffff006f8b9b8, is null).
+    pub(crate) fn darwin_mac_check_get_movable_control_port(&mut self) -> u32 {
+        let ents = self.dtask.codesign.as_ref().map(|c| c.ents.clone()).unwrap_or_default();
+        let csflags = self.dtask.csflags.load(std::sync::atomic::Ordering::Acquire);
+        super::amfi::get_movable_control_port(&ents, csflags).err().unwrap_or(0)
+    }
+
     /// `mac_task_check_get_task_special_port` and `_set_` (Sandbox's hooks,
     /// slots 74 and 75): mach-task-special-port-get or -set of process
     /// `pid`'s task, for a port number that fits 16 bits (ENOTSUP for

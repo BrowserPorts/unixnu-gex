@@ -67,6 +67,7 @@ pub fn stand_ins(os: bool, boot: bool) -> Vec<&'static str> {
         v.push(super::tx::KEYS_STAND_IN);
         v.push(fsops::PER_FILE_KEY_STAND_IN);
         v.push(USERSESSION_STAND_IN);
+        v.push(RESTORE_OPTIONS_STAND_IN);
     }
     v
 }
@@ -247,6 +248,9 @@ pub fn build_disk0_with(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() ->
     } else {
         "the restore's later writes to Preboot (install_kernel_cache's boot objects, populate_preboot_volume, install_splat's cryptex1) and Data's contents".into()
     });
+    if os.is_some() {
+        missing.push(nvram_missing(&nvram_after_fixup_var(&RestoreOptions::DEFAULTS)?));
+    }
     // The kernel's own counting of the checksums it sets (its kext has
     // sites newfs_apfs's copy does not) and whether its read-write mount's
     // block-0 write has the newest mounting version are not traced.
@@ -1103,6 +1107,82 @@ pub struct RestoreOptions {
 impl RestoreOptions {
     /// restored's defaults, no option given.
     pub const DEFAULTS: RestoreOptions = RestoreOptions { system_image: true, read_only_root_filesystem: true, create_filesystem_partitions: true, log_partition_size: 0, skip_production_ucrt_retrieval: false, set_field_diagnostics_boot: false, set_target_disk_mode: None };
+}
+
+/// A variable's value as the kernel stores it (IONVRAM.cpp's type for its
+/// name: an OSData, or an OSString for a string variable).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NvramValue {
+    Data(&'static [u8]),
+    String(&'static str),
+}
+
+/// A change restored makes to the NVRAM variables (`IODeviceTree:/options`,
+/// IODTNVRAM) through IORegistryEntrySetCFProperty on its NVRAM queue
+/// (RE@0x100062818; drafts/s27/re-mountpoints.md 0.2, 5.5): a variable
+/// deleted (`IONVRAM-DELETE-PROPERTY` = its name; one that is not there is
+/// no error) or set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NvramOp {
+    Delete(&'static str),
+    Set(&'static str, NvramValue),
+}
+
+/// set_filesystem_permissions (RE@0x10002f430), the first act of
+/// check_mounted's create_partition_mountpoints block (RE@0x100018f00) when
+/// `SystemImage` holds: root-live-fs deleted (set to "1" without
+/// `ReadOnlyRootFilesystem`), allow-root-hash-mismatch deleted, and with
+/// `CreateFilesystemPartitions` the three oblit- variables. Their results
+/// are not checked.
+fn set_filesystem_permissions(o: &RestoreOptions, nv: &mut Vec<NvramOp>) {
+    nv.push(if o.read_only_root_filesystem { NvramOp::Delete("root-live-fs") } else { NvramOp::Set("root-live-fs", NvramValue::Data(b"1")) });
+    nv.push(NvramOp::Delete("allow-root-hash-mismatch"));
+    if o.create_filesystem_partitions {
+        for v in ["oblit-inprogress", "oblit-begins", "oblit-failure"] {
+            nv.push(NvramOp::Delete(v));
+        }
+    }
+}
+
+/// The NVRAM changes of the steps from check_mounted's
+/// create_partition_mountpoints to set_tdm (drafts/s27/re-mountpoints.md
+/// 0.2, 2.2, 4, 5), in order: set_filesystem_permissions'; none from
+/// create_production_ucrt (its UCRT fetch is compiled out, RE@0x1000266f0
+/// returns NULL, so it makes no call at all); set_one_time_boot_command's
+/// (RE@0x100039ebc: one-time-boot-command deleted, or set to "checkerboard"
+/// with `SetFieldDiagnosticsBoot`); none from set_nvram_variables (a no-op,
+/// RE@0x100039f30); persistent_boot_args' (RE@0x100039e14: after the host
+/// answers its message 0x19, boot-args set to "": the CFData attempt is
+/// refused by the kernel, boot-args being a string variable, and the
+/// CFString one stored); set_tdm's only with `BridgeOS.SetTargetDiskMode`
+/// true (not implemented). restored asks for no NVRAM sync anywhere here
+/// (no sync flag, no IONVRAM-FORCESYNCNOW-PROPERTY), and its NVRAM file
+/// shadow has no session on an erase (no write on any volume).
+pub fn nvram_after_fixup_var(o: &RestoreOptions) -> Result<Vec<NvramOp>, String> {
+    let mut nv = Vec::new();
+    if o.system_image {
+        set_filesystem_permissions(o, &mut nv);
+    }
+    nv.push(if o.set_field_diagnostics_boot { NvramOp::Set("one-time-boot-command", NvramValue::Data(b"checkerboard")) } else { NvramOp::Delete("one-time-boot-command") });
+    nv.push(NvramOp::Set("boot-args", NvramValue::String("")));
+    if o.set_target_disk_mode == Some(true) {
+        return Err("not implemented: set_tdm's enter-tdm-mode and auto-boot-x86-once (restored's type attempts for each against the kernel's variable types)".into());
+    }
+    Ok(nv)
+}
+
+/// The restore's NVRAM changes `nv` as a missing entry: gex keeps no NVRAM
+/// variables a run of the restore could change and the next boot read.
+pub fn nvram_missing(nv: &[NvramOp]) -> String {
+    let ops: Vec<String> = nv
+        .iter()
+        .map(|op| match op {
+            NvramOp::Delete(n) => format!("delete {n}"),
+            NvramOp::Set(n, NvramValue::Data(d)) => format!("set {n} to the data {:?}", String::from_utf8_lossy(d)),
+            NvramOp::Set(n, NvramValue::String(s)) => format!("set {n} to the string {s:?}"),
+        })
+        .collect();
+    format!("the restore's NVRAM changes after fixup_var (IODeviceTree:/options, in order, no sync asked: {}): gex has no NVRAM variable store for them (needed: IODTNVRAM's variables over an image of the device's NVRAM that a restore run writes and the next boot reads; the boot's /options is the boot payload's device tree, read-only)", ops.join(", "))
 }
 
 /// restored's volume table (RE@0x100285668, 64-byte records): each
@@ -2193,6 +2273,25 @@ mod tests {
             || l.contains("overallocation detected on Main device")
             || (l.contains("orphan mappings found") && l.contains(&format!(" {} orphan", unnamed.len())))
             || unnamed.iter().any(|o| l.contains(&format!("orphan omap mapping found for oid {o}")) || l.contains(&format!("orphan omap mapping (oid {o} ")))
+    }
+
+    /// The NVRAM changes of the steps after fixup_var
+    /// (drafts/s27/re-mountpoints.md 0.2): with restored's defaults, and with
+    /// the options that change them.
+    #[test]
+    fn nvram_changes_follow_the_restore_options() {
+        use NvramOp::{Delete, Set};
+        let d = RestoreOptions::DEFAULTS;
+        assert_eq!(
+            nvram_after_fixup_var(&d).unwrap(),
+            vec![Delete("root-live-fs"), Delete("allow-root-hash-mismatch"), Delete("oblit-inprogress"), Delete("oblit-begins"), Delete("oblit-failure"), Delete("one-time-boot-command"), Set("boot-args", NvramValue::String(""))]
+        );
+        let o = RestoreOptions { read_only_root_filesystem: false, create_filesystem_partitions: false, set_field_diagnostics_boot: true, ..d };
+        assert_eq!(nvram_after_fixup_var(&o).unwrap(), vec![Set("root-live-fs", NvramValue::Data(b"1")), Delete("allow-root-hash-mismatch"), Set("one-time-boot-command", NvramValue::Data(b"checkerboard")), Set("boot-args", NvramValue::String(""))]);
+        let o = RestoreOptions { system_image: false, ..d };
+        assert_eq!(nvram_after_fixup_var(&o).unwrap(), vec![Delete("one-time-boot-command"), Set("boot-args", NvramValue::String(""))]);
+        assert!(nvram_after_fixup_var(&RestoreOptions { set_target_disk_mode: Some(true), ..d }).is_err());
+        assert_eq!(nvram_after_fixup_var(&RestoreOptions { set_target_disk_mode: Some(false), ..d }).unwrap(), nvram_after_fixup_var(&d).unwrap());
     }
 
     /// check_mounted's create_partition_mountpoints on a container of its

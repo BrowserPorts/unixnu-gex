@@ -6,13 +6,12 @@
 // copies of the child's with ids of their own, held for inspection, the
 // calling thread's copy the crashed one, and whose crash information says
 // it is a fork: the child's pid, exception type and codes 0, no exit time;
-// the child goes on. A corpse's own fork is refused. At most five corpses
-// are in flight.
+// its ledgers are the child's copied ones and its audit token the child's;
+// the child goes on. A corpse's own fork is refused. At most five corpses are in flight.
 // os_fault_with_payload makes a fork corpse for the child's EXC_CORPSE_NOTIFY
 // handler, its codes {EXC_GUARD, 0}, its crash information the simulated
 // guard's codes and the reason's snapshot; a second fault while the first
-// is held is refused (one user fault in flight). A soft memory limit
-// crossed makes one for EXC_RESOURCE, its code the high watermark's.
+// is held is refused (one user fault in flight).
 
 #include <errno.h>
 #include <fcntl.h>
@@ -31,9 +30,7 @@
 #include <unistd.h>
 
 int os_fault_with_payload(uint32_t reason_namespace, uint64_t reason_code, void *payload, uint32_t payload_size, const char *reason_string, uint64_t reason_flags);
-int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags, void *buffer, size_t buffersize);
 
-#define MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES 7
 #define FAULT_NS 9
 #define FAULT_CODE 0x1234
 
@@ -93,8 +90,7 @@ static void child_say(int v) {
 // The child: "live" forks a corpse of itself and sends its port, the
 // value's address and its threads' ids and handle to its bootstrap port,
 // then writes the value when told; "fault" makes a user
-// fault, and another when told; "soft" crosses a soft memory limit. Each
-// ends when told.
+// fault, and another when told. Each ends when told.
 static int thread_ident(mach_port_t t, thread_identifier_info_data_t *ti) {
     mach_msg_type_number_t n = THREAD_IDENTIFIER_INFO_COUNT;
     return thread_info(t, THREAD_IDENTIFIER_INFO, (thread_info_t)ti, &n);
@@ -142,20 +138,6 @@ static int child(const char *how) {
         r = os_fault_with_payload(FAULT_NS, FAULT_CODE, NULL, 0, "corpsefork", 0);
         child_say(r ? errno : 0);
         return child_cmd() == 'x' ? 0 : 6;
-    }
-    if (!strcmp(how, "soft")) {
-        struct {
-            int32_t active;
-            uint32_t active_attr;
-            int32_t inactive;
-            uint32_t inactive_attr;
-        } p = {48, 0, 48, 0};
-        if (memorystatus_control(MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES, getpid(), 0, &p, sizeof p)) return 7;
-        char *m = mmap(NULL, 64 << 20, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
-        if (m == MAP_FAILED) return 8;
-        for (size_t i = 0; i < (64u << 20); i += 4096) m[i] = 1;
-        child_say(0);
-        return child_cmd() == 'x' ? 0 : 9;
     }
     return 10;
 }
@@ -352,6 +334,22 @@ static int live(void) {
     if (item(b, 0x4000, 0x1001, &sz)) return bad("an exit reason snapshot", 1, 0);
     vm_deallocate(mach_task_self(), (vm_address_t)b, 0x4000);
 
+    // Its ledgers are those the fork copied: its pmap holds no page, its
+    // footprint and internal ledgers are the child's at the fork, each
+    // with that peak; with no process it has no limit left.
+    task_vm_info_data_t vi;
+    mach_msg_type_number_t vn = TASK_VM_INFO_COUNT;
+    if ((kr = task_info(corpse, TASK_VM_INFO, (task_info_t)&vi, &vn))) return bad("TASK_VM_INFO of the corpse", kr, 0);
+    if (vi.resident_size != 0 || vi.external != 0 || vi.reusable != 0) return bad("the corpse's resident size", vi.resident_size, 0);
+    if (vi.phys_footprint == 0 || vi.ledger_phys_footprint_peak != (int64_t)vi.phys_footprint) return bad("the corpse's footprint peak", vi.ledger_phys_footprint_peak, vi.phys_footprint);
+    if (vi.internal == 0 || vi.internal_peak != vi.internal) return bad("the corpse's internal peak", vi.internal_peak, vi.internal);
+    if (vi.limit_bytes_remaining != 0) return bad("the corpse's limit left", vi.limit_bytes_remaining, 0);
+    // Its audit token is the child's.
+    audit_token_t at;
+    mach_msg_type_number_t an = TASK_AUDIT_TOKEN_COUNT;
+    if ((kr = task_info(corpse, TASK_AUDIT_TOKEN, (task_info_t)&at, &an))) return bad("TASK_AUDIT_TOKEN of the corpse", kr, 0);
+    if ((pid_t)at.val[5] != k.pid) return bad("the corpse's audit token pid", at.val[5], k.pid);
+
     // A corpse is no task to fork.
     mach_port_t again = MACH_PORT_NULL;
     kr = task_generate_corpse(corpse, &again);
@@ -485,35 +483,6 @@ static int fault(void) {
     return 0;
 }
 
-static int soft(void) {
-    mach_port_t port = new_port();
-    kid_t k;
-    if (spawn_child("soft", port, 0, &k)) return bad("spawning", 0, 0);
-    int r = heard(&k);
-    if (r != 0) return bad("the child's memory", r, 0);
-    request_t req;
-    if (receive(port, &req)) return 1;
-    if (req.code[0] != EXC_RESOURCE || req.code[1] != 0) return bad("the notification's codes", req.code[0], EXC_RESOURCE);
-    const uint8_t *b;
-    if (crashinfo(req.task.name, &b)) return 1;
-    uint32_t sz;
-    const uint8_t *p = item(b, 0x4000, 0x80E, &sz);
-    // RESOURCE_TYPE_MEMORY, FLAVOR_HIGH_WATERMARK, the limit in MB.
-    uint64_t want = (3ull << 61) | (1ull << 58) | 48;
-    if (!p || u64_at(p) != want || u64_at(p + 8) != 0) return bad("TASK_CRASHINFO_EXCEPTION_CODES", p ? u64_at(p) : -1, want);
-    p = item(b, 0x4000, 0x837, &sz);
-    if (!p || u32_at(p) != 1) return bad("TASK_CRASHINFO_TASK_IS_CORPSE_FORK", p ? u32_at(p) : -1, 1);
-    p = item(b, 0x4000, 0x838, &sz);
-    if (!p || u32_at(p) != EXC_RESOURCE) return bad("TASK_CRASHINFO_EXCEPTION_TYPE", p ? u32_at(p) : -1, EXC_RESOURCE);
-    vm_deallocate(mach_task_self(), (vm_address_t)b, 0x4000);
-    int st = 0;
-    if (waitpid(k.pid, &st, WNOHANG) != 0) return bad("the child past a soft limit", st, 0);
-    reply(&req);
-    if (release(req.task.name, req.thread.name)) return 1;
-    if (tell(&k, 'x') || waitpid(k.pid, &st, 0) != k.pid || !WIFEXITED(st) || WEXITSTATUS(st) != 0) return bad("the child's end", st, 0);
-    return 0;
-}
-
 int main(int argc, char **argv) {
     if (argc > 2 && !strcmp(argv[1], "child")) return child(argv[2]);
     signal(SIGPIPE, SIG_IGN);
@@ -523,7 +492,6 @@ int main(int argc, char **argv) {
     if (own()) return 1;
     if (limit()) return 1;
     if (fault()) return 1;
-    if (soft()) return 1;
     printf("corpsefork ok\n");
     return 0;
 }

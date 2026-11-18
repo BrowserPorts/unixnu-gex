@@ -705,6 +705,10 @@ impl crate::syscalls::Kernel {
     /// ruid, rgid, pid, asid, pidversion. A process launchd has put in no
     /// session has the default one (`AU_DEFAUDITID`, `AU_DEFAUDITSID`).
     pub(crate) fn darwin_audit_token(&self) -> [u32; 8] {
+        // A corpse fork's is its parent's.
+        if let Some(t) = self.dtask.corpse.as_ref().and_then(|c| c.audit) {
+            return t;
+        }
         const AU_DEFAUDITID: u32 = u32::MAX;
         const AU_DEFAUDITSID: u32 = 0;
         let c = &self.dtask.cred;

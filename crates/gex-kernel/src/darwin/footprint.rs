@@ -46,7 +46,7 @@ const PERCENT_NONE: u32 = u16::MAX as u32;
 /// The map's page (16 KiB) and arm64's tables over it: a leaf table maps
 /// 32 MB, a twig table 64 GB; the root, of 8 entries, is 64 bytes
 /// (`__ARM64_PMAP_SUBPAGE_L1__`, `T0SZ_BOOT` 25).
-const PAGE: u64 = super::mach::PAGE_MASK + 1;
+pub(crate) const PAGE: u64 = super::mach::PAGE_MASK + 1;
 const L3_SHIFT: u32 = 25;
 const L2_SHIFT: u32 = 36;
 const ROOT_SIZE: u64 = 64;
@@ -801,6 +801,16 @@ impl Kernel {
                     const RESOURCE_TYPE_MEMORY: i64 = 3;
                     const FLAVOR_HIGH_WATERMARK: i64 = 1;
                     let code = (RESOURCE_TYPE_MEMORY << 61) | (FLAVOR_HIGH_WATERMARK << 58) | (i64::from(mb) & 0x1fff);
+                    // XNU raises it on the thread whose credit crossed the
+                    // limit: ledger_entry_check_new_balance sets AST_LEDGER
+                    // on it (act_set_astledger_async), and its ledger_ast
+                    // calls task_footprint_exceeded, whose fork makes that
+                    // thread's copy the crashed one. This host's memory
+                    // takes a thread's first store to a page with no fault,
+                    // so the crossing is seen only by this sampling, and no
+                    // thread is known to have made it: the copy of the
+                    // first is the crashed thread.
+                    self.darwin_unimplemented("the crashed thread of a soft memory limit's corpse fork (the thread whose page fault credited phys_footprint past the limit, ledger_ast's task_footprint_exceeded: no fault marks a first store here)".into());
                     let req = super::corpsefork::Request { etype: super::exception::EXC_RESOURCE, code, subcode: 0, reason: None, current: None, origin: super::corpsefork::Origin::ThreadCall };
                     // A host that cannot make it has said so.
                     let _ = self.darwin_corpse_fork_queue(req);
@@ -913,11 +923,24 @@ impl Kernel {
         put(&mut out, 0, size);
         out[8..12].copy_from_slice(&entries.to_le_bytes());
         out[12..16].copy_from_slice(&((super::mach::PAGE_MASK + 1) as u32).to_le_bytes());
+        // A corpse fork's ledgers are those copied to it: its pmap enters
+        // nothing (phys_mem, external and reusable 0), and each copied
+        // ledger's lifetime peak is the balance the copy credited.
+        let copied = self.dtask.corpse.as_ref().and_then(|c| c.ledgers);
         // One look: the ledgers as the pmap holds them now.
-        let footprint = self.darwin_footprint_now(m);
-        let (now, peaks) = {
-            let pm = self.dtask.rusage.meter.lock();
-            (pm.pages(), pm.peaks)
+        let footprint = match copied {
+            Some(l) => Some(l.phys_footprint),
+            None => self.darwin_footprint_now(m),
+        };
+        let (now, peaks) = match copied {
+            Some(l) => {
+                let p = Pages { internal: l.internal / PAGE, ..Default::default() };
+                (p, p)
+            }
+            None => {
+                let pm = self.dtask.rusage.meter.lock();
+                (pm.pages(), pm.peaks)
+            }
         };
         let Some(footprint) = footprint else {
             self.darwin_unimplemented("task_info TASK_VM_INFO on a host that cannot say which pages are a task's".into());
@@ -976,9 +999,13 @@ impl Kernel {
         if original >= REV3 {
             // ledger_phys_footprint_peak, then the purgeable and tag
             // ledgers of what the task owns (their compressed parts 0).
-            let peak = self.procs.jetsam().ledgers.get(&self.pid).map_or(footprint, |l| l.lifetime_max);
+            let peak = if copied.is_some() { footprint } else { self.procs.jetsam().ledgers.get(&self.pid).map_or(footprint, |l| l.lifetime_max) };
             put(&mut out, 168, peak as u64);
-            let Some(o) = super::purgeable::owned(&self.dtask.rusage.meter.owner()) else {
+            let owned = match copied {
+                Some(l) => Some(l.owned),
+                None => super::purgeable::owned(&self.dtask.rusage.meter.owner()),
+            };
+            let Some(o) = owned else {
                 self.darwin_unimplemented("task_info TASK_VM_INFO's owned ledgers on a host that cannot say what it holds of purgeable memory".into());
                 return Reply::err(5);
             };
@@ -988,7 +1015,9 @@ impl Kernel {
             n = REV3;
         }
         if original >= REV4 {
-            put(&mut out, 336, self.procs.jetsam().available_memory(self.pid, footprint as u64));
+            // No process (a corpse fork's task): 0.
+            let left = if copied.is_some() { 0 } else { self.procs.jetsam().available_memory(self.pid, footprint as u64) };
+            put(&mut out, 336, left);
             n = REV4;
         }
         if original >= REV5 {

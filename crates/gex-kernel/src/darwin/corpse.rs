@@ -155,6 +155,29 @@ pub struct Corpse {
     /// A corpse fork's footprint, collected from its parent's pmap
     /// (`vmmap_corpse_footprint`).
     pub footprint: Option<Footprint>,
+    /// A corpse fork's ledgers: those `vm_map_copy_footprint_ledgers`
+    /// copied from its parent; every other ledger of its task holds 0 (its
+    /// pmap enters no page, it owns no object).
+    pub ledgers: Option<Ledgers>,
+    /// A corpse fork's audit token: its parent's (task_create_internal's
+    /// task_tokens).
+    pub audit: Option<[u32; 8]>,
+}
+
+/// The ledgers `vm_map_copy_footprint_ledgers` copies to a corpse fork:
+/// phys_footprint, internal, alternate_accounting, page_table, wired_mem,
+/// and of the objects owned the purgeable nonvolatile, network nonvolatile
+/// and each tag's footprint ledgers (with their compressed parts, 0 here:
+/// nothing is compressed), iokit_mapped (0: no mapping here is IOKit's
+/// accounted one).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Ledgers {
+    pub phys_footprint: i64,
+    pub internal: u64,
+    pub alternate_accounting: u64,
+    pub page_table: u64,
+    pub wired_mem: u64,
+    pub owned: super::purgeable::Owned,
 }
 
 /// `union corpse_creation_gate`'s word (`inflight_corpses`): the user
@@ -685,6 +708,8 @@ impl crate::syscalls::Kernel {
             enqueued: None,
             coalition_key: None,
             footprint: None,
+            ledgers: None,
+            audit: None,
         }));
         let ipc = self.ipc();
         ipc.task_disable();

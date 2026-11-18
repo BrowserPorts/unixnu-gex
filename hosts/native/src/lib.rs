@@ -2122,28 +2122,39 @@ impl Drop for GatePaused<'_> {
 
 /// Bring every other guest thread to a halt after the process has exited.
 fn stop_other_threads(spawn: &SpawnContext, verbose: bool) {
+    stop_other_threads_but(spawn, 0, verbose);
+}
+
+/// [`stop_other_threads`] from a thread `own` of the running count is (a
+/// spawned thread counts itself until it returns). As XNU's exit does
+/// (`task_terminate_internal`, then the last thread's `proc_exit`), the
+/// process ends only once every other thread has: there is no time limit.
+/// A thread still running after half a second is said, once.
+fn stop_other_threads_but(spawn: &SpawnContext, own: usize, verbose: bool) {
     use std::sync::atomic::Ordering;
     let started = std::time::Instant::now();
-    spawn.stopping.store(true, Ordering::Release);
+    let already = spawn.stopping.swap(true, Ordering::AcqRel);
     {
         let k = spawn.kernel.lock().unwrap_or_else(|e| e.into_inner());
         k.futexes.wake_everything();
     }
-    let deadline = started + std::time::Duration::from_millis(500);
-    while spawn.running.load(Ordering::Acquire) > 0 && std::time::Instant::now() < deadline {
+    // A spawned thread another thread's end is stopping goes: it is one of
+    // those that one waits for.
+    if already && own > 0 {
+        return;
+    }
+    let slow = started + std::time::Duration::from_millis(500);
+    let mut said = false;
+    while spawn.running.load(Ordering::Acquire) > own {
+        if !said && std::time::Instant::now() >= slow {
+            said = true;
+            let pid = spawn.kernel.lock().unwrap_or_else(|e| e.into_inner()).pid;
+            eprintln!("[gex] pid {pid}: {} thread(s) still running 500ms after the process began to end; waiting for them", spawn.running.load(Ordering::Acquire) - own);
+        }
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
     if verbose {
-        let left = spawn.running.load(Ordering::Acquire);
-        eprintln!(
-            "[gex] stopped other threads in {:.0}ms{}",
-            started.elapsed().as_secs_f64() * 1000.0,
-            if left > 0 {
-                format!(", {left} did not stop in time")
-            } else {
-                String::new()
-            }
-        );
+        eprintln!("[gex] stopped other threads in {:.0}ms", started.elapsed().as_secs_f64() * 1000.0);
     }
 }
 
@@ -4487,7 +4498,8 @@ fn end_process(cx: &SpawnContext, exit: Exit) {
             *ended = Some(exit);
         }
     }
-    stop_other_threads(cx, false);
+    // The thread ending the process is one of the running.
+    stop_other_threads_but(cx, 1, false);
 }
 
 /// Instantiate every registry entry into this store, outside a wasm frame.

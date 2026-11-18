@@ -15,6 +15,16 @@ pub const SOL_SOCKET: u64 = 0xffff;
 /// `IPPROTO_TCP`, and its `TCP_NODELAY`.
 const IPPROTO_TCP: u64 = 6;
 const TCP_NODELAY: u32 = 1;
+/// TCP_KEEPALIVE, TCP_KEEPINTVL, TCP_KEEPCNT (`bsd/netinet/tcp.h`).
+const TCP_KEEPALIVE: u32 = 0x10;
+const TCP_KEEPINTVL: u32 = 0x101;
+const TCP_KEEPCNT: u32 = 0x102;
+/// `TCP_RETRANSHZ`, and the defaults `tcp_keepidle`, `tcp_keepintvl`,
+/// `tcp_keepcnt` (TCPTV_KEEP_IDLE, TCPTV_KEEPINTVL, TCPTV_KEEPCNT).
+pub const TCP_RETRANSHZ: u32 = 1000;
+pub const TCPTV_KEEP_IDLE: u32 = 120 * 60 * TCP_RETRANSHZ;
+pub const TCPTV_KEEPINTVL: u32 = 75 * TCP_RETRANSHZ;
+pub const TCPTV_KEEPCNT: u32 = 8;
 /// `TF_NODELAY`, the `t_flags` bit TCP_NODELAY reads back as.
 const TF_NODELAY: u32 = 0x4;
 
@@ -66,6 +76,11 @@ pub struct SockOpts {
     pub tcp_nodelay: bool,
     /// `so_flags`' `SOF_NOSIGPIPE`: a send's EPIPE raises no SIGPIPE.
     pub nosigpipe: bool,
+    /// A TCP socket's `t_keepidle`, `t_keepintvl` (milliseconds,
+    /// TCP_RETRANSHZ) and `t_keepcnt`; 0 is the system's.
+    pub keepidle: u32,
+    pub keepintvl: u32,
+    pub keepcnt: u32,
 }
 
 impl SockOpts {
@@ -83,13 +98,17 @@ impl SockOpts {
             snd_lowat: (st.snd_lowat as u32).min(snd_hiwat),
             tcp_nodelay: false,
             nosigpipe: false,
+            keepidle: 0,
+            keepintvl: 0,
+            keepcnt: 0,
         }
     }
 
     /// `sonewconn`: a connection's new socket's options from its
     /// listener's: `so_options` but `SO_ACCEPTCONN`, the linger and
     /// `SOF_NOSIGPIPE`, buffers of the listener's sizes and the low-water
-    /// marks `soreserve` gives a new socket.
+    /// marks `soreserve` gives a new socket; and TCP's, as its new
+    /// connection takes them from the listener's.
     pub fn inherited(head: &SockOpts, snd_hiwat: u32, rcv_hiwat: u32) -> SockOpts {
         SockOpts {
             options: head.options & !so::ACCEPTCONN,
@@ -98,15 +117,20 @@ impl SockOpts {
             snd_hiwat,
             rcv_lowat: 1,
             snd_lowat: MCLBYTES.min(snd_hiwat),
-            tcp_nodelay: false,
+            // tcp_input's new connection on a listener: TF_NODELAY,
+            // t_keepintvl and t_keepcnt (not t_keepidle) from it.
+            tcp_nodelay: head.tcp_nodelay,
             nosigpipe: head.nosigpipe,
+            keepidle: 0,
+            keepintvl: head.keepintvl,
+            keepcnt: head.keepcnt,
         }
     }
 
     /// `soreserve`'s for a socket that has set none: buffers of the given
     /// sizes, a receive low-water mark of 1 and a send one of MCLBYTES.
     pub fn reserved(snd_hiwat: u32, rcv_hiwat: u32) -> SockOpts {
-        SockOpts { options: 0, linger: 0, rcv_hiwat, snd_hiwat, rcv_lowat: 1, snd_lowat: MCLBYTES.min(snd_hiwat), tcp_nodelay: false, nosigpipe: false }
+        SockOpts { options: 0, linger: 0, rcv_hiwat, snd_hiwat, rcv_lowat: 1, snd_lowat: MCLBYTES.min(snd_hiwat), tcp_nodelay: false, nosigpipe: false, keepidle: 0, keepintvl: 0, keepcnt: 0 }
     }
 }
 
@@ -203,6 +227,13 @@ impl Kernel {
             }
             so::DEBUG | so::KEEPALIVE | so::DONTROUTE | so::USELOOPBACK | so::BROADCAST | so::REUSEADDR | so::REUSEPORT | so::OOBINLINE => {
                 let on = i32::from_le_bytes(copyin(4)?[..4].try_into().unwrap()) != 0;
+                // TCP's keepalive timer (TCPT_KEEP: probes after the idle
+                // time, the peer's SO_FILT_HINT_KEEPALIVE, a reset from an
+                // orphan gone) is not run here.
+                if on && name == so::KEEPALIVE && self.darwin_sock_proto(fd) == Some(super::sockerr::Proto::Tcp) && st.conn.connected {
+                    self.darwin_unimplemented("SO_KEEPALIVE on a TCP socket (TCPT_KEEP's probes and the peer's SO_FILT_HINT_KEEPALIVE)".into());
+                    return Err(Errno::ENOPROTOOPT);
+                }
                 if on && name == so::DONTROUTE {
                     self.darwin_unimplemented("SO_DONTROUTE turned on (routing around the tables)".into());
                     return Err(Errno::ENOPROTOOPT);
@@ -261,6 +292,29 @@ impl Kernel {
                 }
             }
             n if n == TCP_NODELAY | TCP_LEVEL => o.tcp_nodelay = i32::from_le_bytes(copyin(4)?[..4].try_into().unwrap()) != 0,
+            // tcp_ctloutput: seconds, kept in TCP_RETRANSHZ ticks.
+            n if (n == TCP_KEEPALIVE | TCP_LEVEL || n == TCP_KEEPINTVL | TCP_LEVEL || n == TCP_KEEPCNT | TCP_LEVEL) && o.options & so::KEEPALIVE != 0 && st.conn.connected => {
+                self.darwin_unimplemented("TCP_KEEPALIVE, TCP_KEEPINTVL or TCP_KEEPCNT with SO_KEEPALIVE on (TCPT_KEEP's probes)".into());
+                return Err(Errno::ENOPROTOOPT);
+            }
+            n if n == TCP_KEEPALIVE | TCP_LEVEL || n == TCP_KEEPINTVL | TCP_LEVEL => {
+                let v = i32::from_le_bytes(copyin(4)?[..4].try_into().unwrap());
+                if v < 0 || v as u32 > u32::MAX / TCP_RETRANSHZ {
+                    return Err(Errno::EINVAL);
+                }
+                if n == TCP_KEEPALIVE | TCP_LEVEL {
+                    o.keepidle = v as u32 * TCP_RETRANSHZ;
+                } else {
+                    o.keepintvl = v as u32 * TCP_RETRANSHZ;
+                }
+            }
+            n if n == TCP_KEEPCNT | TCP_LEVEL => {
+                let v = i32::from_le_bytes(copyin(4)?[..4].try_into().unwrap());
+                if v < 0 {
+                    return Err(Errno::EINVAL);
+                }
+                o.keepcnt = v as u32;
+            }
             so::NOSIGPIPE => o.nosigpipe = i32::from_le_bytes(copyin(4)?[..4].try_into().unwrap()) != 0,
             _ => unreachable!("an option kept here"),
         }
@@ -323,6 +377,9 @@ impl Kernel {
             so::SNDLOWAT => o.snd_lowat.to_le_bytes().to_vec(),
             so::RCVLOWAT => o.rcv_lowat.to_le_bytes().to_vec(),
             n if n == TCP_NODELAY | TCP_LEVEL => (if o.tcp_nodelay { TF_NODELAY } else { 0 }).to_le_bytes().to_vec(),
+            n if n == TCP_KEEPALIVE | TCP_LEVEL => ((if o.keepidle > 0 { o.keepidle } else { TCPTV_KEEP_IDLE }) / TCP_RETRANSHZ).to_le_bytes().to_vec(),
+            n if n == TCP_KEEPINTVL | TCP_LEVEL => ((if o.keepintvl > 0 { o.keepintvl } else { TCPTV_KEEPINTVL }) / TCP_RETRANSHZ).to_le_bytes().to_vec(),
+            n if n == TCP_KEEPCNT | TCP_LEVEL => (if o.keepcnt > 0 { o.keepcnt } else { TCPTV_KEEPCNT }).to_le_bytes().to_vec(),
             // so_flags & SOF_NOSIGPIPE, which is 1.
             so::NOSIGPIPE => i32::from(o.nosigpipe).to_le_bytes().to_vec(),
             _ => return Err(Errno::ENOPROTOOPT),
@@ -356,16 +413,18 @@ impl Kernel {
     }
 
     /// Whether a connect of `fd` to the address at `addr` would carry
-    /// SO_KEEPALIVE onto a connection the host makes: a TCP socket asking
-    /// for it, to an AF_INET address off the loopback network.
+    /// SO_KEEPALIVE onto a connection: a TCP socket asking for it, to an
+    /// AF_INET address (the host's probes are not TCP's; loopback's
+    /// TCPT_KEEP is not run).
     pub(crate) fn darwin_keepalive_off_host(&mut self, m: &GuestMem<'_>, fd: i32, addr: u64, len: u64) -> bool {
         const AF_INET: u8 = 2;
         let Ok((file, st)) = self.darwin_socket_opts(fd) else { return false };
         if st.unix_stream || Self::darwin_sockopts(&file, &st).options & so::KEEPALIVE == 0 || len < 8 {
             return false;
         }
+        // Loopback's too: TCP's keepalive timer is not run here.
         match m.read(addr, 8) {
-            Ok(b) => b[1] == AF_INET && b[4] != 127,
+            Ok(b) => b[1] == AF_INET,
             Err(_) => false,
         }
     }
@@ -394,7 +453,7 @@ impl Kernel {
     fn darwin_tcp_option(&mut self, fd: i32, name: u32) -> Option<Result<(), Errno>> {
         use super::sockerr::Proto;
         match self.darwin_sock_proto(fd) {
-            Some(Proto::Tcp) if name == TCP_NODELAY => Some(Ok(())),
+            Some(Proto::Tcp) if matches!(name, TCP_NODELAY | TCP_KEEPALIVE | TCP_KEEPINTVL | TCP_KEEPCNT) => Some(Ok(())),
             Some(Proto::Tcp) | None => None,
             Some(_) => {
                 self.darwin_unimplemented(format!("IPPROTO_TCP option {name:#x} on a socket that is not TCP"));

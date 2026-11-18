@@ -935,6 +935,9 @@ impl Kernel {
         if let Some(r) = self.darwin_tcp_oob(m, raw, a) {
             return Some(res(r));
         }
+        if let Some(r) = self.darwin_tcp_shutdown(raw, a) {
+            return Some(res(r));
+        }
         if let Some(write) = super::fsops::vectored(raw) {
             if let Err(e) = self.darwin_uio_check(m, write, a) {
                 return Some(neg(e));
@@ -1230,15 +1233,12 @@ impl Kernel {
             // A connection the host carries with SO_KEEPALIVE asked for: the
             // probes are TCP's own, which the host's connection does not send.
             sys::CONNECT | sys::CONNECT_NOCANCEL if self.darwin_keepalive_off_host(m, a[0] as i32, a[1], a[2]) => {
-                self.darwin_unimplemented("SO_KEEPALIVE on a connection the host carries (keepalive probes)".into());
+                self.darwin_unimplemented("SO_KEEPALIVE on a TCP connection (TCPT_KEEP's probes and the peer's SO_FILT_HINT_KEEPALIVE)".into());
                 neg(Errno::ENOPROTOOPT)
             }
-            // sonewconn copies the listener's so_state, SS_ASYNC with it, and
-            // not its buffers' SB_ASYNC: the new socket's SIGIO then goes with
-            // sb_notify's waiters, select records and knotes, which are not
-            // followed here.
-            sys::ACCEPT | sys::ACCEPT_NOCANCEL if self.fds.get(a[0] as i32).ok().and_then(|f| f.handle.so_owner()).is_some_and(|(o, _)| o.flags() & crate::vfs::SoOwner::SS_ASYNC != 0) => {
-                self.darwin_unimplemented("accept from an SS_ASYNC listener (the new socket's SS_ASYNC without SB_ASYNC)".into());
+            // The new connection takes SO_KEEPALIVE from its listener.
+            sys::ACCEPT | sys::ACCEPT_NOCANCEL if self.fds.get(a[0] as i32).ok().and_then(|f| f.handle.xnu_sockopts()).is_some_and(|o| o.options & super::sockopt::so::KEEPALIVE != 0) && self.darwin_sock_proto(a[0] as i32) == Some(super::sockerr::Proto::Tcp) => {
+                self.darwin_unimplemented("accept from a TCP listener with SO_KEEPALIVE (TCPT_KEEP's probes on the new connection)".into());
                 return None;
             }
             sys::CONNECT | sys::CONNECT_NOCANCEL if self.darwin_async_off_host(m, a[0] as i32, a[1], a[2]) => {

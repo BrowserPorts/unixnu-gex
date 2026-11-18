@@ -109,8 +109,71 @@ impl Kernel {
         let s = Arc::clone(&self.fds.get(a[0] as i32).ok()?.handle).as_inet_socket()?;
         match raw {
             sys::SENDMSG | sys::SENDMSG_NOCANCEL | sys::RECVMSG | sys::RECVMSG_NOCANCEL => {
-                self.darwin_unimplemented("MSG_OOB through sendmsg or recvmsg on a TCP socket".into());
-                Some(Err(Errno::EOPNOTSUPP))
+                // The user_msghdr_x of a 64-bit process: name, namelen, iov,
+                // iovlen, control, controllen, flags; its iovecs base, len.
+                const UIO_MAXIOV: u32 = 1024;
+                let send = matches!(raw, sys::SENDMSG | sys::SENDMSG_NOCANCEL);
+                let hdr = match m.read(a[1], 48) {
+                    Ok(b) => b.to_vec(),
+                    Err(e) => return Some(Err(e)),
+                };
+                let u64at = |o: usize| u64::from_le_bytes(hdr[o..o + 8].try_into().unwrap());
+                let u32at = |o: usize| u32::from_le_bytes(hdr[o..o + 4].try_into().unwrap());
+                let (name, iov, iovlen, control, controllen) = (u64at(0), u64at(16), u32at(24) as i32, u64at(32), u32at(40));
+                if iovlen <= 0 || iovlen as u32 > UIO_MAXIOV {
+                    return Some(Err(Errno::EMSGSIZE));
+                }
+                let vecs = match m.read(iov, iovlen as usize * 16) {
+                    Ok(b) => b.chunks_exact(16).map(|c| (u64::from_le_bytes(c[..8].try_into().unwrap()), u64::from_le_bytes(c[8..].try_into().unwrap()))).collect::<Vec<_>>(),
+                    Err(e) => return Some(Err(e)),
+                };
+                if vecs.iter().try_fold(0u64, |t, &(_, l)| t.checked_add(l).filter(|&t| t <= i32::MAX as u64)).is_none() {
+                    return Some(Err(Errno::EINVAL));
+                }
+                if send {
+                    if control != 0 && controllen != 0 {
+                        self.darwin_unimplemented("control with MSG_OOB on a TCP socket (sockargs and tcp_usr_send's disposal of it)".into());
+                        return Some(Err(Errno::EOPNOTSUPP));
+                    }
+                    let st = s.so_state()?;
+                    if st.cantsend || st.error != 0 || !st.conn.connected {
+                        return None;
+                    }
+                    let mut data = Vec::new();
+                    for &(base, len) in &vecs {
+                        match m.read(base, len as usize) {
+                            Ok(b) => data.extend_from_slice(b),
+                            Err(e) => return Some(Err(e)),
+                        }
+                    }
+                    return Some(s.send_oob(&data)?.map(|n| n as u64));
+                }
+                let b = match s.recv_oob(flags & MSG_PEEK != 0)? {
+                    Ok(b) => b,
+                    Err(e) => return Some(Err(e)),
+                };
+                // uiomove of the one byte into the first iovec with room.
+                let mut n = 0;
+                if let Some(&(base, _)) = vecs.iter().find(|&&(_, l)| l > 0) {
+                    if let Err(e) = m.write(base, &[b]) {
+                        return Some(Err(e));
+                    }
+                    n = 1;
+                }
+                // recvit: no address (copyout_sa's length 0), no control,
+                // the flags as given; the header copied back.
+                let mut out = hdr.clone();
+                if name != 0 {
+                    out[8..12].copy_from_slice(&0u32.to_le_bytes());
+                }
+                if control != 0 {
+                    out[40..44].copy_from_slice(&0u32.to_le_bytes());
+                }
+                out[44..48].copy_from_slice(&(flags as u32).to_le_bytes());
+                if let Err(e) = m.write(a[1], &out) {
+                    return Some(Err(e));
+                }
+                Some(Ok(n))
             }
             sys::SENDTO | sys::SENDTO_NOCANCEL => {
                 // sosendcheck's refusals (a shut down or failed or
@@ -146,5 +209,45 @@ impl Kernel {
                 Some(Ok(n))
             }
         }
+    }
+}
+
+impl Kernel {
+    /// `shutdown` of a Darwin TCP socket (`soshutdown`,
+    /// `soshutdownlock_final`): ENOTCONN unless connected or connecting,
+    /// and for a direction already shut; its reading is `sorflush`, which
+    /// drops what is buffered and what arrives after. `None` for anything
+    /// else.
+    pub(crate) fn darwin_tcp_shutdown(&mut self, raw: u64, a: &[u64; 6]) -> Option<Result<u64, Errno>> {
+        const SHUT_RD: u64 = 0;
+        const SHUT_WR: u64 = 1;
+        if raw != sys::SHUTDOWN || self.darwin_sock_proto(a[0] as i32) != Some(Proto::Tcp) {
+            return None;
+        }
+        let s = Arc::clone(&self.fds.get(a[0] as i32).ok()?.handle).as_inet_socket()?;
+        let how = a[1] as u32 as u64;
+        if how > 2 {
+            return Some(Err(Errno::EINVAL));
+        }
+        let st = s.so_state()?;
+        if !st.conn.connected && s.status() != net::Status::Connecting {
+            return Some(Err(Errno::ENOTCONN));
+        }
+        if how != SHUT_WR {
+            if st.cantrcv {
+                return Some(Err(Errno::ENOTCONN));
+            }
+            if !s.sorflush() {
+                self.darwin_unimplemented("shutdown(SHUT_RD) of a TCP connection the host or the global kernel carries (sorflush's dropping of what arrives)".into());
+                return Some(Err(Errno::EOPNOTSUPP));
+            }
+        }
+        if how != SHUT_RD {
+            if st.cantsend {
+                return Some(Err(Errno::ENOTCONN));
+            }
+            return Some(s.shutdown(SHUT_WR));
+        }
+        Some(Ok(0))
     }
 }

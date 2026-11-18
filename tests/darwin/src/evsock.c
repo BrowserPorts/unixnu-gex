@@ -15,7 +15,9 @@
 #include <signal.h>
 #include <sys/ioctl.h>
 #include <sys/sockio.h>
+#include <sys/uio.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/event.h>
@@ -401,8 +403,129 @@ static int oob(void) {
     return 0;
 }
 
+static int getint(int s, int level, int name) {
+    int v = -1;
+    socklen_t l = sizeof v;
+    return getsockopt(s, level, name, &v, &l) ? -1 : v;
+}
+
+// sonewconn and tcp_input's new connection: the listener's options, TCP's
+// (TF_NODELAY, t_keepintvl, t_keepcnt; not t_keepidle), so_pgid, and the
+// listening descriptor's FASYNC and FNONBLOCK (accept_nocancel).
+static int inherit(void) {
+    struct sockaddr_in in;
+    int l = listener(&in), on = 1, sz = 20000, v = 30;
+    setsockopt(l, SOL_SOCKET, SO_OOBINLINE, &on, sizeof on);
+    setsockopt(l, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on);
+    setsockopt(l, SOL_SOCKET, SO_SNDBUF, &sz, sizeof sz);
+    if (setsockopt(l, IPPROTO_TCP, TCP_KEEPINTVL, &v, sizeof v) || setsockopt(l, IPPROTO_TCP, TCP_KEEPALIVE, &v, sizeof v)) return bad("TCP_KEEPINTVL", errno, 0);
+    v = 3;
+    setsockopt(l, IPPROTO_TCP, TCP_KEEPCNT, &v, sizeof v);
+    fcntl(l, F_SETOWN, getpid());
+    fcntl(l, F_SETFL, O_ASYNC);
+    signal(SIGIO, on_io);
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    if (connect(c, (struct sockaddr *)&in, sizeof in)) return bad("connect", errno, 0);
+    int s = accept(l, NULL, NULL);
+    if (s < 0) return bad("accept", errno, 0);
+    if (getint(s, SOL_SOCKET, SO_OOBINLINE) == 0) return bad("SO_OOBINLINE inherited", 0, 1);
+    if (getint(s, IPPROTO_TCP, TCP_NODELAY) == 0) return bad("TCP_NODELAY inherited", 0, 1);
+    if (getint(s, SOL_SOCKET, SO_SNDBUF) != 20000) return bad("SO_SNDBUF inherited", getint(s, SOL_SOCKET, SO_SNDBUF), 20000);
+    if (getint(s, IPPROTO_TCP, TCP_KEEPINTVL) != 30 || getint(s, IPPROTO_TCP, TCP_KEEPCNT) != 3) return bad("TCP_KEEPINTVL inherited", getint(s, IPPROTO_TCP, TCP_KEEPINTVL), 30);
+    if (getint(s, IPPROTO_TCP, TCP_KEEPALIVE) != 7200) return bad("TCP_KEEPALIVE not inherited", getint(s, IPPROTO_TCP, TCP_KEEPALIVE), 7200);
+    if (fcntl(s, F_GETOWN) != getpid() || !(fcntl(s, F_GETFL) & O_ASYNC)) return bad("so_pgid and FASYNC inherited", fcntl(s, F_GETOWN), getpid());
+    ios = 0;
+    write(c, "x", 1);
+    if (!sigio_came()) return bad("SIGIO on the accepted socket", 0, 1);
+    close(c);
+    close(s);
+    close(l);
+    signal(SIGIO, SIG_DFL);
+    return 0;
+}
+
+// soshutdown's SHUT_RD: sorflush drops what is buffered and what arrives.
+static int shutrd(void) {
+    struct sockaddr_in in;
+    char b[8];
+    int l = listener(&in);
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    connect(c, (struct sockaddr *)&in, sizeof in);
+    int s = accept(l, NULL, NULL);
+    write(c, "abc", 3);
+    usleep(10000);
+    if (shutdown(s, SHUT_RD)) return bad("SHUT_RD", errno, 0);
+    if (read(s, b, sizeof b) != 0) return bad("a read after SHUT_RD", errno, 0);
+    if (write(c, "def", 3) != 3) return bad("the peer's write after SHUT_RD", errno, 3);
+    usleep(10000);
+    if (read(s, b, sizeof b) != 0) return bad("what arrived after SHUT_RD", errno, 0);
+    if (shutdown(s, SHUT_RD) != -1 || errno != ENOTCONN) return bad("SHUT_RD again", errno, ENOTCONN);
+    if (shutdown(s, SHUT_RDWR) != -1 || errno != ENOTCONN) return bad("SHUT_RDWR after SHUT_RD", errno, ENOTCONN);
+    if (shutdown(s, SHUT_WR) || shutdown(s, SHUT_WR) != -1 || errno != ENOTCONN) return bad("SHUT_WR twice", errno, ENOTCONN);
+    close(s);
+    close(c);
+    close(l);
+    // A refused connect's PCB is dead: connect again is EINVAL; so_error
+    // was taken by the connect.
+    l = listener(&in);
+    if (l < 0) return bad("the second listener", errno, 0);
+    close(l);
+    c = socket(AF_INET, SOCK_STREAM, 0);
+    int r = connect(c, (struct sockaddr *)&in, sizeof in);
+    if (r != -1 || errno != ECONNREFUSED) return bad(r ? "the refused connect" : "the refused connect succeeded", r ? errno : ntohs(in.sin_port), ECONNREFUSED);
+    if (getint(c, SOL_SOCKET, SO_ERROR) != 0) return bad("SO_ERROR after it", getint(c, SOL_SOCKET, SO_ERROR), 0);
+    if (connect(c, (struct sockaddr *)&in, sizeof in) != -1 || errno != EINVAL) return bad("connect again", errno, EINVAL);
+    close(c);
+    return 0;
+}
+
+// unp_drop: a datagram socket whose peer closed has ECONNRESET in
+// so_error, which a send takes; then it is not connected.
+static int dgdrop(void) {
+    int sv[2];
+    char b[4];
+    socketpair(AF_UNIX, SOCK_DGRAM, 0, sv);
+    close(sv[1]);
+    if (send(sv[0], "x", 1, 0) != -1 || errno != ECONNRESET) return bad("a send after the peer closed", errno, ECONNRESET);
+    if (send(sv[0], "x", 1, 0) != -1 || errno != EDESTADDRREQ) return bad("a send after that", errno, EDESTADDRREQ);
+    close(sv[0]);
+    socketpair(AF_UNIX, SOCK_DGRAM, 0, sv);
+    close(sv[1]);
+    if (getint(sv[0], SOL_SOCKET, SO_ERROR) != ECONNRESET || getint(sv[0], SOL_SOCKET, SO_ERROR) != 0) return bad("SO_ERROR after the peer closed", getint(sv[0], SOL_SOCKET, SO_ERROR), 0);
+    close(sv[0]);
+    socketpair(AF_UNIX, SOCK_DGRAM, 0, sv);
+    close(sv[1]);
+    if (recv(sv[0], b, sizeof b, MSG_DONTWAIT) != -1 || errno != ECONNRESET) return bad("a receive after the peer closed", errno, ECONNRESET);
+    if (recv(sv[0], b, sizeof b, MSG_DONTWAIT) != -1 || errno != EAGAIN) return bad("a receive after that", errno, EAGAIN);
+    close(sv[0]);
+    return 0;
+}
+
+// MSG_OOB through sendmsg and recvmsg.
+static int oobmsg(void) {
+    struct sockaddr_in in;
+    char b[4], name[32];
+    int l = listener(&in);
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    connect(c, (struct sockaddr *)&in, sizeof in);
+    int s = accept(l, NULL, NULL);
+    struct iovec v[2] = {{"P", 1}, {"Q", 1}};
+    struct msghdr mh = {.msg_iov = v, .msg_iovlen = 2};
+    if (sendmsg(c, &mh, MSG_OOB) != 2) return bad("sendmsg MSG_OOB", errno, 2);
+    usleep(10000);
+    struct iovec r = {b, sizeof b};
+    struct msghdr rh = {.msg_name = name, .msg_namelen = sizeof name, .msg_iov = &r, .msg_iovlen = 1};
+    if (recvmsg(s, &rh, MSG_OOB) != 1 || b[0] != 'Q') return bad("recvmsg MSG_OOB", b[0], 'Q');
+    if (rh.msg_namelen != 0 || rh.msg_flags != MSG_OOB) return bad("recvmsg's header", rh.msg_flags, MSG_OOB);
+    if (read(s, b, sizeof b) != 1 || b[0] != 'P') return bad("the data before the mark", b[0], 'P');
+    close(s);
+    close(c);
+    close(l);
+    return 0;
+}
+
 int main(void) {
-    if (tcp() || unixstream() || except() || owner() || oob()) return 1;
+    if (tcp() || unixstream() || except() || owner() || oob() || inherit() || shutrd() || dgdrop() || oobmsg()) return 1;
     printf("evsock ok\n");
     return 0;
 }

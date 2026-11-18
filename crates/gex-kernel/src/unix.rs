@@ -1521,7 +1521,14 @@ pub struct UnixDgram {
     connects: AtomicU32,
     /// Its owner (`so_pgid`, `SS_ASYNC`).
     owner: Arc<crate::vfs::SoOwner>,
+    /// A Darwin socket whose connected peer closed (`unp_drop`): its
+    /// ECONNRESET in so_error, [`DROP_PENDING`] until a send, a receive or
+    /// SO_ERROR takes it ([`DROP_TAKEN`]).
+    dropped: std::sync::atomic::AtomicU8,
 }
+
+const DROP_PENDING: u8 = 1;
+const DROP_TAKEN: u8 = 2;
 
 impl UnixDgram {
     pub fn new(names: &Arc<SocketNames>) -> Arc<UnixDgram> {
@@ -1536,7 +1543,27 @@ impl UnixDgram {
             queue: crate::wait::Queue::new(),
             connects: AtomicU32::new(0),
             owner: Default::default(),
+            dropped: Default::default(),
         })
+    }
+
+    /// Whether a Darwin socket's connected peer has closed: `unp_detach`'s
+    /// `unp_drop(ECONNRESET)` of it, seen now.
+    fn peer_dropped(&self) -> bool {
+        if self.xnu.lock().unwrap().is_none() {
+            return false;
+        }
+        let dead = matches!(&*self.peer.lock().unwrap(), Some((w, _)) if w.strong_count() == 0);
+        if dead {
+            let _ = self.dropped.compare_exchange(0, DROP_PENDING, Ordering::AcqRel, Ordering::Acquire);
+        }
+        dead
+    }
+
+    /// The pending ECONNRESET, taken.
+    pub fn take_so_error(&self) -> Option<Errno> {
+        self.peer_dropped();
+        self.dropped.compare_exchange(DROP_PENDING, DROP_TAKEN, Ordering::AcqRel, Ordering::Acquire).ok().map(|_| Errno::ECONNRESET)
     }
 
     /// `socketpair(AF_UNIX, SOCK_DGRAM)`: two sockets connected to each other.
@@ -1574,6 +1601,10 @@ impl UnixDgram {
     /// The name `connect` gave, for `getpeername`; `ENOTCONN` when it was
     /// not connected (a socketpair's end has an unnamed peer: `Ok(None)`).
     pub fn peer_name(&self) -> Result<Option<String>, Errno> {
+        // unp_drop disconnected it.
+        if self.peer_dropped() {
+            return Err(Errno::ENOTCONN);
+        }
         match &*self.peer.lock().unwrap() {
             Some((_, name)) => Ok(name.clone()),
             None => Err(Errno::ENOTCONN),
@@ -1643,6 +1674,16 @@ impl UnixDgram {
 
     /// `sendto`: to the socket bound to `to`, or (`None`) to the connected one.
     pub fn send_to(&self, data: &[u8], to: Option<&str>) -> SysResult {
+        // sosendcheck: so_error (unp_drop's) before anything else, then no
+        // connection and no address.
+        if self.peer_dropped() {
+            if let Some(e) = self.take_so_error() {
+                return Err(e);
+            }
+            if to.is_none() {
+                return Err(Errno::EDESTADDRREQ);
+            }
+        }
         let name_len = self.send_check(data.len())?;
         let target = match to {
             Some(path) => self.names.dgram_target(path)?,
@@ -1659,6 +1700,17 @@ impl UnixDgram {
     pub fn recv_from(&self, buf: &mut [u8], peek: bool) -> Result<(usize, usize, Option<String>), Errno> {
         // The buffer's accounting, then its datagrams, as `deliver` takes
         // them.
+        // soreceive: what is buffered first, then so_error (a peek leaves
+        // it).
+        if self.inbox.lock().unwrap().is_empty() && self.peer_dropped() {
+            if peek {
+                if self.dropped.load(Ordering::Acquire) == DROP_PENDING {
+                    return Err(Errno::ECONNRESET);
+                }
+            } else if let Some(e) = self.take_so_error() {
+                return Err(e);
+            }
+        }
         let mut xnu = self.xnu.lock().unwrap();
         let mut inbox = self.inbox.lock().unwrap();
         let (data, from) = if peek {
@@ -1701,6 +1753,10 @@ impl FileHandle for UnixDgram {
     /// `write` and `send` with no address: to the connected socket. The
     /// syscalls that carry a name call [`UnixDgram::send_to`] themselves.
     fn write_at(&self, _offset: u64, buf: &[u8]) -> SysResult {
+        // sosendcheck: so_error, then no connection and no address.
+        if self.peer_dropped() {
+            return Err(self.take_so_error().unwrap_or(Errno::EDESTADDRREQ));
+        }
         let name_len = self.send_check(buf.len())?;
         let target = match &*self.peer.lock().unwrap() {
             Some((w, _)) => w.upgrade().ok_or(Errno::ECONNREFUSED)?,
@@ -1739,7 +1795,7 @@ impl FileHandle for UnixDgram {
     }
 
     fn poll_readable(&self) -> bool {
-        !self.inbox.lock().unwrap().is_empty()
+        !self.inbox.lock().unwrap().is_empty() || (self.peer_dropped() && self.dropped.load(Ordering::Acquire) == DROP_PENDING)
     }
 
     fn poll_writable(&self) -> bool {
@@ -1767,10 +1823,13 @@ impl FileHandle for UnixDgram {
         // two); a peer gone is unp_drop's: SS_ISCONNECTED cleared, unposted,
         // and ECONNRESET left in so_error, which is not kept here.
         st.conn.connects = self.connects.load(Ordering::Acquire);
-        match &*self.peer.lock().unwrap() {
-            Some((w, _)) if w.strong_count() != 0 => st.conn.connected = true,
-            Some(_) => st.conn.unmodelled = Some("unp_drop of a unix datagram socket whose peer closed (its ECONNRESET in so_error)"),
-            None => {}
+        let dropped = self.peer_dropped();
+        if dropped && self.dropped.load(Ordering::Acquire) == DROP_PENDING {
+            // ECONNRESET, as Darwin numbers it.
+            st.error = 54;
+        }
+        if let Some((w, _)) = &*self.peer.lock().unwrap() {
+            st.conn.connected = w.strong_count() != 0;
         }
         let xnu = self.xnu.lock().unwrap();
         match xnu.as_ref() {

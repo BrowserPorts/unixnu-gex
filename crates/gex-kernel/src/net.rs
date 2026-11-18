@@ -146,6 +146,12 @@ pub trait Transport: Send + Sync + std::fmt::Debug {
     fn oob_state(&self) -> Option<(u64, bool)> {
         None
     }
+    /// `sorflush`: this end's reading shut down, what waits to be read
+    /// thrown away and what arrives after dropped (SB_DROP); false for a
+    /// transport that cannot (the host's).
+    fn sorflush(&self) -> bool {
+        false
+    }
 }
 
 /// One end of a TCP connection's state as XNU's TCP leaves it, for a
@@ -371,6 +377,11 @@ struct LoopBuf {
     oobflags: u8,
     /// The reader's `SO_OOBINLINE`.
     oobinline: bool,
+    /// The reader's `shutdown(SHUT_RD)`, and whether it came before the
+    /// reader's own FIN; `sorflush`'s `SB_DROP`, which drops what arrives.
+    rd_shut: bool,
+    rd_first: bool,
+    dropping: bool,
 }
 
 /// `TCPOOB_HAVEDATA` and `TCPOOB_HADDATA`.
@@ -387,13 +398,7 @@ const SB_MAX: u64 = 8192 * 1024;
 pub struct LoopEnd {
     rx: Arc<Mutex<LoopBuf>>,
     tx: Arc<Mutex<LoopBuf>>,
-    /// This end's `shutdown(SHUT_RD)`: [`LOOP_RD_SHUT`], and
-    /// [`LOOP_RD_FIRST`] when it came before this end's FIN.
-    rd: std::sync::atomic::AtomicU8,
 }
-
-const LOOP_RD_SHUT: u8 = 1;
-const LOOP_RD_FIRST: u8 = 2;
 
 /// Far more than a guest leaves unread in practice; a writer past it gets a
 /// short count and waits, as on a full socket buffer.
@@ -402,7 +407,7 @@ const LOOP_BUF_MAX: usize = 4 << 20;
 impl LoopEnd {
     pub fn pair() -> (Arc<LoopEnd>, Arc<LoopEnd>) {
         let (a, b) = (Arc::new(Mutex::new(LoopBuf::default())), Arc::new(Mutex::new(LoopBuf::default())));
-        (Arc::new(LoopEnd { rx: Arc::clone(&a), tx: Arc::clone(&b), rd: Default::default() }), Arc::new(LoopEnd { rx: b, tx: a, rd: Default::default() }))
+        (Arc::new(LoopEnd { rx: Arc::clone(&a), tx: Arc::clone(&b) }), Arc::new(LoopEnd { rx: b, tx: a }))
     }
 }
 
@@ -439,8 +444,16 @@ impl Transport for LoopEnd {
         if n == 0 && !data.is_empty() {
             return Err(Errno::EAGAIN);
         }
-        tx.data.extend(&data[..n]);
         tx.seq += n as u64;
+        // A reader that shut its reading drops what arrives (SB_DROP), and
+        // is not woken; the data is still acknowledged.
+        if tx.dropping {
+            let me = tx.writer_owner.clone();
+            drop(tx);
+            wake(&me);
+            return Ok(n);
+        }
+        tx.data.extend(&data[..n]);
         // The data's arrival (sorwakeup of the peer) and its
         // acknowledgement (sowwakeup of this end).
         let (peer, me) = (tx.reader_owner.clone(), tx.writer_owner.clone());
@@ -454,7 +467,7 @@ impl Transport for LoopEnd {
     fn recv(&self, buf: &mut [u8]) -> Result<usize, Errno> {
         let mut rx = self.rx.lock().unwrap();
         if rx.data.is_empty() {
-            let gone = rx.writer_gone;
+            let gone = rx.writer_gone || rx.dropping;
             drop(rx);
             // A reset's error, ahead of the end of file (soreceive takes
             // so_error when nothing is buffered).
@@ -482,7 +495,7 @@ impl Transport for LoopEnd {
     }
     fn has_data(&self) -> bool {
         let rx = self.rx.lock().unwrap();
-        !rx.data.is_empty() || rx.writer_gone
+        !rx.data.is_empty() || rx.writer_gone || rx.dropping
     }
     fn available(&self) -> usize {
         self.rx.lock().unwrap().data.len()
@@ -503,10 +516,14 @@ impl Transport for LoopEnd {
         // told; it is kept for the state its FIN then leaves (`soshutdown`
         // flushes the reading before the protocol's shutdown).
         if how == 0 || how == 2 {
-            let first = if self.tx.lock().unwrap().writer_gone { 0 } else { LOOP_RD_FIRST };
-            self.rd.fetch_or(LOOP_RD_SHUT | first, Ordering::AcqRel);
+            let first = !self.tx.lock().unwrap().writer_gone;
+            let me = {
+                let mut rx = self.rx.lock().unwrap();
+                rx.rd_first |= first && !rx.rd_shut;
+                rx.rd_shut = true;
+                rx.reader_owner.clone()
+            };
             // sorflush's socantrcvmore: sorwakeup.
-            let me = self.rx.lock().unwrap().reader_owner.clone();
             wake(&me);
         }
         // SHUT_WR (or RDWR): the peer reads to end of file.
@@ -536,7 +553,7 @@ impl Transport for LoopEnd {
     fn peek(&self, buf: &mut [u8]) -> Result<usize, Errno> {
         let rx = self.rx.lock().unwrap();
         if rx.data.is_empty() {
-            let gone = rx.writer_gone;
+            let gone = rx.writer_gone || rx.dropping;
             drop(rx);
             // MSG_PEEK reads the reset's error and leaves it.
             if self.reset_error(false) {
@@ -557,13 +574,15 @@ impl Transport for LoopEnd {
         Ok(n)
     }
     fn tcp_end(&self) -> Option<TcpEnd> {
-        let rd = self.rd.load(Ordering::Acquire);
         let (fin_sent, reset, reset_error) = {
             let tx = self.tx.lock().unwrap();
             (tx.writer_gone, tx.reset, tx.reset_error)
         };
-        let fin_rcvd = self.rx.lock().unwrap().writer_gone;
-        Some(TcpEnd { fin_sent, fin_rcvd, reset, rd_shut: rd & LOOP_RD_SHUT != 0, rd_shut_first: rd & LOOP_RD_FIRST != 0, reset_error })
+        let (fin_rcvd, rd_shut, rd_shut_first) = {
+            let rx = self.rx.lock().unwrap();
+            (rx.writer_gone, rx.rd_shut, rx.rd_first)
+        };
+        Some(TcpEnd { fin_sent, fin_rcvd, reset, rd_shut, rd_shut_first, reset_error })
     }
     fn take_error(&self) -> Option<Errno> {
         self.reset_error(true).then_some(Errno::ECONNRESET)
@@ -642,6 +661,12 @@ impl Transport for LoopEnd {
     }
     fn set_oobinline(&self, on: bool) -> bool {
         self.rx.lock().unwrap().oobinline = on;
+        true
+    }
+    fn sorflush(&self) -> bool {
+        self.rx.lock().unwrap().data.clear();
+        self.shutdown(0).expect("SHUT_RD");
+        self.rx.lock().unwrap().dropping = true;
         true
     }
     fn oob_state(&self) -> Option<(u64, bool)> {
@@ -982,6 +1007,15 @@ pub struct Socket {
     owner_linked: AtomicBool,
     /// SO_OOBINLINE, for the connection it makes.
     oobinline: AtomicBool,
+    /// A Darwin process's socket: its options kept with it (which its
+    /// connections' new sockets take, `sonewconn`), and XNU's errors.
+    xnu: AtomicBool,
+    xnu_opts: Mutex<Option<crate::darwin::sockopt::SockOpts>>,
+    /// The ECONNREFUSED a refused connection left (`tcp_drop`'s so_error)
+    /// has been taken.
+    refused_taken: AtomicBool,
+    /// [`Self::started`]'s failure, for the call that reports it.
+    started_err: Mutex<Option<Errno>>,
 }
 
 /// A connect met a reset (`tcp_input` in SYN_SENT: SO_FILT_HINT_CONNRESET,
@@ -1023,6 +1057,46 @@ impl Socket {
             owner: Default::default(),
             owner_linked: AtomicBool::new(false),
             oobinline: AtomicBool::new(false),
+            xnu: AtomicBool::new(false),
+            xnu_opts: Mutex::new(None),
+            refused_taken: AtomicBool::new(false),
+            started_err: Mutex::new(None),
+        }
+    }
+
+    /// A connect started ahead of the call that reports it (a blocking
+    /// call's wait set up first): a failure it met is that call's answer,
+    /// not a second connect's.
+    pub fn started(&self, r: Result<(), Errno>) {
+        if let Err(e) = r {
+            if e != Errno::EINPROGRESS {
+                *self.started_err.lock().unwrap() = Some(e);
+            }
+        }
+    }
+
+    /// A Darwin process's socket ([`Self::xnu`]).
+    pub fn use_xnu(&self) {
+        self.xnu.store(true, Ordering::Release);
+    }
+
+    fn is_xnu(&self) -> bool {
+        self.xnu.load(Ordering::Acquire)
+    }
+
+    /// A refused connection's so_error, taken once (connect, a read or
+    /// SO_ERROR report it).
+    fn take_refused(&self) -> bool {
+        !self.refused_taken.swap(true, Ordering::AcqRel)
+    }
+
+    /// `soshutdown` of a Darwin TCP socket's reading: `sorflush` (the
+    /// buffer dropped, later data with it); false where the connection is
+    /// the host's.
+    pub fn sorflush(&self) -> bool {
+        match self.transport.lock().unwrap().as_ref() {
+            Some(t) => t.sorflush(),
+            None => false,
         }
     }
 
@@ -1230,9 +1304,20 @@ impl Socket {
             },
         };
         let s = Socket::new(Kind::Tcp, Arc::clone(&self.net), Arc::clone(&self.resolver), Arc::clone(&self.ports), self.remote);
-        // sonewconn: the listener's owner.
+        // sonewconn: the listener's owner, options and buffers (and TCP's
+        // from its listener's), and SO_OOBINLINE with them.
         s.owner.inherit(&self.owner);
         s.owner_linked.store(t.set_owner(&s.owner), Ordering::Release);
+        if self.is_xnu() {
+            s.use_xnu();
+            let head = *self.xnu_opts.lock().unwrap();
+            if let Some(h) = head {
+                *s.xnu_opts.lock().unwrap() = Some(crate::darwin::sockopt::SockOpts::inherited(&h, h.snd_hiwat, h.rcv_hiwat));
+                let inline = h.options & crate::darwin::sockopt::so::OOBINLINE != 0;
+                s.oobinline.store(inline, Ordering::Release);
+                t.set_oobinline(inline);
+            }
+        }
         *s.transport.lock().unwrap() = Some(t);
         *s.peer.lock().unwrap() = Some(from);
         *s.local.lock().unwrap() = Some((0x7f00_0001, self.local().1));
@@ -1340,6 +1425,11 @@ impl Socket {
     /// turns that into a wait for a blocking descriptor. Idempotent: asking
     /// twice does not open a second connection.
     pub fn connect(&self, addr: u32, port: u16) -> Result<(), Errno> {
+        // The answer of the connect a waiting call started
+        // ([`Self::started`]), which this call reports.
+        if let Some(e) = self.started_err.lock().unwrap().take() {
+            return Err(e);
+        }
         if let Some(v) = self.fwd(op::CONNECT, addr as u64, port as u64, &mut []) {
             // The global kernel has no network of its own: a connection
             // out is made here, and the socket comes back to this process
@@ -1350,12 +1440,22 @@ impl Socket {
             return self.go_out(addr, port);
         }
         if let Some(t) = self.transport.lock().unwrap().as_ref() {
+            if self.is_xnu() && t.tcp_end().is_some_and(|e| e.disconnected()) {
+                return Err(Errno::EINVAL);
+            }
             return match t.status() {
                 Status::Connecting => Err(Errno::EINPROGRESS),
                 Status::Open => Ok(()),
+                // XNU's connect takes so_error; after that the dead PCB's
+                // pru_connect is EINVAL.
+                Status::Refused if self.is_xnu() && !self.take_refused() => Err(Errno::EINVAL),
                 Status::Refused => Err(Errno::ECONNREFUSED),
                 Status::Closed => Err(Errno::ECONNRESET),
             };
+        }
+        // A Darwin socket whose connection was dropped: its PCB is dead.
+        if self.is_xnu() && self.kind == Kind::Tcp && self.connect_failed.load(Ordering::Acquire) != 0 {
+            return Err(Errno::EINVAL);
         }
         // A port a guest here listens on: connected at once, no network
         // involved. (One nothing here listens on still goes out: the host
@@ -1421,7 +1521,7 @@ impl Socket {
     /// connection the host or the global kernel carries does not, nor a
     /// listener, whose connections would take its options).
     pub fn set_oobinline(&self, on: bool) -> bool {
-        if self.kind != Kind::Tcp || self.moved().is_some() || self.backlog.lock().unwrap().is_some() || self.remote_listener.lock().unwrap().is_some() {
+        if self.kind != Kind::Tcp || self.moved().is_some() || self.remote_listener.lock().unwrap().is_some() {
             return false;
         }
         self.oobinline.store(on, Ordering::Release);
@@ -1455,6 +1555,16 @@ impl Socket {
             Some(t) => t.recv_oob(peek),
             None if self.kind == Kind::Tcp && self.moved().is_none() => Some(Err(Errno::EINVAL)),
             None => None,
+        }
+    }
+
+    /// `SO_ERROR` of a refused connection: ECONNREFUSED, which a Darwin
+    /// socket's reading takes.
+    pub fn refused_so_error(&self) -> i32 {
+        if !self.is_xnu() || self.take_refused() {
+            Errno::ECONNREFUSED.0
+        } else {
+            0
         }
     }
 
@@ -1839,6 +1949,7 @@ impl Socket {
             return Err(Errno::ENOTCONN);
         };
         match t.status() {
+            Status::Refused if self.is_xnu() && self.refused_taken.load(Ordering::Acquire) => Ok(0),
             Status::Refused => Err(Errno::ECONNREFUSED),
             Status::Closed => match t.peek(buf) {
                 Ok(n) => Ok(n as u64),
@@ -2365,6 +2476,8 @@ impl FileHandle for Socket {
             return Err(Errno::ENOTCONN);
         };
         match t.status() {
+            // so_error, taken once; then the end of the stream.
+            Status::Refused if self.is_xnu() && !self.take_refused() => Ok(0),
             Status::Refused => Err(Errno::ECONNREFUSED),
             // Closed and drained is end of file, not "try again": a transport
             // reports "nothing right now" as EAGAIN and cannot tell an empty
@@ -2402,6 +2515,8 @@ impl FileHandle for Socket {
             return Err(Errno::ENOTCONN);
         };
         match t.status() {
+            // After tcp_drop the socket can send no more (sosendcheck's EPIPE).
+            Status::Refused if self.is_xnu() => Err(Errno::EPIPE),
             Status::Refused => Err(Errno::ECONNREFUSED),
             Status::Closed => t.send_closed(buf).map(|n| n as u64),
             // Still connecting: the bytes cannot go yet, and a caller that
@@ -2560,7 +2675,9 @@ impl FileHandle for Socket {
                 Status::Refused => {
                     st.cantrcv = true;
                     st.cantsend = true;
-                    st.error = ECONNREFUSED;
+                    if !(self.is_xnu() && self.refused_taken.load(Ordering::Acquire)) {
+                        st.error = ECONNREFUSED;
+                    }
                 }
             }
             // The connection's events (soisconnected, socantrcvmore,
@@ -2606,6 +2723,23 @@ impl FileHandle for Socket {
             }
         }
         Some(st)
+    }
+
+    /// A Darwin socket's options, kept with it.
+    fn xnu_sockopts(&self) -> Option<crate::darwin::sockopt::SockOpts> {
+        if self.is_xnu() {
+            *self.xnu_opts.lock().unwrap()
+        } else {
+            None
+        }
+    }
+
+    fn set_xnu_sockopts(&self, o: crate::darwin::sockopt::SockOpts) -> bool {
+        if !self.is_xnu() {
+            return false;
+        }
+        *self.xnu_opts.lock().unwrap() = Some(o);
+        true
     }
 
     /// A TCP socket on this machine's connections (or none yet) makes

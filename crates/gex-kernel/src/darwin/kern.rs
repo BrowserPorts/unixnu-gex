@@ -867,6 +867,9 @@ impl Kernel {
         if let Some(r) = self.darwin_fs_call(m, raw, a) {
             return Some(res(r));
         }
+        if raw == sys::REBOOT {
+            return Some(res(self.darwin_reboot(m, a[0] as i32, a[1])));
+        }
         if let Some(r) = self.darwin_fixed_call(raw, a) {
             return Some(res(r));
         }

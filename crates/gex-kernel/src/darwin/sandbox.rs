@@ -240,6 +240,8 @@ pub mod kind {
     pub const HOST_SPECIAL_PORT: u32 = 7;
     pub const IOKIT: u32 = 8;
     pub const NVRAM: u32 = 0x11;
+    /// `mpo_system_check_reboot`'s: the `RB_*` flags as a halfword.
+    pub const REBOOT: u32 = 0x13;
     pub const SYSCALL_UNIX: u32 = 0x14;
     pub const SYSCALL_MACH: u32 = 0x16;
     pub const SYSCALL_MIG: u32 = 0x17;

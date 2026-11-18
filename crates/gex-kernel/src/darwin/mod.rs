@@ -105,6 +105,7 @@ pub mod procpolicy;
 pub mod psem;
 pub mod psynch;
 pub mod reason;
+pub mod reboot;
 pub mod rlimit;
 pub mod rusage;
 pub mod sandbox;

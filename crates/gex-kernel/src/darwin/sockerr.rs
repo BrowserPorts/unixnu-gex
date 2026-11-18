@@ -7,6 +7,9 @@ use super::errno::EOPNOTSUPP;
 use crate::errno::Errno;
 use crate::net;
 use crate::syscalls::Kernel;
+use crate::vfs::FileHandle;
+use crate::GuestMem;
+use std::sync::Arc;
 
 const MSG_OOB: u64 = 1;
 const AF_INET: u64 = 2;
@@ -75,11 +78,73 @@ impl Kernel {
                 (Proto::UnixStream, true) => (!state.cantsend && state.can_write).then_some(EOPNOTSUPP),
                 // pru_rcvoob_notsupp.
                 (Proto::Datagram | Proto::UnixStream, false) => Some(EOPNOTSUPP),
+                // Urgent data on a connection between two sockets here
+                // (darwin_tcp_oob); a connection the host or the global
+                // kernel carries has no urgent pointer here.
+                (Proto::Tcp, _) if self.fds.get(fd).ok().and_then(|f| Arc::clone(&f.handle).as_inet_socket()).is_some_and(|s| s.urgent_followed()) => None,
                 (Proto::Tcp, _) => {
-                    self.darwin_unimplemented("MSG_OOB on a TCP socket (the host's connection carries no urgent data here)".into());
+                    self.darwin_unimplemented("MSG_OOB on a TCP connection the host or the global kernel carries (no urgent pointer reaches it here)".into());
                     Some(Errno::EINVAL)
                 }
             },
+        }
+    }
+}
+
+impl Kernel {
+    /// MSG_OOB on a TCP socket whose connection is this kernel's:
+    /// `sosend` to `tcp_usr_send` with PRUS_OOB, and `soreceive`'s
+    /// `pru_rcvoob` (`tcp_usr_rcvoob`), for `sendto` and `recvfrom`; `None`
+    /// for anything else, which goes on as it would.
+    pub(crate) fn darwin_tcp_oob(&mut self, m: &mut GuestMem<'_>, raw: u64, a: &[u64; 6]) -> Option<Result<u64, Errno>> {
+        const MSG_PEEK: u64 = 0x2;
+        let flags = match raw {
+            sys::SENDTO | sys::SENDTO_NOCANCEL | sys::RECVFROM | sys::RECVFROM_NOCANCEL => a[3],
+            sys::SENDMSG | sys::SENDMSG_NOCANCEL | sys::RECVMSG | sys::RECVMSG_NOCANCEL => a[2],
+            _ => return None,
+        };
+        if flags & MSG_OOB == 0 || self.darwin_sock_proto(a[0] as i32) != Some(Proto::Tcp) {
+            return None;
+        }
+        let s = Arc::clone(&self.fds.get(a[0] as i32).ok()?.handle).as_inet_socket()?;
+        match raw {
+            sys::SENDMSG | sys::SENDMSG_NOCANCEL | sys::RECVMSG | sys::RECVMSG_NOCANCEL => {
+                self.darwin_unimplemented("MSG_OOB through sendmsg or recvmsg on a TCP socket".into());
+                Some(Err(Errno::EOPNOTSUPP))
+            }
+            sys::SENDTO | sys::SENDTO_NOCANCEL => {
+                // sosendcheck's refusals (a shut down or failed or
+                // unconnected socket) are the ordinary send's.
+                let st = s.so_state()?;
+                if st.cantsend || st.error != 0 || !st.conn.connected {
+                    return None;
+                }
+                let data = match m.read(a[1], a[2] as usize) {
+                    Ok(b) => b.to_vec(),
+                    Err(e) => return Some(Err(e)),
+                };
+                Some(s.send_oob(&data)?.map(|n| n as u64))
+            }
+            _ => {
+                let b = match s.recv_oob(flags & MSG_PEEK != 0)? {
+                    Ok(b) => b,
+                    Err(e) => return Some(Err(e)),
+                };
+                // One byte, as much of it as the buffer takes.
+                let n = a[2].min(1);
+                if n != 0 {
+                    if let Err(e) = m.write(a[1], &[b]) {
+                        return Some(Err(e));
+                    }
+                }
+                // No address: a length of 0, where one was asked for.
+                if a[4] != 0 && a[5] != 0 {
+                    if let Err(e) = m.write(a[5], &0u32.to_le_bytes()) {
+                        return Some(Err(e));
+                    }
+                }
+                Some(Ok(n))
+            }
         }
     }
 }

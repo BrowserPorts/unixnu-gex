@@ -158,6 +158,10 @@ struct Pipe {
     /// [`Self::notify_writer`]): the ends' `FileHandle::wakes`.
     reader_wakes: AtomicU64,
     writer_wakes: AtomicU64,
+    /// The owners of the sockets that read and write this direction, whose
+    /// wakeups here signal them (`sorwakeup`, `sowwakeup`).
+    reader_owner: Mutex<Weak<crate::vfs::SoOwner>>,
+    writer_owner: Mutex<Weak<crate::vfs::SoOwner>>,
 }
 
 /// A guest wrote to (or closed) a host-serviced socket since the last
@@ -184,9 +188,22 @@ impl Pipe {
     fn notify_reader(&self) {
         self.reader_wakes.fetch_add(1, Ordering::SeqCst);
         crate::wait::notify(self.reader_q.load(Ordering::SeqCst));
+        let o = self.reader_owner.lock().unwrap_or_else(|e| e.into_inner()).upgrade();
+        if let Some(o) = o {
+            o.wakeup();
+        }
     }
 
     fn notify_writer(&self) {
+        self.wake_writer();
+        let o = self.writer_owner.lock().unwrap_or_else(|e| e.into_inner()).upgrade();
+        if let Some(o) = o {
+            o.wakeup();
+        }
+    }
+
+    /// The writer's waiters woken, with no `sowwakeup` of its socket.
+    fn wake_writer(&self) {
         self.writer_wakes.fetch_add(1, Ordering::SeqCst);
         crate::wait::notify(self.writer_q.load(Ordering::SeqCst));
     }
@@ -432,8 +449,9 @@ impl Pipe {
         x.rights.clear();
         st.bytes.clear();
         drop(s);
+        // socantrcvmore's sorwakeup; the sender is not told.
         self.notify_reader();
-        self.notify_writer();
+        self.wake_writer();
     }
 }
 
@@ -496,6 +514,8 @@ pub struct UnixSocket {
     passcred: AtomicBool,
     /// A Darwin process's socket: what XNU keeps with it.
     xnu: Mutex<Option<XnuSock>>,
+    /// Its owner (`so_pgid`, `SS_ASYNC`).
+    owner: Arc<crate::vfs::SoOwner>,
 }
 
 /// What XNU keeps with a Darwin unix socket: its buffers' `sb_hiwat` while
@@ -544,6 +564,7 @@ impl UnixSocket {
             gone: AtomicBool::new(false),
             passcred: AtomicBool::new(false),
             xnu: Mutex::new(None),
+            owner: Default::default(),
         }
     }
 
@@ -671,6 +692,8 @@ impl UnixSocket {
     fn adopt(&self, rx: &Pipe, tx: &Pipe) {
         rx.reader_q.store(self.queue.id(), Ordering::SeqCst);
         tx.writer_q.store(self.queue.id(), Ordering::SeqCst);
+        *rx.reader_owner.lock().unwrap_or_else(|e| e.into_inner()) = Arc::downgrade(&self.owner);
+        *tx.writer_owner.lock().unwrap_or_else(|e| e.into_inner()) = Arc::downgrade(&self.owner);
     }
 
     /// The queue of the end connected to this one (which reads what this one
@@ -841,14 +864,18 @@ impl UnixSocket {
             // listener's (from its `listen`) for this one.
             let client = *self.cred.lock().unwrap();
             let server = *listener.cred.lock().unwrap();
+            // sonewconn: the listener's owner.
+            theirs.owner.inherit(&listener.owner);
             *theirs.cred.lock().unwrap() = server;
             *theirs.peer_cred.lock().unwrap() = client;
             *self.peer_cred.lock().unwrap() = server;
             *theirs.peer_addr.lock().unwrap() = *self.addr.lock().unwrap();
             backlog.lock().unwrap().push_back(theirs);
         }
-        // A connection is waiting for `accept`.
+        // A connection is waiting for `accept` (soisconnected's sorwakeup
+        // of the head).
         listener.queue.notify();
+        listener.owner.wakeup();
         // Take the pair's plumbing rather than the socket itself, because the
         // descriptor the caller holds is this one.
         let mut role = self.role.lock().unwrap();
@@ -863,6 +890,8 @@ impl UnixSocket {
             peer: Some(path.to_string()),
             local: None,
         };
+        // soisconnected: this end's sorwakeup and sowwakeup.
+        self.owner.wakeup();
         Ok(0)
     }
 
@@ -1181,7 +1210,7 @@ impl FileHandle for UnixSocket {
     /// `PIPSIZ` both ways, and a connected stream's send space is what the
     /// peer's receive buffer has left.
     fn so_state(&self) -> Option<crate::vfs::SoState> {
-        let mut st = crate::vfs::SoState { qlen: None, rcv: 0, cantrcv: false, cantsend: false, error: 0, can_write: false, snd_used: 0, hiwat: (PIPSIZ, PIPSIZ), snd_lowat: 2048, unix_stream: true, ctl: 0, records: None, exact: true, peer_space: None, snd_mbmax: None, unp_cc: 0, live_hiwat: false };
+        let mut st = crate::vfs::SoState { qlen: None, rcv: 0, cantrcv: false, cantsend: false, error: 0, can_write: false, snd_used: 0, hiwat: (PIPSIZ, PIPSIZ), snd_lowat: 2048, unix_stream: true, ctl: 0, records: None, exact: true, peer_space: None, snd_mbmax: None, unp_cc: 0, live_hiwat: false, conn: Default::default(), oobmark: 0, rcvatmark: false, oob_unmodelled: None };
         // A Darwin socket's buffers are its own counts: its receive
         // buffer's, and its send buffer's limits lowered by what waits in
         // its peer's (whose room also bounds it).
@@ -1205,14 +1234,26 @@ impl FileHandle for UnixSocket {
                         st.unp_cc = u64::from(d.unp_cc);
                         st.peer_space = Some(d.rcv.space().max(0) as u64);
                     }
+                    // unp_connect2's soisconnected, and unp_disconnect's
+                    // soisdisconnected of both ends when either detaches.
+                    st.conn.connects = 1;
+                    st.conn.connected = !d.disconnected;
+                    st.conn.disconnected = d.disconnected;
+                    st.conn.disconnects = u32::from(d.disconnected);
                 });
                 st.can_write = true;
                 return Some(st);
             }
-            if let Role::Listening { backlog, .. } = &*self.role.lock().unwrap() {
-                st.qlen = Some(backlog.lock().unwrap().len() as u64);
+            match &*self.role.lock().unwrap() {
+                Role::Listening { backlog, .. } => st.qlen = Some(backlog.lock().unwrap().len() as u64),
+                // A peer that is not a Darwin socket: its directions' own
+                // counts, below.
+                Role::Connected { .. } => {}
+                _ => return Some(st),
             }
-            return Some(st);
+            if st.qlen.is_some() {
+                return Some(st);
+            }
         }
         match &*self.role.lock().unwrap() {
             Role::Listening { backlog, .. } => st.qlen = Some(backlog.lock().unwrap().len() as u64),
@@ -1226,10 +1267,23 @@ impl FileHandle for UnixSocket {
                 st.can_write = true;
                 st.snd_used = tx.available();
                 st.unp_cc = st.snd_used;
+                st.conn.connects = 1;
+                st.conn.connected = true;
+                // A peer that is not a Darwin socket's: its going and two
+                // shutdowns look the same here.
+                if st.cantrcv && st.cantsend {
+                    st.conn.unmodelled = Some("unp_disconnect of a unix stream socket whose peer is not a Darwin socket (SO_FILT_HINT_DISCONNECTED)");
+                }
             }
             _ => {}
         }
         Some(st)
+    }
+
+    /// A Darwin socket's wakeups are XNU's (`uipc_send`, `uipc_rcvd`,
+    /// `unp_shutdown`, `unp_disconnect`, `unp_connect`).
+    fn so_owner(&self) -> Option<(Arc<crate::vfs::SoOwner>, bool)> {
+        Some((Arc::clone(&self.owner), self.is_xnu()))
     }
 
     /// A Darwin stream's is `sowriteable`: its sending over, or connected
@@ -1463,6 +1517,10 @@ pub struct UnixDgram {
     nonblocking: AtomicBool,
     /// Who waits on it (`crate::wait`): readers.
     queue: crate::wait::Queue,
+    /// Its connects (`unp_connect2`'s `soisconnected`).
+    connects: AtomicU32,
+    /// Its owner (`so_pgid`, `SS_ASYNC`).
+    owner: Arc<crate::vfs::SoOwner>,
 }
 
 impl UnixDgram {
@@ -1476,6 +1534,8 @@ impl UnixDgram {
             xnu: Mutex::new(None),
             nonblocking: AtomicBool::new(false),
             queue: crate::wait::Queue::new(),
+            connects: AtomicU32::new(0),
+            owner: Default::default(),
         })
     }
 
@@ -1484,6 +1544,8 @@ impl UnixDgram {
         let (a, b) = (UnixDgram::new(names), UnixDgram::new(names));
         *a.peer.lock().unwrap() = Some((Arc::downgrade(&b), None));
         *b.peer.lock().unwrap() = Some((Arc::downgrade(&a), None));
+        a.connects.store(1, Ordering::Release);
+        b.connects.store(1, Ordering::Release);
         (a, b)
     }
 
@@ -1537,6 +1599,9 @@ impl UnixDgram {
     pub fn connect(&self, path: &str) -> SysResult {
         let target = self.names.dgram_target(path)?;
         *self.peer.lock().unwrap() = Some((Arc::downgrade(&target), Some(path.to_string())));
+        self.connects.fetch_add(1, Ordering::AcqRel);
+        // soisconnected's wakeups.
+        self.owner.wakeup();
         Ok(0)
     }
 
@@ -1550,6 +1615,8 @@ impl UnixDgram {
             }
             self.inbox.lock().unwrap().push_back((data.to_vec(), from));
             self.queue.notify();
+            // uipc_send's sorwakeup of the receiver.
+            self.owner.wakeup();
             return Ok(data.len() as u64);
         }
         let mut inbox = self.inbox.lock().unwrap();
@@ -1695,7 +1762,16 @@ impl FileHandle for UnixDgram {
     /// buffer. A Darwin socket's receive buffer is counted as XNU counts
     /// it, and while it is connected its peer's room is what it may send.
     fn so_state(&self) -> Option<crate::vfs::SoState> {
-        let mut st = crate::vfs::SoState { qlen: None, rcv: 0, cantrcv: false, cantsend: false, error: 0, can_write: true, snd_used: 0, hiwat: (4096, 2048), snd_lowat: 1, unix_stream: false, ctl: 0, records: None, exact: false, peer_space: None, snd_mbmax: None, unp_cc: 0, live_hiwat: false };
+        let mut st = crate::vfs::SoState { qlen: None, rcv: 0, cantrcv: false, cantsend: false, error: 0, can_write: true, snd_used: 0, hiwat: (4096, 2048), snd_lowat: 1, unix_stream: false, ctl: 0, records: None, exact: false, peer_space: None, snd_mbmax: None, unp_cc: 0, live_hiwat: false, conn: Default::default(), oobmark: 0, rcvatmark: false, oob_unmodelled: None };
+        // unp_connect2's soisconnected for each connect (a socketpair's
+        // two); a peer gone is unp_drop's: SS_ISCONNECTED cleared, unposted,
+        // and ECONNRESET left in so_error, which is not kept here.
+        st.conn.connects = self.connects.load(Ordering::Acquire);
+        match &*self.peer.lock().unwrap() {
+            Some((w, _)) if w.strong_count() != 0 => st.conn.connected = true,
+            Some(_) => st.conn.unmodelled = Some("unp_drop of a unix datagram socket whose peer closed (its ECONNRESET in so_error)"),
+            None => {}
+        }
         let xnu = self.xnu.lock().unwrap();
         match xnu.as_ref() {
             Some(x) => {
@@ -1725,6 +1801,11 @@ impl FileHandle for UnixDgram {
 
     fn as_unix_dgram(self: Arc<Self>) -> Option<Arc<UnixDgram>> {
         Some(self)
+    }
+
+    /// A Darwin socket's wakeups are XNU's (`uipc_send`'s, `unp_connect`'s).
+    fn so_owner(&self) -> Option<(Arc<crate::vfs::SoOwner>, bool)> {
+        Some((Arc::clone(&self.owner), self.xnu.lock().unwrap().is_some()))
     }
 }
 
@@ -2928,11 +3009,19 @@ impl crate::vfs::FileHandle for RemoteUnix {
     /// writable or not.
     fn so_state(&self) -> Option<crate::vfs::SoState> {
         if self.listening {
-            return Some(crate::vfs::SoState { qlen: Some(self.has_pending().into()), rcv: 0, cantrcv: false, cantsend: false, error: 0, can_write: false, snd_used: 0, hiwat: (PIPSIZ, PIPSIZ), snd_lowat: 2048, unix_stream: true, ctl: 0, records: None, exact: false, peer_space: None, snd_mbmax: None, unp_cc: 0, live_hiwat: false });
+            return Some(crate::vfs::SoState { qlen: Some(self.has_pending().into()), rcv: 0, cantrcv: false, cantsend: false, error: 0, can_write: false, snd_used: 0, hiwat: (PIPSIZ, PIPSIZ), snd_lowat: 2048, unix_stream: true, ctl: 0, records: None, exact: false, peer_space: None, snd_mbmax: None, unp_cc: 0, live_hiwat: false, conn: Default::default(), oobmark: 0, rcvatmark: false, oob_unmodelled: None });
         }
         let hup = (self.remote.hup)(self.id);
         let full = (self.remote.writable)(self.id) == 0;
-        Some(crate::vfs::SoState { qlen: None, rcv: (self.remote.available)(self.id).max(0) as u64, cantrcv: hup & 2 != 0, cantsend: hup & 1 != 0, error: 0, can_write: true, snd_used: if full { PIPSIZ } else { 0 }, hiwat: (PIPSIZ, PIPSIZ), snd_lowat: 2048, unix_stream: true, ctl: 0, records: None, exact: false, peer_space: None, snd_mbmax: None, unp_cc: if full { PIPSIZ } else { 0 }, live_hiwat: false })
+        // Connected; the global kernel's stream says its directions are
+        // over, not whether its peer went or both were shut down.
+        let conn = crate::vfs::SoConn {
+            connected: true,
+            connects: 1,
+            unmodelled: (hup == 3).then_some("unp_disconnect of a unix stream socket the global kernel holds (SO_FILT_HINT_DISCONNECTED)"),
+            ..Default::default()
+        };
+        Some(crate::vfs::SoState { qlen: None, rcv: (self.remote.available)(self.id).max(0) as u64, cantrcv: hup & 2 != 0, cantsend: hup & 1 != 0, error: 0, can_write: true, snd_used: if full { PIPSIZ } else { 0 }, hiwat: (PIPSIZ, PIPSIZ), snd_lowat: 2048, unix_stream: true, ctl: 0, records: None, exact: false, peer_space: None, snd_mbmax: None, unp_cc: if full { PIPSIZ } else { 0 }, live_hiwat: false, conn, oobmark: 0, rcvatmark: false, oob_unmodelled: None })
     }
 
     fn available(&self) -> Option<u64> {

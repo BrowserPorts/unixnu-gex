@@ -45,6 +45,9 @@ pub struct OpenFile {
     /// A Darwin socket's socket-level options (`so_options`, `so_linger`,
     /// its buffers' marks), once one is set or read.
     pub darwin_sockopt: Mutex<Option<crate::darwin::sockopt::SockOpts>>,
+    /// A socket's event hints as its EVFILT_SOCK knotes are posted them
+    /// (`soevent`), for a Darwin process.
+    pub darwin_sockev: Mutex<crate::darwin::sockev::SoEv>,
     /// XNU's `fg_count`: the descriptors, file ports and messages in flight
     /// that hold it, which its other references (a lookup's, a mapping's)
     /// are not.
@@ -271,6 +274,7 @@ impl OpenFile {
             darwin_lock_key: OnceLock::new(),
             darwin_vnote_key: OnceLock::new(),
             darwin_sockopt: Mutex::new(None),
+            darwin_sockev: Mutex::new(Default::default()),
             fg_count: std::sync::atomic::AtomicU32::new(0),
             darwin_closed: std::sync::atomic::AtomicBool::new(false),
             darwin_writer: std::sync::atomic::AtomicBool::new(false),
@@ -305,6 +309,7 @@ impl OpenFile {
             darwin_lock_key: OnceLock::new(),
             darwin_vnote_key: OnceLock::new(),
             darwin_sockopt: Mutex::new(None),
+            darwin_sockev: Mutex::new(Default::default()),
             fg_count: std::sync::atomic::AtomicU32::new(0),
             darwin_closed: std::sync::atomic::AtomicBool::new(false),
             darwin_writer: std::sync::atomic::AtomicBool::new(false),

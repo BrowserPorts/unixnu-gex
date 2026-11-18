@@ -60,6 +60,8 @@ pub mod filtid {
     pub const PTSD: u8 = 22;
     pub const SO_R: u8 = 23;
     pub const SO_W: u8 = 24;
+    pub const SCK: u8 = 25;
+    pub const SOEXCEPT: u8 = 26;
     pub const VN: u8 = 34;
     pub const PTMX: u8 = 36;
     pub const MACH_PORT: u8 = 37;
@@ -502,7 +504,7 @@ pub(super) mod pollev {
 
 /// `EV_POLL` and `EV_OOBAND` (EV_FLAG0, EV_FLAG1).
 pub(super) const EV_POLL: u16 = 0x1000;
-const EV_OOBAND: u16 = 0x2000;
+pub(super) const EV_OOBAND: u16 = 0x2000;
 
 /// `kevent_ctx_s`: a call's data buffer and scan.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

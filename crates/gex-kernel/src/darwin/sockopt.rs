@@ -203,10 +203,19 @@ impl Kernel {
             }
             so::DEBUG | so::KEEPALIVE | so::DONTROUTE | so::USELOOPBACK | so::BROADCAST | so::REUSEADDR | so::REUSEPORT | so::OOBINLINE => {
                 let on = i32::from_le_bytes(copyin(4)?[..4].try_into().unwrap()) != 0;
-                if on && matches!(name, so::DONTROUTE | so::OOBINLINE) {
-                    let what = if name == so::DONTROUTE { "SO_DONTROUTE turned on (routing around the tables)" } else { "SO_OOBINLINE turned on (urgent data in line)" };
-                    self.darwin_unimplemented(what.into());
+                if on && name == so::DONTROUTE {
+                    self.darwin_unimplemented("SO_DONTROUTE turned on (routing around the tables)".into());
                     return Err(Errno::ENOPROTOOPT);
+                }
+                // SO_OOBINLINE is TCP's to read as urgent data arrives; the
+                // other protocols here carry none.
+                if name == so::OOBINLINE {
+                    if let Some(s) = std::sync::Arc::clone(&file.handle).as_inet_socket() {
+                        if !s.set_oobinline(on) && on && s.kind == crate::net::Kind::Tcp {
+                            self.darwin_unimplemented("SO_OOBINLINE on a TCP listener (sonewconn's so_options for its connections) or a connection the host or the global kernel carries".into());
+                            return Err(Errno::ENOPROTOOPT);
+                        }
+                    }
                 }
                 if on {
                     o.options |= name;
@@ -353,6 +362,23 @@ impl Kernel {
         const AF_INET: u8 = 2;
         let Ok((file, st)) = self.darwin_socket_opts(fd) else { return false };
         if st.unix_stream || Self::darwin_sockopts(&file, &st).options & so::KEEPALIVE == 0 || len < 8 {
+            return false;
+        }
+        match m.read(addr, 8) {
+            Ok(b) => b[1] == AF_INET && b[4] != 127,
+            Err(_) => false,
+        }
+    }
+
+    /// Whether a connect of `fd` to the address at `addr` would take an
+    /// `SS_ASYNC` socket onto a connection the host makes, whose wakeups
+    /// (sowakeup's SIGIO) are the host's TCP's: an AF_INET address off the
+    /// loopback network.
+    pub(crate) fn darwin_async_off_host(&mut self, m: &GuestMem<'_>, fd: i32, addr: u64, len: u64) -> bool {
+        const AF_INET: u8 = 2;
+        let Ok(file) = self.fds.get(fd) else { return false };
+        let Some((o, _)) = file.handle.so_owner() else { return false };
+        if o.flags() & crate::vfs::SoOwner::SS_ASYNC == 0 || len < 8 {
             return false;
         }
         match m.read(addr, 8) {

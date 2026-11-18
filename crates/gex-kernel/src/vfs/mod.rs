@@ -82,6 +82,128 @@ pub struct SoState {
     /// Whether `hiwat` is the socket's own, which its options' copy goes
     /// by (a socket that keeps its buffers as XNU does).
     pub live_hiwat: bool,
+    /// Its connection, as EVFILT_SOCK reads it.
+    pub conn: SoConn,
+    /// `so_oobmark` and `SS_RCVATMARK`: where TCP's urgent data is in what
+    /// waits to be read.
+    pub oobmark: u64,
+    pub rcvatmark: bool,
+    /// Urgent data this socket may be sent that is not followed here:
+    /// what it is.
+    pub oob_unmodelled: Option<&'static str>,
+}
+
+/// A socket's connection as the socket layer's event hints follow it
+/// (`soisconnected`, `soisdisconnected`, a TCP reset; `soevent` in
+/// `bsd/kern/uipc_socket2.c`): its state, and counts of the events that
+/// change it, from which the hints posted since a look are told.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SoConn {
+    /// `SS_ISCONNECTED` and `SS_ISDISCONNECTED`.
+    pub connected: bool,
+    pub disconnected: bool,
+    /// The `soisconnected` calls that post SO_FILT_HINT_CONNECTED (a
+    /// connection a listener queues is presented connected, unposted, so
+    /// one counted from its first look is the same).
+    pub connects: u32,
+    /// The `soisdisconnected` calls (SO_FILT_HINT_DISCONNECTED).
+    pub disconnects: u32,
+    /// TCP resets taken (SO_FILT_HINT_CONNRESET).
+    pub resets: u32,
+    /// TCP connections dropped for their timers (SO_FILT_HINT_TIMEOUT).
+    pub timeouts: u32,
+    /// `PR_EVCONNINFO`: the protocol's connection info events are
+    /// NOTE_CONNINFO_UPDATED (TCP's and UDP's).
+    pub evconninfo: bool,
+    /// An event the socket's protocol would post here that this kernel
+    /// does not carry: what it is.
+    pub unmodelled: Option<&'static str>,
+}
+
+/// A socket's owner and asynchronous mode as the socket layer keeps them
+/// (`so_pgid`; `SS_ASYNC` and its buffers' `SB_ASYNC`), which the signals
+/// its wakeups send go by: `sowakeup`'s SIGIO and `sohasoutofband`'s
+/// SIGURG (`bsd/kern/uipc_socket2.c`, `bsd/kern/uipc_socket.c`).
+#[derive(Default)]
+pub struct SoOwner {
+    pgid: std::sync::atomic::AtomicI32,
+    /// [`SoOwner::SS_ASYNC`], [`SoOwner::SB_ASYNC`].
+    flags: std::sync::atomic::AtomicU8,
+    /// How a signal reaches the owner: given the owner (`so_pgid`, a
+    /// process or the negated group) and Darwin's signal number.
+    send: std::sync::Mutex<Option<Arc<dyn Fn(i32, u32) + Send + Sync>>>,
+}
+
+impl std::fmt::Debug for SoOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SoOwner({}, {:#x})", self.pgid(), self.flags.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl SoOwner {
+    /// `SS_ASYNC`.
+    pub const SS_ASYNC: u8 = 1;
+    /// `SB_ASYNC` of both buffers, which FIOASYNC sets with `SS_ASYNC`.
+    pub const SB_ASYNC: u8 = 2;
+    /// Darwin's SIGURG and SIGIO.
+    pub const SIGURG: u32 = 16;
+    pub const SIGIO: u32 = 23;
+
+    /// `sonewconn`: a connection's new socket takes its listener's
+    /// `so_pgid` and `so_state` (`SS_ASYNC` with it), not its buffers'
+    /// flags.
+    pub fn inherit(&self, head: &SoOwner) {
+        self.pgid.store(head.pgid(), std::sync::atomic::Ordering::Release);
+        self.flags.store(head.flags() & Self::SS_ASYNC, std::sync::atomic::Ordering::Release);
+        *self.send.lock().unwrap() = head.send.lock().unwrap().clone();
+    }
+
+    pub fn pgid(&self) -> i32 {
+        self.pgid.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn set_pgid(&self, pgid: i32) {
+        self.pgid.store(pgid, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn flags(&self) -> u8 {
+        self.flags.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// FIOASYNC: `SS_ASYNC` and both buffers' `SB_ASYNC`, on or off.
+    pub fn set_async(&self, on: bool) {
+        self.flags.store(if on { Self::SS_ASYNC | Self::SB_ASYNC } else { 0 }, std::sync::atomic::Ordering::Release);
+    }
+
+    /// How its signals are sent.
+    pub fn set_sender(&self, send: Arc<dyn Fn(i32, u32) + Send + Sync>) {
+        *self.send.lock().unwrap() = Some(send);
+    }
+
+    /// `pgsigio`'s choice: `gsignal` of the group a negative names,
+    /// `proc_signal` of a positive pid, nothing for 0.
+    fn signal(&self, sig: u32) {
+        let pgid = self.pgid();
+        if pgid == 0 {
+            return;
+        }
+        if let Some(send) = self.send.lock().unwrap().clone() {
+            send(pgid, sig);
+        }
+    }
+
+    /// `sowakeup` of a buffer that `sb_notify` lets through for its
+    /// `SB_ASYNC`: SIGIO to the owner of an `SS_ASYNC` socket.
+    pub fn wakeup(&self) {
+        if self.flags() == Self::SS_ASYNC | Self::SB_ASYNC {
+            self.signal(Self::SIGIO);
+        }
+    }
+
+    /// `sohasoutofband`: SIGURG to the owner.
+    pub fn urgent(&self) {
+        self.signal(Self::SIGURG);
+    }
 }
 
 /// What a kqueue's pipe filters read of an anonymous pipe end
@@ -504,6 +626,13 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     /// A socket's state, for a kqueue's socket filters; `None` for
     /// anything else.
     fn so_state(&self) -> Option<SoState> {
+        None
+    }
+
+    /// A socket's owner ([`SoOwner`]), and whether the wakeups that
+    /// signal it are the socket's as XNU makes them; `None` for anything
+    /// else, or a socket that keeps none.
+    fn so_owner(&self) -> Option<(Arc<SoOwner>, bool)> {
         None
     }
 

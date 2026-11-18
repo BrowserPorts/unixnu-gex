@@ -112,6 +112,8 @@ pub struct SoConn {
     pub resets: u32,
     /// TCP connections dropped for their timers (SO_FILT_HINT_TIMEOUT).
     pub timeouts: u32,
+    /// TCP keepalive probes received (SO_FILT_HINT_KEEPALIVE).
+    pub keepalives: u32,
     /// `PR_EVCONNINFO`: the protocol's connection info events are
     /// NOTE_CONNINFO_UPDATED (TCP's and UDP's).
     pub evconninfo: bool,

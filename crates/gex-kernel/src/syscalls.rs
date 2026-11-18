@@ -12148,6 +12148,13 @@ impl Kernel {
                 self.retry_sigwait = Some(a);
                 Some(op)
             }
+            // A Darwin connect's first part was its call's (`darwin_call`):
+            // what is left here is its sleep.
+            nr::CONNECT if self.darwin => {
+                let socket = self.dtask.connect_wait.take()?;
+                self.dtask.connect_waited = Some(Arc::clone(&socket));
+                Some(BlockOp::Connect { socket })
+            }
             nr::CONNECT => {
                 let (ip, port) = self.fd_io().inet_addr(m, a[1], a[2]).ok()?;
                 let file = self.fds.get(a[0] as i32).ok()?;
@@ -12328,6 +12335,12 @@ impl Kernel {
                 Ok(done) => done,
                 Err(op) => return SyscallOutcome::Blocking(op),
             },
+            _ => r,
+        };
+        // A Darwin connect's sleep is over: connectit takes so_error (a
+        // signal's EINTR stands; the connection goes on).
+        let r = match self.dtask.connect_waited.take() {
+            Some(s) if r != Err(Errno::EINTR) => s.xnu_connect_waited(r.map(|_| ())).map(|()| 0),
             _ => r,
         };
         // An `accept` that waited does its real work here, now that the
@@ -14066,7 +14079,7 @@ impl Kernel {
 
 
 
-    fn socket_of(&self, fd: i32) -> Result<Arc<net::Socket>, Errno> {
+    pub(crate) fn socket_of(&self, fd: i32) -> Result<Arc<net::Socket>, Errno> {
         self.fd_io().socket_of(fd)
     }
 

@@ -152,20 +152,37 @@ pub trait Transport: Send + Sync + std::fmt::Debug {
     fn sorflush(&self) -> bool {
         false
     }
+    /// The end dropped while its listener's queue held it (`soabort`): a
+    /// transport whose TCP is not this kernel's closes it.
+    fn abort(&self) {
+        self.close();
+    }
+    /// The socket's options its TCP reads ([`crate::tcploop::TcpOpts`]),
+    /// with what `tcp_ctloutput` does on the change; false for a transport
+    /// whose TCP is not this kernel's.
+    fn tcp_opts(&self, opts: crate::tcploop::TcpOpts, change: crate::tcploop::OptChange) -> bool {
+        let _ = (opts, change);
+        false
+    }
+    /// The timers due run, and when the next of this connection's TCP
+    /// timers is due.
+    fn next_deadline(&self) -> Option<std::time::Instant> {
+        None
+    }
 }
 
 /// One end of a TCP connection's state as XNU's TCP leaves it, for a
-/// connection carried between two ends this kernel holds (on loopback a
-/// segment arrives as it is sent, and is acknowledged at once).
+/// connection carried between two ends this kernel holds
+/// ([`crate::tcploop`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TcpEnd {
+    /// `t_state` ([`crate::tcploop::state`]).
+    pub state: u8,
     /// This end sent its FIN (`shutdown(SHUT_WR)` or its close).
     pub fin_sent: bool,
     /// The peer's FIN arrived (`socantrcvmore`).
     pub fin_rcvd: bool,
-    /// The peer's reset arrived: data sent after the peer closed met its
-    /// `tcp_close`'d PCB (`TCPS_CLOSE_WAIT` taking the RST: `so_error`
-    /// ECONNRESET, SO_FILT_HINT_CONNRESET, then `tcp_close`).
+    /// A reset was taken (SO_FILT_HINT_CONNRESET).
     pub reset: bool,
     /// This end shut its reading down (`sorflush`'s `socantrcvmore`).
     pub rd_shut: bool,
@@ -173,16 +190,29 @@ pub struct TcpEnd {
     /// (`TCPS_FIN_WAIT_1` to `TCPS_FIN_WAIT_2`) it could receive no more,
     /// which is `soisdisconnected`.
     pub rd_shut_first: bool,
-    /// The reset's ECONNRESET is still to be read (`so_error`).
+    /// A reset's ECONNRESET is still to be read (`so_error`).
     pub reset_error: bool,
+    /// `so_error`.
+    pub error: Option<Errno>,
+    /// SS_ISCONNECTED, SS_CANTRCVMORE, SS_CANTSENDMORE.
+    pub connected: bool,
+    pub cantrcv: bool,
+    pub cantsend: bool,
+    /// `tcp_close` has run: the PCB is dead (INPCB_STATE_DEAD).
+    pub closed: bool,
+    /// The `soisdisconnected` calls, the resets taken, the drops for a
+    /// timer (SO_FILT_HINT_TIMEOUT) and the keepalive probes received
+    /// (SO_FILT_HINT_KEEPALIVE).
+    pub disconnects: u32,
+    pub resets: u32,
+    pub timeouts: u32,
+    pub keepalives: u32,
 }
 
 impl TcpEnd {
-    /// `SS_ISDISCONNECTED`: a reset closed it, or its FIN and the peer's
-    /// were both acknowledged (TIME_WAIT from FIN_WAIT_2, or LAST_ACK's
-    /// `tcp_close`), or its FIN was acknowledged with its reading shut.
+    /// SS_ISDISCONNECTED: `soisdisconnected` has run.
     pub fn disconnected(&self) -> bool {
-        self.reset || (self.fin_sent && (self.fin_rcvd || self.rd_shut_first))
+        self.disconnects != 0
     }
 }
 
@@ -344,356 +374,7 @@ pub fn answer_dns(query: &[u8], resolver: &Resolver) -> Option<Vec<u8>> {
 
 // -- loopback ---------------------------------------------------------------
 
-/// One direction of a loopback connection.
-#[derive(Debug, Default)]
-struct LoopBuf {
-    data: VecDeque<u8>,
-    /// The writing end closed: once drained, the reader sees end of file.
-    writer_gone: bool,
-    /// The reading end closed: a write is `EPIPE` (after the first, which
-    /// Linux takes before the peer's reset arrives).
-    reader_gone: bool,
-    /// A write after `reader_gone` was taken: the next is `EPIPE`.
-    reset: bool,
-    /// Of the writing end: the reset that write met left ECONNRESET to be
-    /// read (`so_error`), which a read of an empty buffer or `SO_ERROR`
-    /// takes.
-    reset_error: bool,
-    /// The owners of the sockets that read and write this direction.
-    reader_owner: std::sync::Weak<crate::vfs::SoOwner>,
-    writer_owner: std::sync::Weak<crate::vfs::SoOwner>,
-    /// The bytes ever sent this way, an urgent byte pulled out of the
-    /// stream among them (the sequence space), and `rcv_up`, the urgent
-    /// pointer as far as it has been taken, in it.
-    seq: u64,
-    rcv_up: u64,
-    /// The reader's `so_oobmark` (bytes of `data` ahead of the mark) and
-    /// `SS_RCVATMARK`.
-    oobmark: usize,
-    atmark: bool,
-    /// The reader's `t_iobc` and `t_oobflags` (TCPOOB_HAVEDATA,
-    /// TCPOOB_HADDATA).
-    iobc: u8,
-    oobflags: u8,
-    /// The reader's `SO_OOBINLINE`.
-    oobinline: bool,
-    /// The reader's `shutdown(SHUT_RD)`, and whether it came before the
-    /// reader's own FIN; `sorflush`'s `SB_DROP`, which drops what arrives.
-    rd_shut: bool,
-    rd_first: bool,
-    dropping: bool,
-}
-
-/// `TCPOOB_HAVEDATA` and `TCPOOB_HADDATA`.
-const TCPOOB_HAVEDATA: u8 = 0x01;
-const TCPOOB_HADDATA: u8 = 0x02;
-/// `sb_max`, which an urgent pointer past it, with what is buffered, is
-/// not taken against (`tcp_input`).
-const SB_MAX: u64 = 8192 * 1024;
-
-/// One end of a TCP connection between two guest sockets on this machine
-/// (a guest connecting to a port another guest listens on): two byte
-/// queues, as a socketpair's.
-#[derive(Debug)]
-pub struct LoopEnd {
-    rx: Arc<Mutex<LoopBuf>>,
-    tx: Arc<Mutex<LoopBuf>>,
-}
-
-/// Far more than a guest leaves unread in practice; a writer past it gets a
-/// short count and waits, as on a full socket buffer.
-const LOOP_BUF_MAX: usize = 4 << 20;
-
-impl LoopEnd {
-    pub fn pair() -> (Arc<LoopEnd>, Arc<LoopEnd>) {
-        let (a, b) = (Arc::new(Mutex::new(LoopBuf::default())), Arc::new(Mutex::new(LoopBuf::default())));
-        (Arc::new(LoopEnd { rx: Arc::clone(&a), tx: Arc::clone(&b) }), Arc::new(LoopEnd { rx: b, tx: a }))
-    }
-}
-
-impl Transport for LoopEnd {
-    fn connect(&self, _host: &str, _port: u16) -> Result<(), Errno> {
-        Ok(())
-    }
-    fn status(&self) -> Status {
-        if self.rx.lock().unwrap().writer_gone || self.tx.lock().unwrap().reader_gone {
-            Status::Closed
-        } else {
-            Status::Open
-        }
-    }
-    fn send(&self, data: &[u8]) -> Result<usize, Errno> {
-        let mut tx = self.tx.lock().unwrap();
-        if tx.reader_gone {
-            if !tx.reset {
-                tx.reset = true;
-                tx.reset_error = true;
-                // The reset's tcp_close: soisdisconnected's wakeups.
-                let me = tx.writer_owner.clone();
-                drop(tx);
-                wake(&me);
-                return Ok(data.len());
-            }
-            return Err(Errno::EPIPE);
-        }
-        if tx.writer_gone {
-            // this end shut down its writing
-            return Err(Errno::EPIPE);
-        }
-        let n = data.len().min(LOOP_BUF_MAX.saturating_sub(tx.data.len()));
-        if n == 0 && !data.is_empty() {
-            return Err(Errno::EAGAIN);
-        }
-        tx.seq += n as u64;
-        // A reader that shut its reading drops what arrives (SB_DROP), and
-        // is not woken; the data is still acknowledged.
-        if tx.dropping {
-            let me = tx.writer_owner.clone();
-            drop(tx);
-            wake(&me);
-            return Ok(n);
-        }
-        tx.data.extend(&data[..n]);
-        // The data's arrival (sorwakeup of the peer) and its
-        // acknowledgement (sowwakeup of this end).
-        let (peer, me) = (tx.reader_owner.clone(), tx.writer_owner.clone());
-        drop(tx);
-        if n != 0 {
-            wake(&peer);
-            wake(&me);
-        }
-        Ok(n)
-    }
-    fn recv(&self, buf: &mut [u8]) -> Result<usize, Errno> {
-        let mut rx = self.rx.lock().unwrap();
-        if rx.data.is_empty() {
-            let gone = rx.writer_gone || rx.dropping;
-            drop(rx);
-            // A reset's error, ahead of the end of file (soreceive takes
-            // so_error when nothing is buffered).
-            if self.reset_error(true) {
-                return Err(Errno::ECONNRESET);
-            }
-            return if gone { Ok(0) } else { Err(Errno::EAGAIN) };
-        }
-        // soreceive stops at the urgent mark, and is at it once there.
-        let mut n = buf.len().min(rx.data.len());
-        if rx.oobmark != 0 {
-            n = n.min(rx.oobmark);
-        }
-        rx.atmark = false;
-        for (d, s) in buf.iter_mut().zip(rx.data.drain(..n)) {
-            *d = s;
-        }
-        if rx.oobmark != 0 {
-            rx.oobmark -= n;
-            if rx.oobmark == 0 {
-                rx.atmark = true;
-            }
-        }
-        Ok(n)
-    }
-    fn has_data(&self) -> bool {
-        let rx = self.rx.lock().unwrap();
-        !rx.data.is_empty() || rx.writer_gone || rx.dropping
-    }
-    fn available(&self) -> usize {
-        self.rx.lock().unwrap().data.len()
-    }
-    fn close(&self) {
-        let peer = {
-            let mut tx = self.tx.lock().unwrap();
-            tx.writer_gone = true;
-            tx.reader_owner.clone()
-        };
-        self.rx.lock().unwrap().reader_gone = true;
-        // Its FIN: socantrcvmore of the peer (and soisdisconnected, when
-        // the peer had sent its own).
-        wake(&peer);
-    }
-    fn shutdown(&self, how: u64) -> Result<(), Errno> {
-        // SHUT_RD (or RDWR) is this end's alone, which the peer is not
-        // told; it is kept for the state its FIN then leaves (`soshutdown`
-        // flushes the reading before the protocol's shutdown).
-        if how == 0 || how == 2 {
-            let first = !self.tx.lock().unwrap().writer_gone;
-            let me = {
-                let mut rx = self.rx.lock().unwrap();
-                rx.rd_first |= first && !rx.rd_shut;
-                rx.rd_shut = true;
-                rx.reader_owner.clone()
-            };
-            // sorflush's socantrcvmore: sorwakeup.
-            wake(&me);
-        }
-        // SHUT_WR (or RDWR): the peer reads to end of file.
-        if how == 1 || how == 2 {
-            let (peer, me) = {
-                let mut tx = self.tx.lock().unwrap();
-                tx.writer_gone = true;
-                (tx.reader_owner.clone(), tx.writer_owner.clone())
-            };
-            // socantsendmore here, the FIN's socantrcvmore there (and a
-            // disconnect of either, once both FINs are sent).
-            wake(&me);
-            wake(&peer);
-        }
-        Ok(())
-    }
-    fn send_closed(&self, data: &[u8]) -> Result<usize, Errno> {
-        self.send(data)
-    }
-    /// A peer's FIN ends only the reading (`socantrcvmore`): sending is
-    /// over once this end shut it down, or once the write after the
-    /// peer's close has met its reset.
-    fn send_over(&self, _closed: bool) -> bool {
-        let tx = self.tx.lock().unwrap();
-        tx.writer_gone || tx.reset
-    }
-    fn peek(&self, buf: &mut [u8]) -> Result<usize, Errno> {
-        let rx = self.rx.lock().unwrap();
-        if rx.data.is_empty() {
-            let gone = rx.writer_gone || rx.dropping;
-            drop(rx);
-            // MSG_PEEK reads the reset's error and leaves it.
-            if self.reset_error(false) {
-                return Err(Errno::ECONNRESET);
-            }
-            return if gone { Ok(0) } else { Err(Errno::EAGAIN) };
-        }
-        // A peek stops at the mark too, and is no longer at it.
-        let mut n = buf.len().min(rx.data.len());
-        if rx.oobmark != 0 {
-            n = n.min(rx.oobmark);
-        }
-        let mut rx = rx;
-        rx.atmark = false;
-        for (d, s) in buf.iter_mut().zip(rx.data.iter()) {
-            *d = *s;
-        }
-        Ok(n)
-    }
-    fn tcp_end(&self) -> Option<TcpEnd> {
-        let (fin_sent, reset, reset_error) = {
-            let tx = self.tx.lock().unwrap();
-            (tx.writer_gone, tx.reset, tx.reset_error)
-        };
-        let (fin_rcvd, rd_shut, rd_shut_first) = {
-            let rx = self.rx.lock().unwrap();
-            (rx.writer_gone, rx.rd_shut, rx.rd_first)
-        };
-        Some(TcpEnd { fin_sent, fin_rcvd, reset, rd_shut, rd_shut_first, reset_error })
-    }
-    fn take_error(&self) -> Option<Errno> {
-        self.reset_error(true).then_some(Errno::ECONNRESET)
-    }
-    fn set_owner(&self, owner: &Arc<crate::vfs::SoOwner>) -> bool {
-        self.rx.lock().unwrap().reader_owner = Arc::downgrade(owner);
-        self.tx.lock().unwrap().writer_owner = Arc::downgrade(owner);
-        true
-    }
-    /// The data goes as a send's; its segment carries the urgent pointer
-    /// after its last byte (`snd_up`), which the peer's `tcp_input` takes:
-    /// the mark before that byte (`so_oobmark`), SIGURG and NOTE_OOB
-    /// (`sohasoutofband`), and the byte pulled out of the stream into
-    /// `t_iobc` unless the peer has SO_OOBINLINE (`tcp_pulloutofband`).
-    fn send_oob(&self, data: &[u8]) -> Option<Result<usize, Errno>> {
-        let mut tx = self.tx.lock().unwrap();
-        if tx.reader_gone || tx.writer_gone {
-            drop(tx);
-            return Some(self.send(data));
-        }
-        // sbspace of the send buffer: none, no urgent data squeezed in.
-        let room = LOOP_BUF_MAX.saturating_sub(tx.data.len());
-        if room == 0 {
-            return Some(Err(Errno::ENOBUFS));
-        }
-        let n = data.len().min(room);
-        if n == 0 {
-            return Some(Ok(0));
-        }
-        let cc = tx.data.len();
-        let up = tx.seq + n as u64;
-        let mut urgent = false;
-        if (n + cc) as u64 <= SB_MAX && up > tx.rcv_up {
-            // th_urp + sb_cc within sb_max, and the pointer advanced.
-            tx.rcv_up = up;
-            tx.oobmark = cc + n - 1;
-            if tx.oobmark == 0 {
-                tx.atmark = true;
-            }
-            tx.oobflags &= !(TCPOOB_HAVEDATA | TCPOOB_HADDATA);
-            urgent = true;
-        }
-        if urgent && !tx.oobinline {
-            tx.iobc = data[n - 1];
-            tx.oobflags |= TCPOOB_HAVEDATA;
-            tx.data.extend(&data[..n - 1]);
-        } else {
-            tx.data.extend(&data[..n]);
-        }
-        tx.seq += n as u64;
-        let (peer, me) = (tx.reader_owner.clone(), tx.writer_owner.clone());
-        drop(tx);
-        if urgent {
-            if let Some(o) = peer.upgrade() {
-                o.urgent();
-            }
-        }
-        wake(&peer);
-        wake(&me);
-        Some(Ok(n))
-    }
-    fn recv_oob(&self, peek: bool) -> Option<Result<u8, Errno>> {
-        let mut rx = self.rx.lock().unwrap();
-        if (rx.oobmark == 0 && !rx.atmark) || rx.oobinline || rx.oobflags & TCPOOB_HADDATA != 0 {
-            return Some(Err(Errno::EINVAL));
-        }
-        if rx.oobflags & TCPOOB_HAVEDATA == 0 {
-            return Some(Err(Errno::EAGAIN));
-        }
-        let b = rx.iobc;
-        rx.atmark = false;
-        if !peek {
-            rx.oobflags ^= TCPOOB_HAVEDATA | TCPOOB_HADDATA;
-        }
-        Some(Ok(b))
-    }
-    fn set_oobinline(&self, on: bool) -> bool {
-        self.rx.lock().unwrap().oobinline = on;
-        true
-    }
-    fn sorflush(&self) -> bool {
-        self.rx.lock().unwrap().data.clear();
-        self.shutdown(0).expect("SHUT_RD");
-        self.rx.lock().unwrap().dropping = true;
-        true
-    }
-    fn oob_state(&self) -> Option<(u64, bool)> {
-        let rx = self.rx.lock().unwrap();
-        Some((rx.oobmark as u64, rx.atmark))
-    }
-}
-
-/// `sowakeup`'s signal to a socket's owner, while the socket is there.
-fn wake(owner: &std::sync::Weak<crate::vfs::SoOwner>) {
-    if let Some(o) = owner.upgrade() {
-        o.wakeup();
-    }
-}
-
-impl LoopEnd {
-    /// Whether a reset's error is pending on this end, taking it when
-    /// `take`.
-    fn reset_error(&self, take: bool) -> bool {
-        let mut tx = self.tx.lock().unwrap();
-        let e = tx.reset_error;
-        if take {
-            tx.reset_error = false;
-        }
-        e
-    }
-}
+pub use crate::tcploop::LoopEnd;
 
 /// One end of a TCP connection between guests in different processes of a
 /// page: a stream in the global kernel (`unix::Remote`), named by the port
@@ -1018,6 +699,19 @@ pub struct Socket {
     started_err: Mutex<Option<Errno>>,
 }
 
+/// What a Darwin connect's first part leaves ([`Socket::xnu_connect`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum XnuConnect {
+    /// The call's answer.
+    Done(Result<(), Errno>),
+    /// The socket is connecting: the call sleeps until it is not
+    /// (`connectit`'s msleep), then reports `so_error`
+    /// ([`Socket::xnu_connect_waited`]).
+    Wait,
+    /// A case this kernel does not model, to be said.
+    Unmodelled(&'static str),
+}
+
 /// A connect met a reset (`tcp_input` in SYN_SENT: SO_FILT_HINT_CONNRESET,
 /// then `tcp_drop(ECONNREFUSED)`).
 const CONNECT_RESET: u8 = 1;
@@ -1082,6 +776,126 @@ impl Socket {
 
     fn is_xnu(&self) -> bool {
         self.xnu.load(Ordering::Acquire)
+    }
+
+    /// What of a Darwin socket's options its TCP reads.
+    fn xnu_tcp_opts(&self) -> crate::tcploop::TcpOpts {
+        self.xnu_opts.lock().unwrap().map(|o| o.tcp()).unwrap_or_default()
+    }
+
+    /// A Darwin socket's options changed (`tcp_ctloutput`): its connection's
+    /// TCP told, with what the change does to its timers.
+    pub fn xnu_tcp_opts_changed(&self, change: crate::tcploop::OptChange) {
+        let opts = self.xnu_tcp_opts();
+        if let Some(t) = self.transport.lock().unwrap().as_ref() {
+            t.tcp_opts(opts, change);
+        }
+    }
+
+    /// Whether this socket's TCP, if it has a connection, is this kernel's
+    /// (its timers run here): a connection between two sockets here; a
+    /// socket with none yet whose connection may be (a listener here, a
+    /// socket yet to connect, which [`Self::connects_here`] decides).
+    pub fn tcp_here(&self) -> bool {
+        if self.kind != Kind::Tcp || self.moved().is_some() || self.remote_listener.lock().unwrap().is_some() {
+            return false;
+        }
+        match self.transport.lock().unwrap().as_ref() {
+            Some(t) => t.tcp_end().is_some(),
+            None => true,
+        }
+    }
+
+    /// Whether a connect to `addr`:`port` would make a connection between
+    /// two sockets here (a guest listening on this machine's port).
+    pub fn connects_here(&self, addr: u32, port: u16) -> bool {
+        self.kind == Kind::Tcp && is_local(addr) && self.remote.is_none() && self.moved().is_none() && self.ports.listener(port).is_some()
+    }
+
+    /// The timers of this socket's connection run, and when its next is
+    /// due ([`Transport::next_deadline`]).
+    pub fn tcp_deadline(&self) -> Option<std::time::Instant> {
+        let t = self.transport.lock().unwrap().clone();
+        t.and_then(|t| t.next_deadline())
+    }
+
+    /// `connectit` for a Darwin internet socket, up to its sleep:
+    /// `soconnectlock`'s checks, the protocol's connect, and what is left
+    /// for the call (`nbio`: the socket is SS_NBIO).
+    pub fn xnu_connect(&self, addr: u32, port: u16, nbio: bool) -> XnuConnect {
+        use XnuConnect::*;
+        // A UDP socket's connect, and one the global kernel holds, as they
+        // were.
+        if self.moved().is_some() || self.kind == Kind::Udp {
+            return Done(self.connect(addr, port));
+        }
+        let t = self.transport.lock().unwrap().clone();
+        let connecting = t.as_ref().is_some_and(|t| t.status() == Status::Connecting);
+        // connectit: a non-blocking socket still connecting.
+        if nbio && connecting {
+            return Done(Err(Errno::EALREADY));
+        }
+        // soconnectlock: a listener (SO_ACCEPTCONN).
+        if self.backlog.lock().unwrap().is_some() || self.remote_listener.lock().unwrap().is_some() {
+            return Done(Err(Errno::EOPNOTSUPP));
+        }
+        if let Some(t) = t {
+            // soconnectlock: SS_ISCONNECTED or SS_ISCONNECTING, and TCP
+            // connects once (PR_CONNREQUIRED).
+            if connecting {
+                return Done(Err(Errno::EISCONN));
+            }
+            match t.tcp_end() {
+                Some(e) if e.connected => return Done(Err(Errno::EISCONN)),
+                // tcp_usr_connect on a dead PCB: so_error, taken, else
+                // EINVAL.
+                Some(e) if e.closed => return Done(Err(t.take_error().unwrap_or(Errno::EINVAL))),
+                // tcp_connect: the connection, in FIN_WAIT_2 or TIME_WAIT,
+                // is still in the hash under the address asked for.
+                Some(_) if self.peer() == Some((addr, port)) => return Done(Err(Errno::EADDRINUSE)),
+                Some(_) => return Unmodelled("connect of a TCP socket whose connection has not closed, to another address (tcp_connect starting a new connection on its PCB)"),
+                None => {}
+            }
+            return match t.status() {
+                Status::Open => Done(Err(Errno::EISCONN)),
+                // tcp_drop(ECONNREFUSED)'s dead PCB: so_error if not taken.
+                Status::Refused => Done(Err(if self.take_refused() { Errno::ECONNREFUSED } else { Errno::EINVAL })),
+                Status::Closed => Unmodelled("connect of a TCP socket whose connection the host carried has ended (its PCB's state is the host's)"),
+                Status::Connecting => unreachable!("handled above"),
+            };
+        }
+        // A connection the host's connect failed: its PCB is dead, its
+        // so_error taken by that connect.
+        if self.connect_failed.load(Ordering::Acquire) != 0 {
+            return Done(Err(Errno::EINVAL));
+        }
+        match self.connect(addr, port) {
+            // tcp_connect leaves the socket SS_ISCONNECTING with its SYN
+            // sent; a connection between two sockets here is up before the
+            // call is back, but a non-blocking call returns as connectit
+            // does, before the SYN's answer.
+            Ok(()) | Err(Errno::EINPROGRESS) if nbio => Done(Err(Errno::EINPROGRESS)),
+            Err(Errno::EINPROGRESS) => Wait,
+            r => Done(r),
+        }
+    }
+
+    /// `connectit` after its sleep: SS_ISCONNECTING over, `so_error`
+    /// taken. `r` is the wait's own answer, for a connection whose end
+    /// says nothing more (the host's).
+    pub fn xnu_connect_waited(&self, r: Result<(), Errno>) -> Result<(), Errno> {
+        match self.status() {
+            Status::Open => Ok(()),
+            // Another taking it first leaves the connect 0.
+            Status::Refused => {
+                if self.take_refused() {
+                    Err(Errno::ECONNREFUSED)
+                } else {
+                    Ok(())
+                }
+            }
+            Status::Connecting | Status::Closed => r,
+        }
     }
 
     /// A refused connection's so_error, taken once (connect, a read or
@@ -1330,6 +1144,15 @@ impl Socket {
     /// made here, the far one queued for the listener's `accept`.
     fn connect_local(&self, listener: &Socket, port: u16) -> Result<(), Errno> {
         let (mine, theirs) = LoopEnd::pair();
+        // A Darwin end's TCP is XNU's: this socket's options, and the new
+        // connection's those its listener's give it (sonewconn, tcp_input).
+        if self.is_xnu() {
+            mine.set_xnu(self.xnu_tcp_opts());
+        }
+        if listener.is_xnu() {
+            let head = listener.xnu_opts.lock().unwrap().map(|h| crate::darwin::sockopt::SockOpts::inherited(&h, h.snd_hiwat, h.rcv_hiwat).tcp());
+            theirs.set_xnu(head.unwrap_or_default());
+        }
         let from = self.ports.ephemeral();
         match &mut *listener.backlog.lock().unwrap() {
             Some(q) => q.push_back((theirs, from)),
@@ -2625,7 +2448,6 @@ impl FileHandle for Socket {
         const TCP_HIWAT: (u64, u64) = (1448 * 384, 1448 * 256);
         const UDP_HIWAT: (u64, u64) = (786896, 9216);
         const ECONNREFUSED: i32 = 61;
-        const ECONNRESET: i32 = 54;
         if self.kind == Kind::Udp {
             let rcv = self.available().unwrap_or(0);
             let connects = self.connects.load(Ordering::Acquire);
@@ -2690,21 +2512,16 @@ impl FileHandle for Socket {
             }
             match t.tcp_end() {
                 Some(e) => {
-                    let disc = e.disconnected();
                     st.conn.connects = u32::from(opened);
-                    st.conn.connected = opened && !disc;
-                    st.conn.disconnected = disc;
-                    st.conn.disconnects = u32::from(disc);
-                    st.conn.resets = u32::from(e.reset);
-                    if e.rd_shut || disc {
-                        st.cantrcv = true;
-                    }
-                    if disc {
-                        st.cantsend = true;
-                    }
-                    if e.reset_error {
-                        st.error = ECONNRESET;
-                    }
+                    st.conn.connected = e.connected;
+                    st.conn.disconnected = e.disconnected();
+                    st.conn.disconnects = e.disconnects;
+                    st.conn.resets = e.resets;
+                    st.conn.timeouts = e.timeouts;
+                    st.conn.keepalives = e.keepalives;
+                    st.cantrcv = e.cantrcv || e.rd_shut;
+                    st.cantsend = e.cantsend;
+                    st.error = e.error.map_or(0, |x| crate::darwin::errno::to_darwin(x.0));
                 }
                 None => {
                     st.oob_unmodelled = Some("urgent data on a TCP connection the host carries (its so_oobmark and SS_RCVATMARK)");
@@ -2833,8 +2650,9 @@ impl Drop for Socket {
             if listeners.get(&port).is_some_and(|w| w.strong_count() == 0) {
                 listeners.remove(&port);
             }
+            // soclose of a listener: soabort of each connection queued.
             for (t, _) in q {
-                t.close();
+                t.abort();
             }
         }
     }
@@ -2946,67 +2764,6 @@ mod tests {
         assert_eq!(&b[..2], b"hi");
         c.shutdown(1).unwrap();
         assert_eq!(s.status(), Status::Closed, "and its shutdown reaches the far end");
-    }
-
-    #[test]
-    fn a_write_after_the_peer_closed_meets_its_reset() {
-        let (a, b) = LoopEnd::pair();
-        assert_eq!(a.tcp_end().map(|e| e.disconnected()), Some(false));
-        b.close();
-        let e = a.tcp_end().unwrap();
-        assert!(e.fin_rcvd && !e.reset && !e.disconnected(), "the peer's FIN alone: CLOSE_WAIT");
-        assert_eq!(a.send(b"x").unwrap(), 1, "the write is taken");
-        let e = a.tcp_end().unwrap();
-        assert!(e.reset && e.reset_error && e.disconnected());
-        let mut buf = [0u8; 4];
-        assert_eq!(a.peek(&mut buf), Err(Errno::ECONNRESET), "a peek reads the error and leaves it");
-        assert_eq!(a.recv(&mut buf), Err(Errno::ECONNRESET));
-        assert_eq!(a.recv(&mut buf), Ok(0), "then the end of file");
-        assert_eq!(a.take_error(), None);
-        assert_eq!(a.send(b"x"), Err(Errno::EPIPE));
-    }
-
-    #[test]
-    fn both_fins_or_a_fin_after_shut_rd_disconnect() {
-        let (a, b) = LoopEnd::pair();
-        a.shutdown(1).unwrap();
-        assert!(!a.tcp_end().unwrap().disconnected(), "FIN_WAIT_2");
-        b.shutdown(1).unwrap();
-        assert!(a.tcp_end().unwrap().disconnected() && b.tcp_end().unwrap().disconnected());
-        let (c, _d) = LoopEnd::pair();
-        c.shutdown(2).unwrap();
-        let e = c.tcp_end().unwrap();
-        assert!(e.rd_shut && e.rd_shut_first && e.disconnected(), "SHUT_RDWR flushes the reading first");
-        let (f, _g) = LoopEnd::pair();
-        f.shutdown(1).unwrap();
-        f.shutdown(0).unwrap();
-        let e = f.tcp_end().unwrap();
-        assert!(e.rd_shut && !e.rd_shut_first && !e.disconnected(), "SHUT_RD after the FIN was acknowledged");
-    }
-
-    #[test]
-    fn urgent_data_marks_the_stream_before_its_last_byte() {
-        let (a, b) = LoopEnd::pair();
-        a.send(b"ab").unwrap();
-        assert_eq!(a.send_oob(b"XY"), Some(Ok(2)));
-        assert_eq!(b.oob_state(), Some((3, false)), "the mark after a, b and X");
-        assert_eq!(b.recv_oob(true), Some(Ok(b'Y')));
-        assert_eq!(b.recv_oob(false), Some(Ok(b'Y')));
-        assert_eq!(b.recv_oob(false), Some(Err(Errno::EINVAL)), "TCPOOB_HADDATA");
-        let mut buf = [0u8; 8];
-        assert_eq!(b.recv(&mut buf), Ok(3));
-        assert_eq!(&buf[..3], b"abX");
-        assert_eq!(b.oob_state(), Some((0, true)), "at the mark");
-        a.send(b"z").unwrap();
-        assert_eq!(b.recv(&mut buf), Ok(1));
-        assert_eq!(b.oob_state(), Some((0, false)));
-        // In line: the byte stays, at the mark.
-        b.set_oobinline(true);
-        a.send_oob(b"Q").unwrap();
-        assert_eq!(b.oob_state(), Some((0, true)));
-        assert_eq!(b.recv_oob(false), Some(Err(Errno::EINVAL)));
-        assert_eq!(b.recv(&mut buf), Ok(1));
-        assert_eq!(buf[0], b'Q');
     }
 
     #[test]

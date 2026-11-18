@@ -865,6 +865,23 @@ impl SysctlReq {
         Ok(v)
     }
 
+    /// `sysctl_io_number` of an `int`: the value out (4 bytes to a buffer
+    /// of 4, the same 4 otherwise), and a new one in when there is one (a
+    /// 64-bit one taken when it fits, ERANGE when it does not).
+    fn io_int(&mut self, m: &mut GuestMem<'_>, cur: i32) -> Result<Option<i32>, Errno> {
+        self.out(m, &cur.to_le_bytes())?;
+        if self.new == 0 {
+            return Ok(None);
+        }
+        if self.newlen == 8 {
+            let b = self.input(m, 8)?;
+            let big = i64::from_le_bytes(b[..8].try_into().expect("8 bytes"));
+            return i32::try_from(big).map(Some).map_err(|_| Errno::ERANGE);
+        }
+        let b = self.input(m, 4)?;
+        Ok(Some(i32::from_le_bytes(b[..4].try_into().expect("4 bytes"))))
+    }
+
     /// `sysctl_io_string`: the value out (cut to the room there is when
     /// `trunc`), and any new one in, of less than `size` bytes.
     fn io_string(&mut self, m: &mut GuestMem<'_>, cur: &[u8], size: usize, trunc: bool) -> Result<Option<Vec<u8>>, Errno> {
@@ -1236,14 +1253,42 @@ impl Kernel {
                 self.darwin_unimplemented("SO_KEEPALIVE on a TCP connection (TCPT_KEEP's probes and the peer's SO_FILT_HINT_KEEPALIVE)".into());
                 neg(Errno::ENOPROTOOPT)
             }
-            // The new connection takes SO_KEEPALIVE from its listener.
-            sys::ACCEPT | sys::ACCEPT_NOCANCEL if self.fds.get(a[0] as i32).ok().and_then(|f| f.handle.xnu_sockopts()).is_some_and(|o| o.options & super::sockopt::so::KEEPALIVE != 0) && self.darwin_sock_proto(a[0] as i32) == Some(super::sockerr::Proto::Tcp) => {
-                self.darwin_unimplemented("accept from a TCP listener with SO_KEEPALIVE (TCPT_KEEP's probes on the new connection)".into());
+            // The new connection takes SO_KEEPALIVE from its listener: one
+            // the global kernel carries runs no TCP timers here.
+            sys::ACCEPT | sys::ACCEPT_NOCANCEL if self.fds.get(a[0] as i32).ok().and_then(|f| f.handle.xnu_sockopts()).is_some_and(|o| o.options & super::sockopt::so::KEEPALIVE != 0) && self.darwin_sock_proto(a[0] as i32) == Some(super::sockerr::Proto::Tcp) && self.socket_of(a[0] as i32).is_ok_and(|s| !s.tcp_here()) => {
+                self.darwin_unimplemented("accept from a TCP listener with SO_KEEPALIVE whose connections the global kernel carries (TCPT_KEEP's probes on the new connection)".into());
                 return None;
             }
             sys::CONNECT | sys::CONNECT_NOCANCEL if self.darwin_async_off_host(m, a[0] as i32, a[1], a[2]) => {
                 self.darwin_unimplemented("an SS_ASYNC socket's connection the host carries (its sowakeup's SIGIO)".into());
                 return None;
+            }
+            // connectit for an internet socket: soconnectlock and the
+            // protocol's connect here; a blocking call still connecting
+            // then sleeps (`connect_wait`, the call's BlockOp::Connect),
+            // and reports so_error when it wakes (`connect_waited`).
+            sys::CONNECT | sys::CONNECT_NOCANCEL if let Ok(s) = self.socket_of(a[0] as i32) => {
+                let (ip, port) = match self.fd_io().inet_addr(m, a[1], a[2]) {
+                    Ok(v) => v,
+                    Err(e) => return Some(neg(e)),
+                };
+                // SS_NBIO: the descriptor's FNONBLOCK (fcntl and FIONBIO
+                // set both).
+                let nbio = self.fds.get(a[0] as i32).is_ok_and(|f| f.flags() & crate::fs::oflags::O_NONBLOCK != 0);
+                let r = s.xnu_connect(ip, port, nbio);
+                // The new connection's timers, for the thread calls.
+                self.dtask.timers.bell().ring();
+                match r {
+                    crate::net::XnuConnect::Done(r) => res(r.map(|()| 0)),
+                    crate::net::XnuConnect::Wait => {
+                        self.dtask.connect_wait = Some(s);
+                        return None;
+                    }
+                    crate::net::XnuConnect::Unmodelled(what) => {
+                        self.darwin_unimplemented(what.into());
+                        neg(Errno::EOPNOTSUPP)
+                    }
+                }
             }
             // A datagram to the limited broadcast address: delivery to an
             // interface's broadcast domain is not modelled.
@@ -1903,6 +1948,7 @@ impl Kernel {
                 req.out(m, &f)
             }
             "kern.hostname" => self.darwin_sysctl_hostname(m, req),
+            "net.inet.tcp.keepidle" | "net.inet.tcp.keepintvl" | "net.inet.tcp.keepinit" | "net.inet.tcp.msl" | "net.inet.tcp.keepcnt" | "net.inet.tcp.always_keepalive" | "net.inet.tcp.fin_timeout" => self.darwin_sysctl_tcp(m, node.path, req),
             p if p.starts_with("kern.proc.") => self.darwin_sysctl_proc(m, p, tail, req),
             "kern.procargs2" => self.darwin_sysctl_procargs2(m, tail, req),
             "kern.osreleasetype" => self.darwin_sysctl_osreleasetype(m, req),
@@ -2131,6 +2177,57 @@ impl Kernel {
             i32::from_le_bytes(b[..4].try_into().expect("4 bytes"))
         };
         self.procs.set_delayterm(self.pid, new != 0);
+        Ok(())
+    }
+
+    /// TCP's timer sysctls ([`crate::tcploop::sysctl`]): `keepidle`,
+    /// `keepintvl`, `keepinit` and `msl` by `sysctl_msec_to_ticks`
+    /// (milliseconds in and out, TCP_RETRANSHZ being 1000; a new value
+    /// under 1 is EINVAL); `keepcnt` and `always_keepalive` by
+    /// `skmem_sysctl_handle_int` (any `int`); `fin_timeout` by
+    /// `sysctl_tcp_fin_timeout` (-1 restores TCPTV_FINWAIT2, a negative
+    /// value otherwise is EINVAL). A value whose timers this kernel's
+    /// clock cannot keep is said, and not taken.
+    fn darwin_sysctl_tcp(&mut self, m: &mut GuestMem<'_>, path: &str, req: &mut SysctlReq) -> Result<(), Errno> {
+        use crate::tcploop::sysctl as t;
+        let var = match path {
+            "net.inet.tcp.keepidle" => &t::KEEPIDLE,
+            "net.inet.tcp.keepintvl" => &t::KEEPINTVL,
+            "net.inet.tcp.keepinit" => &t::KEEPINIT,
+            "net.inet.tcp.msl" => &t::MSL,
+            "net.inet.tcp.keepcnt" => &t::KEEPCNT,
+            "net.inet.tcp.always_keepalive" => &t::ALWAYS_KEEPALIVE,
+            _ => &t::FIN_TIMEOUT,
+        };
+        let cur = t::get(var);
+        let msec = matches!(path, "net.inet.tcp.keepidle" | "net.inet.tcp.keepintvl" | "net.inet.tcp.keepinit" | "net.inet.tcp.msl");
+        // sysctl_msec_to_ticks: a negative value is not shown.
+        if msec && cur < 0 {
+            return Err(Errno::EINVAL);
+        }
+        let Some(new) = req.io_int(m, cur)? else { return Ok(()) };
+        let new = if msec {
+            if new < 1 {
+                return Err(Errno::EINVAL);
+            }
+            new
+        } else if path == "net.inet.tcp.fin_timeout" {
+            match new {
+                -1 => t::TCPTV_FINWAIT2,
+                v if v < 0 => return Err(Errno::EINVAL),
+                v => v,
+            }
+        } else {
+            new
+        };
+        t::set(var, new);
+        if !crate::tcploop::offsets_fit(&crate::tcploop::TcpOpts::default()) {
+            t::set(var, cur);
+            self.darwin_unimplemented(format!("{path} {new}: a TCP timer offset of 2^31 ms or more (tcp_now's 32-bit wraparound)"));
+            return Err(Errno::EOPNOTSUPP);
+        }
+        // Connections' deadlines may have moved: the thread calls look.
+        self.dtask.timers.bell().ring();
         Ok(())
     }
 

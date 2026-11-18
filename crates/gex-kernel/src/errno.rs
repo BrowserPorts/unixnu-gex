@@ -66,6 +66,7 @@ impl Errno {
     pub const EMSGSIZE: Errno = Errno(90);
     pub const EPROTOTYPE: Errno = Errno(91);
     pub const ENOPROTOOPT: Errno = Errno(92);
+    pub const ECONNABORTED: Errno = Errno(103);
     pub const ECONNRESET: Errno = Errno(104);
     pub const ENOBUFS: Errno = Errno(105);
     pub const EISCONN: Errno = Errno(106);

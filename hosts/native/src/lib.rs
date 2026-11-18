@@ -6318,6 +6318,24 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 caller.data_mut().exit = Some(Exit::Signal { signal: signal::SIGTRAP, pc: pc as u64, detail, internal: true });
                 return Err(StopExecution.into());
             }
+            // A Darwin program's brk: sleh's handle_breakpoint, EXC_BREAKPOINT
+            // through exception triage to the signal it means (SIGTRAP), its
+            // handler run, or the process's end with its report.
+            if caller.data_mut().with_kernel(|k| k.darwin) {
+                let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+                let mut gm = GuestMem::new(memory.bytes());
+                let state = caller.data_mut();
+                match state.with_kernel(|k| k.raise_fault(&mut gm, signal::SIGTRAP as u32, pc as u64, pc as u64)) {
+                    gex_kernel::signal::Delivery::Resume(target) => {
+                        state.resume_cause = Some("SIGTRAP".into());
+                        state.resume_at = Some(target);
+                    }
+                    _ => {
+                        state.exit = Some(Exit::Signal { signal: signal::SIGTRAP, pc: pc as u64, detail: format!("brk #{imm}"), internal: false });
+                    }
+                }
+                return Err(StopExecution.into());
+            }
             // int3: the hook sees the address after it, as hardware leaves it.
             if deliver_guest_fault(&mut caller, fault_code::BREAKPOINT, pc as u64 + 1, pc as u64)? {
                 return Err(StopExecution.into());

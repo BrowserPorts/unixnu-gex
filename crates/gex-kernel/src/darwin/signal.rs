@@ -1066,6 +1066,8 @@ impl Kernel {
         let code = self.dtask.fault_code.take();
         let codes = match (ty, code) {
             (Some(exc::EXC_BAD_ACCESS), Some(code)) => Some((exc::EXC_BAD_ACCESS, code, fault_address as i64)),
+            // A brk's (handle_breakpoint): EXC_ARM_BREAKPOINT and its pc.
+            (Some(exc::EXC_BREAKPOINT), _) => Some((exc::EXC_BREAKPOINT, 1, pc as i64)),
             (Some(exc::EXC_BAD_INSTRUCTION), _) => m.kernel().read_u32(pc).ok().map(|instr| {
                 const EXC_ARM_UNDEFINED: i64 = 1;
                 const EXC_ARM_BREAKPOINT: i64 = 1;

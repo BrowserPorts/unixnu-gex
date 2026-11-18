@@ -81,18 +81,39 @@ fn fs_tx_enter(nx: &mut Nx<'_>, vol: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// `fs_tx_leave`: `apfs_last_mod_time` and the last change's transaction.
+/// `fs_tx_leave`: `apfs_last_mod_time` and the last change's transaction;
+/// on a volume of a role that keeps document identifiers (no role, User,
+/// Data, Enterprise), +0x428's 0x10 too (K 0x66f70c8).
 fn fs_tx_leave(nx: &mut Nx<'_>, vol: usize, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     let t = now();
     let xid = nx.xid;
     let sb = nx.vol_sb(vol)?;
     sb.put64(SB_LAST_MOD_TIME, t);
     sb.put64(SB_LAST_XID, xid);
+    if DOC_ID_ROLES.contains(&u16::from_le_bytes([sb[SB_ROLE], sb[SB_ROLE + 1]])) {
+        let f = u32::from_le_bytes(sb[SB_DOC_ID_FLAGS..SB_DOC_ID_FLAGS + 4].try_into().unwrap());
+        sb.put32(SB_DOC_ID_FLAGS, f | 0x10);
+    }
     Ok(())
 }
 
-fn check_volume(nx: &mut Nx<'_>, vol: usize) -> Result<(), String> {
-    let sb = nx.vol_sb(vol)?;
+/// The roles whose volumes keep document identifiers (K 0x66f70c8, K
+/// 0x6714ea4, K 0x671ae4c): no role, User, Data, Enterprise.
+const DOC_ID_ROLES: [u16; 4] = [0, 2, 0x40, 0x240];
+/// The superblock's document-identifier flags, its doc-id tree and
+/// previous tree, and its encryption-rolling state.
+const SB_DOC_ID_FLAGS: usize = 0x428;
+const SB_DOC_ID_TREE: usize = 0x430;
+const SB_DOC_ID_PREV_TREE: usize = 0x438;
+const SB_ER_STATE: usize = 0x3d0;
+const SB_FS_FLAGS: usize = 0x108;
+const SB_FEATURES: usize = 0x28;
+const SB_RO_COMPAT: usize = 0x30;
+
+/// What the names of the volume's directory records need: hashed keys,
+/// no case folding.
+fn check_names(nx: &mut Nx<'_>, vol: usize) -> Result<(), String> {
+    let (sb, _) = nx.vol_sb_read(vol)?;
     let incompat = u64a(sb, SB_INCOMPAT);
     if incompat & 0x1 != 0 {
         return Err("not implemented: names of a case-insensitive volume (case folding in the name hash)".into());
@@ -100,30 +121,230 @@ fn check_volume(nx: &mut Nx<'_>, vol: usize) -> Result<(), String> {
     if incompat & 0x8 == 0 {
         return Err("not implemented: directory records of a volume without NORMALIZATION_INSENSITIVE (unhashed keys)".into());
     }
+    Ok(())
+}
+
+fn check_volume(nx: &mut Nx<'_>, vol: usize) -> Result<(), String> {
+    check_names(nx, vol)?;
+    let (sb, _) = nx.vol_sb_read(vol)?;
     let role = u16::from_le_bytes([sb[SB_ROLE], sb[SB_ROLE + 1]]);
-    if [0u16, 2, 0x40, 0x240].contains(&role) {
-        return Err(format!("not implemented: the document-identifier and +0x428 upkeep of a volume of role {role:#x}"));
+    if DOC_ID_ROLES.contains(&role) {
+        return Err(format!("not implemented: the document-identifier upkeep of file operations on a volume of role {role:#x}"));
     }
     Ok(())
 }
 
-/// The read-write mount's one write (`set_cloneinfo_id_epoch`, K
-/// 0x6716184): a volume never given a clone epoch, or changed since its
-/// last unmount's entry, gets its next object identifier as the epoch.
-pub fn mount_rw(nx: &mut Nx<'_>, vol: usize, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
-    check_volume(nx, vol)?;
-    let sb = nx.vol_sb(vol)?.clone();
-    let epoch = u64a(&sb, SB_CLONEINFO_EPOCH);
-    let last = u64a(&sb, SB_MODIFIED_BY + MODIFIED_NAMELEN + 8);
-    if epoch != 0 && u64a(&sb, SB_CLONEINFO_XID) == last {
+/// `clean_up_doc_id_trees_if_needed` (K 0x67150f8) at a read-write
+/// mount: on a volume of a document-identifier role, the volume's last
+/// change (+0x420) checked against the transaction its superblock was last
+/// dirtied in or written by (`mark_doc_id_index_for_rebuild_if_needed`, K
+/// 0x6714ea4); then the doc-id trees' rebuild, rotation and cleanup that
+/// +0x428's bits 1 to 3 and the previous tree ask for. Only the states
+/// where it writes nothing are implemented: the volume unchanged since its
+/// superblock was written, no doc-id tree to check, nothing to rebuild.
+fn doc_id_cleanup(nx: &mut Nx<'_>, vol: usize) -> Result<(), String> {
+    let (sb, x) = nx.vol_sb_read(vol)?;
+    let role = u16::from_le_bytes([sb[SB_ROLE], sb[SB_ROLE + 1]]);
+    if !DOC_ID_ROLES.contains(&role) {
         return Ok(());
     }
+    let flags = u32::from_le_bytes(sb[SB_DOC_ID_FLAGS..SB_DOC_ID_FLAGS + 4].try_into().unwrap());
+    if u64a(sb, SB_LAST_XID) != x || (role == 0x240 && flags & 0x10 == 0) {
+        return Err(format!("not implemented: marking the doc-id index for rebuild (K 0x6714ea4: the volume's last change {:#x}, its superblock's transaction {x:#x})", u64a(sb, SB_LAST_XID)));
+    }
+    if u64a(sb, SB_FS_FLAGS) & 1 == 0 && u64a(sb, SB_ER_STATE) == 0 && u64a(sb, SB_DOC_ID_TREE) != 0 {
+        return Err("not implemented: the doc-id tree's check at mount (K 0x6714ea4's tree read)".into());
+    }
+    if flags & 0xe != 0 || (u64a(sb, SB_DOC_ID_PREV_TREE) != 0 && flags & 1 == 0) {
+        return Err(format!("not implemented: the doc-id trees' rebuild or cleanup at mount (K 0x67150f8: flags {flags:#x})"));
+    }
+    Ok(())
+}
+
+/// A read-write mount (`apfs_vfsop_mount` K 0x66c5fac, of a volume's
+/// device node): inside mount(2), the doc-id check ([`doc_id_cleanup`])
+/// and the one write of `set_cloneinfo_id_epoch` (K 0x6716184: a volume
+/// never given a clone epoch, or changed since its last unmount's entry,
+/// gets its next object identifier as the epoch); then the threads the
+/// mount's tail starts (K 0x66c8030..0x66c8074, drafts/s21/re-data.md
+/// 1.3), which write only on a volume they run on: the pfkur thread's
+/// temporary inode ([`pfkur_resume`]) and the fixup thread's transaction
+/// ([`volume_fixup`]), in that order (RUN_STAND_IN: the two threads are not
+/// ordered). The purgatory cleaner finds no deleted snapshot, the
+/// encryption-rolling resume returns on a ramdisk boot, and the keybag
+/// notification handler only waits: none writes.
+pub fn mount_rw(nx: &mut Nx<'_>, vol: usize, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    check_names(nx, vol)?;
+    doc_id_cleanup(nx, vol)?;
+    let (sb, _) = nx.vol_sb_read(vol)?;
+    let epoch = u64a(sb, SB_CLONEINFO_EPOCH);
+    let last = u64a(sb, SB_MODIFIED_BY + MODIFIED_NAMELEN + 8);
+    if epoch == 0 || u64a(sb, SB_CLONEINFO_XID) != last {
+        fs_tx_enter(nx, vol)?;
+        let sb = nx.vol_sb(vol)?;
+        let next = u64a(sb, SB_NEXT_OBJ_ID);
+        sb.put64(SB_CLONEINFO_EPOCH, next);
+        fs_tx_leave(nx, vol, now)?;
+    }
+    pfkur_resume(nx, vol, now)?;
+    volume_fixup(nx, vol, now)
+}
+
+/// The volume's crypto kind (K 0x671a778, from `fs_flags & 0x109`): 3 for
+/// a volume with a VEK (0x100), 2 for one with software crypto (8), 1 for
+/// an encrypted one with its own key (0), else 0.
+fn vol_crypto(sb: &[u8]) -> u32 {
+    match u64a(sb, SB_FS_FLAGS) & 0x109 {
+        0x100 => 3,
+        8 => 2,
+        0 => 1,
+        _ => 0,
+    }
+}
+
+/// The private directory's inode number (`PRIV_DIR_INO_NUM`).
+const PRIV_DIR_INO: u64 = 3;
+
+/// `pfkur_resume` (K 0x66b7b78) at a read-write mount: on a volume with
+/// per-file keys (incompat 0x40, ro_compat without 0x2) of crypto kind 3,
+/// with no pfk transcription under way (K 0x66a99b8: none at a fresh
+/// Data's first mount) and no `-apfs_pfkur_disable` boot argument (the
+/// restore's has none), the rolling thread starts (K 0x66a9bcc); its
+/// first act (`pfkur_alloc_tls` K 0x66a9d04) makes its temporary inode
+/// ([`alloc_tmp_ino`]), and with the pfkur tree empty it then parks (state
+/// 3, K 0x66a9fb8) until the unmount stops it. The inode is kept in
+/// `nx.pfkur_tmp`.
+fn pfkur_resume(nx: &mut Nx<'_>, vol: usize, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    let (sb, _) = nx.vol_sb_read(vol)?;
+    if u64a(sb, SB_INCOMPAT) & 0x40 == 0 || u64a(sb, SB_RO_COMPAT) & 0x2 != 0 || vol_crypto(sb) != 3 {
+        return Ok(());
+    }
+    if nx.pfkur_tmp.contains_key(&vol) {
+        return Err("not implemented: a pfkur thread already running at the mount (apfs + 0x1ee8 set)".into());
+    }
+    let pfkur_root = u64a(sb, 0x418);
+    if pfkur_root == 0 || nx.phys_node_counts(pfkur_root)? != (0, 0) {
+        return Err("not implemented: the pfkur thread's iteration of a non-empty pfkur tree (K 0x66a9fb8)".into());
+    }
+    let ino = alloc_tmp_ino(nx, vol, now)?;
+    nx.pfkur_tmp.insert(vol, ino);
+    Ok(())
+}
+
+/// `alloc_tmp_ino_helper(apfs, &ino, 0, 0, NULL)` (K 0x6700e5c), in its
+/// own file-system transaction: the next object identifier taken (no file
+/// counted), the inode made in the private directory as
+/// `fs_obj_create_name_checked` (K 0x66f251c, called at K 0x6700f44) makes
+/// it with the helper's arguments (mode 0100600, owner and group 0, no BSD
+/// flags, no extra internal flags, protection class 0), its name
+/// `tmp-ino-xattr-dstream-0x0-0x<ino>`; then a data-stream field
+/// (`XF_SYSTEM_FIELD`, its sizes and counters 0 and its default crypto
+/// identifier all ones: the helper's third argument stands only with a
+/// non-zero fourth) and the stream's `j_dstream_id` record with one
+/// reference. Its inode number.
+pub fn alloc_tmp_ino(nx: &mut Nx<'_>, vol: usize, now: &mut dyn FnMut() -> u64) -> Result<u64, String> {
+    check_names(nx, vol)?;
     fs_tx_enter(nx, vol)?;
-    let sb = nx.vol_sb(vol)?;
-    let next = u64a(sb, SB_NEXT_OBJ_ID);
-    sb.put64(SB_CLONEINFO_EPOCH, next);
+    let ino = {
+        let sb = nx.vol_sb(vol)?;
+        let ino = u64a(sb, SB_NEXT_OBJ_ID);
+        sb.put64(SB_NEXT_OBJ_ID, ino + 1);
+        ino
+    };
+    let name = format!("tmp-ino-xattr-dstream-0x0-{ino:#x}");
+    let pv = get_rec(nx, vol, &inode_key(PRIV_DIR_INO))?.ok_or("the volume has no private directory")?;
+    if get_rec(nx, vol, &drec_key(PRIV_DIR_INO, &name))?.is_some() {
+        return Err(format!("the pfkur temporary inode's name {name} exists (EEXIST)"));
+    }
+    let v = obj_create_name(nx, vol, PRIV_DIR_INO, &Inode(pv), &name, S_IFREG | 0o600, 0, 0, ino, 0, 0, now)?;
+    let mut ds = vec![0u8; 0x28];
+    ds.put64(0x10, u64::MAX);
+    let mut x = xfields(&v)?;
+    x.push((INO_EXT_TYPE_DSTREAM, XF_SYSTEM_FIELD, ds));
+    put_rec(nx, vol, &inode_key(ino), &with_xfields(&v, &x))?;
+    put_rec(nx, vol, &(u64a(&v, 0x08) | J_DSTREAM_ID << 60).to_le_bytes(), &1u32.to_le_bytes())?;
+    fs_tx_leave(nx, vol, now)?;
+    Ok(ino)
+}
+
+/// `free_tmp_ino_helper(apfs, tmp, 0)` (K 0x6701940), run by the pfkur
+/// thread when the unmount stops it: in a file-system transaction, the
+/// temporary inode's directory entry found by its name field and removed
+/// with the private directory's update ([`remove_dir_entry`], K
+/// 0x66fd1ac), its data stream's `j_dstream_id` record, then the inode.
+pub fn free_tmp_ino(nx: &mut Nx<'_>, vol: usize, ino: u64, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    fs_tx_enter(nx, vol)?;
+    let v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no temporary inode {ino:#x}"))?;
+    let name = xfields(&v)?.into_iter().find(|f| f.0 == 4).ok_or("the temporary inode has no name field")?.2;
+    let name = std::str::from_utf8(name.strip_suffix(&[0]).ok_or("a name field without its NUL")?).map_err(|_| "a name that is not UTF-8")?.to_string();
+    let parent = u64a(&v, 0);
+    let dk = drec_key(parent, &name);
+    if get_rec(nx, vol, &dk)?.is_none() {
+        return Err(format!("not implemented: a temporary inode whose entry {name} is gone (K 0x6701940's assertion path)"));
+    }
+    remove_dir_entry(nx, vol, parent, &dk, now)?;
+    let private = u64a(&v, 0x08);
+    if private != 0 {
+        remove_rec(nx, vol, &(private | J_DSTREAM_ID << 60).to_le_bytes())?;
+    }
+    remove_rec(nx, vol, &inode_key(ino))?;
     fs_tx_leave(nx, vol, now)
 }
+
+/// `apfs_volume_fixup` (K 0x6713d14) at a read-write mount, and the
+/// thread it starts (K 0x6713e00). The thread runs on a volume with the
+/// hard-link map feature (0x2) and no doc-id fixup pending when it has the
+/// expanded records (incompat 0x200) and is Data, or is another role with
+/// fs_flags 0x400, and (on Data, e-apfs) no pfk transcription; its work:
+/// the doc-id fixup loop (only with +0x428's bit 0), the post-offline-purge
+/// cleanup (expanded records: an iteration of the purgeable tombstones,
+/// which only offline purging makes and nothing here has made, then one
+/// file-system transaction clearing fs_flags 0x400), and the
+/// overprovisioning file's flag (none at the first mount).
+fn volume_fixup(nx: &mut Nx<'_>, vol: usize, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    let (sb, _) = nx.vol_sb_read(vol)?;
+    let role = u16::from_le_bytes([sb[SB_ROLE], sb[SB_ROLE + 1]]);
+    let (features, incompat, fs_flags) = (u64a(sb, SB_FEATURES), u64a(sb, SB_INCOMPAT), u64a(sb, SB_FS_FLAGS));
+    let doc_flags = u32::from_le_bytes(sb[SB_DOC_ID_FLAGS..SB_DOC_ID_FLAGS + 4].try_into().unwrap());
+    if features & 2 != 0 && doc_flags & 1 == 0 {
+        if incompat & 0x200 == 0 {
+            if role != 0x40 {
+                return Ok(());
+            }
+        } else if role != 0x40 && fs_flags & 0x400 == 0 {
+            return Ok(());
+        }
+        // K 0x66a99b8 on Data of an e-apfs device: no pfk transcription
+        // state at the mount (apfs + 0x125, + 0x2298: set only by the
+        // crypto migration), so only a crypto kind 1 volume answers 1.
+        if role == 0x40 && vol_crypto(sb) == 1 {
+            return Ok(());
+        }
+    }
+    if features & 2 == 0 {
+        return Err("not implemented: the fixup thread's hard-link map conversion (K 0x671478c)".into());
+    }
+    if doc_flags & 1 != 0 {
+        return Err("not implemented: the fixup thread's doc-id fixup loop (K 0x6713e00)".into());
+    }
+    if incompat & 0x200 != 0 {
+        if incompat & 0x100 != 0 {
+            return Err("not implemented: the post-offline-purge cleanup on a volume's secondary tree".into());
+        }
+        fs_tx_enter(nx, vol)?;
+        let sb = nx.vol_sb(vol)?;
+        let f = u64a(sb, SB_FS_FLAGS);
+        sb.put64(SB_FS_FLAGS, f & !0x400);
+        fs_tx_leave(nx, vol, now)?;
+    }
+    if lookup(nx, vol, ROOT_DIR_INO, ".overprovisioning_file")?.is_some() {
+        return Err("not implemented: the fixup thread's overprovisioning file flag (K 0x6713e00, inode flag 0x800)".into());
+    }
+    Ok(())
+}
+
+/// The root directory's inode number.
+const ROOT_DIR_INO: u64 = 2;
 
 /// An inode's value, the record's fields at their `j_inode_val_t`
 /// offsets.
@@ -156,9 +377,27 @@ pub fn create(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str, mode: u16, u
 }
 
 fn create_obj(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str, mode: u16, uid: u32, gid: u32, now: &mut dyn FnMut() -> u64) -> Result<Result<u64, i32>, String> {
-    check_volume(nx, vol)?;
     let dir = mode & S_IFMT == S_IFDIR;
     let link = mode & S_IFMT == S_IFLNK;
+    // A directory on Data, or a directory or file on User: the only
+    // document-identifier upkeep of mkdir and create is the tombstone
+    // inheritance (K 0x66a3a38), which needs a tombstone the restore's
+    // threads do not hold (drafts/s23/re-uml-data.md 1.3), and on User
+    // their inode and directory records go to the file-system tree, not
+    // the secondary one (K 0x66ed1bc; drafts/s23/re-user-copy.md 2.1).
+    let doc_ok = !link && {
+        let (sb, _) = nx.vol_sb_read(vol)?;
+        match u16::from_le_bytes([sb[SB_ROLE], sb[SB_ROLE + 1]]) {
+            0x40 => u64a(sb, SB_INCOMPAT) & 0x100 == 0,
+            0x2 => vol_crypto(sb) == 1,
+            _ => false,
+        }
+    };
+    if doc_ok {
+        check_names(nx, vol)?;
+    } else {
+        check_volume(nx, vol)?;
+    }
     if !dir && !link && mode & S_IFMT != S_IFREG {
         return Err(format!("not implemented: creating an object of mode {mode:o}"));
     }
@@ -190,13 +429,6 @@ fn create_obj(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str, mode: u16, u
     if ino & !OBJ_MASK != 0 {
         return Err("inode numbers past the object identifier space".into());
     }
-    // The directory record: its type from the mode (DT_DIR 4, DT_REG 8).
-    let t1 = now();
-    let mut dv = ino.to_le_bytes().to_vec();
-    dv.extend_from_slice(&t1.to_le_bytes());
-    dv.extend_from_slice(&(mode >> 12).to_le_bytes());
-    // The inode: the parent's flags kept and inherited, the protection
-    // class; one extended field, the name.
     // The extra flags (K 0x66a39b8, called by mkdir at K 0x6695bb8 and by
     // create for a regular file at K 0x668c510; a symbolic link gets none):
     // the parent's 0x23000, and PINNED_TO_MAIN (0x1000) on a Preboot or VM
@@ -206,7 +438,7 @@ fn create_obj(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str, mode: u16, u
     } else {
         let mut e = pi.internal_flags() & INHERIT_EXTRA;
         let role = {
-            let sb = nx.vol_sb(vol)?;
+            let (sb, _) = nx.vol_sb_read(vol)?;
             u16::from_le_bytes([sb[SB_ROLE], sb[SB_ROLE + 1]])
         };
         if e & 0x3000 == 0 && (role == 0x10 || role == 0x8) {
@@ -217,25 +449,112 @@ fn create_obj(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str, mode: u16, u
     if extra & !INODE_PINNED_TO_MAIN != 0 {
         return Err(format!("not implemented: an object inheriting internal flags {extra:#x}"));
     }
-    if pi.internal_flags() & 0x2 != 0 {
-        return Err("not implemented: directory statistics (INODE_MAINTAIN_DIR_STATS)".into());
-    }
-    if !dir && !link && pi.internal_flags() & 0x200_0000 != 0 {
-        return Err("not implemented: a file made in a directory whose internal flags have 0x2000000 (the type-15 extended field, K 0x66f2b9c)".into());
-    }
-    let flags = (pi.internal_flags() & INHERIT_KEPT) | extra | INODE_NO_RSRC_FORK;
     let parent_prot = u32::from_le_bytes(pi.0[0x3c..0x40].try_into().unwrap());
     // A symbolic link is made with class 0 (apfs_vnop_symlink calls no
     // setup_prot_class).
+    let (encrypted, crypto) = {
+        let (sb, _) = nx.vol_sb_read(vol)?;
+        (u64a(sb, SB_FS_FLAGS) & 1 == 0, vol_crypto(sb))
+    };
+    // setup_prot_class with no explicit class (K 0x66a3670's else branch):
+    // a directory takes its parent's class; on a VEK volume (fs_flags
+    // 0x100) PROT_CLASS_EXPLICIT (internal 0x8) is set for classes 0, 1, 2
+    // and 7, and for 4 when class-F keys are supported (K 0x67372d0 in
+    // crypto mode 3: yes) (K 0x66a3820..0x66a3858).
+    let mut extra = extra;
+    if dir && crypto == 3 && parent_prot <= 7 && (1u32 << parent_prot) & 0x97 != 0 {
+        extra |= 0x8;
+    }
+    // On a volume with its own key (crypto mode 1) a file takes the
+    // default class C like an unencrypted one's and a directory its
+    // parent's, with no PROT_CLASS_EXPLICIT (drafts/s23/re-user-copy.md
+    // 2.2, 2.3).
+    // A file on a VEK volume takes its parent's class when that is a
+    // valid file class (cp_is_valid_class(1, c): 1 to 7) other than 0, with
+    // PROT_CLASS_EXPLICIT by the directory rule above (K 0x66a36c0..
+    // 0x66a3858; drafts/s26/re-aks-data.md 3.6); under a class-0 parent it
+    // would take the volume's default (fs + 0x350), not transcribed.
+    let vek_file_class = encrypted && !dir && !link && crypto == 3 && (1..=7).contains(&parent_prot);
+    if vek_file_class && (1u32 << parent_prot) & 0x97 != 0 {
+        extra |= 0x8;
+    }
+    if encrypted && !dir && !link && crypto != 1 && !vek_file_class {
+        return Err("not implemented: a file made with no explicit class on a VEK volume under a class-0 directory (setup_prot_class's volume default, fs + 0x350)".into());
+    }
+    if encrypted && dir && crypto != 3 && crypto != 1 {
+        return Err("not implemented: a directory on an encrypted volume of crypto kind 0 or 2".into());
+    }
     let prot = if dir {
         parent_prot
     } else if link {
         0
+    } else if vek_file_class {
+        parent_prot
     } else if parent_prot != 0 {
         return Err(format!("not implemented: a file in a directory of protection class {parent_prot} (setup_prot_class's class checks, K 0x67684a0)"));
     } else {
         DEFAULT_CP_CLASS
     };
+    obj_create_name(nx, vol, parent, &pi, name, mode, uid, gid, ino, prot, extra, now)?;
+    let sb = nx.vol_sb(vol)?;
+    let at = if dir {
+        SB_NUM_DIRECTORIES
+    } else if link {
+        SB_NUM_SYMLINKS
+    } else {
+        SB_NUM_FILES
+    };
+    let n = u64a(sb, at);
+    sb.put64(at, n + 1);
+    if !link {
+        fs_tx_leave(nx, vol, now)?;
+    }
+    Ok(Ok(ino))
+}
+
+/// `fs_obj_create_name_checked` (K 0x66f251c) in an open file-system
+/// transaction, the name already found absent: object `ino` named `name`
+/// in directory `parent` (whose inode value `pi` is), with `mode`, owner
+/// `uid`, group `gid`, no BSD flags, protection class `prot` (its
+/// eleventh argument) and the extra internal flags `extra` (its tenth).
+/// The directory record (its type from the mode) and the inode share one
+/// clock reading (the record's date added and the inode's four times);
+/// the inode keeps the parent's 0x20400002 internal flags and gets
+/// `INODE_NO_RSRC_FORK`, a link count of one unless a directory, a write
+/// generation of one and one extended field, its name; then the parent's
+/// modification and change times (one more reading, K 0x66f3750), child
+/// count and write generation. The new inode's value.
+#[allow(clippy::too_many_arguments)]
+fn obj_create_name(nx: &mut Nx<'_>, vol: usize, parent: u64, pi: &Inode, name: &str, mode: u16, uid: u32, gid: u32, ino: u64, prot: u32, extra: u64, now: &mut dyn FnMut() -> u64) -> Result<Vec<u8>, String> {
+    let dir = mode & S_IFMT == S_IFDIR;
+    if pi.internal_flags() & 0x2 != 0 {
+        return Err("not implemented: directory statistics (INODE_MAINTAIN_DIR_STATS)".into());
+    }
+    if mode & S_IFMT == S_IFREG && pi.internal_flags() & 0x200_0000 != 0 {
+        return Err("not implemented: a file made in a directory whose internal flags have 0x2000000 (the type-15 extended field, K 0x66f2b9c)".into());
+    }
+    // The expanded records' subdirectory count (incompat 0x200): a new
+    // directory's j_inode_val +0x54 is 0 (K 0x66f2ae8) and its parent's
+    // grows by one (K 0x66f37a8: the in-memory +0x90, serialized at +0x54
+    // by K 0x66f0374); without them, ro_compat 0x2 would add the count as
+    // extended field 0x11.
+    let subdir_count = if dir {
+        let (sb, _) = nx.vol_sb_read(vol)?;
+        let expanded = u64a(sb, SB_INCOMPAT) & 0x200 != 0;
+        if !expanded && u64a(sb, SB_RO_COMPAT) & 0x2 != 0 {
+            return Err("not implemented: a directory made on a volume with ro_compat 0x2 (the subdirectory-count extended field 0x11, K 0x66f251c, K 0x66f37a8)".into());
+        }
+        expanded
+    } else {
+        false
+    };
+    let dk = drec_key(parent, name);
+    nx.jobj_times.remove(&(vol, parent));
+    let t1 = now();
+    let mut dv = ino.to_le_bytes().to_vec();
+    dv.extend_from_slice(&t1.to_le_bytes());
+    dv.extend_from_slice(&(mode >> 12).to_le_bytes());
+    let flags = (pi.internal_flags() & INHERIT_KEPT) | extra | INODE_NO_RSRC_FORK;
     let nlink = if dir { 0u32 } else { 1 };
     let mut iv = Vec::new();
     for f in [parent, ino, t1, t1, t1, t1, flags] {
@@ -255,36 +574,26 @@ fn create_obj(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str, mode: u16, u
     iv.extend_from_slice(&(data_len as u16).to_le_bytes());
     iv.extend_from_slice(name.as_bytes());
     iv.resize(iv.len() + padded - name.len(), 0);
-    {
-        let (mut t, mut st) = nx.fs_tree(vol)?;
-        t.insert(&mut st, &dk, Some(&dv))?;
-        t.insert(&mut st, &inode_key(ino), Some(&iv))?;
-        // The parent: its times, children and write generation.
-        let t2 = now();
-        let mut p = pi.0.clone();
-        p.put64(0x18, t2);
-        p.put64(0x20, t2);
-        let nchildren = i32::from_le_bytes(p[0x38..0x3c].try_into().unwrap()) + 1;
-        p.put32(0x38, nchildren as u32);
-        let wgc = u32::from_le_bytes(p[0x40..0x44].try_into().unwrap()) + 1;
-        p.put32(0x40, wgc);
-        t.insert(&mut st, &inode_key(parent), Some(&p))?;
-        nx.set_fs_tree(vol, t);
+    let (mut t, mut st) = nx.fs_tree(vol)?;
+    t.insert(&mut st, &dk, Some(&dv))?;
+    t.insert(&mut st, &inode_key(ino), Some(&iv))?;
+    // The parent: its times (any its in-memory object held are replaced),
+    // children and write generation.
+    let t2 = now();
+    let mut p = pi.0.clone();
+    p.put64(0x18, t2);
+    p.put64(0x20, t2);
+    let nchildren = i32::from_le_bytes(p[0x38..0x3c].try_into().unwrap()) + 1;
+    p.put32(0x38, nchildren as u32);
+    let wgc = u32::from_le_bytes(p[0x40..0x44].try_into().unwrap()) + 1;
+    p.put32(0x40, wgc);
+    if subdir_count {
+        let n = u32::from_le_bytes(p[0x54..0x58].try_into().unwrap());
+        p.put32(0x54, n.wrapping_add(1));
     }
-    let sb = nx.vol_sb(vol)?;
-    let at = if dir {
-        SB_NUM_DIRECTORIES
-    } else if link {
-        SB_NUM_SYMLINKS
-    } else {
-        SB_NUM_FILES
-    };
-    let n = u64a(sb, at);
-    sb.put64(at, n + 1);
-    if !link {
-        fs_tx_leave(nx, vol, now)?;
-    }
-    Ok(Ok(ino))
+    t.insert(&mut st, &inode_key(parent), Some(&p))?;
+    nx.set_fs_tree(vol, t);
+    Ok(iv)
 }
 
 /// `symlink(target, name)` in directory `parent` (apfs_vnop_symlink K
@@ -426,12 +735,12 @@ fn dstream_of(v: &[u8]) -> Result<Option<Dstream>, String> {
 }
 
 /// What the kernel writes for a file's inode as its size and data change
-/// that is not transcribed here (apfs_truncate_locked K 0x66a6bbc and the
-/// write path's inode updates: the sparse-bytes field and INODE_IS_SPARSE,
-/// the data stream's byte counters, the times and write generation): the
-/// inode keeps the fields its creation and its data stream's creation gave
-/// it, the stream's size and allocated size.
-pub const FILE_INODE_STAND_IN: &str = "the inode fields the kernel updates as a file's size and data change (sparse bytes, data-stream byte counters, times, write generation) are not transcribed (stand-in: the fields its creation and its data stream's creation give it, and the stream's sizes); for asr's image file apfs_invert retires these records whole";
+/// that is not transcribed for asr's pwrites (prepare_write_and_lock's
+/// per-write updates: the data stream's byte counters, the times, the write
+/// generation, PREV_FSIZE): the inode keeps the fields its creation, its
+/// data stream's creation, its truncate and its block maps' sparse bytes
+/// give it.
+pub const FILE_INODE_STAND_IN: &str = "the inode fields the kernel updates at each of asr's pwrites into its image file (data-stream byte counters, times, write generation, PREV_FSIZE) are not transcribed (stand-in: the fields its creation, its data stream's creation, its truncate and its block maps' sparse bytes give it, and the stream's sizes); apfs_invert retires these records whole";
 
 /// `ftruncate` growing a file with no data (apfs_vnop_setattr K 0x668e4a0
 /// → apfs_truncate_locked K 0x66a6bbc → apfs_set_file_size K 0x6766f50):
@@ -442,6 +751,14 @@ pub const FILE_INODE_STAND_IN: &str = "the inode fields the kernel updates as a 
 /// the new size rounded up to the block size, and the stream's sizes.
 pub fn truncate_grow(nx: &mut Nx<'_>, vol: usize, ino: u64, size: u64, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     check_volume(nx, vol)?;
+    truncate_grow_unchecked(nx, vol, ino, size, now)
+}
+
+/// [`truncate_grow`] on a volume whose role the caller has checked. On a
+/// volume with unwritten extents (incompat 0x80) growing into the
+/// preallocation records no unwritten range (K 0x66a7984): the records
+/// are the same.
+fn truncate_grow_unchecked(nx: &mut Nx<'_>, vol: usize, ino: u64, size: u64, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     let bs = nx.l.bs;
     fs_tx_enter(nx, vol)?;
     let (mut t, mut st) = nx.fs_tree(vol)?;
@@ -485,49 +802,98 @@ pub fn truncate_grow(nx: &mut Nx<'_>, vol: usize, ino: u64, size: u64, now: &mut
     if size <= old.size || old.alloced != 0 {
         return Err("not implemented: a truncate other than growing a file with no data or into its preallocation".into());
     }
+    // alloc_space with no length (K 0x6707764): the hole extent, the
+    // allocated size, then the sparse bytes it adds (K 0x6708614 →
+    // update_sparse_bytes K 0x66ff7c0: INODE_IS_SPARSE and the
+    // SPARSE_BYTES field, appended).
     let alloced = size.div_ceil(bs) * bs;
     t.insert(&mut st, &fext_key(old.oid, 0), Some(&fext_val(alloced, 0)))?;
     let d = x.iter_mut().find(|f| f.0 == INO_EXT_TYPE_DSTREAM).unwrap();
     d.2.put64(0, size);
     d.2.put64(8, alloced);
+    sparse_bytes(&mut v, &mut x, alloced as i64)?;
     v = with_xfields(&v, &x);
     t.insert(&mut st, &inode_key(ino), Some(&v))?;
     nx.set_fs_tree(vol, t);
     fs_tx_leave(nx, vol, now)
 }
 
-/// A write into a file's sparse extent (apfs_vnop_write K 0x6691308 →
-/// cluster_write → apfs_vnop_blockmap K 0x66882ec →
-/// fs_make_hole_range_writable K 0x670afbc), `data` at byte `off` (both
-/// block multiples): for each piece the space manager grants
-/// ([`Nx::alloc_data`]), the volume's allocation count, the block
+/// `INO_EXT_TYPE_SPARSE_BYTES` and `INODE_IS_SPARSE`.
+const INO_EXT_TYPE_SPARSE_BYTES: u8 = 0xd;
+const INODE_IS_SPARSE: u64 = 0x200;
+
+/// `update_sparse_bytes` (K 0x66ff7c0) by `delta` on an inode value `v`
+/// whose extended fields are `x`: the SPARSE_BYTES field (flags 0x28)
+/// rewritten in place or appended with INODE_IS_SPARSE while the count
+/// stays above 0, else removed with the flag cleared. A decrease with no
+/// field is the kernel's error (2).
+fn sparse_bytes(v: &mut [u8], x: &mut Vec<(u8, u8, Vec<u8>)>, delta: i64) -> Result<(), String> {
+    if delta == 0 {
+        return Ok(());
+    }
+    let at = x.iter().position(|f| f.0 == INO_EXT_TYPE_SPARSE_BYTES);
+    let old = match at {
+        Some(i) => u64a(&x[i].2, 0) as i64,
+        None if delta < 0 => return Err("a sparse-bytes decrease on an inode with no SPARSE_BYTES field (update_sparse_bytes returns 2)".into()),
+        None => 0,
+    };
+    let new = old + delta;
+    let f = u64a(v, INO_INTERNAL_FLAGS);
+    if new < 1 {
+        if let Some(i) = at {
+            x.remove(i);
+        }
+        v[INO_INTERNAL_FLAGS..INO_INTERNAL_FLAGS + 8].copy_from_slice(&(f & !INODE_IS_SPARSE).to_le_bytes());
+    } else {
+        v[INO_INTERNAL_FLAGS..INO_INTERNAL_FLAGS + 8].copy_from_slice(&(f | INODE_IS_SPARSE).to_le_bytes());
+        let d = (new as u64).to_le_bytes().to_vec();
+        match at {
+            Some(i) => x[i].2 = d,
+            None => x.push((INO_EXT_TYPE_SPARSE_BYTES, 0x28, d)),
+        }
+    }
+    Ok(())
+}
+
+/// A write into a file's sparse extent, as XNU's cluster layer pushes it:
+/// one `VNOP_BLOCKMAP` of `data` at byte `off` (both block multiples)
+/// (apfs_vnop_blockmap K 0x66882ec → fs_map_file_offset_ext K 0x6708b54 →
+/// fs_make_hole_range_writable K 0x670afbc). Each piece the space manager
+/// grants ([`Nx::alloc_data`], one request per transaction: a shorter
+/// grant ends the block map and cluster_io maps the rest again) is its own
+/// file-system transaction: the volume's allocation counts, the block
 /// references (a record per physically contiguous run of the stream's
 /// blocks, merged with its neighbours, `insert_phys_extent` K 0x66f6ca0),
-/// and the file extents: a piece at the sparse extent's start replaces it
-/// or, physically following the extent before it, extends that one; any
-/// other piece splits it; what the piece leaves of it stays sparse. The
-/// blocks granted, in order.
+/// the file extents (a piece at the sparse extent's start replaces it or,
+/// physically following the extent before it, extends that one; any other
+/// piece splits it; what the piece leaves of it stays sparse), the sparse
+/// bytes lowered (K 0x670920c) and the inode rewritten from its in-memory
+/// object (K 0x6709228), with `times` (the write's modification and change
+/// times and the stream's bytes written) when the write's end has already
+/// set them there. The data reaches the blocks with each piece. The
+/// pieces granted, in order.
 pub fn write_sparse(nx: &mut Nx<'_>, vol: usize, ino: u64, off: u64, data: &[u8], now: &mut dyn FnMut() -> u64) -> Result<Vec<(u64, u64)>, String> {
     check_volume(nx, vol)?;
+    blockmap_fill(nx, vol, ino, off, data, None, now)
+}
+
+fn blockmap_fill(nx: &mut Nx<'_>, vol: usize, ino: u64, off: u64, data: &[u8], times: Option<(u64, u64)>, now: &mut dyn FnMut() -> u64) -> Result<Vec<(u64, u64)>, String> {
     let bs = nx.l.bs;
     if off % bs != 0 || data.len() as u64 % bs != 0 || data.is_empty() {
         return Err("not implemented: a write not of whole blocks".into());
-    }
-    fs_tx_enter(nx, vol)?;
-    let v = {
-        let (t, mut st) = nx.fs_tree(vol)?;
-        t.get(&mut st, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?
-    };
-    let ds = dstream_of(&v)?.ok_or("a write to a file with no data stream")?;
-    if off + data.len() as u64 > ds.size {
-        return Err("not implemented: a write past the end of a file".into());
     }
     let mut out = Vec::new();
     let mut pos = off;
     let end = off + data.len() as u64;
     while pos < end {
+        fs_tx_enter(nx, vol)?;
+        let v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
+        let ds = dstream_of(&v)?.ok_or("a write to a file with no data stream")?;
+        if end > ds.alloced {
+            return Err("not implemented: a block map past the file's allocated size".into());
+        }
         // The sparse extent holding `pos`.
-        let (mut t, mut st) = nx.fs_tree(vol)?;
+        let (t, mut st) = nx.fs_tree(vol)?;
         let recs = t.records(&mut st)?;
         let ext: Vec<(u64, u64, u64)> = recs
             .iter()
@@ -537,11 +903,11 @@ pub fn write_sparse(nx: &mut Nx<'_>, vol: usize, ino: u64, off: u64, data: &[u8]
                 (u64a(k, 8), u64a(v, 0) & 0x00ff_ffff_ffff_ffff, u64a(v, 8))
             })
             .collect();
+        drop(st);
         let &(hl, hlen, hphys) = ext.iter().find(|&&(l, n, _)| l <= pos && pos < l + n).ok_or("a write where the file has no extent")?;
         if hphys != 0 {
             return Err("not implemented: a write over a file's allocated blocks".into());
         }
-        drop(st);
         let want = (end - pos).min(hl + hlen - pos);
         let blocks = want.div_ceil(bs);
         let (a, got) = nx.alloc_data(blocks)?;
@@ -567,12 +933,23 @@ pub fn write_sparse(nx: &mut Nx<'_>, vol: usize, ino: u64, off: u64, data: &[u8]
             t.insert(&mut st, &fext_key(ds.oid, pos + n), Some(&fext_val(hl + hlen - (pos + n), 0)))?;
         }
         nx.set_fs_tree(vol, t);
+        let mut v = v;
+        let mut x = xfields(&v)?;
+        sparse_bytes(&mut v, &mut x, -(n as i64))?;
+        if let Some((t_w, written)) = times {
+            let d = x.iter_mut().find(|f| f.0 == INO_EXT_TYPE_DSTREAM).unwrap();
+            d.2.put64(0x18, written);
+            v.put64(INO_MOD_TIME, t_w);
+            v.put64(INO_CHANGE_TIME, t_w);
+        }
+        let v = with_xfields(&v, &x);
+        put_rec(nx, vol, &inode_key(ino), &v)?;
         let at = (pos - off) as usize;
         nx.write_data(a, &data[at..at + n as usize])?;
+        fs_tx_leave(nx, vol, now)?;
         out.push((a, got));
         pos += n;
     }
-    fs_tx_leave(nx, vol, now)?;
     Ok(out)
 }
 
@@ -677,6 +1054,418 @@ pub fn preallocate(nx: &mut Nx<'_>, vol: usize, ino: u64, len: u64, now: &mut dy
     Ok(blocks * bs)
 }
 
+/// `restored_external`'s reserve_overprov_space (RE 0x10002e5bc,
+/// drafts/s21/re-overprov.md) on the Data volume `vol` of a disk of
+/// `disk_bytes` (the whole disk's DKIOCGETBLOCKSIZE times
+/// DKIOCGETBLOCKCOUNT), whose container device answers DK_FEATURE_UNMAP as
+/// `unmap`: `/.overprovisioning_file` made with `open_dprotected_np(O_RDWR
+/// | O_CREAT | O_EXCL, class 6, 0600)` (stored as class C on a VEK volume),
+/// `F_PREALLOCATE` {CONTIG | ALL | PERSIST, F_PEOFPOSMODE} of 1 GiB, or a
+/// hundredth of the disk when it is no more than 0x1900000063 bytes,
+/// `ftruncate` to it, `F_FULLFSYNC`, `F_TRIM_ACTIVE_FILE` over it, then
+/// the closes (nothing written). Its inode number.
+pub fn reserve_overprov_space(nx: &mut Nx<'_>, vol: usize, disk_bytes: u64, unmap: bool, now: &mut dyn FnMut() -> u64) -> Result<u64, String> {
+    const NAME: &str = ".overprovisioning_file";
+    let size = if disk_bytes as i64 > 0x19_0000_0063 { 0x4000_0000 } else { (disk_bytes as i64 / 100) as u64 };
+    if lookup(nx, vol, ROOT_DIR_INO, NAME)?.is_some() {
+        return Err("not implemented: the overprovisioning file's open finding it (O_EXCL: EEXIST)".into());
+    }
+    let ino = create_protected(nx, vol, ROOT_DIR_INO, NAME, 0o600, 0, 6, now)?;
+    match preallocate_contig_persist(nx, vol, ino, size, now)? {
+        Ok(got) if got == size => {}
+        Ok(_) => return Err("a contiguous preallocation given fewer bytes".into()),
+        Err(_) => return Err("not implemented: the overprovisioning file's preallocation retries after ENOSPC (flags 0xa, then 0x8: preallocate_with_temp_file)".into()),
+    }
+    check_names(nx, vol)?;
+    truncate_grow_unchecked(nx, vol, ino, size, now)?;
+    nx.tx_finish()?;
+    if unmap {
+        trim_active_file(nx, vol, ino, now)?;
+    }
+    Ok(ino)
+}
+
+/// `open_dprotected_np(O_CREAT, class, 0, mode)` of a regular file
+/// `name` in directory `parent` of an encrypted volume with a VEK, by
+/// root under umask 0 (apfs_vnop_create K 0x668c3f8): setup_prot_class
+/// with an explicit class (K 0x66a3670, drafts/s21/re-overprov.md 1.1),
+/// which on a VEK volume stores class 6 as class C without
+/// PROT_CLASS_EXPLICIT and needs no per-file key (K 0x66f44b0 takes the
+/// VEK); the Secure Enclave's lock-state answer for the class
+/// (K 0x669caec, device-only) must allow it, as the restore's success
+/// says it does; then the create as [`create`] makes it, the group the
+/// parent's. Class 4 stays class D with PROT_CLASS_EXPLICIT (internal
+/// 0x8; drafts/s23/re-uml-data.md 2.1): its per-file key comes with its
+/// data stream. Only classes 4 and 6 on a volume with a VEK are
+/// implemented. The new inode's number.
+pub fn create_protected(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str, mode: u16, uid: u32, class: u32, now: &mut dyn FnMut() -> u64) -> Result<u64, String> {
+    check_names(nx, vol)?;
+    let (sb, _) = nx.vol_sb_read(vol)?;
+    let role = u16::from_le_bytes([sb[SB_ROLE], sb[SB_ROLE + 1]]);
+    if vol_crypto(sb) != 3 || u64a(sb, SB_INCOMPAT) & 0x100 != 0 {
+        return Err("not implemented: an explicit protection class on a volume without a VEK (setup_prot_class's other branches, the per-file key path)".into());
+    }
+    // On Data, the only document-identifier upkeep of a create is the
+    // tombstone transfer (K 0x66a3a38) for a thread holding a tombstone of
+    // the name: none for the restore.
+    if role != 0x40 {
+        return Err(format!("not implemented: a protected create on a volume of role {role:#x}"));
+    }
+    let (stored, extra) = match class {
+        6 => (DEFAULT_CP_CLASS, 0),
+        4 => (4, 0x8),
+        _ => return Err(format!("not implemented: a create with explicit class {class} on a VEK volume")),
+    };
+    if get_rec(nx, vol, &drec_key(parent, name))?.is_some() {
+        return Err(format!("{name} exists (EEXIST)"));
+    }
+    let pv = get_rec(nx, vol, &inode_key(parent))?.ok_or_else(|| format!("no inode {parent:#x}"))?;
+    let pi = Inode(pv);
+    if u16::from_le_bytes([pi.0[0x50], pi.0[0x51]]) & S_IFMT != S_IFDIR {
+        return Err(format!("{parent:#x} is not a directory"));
+    }
+    if pi.internal_flags() & INHERIT_EXTRA != 0 {
+        return Err(format!("not implemented: a file inheriting internal flags {:#x}", pi.internal_flags() & INHERIT_EXTRA));
+    }
+    if parent == PRIV_DIR_INO {
+        return Err("a create in the private directory (EACCES)".into());
+    }
+    let gid = u32::from_le_bytes(pi.0[0x4c..0x50].try_into().unwrap());
+    fs_tx_enter(nx, vol)?;
+    let ino = {
+        let sb = nx.vol_sb(vol)?;
+        let ino = u64a(sb, SB_NEXT_OBJ_ID);
+        sb.put64(SB_NEXT_OBJ_ID, ino + 1);
+        ino
+    };
+    obj_create_name(nx, vol, parent, &pi, name, S_IFREG | (mode & 0o7777), uid, gid, ino, stored, extra, now)?;
+    let sb = nx.vol_sb(vol)?;
+    let n = u64a(sb, SB_NUM_FILES);
+    sb.put64(SB_NUM_FILES, n + 1);
+    fs_tx_leave(nx, vol, now)?;
+    Ok(ino)
+}
+
+/// `fcntl(F_PREALLOCATE)` {CONTIG | ALL | PERSIST, F_PEOFPOSMODE, 0, `len`}
+/// on an empty regular file of a VEK volume with unwritten extents
+/// (incompat 0x80) by a process entitled to `allocate_contig`
+/// (apfs_vnop_allocate K 0x669a348 with VNOP flags 0x1f →
+/// preallocate_inline K 0x669cef0 with 0xe5; drafts/s21/re-overprov.md
+/// 2.2-2.4): in one file-system transaction the data stream made (its
+/// default crypto identifier 4, the VEK's, K 0x66f44b0), then alloc_space
+/// (K 0x6707764): the free-space floor, one contiguous non-partial data
+/// allocation, the volume's counts, one unwritten file extent whose crypto
+/// field is its physical block (FEXT_CRYPTO_ID_IS_TWEAK | unwritten, K
+/// 0x6700a08), its block references; the stream's allocated size, the
+/// inode's PERSIST flag 0x8000000, its modification and change times from
+/// one clock reading. The bytes allocated, or ENOSPC.
+fn preallocate_contig_persist(nx: &mut Nx<'_>, vol: usize, ino: u64, len: u64, now: &mut dyn FnMut() -> u64) -> Result<Result<u64, i32>, String> {
+    const INODE_PREALLOCATED_PERSIST: u64 = 0x800_0000;
+    const FEXT_CRYPTO_ID_IS_TWEAK: u64 = 1;
+    const FEXT_UNWRITTEN: u64 = 2;
+    const CRYPTO_VEK: u64 = 4;
+    let bs = nx.l.bs;
+    {
+        let (sb, _) = nx.vol_sb_read(vol)?;
+        if u64a(sb, SB_INCOMPAT) & 0x80 == 0 || vol_crypto(sb) != 3 {
+            return Err("not implemented: a contiguous preallocation on a volume without unwritten extents or a VEK".into());
+        }
+        let quota = u64a(sb, 0x50);
+        if quota != 0 || u64a(sb, 0x48) != 0 {
+            return Err("not implemented: a contiguous preallocation on a volume with a quota or reserve".into());
+        }
+    }
+    let v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
+    if u16::from_le_bytes([v[INO_MODE], v[INO_MODE + 1]]) & S_IFMT != S_IFREG || dstream_of(&v)?.is_some() {
+        return Err("not implemented: preallocating other than an empty regular file with no data stream".into());
+    }
+    if u64a(&v, INO_INTERNAL_FLAGS) & (INODE_PURGEABLE | 0x8 | 0x10 | 0x2) != 0 || u32::from_le_bytes(v[0x3c..0x40].try_into().unwrap()) != DEFAULT_CP_CLASS {
+        return Err("not implemented: preallocating a file of another class, explicit class or internal flags".into());
+    }
+    if u32::from_le_bytes(v[0x44..0x48].try_into().unwrap()) & 0x4000_0020 == 0x4000_0020 {
+        return Err("not implemented: a data stream of its own identifier (bsd_flags 0x40000020, K 0x66fb37c)".into());
+    }
+    if len == 0 || len % bs != 0 {
+        return Err("not implemented: a contiguous preallocation not a whole number of blocks".into());
+    }
+    let blocks = len / bs;
+    // preflight (K 0x669d2c4): the reservation counter and the space check
+    // with blocks / 50 + 3 metadata blocks; the allocation's own checks
+    // follow in alloc_data_contig.
+    fs_tx_enter(nx, vol)?;
+    let oid = u64a(&v, 0x08);
+    let mut x = xfields(&v)?;
+    let mut ds = vec![0u8; 0x28];
+    ds.put64(0x10, CRYPTO_VEK);
+    x.push((INO_EXT_TYPE_DSTREAM, XF_SYSTEM_FIELD, ds));
+    put_rec(nx, vol, &(oid | J_DSTREAM_ID << 60).to_le_bytes(), &1u32.to_le_bytes())?;
+    // The free-space floor (K 0x6707d1c..0x6707d70, the statistics of K
+    // 0x67515e4): ENOSPC unless what stays free is at least a hundredth of
+    // the blocks or 20 MiB, the smaller. Whether the free count the
+    // statistics give is less the other volumes' reserves is not
+    // transcribed: only an answer both ways give is taken.
+    let (free, held, total) = nx.space_counts();
+    let floor = (total / 100).min(0x140_0000 / bs);
+    let fits = |free: u64| free >= blocks && free - blocks >= floor;
+    if fits(free) != fits(free.saturating_sub(held)) {
+        return Err("not implemented: the free-space floor where the volumes' reserves decide it (K 0x67515e4's free count)".into());
+    }
+    if !fits(free) {
+        return Ok(Err(28));
+    }
+    let p = match nx.alloc_data_contig(blocks)? {
+        Ok(p) => p,
+        Err(e) => return Ok(Err(e)),
+    };
+    blocks_alloced(nx, vol, blocks)?;
+    let mut fv = (len | (FEXT_CRYPTO_ID_IS_TWEAK | FEXT_UNWRITTEN) << 56).to_le_bytes().to_vec();
+    fv.extend_from_slice(&p.to_le_bytes());
+    fv.extend_from_slice(&p.to_le_bytes());
+    put_rec(nx, vol, &fext_key(oid, 0), &fv)?;
+    phys_extent_add(nx, vol, p, blocks, oid)?;
+    let d = x.iter_mut().find(|f| f.0 == INO_EXT_TYPE_DSTREAM).unwrap();
+    d.2.put64(8, len);
+    let t = now();
+    let mut v = with_xfields(&v, &x);
+    let f = u64a(&v, INO_INTERNAL_FLAGS);
+    v.put64(INO_INTERNAL_FLAGS, f | INODE_PREALLOCATED_PERSIST);
+    v.put64(INO_MOD_TIME, t);
+    v.put64(INO_CHANGE_TIME, t);
+    put_rec(nx, vol, &inode_key(ino), &v)?;
+    fs_tx_leave(nx, vol, now)?;
+    Ok(Ok(len))
+}
+
+/// The two blobs AppleKeyStore's file-system key services write into a
+/// new per-file key's crypto-state record (`fn + 0x50`, each at most 0x80
+/// bytes; their lengths go in `key_len`): device-only, KEYS_STAND_IN.
+pub const PER_FILE_KEY_STAND_IN: &str = "the wrapped per-file keys of class-D files on Data (device-only: the two blobs AppleKeyStore's file-system key services return for a new file key, each at most 0x80 bytes) (stand-in: two blobs of 0x28 bytes, \"KEY-STAND-IN\" repeated; measure a class-D file's crypto-state record on the device)";
+
+const J_CRYPTO_STATE: u64 = 7;
+const INO_EXT_TYPE_PREV_FSIZE: u8 = 5;
+
+/// What a small first write leaves pending in memory (the file's times,
+/// the stream's bytes written) for its `fsync` to write.
+pub struct PendingWrite {
+    ino: u64,
+    len: u64,
+    paddr: u64,
+    data: Vec<u8>,
+    times: u64,
+}
+
+/// The first `write(2)` of `data` (under one block) at offset 0 into an
+/// empty class-D file with PROT_CLASS_EXPLICIT on a VEK volume
+/// (apfs_vnop_write K 0x6691308, prepare_write_and_lock K 0x66a4024;
+/// drafts/s23/re-uml-data.md 3): in one file-system transaction the data
+/// stream made (its identifier the inode's) with the per-file key's
+/// crypto-state record (K 0x66f441c's per-file path: the crypto identifier
+/// is the stream's; K 0x6734154 fills the record with AppleKeyStore's
+/// blobs, PER_FILE_KEY_STAND_IN; K 0x66f4e3c inserts it), its
+/// `j_dstream_id`, one block from the allocation zone (alloc_space flags
+/// 8) whose file extent counts the record a second reference (K
+/// 0x66f8ad8), the block references, then the stream's size and allocated
+/// size, a PREV_FSIZE field of the old size 0, the write generation and
+/// the inode. The modification and change times (one more reading) and the
+/// bytes written stay in memory until the `fsync` ([`fsync_pending`]); the
+/// data reaches the block then.
+pub fn write_new_protected(nx: &mut Nx<'_>, vol: usize, ino: u64, data: &[u8], now: &mut dyn FnMut() -> u64) -> Result<PendingWrite, String> {
+    let bs = nx.l.bs;
+    if data.is_empty() || data.len() as u64 >= bs {
+        return Err(format!("not implemented: a first write of {} bytes (only one under a block is traced)", data.len()));
+    }
+    let key_os_version = {
+        let (sb, _) = nx.vol_sb_read(vol)?;
+        if vol_crypto(sb) != 3 || u64a(sb, SB_INCOMPAT) & 0x100 != 0 {
+            return Err("not implemented: a per-file key on a volume without a VEK".into());
+        }
+        u32::from_le_bytes(sb[0x6c..0x70].try_into().unwrap())
+    };
+    let v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
+    if u16::from_le_bytes([v[INO_MODE], v[INO_MODE + 1]]) & S_IFMT != S_IFREG || dstream_of(&v)?.is_some() {
+        return Err("not implemented: a first write into other than an empty regular file".into());
+    }
+    if u32::from_le_bytes(v[0x3c..0x40].try_into().unwrap()) != 4 || u64a(&v, INO_INTERNAL_FLAGS) & 0x8 == 0 || u64a(&v, INO_INTERNAL_FLAGS) & 0x410 != 0 {
+        return Err("not implemented: a first write into a file other than an explicit class-D one".into());
+    }
+    if u32::from_le_bytes(v[0x44..0x48].try_into().unwrap()) & 0x4000_0020 == 0x4000_0020 {
+        return Err("not implemented: a data stream of its own identifier (bsd_flags 0x40000020, K 0x66fb37c)".into());
+    }
+    fs_tx_enter(nx, vol)?;
+    let oid = u64a(&v, 0x08);
+    // The crypto-state record (K 0x6734490/K 0x6734154): one reference,
+    // version 6.0, no flags, class 4 (kind 3, K 0x67072f4), the OS version,
+    // revision 0, the blobs' lengths, the blobs.
+    let blob = |n: usize| -> Vec<u8> { b"KEY-STAND-IN".iter().copied().cycle().take(n).collect() };
+    let (b1, b2) = (blob(0x28), blob(0x28));
+    let mut cs = 1u32.to_le_bytes().to_vec();
+    cs.extend_from_slice(&6u16.to_le_bytes());
+    cs.extend_from_slice(&0u16.to_le_bytes());
+    cs.extend_from_slice(&0u32.to_le_bytes());
+    cs.extend_from_slice(&4u32.to_le_bytes());
+    cs.extend_from_slice(&key_os_version.to_le_bytes());
+    cs.extend_from_slice(&0u16.to_le_bytes());
+    cs.extend_from_slice(&(b1.len() as u16 | (b2.len() as u16) << 8).to_le_bytes());
+    cs.extend_from_slice(&b1);
+    cs.extend_from_slice(&b2);
+    let ck = (oid | J_CRYPTO_STATE << 60).to_le_bytes();
+    put_rec(nx, vol, &ck, &cs)?;
+    put_rec(nx, vol, &(oid | J_DSTREAM_ID << 60).to_le_bytes(), &1u32.to_le_bytes())?;
+    let (p, got) = nx.alloc_data(1)?;
+    if got != 1 {
+        return Err("a one-block data allocation given no block".into());
+    }
+    blocks_alloced(nx, vol, 1)?;
+    cs.put32(0, 2);
+    put_rec(nx, vol, &ck, &cs)?;
+    let mut fv = bs.to_le_bytes().to_vec();
+    fv.extend_from_slice(&p.to_le_bytes());
+    fv.extend_from_slice(&oid.to_le_bytes());
+    put_rec(nx, vol, &fext_key(oid, 0), &fv)?;
+    phys_extent_add(nx, vol, p, 1, oid)?;
+    let mut x = xfields(&v)?;
+    let mut ds = vec![0u8; 0x28];
+    ds.put64(0, data.len() as u64);
+    ds.put64(8, bs);
+    ds.put64(0x10, oid);
+    x.push((INO_EXT_TYPE_DSTREAM, XF_SYSTEM_FIELD, ds));
+    x.push((INO_EXT_TYPE_PREV_FSIZE, 0, vec![0u8; 8]));
+    let mut v = with_xfields(&v, &x);
+    let wgc = u32::from_le_bytes(v[INO_WRITE_GEN..INO_WRITE_GEN + 4].try_into().unwrap());
+    v.put32(INO_WRITE_GEN, wgc.wrapping_add(1));
+    put_rec(nx, vol, &inode_key(ino), &v)?;
+    fs_tx_leave(nx, vol, now)?;
+    let times = now();
+    Ok(PendingWrite { ino, len: data.len() as u64, paddr: p, data: data.to_vec(), times })
+}
+
+/// `fsync(2)` after [`write_new_protected`] (apfs_vnop_fsync K 0x669176c →
+/// apfs_fsync_internal K 0x66a12e4; drafts/s23/re-uml-data.md 4): the
+/// data block written (the bytes, then zeros to the block's end: the
+/// plaintext the per-file key encrypts, KEYS_STAND_IN), then the
+/// PREV_FSIZE field removed in a file-system transaction (K 0x6766d4c)
+/// whose inode write carries the pending modification and change times
+/// and the bytes written. No commit.
+pub fn fsync_pending(nx: &mut Nx<'_>, vol: usize, w: &PendingWrite, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    let bs = nx.l.bs as usize;
+    let mut b = w.data.clone();
+    b.resize(bs, 0);
+    nx.write_data(w.paddr, &b)?;
+    fs_tx_enter(nx, vol)?;
+    let v = get_rec(nx, vol, &inode_key(w.ino))?.ok_or("the written file has no inode")?;
+    let x: Vec<(u8, u8, Vec<u8>)> = xfields(&v)?
+        .into_iter()
+        .filter(|f| f.0 != INO_EXT_TYPE_PREV_FSIZE)
+        .map(|(t, fl, mut d)| {
+            if t == INO_EXT_TYPE_DSTREAM {
+                d.put64(0x18, w.len);
+            }
+            (t, fl, d)
+        })
+        .collect();
+    let mut v = with_xfields(&v, &x);
+    v.put64(INO_MOD_TIME, w.times);
+    v.put64(INO_CHANGE_TIME, w.times);
+    put_rec(nx, vol, &inode_key(w.ino), &v)?;
+    fs_tx_leave(nx, vol, now)
+}
+
+/// The times a rename leaves in memory: the file's change time and its
+/// directory's modification and change times (one reading each).
+pub struct RenameTimes {
+    pub file: (u64, u64),
+    pub dir: (u64, u64),
+}
+
+/// `rename(2)` of regular file `ino` (one link) from `from` to `to` in
+/// directory `dir`, no file named `to` there (apfs_vnop_renamex K
+/// 0x6692440 with no flags; drafts/s23/re-uml-data.md 5.1): in one
+/// file-system transaction the old record removed and the new one
+/// inserted (its date added and flags the old one's), the inode's
+/// name field and the directory's write generation rewritten, no time
+/// changed; after it the file's change time and the directory's times
+/// are read into memory only (returned; the directory's are also kept in
+/// `nx.jobj_times`, for its next rewrite or a sync pass to write).
+pub fn rename_in_dir(nx: &mut Nx<'_>, vol: usize, dir: u64, from: &str, to: &str, ino: u64, now: &mut dyn FnMut() -> u64) -> Result<RenameTimes, String> {
+    check_names(nx, vol)?;
+    let (sb, _) = nx.vol_sb_read(vol)?;
+    if u16::from_le_bytes([sb[SB_ROLE], sb[SB_ROLE + 1]]) != 0x40 || u64a(sb, SB_INCOMPAT) & 0x100 != 0 {
+        return Err("not implemented: a rename on other than Data (its document-identifier and secondary-tree rules)".into());
+    }
+    if to.is_empty() || to.len() > 255 || to.contains('/') {
+        return Err(format!("not implemented: the name checks for {to:?}"));
+    }
+    let fk = drec_key(dir, from);
+    let fdv = get_rec(nx, vol, &fk)?.ok_or("the file to rename is not there (ENOENT)")?;
+    if u64a(&fdv, 0) != ino {
+        return Err("the entry names another inode".into());
+    }
+    let tk = drec_key(dir, to);
+    if get_rec(nx, vol, &tk)?.is_some() {
+        return Err("not implemented: a rename onto an existing name".into());
+    }
+    let f = get_rec(nx, vol, &inode_key(ino))?.ok_or("the file has no inode")?;
+    if u16::from_le_bytes([f[INO_MODE], f[INO_MODE + 1]]) & S_IFMT != S_IFREG || u32::from_le_bytes(f[INO_NCHILDREN..INO_NCHILDREN + 4].try_into().unwrap()) != 1 || u32::from_le_bytes(f[0x44..0x48].try_into().unwrap()) & 0x40 != 0 {
+        return Err("not implemented: renaming other than a regular file of one link and no UF_TRACKED".into());
+    }
+    if fdv.len() != 0x12 {
+        return Err("not implemented: a directory record with extended fields (SIBLING_ID)".into());
+    }
+    let mut d = get_rec(nx, vol, &inode_key(dir))?.ok_or("the directory has no inode")?;
+    if u64a(&d, INO_INTERNAL_FLAGS) & INODE_MAINTAIN_DIR_STATS != 0 {
+        return Err("not implemented: a rename in a directory keeping statistics".into());
+    }
+    fs_tx_enter(nx, vol)?;
+    let g = u32::from_le_bytes(d[INO_WRITE_GEN..INO_WRITE_GEN + 4].try_into().unwrap());
+    d.put32(INO_WRITE_GEN, g.wrapping_add(1));
+    remove_rec(nx, vol, &fk)?;
+    put_rec(nx, vol, &tk, &fdv)?;
+    let mut name = to.as_bytes().to_vec();
+    name.push(0);
+    let x: Vec<(u8, u8, Vec<u8>)> = xfields(&f)?.into_iter().map(|(t, fl, dd)| if t == 4 { (t, fl, name.clone()) } else { (t, fl, dd) }).collect();
+    let mut f = with_xfields(&f, &x);
+    f.put64(0, dir);
+    put_rec(nx, vol, &inode_key(ino), &f)?;
+    put_rec(nx, vol, &inode_key(dir), &d)?;
+    fs_tx_leave(nx, vol, now)?;
+    // After the transaction (K 0x6693700, K 0x6693720): the file's change
+    // time, then K 0x66f3750 on the directory, each with the times-dirty
+    // bit.
+    let fc = now();
+    let dt = now();
+    nx.jobj_times.insert((vol, dir), (dt, dt));
+    Ok(RenameTimes { file: (u64a(&f, INO_MOD_TIME), fc), dir: (dt, dt) })
+}
+
+/// `fcntl(F_BARRIERFSYNC)` (apfs_vnop_ioctl 0x55 → K 0x66d6230): the
+/// file's pending times written in a file-system transaction (K
+/// 0x66a1878: `times` its modification and change times), then
+/// `tx_finish(nx, 1)`: the container transaction closed and committed.
+pub fn barrier_fsync(nx: &mut Nx<'_>, vol: usize, ino: u64, times: (u64, u64), now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    fs_tx_enter(nx, vol)?;
+    let mut v = get_rec(nx, vol, &inode_key(ino))?.ok_or("the file has no inode")?;
+    v.put64(INO_MOD_TIME, times.0);
+    v.put64(INO_CHANGE_TIME, times.1);
+    put_rec(nx, vol, &inode_key(ino), &v)?;
+    fs_tx_leave(nx, vol, now)?;
+    nx.tx_finish()
+}
+
+/// `fcntl(F_TRIM_ACTIVE_FILE)` over a whole file (K 0x66e882c, the device
+/// answering DK_FEATURE_UNMAP): in its own file-system transaction the
+/// inode's INODE_ACTIVE_FILE_TRIMMED (0x800), rewritten with no time
+/// change; then the device told to unmap the file's extents (DKIOCUNMAP:
+/// what the device then reads back for them is its own; nothing here
+/// writes them).
+fn trim_active_file(nx: &mut Nx<'_>, vol: usize, ino: u64, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    fs_tx_enter(nx, vol)?;
+    let mut v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
+    let f = u64a(&v, INO_INTERNAL_FLAGS);
+    v.put64(INO_INTERNAL_FLAGS, f | 0x800);
+    put_rec(nx, vol, &inode_key(ino), &v)?;
+    fs_tx_leave(nx, vol, now)
+}
+
 /// The data blocks a file's allocated-but-unwritten range has, zero-filled
 /// by the close after a size grown into a preallocation (VNOP_CLOSE's
 /// `VNOP_FSYNC` → apfs_flush_allocated_unwritten_ranges K 0x66a1a98:
@@ -710,34 +1499,62 @@ pub fn close_after_grow(nx: &mut Nx<'_>, vol: usize, ino: u64) -> Result<(), Str
     Ok(())
 }
 
+/// How XNU's cluster layer pushes a new file's data written by one
+/// `write(2)` of `n` bytes from offset 0: the block maps it asks for, in
+/// order (byte offset and length, block multiples ending at the file's
+/// allocated end), and how many of them the write's own write-behind pushes
+/// before its end (the rest the close's fsync pushes).
+pub struct Pushes {
+    pub maps: Vec<(u64, u64)>,
+    pub before_end: usize,
+}
+
 /// `open_dprotected_np(O_WRONLY | O_CREAT | O_TRUNC, class -1 (the
-/// default: no class passed), 0, mode)` of a new file `name` in `parent`,
-/// one `write` of `data` (shorter than a block) at offset 0, and `close`
-/// (drafts/s21/re-gigalocker.md D): the file made as [`create`] makes it
-/// (O_TRUNC does nothing to a file the open made); the write's
-/// transaction (prepare_write_and_lock K 0x66a4024) makes the data stream,
-/// allocates its block at once (a first write under 0x20000 bytes, alloc
-/// flags 8: one block from the 1-block allocation zone), counts it, adds
-/// the file extent and its block reference, sets the size, adds a
-/// PREV_FSIZE field holding the old size 0 and raises the write
-/// generation; the write's end reads the clock for the modification and
-/// change times and counts the bytes written, in memory; the close's fsync
-/// writes the block (the data, zeros after it), removes the PREV_FSIZE
-/// field and writes the inode in its own transaction (K 0x6766d4c). The
-/// file's inode number.
-pub fn write_new_file(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str, mode: u16, data: &[u8], now: &mut dyn FnMut() -> u64) -> Result<u64, String> {
-    const INO_EXT_TYPE_PREV_FSIZE: u8 = 5;
+/// default: no class passed), 0, mode)` (or `open` with the same flags) of
+/// a new file `name` in `parent` of an unencrypted volume, one `write` of
+/// all of `data` at offset 0, and `close` (drafts/s21/re-gigalocker.md D,
+/// drafts/s23/re-kernelcache.md 4): the file made as [`create`] makes it
+/// (O_TRUNC does nothing to a file the open made). The write's
+/// transaction (prepare_write_and_lock K 0x66a4024) makes the data stream
+/// and takes one of two paths (K 0x66a4410..0x66a4478):
+/// - direct, for a length not a block multiple and under 0x20000: the
+///   blocks allocated at once (alloc_space flags 8: requests for what is
+///   left until the space manager has granted it all), each piece counted,
+///   its file extent (extending the one before it when physically
+///   contiguous) and block references; the size, a PREV_FSIZE field of the
+///   old size 0, the write generation; the close's push writes the blocks
+///   with no transaction;
+/// - deferred, otherwise: one sparse extent over the allocated size, the
+///   SPARSE_BYTES field and INODE_IS_SPARSE (alloc_space flags 0x10), the
+///   size, PREV_FSIZE, the write generation; the blocks are allocated by
+///   the block maps `pushes` gives ([`blockmap_fill`]), those after the
+///   write's end carrying its times and bytes written.
+/// The write's end reads the clock for the modification and change times
+/// and counts the bytes written, in memory; the close's fsync removes the
+/// PREV_FSIZE field in its own transaction (K 0x6766d4c) whose inode write
+/// carries them. The file's inode number.
+pub fn write_new_file(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str, mode: u16, data: &[u8], pushes: &dyn Fn(u64) -> Result<Pushes, String>, now: &mut dyn FnMut() -> u64) -> Result<u64, String> {
     let bs = nx.l.bs;
-    if data.is_empty() || data.len() as u64 >= bs {
-        return Err(format!("not implemented: a first write of {} bytes (only one under a block is traced)", data.len()));
+    let n = data.len() as u64;
+    if n == 0 {
+        return Err("not implemented: an empty write".into());
     }
     {
         let sb = nx.vol_sb(vol)?;
         if u64a(sb, 0x108) & 1 == 0 || u64a(sb, SB_INCOMPAT) & 0x80 != 0 {
             return Err("not implemented: a file write on an encrypted volume or one with unwritten extents".into());
         }
+        // The volume's low-space state (fs + 0x3ac, set below the
+        // thresholds at fs + 0x3b0..0x3bc) can force the direct path; its
+        // thresholds are not transcribed, so only a volume without a quota
+        // is taken.
+        if u64a(sb, 0x50) != 0 && (n % bs == 0 || n >= 0x20000) {
+            return Err("not implemented: a deferred write on a volume with a quota (the low-space state at fs + 0x3ac)".into());
+        }
     }
     let ino = create(nx, vol, parent, name, mode, 0, 0, now)?.map_err(|e| format!("creating {name}: errno {e}"))?;
+    let blocks = n.div_ceil(bs);
+    let direct = n % bs != 0 && n < 0x20000;
     // The write's transaction.
     fs_tx_enter(nx, vol)?;
     let v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
@@ -745,17 +1562,34 @@ pub fn write_new_file(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str, mode
     let mut x = xfields(&v)?;
     x.push((INO_EXT_TYPE_DSTREAM, XF_SYSTEM_FIELD, vec![0u8; 0x28]));
     put_rec(nx, vol, &(oid | J_DSTREAM_ID << 60).to_le_bytes(), &1u32.to_le_bytes())?;
-    let (a, got) = nx.alloc_data(1)?;
-    if got != 1 {
-        return Err("a one-block data allocation given no block".into());
+    let mut v = v;
+    let mut extents: Vec<(u64, u64, u64)> = Vec::new();
+    if direct {
+        let mut done = 0u64;
+        while done < blocks {
+            let (a, got) = nx.alloc_data(blocks - done)?;
+            blocks_alloced(nx, vol, got)?;
+            match extents.last_mut() {
+                Some((l, len, p)) if *p + *len / bs == a => {
+                    *len += got * bs;
+                    put_rec(nx, vol, &fext_key(oid, *l), &fext_val(*len, *p))?;
+                }
+                _ => {
+                    put_rec(nx, vol, &fext_key(oid, done * bs), &fext_val(got * bs, a))?;
+                    extents.push((done * bs, got * bs, a));
+                }
+            }
+            phys_extent_add(nx, vol, a, got, oid)?;
+            done += got;
+        }
+    } else {
+        put_rec(nx, vol, &fext_key(oid, 0), &fext_val(blocks * bs, 0))?;
+        sparse_bytes(&mut v, &mut x, (blocks * bs) as i64)?;
     }
-    blocks_alloced(nx, vol, 1)?;
-    put_rec(nx, vol, &fext_key(oid, 0), &fext_val(bs, a))?;
-    phys_extent_add(nx, vol, a, 1, oid)?;
     {
         let d = x.iter_mut().find(|f| f.0 == INO_EXT_TYPE_DSTREAM).unwrap();
-        d.2.put64(0, data.len() as u64);
-        d.2.put64(8, bs);
+        d.2.put64(0, n);
+        d.2.put64(8, blocks * bs);
     }
     x.push((INO_EXT_TYPE_PREV_FSIZE, 0, 0u64.to_le_bytes().to_vec()));
     let mut v = with_xfields(&v, &x);
@@ -763,18 +1597,42 @@ pub fn write_new_file(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str, mode
     v.put32(INO_WRITE_GEN, wgc.wrapping_add(1));
     put_rec(nx, vol, &inode_key(ino), &v)?;
     fs_tx_leave(nx, vol, now)?;
-    // The write's end (K 0x66a5c80): the times and the bytes written, in
-    // memory.
-    let t_w = now();
-    // The close: the block written, then the PREV_FSIZE field's removal.
-    let mut block = data.to_vec();
-    block.resize(bs as usize, 0);
-    nx.write_data(a, &block)?;
+    // The data as the pages hold it: the bytes, zeros to the block's end.
+    let mut padded = data.to_vec();
+    padded.resize((blocks * bs) as usize, 0);
+    let t_w = if direct {
+        // The write's end (K 0x66a5c80): the times and the bytes written,
+        // in memory; the close's push writes the blocks.
+        let t_w = now();
+        for &(l, len, p) in &extents {
+            nx.write_data(p, &padded[l as usize..(l + len) as usize])?;
+        }
+        t_w
+    } else {
+        let plan = pushes(n)?;
+        let mut t_w = None;
+        for (k, &(off, len)) in plan.maps.iter().enumerate() {
+            if k == plan.before_end {
+                t_w = Some(now());
+            }
+            blockmap_fill(nx, vol, ino, off, &padded[off as usize..(off + len) as usize], t_w.map(|t| (t, n)), now)?;
+        }
+        match t_w {
+            Some(t) => t,
+            None => now(),
+        }
+    };
+    // The close: the PREV_FSIZE field's removal.
     fs_tx_enter(nx, vol)?;
+    let v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
+    let mut x = xfields(&v)?;
+    if x.iter().any(|f| f.0 == INO_EXT_TYPE_SPARSE_BYTES) {
+        return Err("the block maps left the file sparse".into());
+    }
     x.retain(|f| f.0 != INO_EXT_TYPE_PREV_FSIZE);
     {
         let d = x.iter_mut().find(|f| f.0 == INO_EXT_TYPE_DSTREAM).unwrap();
-        d.2.put64(0x18, data.len() as u64);
+        d.2.put64(0x18, n);
     }
     let mut v = with_xfields(&v, &x);
     v.put64(INO_MOD_TIME, t_w);
@@ -861,13 +1719,44 @@ pub fn chown(nx: &mut Nx<'_>, vol: usize, ino: u64, uid: u32, gid: u32, now: &mu
     fs_tx_leave(nx, vol, now)
 }
 
-/// The unmount of a read-write volume (apfs_vfsop_unmount K 0x66c8214):
-/// XNU's sync commits the container's transaction (`tx_finish`); then, in
-/// the next transaction, which stays open, the kernel's `apfs_modified_by`
-/// entry (an existing one of the same name moves to the front, else the
-/// entries shift and the oldest goes), the clone transaction, and the
-/// unmount time.
-pub fn unmount(nx: &mut Nx<'_>, vol: usize, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+/// The unmount of a read-write volume, `forced` (MNT_FORCE) or not:
+/// without it XNU's VFS_SYNC first writes the times the volume's inodes
+/// hold in memory and commits the container's transaction (`tx_finish`);
+/// with it, inodes holding unwritten times are refused (their reclaim is
+/// not transcribed); apfs_vfsop_unmount (K 0x66c8214) stops the volume's
+/// pfkur thread (K 0x66b0ffc at K 0x66c8988), which removes its temporary
+/// inode ([`free_tmp_ino`]), and commits (`tx_finish(0x11)` at K
+/// 0x66c8ef8); then, in the next transaction, which stays open, the
+/// kernel's `apfs_modified_by` entry (an existing one of the same name
+/// moves to the front, else the entries shift and the oldest goes), the
+/// clone transaction, and the unmount time.
+pub fn unmount(nx: &mut Nx<'_>, vol: usize, forced: bool, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    let pending: Vec<u64> = nx.jobj_times.keys().filter(|k| k.0 == vol).map(|k| k.1).collect();
+    if forced && !pending.is_empty() {
+        return Err(format!("not implemented: a forced unmount reclaiming vnodes whose in-memory times are unwritten (inodes {pending:#x?}; apfs_vnop_reclaim not transcribed)"));
+    }
+    if !forced {
+        // apfs_vfsop_sync (K 0x66c9d80): the vnode pass first (K 0x66d1748
+        // → apfs_fsync_internal, whose times write for an inode with only
+        // its times dirty is one file-system transaction rewriting it, K
+        // 0x66a1878), then tx_finish.
+        if pending.len() > 1 {
+            return Err("not implemented: the sync pass's vnode order (vnode_iterate over the mount's list) for more than one inode with unwritten times".into());
+        }
+        for ino in pending {
+            let (m, c) = nx.jobj_times.remove(&(vol, ino)).unwrap();
+            fs_tx_enter(nx, vol)?;
+            let mut v = inode(nx, vol, ino)?;
+            v.put64(INO_MOD_TIME, m);
+            v.put64(INO_CHANGE_TIME, c);
+            put_rec(nx, vol, &inode_key(ino), &v)?;
+            fs_tx_leave(nx, vol, now)?;
+        }
+        nx.commit()?;
+    }
+    if let Some(ino) = nx.pfkur_tmp.remove(&vol) {
+        free_tmp_ino(nx, vol, ino, now)?;
+    }
     nx.commit()?;
     nx.begin()?;
     let xid = nx.xid;
@@ -891,6 +1780,285 @@ pub fn unmount(nx: &mut Nx<'_>, vol: usize, now: &mut dyn FnMut() -> u64) -> Res
     sb.put64(SB_UNMOUNT_TIME, t);
     sb.put64(SB_LAST_XID, xid);
     Ok(())
+}
+
+/// The attributes a `setattr` sets (XNU's `vnode_attr` as chmodx_np,
+/// fchown, lchown and fsetattrlist fill it): owner, group, mode bits,
+/// modification and access times.
+#[derive(Default, Clone, Copy)]
+pub struct SetAttr {
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub mode: Option<u16>,
+    pub mtime: Option<u64>,
+    pub atime: Option<u64>,
+}
+
+/// The roles whose file operations here are transcribed: Update's and the
+/// others' unencrypted ones, Data's, User's (crypto mode 1).
+fn check_setattr_volume(nx: &mut Nx<'_>, vol: usize) -> Result<(), String> {
+    check_names(nx, vol)?;
+    let (sb, _) = nx.vol_sb_read(vol)?;
+    let role = u16::from_le_bytes([sb[SB_ROLE], sb[SB_ROLE + 1]]);
+    if (role == 0 || role == 0x240) || (role == 2 && vol_crypto(sb) != 1) {
+        return Err(format!("not implemented: setattr on a volume of role {role:#x}"));
+    }
+    Ok(())
+}
+
+/// `setattr` of `a` on `ino` (apfs_vnop_setattr K 0x668e4a0's general
+/// path, drafts/s23/re-user-copy.md 2.4): nothing to set writes nothing; a
+/// mode alone and unchanged takes the fast path (the change time in memory
+/// only: every one here is overwritten by the next write, so it is not
+/// kept); else in one file-system transaction owner and group (counted
+/// even when unchanged), the mode bits, the access time (not counted), the
+/// modification time (and the creation time lowered to it when later),
+/// the change time read when anything counted, the inode rewritten.
+pub fn setattr(nx: &mut Nx<'_>, vol: usize, ino: u64, a: SetAttr, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    check_setattr_volume(nx, vol)?;
+    if a.uid.is_none() && a.gid.is_none() && a.mode.is_none() && a.mtime.is_none() && a.atime.is_none() {
+        return Ok(());
+    }
+    let mut v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
+    let cur = u16::from_le_bytes([v[INO_MODE], v[INO_MODE + 1]]);
+    if a.uid.is_none() && a.gid.is_none() && a.mtime.is_none() && a.atime.is_none() {
+        let m = a.mode.unwrap();
+        if (m ^ cur) & 0o7777 == 0 {
+            return Ok(());
+        }
+    }
+    if let Some(m) = a.mode {
+        if (m ^ cur) & 0o7777 != 0 && u64a(&v, 0) == ROOT_DIR_INO && name_of(&v)? == "Library" {
+            return Err("not implemented: a mode change of User's /Library (EPERM unless 0755)".into());
+        }
+    }
+    fs_tx_enter(nx, vol)?;
+    let mut n = 0;
+    if let Some(u) = a.uid {
+        v.put32(0x48, u);
+        n += 1;
+    }
+    if let Some(g) = a.gid {
+        v.put32(0x4c, g);
+        n += 1;
+    }
+    if let Some(m) = a.mode {
+        v.put16(INO_MODE, (cur & 0xf000) | (m & 0o7777));
+        n += 1;
+    }
+    if let Some(t) = a.atime {
+        v.put64(0x28, t);
+    }
+    if let Some(t) = a.mtime {
+        v.put64(INO_MOD_TIME, t);
+        n += 1;
+        if t < u64a(&v, 0x10) {
+            v.put64(0x10, t);
+        }
+    }
+    if n != 0 {
+        v.put64(INO_CHANGE_TIME, now());
+    }
+    put_rec(nx, vol, &inode_key(ino), &v)?;
+    fs_tx_leave(nx, vol, now)
+}
+
+/// An inode's name, from its name field.
+fn name_of(v: &[u8]) -> Result<String, String> {
+    let n = xfields(v)?.into_iter().find(|f| f.0 == 4).ok_or("an inode with no name field")?.2;
+    Ok(String::from_utf8_lossy(n.strip_suffix(&[0]).unwrap_or(&n)).into_owned())
+}
+
+/// `ftruncate(fd, 0)` of an empty regular file with no data stream
+/// (apfs_truncate_locked K 0x66a6bbc's equal-size branch; drafts/s23/
+/// re-user-copy.md 2.5): in one file-system transaction the modification
+/// and change times (one reading), the inode rewritten; no data stream.
+pub fn truncate_same(nx: &mut Nx<'_>, vol: usize, ino: u64, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    check_setattr_volume(nx, vol)?;
+    let mut v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
+    if u16::from_le_bytes([v[INO_MODE], v[INO_MODE + 1]]) & S_IFMT != S_IFREG || dstream_of(&v)?.is_some() {
+        return Err("not implemented: a truncate to 0 of other than an empty file with no data stream".into());
+    }
+    fs_tx_enter(nx, vol)?;
+    let t = now();
+    v.put64(INO_MOD_TIME, t);
+    v.put64(INO_CHANGE_TIME, t);
+    put_rec(nx, vol, &inode_key(ino), &v)?;
+    fs_tx_leave(nx, vol, now)
+}
+
+/// `fsetxattr(fd, "com.apple.decmpfs", data, XATTR_SHOWCOMPRESSION)` on a
+/// file not yet compressed (apfs_setxattr_internal K 0x6765cc4; drafts/
+/// s23/re-user-copy.md 2.6): the attribute embedded in its record
+/// (XATTR_DATA_EMBEDDED) in one file-system transaction, the file's change
+/// time read, the inode rewritten.
+pub fn set_decmpfs_xattr(nx: &mut Nx<'_>, vol: usize, ino: u64, data: &[u8], now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    const NAME: &str = "com.apple.decmpfs";
+    check_setattr_volume(nx, vol)?;
+    let mut k = (ino | J_XATTR << 60).to_le_bytes().to_vec();
+    k.extend_from_slice(&(NAME.len() as u16 + 1).to_le_bytes());
+    k.extend_from_slice(NAME.as_bytes());
+    k.push(0);
+    let mut val = 2u16.to_le_bytes().to_vec();
+    val.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    val.extend_from_slice(data);
+    if data.len() + 4 >= 0xedd || k.len() + val.len() > 0xedd {
+        return Err("not implemented: a decmpfs attribute too large to embed (the stream form, K 0x665e120)".into());
+    }
+    let mut v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
+    if u32::from_le_bytes(v[0x44..0x48].try_into().unwrap()) & 0x20 != 0 || get_rec(nx, vol, &k)?.is_some() {
+        return Err("not implemented: setting the decmpfs attribute of a compressed file or over an existing one".into());
+    }
+    fs_tx_enter(nx, vol)?;
+    put_rec(nx, vol, &k, &val)?;
+    v.put64(INO_CHANGE_TIME, now());
+    put_rec(nx, vol, &inode_key(ino), &v)?;
+    fs_tx_leave(nx, vol, now)
+}
+
+/// FSIOC_CAS_BSDFLAGS from `expected` to `new` (handle_cas_bsdflags K
+/// 0x66e0088; drafts/s23/re-user-copy.md 2.7): setting UF_COMPRESSED on a
+/// file with a valid decmpfs attribute first truncates it to its (equal)
+/// size; then, the flags being `expected`, in one file-system transaction
+/// the flags set, the change time read, and for a regular file becoming
+/// compressed the decmpfs header's uncompressed size in j_inode_val +0x54
+/// with INODE_HAS_UNCOMPRESSED_SIZE (0x40000), the inode rewritten.
+pub fn cas_bsdflags(nx: &mut Nx<'_>, vol: usize, ino: u64, expected: u32, new: u32, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    check_setattr_volume(nx, vol)?;
+    let v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
+    let compressing = new & 0x20 != 0 && expected & 0x20 == 0;
+    let mut usize_ = 0;
+    if compressing {
+        let mut k = (ino | J_XATTR << 60).to_le_bytes().to_vec();
+        k.extend_from_slice(&18u16.to_le_bytes());
+        k.extend_from_slice(b"com.apple.decmpfs\0");
+        let x = get_rec(nx, vol, &k)?.ok_or("not implemented: UF_COMPRESSED on a file without a decmpfs attribute")?;
+        let d = &x[4..];
+        if x[0..2] != 2u16.to_le_bytes() || d.len() < 16 || &d[0..4] != b"fpmc" || u32::from_le_bytes(d[4..8].try_into().unwrap()) != 9 {
+            return Err("not implemented: UF_COMPRESSED with a decmpfs attribute other than an embedded type 9".into());
+        }
+        usize_ = u64a(d, 8);
+        truncate_same(nx, vol, ino, now)?;
+    }
+    let mut v = if compressing { get_rec(nx, vol, &inode_key(ino))?.ok_or("no inode")? } else { v };
+    let flags = u32::from_le_bytes(v[0x44..0x48].try_into().unwrap());
+    if flags & 0x3fff_ffff != expected {
+        return Err("not implemented: a flags compare-and-swap that does not match".into());
+    }
+    if (flags ^ new) & !0x20 & 0x3fff_ffff != 0 {
+        return Err("not implemented: changing BSD flags other than UF_COMPRESSED".into());
+    }
+    fs_tx_enter(nx, vol)?;
+    v.put32(0x44, (flags & 0xc000_0000) | (new & 0x3fff_ffff));
+    v.put64(INO_CHANGE_TIME, now());
+    if compressing && u16::from_le_bytes([v[INO_MODE], v[INO_MODE + 1]]) & S_IFMT == S_IFREG && usize_ != 0 {
+        v.put64(0x54, usize_);
+        let f = u64a(&v, INO_INTERNAL_FLAGS);
+        v.put64(INO_INTERNAL_FLAGS, f | 0x4_0000);
+    }
+    put_rec(nx, vol, &inode_key(ino), &v)?;
+    fs_tx_leave(nx, vol, now)
+}
+
+/// `setattrlist(ATTR_CMN_DATA_PROTECT_FLAGS)` of directory `ino` to class
+/// `class` (apfs_vnop_setattr K 0x668e4a0), on a volume of crypto mode 1
+/// (drafts/s23/re-user-copy.md 3) or 3 (a VEK volume: K 0x668eb64 →
+/// K 0x66a8804; drafts/s26/re-aks-data.md 1): nothing when the class is
+/// already it; else one file-system transaction setting the class and
+/// PROT_CLASS_EXPLICIT (0x8) with the change time read, the inode written
+/// from its in-memory object (so with any times it held, `nx.jobj_times`),
+/// then the general path's transaction with nothing counted (the inode
+/// rewritten as it is).
+pub fn set_dir_class(nx: &mut Nx<'_>, vol: usize, ino: u64, class: u32, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    check_setattr_volume(nx, vol)?;
+    let crypto = {
+        let (sb, _) = nx.vol_sb_read(vol)?;
+        vol_crypto(sb)
+    };
+    if crypto != 1 && crypto != 3 {
+        return Err(format!("not implemented: a class change on a volume of crypto mode {crypto}"));
+    }
+    let mut v = inode(nx, vol, ino)?;
+    if u16::from_le_bytes([v[INO_MODE], v[INO_MODE + 1]]) & S_IFMT != S_IFDIR {
+        return Err("not implemented: a class change of other than a directory".into());
+    }
+    if class == 6 {
+        return Err("class F on a directory (EPERM)".into());
+    }
+    let old = u32::from_le_bytes(v[0x3c..0x40].try_into().unwrap());
+    if crypto == 3 {
+        // The mode-3 branch for a directory: the class must be a valid one
+        // (classes 0 to 7 but 5, mask 0xdf), and K 0x6701c0c gives the
+        // directory's current key kind from its class by the table at
+        // K 0x55af1ac (a directory never uses the VEK, K 0x66f7f88); the
+        // same kind writes nothing in K 0x66a8804, but the general path's
+        // transaction still follows.
+        const KIND: [u32; 8] = [5, 0, 1, 2, 3, 0, 4, 7];
+        let valid = |c: u32| c < 8 && (0xdfu32 >> c) & 1 != 0;
+        if !valid(class) {
+            return Err(format!("class {class} on a directory (EINVAL)"));
+        }
+        if !valid(old & 0x1f) {
+            return Err(format!("a directory of class {old:#x} has no key kind (K 0x66a8804 returns 0x5c)"));
+        }
+        if KIND[(old & 0x1f) as usize] == KIND[class as usize] {
+            return Err("not implemented: a class change to the directory's own key kind (the general path's transaction alone)".into());
+        }
+    } else if old == class {
+        return Ok(());
+    }
+    if crypto == 1 && old == 2 {
+        return Err("not implemented: a class change from class B (K 0x66fac40)".into());
+    }
+    if let Some((m, c)) = nx.jobj_times.remove(&(vol, ino)) {
+        v.put64(INO_MOD_TIME, m);
+        v.put64(INO_CHANGE_TIME, c);
+    }
+    fs_tx_enter(nx, vol)?;
+    v.put32(0x3c, class);
+    let f = u64a(&v, INO_INTERNAL_FLAGS);
+    v.put64(INO_INTERNAL_FLAGS, f | 0x8);
+    v.put64(INO_CHANGE_TIME, now());
+    put_rec(nx, vol, &inode_key(ino), &v)?;
+    fs_tx_leave(nx, vol, now)?;
+    fs_tx_enter(nx, vol)?;
+    put_rec(nx, vol, &inode_key(ino), &v)?;
+    fs_tx_leave(nx, vol, now)
+}
+
+/// The value of `ino`'s inode.
+pub fn inode(nx: &mut Nx<'_>, vol: usize, ino: u64) -> Result<Vec<u8>, String> {
+    get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))
+}
+
+/// The embedded value of `ino`'s extended attribute `name`, if it has
+/// one; one kept in a stream is refused.
+pub fn xattr_embedded(nx: &mut Nx<'_>, vol: usize, ino: u64, name: &str) -> Result<Option<Vec<u8>>, String> {
+    let mut k = (ino | J_XATTR << 60).to_le_bytes().to_vec();
+    k.extend_from_slice(&(name.len() as u16 + 1).to_le_bytes());
+    k.extend_from_slice(name.as_bytes());
+    k.push(0);
+    match get_rec(nx, vol, &k)? {
+        None => Ok(None),
+        Some(v) if v[0..2] == 2u16.to_le_bytes() || v[0..2] == 6u16.to_le_bytes() => Ok(Some(v[4..].to_vec())),
+        Some(_) => Err(format!("not implemented: the stream attribute {name}")),
+    }
+}
+
+/// The names of `ino`'s extended attributes.
+pub fn xattr_names(nx: &mut Nx<'_>, vol: usize, ino: u64) -> Result<Vec<String>, String> {
+    let (t, mut st) = nx.fs_tree(vol)?;
+    // The attributes follow the inode's record.
+    let mut key = inode_key(ino);
+    let mut out = Vec::new();
+    while let Some((k, _)) = t.get_gt(&mut st, &key)? {
+        if u64a(&k, 0) != (ino | J_XATTR << 60) {
+            break;
+        }
+        out.push(String::from_utf8_lossy(&k[10..k.len() - 1]).into_owned());
+        key = k;
+    }
+    Ok(out)
 }
 
 /// The directory `ino` is in (its inode's `parent_id`).
@@ -937,6 +2105,12 @@ fn get_rec(nx: &mut Nx<'_>, vol: usize, key: &[u8]) -> Result<Option<Vec<u8>>, S
 }
 
 fn put_rec(nx: &mut Nx<'_>, vol: usize, key: &[u8], val: &[u8]) -> Result<(), String> {
+    if key.len() == 8 && u64a(key, 0) >> 60 == J_INODE {
+        let ino = u64a(key, 0) & OBJ_MASK;
+        if nx.jobj_times.contains_key(&(vol, ino)) {
+            return Err(format!("not implemented: a rewrite of inode {ino:#x} that does not carry the times its in-memory object holds"));
+        }
+    }
     let (mut t, mut st) = nx.fs_tree(vol)?;
     t.insert(&mut st, key, Some(val))?;
     nx.set_fs_tree(vol, t);

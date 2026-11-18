@@ -52,14 +52,22 @@ pub fn key_os_version(build: &str) -> Result<u32, String> {
 /// transactions holds (on internal storage the kernel commits only when a
 /// sync, an unmount or a full transaction asks it to, K 0x675a6a0, so the
 /// grouping follows what else wrote to the container meanwhile).
-pub const RUN_STAND_IN: &str = "the erase restore's clock readings, transaction grouping and the order its concurrent writers reach the kernel on disk0 (stand-in: the clock of the machine building the image; each call joining the open transaction until a sync, an unmount, a volume creation or a volume rename commits it; asr's thread mounting System first, then restored_external's main-thread steps from init_gigalocker to commit_sep_os all reaching the kernel before asr's first call, then asr's file, its size and its four writer threads' pwrites in step order; the kernel's container unmounted (its last transaction committed, block 0 written) after the unmounts of everything and before apfs_invert opens the device, and the kernel's apfs_reaper thread, started by its next mount of the container, running to its end before anything else reaches the container; measure the device's disk0 after its erase restore)";
+pub const RUN_STAND_IN: &str = "the erase restore's clock readings, transaction grouping and the order its concurrent writers reach the kernel on disk0 (stand-in: the clock of the machine building the image; each call joining the open transaction until a sync, an unmount, a volume creation or a volume rename commits it; asr's thread mounting System first, then restored_external's main-thread steps from init_gigalocker to commit_sep_os all reaching the kernel before asr's first call, then asr's file, its size and its four writer threads' pwrites in step order; the kernel's container unmounted (its last transaction committed, block 0 written) after the unmounts of everything and before apfs_invert opens the device, and the kernel's apfs_reaper thread, started by its next mount of the container, running to its end before anything else reaches the container; the threads Data's read-write mount starts making their writes in the order the mount starts them, the pfkur thread's temporary inode then the fixup thread's transaction, both before User's volumeCreate; measure the device's disk0 after its erase restore)";
 
 /// Every stand-in the build takes, for the caller to report: the image
 /// is the device's only where these are.
-pub fn stand_ins(os: bool) -> Vec<&'static str> {
+pub fn stand_ins(os: bool, boot: bool) -> Vec<&'static str> {
     let mut v = vec![RUN_STAND_IN, HOST_UUID_STAND_IN, GIGALOCKER_STAND_IN, fsops::UNWRITTEN_STAND_IN, NSIH_STAND_IN];
+    if boot {
+        v.push(TICKET_STAND_IN);
+        v.push(RESTORE_HOST_STAND_IN);
+        v.push(CLUSTER_STAND_IN);
+    }
     if os {
         v.push(fsops::FILE_INODE_STAND_IN);
+        v.push(super::tx::KEYS_STAND_IN);
+        v.push(fsops::PER_FILE_KEY_STAND_IN);
+        v.push(USERSESSION_STAND_IN);
     }
     v
 }
@@ -72,6 +80,9 @@ pub const RESTORE_BUILD: &str = "21H461";
 pub struct OsImage {
     pub image: std::sync::Arc<crate::darwin::udif::Udif>,
     pub partition: usize,
+    /// The IPSW's boot objects install_kernel_cache's list installs
+    /// (listed as missing without them).
+    pub boot: Option<BootObjects>,
 }
 
 /// Writes disk0 on `disk` (zeroed, the size of [`storage::disk0_bytes`]),
@@ -114,16 +125,17 @@ pub fn build_disk0_with(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() ->
     nx.set_solid_state(crate::darwin::storagestack::container_solid_state());
     nx.mount_rw()?;
     let kv = key_os_version(RESTORE_BUILD)?;
-    let add = |nx: &mut Nx<'_>, name: &str, role: u16, size_bytes: Option<u64>, now: &mut dyn FnMut() -> u64| -> Result<u64, String> {
+    let add_with = |nx: &mut Nx<'_>, name: &str, role: u16, size_bytes: Option<u64>, encrypted: bool, now: &mut dyn FnMut() -> u64| -> Result<u64, String> {
         let formatted = now();
         let root = now();
         let private = now();
         let modified = now();
-        let v = NewVolume { name: name.into(), role, encrypted: false, e_apfs: true, times: VolumeTimes { formatted, root, private, modified }, uid: 0, gid: 0, key_os_version: kv, size_bytes };
+        let v = NewVolume { name: name.into(), role, encrypted, e_apfs: true, times: VolumeTimes { formatted, root, private, modified }, uid: 0, gid: 0, key_os_version: kv, size_bytes };
         let oid = nx.create_volume(&v)?;
         nx.commit()?;
         Ok(oid)
     };
+    let add = |nx: &mut Nx<'_>, name: &str, role: u16, size_bytes: Option<u64>, now: &mut dyn FnMut() -> u64| add_with(nx, name, role, size_bytes, false, now);
     let slot = |nx: &Nx<'_>, oid: u64| nx.fs_oid.iter().position(|&o| o == oid).ok_or_else(|| format!("no volume {oid:#x}"));
     let o = add(&mut nx, "System", storage::role::SYSTEM, None, now)?;
     let system = slot(&nx, o)?;
@@ -141,7 +153,7 @@ pub fn build_disk0_with(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() ->
     let update = slot(&nx, o)?;
     fsops::mount_rw(&mut nx, update, now)?;
     update_hierarchy(&mut nx, update, now)?;
-    fsops::unmount(&mut nx, update, now)?;
+    fsops::unmount(&mut nx, update, false, now)?;
     if !before_asr(&mut nx)? {
         return Ok(missing);
     }
@@ -167,13 +179,13 @@ pub fn build_disk0_with(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() ->
     // tx_finish and its modified_by transaction all the same), xART's after
     // `seputil --gigalocker-shutdown` (a Secure Enclave call only).
     for v in [preboot, update, hardware, xart, system] {
-        fsops::unmount(&mut nx, v, now)?;
+        fsops::unmount(&mut nx, v, true, now)?;
     }
     // The container handed to apfs_invert: the kernel's last transaction
     // committed and block 0 written (a stand-in, in RUN_STAND_IN), then the
     // tool's own mount.
     nx.unmount()?;
-    if let Some(_os) = os {
+    if let Some(os) = os {
         before_invert()?;
         let barrier = barrier.unwrap_or_else(crate::darwin::storagestack::container_barrier);
         super::invert::invert(&mut nx, system, super::asr::IMAGE_NAME, std::sync::Arc::clone(&disk), base, barrier, now)?;
@@ -189,15 +201,60 @@ pub fn build_disk0_with(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() ->
         nx.remount(Mode::Kernel)?;
         nx.reaper_run()?;
         after_invert_mounts(&mut nx, Volumes { system, xart, hardware, preboot, update }, now)?;
-        missing.push("the System volume after apfs_invert and the reaping of its old trees: (once Data and User exist) the data-volume trees' removal (restored_external's fixup_var), /private/xarts, apfs_sealvolume to the signed root hash, and the com.apple.os.update- snapshot".into());
+        // 6. create_protected_filesystems (0x10002a54c): class D's key
+        // obliterated (effaceable storage only), then Data made encrypted
+        // (`newfs_apfs -A -D -o role=d -v Data -P`: the kernel's
+        // volumeCreate with the container keybag's entries,
+        // drafts/s16/re-protected.md; keys and ciphertext KEYS_STAND_IN).
+        // Each is mounted read-write as it is made (0x10002a698 →
+        // mount_partition, `mount_apfs -R`): Data's mount starts its pfkur
+        // and fixup threads, whose writes reach the kernel before User's
+        // volumeCreate (RUN_STAND_IN), whose checkpoint commits them; the
+        // `.fseventsd/.ramdisk-boot-done` opens after each mount fail at
+        // their lookups.
+        let o = add_with(&mut nx, "Data", storage::role::DATA, None, true, now)?;
+        let data = slot(&nx, o)?;
+        fsops::mount_rw(&mut nx, data, now)?;
+        // User only when the data volume is split, which `e-apfs` in the
+        // device tree's /filesystems makes so (0x100047258).
+        let o = add_with(&mut nx, "User", storage::role::USER, None, true, now)?;
+        let user = slot(&nx, o)?;
+        fsops::mount_rw(&mut nx, user, now)?;
+        configure_data_volumes(&mut nx, system, data, user, now)?;
+        // reserve_overprov_space (0x1000184ec → 0x10002e5bc, erase only):
+        // the disk's size from the whole-disk node's block size and count.
+        fsops::reserve_overprov_space(&mut nx, data, storage::disk0_bytes(), crate::darwin::storagestack::container_unmap(), now)?;
+        // read_new_os_build_version only reads System; install_splat
+        // (0x1000185a8 → 0x10003af24) writes the Cryptex1 objects under
+        // Preboot's cryptex1/current.
+        missing.push("install_splat's Cryptex1 objects on Preboot (cryptex1/current: os.dmg, app.dmg, their root hashes and trust caches, the version plists, the build manifest, the cryptex1 ticket and LocalPolicy; their sources and the install handler not traced, drafts/s14/restored/slice_preboot_update.md 2.5): everything the restore writes after it is placed without them".into());
+        match &os.boot {
+            Some(b) => install_kernel_cache(&mut nx, Volumes { system, xart, hardware, preboot, update }, b, &cluster_pushes, now)?,
+            None => missing.push("install_kernel_cache's list (no IPSW boot objects given: the kernelcache, devicetree, iBoot and root_hash Image4 files and the AP ticket on Preboot and Hardware)".into()),
+        }
+        // check_mounted (0x100018b6c): fixup_var (0x10002ef8c):
+        // MKBKeyBagCreateSystem writes nothing with enhanced APFS, then the
+        // system data volume's bootstrap.
+        aks_bootstrap_fs(&mut nx, data, now)?;
     }
-    // 6.
-    missing.push("the Data and User volumes (newfs_apfs -P: encrypted with keys the device's Secure Enclave makes)".into());
+    if os.is_none() {
+        missing.push("the Data and User volumes (newfs_apfs -P), made after apfs_invert".into());
+    }
     // 7.
-    missing.push("the restore's later writes to Preboot (install_kernel_cache's boot objects, populate_preboot_volume, install_splat's cryptex1) and Data's contents".into());
+    missing.push(if os.is_some() {
+        "the restore's later steps, in its order: check_mounted's fixup_var (BOM's copy of /private/var interleaved with remove_moved_trees), the mountpoints (/mnt1/private/xarts, /mnt2/hardware, MobileSoftwareUpdate, internal), populate_preboot_volume, apfs_sealvolume and the update snapshot".into()
+    } else {
+        "the restore's later writes to Preboot (install_kernel_cache's boot objects, populate_preboot_volume, install_splat's cryptex1) and Data's contents".into()
+    });
     // The kernel's own counting of the checksums it sets (its kext has
     // sites newfs_apfs's copy does not) and whether its read-write mount's
     // block-0 write has the newest mounting version are not traced.
+    // Times the kernel still holds in memory: the next rewrite of their
+    // inodes (for Data's /keybags, aks_bootstrap_fs's class change in
+    // fixup_var, drafts/s26/re-aks-data.md 1) is not reached.
+    for (&(v, ino), &(m, c)) in &nx.jobj_times {
+        missing.push(format!("the times inode {ino:#x} of volume slot {v} holds in memory (modification {m}, change {c}), written by its next rewrite"));
+    }
     missing.push("nx_counters[0] and block 0's nx_newest_mounted_version as the kernel's transactions leave them (projected from newfs_apfs's three counting sites; the kext has ten)".into());
     nx.unmount()?;
     Ok(missing)
@@ -282,7 +339,7 @@ fn concurrent_steps(nx: &mut Nx<'_>, v: Volumes, now: &mut dyn FnMut() -> u64, m
     // unmount.
     fsops::mount_rw(nx, v.update, now)?;
     update_hierarchy(nx, v.update, now)?;
-    fsops::unmount(nx, v.update, now)?;
+    fsops::unmount(nx, v.update, false, now)?;
     // mount_filesystem (0x10001785c): mount_filesystems mounts Hardware and
     // Preboot (`mount_apfs -R`), Update is mounted again, and System is
     // given its name (set_system_vol_name, 0x100027be0).
@@ -310,11 +367,413 @@ fn concurrent_steps(nx: &mut Nx<'_>, v: Volumes, now: &mut dyn FnMut() -> u64, m
     for name in ["OS", "App"] {
         fsops::mkdir(nx, v.preboot, cryptexes, name, 0o777, 0, 0, now)?.map_err(|e| format!("mkdir Cryptexes/{name}: errno {e}"))?;
     }
-    fsops::write_new_file(nx, v.preboot, ROOT_INO, "active", 0o644, p.as_bytes(), now)?;
+    fsops::write_new_file(nx, v.preboot, ROOT_INO, "active", 0o644, p.as_bytes(), &|n| Err(format!("a {n}-byte active file (the direct path's)")), now)?;
     // fdr_prepare's removefile walk of the empty factorydata directory and
     // the access() checks of the later steps only read.
     missing.push("the FDR local store on Hardware (libFDR's writes into /FactoryData/System/Library/Caches/com.apple.factorydata by fdr_prepare's commit, fdr_recover, fdr_auto_challenge_claim and verify_fdr_data: server and device data, file names not traced)".into());
     missing.push("install_fud's firmware on Preboot (<nsih>/usr/standalone/firmware/FUD and the host's personalized images in it, AOP, AVE and StaticTrustCache for the erase identity)".into());
+    Ok(())
+}
+
+/// What stands in for `/mnt2/keybags/usersession.kb`: UserManagementLayout
+/// writes its user manifest with NSPropertyListSerialization (binary,
+/// drafts/s21/re-data.md 2.1), two of its values fresh random UUIDs, the
+/// order CFBinaryPList takes the dictionaries' keys in and the user
+/// dictionary's fields after `userFromManifestDictionary:` not traced.
+pub const USERSESSION_STAND_IN: &str = "the bytes of Data's /keybags/usersession.kb (UserManagementLayout's binary user manifest: two random UUIDs per device run, CFBinaryPList's key order and the user dictionary's serialized fields not traced: re-data UNSETTLED-4) (stand-in: a binary property list of the manifest's and the user's listed keys in sorted order, objects uniqued, the UUIDs 00000000-0000-4000-8000-0000000001F5 and ...1F6)";
+
+/// A binary property list (`bplist00`) of `v`: the objects in the order
+/// a depth-first walk first meets them (a dictionary's keys, then its
+/// values), strings and numbers uniqued, the smallest integer sizes.
+fn bplist(v: &super::super::plist::Value) -> Vec<u8> {
+    use super::super::plist::Value;
+    fn flatten(v: &Value, objs: &mut Vec<Value>, refs: &mut Vec<Vec<usize>>) -> usize {
+        if !matches!(v, Value::Dict(_) | Value::Array(_)) {
+            if let Some(i) = objs.iter().position(|o| o == v) {
+                return i;
+            }
+        }
+        let i = objs.len();
+        objs.push(v.clone());
+        refs.push(Vec::new());
+        let r = match v {
+            Value::Dict(d) => {
+                let mut d = d.clone();
+                d.sort_by(|a, b| a.0.cmp(&b.0));
+                let ks: Vec<usize> = d.iter().map(|(k, _)| flatten(&Value::String(k.clone()), objs, refs)).collect();
+                let vs: Vec<usize> = d.iter().map(|(_, x)| flatten(x, objs, refs)).collect();
+                ks.into_iter().chain(vs).collect()
+            }
+            Value::Array(a) => a.iter().map(|x| flatten(x, objs, refs)).collect(),
+            _ => Vec::new(),
+        };
+        refs[i] = r;
+        i
+    }
+    fn size_of(n: u64) -> usize {
+        if n <= 0xff {
+            1
+        } else if n <= 0xffff {
+            2
+        } else if n <= 0xffff_ffff {
+            4
+        } else {
+            8
+        }
+    }
+    fn be(out: &mut Vec<u8>, n: u64, w: usize) {
+        out.extend_from_slice(&n.to_be_bytes()[8 - w..]);
+    }
+    fn marker(out: &mut Vec<u8>, hi: u8, n: usize) {
+        if n < 15 {
+            out.push(hi | n as u8);
+        } else {
+            out.push(hi | 0xf);
+            let w = size_of(n as u64);
+            out.push(0x10 | w.trailing_zeros() as u8);
+            be(out, n as u64, w);
+        }
+    }
+    let (mut objs, mut refs) = (Vec::new(), Vec::new());
+    flatten(v, &mut objs, &mut refs);
+    let rs = size_of(objs.len() as u64);
+    let mut out = b"bplist00".to_vec();
+    let mut offs = Vec::new();
+    for (o, r) in objs.iter().zip(&refs) {
+        offs.push(out.len() as u64);
+        match o {
+            Value::Bool(b) => out.push(if *b { 9 } else { 8 }),
+            Value::Integer(n) => {
+                let w = if *n < 0 { 8 } else { size_of(*n as u64) };
+                out.push(0x10 | w.trailing_zeros() as u8);
+                be(&mut out, *n as u64, w);
+            }
+            Value::String(t) if t.is_ascii() => {
+                marker(&mut out, 0x50, t.len());
+                out.extend_from_slice(t.as_bytes());
+            }
+            Value::String(t) => {
+                let u: Vec<u16> = t.encode_utf16().collect();
+                marker(&mut out, 0x60, u.len());
+                u.iter().for_each(|c| out.extend_from_slice(&c.to_be_bytes()));
+            }
+            Value::Data(d) => {
+                marker(&mut out, 0x40, d.len());
+                out.extend_from_slice(d);
+            }
+            Value::Array(_) => {
+                marker(&mut out, 0xa0, r.len());
+                r.iter().for_each(|&x| be(&mut out, x as u64, rs));
+            }
+            Value::Dict(_) => {
+                marker(&mut out, 0xd0, r.len() / 2);
+                r.iter().for_each(|&x| be(&mut out, x as u64, rs));
+            }
+        }
+    }
+    let table = out.len() as u64;
+    let os = size_of(table);
+    offs.iter().for_each(|&o| be(&mut out, o, os));
+    out.extend_from_slice(&[0; 6]);
+    out.push(os as u8);
+    out.push(rs as u8);
+    out.extend_from_slice(&(objs.len() as u64).to_be_bytes());
+    out.extend_from_slice(&0u64.to_be_bytes());
+    out.extend_from_slice(&table.to_be_bytes());
+    out
+}
+
+/// USERSESSION_STAND_IN's bytes: the user manifest UserManagementLayout's
+/// `saveManifest:toPath:` writes for the primary user (drafts/s21/re-data.md
+/// 2.1's tables).
+fn usersession_kb() -> Vec<u8> {
+    use super::super::plist::Value;
+    let s = |x: &str| Value::String(x.into());
+    let i = |n: i128| Value::Integer(n);
+    let user = Value::Dict(vec![
+        ("MKBUserSessionID".into(), i(501)),
+        ("MKBUserSessionGroupID".into(), i(501)),
+        ("MKBUserTypeKey".into(), s("UserSessionOther")),
+        ("ShortName".into(), s("mobile")),
+        ("FirstName".into(), s("mobile")),
+        ("LastName".into(), s("mobile")),
+        ("Name".into(), s("mobile")),
+        ("DisplayName".into(), s("mobile")),
+        ("Language".into(), s("en_US")),
+        ("MKBUserSessionUUID".into(), s("00000000-0000-4000-8000-0000000001F5")),
+        ("MKBUserSessionAlternateUUID".into(), s("00000000-0000-4000-8000-0000000001F6")),
+        ("CreateTimeStamp".into(), s("1970-01-01 00:00:01 +0000")),
+        ("LoginTimeStamp".into(), s("1970-01-01 00:00:01 +0000")),
+        ("LoginUser".into(), Value::Bool(false)),
+        ("Dirty".into(), Value::Bool(false)),
+        ("Foreground".into(), Value::Bool(true)),
+        ("isPrimary".into(), Value::Bool(true)),
+        ("isAdminKey".into(), Value::Bool(true)),
+        ("LibinfoHomeDir".into(), s("/var/mobile")),
+    ]);
+    bplist(&Value::Dict(vec![
+        ("DEVICECONFIG".into(), i(0)),
+        ("BOOTEDUSER".into(), i(0)),
+        ("APNSID".into(), i(1)),
+        ("MKBUserSessionVolumeFSType".into(), s("UserVolumeAPFSNative")),
+        ("USESSTYPE".into(), i(0)),
+        ("LOGINCHECKIN".into(), i(0)),
+        ("DEVICENETWORKBG".into(), i(0)),
+        ("NUMENT".into(), i(1)),
+        ("BLOB".into(), Value::Data(bplist(&Value::Array(vec![user])))),
+        ("UserManifestVersion".into(), i(1)),
+    ]))
+}
+
+/// configure_data_volumes (0x10002a098; drafts/s21/re-data.md 2) on Data
+/// (`data`) and User (`user`), when System's image has
+/// /System/Library/Templates/User: UserManagementLayout's primary user on
+/// Data (2.1, drafts/s23/re-uml-data.md), the AKS identity calls (Secure
+/// Enclave only), the user protection of Data's VEK (2.3) and
+/// AKSVolumeMap's cookie on User (2.5), each with its checkpoint, the
+/// template's copy onto User and aks_bootstrap_user_fs (2.4). The rename
+/// leaves /keybags' times in the kernel's memory (`nx.jobj_times`).
+fn configure_data_volumes(nx: &mut Nx<'_>, system: usize, data: usize, user: usize, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    let mut t = ROOT_INO;
+    for n in ["System", "Library", "Templates", "User"] {
+        match fsops::lookup(nx, system, t, n)? {
+            Some(i) => t = i,
+            None => return Ok(()),
+        }
+    }
+    // createPrimaryUserOnSharedDataVolumePath:@"/mnt2" (UML 0x94a0 →
+    // saveManifest:toPath: UML 0xb8b0): mkpath_np of /keybags (0700, root,
+    // the root's group), then atomicallyWriteData (UML 0x5a28): the
+    // `.writing` file's unlink (ENOENT), its class-D create, one write, the
+    // fsync, the swap's ENOENT, the rename, F_BARRIERFSYNC (the commit),
+    // the close and the unlink (ENOENT): nothing else written.
+    if fsops::lookup(nx, data, ROOT_INO, "keybags")?.is_some() {
+        return Err("not implemented: UML finding /mnt2/keybags".into());
+    }
+    let keybags = fsops::mkdir(nx, data, ROOT_INO, "keybags", 0o700, 0, 0, now)?.map_err(|e| format!("mkdir /mnt2/keybags: errno {e}"))?;
+    let ino = fsops::create_protected(nx, data, keybags, "usersession.kb.writing", 0o644, 0, 4, now)?;
+    let w = fsops::write_new_protected(nx, data, ino, &usersession_kb(), now)?;
+    fsops::fsync_pending(nx, data, &w, now)?;
+    let rt = fsops::rename_in_dir(nx, data, keybags, "usersession.kb.writing", "usersession.kb", ino, now)?;
+    fsops::barrier_fsync(nx, data, ino, rt.file, now)?;
+    // bindAPFSSystemDataVolume (enc 2) and AKSVolumeMap(User, 501).
+    nx.vek_set_protection(data)?;
+    nx.volume_payload_set(user, 0)?;
+    // createPrimaryUserLayoutWithOnUserVolumePath:@"/mnt10"
+    // fromSystemVolumePath:@"/mnt1" (UML 0x9f34): the template copied by
+    // libcopyfile with the handler's lchown to 501:501, then
+    // aks_bootstrap_user_fs.
+    user_template_copy(nx, system, t, user, now)?;
+    aks_bootstrap_user_fs(nx, user, now)
+}
+
+const MOBILE: u32 = 501;
+
+/// copyfile(".../Templates/User/", "/mnt10", COPYFILE_ALL |
+/// COPYFILE_RECURSIVE | COPYFILE_NOFOLLOW) by libcopyfile 196.120.5 with
+/// UserManagementLayout's handler (lchown to 501:501 at every FINISH),
+/// from the template directory `tmpl` on System onto User's root
+/// (drafts/s23/re-user-copy.md 1.5 and 5): fts in the source's directory
+/// order, each directory made and closed over by the cleanup pass, empty
+/// files truncated, compressed ones copied by their decmpfs attribute and
+/// UF_COMPRESSED; the source's modes, times and flags applied as
+/// COPYFILE_STAT does.
+fn user_template_copy(nx: &mut Nx<'_>, system: usize, tmpl: u64, user: usize, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    use fsops::SetAttr;
+    let ids = |u: u32, g: u32| SetAttr { uid: Some(u), gid: Some(g), ..Default::default() };
+    let times = |m: u64, a: u64| SetAttr { mtime: Some(m), atime: Some(a), ..Default::default() };
+    let src_inode = |nx: &mut Nx<'_>, ino: u64| -> Result<(u16, u64, u64, u32), String> {
+        let v = fsops::inode(nx, system, ino)?;
+        let q = |o: usize| u64::from_le_bytes(v[o..o + 8].try_into().unwrap());
+        let (uid, gid, flags) = (u32::from_le_bytes(v[0x48..0x4c].try_into().unwrap()), u32::from_le_bytes(v[0x4c..0x50].try_into().unwrap()), u32::from_le_bytes(v[0x44..0x48].try_into().unwrap()));
+        if (uid, gid) != (0, 0) || flags & !0x20 != 0 {
+            return Err(format!("not implemented: copying a template item owned {uid}:{gid} or with BSD flags {flags:#x}"));
+        }
+        Ok((u16::from_le_bytes([v[0x50], v[0x51]]), q(0x18), q(0x28), flags))
+    };
+    // The root's pre-order: mkdir finds it (EEXIST), then chmodx_np,
+    // the empty fchmodx_np, fchown, fchmod, the handler's lchown.
+    let (rmode, rmtime, ratime, _) = src_inode(nx, tmpl)?;
+    fsops::setattr(nx, user, ROOT_INO, SetAttr { mode: Some(rmode & 0o7777), ..ids(0, 0) }, now)?;
+    fsops::setattr(nx, user, ROOT_INO, ids(0, 0), now)?;
+    fsops::setattr(nx, user, ROOT_INO, SetAttr { mode: Some(rmode & 0o7777), ..Default::default() }, now)?;
+    fsops::setattr(nx, user, ROOT_INO, ids(MOBILE, MOBILE), now)?;
+    fn walk(nx: &mut Nx<'_>, system: usize, src: u64, user: usize, dst: u64, now: &mut dyn FnMut() -> u64, item: &dyn Fn(&mut Nx<'_>, u64) -> Result<(u16, u64, u64, u32), String>) -> Result<(), String> {
+        use fsops::SetAttr;
+        let ids = |u: u32, g: u32| SetAttr { uid: Some(u), gid: Some(g), ..Default::default() };
+        let times = |m: u64, a: u64| SetAttr { mtime: Some(m), atime: Some(a), ..Default::default() };
+        for (k, ino, ty) in fsops::read_dir(nx, system, src)? {
+            let nl = (u32::from_le_bytes(k[8..12].try_into().unwrap()) & 0x3ff) as usize;
+            let name = std::str::from_utf8(&k[12..12 + nl - 1]).map_err(|_| "a template name that is not UTF-8")?.to_string();
+            let (mode, mtime, atime, flags) = item(nx, ino)?;
+            let xattrs = fsops::xattr_names(nx, system, ino)?;
+            let gid = u32::from_le_bytes(fsops::inode(nx, user, dst)?[0x4c..0x50].try_into().unwrap());
+            match ty {
+                4 => {
+                    if !xattrs.is_empty() {
+                        return Err(format!("not implemented: copying a template directory with extended attributes ({name})"));
+                    }
+                    let d = fsops::mkdir(nx, user, dst, &name, mode & 0o7777, 0, gid, now)?.map_err(|e| format!("mkdir /mnt10/.../{name}: errno {e}"))?;
+                    fsops::setattr(nx, user, d, ids(MOBILE, MOBILE), now)?;
+                    walk(nx, system, ino, user, d, now, item)?;
+                    cleanup(nx, user, d, mode, mtime, atime, now)?;
+                }
+                8 => {
+                    let v = fsops::inode(nx, system, ino)?;
+                    let compressed = flags & 0x20 != 0;
+                    let has_stream = v.len() > 0x5c && {
+                        let n = u16::from_le_bytes([v[0x5c], v[0x5d]]) as usize;
+                        (0..n).any(|i| v[0x60 + 4 * i] == 8)
+                    };
+                    if has_stream || xattrs.iter().any(|x| !(compressed && x == "com.apple.decmpfs")) {
+                        return Err(format!("not implemented: copying a template file with data or extended attributes other than an embedded decmpfs one ({name})"));
+                    }
+                    let f = fsops::create(nx, user, dst, &name, mode & 0o7777, 0, gid, now)?.map_err(|e| format!("create /mnt10/.../{name}: errno {e}"))?;
+                    if compressed {
+                        let hdr = fsops::xattr_embedded(nx, system, ino, "com.apple.decmpfs")?.ok_or("a compressed template file with no decmpfs attribute")?;
+                        fsops::set_decmpfs_xattr(nx, user, f, &hdr, now)?;
+                        fsops::setattr(nx, user, f, ids(MOBILE, MOBILE), now)?;
+                        fsops::cas_bsdflags(nx, user, f, 0, 0x20, now)?;
+                    } else {
+                        fsops::truncate_same(nx, user, f, now)?;
+                    }
+                    fsops::setattr(nx, user, f, SetAttr { mode: Some(mode & 0o7777), ..ids(0, 0) }, now)?;
+                    fsops::setattr(nx, user, f, times(mtime, atime), now)?;
+                    fsops::setattr(nx, user, f, ids(0, 0), now)?;
+                    fsops::setattr(nx, user, f, SetAttr { mode: Some(mode & 0o7777), ..Default::default() }, now)?;
+                    fsops::cas_bsdflags(nx, user, f, flags, flags, now)?;
+                    if compressed {
+                        fsops::setattr(nx, user, f, times(mtime, atime), now)?;
+                    }
+                    fsops::setattr(nx, user, f, ids(MOBILE, MOBILE), now)?;
+                }
+                _ => return Err(format!("not implemented: copying a template item of type {ty} ({name})")),
+            }
+        }
+        Ok(())
+    }
+    /// The cleanup pass of a copied directory: chmodx_np, fchmod,
+    /// fsetattrlist of the source's times, fchown(0, 0), fchmod, the flags'
+    /// compare-and-swap, the handler's lchown.
+    fn cleanup(nx: &mut Nx<'_>, user: usize, d: u64, mode: u16, mtime: u64, atime: u64, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+        use fsops::SetAttr;
+        let ids = |u: u32, g: u32| SetAttr { uid: Some(u), gid: Some(g), ..Default::default() };
+        let same = SetAttr { mode: Some(mode & 0o7777), ..Default::default() };
+        fsops::setattr(nx, user, d, SetAttr { mode: Some(mode & 0o7777), ..ids(MOBILE, MOBILE) }, now)?;
+        fsops::setattr(nx, user, d, same, now)?;
+        fsops::setattr(nx, user, d, SetAttr { mtime: Some(mtime), atime: Some(atime), ..Default::default() }, now)?;
+        fsops::setattr(nx, user, d, ids(0, 0), now)?;
+        fsops::setattr(nx, user, d, same, now)?;
+        fsops::cas_bsdflags(nx, user, d, 0, 0, now)?;
+        fsops::setattr(nx, user, d, ids(MOBILE, MOBILE), now)
+    }
+    let _ = times;
+    walk(nx, system, tmpl, user, ROOT_INO, now, &src_inode)?;
+    cleanup(nx, user, ROOT_INO, rmode, rmtime, ratime, now)
+}
+
+/// AppleKeyStore's map for a user's volume (AKS 0x30f60, 72 entries;
+/// drafts/s14/restored/aks_bootstrap_map.txt): path, flags (1: set the
+/// class on a directory, 2 and 4 kept for its other users, 8: skipped),
+/// mode, class. The entries with flags 0x0a are left out: skipped.
+const USER_MAP: [(&str, u32, u16, u32); 46] = [
+    ("", 0x00, 0o711, 0),
+    ("/.ssh", 0x05, 0o700, 4),
+    ("/Applications", 0x02, 0o755, 0),
+    ("/Containers", 0x02, 0o755, 0),
+    ("/Library", 0x00, 0o711, 0),
+    ("/Library/CoreDuet", 0x01, 0o755, 4),
+    ("/Library/Logs", 0x01, 0o755, 4),
+    ("/Library/Logs/CoreDuet", 0x01, 0o755, 4),
+    ("/Library/Logs/AppleSupport", 0x01, 0o700, 4),
+    ("/Library/Passes", 0x01, 0o755, 4),
+    ("/Library/Preferences", 0x01, 0o755, 4),
+    ("/Library/MobileInstallation", 0x05, 0o755, 4),
+    ("/Library/Voicemail", 0x05, 0o755, 4),
+    ("/Library/VoiceServices", 0x05, 0o755, 4),
+    ("/Library/CallHistoryDB", 0x05, 0o755, 4),
+    ("/Library/Carrier Bundles", 0x05, 0o755, 4),
+    ("/Library/CrashReporter", 0x05, 0o755, 4),
+    ("/Library/Logs/CrashReporter", 0x05, 0o755, 4),
+    ("/Library/Assistant", 0x01, 0o755, 4),
+    ("/Library/ApplePushService", 0x01, 0o755, 4),
+    ("/Library/AggregateDictionary", 0x01, 0o755, 4),
+    ("/Library/BackBoard", 0x01, 0o755, 4),
+    ("/Library/DataAccess", 0x01, 0o755, 4),
+    ("/Library/IdentityServices", 0x01, 0o755, 4),
+    ("/Library/SyncedPreferences", 0x01, 0o755, 4),
+    ("/Library/SoftwareUpdate", 0x01, 0o755, 4),
+    ("/Library/TCC", 0x01, 0o755, 4),
+    ("/Library/MediaStream", 0x01, 0o755, 4),
+    ("/Library/MediaStream", 0x05, 0o755, 4),
+    ("/Library/Caches", 0x01, 0o700, 4),
+    ("/Library/AddressBook", 0x01, 0o700, 4),
+    ("/Library/Keyboard", 0x01, 0o700, 4),
+    ("/Library/mad", 0x01, 0o700, 4),
+    ("/Library/mad/activation_records", 0x01, 0o755, 4),
+    ("/Library/ConfigurationProfiles", 0x01, 0o755, 4),
+    ("/Library/UserConfigurationProfiles", 0x01, 0o755, 4),
+    ("/Library/BulletinBoard", 0x01, 0o755, 4),
+    ("/Library/SMS", 0x01, 0o700, 4),
+    ("/Library/Calendar", 0x01, 0o700, 4),
+    ("/Library/SpringBoard", 0x01, 0o755, 4),
+    ("/Library/Cookies", 0x01, 0o700, 4),
+    ("/Library/Accounts", 0x01, 0o700, 4),
+    ("/Library/Mail", 0x01, 0o700, 4),
+    ("/Media", 0x00, 0o750, 0),
+    ("/Media/iTunes_Control", 0x05, 0o755, 4),
+    ("/Media/Downloads", 0x05, 0o755, 4),
+];
+
+/// aks_bootstrap_user_fs("/mnt10", 0, 501, 501) (AKS 0x13a28 →
+/// aks_bootstrap_fs_with_map AKS 0x13634; drafts/s21/re-data.md 2.4,
+/// drafts/s23/re-user-copy.md 3): with no /.bootstrapped, each map entry
+/// in order: a missing path made by mkpath_np with the entry's mode (its
+/// parent exists: one mkdir; a mode of 01000 or more would be chmodded:
+/// none is) and chowned to 501:501; then a directory whose entry has
+/// flag 1 given the entry's class when it has another; existing paths
+/// keep their mode and owner. Then /.bootstrapped made (open O_CREAT,
+/// 0644) and closed.
+fn aks_bootstrap_user_fs(nx: &mut Nx<'_>, user: usize, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    if fsops::lookup(nx, user, ROOT_INO, ".bootstrapped")?.is_some() {
+        return Err("not implemented: aks_bootstrap_user_fs on a bootstrapped volume".into());
+    }
+    for (path, flags, mode, class) in USER_MAP {
+        let mut dir = ROOT_INO;
+        let mut ino = Some(ROOT_INO);
+        let comps: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+        for (i, c) in comps.iter().enumerate() {
+            match fsops::lookup(nx, user, dir, c)? {
+                Some(x) => dir = x,
+                None if i + 1 == comps.len() => {
+                    ino = None;
+                    break;
+                }
+                None => return Err(format!("not implemented: mkpath_np making the intermediate directories of {path}")),
+            }
+        }
+        let ino = match ino {
+            Some(_) => dir,
+            None => {
+                if mode >= 0o1000 {
+                    return Err("not implemented: the chmod of a map mode of 01000 or more".into());
+                }
+                let gid = u32::from_le_bytes(fsops::inode(nx, user, dir)?[0x4c..0x50].try_into().unwrap());
+                let d = fsops::mkdir(nx, user, dir, comps[comps.len() - 1], mode, 0, gid, now)?.map_err(|e| format!("mkdir /mnt10{path}: errno {e}"))?;
+                fsops::setattr(nx, user, d, fsops::SetAttr { uid: Some(MOBILE), gid: Some(MOBILE), ..Default::default() }, now)?;
+                d
+            }
+        };
+        let v = fsops::inode(nx, user, ino)?;
+        let is_dir = u16::from_le_bytes([v[0x50], v[0x51]]) & 0o170000 == 0o040000;
+        if is_dir && flags & 1 != 0 {
+            fsops::set_dir_class(nx, user, ino, class, now)?;
+        } else if !is_dir {
+            return Err(format!("not implemented: a bootstrap map path that is not a directory (/mnt10{path})"));
+        }
+    }
+    let gid = u32::from_le_bytes(fsops::inode(nx, user, ROOT_INO)?[0x4c..0x50].try_into().unwrap());
+    fsops::create(nx, user, ROOT_INO, ".bootstrapped", 0o644, 0, gid, now)?.map_err(|e| format!("create /mnt10/.bootstrapped: errno {e}"))?;
     Ok(())
 }
 
@@ -351,6 +810,252 @@ fn gigalocker_init(nx: &mut Nx<'_>, xart: usize, now: &mut dyn FnMut() -> u64) -
     }
     fsops::truncate_grow(nx, xart, ino, SIZE, now)?;
     fsops::close_after_grow(nx, xart, ino)
+}
+
+/// The IPSW's boot objects the host personalizes for install_kernel_cache's
+/// list (drafts/s23/re-kernelcache.md 3): the IM4P payloads as the IPSW has
+/// them (their SHA-384 the erase identity's digests).
+pub struct BootObjects {
+    /// `kernelcache.release.ipad7`.
+    pub kernelcache: Vec<u8>,
+    /// `Firmware/all_flash/DeviceTree.j120ap.im4p`.
+    pub devicetree: Vec<u8>,
+    /// `Firmware/all_flash/iBoot.j120.RELEASE.im4p`.
+    pub iboot: Vec<u8>,
+    /// `Firmware/044-76040-038.dmg.root_hash`.
+    pub root_hash: Vec<u8>,
+}
+
+impl BootObjects {
+    /// The four objects from an IPSW extracted at `dir`.
+    pub fn read(dir: &std::path::Path) -> Result<Self, String> {
+        let r = |p: &str| std::fs::read(dir.join(p)).map_err(|e| format!("{}: {e}", dir.join(p).display()));
+        Ok(BootObjects { kernelcache: r("kernelcache.release.ipad7")?, devicetree: r("Firmware/all_flash/DeviceTree.j120ap.im4p")?, iboot: r("Firmware/all_flash/iBoot.j120.RELEASE.im4p")?, root_hash: r("Firmware/044-76040-038.dmg.root_hash")? })
+    }
+}
+
+/// The AP ticket the host sends as RootTicketData (TSS's, personalized
+/// for the device's ECID and nonces) and what the host makes of the boot
+/// objects with it.
+pub const TICKET_STAND_IN: &str = "the AP ticket (the host's RootTicketData from TSS: its bytes and length decide the personalized files' lengths and so their placement) and the host's Image4 files (KernelCacheFile, DeviceTreeFile, NorImageData's iBoot, SystemImageRootHashFile: drafts/s23/re-kernelcache.md UNSETTLED-3 and 4) (stand-in: the ticket an empty DER SEQUENCE, 30 00; each file IMG4 { \"IMG4\", the IPSW's IM4P, [0] the ticket } in DER, no IM4R; measure /private/preboot/<nsih>/System/Library/Caches/apticket.der and the files beside it on the device)";
+const TICKET: [u8; 2] = [0x30, 0x00];
+
+/// What the host answers that decides which of the list's files exist:
+/// install_device_tree runs only for a RestoreProtocolVersion of 15 or more
+/// (0x100012ce8), and the names take ".img4" when MobileGestalt's
+/// Image4Supported is true.
+pub const RESTORE_HOST_STAND_IN: &str = "the restore host's RestoreProtocolVersion (15 or more makes install_device_tree write devicetree.img4) and the ramdisk's Image4Supported answer (the .img4 names) (stand-in: 15 or more, and true, as a current host and an Image4 device give; measure /private/preboot/<nsih>/usr/standalone/firmware on the device)";
+
+/// A DER length.
+fn der_len(out: &mut Vec<u8>, n: usize) {
+    if n < 0x80 {
+        out.push(n as u8);
+    } else {
+        let b = (n as u64).to_be_bytes();
+        let skip = b.iter().position(|&x| x != 0).unwrap();
+        out.push(0x80 | (8 - skip) as u8);
+        out.extend_from_slice(&b[skip..]);
+    }
+}
+
+/// `IMG4 ::= SEQUENCE { IA5String "IMG4", IM4P, [0] EXPLICIT IM4M }` in
+/// DER (TICKET_STAND_IN: no IM4R).
+fn img4(im4p: &[u8], ticket: &[u8]) -> Vec<u8> {
+    let mut tagged = vec![0xa0];
+    der_len(&mut tagged, ticket.len());
+    tagged.extend_from_slice(ticket);
+    let mut body = vec![0x16, 4];
+    body.extend_from_slice(b"IMG4");
+    body.extend_from_slice(im4p);
+    body.extend_from_slice(&tagged);
+    let mut out = vec![0x30];
+    der_len(&mut out, body.len());
+    out.extend_from_slice(&body);
+    out
+}
+
+/// install_kernel_cache's nested list (0x100018620; drafts/s23/
+/// re-kernelcache.md 1, 2), run after install_splat with Preboot and
+/// Hardware mounted read-write: the kernel cache, device tree, iBoot and
+/// root hash, each a new file under the Preboot directory of the ticket's
+/// hash written by one `write` and closed ([`fsops::write_new_file`]), then
+/// write_ticket's AP ticket there, its symbolic link in the firmware
+/// directory and its copy on Hardware. The /mnt1 `stat`s and the
+/// `access`es only read.
+fn install_kernel_cache(nx: &mut Nx<'_>, v: Volumes, boot: &BootObjects, pushes: &dyn Fn(u64) -> Result<fsops::Pushes, String>, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    let p = nsih();
+    let dir = |nx: &mut Nx<'_>, vol: usize, path: &str| -> Result<u64, String> {
+        let mut d = ROOT_INO;
+        for c in path.split('/') {
+            d = fsops::lookup(nx, vol, d, c)?.ok_or_else(|| format!("not implemented: install_kernel_cache with no {path} (its mkdir chain)"))?;
+        }
+        Ok(d)
+    };
+    let kc = dir(nx, v.preboot, &format!("{p}/System/Library/Caches/com.apple.kernelcaches"))?;
+    fsops::write_new_file(nx, v.preboot, kc, "kernelcache", 0o644, &img4(&boot.kernelcache, &TICKET), pushes, now)?;
+    let fw = dir(nx, v.preboot, &format!("{p}/usr/standalone/firmware"))?;
+    fsops::write_new_file(nx, v.preboot, fw, "devicetree.img4", 0o644, &img4(&boot.devicetree, &TICKET), pushes, now)?;
+    fsops::write_new_file(nx, v.preboot, fw, "iBoot.img4", 0o644, &img4(&boot.iboot, &TICKET), pushes, now)?;
+    fsops::write_new_file(nx, v.preboot, fw, "root_hash.img4", 0o644, &img4(&boot.root_hash, &TICKET), pushes, now)?;
+    // write_ticket (0x1000303d8 → ramrod_ticket_write_explicit 0x1000667a4):
+    // the ticket by a plain open(O_WRONLY | O_CREAT | O_TRUNC, 0644), its
+    // link (symlink(2) by root under umask 0: ACCESSPERMS, the parent's
+    // group) to /private/preboot's path, and the Hardware copy, not linked.
+    let caches = dir(nx, v.preboot, &format!("{p}/System/Library/Caches"))?;
+    fsops::write_new_file(nx, v.preboot, caches, "apticket.der", 0o644, &TICKET, pushes, now)?;
+    let gid = u32::from_le_bytes(fsops::inode(nx, v.preboot, fw)?[0x4c..0x50].try_into().unwrap());
+    fsops::symlink(nx, v.preboot, fw, "apticket.der", &format!("/private/preboot/{p}/System/Library/Caches/apticket.der"), 0o777, 0, gid, now)?.map_err(|e| format!("symlink apticket.der: errno {e}"))?;
+    let hw = dir(nx, v.hardware, "FactoryData/System/Library/Caches")?;
+    fsops::write_new_file(nx, v.hardware, hw, "apticket.der", 0o644, &TICKET, pushes, now)?;
+    Ok(())
+}
+
+/// What decides how XNU's cluster layer pushes a large file's data that
+/// only the device answers.
+pub const CLUSTER_STAND_IN: &str = "how the cluster layer pushes install_kernel_cache's large files (drafts/s26/re-cluster.md): the main namespace's limit table index (the byte at its object's +0x1f0) that sets IOMaximumByteCountWrite, and the controller's IOMinimumSaturationByteCount, throttling and any syncer push, which only move the pushes in time (stand-in: the table's type-1 limits, 1 MiB, so 1 MiB clusters and block maps; the write-behind leaving its last four clusters to the close, the pushes ordered by offset; measure the kernelcache's file extents on the device's Preboot)";
+
+/// The pushes of one `write(2)` of `n` bytes from offset 0 into a new file
+/// on a disk0 volume (drafts/s26/re-cluster.md): the mount's I/O
+/// attributes from the volume node's limits (vfs_init_io_attributes X
+/// 0xfffffff0073742f4: Wc the byte count, or the block count's bytes when
+/// fewer, 64 MiB with neither; the segment count, else Wc / 16 KiB, at
+/// most 0xffff), the cluster size C = cluster_max_io_size (X
+/// 0xfffffff00735ee9c: min(segments, 4096) pages or Wc, a 16 KiB multiple,
+/// at least 1 MiB) and the block-map length M (Wc to a 16 KiB multiple);
+/// cluster_write_copy files the data in clusters of C up to the 16 KiB
+/// page end, each pushed as block maps of at most M; with MAX_CLUSTERS 4,
+/// the write-behind pushes the lowest cluster each time a fifth is added,
+/// so all but the last four go during the write and the close's push takes
+/// those in order. Block maps are clipped at the file's hole end (round_up
+/// to the volume's block), where APFS stops allocating.
+fn cluster_pushes(n: u64) -> Result<fsops::Pushes, String> {
+    const PAGE: u64 = 16 << 10;
+    const MAX_CLUSTERS: usize = 4;
+    let bs = u64::from(storage::nvme().block_size);
+    let (w, b, sg) = crate::darwin::storagestack::disk0_write_limits();
+    let mut wc = if w != 0 { w.min(u64::from(u32::MAX)) } else { 64 << 20 };
+    if b != 0 && (b * bs).min(u64::from(u32::MAX)) < wc {
+        wc = (b * bs).min(u64::from(u32::MAX));
+    }
+    let sc = if sg != 0 { sg.min(0xffff) } else { (wc / PAGE).min(0xffff) };
+    let c = ((sc.min(4096) * PAGE).min(wc) & !(PAGE - 1)).max(1 << 20);
+    let m = match wc & !(PAGE - 1) {
+        0 => PAGE,
+        x => x,
+    };
+    let end16 = n.div_ceil(PAGE) * PAGE;
+    let hole = n.div_ceil(bs) * bs;
+    let clusters = end16.div_ceil(c);
+    let mut maps = Vec::new();
+    let mut before_end = 0;
+    for k in 0..clusters {
+        let (start, stop) = (k * c, ((k + 1) * c).min(end16));
+        let mut off = start;
+        while off < stop {
+            let len = m.min(stop - off);
+            if off >= hole {
+                return Err(format!("not implemented: a block map past a file's hole end ({off:#x} of {n} bytes)"));
+            }
+            maps.push((off, len.min(hole - off)));
+            off += len;
+        }
+        if (k as usize) + MAX_CLUSTERS < clusters as usize {
+            before_end = maps.len();
+        }
+    }
+    Ok(fsops::Pushes { maps, before_end })
+}
+
+/// AppleKeyStore's map for the system data volume (AKS 0x308d0, 35
+/// entries; drafts/s14/restored/aks_bootstrap_map.txt): path, flags (1:
+/// set the class on a directory, 8: skipped), mode, owner and group as the
+/// ramdisk's /etc/master.passwd and /etc/group name them (root and wheel
+/// 0, daemon 1, _securityd 64, _wireless 25, _networkd 24, mobile 501;
+/// drafts/s26/re-aks-data.md 2.5), class. The flags-0x0a entries are left
+/// out: skipped.
+const SYSTEM_MAP: [(&str, u32, u16, u32, u32, u32); 27] = [
+    ("/keybags", 0x01, 0o700, 0, 0, 4),
+    ("/logs", 0x01, 0o755, 0, 0, 4),
+    ("/logs/AppleSupport", 0x01, 0o755, 0, 0, 4),
+    ("/logs/BurnIn", 0x05, 0o755, 0, 0, 4),
+    ("/log", 0x01, 0o755, 0, 0, 4),
+    ("/log/com.apple.xpc.launchd", 0x01, 0o755, 0, 0, 4),
+    ("/MobileSoftwareUpdate", 0x01, 0o755, 0, 0, 4),
+    ("/tmp", 0x01, 0o1777, 0, 0, 4),
+    ("/Keychains", 0x01, 0o755, 64, 0, 4),
+    ("/preferences", 0x01, 0o755, 0, 0, 4),
+    ("/vm", 0x01, 0o755, 0, 0, 4),
+    ("/run", 0x01, 0o775, 0, 1, 4),
+    ("/db", 0x01, 0o755, 0, 0, 4),
+    ("/db/com.apple.xpc.launchd", 0x01, 0o755, 0, 0, 4),
+    ("/wireless", 0x05, 0o755, 25, 25, 4),
+    ("/Managed Preferences", 0x01, 0o755, 0, 0, 4),
+    ("/networkd", 0x01, 0o755, 24, 24, 4),
+    ("/root", 0x01, 0o755, 0, 0, 4),
+    ("/root/Library", 0x00, 0o755, 0, 0, 0),
+    ("/root/Library/Logs", 0x01, 0o755, 0, 0, 4),
+    ("/root/Library/Preferences", 0x01, 0o755, 0, 0, 4),
+    ("/root/Library/Lockdown", 0x01, 0o700, 0, 0, 4),
+    ("/root/Library/Caches", 0x05, 0o700, 0, 0, 4),
+    ("/containers", 0x02, 0o755, 0, 0, 0),
+    ("/MobileAsset", 0x01, 0o755, 0, 0, 4),
+    ("/MobileDevice/ProvisioningProfiles", 0x01, 0o755, 0, 0, 4),
+    ("/Managed Preferences/mobile", 0x01, 0o755, 501, 501, 4),
+];
+
+/// fixup_var's `aks_bootstrap_fs("/mnt2", 1)` (AKS 0x13b1c; drafts/s26/
+/// re-aks-data.md 2-4), after `MKBKeyBagCreateSystem`, which writes nothing
+/// with enhanced APFS: with no /root/.bootstrapped, each system map entry in
+/// order (the mobile map is skipped with enhanced APFS): a missing path made
+/// by mkpath_np (missing intermediates by mkdir 0777 with no owner or class
+/// change, then the entry's mkdir with its mode masked to 0777), chmod to the
+/// entry's mode when it is 0x200 or more, chown to its owner and group; then
+/// a directory whose entry has flag 1 given the entry's class when its
+/// stored class differs. Then /root/.bootstrapped made by open(O_WRONLY |
+/// O_CREAT, 0644), which takes /root's class, and closed.
+fn aks_bootstrap_fs(nx: &mut Nx<'_>, data: usize, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    use fsops::SetAttr;
+    if let Some(root) = fsops::lookup(nx, data, ROOT_INO, "root")? {
+        if fsops::lookup(nx, data, root, ".bootstrapped")?.is_some() {
+            return Err("not implemented: aks_bootstrap_fs on a bootstrapped data volume".into());
+        }
+    }
+    let gid_of = |nx: &mut Nx<'_>, ino: u64| -> Result<u32, String> { Ok(u32::from_le_bytes(fsops::inode(nx, data, ino)?[0x4c..0x50].try_into().unwrap())) };
+    for (path, flags, mode, uid, gid, class) in SYSTEM_MAP {
+        let comps: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+        let mut dir = ROOT_INO;
+        let mut made = false;
+        for (i, c) in comps.iter().enumerate() {
+            dir = match fsops::lookup(nx, data, dir, c)? {
+                Some(x) => x,
+                None => {
+                    let last = i + 1 == comps.len();
+                    let m = if last { mode & 0o777 } else { 0o777 };
+                    let g = gid_of(nx, dir)?;
+                    let d = fsops::mkdir(nx, data, dir, c, m, 0, g, now)?.map_err(|e| format!("mkdir /mnt2{path}: errno {e}"))?;
+                    made |= last;
+                    d
+                }
+            };
+        }
+        if made {
+            if mode >= 0x200 {
+                fsops::setattr(nx, data, dir, SetAttr { mode: Some(mode), ..Default::default() }, now)?;
+            }
+            fsops::setattr(nx, data, dir, SetAttr { uid: Some(uid), gid: Some(gid), ..Default::default() }, now)?;
+        }
+        let v = fsops::inode(nx, data, dir)?;
+        if u16::from_le_bytes([v[0x50], v[0x51]]) & 0o170000 != 0o040000 {
+            return Err(format!("not implemented: a bootstrap map path that is not a directory (/mnt2{path})"));
+        }
+        if flags & 1 != 0 && u32::from_le_bytes(v[0x3c..0x40].try_into().unwrap()) != class {
+            fsops::set_dir_class(nx, data, dir, class, now)?;
+        }
+    }
+    let root = fsops::lookup(nx, data, ROOT_INO, "root")?.ok_or("no /mnt2/root after the bootstrap map")?;
+    let g = gid_of(nx, root)?;
+    fsops::create(nx, data, root, ".bootstrapped", 0o644, 0, g, now)?.map_err(|e| format!("create /mnt2/root/.bootstrapped: errno {e}"))?;
+    Ok(())
 }
 
 /// The mounts await_asr_and_retry makes after apfs_invert: xART
@@ -533,7 +1238,7 @@ mod tests {
         let len = f.metadata().unwrap().len();
         let image = std::sync::Arc::new(crate::darwin::udif::Udif::open(std::sync::Arc::new(super::super::HostFile(f, len))).unwrap());
         let partition = image.partition("Apple_APFS").unwrap();
-        let os = OsImage { image: std::sync::Arc::clone(&image), partition };
+        let os = OsImage { image: std::sync::Arc::clone(&image), partition, boot: None };
         let size = storage::disk0_bytes();
         let dir = std::path::Path::new(&dir);
         let disk_path = dir.join(format!("gex-disk0-asr-{}", std::process::id()));
@@ -614,7 +1319,7 @@ mod tests {
         let len = f.metadata().unwrap().len();
         let image = std::sync::Arc::new(crate::darwin::udif::Udif::open(std::sync::Arc::new(super::super::HostFile(f, len))).unwrap());
         let partition = image.partition("Apple_APFS").unwrap();
-        let os = OsImage { image: std::sync::Arc::clone(&image), partition };
+        let os = OsImage { image: std::sync::Arc::clone(&image), partition, boot: None };
         let size = storage::disk0_bytes();
         let dir = std::path::Path::new(&dir);
         let disk_path = dir.join(format!("gex-inv-disk-{}", std::process::id()));
@@ -744,7 +1449,7 @@ mod tests {
         let len = f.metadata().unwrap().len();
         let image = std::sync::Arc::new(crate::darwin::udif::Udif::open(std::sync::Arc::new(super::super::HostFile(f, len))).unwrap());
         let partition = image.partition("Apple_APFS").unwrap();
-        let os = OsImage { image: std::sync::Arc::clone(&image), partition };
+        let os = OsImage { image: std::sync::Arc::clone(&image), partition, boot: None };
         let size = storage::disk0_bytes();
         let dir = std::path::Path::new(&dir);
         let disk_path = dir.join(format!("gex-reap-disk-{}", std::process::id()));
@@ -807,7 +1512,7 @@ mod tests {
         let len = f.metadata().unwrap().len();
         let image = std::sync::Arc::new(crate::darwin::udif::Udif::open(std::sync::Arc::new(super::super::HostFile(f, len))).unwrap());
         let partition = image.partition("Apple_APFS").unwrap();
-        let os = OsImage { image: std::sync::Arc::clone(&image), partition };
+        let os = OsImage { image: std::sync::Arc::clone(&image), partition, boot: None };
         let size = storage::disk0_bytes();
         let dir = std::path::Path::new(&dir);
         let disk_path = dir.join(format!("gex-rm-disk-{}", std::process::id()));
@@ -956,6 +1661,649 @@ mod tests {
             assert_eq!(a, b, "allocation {i} (paddr, got, roving)");
         }
         assert_eq!(zones_ours, zones_theirs);
+    }
+
+    /// The encrypted Data and User volumes after the invert (GEX_TEST_UDIF,
+    /// GEX_TEST_SCRATCH, GEX_TEST_FSCK): Data's superblock as the kernel's
+    /// volumeCreate and read-write mount leave it (drafts/s16/re-protected.md
+    /// 2.1, drafts/s21/re-data.md 1), the pfkur thread's temporary inode,
+    /// User's epoch, the container keybag's four entries; the device's and
+    /// the host's fsck_apfs with -M (their keybag read needs the device's
+    /// crypto I/O, drafts/s21/re-data.md 4), and the host's on a copy
+    /// presenting the encrypted volumes as unencrypted, which checks their
+    /// trees.
+    #[test]
+    fn data_volume_is_made_as_the_kernel_makes_it() {
+        use crate::darwin::apfsread::{Container, Medium, Omap};
+        let (Ok(dmg), Ok(dir), Ok(fsck)) = (std::env::var("GEX_TEST_UDIF"), std::env::var("GEX_TEST_SCRATCH"), std::env::var("GEX_TEST_FSCK")) else { return };
+        let f = std::fs::File::open(&dmg).unwrap();
+        let len = f.metadata().unwrap().len();
+        let image = std::sync::Arc::new(crate::darwin::udif::Udif::open(std::sync::Arc::new(super::super::HostFile(f, len))).unwrap());
+        let partition = image.partition("Apple_APFS").unwrap();
+        let os = OsImage { image: std::sync::Arc::clone(&image), partition, boot: None };
+        let size = storage::disk0_bytes();
+        let dir = std::path::Path::new(&dir);
+        let disk_path = dir.join(format!("gex-data-disk-{}", std::process::id()));
+        let ctr_path = dir.join(format!("gex-data-ctr-{}", std::process::id()));
+        let f = std::fs::OpenOptions::new().create(true).truncate(true).read(true).write(true).open(&disk_path).unwrap();
+        f.set_len(size).unwrap();
+        let disk = std::sync::Arc::new(super::super::HostFile(f, size));
+        let (base, psize) = storage::partition_extent();
+        let mut t = 1_700_000_000_000_000_000u64;
+        let mut now = move || {
+            t += 1000;
+            t
+        };
+        build_disk0(disk.clone(), &mut now, Some(&os)).unwrap();
+        disk.0.sync_all().unwrap();
+        let _ = std::fs::remove_file(&disk_path);
+        copy_container_from(&disk, &ctr_path, base, psize);
+        drop(disk);
+        let open = || std::sync::Arc::new(Container::open(std::sync::Arc::new(super::super::HostFile(std::fs::File::open(&ctr_path).unwrap(), psize))).unwrap());
+        let c = open();
+        let q = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+        let com = c.omap().unwrap();
+        let sb_paddr = com.lookup(&c, c.nx.fs_oid[1], c.xid()).unwrap().unwrap().paddr;
+        let sb = c.read_raw(sb_paddr).unwrap();
+        assert_eq!((q(&sb, 0x28), q(&sb, 0x30), q(&sb, 0x38), q(&sb, 0x108), q(&sb, 0x58)), (2, 0xc, 0x2c8, 0x100, 7 + 156_250));
+        assert_eq!(&sb[0x60..0x74], &[5, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 0xcd, 0x01, 0x48, 0x15, 1, 0, 0, 0][..]);
+        // The mount: the epoch, then the pfkur thread's inode 0x10; then
+        // /keybags (0x11), usersession.kb (0x12) and the overprovisioning
+        // file (0x13: one contiguous unwritten extent of 156,250 blocks,
+        // trimmed when the device answers DK_FEATURE_UNMAP).
+        assert_eq!((q(&sb, 0xb0), q(&sb, 0x3d8), q(&sb, 0xb8), u32::from_le_bytes(sb[0x428..0x42c].try_into().unwrap())), (0x14, 0x10, 2, 0x10));
+        let pfkur = c.read_raw(q(&sb, 0x418)).unwrap();
+        assert_eq!((u32::from_le_bytes(pfkur[24..28].try_into().unwrap()), u32::from_le_bytes(pfkur[28..32].try_into().unwrap())), (0x4000_0002, 0x20));
+        let usb = c.read_raw(com.lookup(&c, c.nx.fs_oid[6], c.xid()).unwrap().unwrap().paddr).unwrap();
+        assert_eq!((q(&usb, 0x38), q(&usb, 0x108), q(&usb, 0xb0), q(&usb, 0x3d8), u16::from_le_bytes([usb[0x3c4], usb[0x3c5]])), (0x388, 0, 0x48, 0x10, 2));
+        // The template copy and the AKS bootstrap (drafts/s23/re-user-copy.md
+        // 4): 18 + 34 directories, 4 files.
+        assert_eq!((q(&usb, 0xb8), q(&usb, 0xc0)), (4, 52));
+        assert_ne!(q(&usb, 0x448), 0);
+        // The volume's object map: one leaf, the root node's mapping (the
+        // reader refuses an encrypted mapping, so read it raw).
+        let raw = |blk: u64| {
+            let mut b = vec![0u8; 4096];
+            super::super::HostFile(std::fs::File::open(&ctr_path).unwrap(), psize).read_at(blk * 4096, &mut b).unwrap();
+            b
+        };
+        let vom = Omap::open(&c, q(&sb, 0x80)).unwrap();
+        let leaf = raw(vom.tree.root_oid);
+        assert_eq!(u32::from_le_bytes(leaf[0x24..0x28].try_into().unwrap()), 1);
+        let ko = u16::from_le_bytes([leaf[0x38], leaf[0x39]]) as usize;
+        let vo = u16::from_le_bytes([leaf[0x3a], leaf[0x3b]]) as usize;
+        let toc_len = u16::from_le_bytes([leaf[0x2a], leaf[0x2b]]) as usize;
+        assert_eq!(q(&leaf, 0x38 + toc_len + ko), q(&sb, 0x88));
+        let vat = 4096 - 0x28 - vo;
+        assert_eq!(u32::from_le_bytes(leaf[vat..vat + 4].try_into().unwrap()), 4);
+        let rootb = raw(q(&leaf, vat + 8));
+        assert_eq!(u32::from_le_bytes(rootb[24..28].try_into().unwrap()), 0x1000_0002);
+        // The temporary inode among the root node's records: its name in
+        // the private directory, mode 0100600, class 0.
+        assert_eq!(u16::from_le_bytes([rootb[0x22], rootb[0x23]]), 0, "Data's tree in one leaf");
+        let toc = u16::from_le_bytes([rootb[0x2a], rootb[0x2b]]) as usize;
+        let recs: Vec<(Vec<u8>, Vec<u8>)> = (0..u32::from_le_bytes(rootb[0x24..0x28].try_into().unwrap()) as usize)
+            .map(|i| {
+                let e = |o: usize| u16::from_le_bytes([rootb[0x38 + 8 * i + o], rootb[0x38 + 8 * i + o + 1]]) as usize;
+                let k = 0x38 + toc + e(0);
+                let v = 4096 - 0x28 - e(4);
+                (rootb[k..k + e(2)].to_vec(), rootb[v..v + e(6)].to_vec())
+            })
+            .collect();
+        let name = b"tmp-ino-xattr-dstream-0x0-0x10\0";
+        let drec = recs.iter().find(|(k, _)| q(k, 0) == (3 | 9 << 60) && k.ends_with(name)).expect("the temporary inode's entry in the private directory");
+        assert_eq!(q(&drec.1, 0), 0x10);
+        let ino = &recs.iter().find(|(k, _)| k[..] == (0x10u64 | 3 << 60).to_le_bytes()).expect("the temporary inode").1;
+        assert_eq!((q(ino, 0), q(ino, 0x30), u32::from_le_bytes(ino[0x3c..0x40].try_into().unwrap()), u16::from_le_bytes([ino[0x50], ino[0x51]])), (3, 0x8000, 0, 0o100600));
+        assert_eq!(q(&ino[ino.len() - 0x28..], 0x10), u64::MAX, "the stream's default crypto identifier");
+        assert!(recs.iter().any(|(k, v)| k[..] == (0x10u64 | 6 << 60).to_le_bytes() && v[..4] == 1u32.to_le_bytes()));
+        let op = &recs.iter().find(|(k, _)| k[..] == (0x13u64 | 3 << 60).to_le_bytes()).expect("the overprovisioning file").1;
+        let trimmed = if crate::darwin::storagestack::container_unmap() { 0x800 } else { 0 };
+        assert_eq!((q(op, 0x30), u32::from_le_bytes(op[0x3c..0x40].try_into().unwrap())), (0x800_8000 | trimmed, 3));
+        let fx = &recs.iter().find(|(k, _)| k.len() == 16 && q(k, 0) == (0x13 | 8 << 60)).expect("its extent").1;
+        assert_eq!((q(fx, 0), q(fx, 16)), (0x0300_0000_2625_a000, q(fx, 8)));
+        // The keybag: its block from the checkpoint's nx_keylocker.
+        let latest = (0..u64::from(c.nx.xp_desc_blocks & 0x7fff_ffff)).map(|i| raw(c.nx.xp_desc_base + i)).filter(|b| &b[32..36] == b"NXSB").max_by_key(|b| q(b, 16)).unwrap();
+        let (kb, kn) = (q(&latest, 0x510), q(&latest, 0x518));
+        assert_eq!(kn, 1);
+        let kbb = c.read_raw(kb).unwrap();
+        assert_eq!(u32::from_le_bytes(kbb[24..28].try_into().unwrap()), 0x6b65_7973);
+        let n = u16::from_le_bytes([kbb[0x22], kbb[0x23]]);
+        let mut at = 0x30;
+        let mut ents = Vec::new();
+        for _ in 0..n {
+            let len = u16::from_le_bytes([kbb[at + 0x12], kbb[at + 0x13]]) as usize;
+            ents.push((kbb[at..at + 16].to_vec(), u16::from_le_bytes([kbb[at + 0x10], kbb[at + 0x11]])));
+            at += (0x18 + len).div_ceil(16) * 16;
+        }
+        let (d, u) = (sb[0xf0..0x100].to_vec(), usb[0xf0..0x100].to_vec());
+        assert_eq!(ents, vec![(d.clone(), 2), (d, 10), (u.clone(), 2), (u.clone(), 0xd), (u, 0xf8)]);
+        drop(c);
+        let run = |args: &[&str], tool: &str| std::process::Command::new(tool).args(args).arg(&ctr_path).output().unwrap();
+        let dev = run(&["-n", "-W", "-s", "-M"], &fsck);
+        let host = run(&["-n", "-s", "-M"], "/sbin/fsck_apfs");
+        let (orphans, unnamed) = unencrypted_view(&ctr_path, psize);
+        let host_trees = run(&["-n", "-s"], "/sbin/fsck_apfs");
+        assert!(dev.status.success(), "device fsck -M: {}{}", String::from_utf8_lossy(&dev.stdout), String::from_utf8_lossy(&dev.stderr));
+        assert!(host.status.success(), "host fsck -M: {}{}", String::from_utf8_lossy(&host.stdout), String::from_utf8_lossy(&host.stderr));
+        let out = String::from_utf8_lossy(&host_trees.stdout).to_string() + &String::from_utf8_lossy(&host_trees.stderr);
+        assert!(!out.contains("skipping the fsroot tree"), "{out}");
+        let bad: Vec<&str> = out.lines().filter(|l| (l.contains("error") || l.contains("warning")) && !view_says(l, &unnamed)).collect();
+        assert!(bad.is_empty(), "{out}");
+        assert_eq!(out.lines().filter(|l| l.starts_with("warning: overallocation detected")).count(), orphans.len(), "{out}");
+        assert!(out.contains("appears to be OK") && out.contains(&format!("{:x}+1", kb)), "{out}");
+        // User's tree through the view (drafts/s23/re-user-copy.md 4), its
+        // expanded-records and unwritten-extents flags cleared for gex's
+        // reader, which refuses them (User has no extents, and the records
+        // read here are laid out alike).
+        {
+            use std::os::unix::fs::FileExt;
+            let c = open();
+            let at = c.omap().unwrap().lookup(&c, c.nx.fs_oid[6], c.xid()).unwrap().unwrap().paddr;
+            let f = std::fs::OpenOptions::new().read(true).write(true).open(&ctr_path).unwrap();
+            let mut b = vec![0u8; 4096];
+            f.read_exact_at(&mut b, at * 4096).unwrap();
+            let inc = q(&b, 0x38) & !0x280;
+            b[0x38..0x40].copy_from_slice(&inc.to_le_bytes());
+            super::super::set_checksum(&mut b);
+            f.write_all_at(&b, at * 4096).unwrap();
+        }
+        let c = open();
+        let u = c.volume(6).unwrap().unwrap();
+        let at = |p: &str| u.resolve(p).unwrap().unwrap_or_else(|| panic!("no {p} on User"));
+        let root = at("/");
+        assert_eq!((root.nchildren_or_nlink, root.uncompressed_size, root.owner, root.group, root.mode), (7, 5, 501, 501, 0o40755));
+        let lib = at("/Library");
+        assert_eq!((lib.nchildren_or_nlink, lib.uncompressed_size, lib.default_protection_class), (38, 37, 0));
+        let caches = at("/Library/Caches");
+        assert_eq!((caches.default_protection_class, caches.internal_flags, caches.mode), (4, 0x8008, 0o40755));
+        let cd = at("/Library/Logs/CoreDuet");
+        assert_eq!((cd.default_protection_class, cd.internal_flags), (4, 0x8000));
+        let fwd = at("/.forward");
+        assert_eq!((fwd.bsd_flags, fwd.internal_flags, fwd.uncompressed_size, fwd.default_protection_class, fwd.owner, fwd.group), (0x20, 0x4_8000, 10, 3, 501, 501));
+        assert!(fwd.dstream.is_none());
+        let mut buf = vec![0u8; 16];
+        assert_eq!(u.read_file(&fwd, 0, &mut buf).unwrap(), 10);
+        assert_eq!(&buf[..10], b"/dev/null\n");
+        let gp = at("/Library/Preferences/.GlobalPreferences.plist");
+        assert_eq!((gp.uncompressed_size, gp.default_protection_class), (89, 3));
+        let bs = at("/.bootstrapped");
+        assert_eq!((bs.owner, bs.group, bs.mode, bs.default_protection_class), (0, 501, 0o100644, 3));
+        assert_eq!(u.resolve("/Library/mad/activation_records").unwrap().map(|i| i.oid), Some(0x3c));
+        drop(c);
+        if std::env::var("GEX_TEST_KEEP").is_err() {
+            let _ = std::fs::remove_file(&ctr_path);
+        }
+    }
+
+    /// The container partition of `disk` (at `base`, `psize` bytes) copied
+    /// to the container file `ctr`, keeping holes.
+    fn copy_container_from(disk: &super::super::HostFile, ctr: &std::path::Path, base: u64, psize: u64) {
+        use crate::darwin::apfsread::Medium;
+        use std::os::unix::fs::FileExt;
+        let _ = std::fs::remove_file(ctr);
+        let out = std::fs::OpenOptions::new().create(true).truncate(true).write(true).open(ctr).unwrap();
+        out.set_len(psize).unwrap();
+        let mut b = vec![0u8; 1 << 20];
+        let mut off = 0;
+        while off < psize {
+            let n = (psize - off).min(1 << 20) as usize;
+            disk.read_at(base + off, &mut b[..n]).unwrap();
+            if b[..n].iter().any(|&x| x != 0) {
+                out.write_all_at(&b[..n], off).unwrap();
+            }
+            off += n as u64;
+        }
+    }
+
+    /// The container file `ctr` (`psize` bytes) changed in place into a
+    /// view that presents its plaintext encrypted volumes as unencrypted,
+    /// for the host's fsck_apfs to check their trees (it skips an
+    /// encrypted volume's): no container keybag, each encrypted volume's
+    /// fs_flags 1 with no per-file-key or secondary-tree features and no
+    /// pfkur tree or secondary root named, its object map's crypto flags
+    /// cleared and its objects' OBJ_ENCRYPTED. The blocks the view leaves
+    /// with nothing naming them (the keybag's and each pfkur tree's), and
+    /// the virtual objects mapped with nothing naming them (each secondary
+    /// root).
+    fn unencrypted_view(ctr: &std::path::Path, psize: u64) -> (Vec<u64>, Vec<u64>) {
+        use crate::darwin::apfsread::{Container, Medium, Omap};
+        use std::os::unix::fs::FileExt;
+        let q = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+        let c = Container::open(std::sync::Arc::new(super::super::HostFile(std::fs::File::open(ctr).unwrap(), psize))).unwrap();
+        let file = super::super::HostFile(std::fs::File::open(ctr).unwrap(), psize);
+        let raw = |blk: u64| {
+            let mut b = vec![0u8; 4096];
+            file.read_at(blk * 4096, &mut b).unwrap();
+            b
+        };
+        let f = std::fs::OpenOptions::new().read(true).write(true).open(ctr).unwrap();
+        let rw = |blk: u64, edit: &dyn Fn(&mut Vec<u8>)| {
+            let mut b = vec![0u8; 4096];
+            f.read_exact_at(&mut b, blk * 4096).unwrap();
+            edit(&mut b);
+            super::super::set_checksum(&mut b);
+            f.write_all_at(&b, blk * 4096).unwrap();
+        };
+        let latest = (0..u64::from(c.nx.xp_desc_blocks & 0x7fff_ffff)).map(|i| (c.nx.xp_desc_base + i, raw(c.nx.xp_desc_base + i))).filter(|(_, b)| &b[32..36] == b"NXSB").max_by_key(|(_, b)| q(b, 16)).unwrap();
+        let mut orphans = Vec::new();
+        let mut unnamed = Vec::new();
+        if q(&latest.1, 0x510) != 0 {
+            orphans.push(q(&latest.1, 0x510));
+        }
+        for blk in [0, latest.0] {
+            rw(blk, &|b| b[0x510..0x520].fill(0));
+        }
+        let com = c.omap().unwrap();
+        for &oid in c.nx.fs_oid.iter().filter(|&&o| o != 0) {
+            let sb_paddr = com.lookup(&c, oid, c.xid()).unwrap().unwrap().paddr;
+            let sb = raw(sb_paddr);
+            if q(&sb, 0x108) & 1 != 0 {
+                continue;
+            }
+            if q(&sb, 0x418) != 0 {
+                orphans.push(q(&sb, 0x418));
+            }
+            if q(&sb, 0x448) != 0 {
+                unnamed.push(q(&sb, 0x448));
+            }
+            rw(sb_paddr, &|b| {
+                b[0x108..0x110].copy_from_slice(&1u64.to_le_bytes());
+                let inc = q(b, 0x38) & !0x140;
+                b[0x38..0x40].copy_from_slice(&inc.to_le_bytes());
+                b[0x418..0x420].fill(0);
+                b[0x448..0x450].fill(0);
+            });
+            let vom = Omap::open(&c, q(&sb, 0x80)).unwrap();
+            let leaf = raw(vom.tree.root_oid);
+            assert_eq!(u16::from_le_bytes([leaf[0x22], leaf[0x23]]), 0, "a volume object map of more than one node");
+            let nk = u32::from_le_bytes(leaf[0x24..0x28].try_into().unwrap()) as usize;
+            let paddr_of = |i: usize| {
+                let vo = u16::from_le_bytes([leaf[0x38 + 4 * i + 2], leaf[0x38 + 4 * i + 3]]) as usize;
+                q(&leaf, 4096 - 0x28 - vo + 8)
+            };
+            let ids: Vec<u64> = (0..nk).flat_map(|i| per_file_ids(&raw(paddr_of(i)))).collect();
+            for i in 0..nk {
+                let vo = u16::from_le_bytes([leaf[0x38 + 4 * i + 2], leaf[0x38 + 4 * i + 3]]) as usize;
+                let at = 4096 - 0x28 - vo;
+                let fl = u32::from_le_bytes(leaf[at..at + 4].try_into().unwrap());
+                let paddr = q(&leaf, at + 8);
+                let kstart = 0x38 + u16::from_le_bytes([leaf[0x2a], leaf[0x2b]]) as usize;
+                let oid = q(&leaf, kstart + u16::from_le_bytes([leaf[0x38 + 4 * i], leaf[0x38 + 4 * i + 1]]) as usize);
+                assert!(fl & 0x20 == 0 || unnamed.contains(&oid), "a secondary-root mapping of an object the superblock does not name");
+                let _ = oid;
+                rw(paddr, &|b| {
+                    let ty = u32::from_le_bytes(b[24..28].try_into().unwrap()) & !0x1000_0000;
+                    b[24..28].copy_from_slice(&ty.to_le_bytes());
+                    per_file_ids_cleared(b, &ids);
+                });
+            }
+            rw(vom.tree.root_oid, &|b| {
+                for i in 0..nk {
+                    let vo = u16::from_le_bytes([b[0x38 + 4 * i + 2], b[0x38 + 4 * i + 3]]) as usize;
+                    let at = 4096 - 0x28 - vo;
+                    let fl = u32::from_le_bytes(b[at..at + 4].try_into().unwrap()) & !0x724;
+                    b[at..at + 4].copy_from_slice(&fl.to_le_bytes());
+                }
+            });
+        }
+        (orphans, unnamed)
+    }
+
+    /// In the view, a one-leaf file-system tree's per-file crypto
+    /// identifiers (a data stream's default crypto identifier, the VEK's 4
+    /// or a per-file key's, and the extents' crypto field naming a per-file
+    /// key's crypto-state record or the block as the VEK's tweak) set to
+    /// 0, as on an unencrypted volume;
+    /// the records stay.
+    /// The per-file crypto identifiers an fs-tree leaf's crypto-state keys
+    /// name (all but the VEK's, 4).
+    fn per_file_ids(b: &[u8]) -> Vec<u64> {
+        let q = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+        if u16::from_le_bytes([b[0x22], b[0x23]]) != 0 || u32::from_le_bytes(b[28..32].try_into().unwrap()) != 0xe {
+            return Vec::new();
+        }
+        let toc = u16::from_le_bytes([b[0x2a], b[0x2b]]) as usize;
+        let n = u32::from_le_bytes(b[0x24..0x28].try_into().unwrap()) as usize;
+        (0..n)
+            .filter_map(|i| {
+                let k = 0x38 + toc + u16::from_le_bytes([b[0x38 + 8 * i], b[0x38 + 8 * i + 1]]) as usize;
+                let key = q(b, k);
+                (key >> 60 == 7 && key & 0x0fff_ffff_ffff_ffff != 4).then_some(key & 0x0fff_ffff_ffff_ffff)
+            })
+            .collect()
+    }
+
+    /// An fs-tree leaf with the per-file identifiers `ids` (and the VEK's
+    /// tweaks) cleared from its file extents and data streams.
+    fn per_file_ids_cleared(b: &mut [u8], ids: &[u64]) {
+        let q = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+        if u16::from_le_bytes([b[0x22], b[0x23]]) != 0 || u32::from_le_bytes(b[28..32].try_into().unwrap()) != 0xe {
+            return;
+        }
+        let toc = u16::from_le_bytes([b[0x2a], b[0x2b]]) as usize;
+        let n = u32::from_le_bytes(b[0x24..0x28].try_into().unwrap()) as usize;
+        // A root node ends with the tree's info.
+        let vend = if u16::from_le_bytes([b[0x20], b[0x21]]) & 1 != 0 { b.len() - 0x28 } else { b.len() };
+        for i in 0..n {
+            let e = |o: usize| u16::from_le_bytes([b[0x38 + 8 * i + o], b[0x38 + 8 * i + o + 1]]) as usize;
+            let (k, v, vl) = (0x38 + toc + e(0), vend - e(4), e(6));
+            let key = q(b, k);
+            match key >> 60 {
+                8 if ids.contains(&q(b, v + 16)) || b[v + 7] & 1 != 0 => {
+                    // A per-file key's identifier, or the physical block as
+                    // the VEK's tweak (FEXT_CRYPTO_ID_IS_TWEAK).
+                    b[v + 7] &= !1;
+                    b[v + 16..v + 24].fill(0);
+                }
+                3 if vl > 0x5c => {
+                    let nx = u16::from_le_bytes([b[v + 0x5c], b[v + 0x5d]]) as usize;
+                    let mut at = v + 0x60 + 4 * nx;
+                    for j in 0..nx {
+                        let d = v + 0x60 + 4 * j;
+                        let size = u16::from_le_bytes([b[d + 2], b[d + 3]]) as usize;
+                        if b[d] == 8 && (ids.contains(&q(b, at + 16)) || q(b, at + 16) == 4) {
+                            b[at + 16..at + 24].fill(0);
+                        }
+                        at += size.div_ceil(8) * 8;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The container keybag's entries (volume UUID, tag, key length) as
+    /// the container file's latest checkpoint names it.
+    fn keybag_entries(ctr: &std::path::Path, psize: u64) -> Vec<(Vec<u8>, u16, usize)> {
+        use crate::darwin::apfsread::{Container, Medium};
+        let q = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+        let file = super::super::HostFile(std::fs::File::open(ctr).unwrap(), psize);
+        let raw = |blk: u64| {
+            let mut b = vec![0u8; 4096];
+            file.read_at(blk * 4096, &mut b).unwrap();
+            b
+        };
+        let c = Container::open(std::sync::Arc::new(super::super::HostFile(std::fs::File::open(ctr).unwrap(), psize))).unwrap();
+        let latest = (0..u64::from(c.nx.xp_desc_blocks & 0x7fff_ffff)).map(|i| raw(c.nx.xp_desc_base + i)).filter(|b| &b[32..36] == b"NXSB").max_by_key(|b| q(b, 16)).unwrap();
+        let kbb = raw(q(&latest, 0x510));
+        assert_eq!(u32::from_le_bytes(kbb[24..28].try_into().unwrap()), 0x6b65_7973);
+        let mut at = 0x30;
+        let mut out = Vec::new();
+        for _ in 0..u16::from_le_bytes([kbb[0x22], kbb[0x23]]) {
+            let len = u16::from_le_bytes([kbb[at + 0x12], kbb[at + 0x13]]) as usize;
+            out.push((kbb[at..at + 16].to_vec(), u16::from_le_bytes([kbb[at + 0x10], kbb[at + 0x11]]), len));
+            at += (0x18 + len).div_ceil(16) * 16;
+        }
+        assert_eq!(u32::from_le_bytes(kbb[0x24..0x28].try_into().unwrap()) as usize, at - 0x20);
+        assert!(kbb[at..].iter().all(|&b| b == 0));
+        out
+    }
+
+    /// Whether a line of the host fsck's output on the unencrypted view is
+    /// one the view itself makes it say: the view's file name, Data's
+    /// crypto-state records (the per-file keys' of version 6.0, K
+    /// 0x6734490) and its sixth counted block (the pfkur tree's) on a
+    /// volume it takes as unencrypted, the unnamed blocks and the unnamed
+    /// secondary roots' mappings.
+    fn view_says(l: &str, unnamed: &[u64]) -> bool {
+        l.contains("not a valid disk name")
+            || l.contains("crypto state object (id ")
+            || (l.contains("crypto state (id ") && l.contains("invalid state.major_version (6)"))
+            || l.split("apfs_fs_alloc_count is not valid (expected ").nth(1).and_then(|r| {
+                let (e, a) = r.trim_end_matches(')').split_once(", actual ")?;
+                Some(e.parse::<u64>().ok()? + 1 == a.parse::<u64>().ok()?)
+            }) == Some(true)
+            || l.contains("overallocation detected on Main device")
+            || (l.contains("orphan mappings found") && l.contains(&format!(" {} orphan", unnamed.len())))
+            || unnamed.iter().any(|o| l.contains(&format!("orphan omap mapping found for oid {o}")) || l.contains(&format!("orphan omap mapping (oid {o} ")))
+    }
+
+    /// Data's read-write mount and unmount on a container of its own
+    /// (GEX_TEST_FSCK: the device's host-runnable fsck_apfs; scratch in
+    /// GEX_TEST_SCRATCH): the clone epoch, the pfkur thread's temporary
+    /// inode (drafts/s23: alloc_tmp_ino_helper's parameters) and the fixup
+    /// thread's transaction at the mount, User's epoch only, the inode gone
+    /// at Data's unmount; the device's and the host's fsck_apfs -M, and the
+    /// host's on the unencrypted view, after each.
+    #[test]
+    fn data_mount_makes_and_unmount_removes_the_pfkur_inode() {
+        let (Ok(dir), Ok(fsck)) = (std::env::var("GEX_TEST_SCRATCH"), std::env::var("GEX_TEST_FSCK")) else { return };
+        let dir = std::path::Path::new(&dir);
+        let path = dir.join(format!("gex-pfkur-{}", std::process::id()));
+        let blocks = 15_625_000u64;
+        let f = std::fs::OpenOptions::new().create(true).truncate(true).read(true).write(true).open(&path).unwrap();
+        f.set_len(blocks * 4096).unwrap();
+        let sink = super::super::HostFile(f, blocks * 4096);
+        let uuid = *b"gex-pfkur-test-1";
+        let fm = container::format(&sink, 4096, blocks, uuid).unwrap();
+        let mut nx = Nx::formatted(&sink, &fm, uuid, Mode::Kernel).unwrap();
+        nx.mount_rw().unwrap();
+        let mut t = 1_700_000_000_000_000_000u64;
+        let mut now = || {
+            t += 1000;
+            t
+        };
+        let q = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+        let kv = key_os_version(RESTORE_BUILD).unwrap();
+        let make = |nx: &mut Nx<'_>, name: &str, role: u16, now: &mut dyn FnMut() -> u64| {
+            let times = VolumeTimes { formatted: now(), root: now(), private: now(), modified: now() };
+            nx.create_volume(&NewVolume { name: name.into(), role, encrypted: true, e_apfs: true, times, uid: 0, gid: 0, key_os_version: kv, size_bytes: None }).unwrap();
+            nx.commit().unwrap();
+        };
+        make(&mut nx, "Data", 0x40, &mut now);
+        fsops::mount_rw(&mut nx, 1, &mut now).unwrap();
+        assert_eq!(nx.pfkur_tmp.get(&1), Some(&0x10));
+        let sb = nx.vol_sb_read(1).unwrap().0.to_vec();
+        assert_eq!((q(&sb, 0xb0), q(&sb, 0x3d8), q(&sb, 0xb8), q(&sb, 0x108)), (0x11, 0x10, 0, 0x100));
+        assert_eq!(fsops::lookup(&mut nx, 1, 3, "tmp-ino-xattr-dstream-0x0-0x10").unwrap(), Some(0x10));
+        make(&mut nx, "User", 0x2, &mut now);
+        fsops::mount_rw(&mut nx, 2, &mut now).unwrap();
+        assert!(!nx.pfkur_tmp.contains_key(&2));
+        let sb = nx.vol_sb_read(2).unwrap().0.to_vec();
+        assert_eq!((q(&sb, 0xb0), q(&sb, 0x3d8)), (0x10, 0x10));
+        // UserManagementLayout's manifest on Data (drafts/s23/re-uml-data.md):
+        // /keybags with the subdirectory count, the class-D file with its
+        // per-file key record, the fsync, the rename, F_BARRIERFSYNC's commit.
+        let keybags = fsops::mkdir(&mut nx, 1, 2, "keybags", 0o700, 0, 0, &mut now).unwrap().unwrap();
+        let ino = fsops::create_protected(&mut nx, 1, keybags, "usersession.kb.writing", 0o644, 0, 4, &mut now).unwrap();
+        let kb = usersession_kb();
+        let w = fsops::write_new_protected(&mut nx, 1, ino, &kb, &mut now).unwrap();
+        fsops::fsync_pending(&mut nx, 1, &w, &mut now).unwrap();
+        let rt = fsops::rename_in_dir(&mut nx, 1, keybags, "usersession.kb.writing", "usersession.kb", ino, &mut now).unwrap();
+        let xid = nx.xid;
+        fsops::barrier_fsync(&mut nx, 1, ino, rt.file, &mut now).unwrap();
+        assert_eq!(nx.xid, xid + 1, "F_BARRIERFSYNC's checkpoint");
+        assert_eq!(nx.jobj_times.iter().map(|(&k, &v)| (k, v)).collect::<Vec<_>>(), vec![((1, keybags), rt.dir)], "/keybags' times stay in memory");
+        {
+            let (t, mut st) = nx.fs_tree(1).unwrap();
+            let recs = t.records(&mut st).unwrap();
+            let get = |k: u64| recs.iter().find(|(kk, _)| kk[..] == k.to_le_bytes()).unwrap().1.clone().unwrap();
+            let root = get(2 | 3 << 60);
+            assert_eq!((u32::from_le_bytes(root[0x38..0x3c].try_into().unwrap()), q(&root, 0x54)), (1, 1));
+            let kd = get(keybags | 3 << 60);
+            assert_eq!((q(&kd, 0x30), u32::from_le_bytes(kd[0x3c..0x40].try_into().unwrap()), u32::from_le_bytes(kd[0x40..0x44].try_into().unwrap()), kd.len()), (0x8008, 0, 3, 0x6c));
+            let f = get(ino | 3 << 60);
+            assert_eq!((q(&f, 0x30), u32::from_le_bytes(f[0x3c..0x40].try_into().unwrap()), u32::from_le_bytes(f[0x40..0x44].try_into().unwrap()), f.len()), (0x8008, 4, 2, 0xa0));
+            assert_eq!((q(&f, 0x18), q(&f, 0x20)), rt.file);
+            let cs = get(ino | 7 << 60);
+            assert_eq!(&cs[..0x10], &[2, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0][..]);
+            let ds = &f[f.len() - 0x28..];
+            assert_eq!((q(ds, 0), q(ds, 8), q(ds, 0x10), q(ds, 0x18)), (kb.len() as u64, 4096, ino, kb.len() as u64));
+        }
+        // configure_data_volumes' keybag rewrites: the user protection of
+        // Data's VEK and AKSVolumeMap's cookie on User, each committed.
+        let (du, uu) = (nx.vol_sb_read(1).unwrap().0[0xf0..0x100].to_vec(), sb[0xf0..0x100].to_vec());
+        let xid = nx.xid;
+        nx.vek_set_protection(1).unwrap();
+        assert_eq!(nx.xid, xid + 1, "the protection's checkpoint");
+        nx.volume_payload_set(2, 0).unwrap();
+        assert_eq!(nx.xid, xid + 2, "the payload's checkpoint");
+        sink.0.sync_all().unwrap();
+        assert_eq!(keybag_entries(&path, blocks * 4096), vec![(du.clone(), 2, 0x28), (du, 10, 0x28), (uu.clone(), 2, 0x28), (uu.clone(), 0xd, 0x28), (uu, 0xf8, 0x28)]);
+        // reserve_overprov_space on Data (drafts/s21/re-overprov.md 4): the
+        // file, its one contiguous unwritten extent of 156,250 blocks, the
+        // commit, the trim's flag.
+        let xid = nx.xid;
+        let ino = fsops::reserve_overprov_space(&mut nx, 1, 64_000_000_000, true, &mut now).unwrap();
+        assert_eq!(nx.xid, xid + 1, "F_FULLFSYNC's checkpoint");
+        let (t, mut st) = nx.fs_tree(1).unwrap();
+        let recs = t.records(&mut st).unwrap();
+        let inode = recs.iter().find(|(k, _)| k[..] == (ino | 3 << 60).to_le_bytes()).unwrap().1.clone().unwrap();
+        assert_eq!((q(&inode, 0x30), u32::from_le_bytes(inode[0x3c..0x40].try_into().unwrap()), u32::from_le_bytes(inode[0x40..0x44].try_into().unwrap())), (0x800_8800, 3, 2));
+        let fext: Vec<_> = recs.iter().filter(|(k, _)| k.len() == 16 && q(k, 0) == (ino | 8 << 60)).map(|(_, v)| v.clone().unwrap()).collect();
+        assert_eq!(fext.len(), 1);
+        assert_eq!((q(&fext[0], 0), q(&fext[0], 16)), (0x0300_0000_2625_a000, q(&fext[0], 8)));
+        let sb = nx.vol_sb_read(1).unwrap().0.to_vec();
+        assert_eq!((q(&sb, 0xb8), q(&sb, 0xe0)), (2, 156_251));
+        // fixup_var's aks_bootstrap_fs("/mnt2") (drafts/s26/re-aks-data.md): its
+        // first entry, /keybags, written from its in-memory object with the
+        // rename's times and class D; then the map's directories, owners,
+        // modes and classes, and /root/.bootstrapped taking /root's class.
+        let before = fsops::inode(&mut nx, 1, keybags).unwrap();
+        let sb0 = nx.vol_sb_read(1).unwrap().0.to_vec();
+        aks_bootstrap_fs(&mut nx, 1, &mut now).unwrap();
+        assert!(nx.jobj_times.is_empty());
+        let kd = fsops::inode(&mut nx, 1, keybags).unwrap();
+        assert_eq!((q(&kd, 0x18), u32::from_le_bytes(kd[0x3c..0x40].try_into().unwrap()), q(&kd, 0x30)), (rt.dir.0, 4, 0x8008));
+        assert!(q(&kd, 0x20) > rt.dir.1);
+        assert_eq!((&kd[..0x18], &kd[0x28..0x3c], &kd[0x40..]), (&before[..0x18], &before[0x28..0x3c], &before[0x40..]));
+        let sb = nx.vol_sb_read(1).unwrap().0.to_vec();
+        assert_eq!((q(&sb, 0xb0) - q(&sb0, 0xb0), q(&sb, 0xc0) - q(&sb0, 0xc0), q(&sb, 0xb8) - q(&sb0, 0xb8)), (28, 27, 1));
+        let walk = |nx: &mut Nx<'_>, p: &str| p.split('/').fold(2u64, |d, c| fsops::lookup(nx, 1, d, c).unwrap().unwrap_or_else(|| panic!("no {p}")));
+        let attrs = |nx: &mut Nx<'_>, p: &str| {
+            let ino = walk(nx, p);
+            let v = fsops::inode(nx, 1, ino).unwrap();
+            let u = |o: usize| u32::from_le_bytes(v[o..o + 4].try_into().unwrap());
+            (u16::from_le_bytes([v[0x50], v[0x51]]), u(0x48), u(0x4c), u(0x3c), q(&v, 0x30))
+        };
+        assert_eq!(attrs(&mut nx, "tmp"), (0o41777, 0, 0, 4, 0x8008));
+        assert_eq!(attrs(&mut nx, "Keychains"), (0o40755, 64, 0, 4, 0x8008));
+        assert_eq!(attrs(&mut nx, "run"), (0o40775, 0, 1, 4, 0x8008));
+        assert_eq!(attrs(&mut nx, "logs/BurnIn"), (0o40755, 0, 0, 4, 0x8008));
+        assert_eq!(attrs(&mut nx, "containers"), (0o40755, 0, 0, 0, 0x8008));
+        assert_eq!(attrs(&mut nx, "MobileDevice"), (0o40777, 0, 0, 0, 0x8008));
+        assert_eq!(attrs(&mut nx, "MobileDevice/ProvisioningProfiles"), (0o40755, 0, 0, 4, 0x8008));
+        assert_eq!(attrs(&mut nx, "Managed Preferences/mobile"), (0o40755, 501, 501, 4, 0x8008));
+        assert_eq!(attrs(&mut nx, "root/Library/Caches"), (0o40700, 0, 0, 4, 0x8008));
+        assert_eq!(attrs(&mut nx, "root/.bootstrapped"), (0o100644, 0, 0, 4, 0x8008));
+        nx.commit().unwrap();
+        let check = |tag: &str| {
+            sink.0.sync_all().unwrap();
+            let view = dir.join(format!("gex-pfkur-view-{}", std::process::id()));
+            let _ = std::fs::remove_file(&view);
+            assert!(std::process::Command::new("cp").arg("-c").arg(&path).arg(&view).status().unwrap().success());
+            let run = |args: &[&str], tool: &str, p: &std::path::Path| std::process::Command::new(tool).args(args).arg(p).output().unwrap();
+            let dev = run(&["-n", "-W", "-s", "-M"], &fsck, &path);
+            let host = run(&["-n", "-s", "-M"], "/sbin/fsck_apfs", &path);
+            let (orphans, unnamed) = unencrypted_view(&view, blocks * 4096);
+            let trees = run(&["-n", "-s"], "/sbin/fsck_apfs", &view);
+            let _ = std::fs::remove_file(&view);
+            let out = String::from_utf8_lossy(&trees.stdout).to_string() + &String::from_utf8_lossy(&trees.stderr);
+            eprintln!("{tag}: view fsck (orphans {orphans:x?}):\n{out}");
+            assert!(dev.status.success(), "{tag}: device fsck -M: {}{}", String::from_utf8_lossy(&dev.stdout), String::from_utf8_lossy(&dev.stderr));
+            assert!(host.status.success(), "{tag}: host fsck -M: {}{}", String::from_utf8_lossy(&host.stdout), String::from_utf8_lossy(&host.stderr));
+            assert!(!out.contains("skipping the fsroot tree"), "{tag}: {out}");
+            let bad: Vec<&str> = out.lines().filter(|l| (l.contains("error") || l.contains("warning")) && !view_says(l, &unnamed)).collect();
+            assert!(bad.is_empty(), "{tag}: {out}");
+            assert_eq!(out.lines().filter(|l| l.starts_with("warning: overallocation detected")).count(), orphans.len(), "{tag}: {out}");
+            assert!(out.contains("appears to be OK"), "{tag}: {out}");
+        };
+        check("mounted");
+        fsops::unmount(&mut nx, 1, false, &mut now).unwrap();
+        assert!(nx.pfkur_tmp.is_empty());
+        assert_eq!(fsops::lookup(&mut nx, 1, 3, "tmp-ino-xattr-dstream-0x0-0x10").unwrap(), None);
+        let (t, mut st) = nx.fs_tree(1).unwrap();
+        let priv_dir = t.get(&mut st, &(3u64 | 3 << 60).to_le_bytes()).unwrap().unwrap();
+        assert_eq!((u32::from_le_bytes(priv_dir[0x38..0x3c].try_into().unwrap()), u32::from_le_bytes(priv_dir[0x40..0x44].try_into().unwrap())), (0, 3));
+        nx.commit().unwrap();
+        nx.unmount().unwrap();
+        check("unmounted");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The checkpoint descriptor block `i`'s address in the container file.
+    fn c_desc(ctr: &std::path::Path, psize: u64, i: u64) -> u64 {
+        use crate::darwin::apfsread::Container;
+        let c = Container::open(std::sync::Arc::new(super::super::HostFile(std::fs::File::open(ctr).unwrap(), psize))).unwrap();
+        c.nx.xp_desc_base + i
+    }
+
+    #[test]
+    fn cluster_pushes_follow_the_cluster_layer() {
+        // drafts/s26/re-cluster.md 2's table for 1 MiB clusters and maps.
+        let p = cluster_pushes(16_243_000).unwrap();
+        let mut want: Vec<(u64, u64)> = (0..15).map(|k| (k << 20, 1 << 20)).collect();
+        want.push((15_728_640, 516_096));
+        assert_eq!((p.maps, p.before_end), (want, 12));
+        let p = cluster_pushes(600_000).unwrap();
+        assert_eq!((p.maps, p.before_end), (vec![(0, 602_112)], 0));
+    }
+
+    /// install_kernel_cache's two paths on a fresh Preboot-role volume: a
+    /// direct multi-block file and two deferred ones (one block map, and
+    /// write-behind with sixteen), their final inodes, extents and the
+    /// container's consistency.
+    #[test]
+    fn new_files_are_written_as_the_kernel_writes_them() {
+        let (Ok(dir), Ok(fsck)) = (std::env::var("GEX_TEST_SCRATCH"), std::env::var("GEX_TEST_FSCK")) else { return };
+        let dir = std::path::Path::new(&dir);
+        let path = dir.join(format!("gex-nf-{}", std::process::id()));
+        let blocks = 15_625_000u64;
+        let f = std::fs::OpenOptions::new().create(true).truncate(true).read(true).write(true).open(&path).unwrap();
+        f.set_len(blocks * 4096).unwrap();
+        let sink = super::super::HostFile(f, blocks * 4096);
+        let uuid = *b"gex-newfile-test";
+        let fm = container::format(&sink, 4096, blocks, uuid).unwrap();
+        let mut nx = Nx::formatted(&sink, &fm, uuid, Mode::Kernel).unwrap();
+        nx.mount_rw().unwrap();
+        let mut t = 1_700_000_000_000_000_000u64;
+        let mut now = || {
+            t += 1000;
+            t
+        };
+        let q = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+        let kv = key_os_version(RESTORE_BUILD).unwrap();
+        let times = VolumeTimes { formatted: now(), root: now(), private: now(), modified: now() };
+        let o = nx.create_volume(&NewVolume { name: "Preboot".into(), role: storage::role::PREBOOT, encrypted: false, e_apfs: true, times, uid: 0, gid: 0, key_os_version: kv, size_bytes: None }).unwrap();
+        nx.commit().unwrap();
+        let vol = nx.fs_oid.iter().position(|&x| x == o).unwrap();
+        fsops::mount_rw(&mut nx, vol, &mut now).unwrap();
+        let data = |n: usize| (0..n).map(|i| (i * 7 + i / 4096) as u8).collect::<Vec<u8>>();
+        for (name, n) in [("direct", 35_276usize), ("one", 600_000), ("many", 16_243_000)] {
+            let d = data(n);
+            let ino = fsops::write_new_file(&mut nx, vol, ROOT_INO, name, 0o644, &d, &cluster_pushes, &mut now).unwrap();
+            let v = fsops::inode(&mut nx, vol, ino).unwrap();
+            // NAME and DSTREAM only: no SPARSE_BYTES or PREV_FSIZE left.
+            assert_eq!((q(&v, 0x30), u32::from_le_bytes(v[0x40..0x44].try_into().unwrap()), u16::from_le_bytes([v[0x5c], v[0x5d]])), (0x9000, 2, 2), "{name}");
+            let ds = &v[v.len() - 0x28..];
+            let alloced = (n as u64).div_ceil(4096) * 4096;
+            assert_eq!((q(ds, 0), q(ds, 8), q(ds, 0x18)), (n as u64, alloced, n as u64), "{name}");
+            assert_eq!(q(&v, 0x18), q(&v, 0x20), "{name}: mod = change");
+            // The extents cover the file and hold its bytes.
+            let (tr, mut st) = nx.fs_tree(vol).unwrap();
+            let ext: Vec<(u64, u64, u64)> = tr.records(&mut st).unwrap().into_iter().filter(|(k, _)| k.len() == 16 && q(k, 0) == (ino | 8 << 60)).map(|(k, v)| (q(&k, 8), q(v.as_ref().unwrap(), 0) & 0x00ff_ffff_ffff_ffff, q(v.as_ref().unwrap(), 8))).collect();
+            drop(st);
+            assert_eq!(ext.iter().map(|e| e.1).sum::<u64>(), alloced, "{name}");
+            let mut back = Vec::new();
+            for (l, len, p) in ext {
+                assert_eq!(l, back.len() as u64);
+                assert_ne!(p, 0, "{name}: a sparse extent left");
+                let mut b = vec![0u8; len as usize];
+                std::os::unix::fs::FileExt::read_exact_at(&sink.0, &mut b, p * 4096).unwrap();
+                back.extend_from_slice(&b);
+            }
+            assert_eq!(&back[..n], &d[..], "{name}");
+            assert!(back[n..].iter().all(|&b| b == 0));
+        }
+        nx.commit().unwrap();
+        nx.unmount().unwrap();
+        sink.0.sync_all().unwrap();
+        let dev = std::process::Command::new(&fsck).args(["-n", "-W", "-s"]).arg(&path).output().unwrap();
+        let host = std::process::Command::new("/sbin/fsck_apfs").args(["-n", "-s"]).arg(&path).output().unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(dev.status.success(), "device fsck: {}{}", String::from_utf8_lossy(&dev.stdout), String::from_utf8_lossy(&dev.stderr));
+        assert!(host.status.success(), "host fsck: {}{}", String::from_utf8_lossy(&host.stdout), String::from_utf8_lossy(&host.stderr));
     }
 
     #[test]

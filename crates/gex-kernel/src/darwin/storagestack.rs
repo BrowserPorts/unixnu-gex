@@ -1164,6 +1164,15 @@ const NAMESPACE_TYPE_KEYS: [&str; 14] = [
 /// NSID, type and size in blocks: (1, 1, 0), (2, 2, 2048), (3, 3, 32),
 /// (4, 4, 2), (5, 5, 2), (6, 6, 1), (7, 8, 256); a restored device's
 /// Identify Namespace answers them (`CreateNamespaces` made them so).
+/// The write limits a disk0 medium's DKIOC ioctls find first up the plane
+/// (the main namespace's, NSID 1: no APFS object or medium above it
+/// publishes them): IOMaximumByteCountWrite, IOMaximumBlockCountWrite and
+/// IOMaximumSegmentCountWrite.
+pub fn disk0_write_limits() -> (u64, u64, u64) {
+    let max = u64::from(NAMESPACE_MAX_BYTES[namespace_type(1) as usize]);
+    (max, max >> 12, max >> 12)
+}
+
 fn namespace_type(nsid: u32) -> u32 {
     match nsid {
         7 => 8,
@@ -1320,6 +1329,13 @@ pub fn container_solid_state() -> bool {
 
 pub fn container_barrier() -> bool {
     matches!(storage_features(), Prop::Dict(d) if d.iter().any(|(k, v)| k == "Barrier" && matches!(v, Prop::Bool(true))))
+}
+
+/// Whether the APFS container's medium has Unmap in its IOStorageFeatures
+/// (DKIOCGETFEATURES' DK_FEATURE_UNMAP, which APFS keeps at dev+0x4f8 with
+/// the barrier, 0xfffffff006650c78).
+pub fn container_unmap() -> bool {
+    matches!(storage_features(), Prop::Dict(d) if d.iter().any(|(k, v)| k == "Unmap" && matches!(v, Prop::Bool(true))))
 }
 
 /// A namespace's IOStorageFeatures, Barrier only on NSID 1.

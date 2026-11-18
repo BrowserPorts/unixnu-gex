@@ -239,9 +239,11 @@ pub fn build_disk0_with(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() ->
     if os.is_none() {
         missing.push("the Data and User volumes (newfs_apfs -P), made after apfs_invert".into());
     }
-    // 7.
+    // 7. create_partition_mountpoints makes what it does not find, so it
+    // runs only on the Data volume BOM's copy leaves (/hardware is the
+    // copy's).
     missing.push(if os.is_some() {
-        "the restore's later steps, in its order: check_mounted's fixup_var (BOM's copy of /private/var interleaved with remove_moved_trees), the mountpoints (/mnt1/private/xarts, /mnt2/hardware, MobileSoftwareUpdate, internal), populate_preboot_volume, apfs_sealvolume and the update snapshot".into()
+        "the restore's later steps, in its order: check_mounted's fixup_var (BOM's copy of /private/var interleaved with remove_moved_trees), then create_partition_mountpoints' /mnt2/internal (implemented, run once the copy before it is), populate_preboot_volume, apfs_sealvolume and the update snapshot".into()
     } else {
         "the restore's later writes to Preboot (install_kernel_cache's boot objects, populate_preboot_volume, install_splat's cryptex1) and Data's contents".into()
     });
@@ -286,7 +288,7 @@ fn update_hierarchy(nx: &mut Nx<'_>, update: usize, now: &mut dyn FnMut() -> u64
             Ok(ino) => ino,
             Err(_) => fsops::lookup(nx, update, dir, name)?.ok_or("an existing directory not found")?,
         };
-        fsops::chmod(nx, update, ino, mode)?;
+        fsops::chmod(nx, update, ino, mode, now)?;
         fsops::chown(nx, update, ino, uid, gid, now)?;
     }
     Ok(())
@@ -294,17 +296,20 @@ fn update_hierarchy(nx: &mut Nx<'_>, update: usize, now: &mut dyn FnMut() -> u64
 
 /// `_ramrod_create_directory(path, mode, uid, gid)` (0x100047aa4 →
 /// 0x100047828, class -1) on volume `vol` for `path` below its root: each
-/// component `lstat`ed, and one that does not exist made (mkdir with
-/// `mode & 0777`, chmod to `mode`, chown to the ids); an existing one is
-/// left as it is. The last component's inode number.
+/// component `lstat`ed (repeated slashes skipped by the lookup,
+/// vfs_lookup.c:888), and one that does not exist made (mkdir with
+/// `mode & 0777` by root, the new directory taking its parent's group,
+/// chmod to `mode`, chown to the ids); an existing one is left as it is.
+/// The last component's inode number.
 fn create_directory(nx: &mut Nx<'_>, vol: usize, path: &str, mode: u16, uid: u32, gid: u32, now: &mut dyn FnMut() -> u64) -> Result<u64, String> {
     let mut dir = ROOT_INO;
-    for name in path.split('/') {
+    for name in path.split('/').filter(|c| !c.is_empty()) {
         dir = match fsops::lookup(nx, vol, dir, name)? {
             Some(ino) => ino,
             None => {
-                let ino = fsops::mkdir(nx, vol, dir, name, mode & 0o777, 0, 0, now)?.map_err(|e| format!("mkdir {path}: errno {e}"))?;
-                fsops::chmod(nx, vol, ino, mode)?;
+                let pgid = u32::from_le_bytes(fsops::inode(nx, vol, dir)?[0x4c..0x50].try_into().unwrap());
+                let ino = fsops::mkdir(nx, vol, dir, name, mode & 0o777, 0, pgid, now)?.map_err(|e| format!("mkdir {path}: errno {e}"))?;
+                fsops::chmod(nx, vol, ino, mode, now)?;
                 fsops::chown(nx, vol, ino, uid, gid, now)?;
                 ino
             }
@@ -1070,6 +1075,122 @@ fn aks_bootstrap_fs(nx: &mut Nx<'_>, data: usize, now: &mut dyn FnMut() -> u64) 
     let root = fsops::lookup(nx, data, ROOT_INO, "root")?.ok_or("no /mnt2/root after the bootstrap map")?;
     let g = gid_of(nx, root)?;
     fsops::create(nx, data, root, ".bootstrapped", 0o644, 0, g, now)?.map_err(|e| format!("create /mnt2/root/.bootstrapped: errno {e}"))?;
+    Ok(())
+}
+
+/// What the restore host decides for the steps after fixup_var: the
+/// restore options restored_external reads (get_bool RE@0x1000408d0 and
+/// get_int with restored's defaults) and the host's answer to
+/// persistent_boot_args' message 0x19 (RE@0x100026c6c).
+pub const RESTORE_OPTIONS_STAND_IN: &str = "the restore host's RestoreOptions as restored_external reads them after fixup_var, and its answer to persistent_boot_args' message 0x19 (stand-in: no option given, so restored's defaults: SystemImage, ReadOnlyRootFilesystem and CreateFilesystemPartitions true, LogPartitionSize 0, SkipProductionUCRTRetrieval and SetFieldDiagnosticsBoot false, no BridgeOS.SetTargetDiskMode; the answer success; drafts/s27/re-mountpoints.md UNSETTLED 1; capture the options a restore host sends)";
+
+/// The restore options the steps after fixup_var read
+/// ([`RESTORE_OPTIONS_STAND_IN`]). `UpdateBaseband` changes nothing on this
+/// device (create_partition_mountpoints' baseband entry is skipped either
+/// way, [`J120_BASEBAND`]).
+#[derive(Clone, Copy, Debug)]
+pub struct RestoreOptions {
+    pub system_image: bool,
+    pub read_only_root_filesystem: bool,
+    pub create_filesystem_partitions: bool,
+    pub log_partition_size: i64,
+    pub skip_production_ucrt_retrieval: bool,
+    pub set_field_diagnostics_boot: bool,
+    /// `BridgeOS.SetTargetDiskMode`, when it is a boolean.
+    pub set_target_disk_mode: Option<bool>,
+}
+
+impl RestoreOptions {
+    /// restored's defaults, no option given.
+    pub const DEFAULTS: RestoreOptions = RestoreOptions { system_image: true, read_only_root_filesystem: true, create_filesystem_partitions: true, log_partition_size: 0, skip_production_ucrt_retrieval: false, set_field_diagnostics_boot: false, set_target_disk_mode: None };
+}
+
+/// restored's volume table (RE@0x100285668, 64-byte records): each
+/// volume's name and its path in the operating system.
+const VOLUME_TABLE: [(&str, &str); 10] = [
+    ("System", "/"),
+    ("xART", "/private/xarts"),
+    ("Data", "/private/var"),
+    ("User", "/private/var/mobile"),
+    ("Baseband Data", "/private/var/wireless/baseband_data"),
+    ("Logs", "/private/var/logs"),
+    ("Hardware", "/private/var/hardware"),
+    ("Scratch", "/private/var/internal"),
+    ("Update", "/private/var/MobileSoftwareUpdate"),
+    ("Preboot", "/private/preboot"),
+];
+
+/// Whether the device has a baseband for create_partition_mountpoints'
+/// Baseband Data entry: with `UpdateBaseband` RE@0x10004af6c needs an
+/// IOService "baseband" (not Leda) or "AppleConvergedIPCLedaBBControl",
+/// without it RE@0x1000456ac needs `/filesystems/fstab/baseband-vol`; J120's
+/// device tree has none of them (drafts/s14/restored/dt.txt: no baseband
+/// node, fstab xart, system, preboot, data, update, hardware).
+const J120_BASEBAND: bool = false;
+
+/// The object `path` names below volume `vol`'s root, if any (repeated
+/// slashes skipped).
+fn resolve(nx: &mut Nx<'_>, vol: usize, path: &str) -> Result<Option<u64>, String> {
+    let mut dir = ROOT_INO;
+    for name in path.split('/').filter(|c| !c.is_empty()) {
+        match fsops::lookup(nx, vol, dir, name)? {
+            Some(ino) => dir = ino,
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(dir))
+}
+
+/// create_partition_mountpoints (RE@0x10003a070; drafts/s27/
+/// re-mountpoints.md 2.3), after its block's set_filesystem_permissions
+/// (NVRAM changes only, re-mountpoints.md 2.2): for the volume table's
+/// xART, Logs (with a `LogPartitionSize`), Hardware, Scratch and Update
+/// entries (Baseband Data only with a baseband; System, Data, User and
+/// Preboot skipped), the mount
+/// point below Data's /mnt2 for a path under /private/var (only when the
+/// install creates the data partitions), else below System's /mnt1, made
+/// where missing by `_ramrod_create_directory(path, 0755, 0, 0)`; then the
+/// Scratch one (`/mnt2//internal`) given mode 0777 and SF_IMMUTABLE |
+/// UF_IMMUTABLE whether it was there or not, a failure of either logged and
+/// not fatal. After fixup_var only /internal is missing on the erase
+/// restore: one directory made by mkdir 0755, chmod's fast path, chown 0:0,
+/// chmod 0777 and chflags 0x20002 (re-mountpoints.md 0.1). The ramdisk's
+/// securelevel is not known (re-mountpoints.md UNSETTLED 5): a flags change
+/// whose answer needs it is refused.
+pub fn create_partition_mountpoints(nx: &mut Nx<'_>, system: usize, data: usize, o: &RestoreOptions, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    use fsops::bsd_flags::{SF_APPEND, SF_IMMUTABLE, UF_APPEND, UF_IMMUTABLE};
+    for (i, (name, path)) in VOLUME_TABLE.iter().enumerate() {
+        let go = match i {
+            0 | 2 | 3 | 9 => false,
+            4 => J120_BASEBAND,
+            5 => o.log_partition_size != 0,
+            _ => true,
+        };
+        if !go {
+            continue;
+        }
+        let (vol, rel) = if let Some(rest) = path.strip_prefix("/private/var") {
+            if !o.create_filesystem_partitions {
+                continue;
+            }
+            (data, rest)
+        } else if let Some(rest) = path.strip_prefix('/') {
+            (system, rest)
+        } else {
+            return Err(format!("could not determine the parent device of the {name} mount point {path:?}"));
+        };
+        let existed = resolve(nx, vol, rel)?.is_some();
+        let ino = create_directory(nx, vol, rel, 0o755, 0, 0, now)?;
+        if i == 7 {
+            let flags = u32::from_le_bytes(fsops::inode(nx, vol, ino)?[0x44..0x48].try_into().unwrap());
+            if existed && flags & (SF_IMMUTABLE | UF_IMMUTABLE | SF_APPEND | UF_APPEND) != 0 {
+                return Err(format!("not implemented: chmod of the existing {path} with flags {flags:#x} (vnode_authorize_checkimmutable: EPERM unless its owner's process ignores node permissions)"));
+            }
+            fsops::chmod(nx, vol, ino, 0o777, now)?;
+            // An error of chflags is logged ("Not fatal") and the loop goes on.
+            let _ = fsops::chflags(nx, vol, ino, SF_IMMUTABLE | UF_IMMUTABLE, None, now)?;
+        }
+    }
     Ok(())
 }
 
@@ -2072,6 +2193,140 @@ mod tests {
             || l.contains("overallocation detected on Main device")
             || (l.contains("orphan mappings found") && l.contains(&format!(" {} orphan", unnamed.len())))
             || unnamed.iter().any(|o| l.contains(&format!("orphan omap mapping found for oid {o}")) || l.contains(&format!("orphan omap mapping (oid {o} ")))
+    }
+
+    /// check_mounted's create_partition_mountpoints on a container of its
+    /// own (GEX_TEST_FSCK, GEX_TEST_SCRATCH; drafts/s27/re-mountpoints.md 0.1,
+    /// 3): System's /private/xarts and Data's /hardware and
+    /// /MobileSoftwareUpdate already there (the image's, the BOM copy's and
+    /// aks_bootstrap_fs'), so only /internal is made: mkdir 0755, chmod's
+    /// fast path (a clock reading, nothing written), chown 0:0, chmod 0777,
+    /// chflags SF_IMMUTABLE | UF_IMMUTABLE, ten clock readings in all;
+    /// nothing on System. Then chflags' own refusals (each before any
+    /// transaction), its masks and its write of unchanged flags; the
+    /// device's and the host's fsck_apfs -M and the host's on the
+    /// unencrypted view, mounted and after the unmounts.
+    #[test]
+    fn partition_mountpoints_make_only_internal() {
+        use fsops::bsd_flags::*;
+        let (Ok(dir), Ok(fsck)) = (std::env::var("GEX_TEST_SCRATCH"), std::env::var("GEX_TEST_FSCK")) else { return };
+        let dir = std::path::Path::new(&dir);
+        let path = dir.join(format!("gex-mp-{}", std::process::id()));
+        let blocks = 15_625_000u64;
+        let f = std::fs::OpenOptions::new().create(true).truncate(true).read(true).write(true).open(&path).unwrap();
+        f.set_len(blocks * 4096).unwrap();
+        let sink = super::super::HostFile(f, blocks * 4096);
+        let uuid = *b"gex-mountpoints1";
+        let fm = container::format(&sink, 4096, blocks, uuid).unwrap();
+        let mut nx = Nx::formatted(&sink, &fm, uuid, Mode::Kernel).unwrap();
+        nx.mount_rw().unwrap();
+        let clock = std::cell::Cell::new(1_700_000_000_000_000_000u64);
+        let mut now = || {
+            clock.set(clock.get() + 1000);
+            clock.get()
+        };
+        let q = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+        let u = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        let kv = key_os_version(RESTORE_BUILD).unwrap();
+        let make = |nx: &mut Nx<'_>, name: &str, role: u16, encrypted: bool, now: &mut dyn FnMut() -> u64| {
+            let times = VolumeTimes { formatted: now(), root: now(), private: now(), modified: now() };
+            let o = nx.create_volume(&NewVolume { name: name.into(), role, encrypted, e_apfs: true, times, uid: 0, gid: 0, key_os_version: kv, size_bytes: None }).unwrap();
+            nx.commit().unwrap();
+            nx.fs_oid.iter().position(|&x| x == o).unwrap()
+        };
+        let system = make(&mut nx, "System", storage::role::SYSTEM, false, &mut now);
+        fsops::mount_rw(&mut nx, system, &mut now).unwrap();
+        let private = fsops::mkdir(&mut nx, system, ROOT_INO, "private", 0o755, 0, 0, &mut now).unwrap().unwrap();
+        fsops::mkdir(&mut nx, system, private, "xarts", 0o755, 0, 0, &mut now).unwrap().unwrap();
+        let data = make(&mut nx, "Data", storage::role::DATA, true, &mut now);
+        fsops::mount_rw(&mut nx, data, &mut now).unwrap();
+        let hw = fsops::mkdir(&mut nx, data, ROOT_INO, "hardware", 0o755, 0, 0, &mut now).unwrap().unwrap();
+        let msu = fsops::mkdir(&mut nx, data, ROOT_INO, "MobileSoftwareUpdate", 0o755, 0, 0, &mut now).unwrap().unwrap();
+        nx.commit().unwrap();
+        let recs = |nx: &mut Nx<'_>, vol: usize| {
+            let (t, mut st) = nx.fs_tree(vol).unwrap();
+            t.records(&mut st).unwrap()
+        };
+        let sys_before = recs(&mut nx, system);
+        let sys_sb = nx.vol_sb_read(system).unwrap().0.to_vec();
+        let (hw_before, msu_before) = (fsops::inode(&mut nx, data, hw).unwrap(), fsops::inode(&mut nx, data, msu).unwrap());
+        let root_before = fsops::inode(&mut nx, data, ROOT_INO).unwrap();
+        let sb0 = nx.vol_sb_read(data).unwrap().0.to_vec();
+        let t0 = clock.get();
+        let c = |i: u64| t0 + 1000 * i;
+        create_partition_mountpoints(&mut nx, system, data, &RestoreOptions::DEFAULTS, &mut now).unwrap();
+        assert_eq!(clock.get(), c(10), "ten clock readings");
+        assert!(nx.jobj_times.is_empty(), "chmod's change time written by chown");
+        assert_eq!(recs(&mut nx, system), sys_before, "nothing on System");
+        assert_eq!(nx.vol_sb_read(system).unwrap().0, &sys_sb[..]);
+        assert_eq!((fsops::inode(&mut nx, data, hw).unwrap(), fsops::inode(&mut nx, data, msu).unwrap()), (hw_before.clone(), msu_before));
+        let ino = fsops::lookup(&mut nx, data, ROOT_INO, "internal").unwrap().expect("/internal");
+        let v = fsops::inode(&mut nx, data, ino).unwrap();
+        assert_eq!(ino, q(&sb0, 0xb0));
+        assert_eq!((q(&v, 0), q(&v, 0x10), q(&v, 0x18), q(&v, 0x20), q(&v, 0x28)), (ROOT_INO, c(1), c(1), c(9), c(1)));
+        assert_eq!((q(&v, 0x30), u(&v, 0x38), u(&v, 0x3c), u(&v, 0x40), u(&v, 0x44)), (0x8008, 0, 0, 1, 0x2_0002));
+        assert_eq!((u(&v, 0x48), u(&v, 0x4c), u16::from_le_bytes([v[0x50], v[0x51]]), q(&v, 0x54)), (0, 0, 0o40777, 0));
+        let r = fsops::inode(&mut nx, data, ROOT_INO).unwrap();
+        assert_eq!((q(&r, 0x18), q(&r, 0x20)), (c(2), c(2)));
+        assert_eq!((u(&r, 0x38), u(&r, 0x40), u(&r, 0x54)), (u(&root_before, 0x38) + 1, u(&root_before, 0x40) + 1, u(&root_before, 0x54) + 1));
+        let sb = nx.vol_sb_read(data).unwrap().0.to_vec();
+        assert_eq!((q(&sb, 0xb0), q(&sb, 0xc0), q(&sb, 0xb8)), (q(&sb0, 0xb0) + 1, q(&sb0, 0xc0) + 1, q(&sb0, 0xb8)));
+        assert_eq!((q(&sb, 0x100), q(&sb, 0x420), u(&sb, 0x428) & 0x10), (c(10), nx.xid, 0x10));
+        // Without the data partitions' creation only System is looked at.
+        create_partition_mountpoints(&mut nx, system, data, &RestoreOptions { create_filesystem_partitions: false, ..RestoreOptions::DEFAULTS }, &mut now).unwrap();
+        assert_eq!(clock.get(), c(10));
+        // Run again, the existing immutable /internal's chmod is refused.
+        assert!(create_partition_mountpoints(&mut nx, system, data, &RestoreOptions::DEFAULTS, &mut now).is_err());
+        assert_eq!(clock.get(), c(10));
+        // chflags' refusals write nothing and read no clock: clearing
+        // SF_IMMUTABLE (EPERM above securelevel 0, unknown securelevel
+        // refused), SF_FIRMLINK newly set, UF_TRACKED with no document
+        // identifier, UF_COMPRESSED.
+        let data_recs = recs(&mut nx, data);
+        assert!(fsops::chflags(&mut nx, data, ino, UF_IMMUTABLE, None, &mut now).is_err());
+        assert_eq!(fsops::chflags(&mut nx, data, ino, UF_IMMUTABLE, Some(1), &mut now).unwrap(), Err(1));
+        assert_eq!(fsops::chflags(&mut nx, data, hw, SF_FIRMLINK, Some(0), &mut now).unwrap(), Err(1));
+        assert!(fsops::chflags(&mut nx, data, hw, UF_TRACKED, Some(0), &mut now).is_err());
+        assert!(fsops::chflags(&mut nx, data, hw, UF_COMPRESSED, Some(0), &mut now).is_err());
+        assert_eq!(recs(&mut nx, data), data_recs);
+        assert_eq!(clock.get(), c(10));
+        // The synthetic bits and those vnode_setattr masks are dropped, and
+        // unchanged flags are written all the same.
+        assert_eq!(fsops::chflags(&mut nx, data, hw, SF_SYNTHETIC | 0x0100_0000, None, &mut now).unwrap(), Ok(()));
+        let h = fsops::inode(&mut nx, data, hw).unwrap();
+        assert_eq!((u(&h, 0x44), q(&h, 0x20), q(&h, 0x18)), (0, c(11), q(&hw_before, 0x18)));
+        assert_eq!(&h[..0x20], &hw_before[..0x20]);
+        assert_eq!(&h[0x28..], &hw_before[0x28..]);
+        assert_eq!(q(nx.vol_sb_read(data).unwrap().0, 0x100), c(12));
+        nx.commit().unwrap();
+        let check = |tag: &str| {
+            sink.0.sync_all().unwrap();
+            let view = dir.join(format!("gex-mp-view-{}", std::process::id()));
+            let _ = std::fs::remove_file(&view);
+            assert!(std::process::Command::new("cp").arg("-c").arg(&path).arg(&view).status().unwrap().success());
+            let run = |args: &[&str], tool: &str, p: &std::path::Path| std::process::Command::new(tool).args(args).arg(p).output().unwrap();
+            let dev = run(&["-n", "-W", "-s", "-M"], &fsck, &path);
+            let host = run(&["-n", "-s", "-M"], "/sbin/fsck_apfs", &path);
+            let (orphans, unnamed) = unencrypted_view(&view, blocks * 4096);
+            let trees = run(&["-n", "-s"], "/sbin/fsck_apfs", &view);
+            let _ = std::fs::remove_file(&view);
+            let out = String::from_utf8_lossy(&trees.stdout).to_string() + &String::from_utf8_lossy(&trees.stderr);
+            eprintln!("{tag}: view fsck (orphans {orphans:x?}):\n{out}");
+            assert!(dev.status.success(), "{tag}: device fsck -M: {}{}", String::from_utf8_lossy(&dev.stdout), String::from_utf8_lossy(&dev.stderr));
+            assert!(host.status.success(), "{tag}: host fsck -M: {}{}", String::from_utf8_lossy(&host.stdout), String::from_utf8_lossy(&host.stderr));
+            assert!(!out.contains("skipping the fsroot tree"), "{tag}: {out}");
+            let bad: Vec<&str> = out.lines().filter(|l| (l.contains("error") || l.contains("warning")) && !view_says(l, &unnamed)).collect();
+            assert!(bad.is_empty(), "{tag}: {out}");
+            assert_eq!(out.lines().filter(|l| l.starts_with("warning: overallocation detected")).count(), orphans.len(), "{tag}: {out}");
+            assert!(out.contains("appears to be OK"), "{tag}: {out}");
+        };
+        check("mounted");
+        fsops::unmount(&mut nx, data, false, &mut now).unwrap();
+        fsops::unmount(&mut nx, system, false, &mut now).unwrap();
+        nx.commit().unwrap();
+        nx.unmount().unwrap();
+        check("unmounted");
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Data's read-write mount and unmount on a container of its own

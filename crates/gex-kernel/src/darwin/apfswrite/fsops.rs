@@ -1743,33 +1743,48 @@ fn phys_extent_add(nx: &mut Nx<'_>, vol: usize, paddr: u64, len: u64, owner: u64
     nx.set_extentref_tree(vol, t)
 }
 
-/// `chmod` of `ino` to `mode` (apfs_vnop_setattr K 0x668e4a0): the same
-/// mode takes the fast path (K 0x668f1a8), which changes only the
-/// in-memory inode, whose next write sets its change time anew.
-pub fn chmod(nx: &mut Nx<'_>, vol: usize, ino: u64, mode: u16) -> Result<(), String> {
-    let (t, mut st) = nx.fs_tree(vol)?;
-    let v = t.get(&mut st, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
-    let cur = u16::from_le_bytes([v[0x50], v[0x51]]);
+/// `chmod` of `ino` to `mode` (apfs_vnop_setattr K 0x668e4a0 with only
+/// va_mode active): the same mode bits (`& 0xfff`) take the fast path
+/// (K 0x668f290 → K 0x668f348), which writes nothing: the in-memory
+/// object's change time is read from the clock (K 0x668f35c) and marked
+/// dirty (jobj + 0x98 |= 0x40000), held for the inode's next write
+/// (`nx.jobj_times`); other bits take [`setattr`]'s general path.
+pub fn chmod(nx: &mut Nx<'_>, vol: usize, ino: u64, mode: u16, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    let v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
+    let cur = u16::from_le_bytes([v[INO_MODE], v[INO_MODE + 1]]);
     if (cur ^ mode) & 0o7777 != 0 {
-        return Err(format!("not implemented: chmod of {ino:#x} from {:o} to {:o} (setattr's general path)", cur & 0o7777, mode & 0o7777));
+        return setattr(nx, vol, ino, SetAttr { mode: Some(mode), ..Default::default() }, now);
     }
+    let t = now();
+    let m = nx.jobj_times.get(&(vol, ino)).map_or(u64a(&v, INO_MOD_TIME), |p| p.0);
+    nx.jobj_times.insert((vol, ino), (m, t));
     Ok(())
+}
+
+/// The inode `ino` as its in-memory object holds it, for a rewrite
+/// (`update_jobj` K 0x66f5030 writes the whole object): its record with
+/// the times the object holds unwritten (`nx.jobj_times`), which leave the
+/// map.
+fn in_memory_inode(nx: &mut Nx<'_>, vol: usize, ino: u64) -> Result<Vec<u8>, String> {
+    let mut v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
+    if let Some((m, c)) = nx.jobj_times.remove(&(vol, ino)) {
+        v.put64(INO_MOD_TIME, m);
+        v.put64(INO_CHANGE_TIME, c);
+    }
+    Ok(v)
 }
 
 /// `chown` of `ino` (apfs_vnop_setattr's general path, K
 /// 0x668f2a4..0x668f8a0): owner and group set, the change time read even
-/// when they do not change, the inode rewritten.
+/// when they do not change, the inode rewritten from its in-memory object
+/// (with any times it held unwritten).
 pub fn chown(nx: &mut Nx<'_>, vol: usize, ino: u64, uid: u32, gid: u32, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     fs_tx_enter(nx, vol)?;
-    {
-        let (mut t, mut st) = nx.fs_tree(vol)?;
-        let mut v = t.get(&mut st, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
-        v.put32(0x48, uid);
-        v.put32(0x4c, gid);
-        v.put64(0x20, now());
-        t.insert(&mut st, &inode_key(ino), Some(&v))?;
-        nx.set_fs_tree(vol, t);
-    }
+    let mut v = in_memory_inode(nx, vol, ino)?;
+    v.put32(0x48, uid);
+    v.put32(0x4c, gid);
+    v.put64(INO_CHANGE_TIME, now());
+    put_rec(nx, vol, &inode_key(ino), &v)?;
     fs_tx_leave(nx, vol, now)
 }
 
@@ -1866,14 +1881,16 @@ fn check_setattr_volume(nx: &mut Nx<'_>, vol: usize) -> Result<(), String> {
 /// only: every one here is overwritten by the next write, so it is not
 /// kept); else in one file-system transaction owner and group (counted
 /// even when unchanged), the mode bits, the access time (not counted), the
-/// modification time (and the creation time lowered to it when later),
-/// the change time read when anything counted, the inode rewritten.
+/// modification time, the creation time lowered to the modification time
+/// when later and a time was given (K 0x668f6c4), the change time read
+/// when anything counted, the inode rewritten from its in-memory object
+/// (with any times it held unwritten).
 pub fn setattr(nx: &mut Nx<'_>, vol: usize, ino: u64, a: SetAttr, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     check_setattr_volume(nx, vol)?;
     if a.uid.is_none() && a.gid.is_none() && a.mode.is_none() && a.mtime.is_none() && a.atime.is_none() {
         return Ok(());
     }
-    let mut v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
+    let v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
     let cur = u16::from_le_bytes([v[INO_MODE], v[INO_MODE + 1]]);
     if a.uid.is_none() && a.gid.is_none() && a.mtime.is_none() && a.atime.is_none() {
         let m = a.mode.unwrap();
@@ -1887,6 +1904,7 @@ pub fn setattr(nx: &mut Nx<'_>, vol: usize, ino: u64, a: SetAttr, now: &mut dyn 
         }
     }
     fs_tx_enter(nx, vol)?;
+    let mut v = in_memory_inode(nx, vol, ino)?;
     let mut n = 0;
     if let Some(u) = a.uid {
         v.put32(0x48, u);
@@ -1906,9 +1924,10 @@ pub fn setattr(nx: &mut Nx<'_>, vol: usize, ino: u64, a: SetAttr, now: &mut dyn 
     if let Some(t) = a.mtime {
         v.put64(INO_MOD_TIME, t);
         n += 1;
-        if t < u64a(&v, 0x10) {
-            v.put64(0x10, t);
-        }
+    }
+    if (a.atime.is_some() || a.mtime.is_some()) && u64a(&v, INO_MOD_TIME) < u64a(&v, 0x10) {
+        let m = u64a(&v, INO_MOD_TIME);
+        v.put64(0x10, m);
     }
     if n != 0 {
         v.put64(INO_CHANGE_TIME, now());
@@ -2078,6 +2097,98 @@ pub fn set_dir_class(nx: &mut Nx<'_>, vol: usize, ino: u64, class: u32, now: &mu
     fs_tx_enter(nx, vol)?;
     put_rec(nx, vol, &inode_key(ino), &v)?;
     fs_tx_leave(nx, vol, now)
+}
+
+/// BSD file flags (`bsd/sys/stat.h`).
+pub mod bsd_flags {
+    pub const UF_SETTABLE: u32 = 0x0000_ffff;
+    pub const UF_IMMUTABLE: u32 = 0x0000_0002;
+    pub const UF_APPEND: u32 = 0x0000_0004;
+    pub const UF_COMPRESSED: u32 = 0x0000_0020;
+    pub const UF_TRACKED: u32 = 0x0000_0040;
+    pub const SF_SUPPORTED: u32 = 0x009f_0000;
+    pub const SF_SYNTHETIC: u32 = 0xc000_0000;
+    pub const SF_IMMUTABLE: u32 = 0x0002_0000;
+    pub const SF_APPEND: u32 = 0x0004_0000;
+    pub const SF_FIRMLINK: u32 = 0x0080_0000;
+}
+
+/// `INO_EXT_TYPE_DOCUMENT_ID`.
+const INO_EXT_TYPE_DOCUMENT_ID: u8 = 3;
+
+/// `chflags(path, flags)` by root of `ino`, the object the path names
+/// (xnu-10063 vfs_syscalls.c chflags → chflags1 → chflags0;
+/// drafts/s27/re-mountpoints.md 3), with `securelevel` the kernel's (`None`:
+/// not known, refused where the answer needs it):
+/// - mac_vnode_check_setflags: the MAC policies taken to allow it, as for
+///   the restore's other calls (re-mountpoints.md UNSETTLED 4);
+/// - vnode_authattr (vfs_subr.c:10822): SF_SYNTHETIC cleared from the new
+///   and the old flags; for root no flag change is illegal (UF_SETTABLE |
+///   SF_SETTABLE is every bit left); a change asks KAUTH_VNODE_WRITE_SECURITY
+///   | KAUTH_VNODE_NOIMMUTABLE, which vnode_authorize grants root on a
+///   read-write mount but for vnode_immutable's ignore case (vfs_subr.c:8789):
+///   above securelevel 0 an old SF_IMMUTABLE or SF_APPEND is EPERM;
+///   unchanged flags authorize nothing and go on;
+/// - vnode_setattr (kpi_vfs.c:2940): the flags masked to SF_SUPPORTED |
+///   UF_SETTABLE, then apfs_vnop_setattr (K 0x668e4a0) with va_flags alone:
+///   decmpfs_update_attributes and the UF_COMPRESSED probe act only on a
+///   UF_COMPRESSED change (not implemented: compression and decompression);
+///   the general path (K 0x668f2a4) refuses SF_FIRMLINK newly set with
+///   EPERM before any transaction (K 0x668f2b8), has purgeable bookkeeping
+///   for an INODE_IS_PURGEABLE object (not implemented); then one
+///   file-system transaction (`fs_tx_enter(4, 1)` K 0x668f414) in which
+///   apfs_set_bsd_flags (K 0x66a96b4) keeps a stored SF_FIRMLINK, does the
+///   document-identifier work a UF_TRACKED change asks (assigning an
+///   identifier to an object without one, or removing one: not implemented)
+///   and stores the old synthetic bits with the new low thirty
+///   (K 0x66a9808); the change time read (K 0x668f858), the inode rewritten
+///   from its in-memory object (update_jobj K 0x668f894), `fs_tx_leave`
+///   (K 0x668f8bc). The flags are written even when unchanged, and
+///   va_flags is marked supported (K 0x668f530), so no ENOTSUP.
+///
+/// `Ok(Err(errno))` is the call's own error.
+pub fn chflags(nx: &mut Nx<'_>, vol: usize, ino: u64, flags: u32, securelevel: Option<i32>, now: &mut dyn FnMut() -> u64) -> Result<Result<(), i32>, String> {
+    use bsd_flags::*;
+    const EPERM: i32 = 1;
+    check_setattr_volume(nx, vol)?;
+    let v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
+    let old = u32::from_le_bytes(v[0x44..0x48].try_into().unwrap());
+    // vnode_authattr and vnode_authorize.
+    let new = flags & !SF_SYNTHETIC;
+    if new ^ (old & !SF_SYNTHETIC) != 0 && old & (SF_IMMUTABLE | SF_APPEND) != 0 {
+        match securelevel {
+            None => return Err(format!("not implemented: a chflags of {ino:#x}, whose flags {old:#x} hold SF_IMMUTABLE or SF_APPEND, at an unknown securelevel (vnode_immutable's ignore case)")),
+            Some(s) if s > 0 => return Ok(Err(EPERM)),
+            Some(_) => {}
+        }
+    }
+    // vnode_setattr.
+    let new = new & (SF_SUPPORTED | UF_SETTABLE);
+    // apfs_vnop_setattr.
+    if (new ^ old) & UF_COMPRESSED != 0 {
+        return Err(format!("not implemented: a chflags of {ino:#x} changing UF_COMPRESSED (decmpfs_update_attributes, apfs_vnop_setattr's compression probe K 0x668e584, apfs_set_bsd_flags' decompression K 0x66a9850)"));
+    }
+    if new & SF_FIRMLINK != 0 && old & SF_FIRMLINK == 0 {
+        return Ok(Err(EPERM));
+    }
+    if u64a(&v, INO_INTERNAL_FLAGS) & INODE_PURGEABLE != 0 {
+        return Err(format!("not implemented: a setattr of the purgeable object {ino:#x} (K 0x668f2dc's purgeable bookkeeping)"));
+    }
+    let doc_id = xfields(&v)?.into_iter().find(|f| f.0 == INO_EXT_TYPE_DOCUMENT_ID).map_or(0, |f| f.2.get(..4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap())));
+    if new & UF_TRACKED != 0 && old & UF_TRACKED == 0 && doc_id == 0 {
+        return Err(format!("not implemented: UF_TRACKED set on {ino:#x}, which has no document identifier (the assignment K 0x6718530)"));
+    }
+    if new & UF_TRACKED == 0 && old & UF_TRACKED != 0 && doc_id != 0 {
+        return Err(format!("not implemented: UF_TRACKED cleared on {ino:#x}, which has document identifier {doc_id} (the removal K 0x66fb9b0)"));
+    }
+    fs_tx_enter(nx, vol)?;
+    let mut v = in_memory_inode(nx, vol, ino)?;
+    let new = if new & SF_FIRMLINK == 0 && old & SF_FIRMLINK != 0 { new | SF_FIRMLINK } else { new };
+    v.put32(0x44, (old & 0xc000_0000) | (new & 0x3fff_ffff));
+    v.put64(INO_CHANGE_TIME, now());
+    put_rec(nx, vol, &inode_key(ino), &v)?;
+    fs_tx_leave(nx, vol, now)?;
+    Ok(Ok(()))
 }
 
 /// The value of `ino`'s inode.

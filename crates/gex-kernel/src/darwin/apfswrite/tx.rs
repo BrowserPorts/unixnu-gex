@@ -298,6 +298,11 @@ pub struct Nx<'a> {
     /// (`apfs + 0x1f00`), by slot: made at the read-write mount of a
     /// volume it runs on, removed when the unmount stops the thread.
     pub pfkur_tmp: BTreeMap<usize, u64>,
+    /// The modification and change times the kernel holds in an inode's
+    /// in-memory object and has not written to its record (the jobj's
+    /// times-dirty bit 0x40000), by slot and inode: the inode's next
+    /// rewrite or a sync pass over the volume's vnodes writes them.
+    pub jobj_times: BTreeMap<(usize, u64), (u64, u64)>,
 }
 
 /// The container's reaper (`nx_reaper_phys_t`): its lists, and the entry
@@ -443,6 +448,7 @@ impl<'a> Nx<'a> {
             keylocker: None,
             keybag: Vec::new(),
             pfkur_tmp: BTreeMap::new(),
+            jobj_times: BTreeMap::new(),
         })
     }
 

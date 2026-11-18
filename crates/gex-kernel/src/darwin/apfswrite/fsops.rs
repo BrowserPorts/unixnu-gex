@@ -538,6 +538,7 @@ fn obj_create_name(nx: &mut Nx<'_>, vol: usize, parent: u64, pi: &Inode, name: &
         false
     };
     let dk = drec_key(parent, name);
+    nx.jobj_times.remove(&(vol, parent));
     let t1 = now();
     let mut dv = ino.to_le_bytes().to_vec();
     dv.extend_from_slice(&t1.to_le_bytes());
@@ -565,7 +566,8 @@ fn obj_create_name(nx: &mut Nx<'_>, vol: usize, parent: u64, pi: &Inode, name: &
     let (mut t, mut st) = nx.fs_tree(vol)?;
     t.insert(&mut st, &dk, Some(&dv))?;
     t.insert(&mut st, &inode_key(ino), Some(&iv))?;
-    // The parent: its times, children and write generation.
+    // The parent: its times (any its in-memory object held are replaced),
+    // children and write generation.
     let t2 = now();
     let mut p = pi.0.clone();
     p.put64(0x18, t2);
@@ -1311,8 +1313,8 @@ pub struct RenameTimes {
 /// inserted (its date added and flags the old one's), the inode's
 /// name field and the directory's write generation rewritten, no time
 /// changed; after it the file's change time and the directory's times
-/// are read into memory only (returned: an `fsync` or a later write of the
-/// inode writes them).
+/// are read into memory only (returned; the directory's are also kept in
+/// `nx.jobj_times`, for its next rewrite or a sync pass to write).
 pub fn rename_in_dir(nx: &mut Nx<'_>, vol: usize, dir: u64, from: &str, to: &str, ino: u64, now: &mut dyn FnMut() -> u64) -> Result<RenameTimes, String> {
     check_names(nx, vol)?;
     let (sb, _) = nx.vol_sb_read(vol)?;
@@ -1355,8 +1357,12 @@ pub fn rename_in_dir(nx: &mut Nx<'_>, vol: usize, dir: u64, from: &str, to: &str
     put_rec(nx, vol, &inode_key(ino), &f)?;
     put_rec(nx, vol, &inode_key(dir), &d)?;
     fs_tx_leave(nx, vol, now)?;
+    // After the transaction (K 0x6693700, K 0x6693720): the file's change
+    // time, then K 0x66f3750 on the directory, each with the times-dirty
+    // bit.
     let fc = now();
     let dt = now();
+    nx.jobj_times.insert((vol, dir), (dt, dt));
     Ok(RenameTimes { file: (u64a(&f, INO_MOD_TIME), fc), dir: (dt, dt) })
 }
 
@@ -1574,8 +1580,10 @@ pub fn chown(nx: &mut Nx<'_>, vol: usize, ino: u64, uid: u32, gid: u32, now: &mu
 }
 
 /// The unmount of a read-write volume, `forced` (MNT_FORCE) or not:
-/// without it XNU's VFS_SYNC first commits the container's transaction
-/// (`tx_finish`); apfs_vfsop_unmount (K 0x66c8214) stops the volume's
+/// without it XNU's VFS_SYNC first writes the times the volume's inodes
+/// hold in memory and commits the container's transaction (`tx_finish`);
+/// with it, inodes holding unwritten times are refused (their reclaim is
+/// not transcribed); apfs_vfsop_unmount (K 0x66c8214) stops the volume's
 /// pfkur thread (K 0x66b0ffc at K 0x66c8988), which removes its temporary
 /// inode ([`free_tmp_ino`]), and commits (`tx_finish(0x11)` at K
 /// 0x66c8ef8); then, in the next transaction, which stays open, the
@@ -1583,7 +1591,27 @@ pub fn chown(nx: &mut Nx<'_>, vol: usize, ino: u64, uid: u32, gid: u32, now: &mu
 /// moves to the front, else the entries shift and the oldest goes), the
 /// clone transaction, and the unmount time.
 pub fn unmount(nx: &mut Nx<'_>, vol: usize, forced: bool, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    let pending: Vec<u64> = nx.jobj_times.keys().filter(|k| k.0 == vol).map(|k| k.1).collect();
+    if forced && !pending.is_empty() {
+        return Err(format!("not implemented: a forced unmount reclaiming vnodes whose in-memory times are unwritten (inodes {pending:#x?}; apfs_vnop_reclaim not transcribed)"));
+    }
     if !forced {
+        // apfs_vfsop_sync (K 0x66c9d80): the vnode pass first (K 0x66d1748
+        // → apfs_fsync_internal, whose times write for an inode with only
+        // its times dirty is one file-system transaction rewriting it, K
+        // 0x66a1878), then tx_finish.
+        if pending.len() > 1 {
+            return Err("not implemented: the sync pass's vnode order (vnode_iterate over the mount's list) for more than one inode with unwritten times".into());
+        }
+        for ino in pending {
+            let (m, c) = nx.jobj_times.remove(&(vol, ino)).unwrap();
+            fs_tx_enter(nx, vol)?;
+            let mut v = inode(nx, vol, ino)?;
+            v.put64(INO_MOD_TIME, m);
+            v.put64(INO_CHANGE_TIME, c);
+            put_rec(nx, vol, &inode_key(ino), &v)?;
+            fs_tx_leave(nx, vol, now)?;
+        }
         nx.commit()?;
     }
     if let Some(ino) = nx.pfkur_tmp.remove(&vol) {
@@ -1793,21 +1821,24 @@ pub fn cas_bsdflags(nx: &mut Nx<'_>, vol: usize, ino: u64, expected: u32, new: u
 }
 
 /// `setattrlist(ATTR_CMN_DATA_PROTECT_FLAGS)` of directory `ino` to class
-/// `class` on a volume of crypto mode 1 (apfs_vnop_setattr K 0x668e4a0;
-/// drafts/s23/re-user-copy.md 3): nothing when the class is already it;
-/// else one file-system transaction setting the class and
-/// PROT_CLASS_EXPLICIT (0x8) with the change time read, then the general
-/// path's transaction with nothing counted (the inode rewritten as it
-/// is).
+/// `class` (apfs_vnop_setattr K 0x668e4a0), on a volume of crypto mode 1
+/// (drafts/s23/re-user-copy.md 3) or 3 (a VEK volume: K 0x668eb64 →
+/// K 0x66a8804; drafts/s26/re-aks-data.md 1): nothing when the class is
+/// already it; else one file-system transaction setting the class and
+/// PROT_CLASS_EXPLICIT (0x8) with the change time read, the inode written
+/// from its in-memory object (so with any times it held, `nx.jobj_times`),
+/// then the general path's transaction with nothing counted (the inode
+/// rewritten as it is).
 pub fn set_dir_class(nx: &mut Nx<'_>, vol: usize, ino: u64, class: u32, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     check_setattr_volume(nx, vol)?;
-    {
+    let crypto = {
         let (sb, _) = nx.vol_sb_read(vol)?;
-        if vol_crypto(sb) != 1 {
-            return Err("not implemented: a class change on other than a crypto-mode-1 volume".into());
-        }
+        vol_crypto(sb)
+    };
+    if crypto != 1 && crypto != 3 {
+        return Err(format!("not implemented: a class change on a volume of crypto mode {crypto}"));
     }
-    let mut v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
+    let mut v = inode(nx, vol, ino)?;
     if u16::from_le_bytes([v[INO_MODE], v[INO_MODE + 1]]) & S_IFMT != S_IFDIR {
         return Err("not implemented: a class change of other than a directory".into());
     }
@@ -1815,11 +1846,33 @@ pub fn set_dir_class(nx: &mut Nx<'_>, vol: usize, ino: u64, class: u32, now: &mu
         return Err("class F on a directory (EPERM)".into());
     }
     let old = u32::from_le_bytes(v[0x3c..0x40].try_into().unwrap());
-    if old == class {
+    if crypto == 3 {
+        // The mode-3 branch for a directory: the class must be a valid one
+        // (classes 0 to 7 but 5, mask 0xdf), and K 0x6701c0c gives the
+        // directory's current key kind from its class by the table at
+        // K 0x55af1ac (a directory never uses the VEK, K 0x66f7f88); the
+        // same kind writes nothing in K 0x66a8804, but the general path's
+        // transaction still follows.
+        const KIND: [u32; 8] = [5, 0, 1, 2, 3, 0, 4, 7];
+        let valid = |c: u32| c < 8 && (0xdfu32 >> c) & 1 != 0;
+        if !valid(class) {
+            return Err(format!("class {class} on a directory (EINVAL)"));
+        }
+        if !valid(old & 0x1f) {
+            return Err(format!("a directory of class {old:#x} has no key kind (K 0x66a8804 returns 0x5c)"));
+        }
+        if KIND[(old & 0x1f) as usize] == KIND[class as usize] {
+            return Err("not implemented: a class change to the directory's own key kind (the general path's transaction alone)".into());
+        }
+    } else if old == class {
         return Ok(());
     }
-    if old == 2 {
+    if crypto == 1 && old == 2 {
         return Err("not implemented: a class change from class B (K 0x66fac40)".into());
+    }
+    if let Some((m, c)) = nx.jobj_times.remove(&(vol, ino)) {
+        v.put64(INO_MOD_TIME, m);
+        v.put64(INO_CHANGE_TIME, c);
     }
     fs_tx_enter(nx, vol)?;
     v.put32(0x3c, class);
@@ -1912,6 +1965,12 @@ fn get_rec(nx: &mut Nx<'_>, vol: usize, key: &[u8]) -> Result<Option<Vec<u8>>, S
 }
 
 fn put_rec(nx: &mut Nx<'_>, vol: usize, key: &[u8], val: &[u8]) -> Result<(), String> {
+    if key.len() == 8 && u64a(key, 0) >> 60 == J_INODE {
+        let ino = u64a(key, 0) & OBJ_MASK;
+        if nx.jobj_times.contains_key(&(vol, ino)) {
+            return Err(format!("not implemented: a rewrite of inode {ino:#x} that does not carry the times its in-memory object holds"));
+        }
+    }
     let (mut t, mut st) = nx.fs_tree(vol)?;
     t.insert(&mut st, key, Some(val))?;
     nx.set_fs_tree(vol, t);

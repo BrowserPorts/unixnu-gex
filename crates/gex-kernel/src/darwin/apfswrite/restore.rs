@@ -212,7 +212,7 @@ pub fn build_disk0_with(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() ->
         let o = add_with(&mut nx, "User", storage::role::USER, None, true, now)?;
         let user = slot(&nx, o)?;
         fsops::mount_rw(&mut nx, user, now)?;
-        configure_data_volumes(&mut nx, system, data, user, now, &mut missing)?;
+        configure_data_volumes(&mut nx, system, data, user, now)?;
         // reserve_overprov_space (0x1000184ec → 0x10002e5bc, erase only):
         // the disk's size from the whole-disk node's block size and count.
         fsops::reserve_overprov_space(&mut nx, data, storage::disk0_bytes(), crate::darwin::storagestack::container_unmap(), now)?;
@@ -229,6 +229,12 @@ pub fn build_disk0_with(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() ->
     // The kernel's own counting of the checksums it sets (its kext has
     // sites newfs_apfs's copy does not) and whether its read-write mount's
     // block-0 write has the newest mounting version are not traced.
+    // Times the kernel still holds in memory: the next rewrite of their
+    // inodes (for Data's /keybags, aks_bootstrap_fs's class change in
+    // fixup_var, drafts/s26/re-aks-data.md 1) is not reached.
+    for (&(v, ino), &(m, c)) in &nx.jobj_times {
+        missing.push(format!("the times inode {ino:#x} of volume slot {v} holds in memory (modification {m}, change {c}), written by its next rewrite"));
+    }
     missing.push("nx_counters[0] and block 0's nx_newest_mounted_version as the kernel's transactions leave them (projected from newfs_apfs's three counting sites; the kext has ten)".into());
     nx.unmount()?;
     Ok(missing)
@@ -504,10 +510,10 @@ fn usersession_kb() -> Vec<u8> {
 /// /System/Library/Templates/User: UserManagementLayout's primary user on
 /// Data (2.1, drafts/s23/re-uml-data.md), the AKS identity calls (Secure
 /// Enclave only), the user protection of Data's VEK (2.3) and
-/// AKSVolumeMap's cookie on User (2.5), each with its checkpoint; the
-/// template's copy onto User (2.4) is not implemented and is returned as
-/// missing.
-fn configure_data_volumes(nx: &mut Nx<'_>, system: usize, data: usize, user: usize, now: &mut dyn FnMut() -> u64, missing: &mut Missing) -> Result<(), String> {
+/// AKSVolumeMap's cookie on User (2.5), each with its checkpoint, the
+/// template's copy onto User and aks_bootstrap_user_fs (2.4). The rename
+/// leaves /keybags' times in the kernel's memory (`nx.jobj_times`).
+fn configure_data_volumes(nx: &mut Nx<'_>, system: usize, data: usize, user: usize, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     let mut t = ROOT_INO;
     for n in ["System", "Library", "Templates", "User"] {
         match fsops::lookup(nx, system, t, n)? {
@@ -538,9 +544,7 @@ fn configure_data_volumes(nx: &mut Nx<'_>, system: usize, data: usize, user: usi
     // libcopyfile with the handler's lchown to 501:501, then
     // aks_bootstrap_user_fs.
     user_template_copy(nx, system, t, user, now)?;
-    aks_bootstrap_user_fs(nx, user, now)?;
-    missing.push(format!("Data's /keybags times the rename left in memory (mod and change {}: written at that inode's next write or a sync pass, drafts/s23/re-uml-data.md UNSETTLED-5)", rt.dir.0));
-    Ok(())
+    aks_bootstrap_user_fs(nx, user, now)
 }
 
 const MOBILE: u32 = 501;
@@ -1830,6 +1834,7 @@ mod tests {
         let xid = nx.xid;
         fsops::barrier_fsync(&mut nx, 1, ino, rt.file, &mut now).unwrap();
         assert_eq!(nx.xid, xid + 1, "F_BARRIERFSYNC's checkpoint");
+        assert_eq!(nx.jobj_times.iter().map(|(&k, &v)| (k, v)).collect::<Vec<_>>(), vec![((1, keybags), rt.dir)], "/keybags' times stay in memory");
         {
             let (t, mut st) = nx.fs_tree(1).unwrap();
             let recs = t.records(&mut st).unwrap();
@@ -1871,6 +1876,17 @@ mod tests {
         assert_eq!((q(&fext[0], 0), q(&fext[0], 16)), (0x0300_0000_2625_a000, q(&fext[0], 8)));
         let sb = nx.vol_sb_read(1).unwrap().0.to_vec();
         assert_eq!((q(&sb, 0xb8), q(&sb, 0xe0)), (2, 156_251));
+        // aks_bootstrap_fs("/mnt2")'s class D for /keybags (drafts/s26/
+        // re-aks-data.md 1): the inode written from its in-memory object, so
+        // with the rename's times, its change time read anew; then the
+        // general path's rewrite.
+        let before = fsops::inode(&mut nx, 1, keybags).unwrap();
+        fsops::set_dir_class(&mut nx, 1, keybags, 4, &mut now).unwrap();
+        assert!(nx.jobj_times.is_empty());
+        let kd = fsops::inode(&mut nx, 1, keybags).unwrap();
+        assert_eq!((q(&kd, 0x18), u32::from_le_bytes(kd[0x3c..0x40].try_into().unwrap()), q(&kd, 0x30)), (rt.dir.0, 4, 0x8008));
+        assert!(q(&kd, 0x20) > rt.dir.1);
+        assert_eq!((&kd[..0x18], &kd[0x28..0x3c], &kd[0x40..]), (&before[..0x18], &before[0x28..0x3c], &before[0x40..]));
         nx.commit().unwrap();
         let check = |tag: &str| {
             sink.0.sync_all().unwrap();

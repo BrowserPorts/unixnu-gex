@@ -62,6 +62,7 @@ pub fn stand_ins(os: bool, boot: bool) -> Vec<&'static str> {
         v.push(SPLAT_STAND_IN);
         v.push(TICKET_STAND_IN);
         v.push(RESTORE_HOST_STAND_IN);
+        v.push(super::snapshot::SNAP_UUID_STAND_IN);
     }
     if os {
         v.push(fsops::FILE_INODE_STAND_IN);
@@ -311,7 +312,18 @@ pub fn build_disk0_hooked(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() 
                 if !seal_system_volume(&mut nx, v, data, user, files, tool_barrier, hooks, now)? {
                     return Ok(missing);
                 }
-                missing.push("create_system_snapshot (fs_snapshot_create of com.apple.os.update-<root hash> on System), migrate_user_fsevents' mounts and unmount_filesystems".into());
+                match &os.boot {
+                    Some(_) => {
+                        create_system_snapshot(&mut nx, v, now)?;
+                        // prepare_data_split, convert_eds_volumes,
+                        // split_data_volume and commit_temporary_checkpoint
+                        // log and return on an erase restore
+                        // (re-seal-snap.md 5).
+                        migrate_user_fsevents(&mut nx, v, data, user, now)?;
+                        unmount_filesystems(&mut nx, v, data, user, now)?;
+                    }
+                    None => missing.push("create_system_snapshot, migrate_user_fsevents' mounts and unmount_filesystems (no IPSW boot objects: Preboot has no usr/standalone/firmware/root_hash.img4, whose absence takes the legacy snapshot name and fs_snapshot_root, not implemented)".into()),
+                }
             }
             None => missing.push("the restore's later steps, in its order: populate_preboot_volume, set_autoboot_delay's sync, seal_system_volume (its unmounts and apfs_sealvolume), create_system_snapshot, migrate_user_fsevents' mounts and unmount_filesystems (no canonical metadata and root hash given)".into()),
         }
@@ -1826,6 +1838,74 @@ fn seal_system_volume(nx: &mut Nx<'_>, v: Volumes, data: usize, user: usize, fil
     Ok(true)
 }
 
+/// `copy_arv_apfs_system_snapshot_name(data, 1)` (RE@0x10001d74c →
+/// RE@0x10001d558): the Image4 file's payload (Img4DecodeInit), at least
+/// 16 bytes, its hash length at +0xc and at least that many bytes after
+/// +0x10; "com.apple.os.update-" and those bytes in "%02X".
+fn arv_snapshot_name(img4_file: &[u8]) -> Result<String, String> {
+    let (_, p) = super::seal::img4_payload(img4_file)?;
+    if p.len() < 16 {
+        return Err("a root hash payload under 16 bytes".into());
+    }
+    let n = u32::from_le_bytes(p[0xc..0x10].try_into().unwrap()) as usize;
+    if p.len() < 0x10 + n {
+        return Err("a root hash payload shorter than its hash".into());
+    }
+    Ok(format!("com.apple.os.update-{}", p[0x10..0x10 + n].iter().map(|b| format!("{b:02X}")).collect::<String>()))
+}
+
+/// create_system_snapshot (RE@0x100039ab4; drafts/s27/re-seal-snap.md 4):
+/// preboot_path's `mount_partition(9, rw)` and its /mnt9/<nsih>; the root
+/// hash Image4 file install_root_hash wrote there read; the update
+/// snapshot's name made of it (the name the device tree's
+/// `root-snapshot-name` gives the booted kernel, [`storage::ROOT_SNAPSHOT`]);
+/// `fs_snapshot_create` on /mnt1 ([`super::snapshot::fs_snapshot_create`]).
+/// With that name, no `mount_partition(0, 0)` and no `fs_snapshot_root`.
+fn create_system_snapshot(nx: &mut Nx<'_>, v: Volumes, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    fsops::mount_rw(nx, v.preboot, now)?;
+    let dir = nsih();
+    resolve(nx, v.preboot, &dir)?.ok_or_else(|| format!("no /mnt9/{dir}"))?;
+    let f = resolve(nx, v.preboot, &format!("{dir}/usr/standalone/firmware/root_hash.img4"))?.ok_or("not implemented: no root_hash.img4 on Preboot (the legacy snapshot name and fs_snapshot_root)")?;
+    let bytes = file_bytes(nx, v.preboot, f)?;
+    let name = arv_snapshot_name(&bytes)?;
+    if name != storage::ROOT_SNAPSHOT {
+        return Err(format!("the update snapshot {name} is not the one the boot mounts ({})", storage::ROOT_SNAPSHOT));
+    }
+    match super::snapshot::fs_snapshot_create(nx, v.system, &name, now)? {
+        Ok(_) => Ok(()),
+        Err(e) => Err(format!("Failed to create ARV snapshot. (errno {e})")),
+    }
+}
+
+/// migrate_user_fsevents (RE@0x10003c044; re-seal-snap.md 5): with
+/// `e-apfs` the data volume is split, so xART (`seputil
+/// --gigalocker-init` only stats it and calls the Secure Enclave), Data
+/// and User are mounted read-write (`mount_apfs -R`; the
+/// `.ramdisk-boot-done` opens fail at their lookups); neither User's nor
+/// Data's root has `.fseventsd`, so nothing is migrated.
+fn migrate_user_fsevents(nx: &mut Nx<'_>, v: Volumes, data: usize, user: usize, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    for vol in [v.xart, data, user] {
+        fsops::mount_rw(nx, vol, now)?;
+    }
+    for vol in [user, data] {
+        if fsops::lookup(nx, vol, ROOT_INO, ".fseventsd")?.is_some() {
+            return Err("not implemented: migrating user fsevents (RE@0x100058c7c with a .fseventsd)".into());
+        }
+    }
+    Ok(())
+}
+
+/// unmount_filesystems (RE@0x10001af18 → RE@0x10002ef18): the same loop as
+/// the seal's, without Update, forced: Preboot, User, Data, xART (after
+/// `seputil --gigalocker-shutdown`); System is mounted read-only (no
+/// transaction), Hardware not at all.
+fn unmount_filesystems(nx: &mut Nx<'_>, v: Volumes, data: usize, user: usize, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    for vol in [v.preboot, user, data, v.xart] {
+        fsops::unmount(nx, vol, true, now)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2189,6 +2269,7 @@ mod tests {
         f.set_len(size).unwrap();
         let disk = std::sync::Arc::new(super::super::HostFile(f, size));
         let (base, psize) = storage::partition_extent();
+        // Clocks before the checkers' own: fsck warns of times to come.
         let clock: Rc<RefCell<(u64, Vec<u64>)>> = Rc::new(RefCell::new((1_760_000_000_000_000_000, Vec::new())));
         let c2 = Rc::clone(&clock);
         let mut now = move || {
@@ -2200,6 +2281,7 @@ mod tests {
             c.0
         };
         let c3 = Rc::clone(&clock);
+        let c4 = Rc::clone(&clock);
         let d2 = std::sync::Arc::clone(&disk);
         let (dp, cp, dbp, pp) = (disk_path.clone(), ctr_path.clone(), db_path.clone(), plist_path.clone());
         let mut before_seal = move || -> Result<(), String> {
@@ -2222,8 +2304,10 @@ mod tests {
         };
         let diffs = Rc::new(RefCell::new(None));
         let dd = Rc::clone(&diffs);
-        let (d3, cp2) = (std::sync::Arc::clone(&disk), ctr_path.clone());
-        let mut after_seal = move |_: &mut Nx<'_>| -> Result<bool, String> {
+        let fscks = Rc::new(RefCell::new(Vec::new()));
+        let ff = Rc::clone(&fscks);
+        let (d3, cp2, dp2) = (std::sync::Arc::clone(&disk), ctr_path.clone(), disk_path.clone());
+        let mut after_seal = move |nx: &mut Nx<'_>| -> Result<bool, String> {
             use crate::darwin::apfsread::Medium;
             let mut diffs = differing_blocks(&d3, base, psize, &cp2);
             // The differing words of each differing block, for the report.
@@ -2237,6 +2321,30 @@ mod tests {
                 d.push_str(&format!(" [{}]", w.join(", ")));
             }
             *dd.borrow_mut() = Some(diffs);
+            // Then the kernel's update snapshot of the sealed volume on the
+            // port's container, checked by the device's and the host's
+            // fsck (GEX_TEST_FSCK).
+            if let Ok(fsck) = std::env::var("GEX_TEST_FSCK") {
+                let mut tick = || {
+                    let mut c = c4.borrow_mut();
+                    c.0 += 1000;
+                    c.0
+                };
+                let system = (0..nx.fs_oid.len()).find(|&i| nx.vol_oid(i).is_some() && nx.vol_sb_read(i).is_ok_and(|(b, _)| u16::from_le_bytes([b[0x3c4], b[0x3c5]]) == storage::role::SYSTEM)).unwrap();
+                nx.remount(Mode::Kernel)?;
+                nx.reaper_run()?;
+                let n = super::super::snapshot::fs_snapshot_create(nx, system, storage::ROOT_SNAPSHOT, &mut tick)?.map_err(|e| format!("fs_snapshot_create: errno {e}"))?;
+                assert_eq!(super::super::snapshot::fs_snapshot_create(nx, system, storage::ROOT_SNAPSHOT, &mut tick)?, Err(17));
+                nx.unmount()?;
+                d3.0.sync_all().map_err(|e| e.to_string())?;
+                copy_container(&dp2, &cp2, base, psize);
+                // -M: the container keybag is KEYS_STAND_IN's plaintext.
+                let dev = std::process::Command::new(&fsck).args(["-n", "-W", "-s", "-M"]).arg(&cp2).output().unwrap();
+                let host = std::process::Command::new("/sbin/fsck_apfs").args(["-n", "-s", "-M"]).arg(&cp2).output().unwrap();
+                eprintln!("snapshot xid {n}\n{}{}", String::from_utf8_lossy(&dev.stdout), String::from_utf8_lossy(&host.stdout));
+                ff.borrow_mut().push((dev.status.success(), String::from_utf8_lossy(&dev.stdout).into_owned() + &String::from_utf8_lossy(&dev.stderr)));
+                ff.borrow_mut().push((host.status.success(), String::from_utf8_lossy(&host.stdout).into_owned() + &String::from_utf8_lossy(&host.stderr)));
+            }
             Ok(false)
         };
         // The binary runs on a regular file: no DK_FEATURE_BARRIER.
@@ -2248,6 +2356,9 @@ mod tests {
             }
         }
         assert!(diffs.is_empty(), "{} blocks differ: {:?}", diffs.len(), &diffs[..diffs.len().min(60)]);
+        for (ok, out) in fscks.borrow().iter() {
+            assert!(ok, "fsck after the snapshot: {out}");
+        }
     }
 
     /// The blocks of `psize` bytes at `base` of `disk` that differ from the

@@ -23,6 +23,7 @@ pub mod node;
 pub mod restore;
 pub mod seal;
 pub mod sealvolume;
+pub mod snapshot;
 pub mod tx;
 
 use super::apfsread::Medium;

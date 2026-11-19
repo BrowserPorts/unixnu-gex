@@ -96,6 +96,7 @@ pub fn superclasses(class: &str) -> &'static [&'static str] {
         "IOSurfaceRoot" | "IOSurfaceRootUserClient" => super::iosurface::superclasses(class),
         super::iopower::ROOT_DOMAIN | super::iopower::ROOT_PARENT | super::iopower::CONNECTION => super::iopower::superclasses(class),
         super::iomfb::CLASS | super::iomfb::UC_CLASS => super::iomfb::superclasses(class),
+        super::sep::registry::A7IOP | super::sep::registry::NUB | super::sep::registry::MANAGER | super::sep::registry::USER_CLIENT => super::sep::registry::superclasses(class),
         _ => match super::platform::superclasses(class) {
             [] => super::accel::superclasses(class),
             s => s,
@@ -189,6 +190,7 @@ pub fn build_with(b: &[u8], chosen: &[(&str, Vec<u8>)]) -> Result<Vec<Node>, Str
         if let Some(disp) = super::platform::arm_io_nub(&mut t, io, "disp0,t8011") {
             super::iomfb::add_service(&mut t, disp);
         }
+        super::sep::registry::add(&mut t, io);
     }
     super::storagestack::add(&mut t, io);
     let resources = super::platform::add_resources(&mut t);
@@ -483,15 +485,34 @@ pub struct KeyWriter {
 ///   image's on itself. APFS only reads it, searching up the parents
 ///   (0xfffffff00666ee94), as fsck_apfs's `io_get_device_features` does
 ///   from user space.
-pub const KEY_WRITERS: &[KeyWriters] = &[KeyWriters {
-    key: "image-format-read-only",
-    writers: &[
-        KeyWriter { class: "IOHDIXHDDriveInKernel", kext: "com.apple.driver.DiskImages.KernelBacked", site: 0xfffffff005f3c158 },
-        KeyWriter { class: "KDIDiskImage", kext: "com.apple.driver.DiskImages.KernelBacked", site: 0xfffffff005f3d7fc },
-        KeyWriter { class: "KDIUDIFDiskImage", kext: "com.apple.driver.DiskImages.UDIFDiskImage", site: 0xfffffff0064a8358 },
-        KeyWriter { class: "AppleDiskImageDevice", kext: "com.apple.driver.AppleDiskImages2", site: 0xfffffff006c982a4 },
-    ],
-}];
+/// - The `sep` node's `sepfw-loaded`, `sepfw-booted`, `has-art`,
+///   `ap-manifest`, `aarch64`, `skip-lynx` and `pcie-up-interrupts`, which
+///   no kext writes (the first entries below).
+pub const KEY_WRITERS: &[KeyWriters] = &[
+    // The device-tree keys of the `sep` node that only AppleSEPManager names, each once in the
+    // kernelcache (its cstring at 0xfffffff00552e084 `sepfw-loaded`, 0xfffffff00552f20e
+    // `sepfw-booted`, 0xfffffff00552ea12 `has-art`, 0xfffffff00552ea1a `ap-manifest`,
+    // 0xfffffff00552e93f `aarch64`, 0xfffffff00552e947 `skip-lynx`, 0xfffffff00552e91c
+    // `pcie-up-interrupts`), where `start` and `_bootSEP` read it with `getProperty`: no kext
+    // writes any, so an entry has one only when the device tree does, which is iBoot's to say
+    // (the web device's boot stage's, here). No writers.
+    KeyWriters { key: "sepfw-loaded", writers: &[] },
+    KeyWriters { key: "sepfw-booted", writers: &[] },
+    KeyWriters { key: "has-art", writers: &[] },
+    KeyWriters { key: "ap-manifest", writers: &[] },
+    KeyWriters { key: "aarch64", writers: &[] },
+    KeyWriters { key: "skip-lynx", writers: &[] },
+    KeyWriters { key: "pcie-up-interrupts", writers: &[] },
+    KeyWriters {
+        key: "image-format-read-only",
+        writers: &[
+            KeyWriter { class: "IOHDIXHDDriveInKernel", kext: "com.apple.driver.DiskImages.KernelBacked", site: 0xfffffff005f3c158 },
+            KeyWriter { class: "KDIDiskImage", kext: "com.apple.driver.DiskImages.KernelBacked", site: 0xfffffff005f3d7fc },
+            KeyWriter { class: "KDIUDIFDiskImage", kext: "com.apple.driver.DiskImages.UDIFDiskImage", site: 0xfffffff0064a8358 },
+            KeyWriter { class: "AppleDiskImageDevice", kext: "com.apple.driver.AppleDiskImages2", site: 0xfffffff006c982a4 },
+        ],
+    },
+];
 
 /// A property entry `i`'s driver keeps and may change while it runs,
 /// ahead of its fixed ones: a medium's open state
@@ -501,6 +522,10 @@ pub const KEY_WRITERS: &[KeyWriters] = &[KeyWriters {
 pub fn live_prop(t: &[Node], i: u32, name: &str) -> Option<Prop> {
     if let Some(p) = super::storagestack::live_prop(t, i, name) {
         return Some(p);
+    }
+    // AppleSEPManager's "sep-booted": false from its start, true once it has booted the SEP.
+    if name == "sep-booted" && t.get(i as usize)?.class == super::sep::registry::MANAGER {
+        return Some(Prop::Bool(super::sep::booted()));
     }
     if t.get(i as usize)?.class != super::iomfb::CLASS {
         return None;
@@ -1113,6 +1138,8 @@ pub enum Kind {
     Surface(u32),
     /// The display framebuffer's ([`super::iomfb`]).
     Framebuffer(super::iomfb::Client),
+    /// AppleSEPManager's AppleSEPUserClient ([`super::sep::userclient`]).
+    Sep,
 }
 
 /// An `IOUserClient` a task opened: the service it is attached to, its
@@ -1196,6 +1223,13 @@ pub fn open_user_client(k: &mut crate::syscalls::Kernel, service: u32, ty: u32) 
         // IOMobileGraphicsFamily, whose class the framebuffer's client is,
         // depends on IOSurface.
         c if c == super::iomfb::CLASS => (super::iomfb::UC_CLASS, Kind::Framebuffer(super::iomfb::new_user_client(k, ty)?), false),
+        // IOService::newUserClient by the manager's IOUserClientClass (AppleSEPUserClient, whose
+        // initWithTask wants an entitlement and ignores the type); the kext does not depend on
+        // IOSurface.
+        super::sep::registry::MANAGER => {
+            super::sep::userclient::open(k)?;
+            (super::sep::registry::USER_CLIENT, Kind::Sep, true)
+        }
         _ => {
             k.darwin_unimplemented(format!("newUserClient of {} (type {ty:#x})", name(t, service)));
             return Err(ret::UNSUPPORTED);
@@ -1309,6 +1343,9 @@ pub fn client_close(k: &mut crate::syscalls::Kernel, c: &mut UserClient, closer:
         // opened on its container and terminates it; neither has a state
         // here, the container's opens not being modelled.
         Kind::Apfs => false,
+        // AppleSEPUserClient::clientClose terminates the client: it has no
+        // state of its own.
+        Kind::Sep => false,
         Kind::Accel(a) => {
             super::accel::client_close(k, a);
             false
@@ -1347,7 +1384,7 @@ pub fn client_died(k: &mut crate::syscalls::Kernel, id: u32) {
 /// IOUserClient's default.
 pub fn client_service(c: &UserClient) -> Option<u32> {
     match &c.kind {
-        Kind::Apfs | Kind::Surface(_) | Kind::Framebuffer(_) => None,
+        Kind::Apfs | Kind::Surface(_) | Kind::Framebuffer(_) | Kind::Sep => None,
         Kind::Accel(a) => super::accel::client_service(c.service, a),
     }
 }
@@ -1392,6 +1429,8 @@ pub fn register_notification_port(k: &mut crate::syscalls::Kernel, c: &mut UserC
             k.darwin_unimplemented("AppleAPFSUserClient::registerNotificationPort".to_string());
             ret::UNSUPPORTED
         }
+        // IOUserClient's: AppleSEPUserClient does not override it.
+        Kind::Sep => ret::UNSUPPORTED,
         Kind::Accel(a) => super::accel::register_notification_port(k, a, port, ty, reference),
         // IOUserClient's (IOSurfaceRootUserClient has none of its own).
         Kind::Surface(_) => ret::UNSUPPORTED,
@@ -1404,6 +1443,7 @@ pub fn external_method(k: &mut crate::syscalls::Kernel, c: &mut UserClient, a: &
     let key = c.id as u32;
     match &mut c.kind {
         Kind::Apfs => apfs_method(k, c.service, a),
+        Kind::Sep => super::sep::userclient::external_method(k, a),
         Kind::Accel(x) => super::accel::external_method(k, x, a),
         Kind::Surface(id) => super::iosurface::external_method(k, *id, a),
         Kind::Framebuffer(f) => super::iomfb::methods::external_method(k, key, f, a),
@@ -1535,6 +1575,8 @@ impl crate::syscalls::Kernel {
             // IOMobileFramebufferUserClient has no trap: IOUserClient's
             // getTargetAndTrapForIndex, none, and so success.
             Kind::Framebuffer(_) => ret::SUCCESS,
+            // AppleSEPUserClient has none either.
+            Kind::Sep => ret::SUCCESS,
         };
         r
     }

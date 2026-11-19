@@ -4,7 +4,8 @@
 //! The AP's side is ported from the kernelcache: the mailbox block
 //! ([`akf`], AppleA7IOPV2's [`a7iop`]), the messages ([`frame`]), the
 //! manager with its boot handshake and endpoints ([`manager`]), the shared
-//! memory it hands the SEP ([`mem`], [`shm`]). The SEP's side is the real sepOS and SEP ROM: what the
+//! memory it hands the SEP ([`mem`], [`shm`]) and the user client
+//! ([`userclient`]). The SEP's side is the real sepOS and SEP ROM: what the
 //! owner supplies ([`image`], [`core`]) and the web device's own UID
 //! ([`secrets`]). No reply of the SEP's is made here; what is missing
 //! fails loudly and is named.
@@ -20,8 +21,10 @@ pub mod hw;
 pub mod image;
 pub mod manager;
 pub mod mem;
+pub mod registry;
 pub mod secrets;
 pub mod shm;
+pub mod userclient;
 
 use super::iokit::{self, Node};
 use hw::Hw;

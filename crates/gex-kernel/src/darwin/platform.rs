@@ -215,7 +215,7 @@ const EXCLUDED: [&str; 4] = ["chosen", "memory", "options", "aliases"];
 /// one of arm-io's, both `IODTResolveAddressing(nub, "reg", NULL)`, as
 /// arm-io's driver keeps no device memory of its own). A range the
 /// unfilled template gives as empty (iBoot fills it) is not answered.
-fn make_nub(t: &mut [Node], entry: u32, class: &'static str, driver: u32) {
+pub(crate) fn make_nub(t: &mut [Node], entry: u32, class: &'static str, driver: u32) {
     t[entry as usize].nub = Some((class, driver));
     if t[entry as usize].service_props.iter().any(|(k, _)| k == "IODeviceMemory") {
         return;

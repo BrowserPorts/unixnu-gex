@@ -158,6 +158,7 @@ pub(crate) fn convert(md: &std::fs::Metadata) -> Metadata {
             atime_ns: md.atime_nsec() as u32,
             ctime: md.ctime(),
             ctime_ns: md.ctime_nsec() as u32,
+            birth: md.created().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| (d.as_secs() as i64, d.subsec_nanos())),
         },
     }
 }
@@ -1081,6 +1082,15 @@ pub mod host_xattr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_host_file_keeps_its_birth_time() {
+        let host = std::fs::metadata(std::env::temp_dir()).unwrap();
+        let want = host.created().ok().map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap()).map(|d| (d.as_secs() as i64, d.subsec_nanos()));
+        assert_eq!(convert(&host).times.birth, want);
+        #[cfg(target_os = "macos")]
+        assert!(want.is_some(), "macOS keeps every file's birth time");
+    }
 
     #[test]
     fn a_host_file_keeps_its_device() {

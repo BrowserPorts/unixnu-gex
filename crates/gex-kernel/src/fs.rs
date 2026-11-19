@@ -113,8 +113,9 @@ pub struct Stat {
     pub ctime_ns: u32,
     /// Darwin's `st_flags`.
     pub flags: u32,
-    /// Darwin's `st_birthtimespec`, where the filesystem has one of its
-    /// own; else the modification time stands for it.
+    /// Darwin's `st_birthtimespec`: the file's creation time where its
+    /// filesystem keeps one (`va_create_time`); else 0, as `vn_stat` gives
+    /// it for a filesystem that does not support it.
     pub birth: Option<(i64, u32)>,
 }
 
@@ -161,7 +162,7 @@ impl Stat {
 
     /// Darwin's `struct stat` (the 64-bit-inode one, 144 bytes): a 32-bit
     /// device, 16-bit mode and link count, then a birth time after the
-    /// three Linux has (the filesystem's, or the modification time), the
+    /// three Linux has (the filesystem's, or 0: xnu-10063 `vn_stat`), the
     /// size, blocks, a 32-bit block size, the flags and a zero generation.
     pub fn encode_darwin(&self) -> StatBytes {
         let mut b = StatBytes::zeroed(144);
@@ -174,7 +175,7 @@ impl Stat {
         // st_rdev as Darwin's dev_t (major << 24 | minor).
         b[24..28].copy_from_slice(&crate::darwin::attrcall::darwin_dev(self.rdev).to_le_bytes());
         let [at, mt, ct] = self.times();
-        let bt = self.birth.unwrap_or(mt);
+        let bt = self.birth.unwrap_or((0, 0));
         for (off, (t, ns)) in [32usize, 48, 64, 80].into_iter().zip([at, mt, ct, bt]) {
             b[off..off + 8].copy_from_slice(&t.to_le_bytes());
             b[off + 8..off + 16].copy_from_slice(&(ns as i64).to_le_bytes());
@@ -333,5 +334,19 @@ mod stat_tests {
         assert_eq!(n[72..96], w[96..120]);
         assert_eq!(i32_at(&n, 92), 0x8000);
         assert!(n[96..120].iter().all(|&b| b == 0));
+    }
+
+    /// `st_birthtimespec` is the filesystem's creation time, and 0 where
+    /// it keeps none (xnu-10063 `vn_stat`), never another time.
+    #[test]
+    fn the_birth_time_is_the_creation_time_or_zero() {
+        let i64_at = |b: &[u8], o: usize| i64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+        let mut st = Stat { mtime: 13, mtime_ns: 14, ctime: 15, ..Default::default() };
+        let w = st.encode_darwin();
+        assert_eq!((i64_at(&w, 80), i64_at(&w, 88)), (0, 0));
+        st.birth = Some((9, 10));
+        let w = st.encode_darwin();
+        assert_eq!((i64_at(&w, 80), i64_at(&w, 88)), (9, 10));
+        assert_eq!((i64_at(&w, 48), i64_at(&w, 56)), (13, 14));
     }
 }

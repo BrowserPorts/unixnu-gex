@@ -12978,6 +12978,7 @@ impl Kernel {
             atime_ns: md.times.atime_ns,
             ctime: if md.times == Default::default() { md.mtime } else { md.times.ctime },
             ctime_ns: md.times.ctime_ns,
+            birth: md.times.birth,
             // What the node says, or for a character device that does not,
             // a pseudo-terminal's number (136:0).
             rdev: if md.rdev != 0 {

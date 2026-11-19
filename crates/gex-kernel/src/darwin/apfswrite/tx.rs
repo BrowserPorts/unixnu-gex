@@ -4047,6 +4047,7 @@ mod tests {
         let vol_uuid: [u8; 16] = sb[0xf0..0x100].try_into().unwrap();
         let range = crate::darwin::graftfs::recorded_jobj_range(&get, &vol_uuid, q(&sb, 0xb0), &|_| None);
         assert_eq!(range, Ok(Some((base, 0x5000))));
+        let crt = q(&fsops::inode(&mut nx, pb, ino).unwrap(), 0x10);
         // Served live, the file shows no attribute: the file system owns
         // them (APFS's getxattr answers ENOATTR, its listing skips them).
         {
@@ -4056,7 +4057,11 @@ mod tests {
             let mut buf = [0u8; 256];
             assert_eq!(live.xattr("os.dmg", XattrOp::List { buf: &mut buf }), Ok(0));
             assert_eq!(live.xattr("os.dmg", XattrOp::Get { name: "user.com.apple.fs.graft-vol-uuid", buf: &mut buf }), Err(crate::errno::Errno::ENODATA));
-            assert_eq!(live.metadata("os.dmg").unwrap().ino, ino);
+            let md = live.metadata("os.dmg").unwrap();
+            assert_eq!(md.ino, ino);
+            // Its creation time is the inode's create_time.
+            assert_eq!(md.times.birth, Some(((crt / 1_000_000_000) as i64, (crt % 1_000_000_000) as u32)));
+            assert!(crt != 0);
             // A bind mount of a directory: the same files below it.
             let b = live.bound_subtree("sub").unwrap();
             assert_eq!((b.metadata("").unwrap().ino, b.metadata("f").unwrap().ino), (sub, f));

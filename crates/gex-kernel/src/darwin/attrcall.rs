@@ -174,7 +174,9 @@ fn vnode(pio: &PathIo<'_>, path: &str, md: &Metadata, name: Option<&str>, want_c
         }
     };
     let t = |s: i64, ns: u32| (s, i64::from(ns));
-    let birth = t(st.mtime, st.mtime_ns);
+    // ATTR_CMN_CRTIME: the creation time `vn_stat` gives too, 0 where
+    // the filesystem keeps none.
+    let birth = st.birth.map_or((0, 0), |(s, ns)| t(s, ns));
     let owned = if want_owner { super::vattr::get_on(pio.ns, mnt, path, md, None)? } else { super::vattr::Owned { uid: 0, gid: 0, mode: md.mode & 0o7777, flags: 0 } };
     let (data_alloc, rdev) = match md.file_type {
         FileType::Regular => (roundup(md.size, u64::from(vfsstat::BSIZE)), 0),

@@ -321,7 +321,7 @@ impl DnTimes {
         if self.atime.0 == 0 {
             self.atime = self.ctime;
         }
-        (self.mtime.0, Times { mtime_ns: self.mtime.1, atime: self.atime.0, atime_ns: self.atime.1, ctime: self.ctime.0, ctime_ns: self.ctime.1 })
+        (self.mtime.0, Times { mtime_ns: self.mtime.1, atime: self.atime.0, atime_ns: self.atime.1, ctime: self.ctime.0, ctime_ns: self.ctime.1, birth: None })
     }
 }
 

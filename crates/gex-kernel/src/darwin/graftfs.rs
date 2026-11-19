@@ -389,6 +389,7 @@ impl GraftFs {
         let (m, mn) = t(ino.mod_time);
         let (a, an) = t(ino.access_time);
         let (c, cn) = t(ino.change_time);
+        let birth = Some(t(ino.create_time));
         Ok(Metadata {
             file_type,
             size,
@@ -398,7 +399,7 @@ impl GraftFs {
             nlink,
             rdev: 0,
             dev: 0,
-            times: Times { mtime_ns: mn, atime: a, atime_ns: an, ctime: c, ctime_ns: cn },
+            times: Times { mtime_ns: mn, atime: a, atime_ns: an, ctime: c, ctime_ns: cn, birth },
         })
     }
 

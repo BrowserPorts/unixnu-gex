@@ -201,6 +201,8 @@ pub fn decode_meta(b: &[u8]) -> Metadata {
             atime_ns: u32at(48),
             ctime: u64at(52) as i64,
             ctime_ns: u32at(60),
+            // The remote's record carries no creation time.
+            birth: None,
         },
     }
 }

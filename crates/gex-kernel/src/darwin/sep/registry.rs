@@ -42,11 +42,40 @@ pub fn superclasses(class: &str) -> &'static [&'static str] {
     }
 }
 
-/// Whether a driver of `class` here registers itself: the manager does at
-/// the end of its start (`registerService(0)`, K 0xfffffff0063cf544, then
-/// publishes the resource "SEP"); whether AppleA7IOPV2 does is not traced.
+/// Whether a service of `class` here registers itself (`registerService`,
+/// IOService's vtable slot 0x2a0):
+/// - The manager does, at the end of its start (`registerService(0)`,
+///   K 0xfffffff0063cf544, then publishes the resource "SEP").
+/// - AppleA7IOPV2 does not. Its start is AppleA7IOP's (slot 0x2b0 of its
+///   vptr K 0xfffffff006fe38e8 is K 0xfffffff005b120d4), whose superclass
+///   start (IOSlaveCPU's, K 0xfffffff005b10e08) is IOService's and a work
+///   loop. The only `registerService` calls in the AppleA7IOP,
+///   AKFWrap-v2 and IOSlaveProcessor kexts are on the nubs AppleA7IOP's
+///   start publishes (K 0xfffffff005b125d0, and K 0xfffffff005b1422c in
+///   the same loop of AppleWrapperMailbox's start), and nothing else
+///   registers a driver that matched.
+/// - AppleA7IOPNub does: that loop (K 0xfffffff005b1255c) makes each nub
+///   (`withRegistryEntry`, K 0xfffffff005b13b40), attaches it to the
+///   A7IOP and calls its `registerService(0)`.
 pub fn registers(class: &str) -> Option<bool> {
-    (class == MANAGER).then_some(true)
+    match class {
+        MANAGER | NUB => Some(true),
+        A7IOP => Some(false),
+        _ => None,
+    }
+}
+
+/// Whether a service of `class` compares names as the device tree does:
+/// AppleA7IOPNub's `compareName` (K 0xfffffff005b13c94, its vtable slot
+/// 0x200) is `IODTCompareNubName`, else IORegistryEntry's.
+pub fn dt_compare_name(class: &str) -> bool {
+    class == NUB
+}
+
+/// Whether a service of `class` is its own `matchLocation`: AppleA7IOPNub's
+/// (K 0xfffffff005b13cf4, its vtable slot 0x338) returns itself.
+pub fn own_location(class: &str) -> bool {
+    class == NUB
 }
 
 /// Whether every registered service of `class` is in the registry here:

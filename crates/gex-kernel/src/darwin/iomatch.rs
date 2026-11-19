@@ -322,6 +322,8 @@ fn entry_compare_name(t: &[Node], i: u32, name: &[u8]) -> bool {
 ///   the entry's name.
 /// - `IOPCIDevice` (0xfffffff0064d2838): its bridge's `compareNubName`
 ///   (slot 0x5a8), every bridge here IOPCIBridge's: `IODTCompareNubName`.
+/// - `AppleA7IOPNub` (0xfffffff005b13c94): `IODTCompareNubName`, else
+///   the entry's name ([`super::sep::registry::dt_compare_name`]).
 /// - Every other class here keeps `IORegistryEntry::compareName`.
 fn compare_name(t: &[Node], i: u32, name: &[u8]) -> Result<bool, String> {
     let class = iokit::class(t, i)?;
@@ -332,7 +334,7 @@ fn compare_name(t: &[Node], i: u32, name: &[u8]) -> Result<bool, String> {
     if chain.contains(&super::storagestack::PCI_DEVICE) {
         return dt_compare_nub_name(t, i, name);
     }
-    if chain.contains(&super::platform::ARM_IO_DEVICE) || chain.contains(&super::platform::PLATFORM_DEVICE) {
+    if chain.contains(&super::platform::ARM_IO_DEVICE) || chain.contains(&super::platform::PLATFORM_DEVICE) || chain.iter().any(|c| super::sep::registry::dt_compare_name(c)) {
         return Ok(dt_compare_nub_name(t, i, name)? || entry_compare_name(t, i, name));
     }
     Ok(entry_compare_name(t, i, name))
@@ -1103,13 +1105,13 @@ fn match_keys(reg: u32, keys: &[u8], default_mask: u32) -> bool {
 
 /// `IOService::matchLocation` of entry `i`: the first of it and its
 /// providers whose class answers itself (`IOPlatformDevice`,
-/// `AppleARMIODevice` 0xfffffff00598cf7c, `IOPCIDevice`); none past the
-/// root.
+/// `AppleARMIODevice` 0xfffffff00598cf7c, `IOPCIDevice`, `AppleA7IOPNub`
+/// 0xfffffff005b13cf4); none past the root.
 fn match_location(t: &[Node], i: u32) -> Result<Option<u32>, String> {
     let mut at = i;
     loop {
         let c = chain(t, at);
-        if [super::platform::PLATFORM_DEVICE, super::platform::ARM_IO_DEVICE, super::storagestack::PCI_DEVICE].iter().any(|k| c.contains(k)) {
+        if [super::platform::PLATFORM_DEVICE, super::platform::ARM_IO_DEVICE, super::storagestack::PCI_DEVICE].iter().any(|k| c.contains(k)) || c.iter().any(|k| super::sep::registry::own_location(k)) {
             return Ok(Some(at));
         }
         match iokit::provider(t, at)? {
@@ -1232,6 +1234,31 @@ mod tests {
         // Its superclass chain matches too: AppleSEPManager is an IOSlaveProcessor.
         let (g, d) = dict(&[("IOProviderClass", s("IOSlaveProcessor"))]);
         assert_eq!(existing(&t, &g, d, false), Err("the services of class IOSlaveProcessor beyond those here (the drivers' own are not here)".to_string()));
+    }
+
+    #[test]
+    fn the_sep_path_answers_whether_each_registered() {
+        use super::super::sep::registry::{A7IOP, MANAGER, NUB};
+        let t = super::super::sep::registry::test_tree();
+        let find = |class: &str| (0..t.len() as u32).find(|&i| iokit::class(&t, i).ok() == Some(class)).unwrap();
+        let (a7iop, nub, m) = (find(A7IOP), find(NUB), find(MANAGER));
+        // AppleA7IOP's start registers its nubs, never itself.
+        assert_eq!(registered(&t, a7iop), Ok(false));
+        assert_eq!((registered(&t, nub), registered(&t, m)), (Ok(true), Ok(true)));
+        // IOSurface.framework's name match walks every service and finds the root alone.
+        let surface = t.iter().position(|n| n.class == super::super::iosurface::CLASS).unwrap() as u32;
+        let (g, d) = dict(&[("IONameMatch", s("IOCoreSurfaceRoot"))]);
+        assert_eq!(existing(&t, &g, d, false), Ok(vec![surface]));
+        // A class match of the A7IOP finds none of the SEP's, and the class's others are not here.
+        let (g, d) = dict(&[("IOProviderClass", s(A7IOP))]);
+        assert_eq!(existing(&t, &g, d, false), Err(format!("the services of class {A7IOP} beyond those here (the drivers' own are not here)")));
+        // The nub compares names as the device tree does, and is its own location.
+        assert_eq!(compare_name(&t, nub, b"iop-nub,sep"), Ok(true));
+        assert_eq!(compare_name(&t, nub, b"iop-sep-nub"), Ok(true));
+        assert_eq!(compare_name(&t, nub, b"sep"), Ok(false));
+        assert_eq!(compare_name(&t, m, b"iop-nub,sep"), Ok(false));
+        assert_eq!(match_location(&t, nub), Ok(Some(nub)));
+        assert_eq!(match_location(&t, m), Ok(Some(nub)));
     }
 
     #[test]

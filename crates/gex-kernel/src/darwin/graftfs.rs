@@ -202,16 +202,17 @@ pub fn va_flags(bsd_flags: u32) -> u32 {
 /// graft's device.
 ///
 /// Or (`live`) a volume of disk0's container (Preboot, xART), served at
-/// its mount point as the disk0 image holds it: its own object
-/// identifiers as its inode numbers (`base` 0, its root 2 and the root's
-/// parent 1, as `apfs_vnop_getattr`'s `va_fileid` gives them), and its
-/// mount's device, read through the checkpoint the image had when it was
-/// mounted. The writes the kernel makes to it are the kernel's
-/// container's ([`super::disknode`]): a writing mount's, and a graft's
-/// range and the attributes recording it, none of which changes what this
-/// view reads (the volume superblock and file-system owned attributes,
-/// which no attribute call sees); a change to its files through a file
-/// call is not routed there and is reported.
+/// its mount point as the kernel's container holds it
+/// ([`super::disknode::volume`]): its own object identifiers as its inode
+/// numbers (`base` 0, its root 2 and the root's parent 1, as
+/// `apfs_vnop_getattr`'s `va_fileid` gives them), and its mount's device,
+/// its records read through the container's object cache as the open
+/// transaction leaves them, so what the container writes (a writing
+/// mount's changes, a graft's range and the attributes recording it, a
+/// commit) is what this view reads. Each inode a path lookup reaches is
+/// brought into the kernel with a vnode ([`super::disknode::vnode_get`]),
+/// the order a sync's vnode pass visits them in. A change to its files
+/// through a file call is not routed to the container and is reported.
 pub struct GraftFs {
     pub vol: Volume,
     /// The first of the host volume's object identifiers the graft holds
@@ -226,16 +227,52 @@ pub struct GraftFs {
     /// The sealed volume's root hash, which names its contents (none for
     /// an unsealed one).
     pub seal: Option<Vec<u8>>,
-    /// A live volume's name; none for a graft.
-    pub live: Option<&'static str>,
+    /// A live volume's name and slot; none for a graft.
+    pub live: Option<Live>,
+}
+
+/// A volume of disk0's container served live: its name, its slot in the
+/// container, and the kernel that holds the container.
+#[derive(Clone)]
+pub struct Live {
+    pub name: &'static str,
+    pub slot: u32,
+    pub kernel: Arc<dyn LiveKernel>,
+}
+
+/// What a live volume's lookups tell the kernel's container: an inode
+/// brought into the kernel ([`super::disknode::vnode_get`]).
+pub trait LiveKernel: Send + Sync {
+    fn vnode_get(&self, slot: u32, ino: u64) -> Result<(), String>;
+}
+
+/// A container no kernel holds (a test's view of a checkpoint): no vnode
+/// table counts its lookups.
+#[cfg(test)]
+pub(crate) struct Unheld;
+
+#[cfg(test)]
+impl LiveKernel for Unheld {
+    fn vnode_get(&self, _: u32, _: u64) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// The kernel's container in the disk0 image ([`super::disknode`]).
+pub struct Disk0;
+
+impl LiveKernel for Disk0 {
+    fn vnode_get(&self, slot: u32, ino: u64) -> Result<(), String> {
+        super::disknode::vnode_get(slot, ino)
+    }
 }
 
 impl GraftFs {
     /// Where its files are, for what is reported: a cryptex graft, or a
     /// live volume.
     pub fn place(&self) -> String {
-        match self.live {
-            Some(name) => format!("the {name} volume"),
+        match &self.live {
+            Some(l) => format!("the {} volume", l.name),
             None => "a cryptex graft".to_string(),
         }
     }
@@ -245,13 +282,13 @@ impl GraftFs {
     /// would write it to the disk, which is not modelled (EIO). Either is
     /// reported.
     fn refuse_change(&self, change: &str) -> Errno {
-        match self.live {
+        match &self.live {
             None => {
                 super::note_unimplemented(format!("APFS's error for {change} in a cryptex graft (its read-only sealed volume)"));
                 Errno::EROFS
             }
-            Some(name) => {
-                super::note_unimplemented(format!("{change} on the {name} volume: a change to its files through a file call, written to the kernel's container in the disk0 image and read back by this view, is not implemented"));
+            Some(l) => {
+                super::note_unimplemented(format!("{change} on the {} volume: a change to its files through a file call, written to the kernel's container in the disk0 image and read back by this view, is not implemented", l.name));
                 Errno::EIO
             }
         }
@@ -264,7 +301,7 @@ impl GraftFs {
     /// (`<nsih>/usr/standalone/firmware`) when the image lacks that step.
     fn unwritten(&self, rel: &str, listing: bool) -> Option<String> {
         use super::apfswrite::restore::{nsih, INSTALL_FUD_MISSING};
-        if self.live != Some("Preboot") || !super::disknode::lacks(INSTALL_FUD_MISSING) {
+        if self.live.as_ref().map(|l| l.name) != Some("Preboot") || !super::disknode::lacks(INSTALL_FUD_MISSING) {
             return None;
         }
         let fw = format!("{}/usr/standalone/firmware", nsih());
@@ -284,11 +321,29 @@ impl GraftFs {
         }
     }
 
-    /// Volume `vol` of disk0's container, named `name`, mounted at run
-    /// time: unsealed, its own identifiers its inode numbers, on its
-    /// mount's device `devt`.
-    pub fn live(vol: Volume, name: &'static str, devt: u32) -> GraftFs {
-        GraftFs { vol, base: 0, len: u64::MAX, dir_ino: afs::ROOT_DIR_INO_NUM, dir_parent_ino: afs::ROOT_DIR_PARENT, devt, seal: None, live: Some(name) }
+    /// Volume `vol` of disk0's container, in slot `slot`, named `name`,
+    /// mounted at run time: unsealed, its own identifiers its inode
+    /// numbers, on its mount's device `devt`.
+    pub fn live(vol: Volume, name: &'static str, slot: u32, devt: u32) -> GraftFs {
+        Self::live_on(vol, name, slot, devt, Arc::new(Disk0))
+    }
+
+    /// [`GraftFs::live`] of a container `kernel` holds.
+    pub fn live_on(vol: Volume, name: &'static str, slot: u32, devt: u32, kernel: Arc<dyn LiveKernel>) -> GraftFs {
+        GraftFs { vol, base: 0, len: u64::MAX, dir_ino: afs::ROOT_DIR_INO_NUM, dir_parent_ino: afs::ROOT_DIR_PARENT, devt, seal: None, live: Some(Live { name, slot, kernel }) }
+    }
+
+    /// Image object `oid`, reached by a lookup, brought into the kernel: a
+    /// live volume's inode gets its vnode in the kernel's container's
+    /// table. A graft's vnodes, on its host's mount, are not counted there:
+    /// its sealed read-only inodes hold no unwritten times for a vnode pass
+    /// to write, and the count stays a lower bound of the vnodes in use.
+    fn looked_up(&self, oid: u64) -> Result<(), Errno> {
+        let Some(l) = &self.live else { return Ok(()) };
+        l.kernel.vnode_get(l.slot, oid).map_err(|why| {
+            super::note_unimplemented(format!("the vnode of inode {oid:#x} of the {} volume: {why}", l.name));
+            Errno::EIO
+        })
     }
 
     /// The host's inode number of image object `oid`.
@@ -317,6 +372,9 @@ impl GraftFs {
         'again: loop {
             let mut stack: Vec<afs::Inode> = Vec::new();
             let mut cur = self.inode(afs::ROOT_DIR_INO_NUM)?;
+            // VFS_ROOT: the mount's root vnode, made at the first path
+            // through the mount point.
+            self.looked_up(cur.oid)?;
             for (i, p) in parts.iter().enumerate() {
                 if p == ".." {
                     if let Some(up) = stack.pop() {
@@ -329,6 +387,7 @@ impl GraftFs {
                 }
                 let e = self.vol.lookup(cur.oid, p).map_err(|e| errno_of(&e, "lookup", &self.place()))?.ok_or(Errno::ENOENT)?;
                 let next = self.inode(e.file_id)?;
+                self.looked_up(next.oid)?;
                 let last = i + 1 == parts.len();
                 if next.kind() == afs::mode::S_IFLNK && (!last || follow) {
                     hops += 1;
@@ -500,6 +559,15 @@ pub fn set_file_dir(f: fn() -> Option<std::path::PathBuf>) {
 static HOST_FILES: Mutex<Vec<(std::path::PathBuf, Arc<std::fs::File>)>> = Mutex::new(Vec::new());
 
 impl GraftHandle {
+    /// The inode as it stands: a graft's never changes; a live volume's is
+    /// read again, as the vnode's in-memory object follows every change.
+    fn current(&self) -> Result<afs::Inode, Errno> {
+        match self.fs.live {
+            None => Ok(self.ino.clone()),
+            Some(_) => self.fs.inode(self.ino.oid),
+        }
+    }
+
     /// The host's file of this regular file of a sealed graft, made once
     /// from the graft's bytes; none where there is no place for it, or
     /// the graft cannot serve the file whole (its reads report why).
@@ -568,9 +636,10 @@ impl std::fmt::Debug for GraftHandle {
 
 impl FileHandle for GraftHandle {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> crate::errno::SysResult {
-        match self.ino.kind() {
+        let ino = self.current()?;
+        match ino.kind() {
             afs::mode::S_IFDIR => Err(Errno::EISDIR),
-            afs::mode::S_IFREG => self.fs.vol.read_file(&self.ino, offset, buf).map(|n| n as u64).map_err(|e| errno_of(&e, "read", &self.fs.place())),
+            afs::mode::S_IFREG => self.fs.vol.read_file(&ino, offset, buf).map(|n| n as u64).map_err(|e| errno_of(&e, "read", &self.fs.place())),
             _ => Err(Errno::EINVAL),
         }
     }
@@ -578,7 +647,7 @@ impl FileHandle for GraftHandle {
         Err(Errno::EBADF)
     }
     fn metadata(&self) -> Result<Metadata, Errno> {
-        self.fs.metadata_of(&self.ino)
+        self.fs.metadata_of(&self.current()?)
     }
     fn host_fd(&self) -> Option<i32> {
         use std::os::fd::AsRawFd;
@@ -588,13 +657,14 @@ impl FileHandle for GraftHandle {
         self.host_file().and_then(|f| f.metadata().ok()).map(|md| crate::vfs::host_id_of(&md))
     }
     fn read_dir(&self) -> Result<Vec<DirEntry>, Errno> {
-        if !self.ino.is_dir() {
+        let ino = self.current()?;
+        if !ino.is_dir() {
             return Err(Errno::ENOTDIR);
         }
-        self.fs.entries(&self.ino)
+        self.fs.entries(&ino)
     }
     fn xattr(&self, op: XattrOp<'_>) -> Option<Result<usize, Errno>> {
-        Some(self.fs.xattr_op(&self.ino, op))
+        Some(self.current().and_then(|ino| self.fs.xattr_op(&ino, op)))
     }
     fn chmod(&self, _mode: u32) -> Option<Result<(), Errno>> {
         Some(Err(self.fs.refuse_change(&format!("a chmod of inode {:#x}", self.ino.oid))))
@@ -1067,7 +1137,7 @@ mod tests {
         bad[0x20] ^= 1;
         assert!(matches!(authenticate_root_hash(true, true, &m, Some(&bad), 0, bs, false), Auth::Panic(_)));
         // The root hash is the SHA-256 of the file-system tree's root node.
-        assert_eq!(m.root_hash, HashType::Sha256.digest(&v.container.read_raw(v.omap.lookup(&v.container, v.sb.root_tree_oid, v.container.xid()).unwrap().unwrap().paddr).unwrap()));
+        assert_eq!(m.root_hash, HashType::Sha256.digest(&v.container.read_raw(v.omap.as_ref().unwrap().lookup(&v.container, v.sb.root_tree_oid, v.container.xid()).unwrap().unwrap().paddr).unwrap()));
     }
 
     /// The graft's files as the namespace sees them: the shared cache's

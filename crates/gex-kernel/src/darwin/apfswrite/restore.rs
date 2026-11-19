@@ -2412,7 +2412,7 @@ mod tests {
             use crate::darwin::vattr::{Owned, RECORD};
             use crate::vfs::{FileSystem, FileType, XattrOp};
             let root = x.inode(2).unwrap().unwrap();
-            let live = GraftMount(std::sync::Arc::new(GraftFs::live(c.volume(2).unwrap().unwrap(), "xART", 0x1000_0003)));
+            let live = GraftMount(std::sync::Arc::new(GraftFs::live_on(c.volume(2).unwrap().unwrap(), "xART", 2, 0x1000_0003, std::sync::Arc::new(crate::darwin::graftfs::Unheld))));
             let md = live.metadata("").unwrap();
             assert_eq!((md.ino, md.file_type, md.mode), (2, FileType::Directory, u32::from(root.mode) & 0o7777));
             let mut rec = [0u8; 128];

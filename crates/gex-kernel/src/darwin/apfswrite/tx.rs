@@ -3301,6 +3301,24 @@ impl<'a> Nx<'a> {
         Ok((t, VirtStore { nx: self, owner: Owner::Volume(index), subtype: FSTREE }))
     }
 
+    /// Volume `index`'s file-system tree's root node, as the open
+    /// transaction leaves it.
+    pub fn fs_tree_root(&self, index: usize) -> Result<u64, String> {
+        Ok(self.vols.get(&index).ok_or_else(|| format!("no volume in slot {index}"))?.fs_tree.root)
+    }
+
+    /// Node `oid` of volume `index`'s file-system tree as the object cache
+    /// holds it (a lookup's `obj_get`: brought in through the volume's
+    /// object map's newest mapping when it is not there), unchanged.
+    pub fn fs_tree_node(&mut self, index: usize, oid: u64) -> Result<Vec<u8>, String> {
+        if !self.vols.contains_key(&index) {
+            return Err(format!("no volume in slot {index}"));
+        }
+        let owner = Owner::Volume(index);
+        self.virt_load(owner, oid)?;
+        Ok(self.virt[&(owner, oid)].b.clone())
+    }
+
     /// Volume `index`'s file-system tree after a change.
     pub fn set_fs_tree(&mut self, index: usize, t: Tree) {
         if let Some(v) = self.vols.get_mut(&index) {
@@ -4175,7 +4193,8 @@ mod tests {
         {
             use crate::darwin::graftfs::{GraftFs, GraftMount};
             use crate::vfs::{FileSystem, XattrOp};
-            let live = GraftMount(std::sync::Arc::new(GraftFs::live(v, "Preboot", 0x1000_0005)));
+            // Read at the checkpoint, through a container no kernel holds.
+            let live = GraftMount(std::sync::Arc::new(GraftFs::live_on(v, "Preboot", pb as u32, 0x1000_0005, std::sync::Arc::new(crate::darwin::graftfs::Unheld))));
             let mut buf = [0u8; 256];
             assert_eq!(live.xattr("os.dmg", XattrOp::List { buf: &mut buf }), Ok(0));
             assert_eq!(live.xattr("os.dmg", XattrOp::Get { name: "user.com.apple.fs.graft-vol-uuid", buf: &mut buf }), Err(crate::errno::Errno::ENODATA));
@@ -4190,6 +4209,184 @@ mod tests {
             assert_eq!(b.path_of_ino(f).as_deref(), Some("f"));
             assert_eq!(b.path_of_ino(ino), None);
             assert!(live.bound_subtree("os.dmg").is_none());
+        }
+    }
+
+    /// A container a test holds as the kernel holds its own: shared, its
+    /// volumes read through it.
+    type Held = std::sync::Arc<std::sync::Mutex<Nx<'static>>>;
+
+    /// Volume `.1`'s file-system tree as the held container has it.
+    struct HeldTree(Held, usize);
+
+    impl crate::darwin::apfsread::btree::LiveNodes for HeldTree {
+        fn root(&self) -> crate::darwin::apfsread::Result<u64> {
+            self.0.lock().unwrap().fs_tree_root(self.1).map_err(crate::darwin::apfsread::Error::Io)
+        }
+        fn node(&self, oid: u64) -> crate::darwin::apfsread::Result<std::sync::Arc<[u8]>> {
+            self.0.lock().unwrap().fs_tree_node(self.1, oid).map(Into::into).map_err(crate::darwin::apfsread::Error::Io)
+        }
+    }
+
+    /// The held container's vnode table.
+    struct HeldKernel(Held);
+
+    impl crate::darwin::graftfs::LiveKernel for HeldKernel {
+        fn vnode_get(&self, slot: u32, ino: u64) -> Result<(), String> {
+            self.0.lock().unwrap().vnode_get(slot as usize, ino, &|| format!("a lookup of {ino:#x}"));
+            Ok(())
+        }
+    }
+
+    /// A volume of a held container served live reads what the container
+    /// holds: a change in the open transaction at once (a view of the
+    /// checkpoint does not see it), each inode a lookup reaches given its
+    /// vnode at the head of the volume's list, an open file's inode as it
+    /// is changed. `VFS_SYNC` (apfs_vfsop_sync) commits the open
+    /// transaction to a checkpoint the reader then finds; the view mounted
+    /// before keeps answering through every later commit, as a view of the
+    /// newest checkpoint does. A sync of a volume not held read-write, of
+    /// an encrypted volume, or with inodes holding unwritten times is
+    /// refused.
+    #[test]
+    fn a_live_view_follows_its_container_through_a_sync() {
+        use super::super::fsops::{self, waitfor};
+        use crate::darwin::apfsread::{Container, Volume};
+        use crate::darwin::graftfs::{GraftFs, GraftMount};
+        use crate::errno::Errno;
+        use crate::vfs::FileSystem;
+        let blocks = 15_625_000u64;
+        let sink: &'static Sparse = Box::leak(Box::new(Sparse::new(blocks * 4096)));
+        let medium: std::sync::Arc<dyn crate::darwin::apfsread::Medium> = std::sync::Arc::new(super::super::Window { sink, base: 0, size: blocks * 4096 });
+        let uuid = *b"gex-live-follows";
+        let fm = super::super::container::format(sink, 4096, blocks, uuid).unwrap();
+        let mut nx = Nx::formatted(sink, &fm, uuid, Mode::Kernel).unwrap();
+        nx.set_barrier(true);
+        nx.mount_rw().unwrap();
+        let mut t = 1_800_000_000_000_000_000u64;
+        let mut now = move || {
+            t += 1000;
+            t
+        };
+        let kv = super::super::restore::key_os_version(super::super::restore::RESTORE_BUILD).unwrap();
+        let mut make = |nx: &mut Nx<'_>, name: &str, role: u16, encrypted: bool, now: &mut dyn FnMut() -> u64| {
+            let times = VolumeTimes { formatted: now(), root: now(), private: now(), modified: now() };
+            let o = nx.create_volume(&NewVolume { name: name.into(), role, encrypted, e_apfs: true, times, uid: 0, gid: 0, key_os_version: kv, size_bytes: None }).unwrap();
+            nx.commit().unwrap();
+            nx.fs_oid.iter().position(|&x| x == o).unwrap()
+        };
+        let pb = make(&mut nx, "Preboot", 0x10, false, &mut now);
+        let data = make(&mut nx, "Data", 0x40, true, &mut now);
+        assert!(fsops::vfs_sync(&mut nx, pb, waitfor::MNT_NOWAIT, &mut now).unwrap_err().contains("does not hold mounted read-write"));
+        // Files an earlier mount made, then this mount's own change.
+        fsops::mount_rw(&mut nx, pb, &mut now).unwrap();
+        let a = fsops::mkdir(&mut nx, pb, 2, "a", 0o755, 0, 0, &mut now).unwrap().unwrap();
+        let f = fsops::create(&mut nx, pb, a, "f", 0o644, 0, 0, &mut now).unwrap().unwrap();
+        fsops::unmount(&mut nx, pb, false, &mut now).unwrap();
+        nx.commit().unwrap();
+        fsops::mount_rw(&mut nx, pb, &mut now).unwrap();
+        fsops::mount_rw(&mut nx, data, &mut now).unwrap();
+        let checkpoint = std::sync::Arc::new(Container::open(std::sync::Arc::clone(&medium)).unwrap());
+        let old = checkpoint.volume(pb).unwrap().unwrap();
+        let g = fsops::create(&mut nx, pb, a, "g", 0o644, 0, 0, &mut now).unwrap().unwrap();
+        assert!(nx.in_tx);
+        assert_eq!(nx.vnode_list(pb), [g, 2]);
+        let sb = nx.vol_sb_read(pb).unwrap().0.to_vec();
+        let held: Held = std::sync::Arc::new(std::sync::Mutex::new(nx));
+        let vol = Volume::live(std::sync::Arc::clone(&checkpoint), &sb, std::sync::Arc::new(HeldTree(std::sync::Arc::clone(&held), pb))).unwrap();
+        let live = GraftMount(std::sync::Arc::new(GraftFs::live_on(vol, "Preboot", pb as u32, 0x1000_0005, std::sync::Arc::new(HeldKernel(std::sync::Arc::clone(&held))))));
+        // The open transaction's record, which the checkpoint has not.
+        assert_eq!(live.metadata("a/g").unwrap().ino, g);
+        assert_eq!(old.lookup(a, "g").unwrap(), None);
+        let mut names: Vec<String> = live.open("a", 0, 0).unwrap().read_dir().unwrap().into_iter().map(|e| e.name).collect();
+        names[2..].sort();
+        assert_eq!(names, [".", "..", "f", "g"]);
+        // The lookups' vnodes, each at the head: a's (for a/g), then f's.
+        assert_eq!(live.metadata("a/f").unwrap().ino, f);
+        assert_eq!(held.lock().unwrap().vnode_list(pb), [f, a, g, 2]);
+        // An open file follows its inode.
+        let h = live.open("a/f", 0, 0).unwrap();
+        assert_eq!(h.metadata().unwrap().mode, 0o644);
+        fsops::chmod(&mut held.lock().unwrap(), pb, f, 0o600, &mut now).unwrap();
+        assert_eq!(h.metadata().unwrap().mode, 0o600);
+        // The sync: refused for the encrypted volume, then Preboot's
+        // commits.
+        {
+            let mut nx = held.lock().unwrap();
+            assert!(fsops::vfs_sync(&mut nx, data, waitfor::MNT_NOWAIT, &mut now).unwrap_err().contains("encryption-policy"));
+            let xid = nx.xid;
+            fsops::vfs_sync(&mut nx, pb, waitfor::MNT_NOWAIT, &mut now).unwrap();
+            assert_eq!((nx.xid, nx.in_tx), (xid + 1, false));
+            // With nothing open, a second sync writes nothing.
+            fsops::vfs_sync(&mut nx, pb, waitfor::MNT_WAIT, &mut now).unwrap();
+            assert_eq!(nx.xid, xid + 1);
+        }
+        let c = std::sync::Arc::new(Container::open(std::sync::Arc::clone(&medium)).unwrap());
+        assert_eq!(c.xid(), held.lock().unwrap().xid - 1);
+        let v = c.volume(pb).unwrap().unwrap();
+        assert_eq!(v.lookup(a, "f").unwrap().map(|e| e.file_id), Some(f));
+        assert_eq!(v.inode(f).unwrap().unwrap().mode & 0o7777, 0o600);
+        // Many commits later, freed blocks given out again: the view still
+        // answers as the newest checkpoint does.
+        let mut made = Vec::new();
+        for round in 0..24 {
+            let mut nx = held.lock().unwrap();
+            for i in 0..40 {
+                let d = fsops::mkdir(&mut nx, pb, a, &format!("r{round}-{i}"), 0o700, 0, 0, &mut now).unwrap().unwrap();
+                made.push((format!("r{round}-{i}"), d));
+            }
+            fsops::vfs_sync(&mut nx, pb, waitfor::MNT_NOWAIT, &mut now).unwrap();
+        }
+        let c = std::sync::Arc::new(Container::open(std::sync::Arc::clone(&medium)).unwrap());
+        let v = c.volume(pb).unwrap().unwrap();
+        for (name, ino) in &made {
+            assert_eq!(live.metadata(&format!("a/{name}")).unwrap().ino, *ino);
+            assert_eq!(v.lookup(a, name).unwrap().map(|e| e.file_id), Some(*ino));
+        }
+        assert_eq!(live.open("a", 0, 0).unwrap().read_dir().unwrap().len(), 4 + made.len());
+        assert_eq!(live.metadata("a/none").unwrap_err(), Errno::ENOENT);
+        // Unwritten times held on an inode: the vnode pass's rewrite is not
+        // implemented.
+        let mut nx = held.lock().unwrap();
+        fsops::chmod(&mut nx, pb, f, 0o600, &mut now).unwrap();
+        assert!(nx.jobj_times.contains_key(&(pb, f)));
+        assert!(fsops::vfs_sync(&mut nx, pb, waitfor::MNT_NOWAIT, &mut now).unwrap_err().contains("held unwritten"));
+    }
+
+    /// apfs_vfsop_unmount's tx_finish, as the sync's, writes no checkpoint
+    /// when no transaction is open; its apfs_modified_by entry and unmount
+    /// time then go into a new transaction, which stays open.
+    #[test]
+    fn an_unmount_with_nothing_open_writes_no_checkpoint() {
+        use super::super::fsops;
+        let blocks = 15_625_000u64;
+        let sink = Sparse::new(blocks * 4096);
+        let uuid = *b"gex-unmount-idle";
+        let fm = super::super::container::format(&sink, 4096, blocks, uuid).unwrap();
+        let mut nx = Nx::formatted(&sink, &fm, uuid, Mode::Kernel).unwrap();
+        nx.mount_rw().unwrap();
+        let mut t = 1_800_000_000_000_000_000u64;
+        let mut now = move || {
+            t += 1000;
+            t
+        };
+        let times = VolumeTimes { formatted: now(), root: now(), private: now(), modified: now() };
+        let o = nx.create_volume(&NewVolume { name: "xART".into(), role: 0x100, encrypted: false, e_apfs: true, times, uid: 0, gid: 0, key_os_version: 0, size_bytes: None }).unwrap();
+        nx.commit().unwrap();
+        let x = nx.fs_oid.iter().position(|&v| v == o).unwrap();
+        for forced in [true, false] {
+            fsops::mount_rw(&mut nx, x, &mut now).unwrap();
+            fsops::mkdir(&mut nx, x, 2, if forced { "f" } else { "n" }, 0o755, 0, 0, &mut now).unwrap().unwrap();
+            nx.tx_finish().unwrap();
+            let (xid, pages) = (nx.xid, sink.pages());
+            assert!(!nx.in_tx);
+            fsops::unmount(&mut nx, x, forced, &mut now).unwrap();
+            assert_eq!((nx.xid, nx.in_tx), (xid, true), "forced {forced}");
+            assert!(sink.pages() == pages, "forced {forced}: the unmount wrote");
+            let sb = nx.vol_sb_read(x).unwrap().0;
+            assert_eq!(&sb[0x140..0x140 + fsops::KEXT_ID.len()], fsops::KEXT_ID.as_bytes());
+            assert_eq!(u64a(sb, 0x140 + 0x28), xid);
+            nx.commit().unwrap();
         }
     }
 

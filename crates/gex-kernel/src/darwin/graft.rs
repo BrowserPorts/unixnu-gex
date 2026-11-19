@@ -811,7 +811,7 @@ impl Kernel {
                 return;
             }
         };
-        self.vfs.system_mount(mnt.on, std::sync::Arc::new(graftfs::GraftMount(std::sync::Arc::new(graftfs::GraftFs::live(vol, "Preboot", mnt.fsid as u32)))));
+        self.vfs.system_mount(mnt.on, std::sync::Arc::new(graftfs::GraftMount(std::sync::Arc::new(graftfs::GraftFs::live(vol, "Preboot", index, mnt.fsid as u32)))));
         let booted = (mnt.flags(), mnt.state().apfs_ro);
         match super::kern::ignition_preboot_mount() {
             Ok(m) => {

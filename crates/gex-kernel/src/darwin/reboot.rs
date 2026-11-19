@@ -554,23 +554,29 @@ impl Kernel {
     }
 
     /// `VFS_SYNC(mp, waitfor, ctx)`: devfs's `devfs_sync` does nothing;
-    /// APFS's, unless its volume is read-only (`+0x354`), pushes each
-    /// regular file's write-behind ([`super::pagecache::sync_mount`]),
-    /// `IO_SYNC` for `MNT_WAIT` or `MNT_DWAIT`, charged to this thread's
-    /// task.
+    /// APFS's (apfs_vfsop_sync, K 0x66c9d80) returns at once for a volume
+    /// mounted read-only (`+0x354`) and, after its log, for a mount being
+    /// updated (`MNT_UPDATE`); else its vnode pass pushes each regular
+    /// file's write-behind ([`super::pagecache::sync_mount`]), `IO_SYNC`
+    /// for `MNT_WAIT` or `MNT_DWAIT`, charged to this thread's task. For a
+    /// volume the kernel's container in the disk0 image holds read-write,
+    /// the pass then writes the times its inodes hold and the container's
+    /// open transaction is committed ([`super::disknode::vfs_sync`]).
     fn darwin_vfs_sync(&mut self, mnt: &'static Mount, waitfor: u32) {
+        const MNT_UPDATE: u32 = 0x1_0000;
         if mnt.fs != kern::Fs::Apfs || mnt.state().apfs_ro == Some(true) {
             return;
         }
-        // A volume the kernel's container in the disk0 image holds
-        // read-write: apfs_vfsop_sync's vnode pass and commit of the
-        // container's transaction (super::apfswrite::fsops::sync) are not
-        // made.
-        if let Some(i) = kern::mount_volume(mnt).filter(|&i| super::disknode::holds_rw(i)) {
-            self.darwin_unimplemented(format!("VFS_SYNC of the volume on {}: apfs_vfsop_sync's vnode pass and commit of the kernel's container in the disk0 image (volume slot {i})", mnt.on));
+        if mnt.state().flags & MNT_UPDATE != 0 {
+            return;
         }
         let sync = waitfor & (kern::MNT_WAIT | kern::MNT_DWAIT) != 0;
         super::pagecache::charge(super::pagecache::sync_mount(mnt, sync));
+        if let Some(i) = kern::mount_volume(mnt).filter(|&i| super::disknode::holds_rw(i)) {
+            if let Err(why) = super::disknode::vfs_sync(i, waitfor) {
+                self.darwin_unimplemented(format!("VFS_SYNC of the volume on {}: {why}", mnt.on));
+            }
+        }
     }
 
     /// `vfs_unmountall(only_non_system)`: the mounts walked from the
@@ -652,12 +658,15 @@ impl Kernel {
             mnt.state().flags &= !kern::MNT_LOCAL;
         }
         // A writable mount of a volume the kernel's container in the disk0
-        // image holds read-write: apfs_vfsop_unmount's own writes (the
-        // container's commit, the volume's apfs_modified_by entry and
-        // unmount time, super::apfswrite::fsops::unmount) are not made.
+        // image holds read-write: the reclaims' and apfs_vfsop_unmount's
+        // own writes (the container's commit, then the volume's
+        // apfs_modified_by entry and unmount time in the next transaction,
+        // left open: super::disknode::unmount_forced).
         if let Some(i) = kern::mount_volume(mnt).filter(|_| mnt.fs == kern::Fs::Apfs && mnt.state().apfs_ro == Some(false)) {
             if super::disknode::holds_rw(i) {
-                self.darwin_unimplemented(format!("the forced unmount of the volume on {}: apfs_vfsop_unmount's writes to the kernel's container in the disk0 image (its commit, the volume's apfs_modified_by entry and unmount time)", mnt.on));
+                if let Err(why) = super::disknode::unmount_forced(i) {
+                    self.darwin_unimplemented(format!("the forced unmount of the volume on {}: {why}", mnt.on));
+                }
             }
         }
         kern::mount_list_remove(mnt);

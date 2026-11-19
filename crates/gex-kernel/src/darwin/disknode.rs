@@ -204,6 +204,16 @@ pub fn holds_rw(index: u32) -> bool {
     KERNEL_NX.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|nx| nx.mounted.contains(&(index as usize)))
 }
 
+/// What of the volume in slot `index`'s superblock, as the kernel holds
+/// it, `apfs_vfsop_getattr` makes its capabilities of.
+pub fn caps_facts(index: u32) -> Result<super::attrcall::CapsFacts, String> {
+    with_container(|nx| {
+        let (sb, _) = nx.vol_sb_read(index as usize)?;
+        let q = |o: usize| u64::from_le_bytes(sb[o..o + 8].try_into().unwrap());
+        Ok(super::attrcall::CapsFacts { role: u16::from_le_bytes([sb[0x3c4], sb[0x3c5]]), incompat: q(0x38), ro_compat: q(0x30), fs_flags: q(0x108), grouped: sb[0x3f0..0x400].iter().any(|&b| b != 0) })
+    })
+}
+
 /// The volume in slot `index` as the kernel holds it: its next object
 /// identifier (`apfs_next_obj_id`) and its UUID.
 pub fn volume_ids(index: u32) -> Result<(u64, [u8; 16]), String> {

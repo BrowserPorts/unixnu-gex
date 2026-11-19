@@ -743,10 +743,10 @@ impl Kernel {
                 self.darwin_set_finderinfo(dir, target.as_ref().map(|(p, _)| p.as_str()), follow, info)?;
             }
         }
-        if any {
-            self.darwin_setattr_apply(&canon, old, file.as_deref(), va, super::fsops::Call::Setattrlist)?;
-        }
-        if attrs.modtime.is_some() || attrs.acctime.is_some() {
+        // One VNOP_SETATTR of everything set for a filesystem that writes
+        // them itself; else the times after the rest.
+        let written = any && self.darwin_setattr_apply_times(&canon, old, file.as_deref(), va, super::fsops::Call::Setattrlist, attrs.acctime, attrs.modtime)?;
+        if !written && (attrs.modtime.is_some() || attrs.acctime.is_some()) {
             self.path_io().set_times_at(m, dir, path, attrs.acctime, attrs.modtime, follow)?;
         }
         if !finder_first {

@@ -4238,6 +4238,21 @@ mod tests {
             super::super::fsops::vnode_load(&mut nx, slot as usize, ino, &|| format!("a lookup of {ino:#x}"))?;
             super::super::fsops::run_time_gaps(&mut nx)
         }
+        fn held_times(&self, slot: u32, ino: u64) -> Result<Option<(u64, u64)>, String> {
+            Ok(self.0.lock().unwrap().jobj_times.get(&(slot as usize, ino)).copied())
+        }
+        fn setattr(&self, slot: u32, ino: u64, a: &crate::vfs::VnodeAttrs, fd: bool) -> Result<Result<(), i32>, String> {
+            let mut nx = self.0.lock().unwrap();
+            let r = super::super::fsops::vnode_setattr(&mut nx, slot as usize, ino, a, fd, 0, &mut held_clock)?;
+            super::super::fsops::run_time_gaps(&mut nx).map(|()| r)
+        }
+    }
+
+    /// The held container's clock: a nanosecond on from its last reading,
+    /// past every time the tests give.
+    fn held_clock() -> u64 {
+        static T: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1_900_000_000_000_000_000);
+        T.fetch_add(1000, std::sync::atomic::Ordering::Relaxed) + 1000
     }
 
     /// A volume of a held container served live reads what the container
@@ -4447,6 +4462,103 @@ mod tests {
         let gap = fsops::run_time_gaps(&mut nx).unwrap_err();
         assert!(gap.contains(&format!("slot {pb} {other:#x} (vnode_pass)")), "{gap}");
         fsops::run_time_gaps(&mut nx).unwrap();
+    }
+
+    /// A live volume's attributes changed through the file calls are
+    /// written as apfs_vnop_setattr writes them on the kernel's container,
+    /// and read back: a mode and an owner in the open transaction; a mode
+    /// set unchanged through a descriptor holds the change time in the
+    /// inode's object, which stat reads at once and the sync writes; times
+    /// in one setattr, the creation time lowered to the modification time;
+    /// flags alone. Flags with other attributes, extended attributes and an
+    /// open to write are reported.
+    #[test]
+    fn a_live_volumes_attributes_change_through_the_kernels_container() {
+        use super::super::fsops::{self, waitfor};
+        use crate::darwin::apfsread::{Container, Volume};
+        use crate::darwin::graftfs::{GraftFs, GraftMount};
+        use crate::darwin::vattr::{Owned, RECORD};
+        use crate::errno::Errno;
+        use crate::vfs::{FileSystem, VnodeAttrs, XattrOp};
+        let blocks = 15_625_000u64;
+        let sink: &'static Sparse = Box::leak(Box::new(Sparse::new(blocks * 4096)));
+        let medium: std::sync::Arc<dyn crate::darwin::apfsread::Medium> = std::sync::Arc::new(super::super::Window { sink, base: 0, size: blocks * 4096 });
+        let uuid = *b"gex-live-setattr";
+        let fm = super::super::container::format(sink, 4096, blocks, uuid).unwrap();
+        let mut nx = Nx::formatted(sink, &fm, uuid, Mode::Kernel).unwrap();
+        nx.set_barrier(true);
+        nx.mount_rw().unwrap();
+        let mut now = || held_clock();
+        let kv = super::super::restore::key_os_version(super::super::restore::RESTORE_BUILD).unwrap();
+        let times = VolumeTimes { formatted: now(), root: now(), private: now(), modified: now() };
+        let o = nx.create_volume(&NewVolume { name: "Preboot".into(), role: 0x10, encrypted: false, e_apfs: true, times, uid: 0, gid: 0, key_os_version: kv, size_bytes: None }).unwrap();
+        nx.commit().unwrap();
+        let pb = nx.fs_oid.iter().position(|&x| x == o).unwrap();
+        fsops::mount_rw(&mut nx, pb, &mut now).unwrap();
+        let f = fsops::create(&mut nx, pb, 2, "f", 0o644, 0, 0, &mut now).unwrap().unwrap();
+        let g = fsops::create(&mut nx, pb, 2, "g", 0o644, 0, 0, &mut now).unwrap().unwrap();
+        nx.tx_finish().unwrap();
+        let sb = nx.vol_sb_read(pb).unwrap().0.to_vec();
+        let held: Held = std::sync::Arc::new(std::sync::Mutex::new(nx));
+        let checkpoint = std::sync::Arc::new(Container::open(std::sync::Arc::clone(&medium)).unwrap());
+        let vol = Volume::live(checkpoint, &sb, std::sync::Arc::new(HeldTree(std::sync::Arc::clone(&held), pb))).unwrap();
+        let live = GraftMount(std::sync::Arc::new(GraftFs::live_on(vol, "Preboot", pb as u32, 0x1000_0005, std::sync::Arc::new(HeldKernel(std::sync::Arc::clone(&held))))));
+        let owned = |path: &str| {
+            let mut rec = [0u8; 128];
+            let n = live.xattr(path, XattrOp::Get { name: RECORD, buf: &mut rec }).unwrap();
+            Owned::parse(&rec[..n]).unwrap()
+        };
+        let ns = |t: (i64, u32)| t.0 as u64 * 1_000_000_000 + u64::from(t.1);
+        // A mode, then an owner and group: in the open transaction.
+        let a = VnodeAttrs { mode: Some(0o600), ..Default::default() };
+        assert_eq!(live.vnode_setattr("f", &a), Some(Ok(())));
+        assert_eq!(live.metadata("f").unwrap().mode, 0o600);
+        let c0 = live.metadata("f").unwrap().times.ctime;
+        assert!(held.lock().unwrap().in_tx);
+        let a = VnodeAttrs { uid: Some(501), gid: Some(20), ..Default::default() };
+        assert_eq!(live.vnode_setattr("f", &a), Some(Ok(())));
+        assert_eq!(owned("f"), Owned { uid: 501, gid: 20, mode: 0o600, flags: 0 });
+        assert!(live.metadata("f").unwrap().times.ctime >= c0);
+        // The same mode through a descriptor: the change time held in the
+        // object, which stat reads.
+        let h = live.open("f", 0, 0).unwrap();
+        let before = held.lock().unwrap().jobj_times.get(&(pb, f)).copied();
+        assert_eq!(before, None);
+        assert_eq!(h.vnode_setattr(&VnodeAttrs { mode: Some(0o600), ..Default::default() }), Some(Ok(())));
+        let (hm, hc) = held.lock().unwrap().jobj_times[&(pb, f)];
+        let md = h.metadata().unwrap();
+        assert_eq!(ns((md.times.ctime, md.times.ctime_ns)), hc);
+        assert_eq!(ns((md.mtime, md.times.mtime_ns)), hm);
+        // Times in one setattr: access and modification as given, the
+        // creation time lowered to the modification time, the change time
+        // read.
+        let (at, mt) = ((1_000_000_000i64, 5u32), (1_700_000_000i64, 7u32));
+        assert_eq!(live.set_times("g", Some(at), Some(mt)), Ok(()));
+        let md = live.metadata("g").unwrap();
+        assert_eq!((md.times.atime, md.times.atime_ns, md.mtime, md.times.mtime_ns), (at.0, at.1, mt.0, mt.1));
+        assert_eq!(md.times.birth, Some(mt));
+        assert!(ns((md.times.ctime, md.times.ctime_ns)) > ns(mt));
+        // Flags alone.
+        assert_eq!(live.vnode_setattr("g", &VnodeAttrs { flags: Some(0x8000), ..Default::default() }), Some(Ok(())));
+        assert_eq!(owned("g").flags, 0x8000);
+        // Reported: flags with a mode, an extended attribute, a write.
+        assert_eq!(live.vnode_setattr("g", &VnodeAttrs { flags: Some(0), mode: Some(0o600), ..Default::default() }), Some(Err(Errno::EIO)));
+        assert_eq!(live.xattr("g", XattrOp::Set { name: "user.x", value: b"1", flags: 0 }), Err(Errno::EIO));
+        assert_eq!(live.xattr("g", XattrOp::Remove { name: "user.x" }), Err(Errno::EIO));
+        assert_eq!(live.open("g", crate::fs::oflags::O_WRONLY, 0).err(), Some(Errno::EIO));
+        // The sync writes the held times; the checkpoint has it all.
+        {
+            let mut nx = held.lock().unwrap();
+            fsops::vfs_sync(&mut nx, pb, waitfor::MNT_NOWAIT, &mut now).unwrap();
+            fsops::run_time_gaps(&mut nx).unwrap();
+            assert!(nx.jobj_times.is_empty());
+        }
+        let c = std::sync::Arc::new(Container::open(std::sync::Arc::clone(&medium)).unwrap());
+        let v = c.volume(pb).unwrap().unwrap();
+        let fi = v.inode(f).unwrap().unwrap();
+        assert_eq!((fi.mode & 0o7777, fi.owner, fi.group, fi.mod_time, fi.change_time), (0o600, 501, 20, hm, hc));
+        let gi = v.inode(g).unwrap().unwrap();
+        assert_eq!((gi.access_time, gi.mod_time, gi.create_time, gi.bsd_flags), (ns(at), ns(mt), ns(mt), 0x8000));
     }
 
     /// sync(2) walks the mount list from its tail (VFS_ITERATE_TAIL_FIRST):

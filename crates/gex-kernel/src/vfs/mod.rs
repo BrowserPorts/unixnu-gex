@@ -575,6 +575,12 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         let _ = op;
         None
     }
+    /// [`FileSystem::vnode_setattr`] of the open file itself, through its
+    /// descriptor.
+    fn vnode_setattr(&self, a: &VnodeAttrs) -> Option<Result<(), Errno>> {
+        let _ = a;
+        None
+    }
     /// True when reads and writes ignore the offset, as for a terminal or
     /// pipe. Such files also report `ESPIPE` from `lseek`.
     fn is_stream(&self) -> bool {
@@ -1159,6 +1165,19 @@ impl Moved {
     }
 }
 
+/// What a Darwin `vnode_setattr` sets of a file (the active attributes of
+/// its `struct vnode_attr`): owner, group, permission bits, flags, and the
+/// access and modification times (seconds and nanoseconds since 1970).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VnodeAttrs {
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub mode: Option<u32>,
+    pub flags: Option<u32>,
+    pub atime: Option<(i64, u32)>,
+    pub mtime: Option<(i64, u32)>,
+}
+
 /// A mounted filesystem.
 pub trait FileSystem: Send + Sync {
     /// A filesystem of `rel`'s subtree, the same files, or `None` when this
@@ -1325,6 +1344,15 @@ pub trait FileSystem: Send + Sync {
     /// ([`crate::inotify::Remote`]): the global kernel's tree.
     fn watched_remotely(&self) -> bool {
         false
+    }
+
+    /// `VNOP_SETATTR` of `a` on the file at `path` (its last link not
+    /// followed), from a filesystem that writes a file's attributes as a
+    /// Darwin volume's does; `None` from one whose attributes the caller
+    /// keeps itself.
+    fn vnode_setattr(&self, path: &str, a: &VnodeAttrs) -> Option<Result<(), Errno>> {
+        let _ = (path, a);
+        None
     }
 
     /// An extended-attribute call on `path` (the node it names: a final
@@ -2111,6 +2139,18 @@ impl Namespace {
         }
         let (fs, rel) = self.resolve(&abs)?;
         fs.xattr(&rel, op)
+    }
+
+    /// [`FileSystem::vnode_setattr`] of the file at `path`, its last link
+    /// not followed: `None` when its filesystem leaves the attributes to
+    /// the caller.
+    pub fn vnode_setattr(&self, path: &str, a: &VnodeAttrs) -> Result<Option<Result<(), Errno>>, Errno> {
+        let abs = normalize(path, &self.cwd);
+        if let Some((fs, rel)) = self.resolve_walked(&abs, false)? {
+            return Ok(fs.vnode_setattr(&rel, a));
+        }
+        let (fs, rel) = self.resolve(&abs)?;
+        Ok(fs.vnode_setattr(&rel, a))
     }
 
     /// Set the modification time of `path`, following a final symlink when

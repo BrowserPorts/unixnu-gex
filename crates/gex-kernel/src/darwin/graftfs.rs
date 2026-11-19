@@ -14,7 +14,7 @@
 
 use super::apfsread::{self, fs as afs, Container, IntegrityMeta, Medium, Volume};
 use crate::errno::Errno;
-use crate::vfs::{DirEntry, FileHandle, FileSystem, FileType, Metadata, Times, XattrOp};
+use crate::vfs::{DirEntry, FileHandle, FileSystem, FileType, Metadata, Times, VnodeAttrs, XattrOp};
 use std::sync::{Arc, Mutex};
 
 /// The image's bytes as APFS reads them: through the graft's blockmap, the
@@ -211,8 +211,10 @@ pub fn va_flags(bsd_flags: u32) -> u32 {
 /// mount's changes, a graft's range and the attributes recording it, a
 /// commit) is what this view reads. Each inode a path lookup reaches is
 /// brought into the kernel with a vnode ([`super::disknode::vnode_get`]),
-/// the order a sync's vnode pass visits them in. A change to its files
-/// through a file call is not routed to the container and is reported.
+/// the order a sync's vnode pass visits them in. A change of a file's
+/// owner, group, mode, flags or times is the container's `VNOP_SETATTR`
+/// ([`super::disknode::setattr`]), which this view then reads; a change
+/// to its data, its names or its extended attributes is reported.
 pub struct GraftFs {
     pub vol: Volume,
     /// The first of the host volume's object identifiers the graft holds
@@ -240,14 +242,20 @@ pub struct Live {
     pub kernel: Arc<dyn LiveKernel>,
 }
 
-/// What a live volume's lookups tell the kernel's container: an inode
-/// brought into the kernel ([`super::disknode::vnode_get`]).
+/// What a live volume's calls ask of the kernel's container: an inode
+/// brought into the kernel ([`super::disknode::vnode_get`]), the times
+/// its in-memory object holds unwritten, if any
+/// ([`super::disknode::held_times`]), and `VNOP_SETATTR` of an inode,
+/// `fd` when through an open descriptor ([`super::disknode::setattr`];
+/// `Ok(Err(errno))` is the call's own error).
 pub trait LiveKernel: Send + Sync {
     fn vnode_get(&self, slot: u32, ino: u64) -> Result<(), String>;
+    fn held_times(&self, slot: u32, ino: u64) -> Result<Option<(u64, u64)>, String>;
+    fn setattr(&self, slot: u32, ino: u64, a: &VnodeAttrs, fd: bool) -> Result<Result<(), i32>, String>;
 }
 
 /// A container no kernel holds (a test's view of a checkpoint): no vnode
-/// table counts its lookups.
+/// table counts its lookups, and nothing writes it.
 #[cfg(test)]
 pub(crate) struct Unheld;
 
@@ -255,6 +263,12 @@ pub(crate) struct Unheld;
 impl LiveKernel for Unheld {
     fn vnode_get(&self, _: u32, _: u64) -> Result<(), String> {
         Ok(())
+    }
+    fn held_times(&self, _: u32, _: u64) -> Result<Option<(u64, u64)>, String> {
+        Ok(None)
+    }
+    fn setattr(&self, slot: u32, ino: u64, _: &VnodeAttrs, _: bool) -> Result<Result<(), i32>, String> {
+        Err(format!("a setattr of inode {ino:#x} of volume slot {slot}, which no kernel holds"))
     }
 }
 
@@ -265,7 +279,32 @@ impl LiveKernel for Disk0 {
     fn vnode_get(&self, slot: u32, ino: u64) -> Result<(), String> {
         super::disknode::vnode_get(slot, ino)
     }
+    fn held_times(&self, slot: u32, ino: u64) -> Result<Option<(u64, u64)>, String> {
+        super::disknode::held_times(slot, ino)
+    }
+    fn setattr(&self, slot: u32, ino: u64, a: &VnodeAttrs, fd: bool) -> Result<Result<(), i32>, String> {
+        super::disknode::setattr(slot, ino, a, fd)
+    }
 }
+
+/// What the writer of the kernel's container does not implement of an
+/// open to write on a live volume: the open's own writes
+/// (`apfs_vnop_create` with the caller's credential for `O_CREAT`, the
+/// size change of `O_TRUNC`) and the file's data writes through the UBC
+/// (`cluster_write`'s delayed allocation, the blocks mapped and written at
+/// the push); the writer's data paths are the restore's own call
+/// sequences.
+const OPEN_WRITE_GAP: &str = "the open's own writes (apfs_vnop_create with the caller's owner and group for O_CREAT, apfs_vnop_setattr's va_data_size for O_TRUNC) and the data writes through the UBC (cluster_write's delayed allocation, VNOP_BLOCKMAP and the extents at the push) are not implemented";
+
+/// What the writer does not implement of `setxattr`: apfs_vnop_setxattr (K
+/// 0x6699610) → apfs_setxattr_internal (K 0x6765cc4), which before its
+/// record calls K 0x66b9ef4: for an in-memory object with jobj + 0x98 bit
+/// 1 set that writes in a file-system transaction of its own (K 0x66fbf98,
+/// type 4), and bit 0 is EPERM; what sets those bits is not traced.
+const SETXATTR_GAP: &str = "apfs_vnop_setxattr (K 0x6699610) and apfs_setxattr_internal (K 0x6765cc4) are not implemented: before its record K 0x66b9ef4 writes, for an in-memory object with jobj + 0x98 bit 1 set, in a file-system transaction of its own (K 0x66fbf98 type 4), and answers EPERM for bit 0, and what sets those bits is not traced";
+
+/// What the writer does not implement of `removexattr`.
+const REMOVEXATTR_GAP: &str = "apfs_vnop_removexattr is not traced";
 
 impl GraftFs {
     /// Where its files are, for what is reported: a cryptex graft, or a
@@ -278,17 +317,17 @@ impl GraftFs {
     }
 
     /// The error of `change` (what a call would change of a file): a
-    /// graft's read-only sealed volume refuses it (EROFS); a live volume
-    /// would write it to the disk, which is not modelled (EIO). Either is
-    /// reported.
-    fn refuse_change(&self, change: &str) -> Errno {
+    /// graft's read-only sealed volume refuses it (EROFS); on a live volume
+    /// `kernel` names what of the kernel's path for it the writer of the
+    /// kernel's container does not implement (EIO). Either is reported.
+    fn refuse_change(&self, change: &str, kernel: &str) -> Errno {
         match &self.live {
             None => {
                 super::note_unimplemented(format!("APFS's error for {change} in a cryptex graft (its read-only sealed volume)"));
                 Errno::EROFS
             }
             Some(l) => {
-                super::note_unimplemented(format!("{change} on the {} volume: a change to its files through a file call, written to the kernel's container in the disk0 image and read back by this view, is not implemented", l.name));
+                super::note_unimplemented(format!("{change} on the {} volume, written to the kernel's container in the disk0 image: {kernel}", l.name));
                 Errno::EIO
             }
         }
@@ -343,6 +382,23 @@ impl GraftFs {
         l.kernel.vnode_get(l.slot, oid).map_err(|why| {
             super::note_unimplemented(format!("the vnode of inode {oid:#x} of the {} volume: {why}", l.name));
             Errno::EIO
+        })
+    }
+
+    /// `VNOP_SETATTR` of `a` on image object `oid` of a live volume
+    /// (`fd`: through an open descriptor), written to the kernel's
+    /// container as apfs_vnop_setattr writes it
+    /// ([`super::disknode::setattr`]); none for a graft, whose attributes
+    /// the caller keeps (its read-only volume refuses a change).
+    fn setattr(&self, oid: u64, a: &VnodeAttrs, fd: bool) -> Option<Result<(), Errno>> {
+        let l = self.live.as_ref()?;
+        Some(match l.kernel.setattr(l.slot, oid, a, fd) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(super::errno::errno_of(e)),
+            Err(why) => {
+                super::note_unimplemented(format!("a setattr of inode {oid:#x} of the {} volume: {why}", l.name));
+                Err(Errno::EIO)
+            }
         })
     }
 
@@ -411,11 +467,25 @@ impl GraftFs {
         }
     }
 
+    /// Image object `oid`'s inode as its in-memory object holds it: on a
+    /// live volume with the modification and change times the object holds
+    /// unwritten (`apfs_vnop_getattr` reads the object).
     fn inode(&self, oid: u64) -> Result<afs::Inode, Errno> {
-        self.vol.inode(oid).map_err(|e| errno_of(&e, "inode read", &self.place()))?.ok_or_else(|| {
+        let mut ino = self.vol.inode(oid).map_err(|e| errno_of(&e, "inode read", &self.place()))?.ok_or_else(|| {
             super::note_unimplemented(format!("APFS's error for a directory entry of {} naming the missing inode {oid:#x}", self.place()));
             Errno::EIO
-        })
+        })?;
+        if let Some(l) = &self.live {
+            match l.kernel.held_times(l.slot, oid) {
+                Ok(Some((m, c))) => (ino.mod_time, ino.change_time) = (m, c),
+                Ok(None) => {}
+                Err(why) => {
+                    super::note_unimplemented(format!("the in-memory object of inode {oid:#x} of the {} volume: {why}", l.name));
+                    return Err(Errno::EIO);
+                }
+            }
+        }
+        Ok(ino)
     }
 
     /// What `stat` says of an inode ([`va_flags`] aside): its type and
@@ -506,7 +576,8 @@ impl GraftFs {
                 }
                 out(buf, &all)
             }
-            XattrOp::Set { .. } | XattrOp::Remove { .. } => Err(self.refuse_change(&format!("a change to an extended attribute of inode {:#x}", ino.oid))),
+            XattrOp::Set { name, .. } => Err(self.refuse_change(&format!("a setxattr of {name} on inode {:#x}", ino.oid), SETXATTR_GAP)),
+            XattrOp::Remove { name } => Err(self.refuse_change(&format!("a removexattr of {name} on inode {:#x}", ino.oid), REMOVEXATTR_GAP)),
         }
     }
 
@@ -666,8 +737,16 @@ impl FileHandle for GraftHandle {
     fn xattr(&self, op: XattrOp<'_>) -> Option<Result<usize, Errno>> {
         Some(self.current().and_then(|ino| self.fs.xattr_op(&ino, op)))
     }
-    fn chmod(&self, _mode: u32) -> Option<Result<(), Errno>> {
-        Some(Err(self.fs.refuse_change(&format!("a chmod of inode {:#x}", self.ino.oid))))
+    fn chmod(&self, mode: u32) -> Option<Result<(), Errno>> {
+        let a = VnodeAttrs { mode: Some(mode & 0o7777), ..Default::default() };
+        self.fs.setattr(self.ino.oid, &a, true).or_else(|| Some(Err(self.fs.refuse_change(&format!("a chmod of inode {:#x}", self.ino.oid), ""))))
+    }
+    fn set_times(&self, atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>) -> Result<(), Errno> {
+        let a = VnodeAttrs { atime, mtime, ..Default::default() };
+        self.fs.setattr(self.ino.oid, &a, true).unwrap_or_else(|| Err(self.fs.refuse_change(&format!("a change of the times of inode {:#x}", self.ino.oid), "")))
+    }
+    fn vnode_setattr(&self, a: &VnodeAttrs) -> Option<Result<(), Errno>> {
+        self.fs.setattr(self.ino.oid, a, true)
     }
 }
 
@@ -689,7 +768,7 @@ impl FileSystem for GraftMount {
             if ino.as_ref().is_ok_and(|i| i.is_dir()) {
                 return Err(Errno::EISDIR);
             }
-            return Err(self.0.refuse_change(&format!("an open of {path} to write")));
+            return Err(self.0.refuse_change(&format!("an open of {path} to write"), OPEN_WRITE_GAP));
         }
         let ino = self.0.resolve(path, true)?;
         if ino.kind() == afs::mode::S_IFREG && ino.compressed() {
@@ -729,13 +808,27 @@ impl FileSystem for GraftMount {
         let ino = self.0.resolve(path, false)?;
         self.0.xattr_op(&ino, op)
     }
-    fn chmod(&self, path: &str, _mode: u32) -> Result<(), Errno> {
-        self.0.resolve(path, true)?;
-        Err(self.0.refuse_change(&format!("a chmod of {path}")))
+    fn chmod(&self, path: &str, mode: u32) -> Result<(), Errno> {
+        let ino = self.0.resolve(path, true)?;
+        let a = VnodeAttrs { mode: Some(mode & 0o7777), ..Default::default() };
+        self.0.setattr(ino.oid, &a, false).unwrap_or_else(|| Err(self.0.refuse_change(&format!("a chmod of {path}"), "")))
     }
-    fn set_mtime(&self, path: &str, _secs: i64) -> Result<(), Errno> {
-        self.0.resolve(path, true)?;
-        Err(self.0.refuse_change(&format!("a change of the times of {path}")))
+    fn set_mtime(&self, path: &str, secs: i64) -> Result<(), Errno> {
+        self.set_times(path, None, Some((secs, 0)))
+    }
+    /// The times of the file `path` names (the caller has followed its
+    /// links): a live volume's `VNOP_SETATTR` of them.
+    fn set_times(&self, path: &str, atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>) -> Result<(), Errno> {
+        let ino = self.0.resolve(path, false)?;
+        let a = VnodeAttrs { atime, mtime, ..Default::default() };
+        self.0.setattr(ino.oid, &a, false).unwrap_or_else(|| Err(self.0.refuse_change(&format!("a change of the times of {path}"), "")))
+    }
+    fn vnode_setattr(&self, path: &str, a: &VnodeAttrs) -> Option<Result<(), Errno>> {
+        self.0.live.as_ref()?;
+        match self.0.resolve(path, false) {
+            Ok(ino) => self.0.setattr(ino.oid, a, false),
+            Err(e) => Some(Err(e)),
+        }
     }
     fn path_of_ino(&self, ino: u64) -> Option<String> {
         let oid = self.0.oid_of(ino)?;
@@ -798,6 +891,12 @@ impl FileSystem for GraftSub {
     }
     fn set_mtime(&self, path: &str, secs: i64) -> Result<(), Errno> {
         self.fs.set_mtime(&self.at(path), secs)
+    }
+    fn set_times(&self, path: &str, atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>) -> Result<(), Errno> {
+        self.fs.set_times(&self.at(path), atime, mtime)
+    }
+    fn vnode_setattr(&self, path: &str, a: &VnodeAttrs) -> Option<Result<(), Errno>> {
+        self.fs.vnode_setattr(&self.at(path), a)
     }
     fn path_of_ino(&self, ino: u64) -> Option<String> {
         let p = self.fs.path_of_ino(ino)?;

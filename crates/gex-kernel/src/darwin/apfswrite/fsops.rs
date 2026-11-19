@@ -2795,6 +2795,35 @@ pub struct SetAttr {
     pub atime: Option<u64>,
 }
 
+/// `VNOP_SETATTR` of `a` on inode `ino` of slot `vol` at run time (`fd`:
+/// through an open descriptor, whose vnode stays referenced), its checks
+/// (`vnode_authattr`, `vnode_authorize`) passed: apfs_vnop_setattr
+/// (K 0x668e4a0) with what is active. Flags alone are [`chflags`] at
+/// `securelevel`; a mode alone [`chmod`] or [`fchmod`] (its fast path
+/// when unchanged); otherwise [`setattr`]'s general path, the times
+/// `tv_sec * 10^9 + tv_nsec`. Flags with other attributes and a time
+/// before 1970 are not implemented. `Ok(Err(errno))` is the call's own
+/// error.
+pub fn vnode_setattr(nx: &mut Nx<'_>, vol: usize, ino: u64, a: &crate::vfs::VnodeAttrs, fd: bool, securelevel: i32, now: &mut dyn FnMut() -> u64) -> Result<Result<(), i32>, String> {
+    let others = a.uid.is_some() || a.gid.is_some() || a.mode.is_some() || a.atime.is_some() || a.mtime.is_some();
+    if let Some(f) = a.flags {
+        if others {
+            return Err(format!("not implemented: a setattr of inode {ino:#x}'s flags with its other attributes (apfs_vnop_setattr's general path with va_flags among them)"));
+        }
+        return chflags(nx, vol, ino, f, Some(securelevel), now);
+    }
+    let ns = |t: (i64, u32)| -> Result<u64, String> {
+        u64::try_from(t.0).ok().and_then(|s| s.checked_mul(1_000_000_000)).and_then(|n| n.checked_add(u64::from(t.1))).ok_or_else(|| format!("not implemented: a time of inode {ino:#x} of {}.{:09} seconds (apfs_vnop_setattr's conversion of a time before 1970)", t.0, t.1))
+    };
+    let mode = a.mode.map(|m| (m & 0o7777) as u16);
+    if let (Some(m), None, None, None, None) = (mode, a.uid, a.gid, a.atime, a.mtime) {
+        let r = if fd { fchmod(nx, vol, ino, m, now) } else { chmod(nx, vol, ino, m, now) };
+        return r.map(Ok);
+    }
+    let set = SetAttr { uid: a.uid, gid: a.gid, mode, mtime: a.mtime.map(ns).transpose()?, atime: a.atime.map(ns).transpose()? };
+    setattr(nx, vol, ino, set, now).map(Ok)
+}
+
 /// The roles whose file operations here are transcribed: Update's and the
 /// others' unencrypted ones, Data's, User's (crypto mode 1).
 fn check_setattr_volume(nx: &mut Nx<'_>, vol: usize) -> Result<(), String> {

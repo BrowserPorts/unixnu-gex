@@ -49,7 +49,10 @@ pub fn install(sink: Arc<dyn Sink>, missing: Vec<String>) -> Result<(), String> 
     if sink.size() != storage::disk0_bytes() {
         return Err(format!("a disk0 image of {} bytes for disk0's {}", sink.size(), storage::disk0_bytes()));
     }
-    DISK.set(Disk { sink, missing }).map_err(|_| "a disk0 image is installed already".to_string())
+    DISK.set(Disk { sink, missing }).map_err(|_| "a disk0 image is installed already".to_string())?;
+    // The stand-in the kernel's container takes at run time, once.
+    eprintln!("[gex] Darwin: the disk0 image served with a stand-in: {VNODE_STAND_IN}");
+    Ok(())
 }
 
 /// What is not right about serving the disk nodes: no image, or an image
@@ -194,6 +197,16 @@ fn with_container<R>(f: impl FnOnce(&mut super::apfswrite::tx::Nx<'static>) -> R
     f(g.as_mut().expect("mounted above"))
 }
 
+/// The running system's vnode table as the kernel's container sees it:
+/// the vnodes the model counts are the disk0 volumes' that its lookups
+/// reached ([`super::apfswrite::tx::Nx::vnode_get`]); every other
+/// filesystem's (the root volume's, devfs's, the grafts') is not counted.
+/// Below XNU's desiredvnodes (10,000, the J120 device tree's /defaults
+/// kern.maxvnodes) no disk0 vnode is taken to be recycled, so an inode's
+/// unwritten times wait for its next write or a sync, and its in-memory
+/// object keeps its leaf hint.
+pub const VNODE_STAND_IN: &str = "the running system's vnode table (stand-in: only the disk0 volumes' vnodes the lookups reach are counted, the root volume's, devfs's and the grafts' leave room below desiredvnodes 10,000, so no disk0 vnode is recycled: unwritten times wait for the inode's next write or a sync, and an in-memory object keeps its leaf hint; measure vfs.vnstats.num_vnodes and num_recycledvnodes on the device during boot)";
+
 /// File-system call `f` on the kernel's container: what it left undecided
 /// ([`super::apfswrite::fsops::run_time_gaps`]) is its error.
 fn kernel_op<R>(f: impl FnOnce(&mut super::apfswrite::tx::Nx<'static>) -> Result<R, String>) -> Result<R, String> {
@@ -257,6 +270,27 @@ pub fn unmount_forced(index: u32) -> Result<(), String> {
 /// ([`super::apfswrite::fsops::vnode_load`]).
 pub fn vnode_get(index: u32, ino: u64) -> Result<(), String> {
     kernel_op(|nx| super::apfswrite::fsops::vnode_load(nx, index as usize, ino, &|| format!("a lookup of inode {ino:#x} on volume slot {index} at run time")))
+}
+
+/// `VNOP_SETATTR` of `a` on inode `ino` of the volume in slot `index`
+/// (`fd`: through an open descriptor), its checks passed: apfs_vnop_setattr
+/// on the kernel's container ([`super::apfswrite::fsops::vnode_setattr`],
+/// at the system's securelevel). A volume the container does not hold
+/// mounted read-write is not written. `Ok(Err(errno))` is the call's own
+/// error.
+pub fn setattr(index: u32, ino: u64, a: &crate::vfs::VnodeAttrs, fd: bool) -> Result<Result<(), i32>, String> {
+    kernel_op(|nx| {
+        if !nx.mounted.contains(&(index as usize)) {
+            return Err(format!("a setattr of inode {ino:#x} of volume slot {index}, which the kernel's container does not hold mounted read-write"));
+        }
+        super::apfswrite::fsops::vnode_setattr(nx, index as usize, ino, a, fd, super::kern::DARWIN_SECURELEVEL, &mut nanotime)
+    })
+}
+
+/// The modification and change times inode `ino` of the volume in slot
+/// `index` holds unwritten in its in-memory object, if any.
+pub fn held_times(index: u32, ino: u64) -> Result<Option<(u64, u64)>, String> {
+    with_container(|nx| Ok(nx.jobj_times.get(&(index as usize, ino)).copied()))
 }
 
 /// Whether the kernel's container holds the volume in slot `index`

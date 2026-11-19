@@ -1128,12 +1128,30 @@ impl Kernel {
     /// with attributes `old` (open as `file`, whose vnode is on the mount
     /// it was opened on), its checks passed.
     pub(crate) fn darwin_setattr_apply(&mut self, canon: &str, old: super::vattr::Owned, file: Option<&crate::file::OpenFile>, set: super::vattr::SetAttr, call: Call) -> Result<u64, Errno> {
+        self.darwin_setattr_apply_times(canon, old, file, set, call, None, None).map(|_| 0)
+    }
+
+    /// [`Kernel::darwin_setattr_apply`] with the access and modification
+    /// times the call sets: a filesystem that writes attributes as a
+    /// Darwin volume does (a volume of the disk0 image served live) is
+    /// given them all in one `VNOP_SETATTR`, whatever they change, and
+    /// `true` comes back; else the owner, group, mode and flags are
+    /// recorded when they change, and the caller sets the times.
+    pub(crate) fn darwin_setattr_apply_times(&mut self, canon: &str, old: super::vattr::Owned, file: Option<&crate::file::OpenFile>, set: super::vattr::SetAttr, call: Call, atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>) -> Result<bool, Errno> {
         use super::vattr::flags as vf;
         let canon = canon.to_string();
         let handle = file.map(|f| f.handle.as_ref());
         let on = file.map_or_else(|| super::kern::mount_of(&canon), super::kern::mount_of_file);
         if super::vattr::device_mnt_flags_on(on, &canon) & super::vauth::mnt::RDONLY != 0 {
             return Err(Errno::EROFS);
+        }
+        let va = crate::vfs::VnodeAttrs { uid: set.uid, gid: set.gid, mode: set.mode.map(|m| m & super::vattr::ALLPERMS), flags: set.flags, atime, mtime };
+        let written = match handle {
+            Some(h) => h.vnode_setattr(&va),
+            None => self.vfs.vnode_setattr(&canon, &va)?,
+        };
+        if let Some(r) = written {
+            return r.map(|()| true);
         }
         let attrs = set.uid.is_some() || set.gid.is_some() || set.mode.is_some() || set.flags.is_some();
         if attrs && on.fs == super::kern::Fs::Devfs {
@@ -1164,7 +1182,7 @@ impl Kernel {
                 return Err(Errno::EIO);
             }
         }
-        Ok(0)
+        Ok(false)
     }
 
     pub(crate) fn darwin_no_link_on_the_way(&mut self, m: &GuestMem<'_>, fd: u64, path: u64) -> Result<(), Errno> {
@@ -1186,11 +1204,13 @@ impl Kernel {
         r
     }
 
-    /// `utimes(path, tptr)` and `futimes(fd, tptr)`: two timevals, or now.
+    /// `utimes(path, tptr)` and `futimes(fd, tptr)`: two timevals, or now
+    /// (`getutimes`: `microtime`, so whole microseconds).
     fn darwin_utimes(&mut self, m: &mut GuestMem<'_>, dirfd: i32, path: u64, tptr: u64) -> Result<u64, Errno> {
         let (atime, mtime) = if tptr == 0 {
             let (s, ns) = (self.clock)();
-            (Some((s as i64, ns as u32)), Some((s as i64, ns as u32)))
+            let us = ns as u32 / 1000 * 1000;
+            (Some((s as i64, us)), Some((s as i64, us)))
         } else {
             let tv = |at: u64| -> Result<(i64, u32), Errno> {
                 let (s, us) = (m.read_u64(at)? as i64, m.read_u32(at + 8)? as i32);
@@ -1208,7 +1228,9 @@ impl Kernel {
         let target = if path == 0 { SetTarget::Fd(dirfd) } else { SetTarget::Path { dirfd, path, follow: true } };
         let mut set = super::vattr::SetAttr { times: true, utimes_null: tptr == 0, ..Default::default() };
         let (canon, old, file) = self.darwin_setattr_auth(m, &target, &mut set, Call::Utimes(tptr == 0), 0)?;
-        self.darwin_setattr_apply(&canon, old, file.as_deref(), set, Call::Utimes(tptr == 0))?;
+        if self.darwin_setattr_apply_times(&canon, old, file.as_deref(), set, Call::Utimes(tptr == 0), atime, mtime)? {
+            return Ok(0);
+        }
         self.path_io().set_times_at(m, dirfd, path, atime, mtime, true)
     }
 

@@ -228,12 +228,13 @@ usage:
                                    GEX_DARWIN_CRYPTEX1_TICKET names: web-device
                                    (GEX_DARWIN_WEB_DEVICE signs its Cryptex1
                                    ticket) or the device's ticket file
-  gexc darwin-web-device init|show|roll|nvram <dir>
+  gexc darwin-web-device init|show|roll|nvram|sep <dir>
                                    make the web device (its root, manifest key,
-                                   identity, UID, nonce slot and factory
+                                   identity, UIDs, nonce slot and factory
                                    NVRAM), show it, roll its cryptex1 boot
                                    nonce, or give one made before its NVRAM
-                                   its factory NVRAM
+                                   its factory NVRAM, or add the Secure
+                                   Enclave's UID to one made without
   gexc darwin-web-ticket <dir>     sign the web device's Cryptex1 ticket for its
                                    current nonce (GEX_DARWIN_RESTORE)
   gexc webmetal-info               the WebGPU implementation the Darwin

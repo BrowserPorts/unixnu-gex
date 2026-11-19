@@ -155,7 +155,10 @@ pub fn superclasses(class: &str) -> &'static [&'static str] {
 /// does at the end of its start (0xfffffff00598f964), arm-io's driver after
 /// publishing its nubs (0xfffffff006c41910).
 pub fn registers(class: &str) -> Option<bool> {
-    matches!(class, PE | ARM_IO).then_some(true)
+    if matches!(class, PE | ARM_IO) {
+        return Some(true);
+    }
+    super::sep::registry::registers(class)
 }
 
 /// A property of entry `i` the platform's drivers changed in a way not
@@ -215,7 +218,7 @@ const EXCLUDED: [&str; 4] = ["chosen", "memory", "options", "aliases"];
 /// one of arm-io's, both `IODTResolveAddressing(nub, "reg", NULL)`, as
 /// arm-io's driver keeps no device memory of its own). A range the
 /// unfilled template gives as empty (iBoot fills it) is not answered.
-fn make_nub(t: &mut [Node], entry: u32, class: &'static str, driver: u32) {
+pub(crate) fn make_nub(t: &mut [Node], entry: u32, class: &'static str, driver: u32) {
     t[entry as usize].nub = Some((class, driver));
     if t[entry as usize].service_props.iter().any(|(k, _)| k == "IODeviceMemory") {
         return;

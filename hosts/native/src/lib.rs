@@ -277,6 +277,10 @@ pub struct RunOptions {
     /// it: the NVRAM the system boots with and writes, when it is not the
     /// web device's own.
     pub darwin_nvram: Option<std::path::PathBuf>,
+    /// The SEP's inputs: the decrypted sepOS payload (`GEX_DARWIN_SEPOS`)
+    /// and the SEP ROM (`GEX_DARWIN_SEPROM`), which the owner supplies.
+    pub darwin_sepos: Option<std::path::PathBuf>,
+    pub darwin_seprom: Option<std::path::PathBuf>,
     /// Run ahead-of-time code only (`aot_only`): an ejected Windows
     /// program's runtime, with no tier-1 module and no run-time translator.
     pub aot_only: bool,
@@ -304,6 +308,8 @@ impl Default for RunOptions {
             darwin_cryptex1_nonce_hash: None,
             darwin_web_device: None,
             darwin_nvram: None,
+            darwin_sepos: None,
+            darwin_seprom: None,
             args: Vec::new(),
             env: Vec::new(),
             trace: false,
@@ -1414,6 +1420,9 @@ fn run_process(
             (None, None) => None,
         };
         gex_kernel::darwin::boot(tc.as_deref(), sandbox, device_tree.as_deref(), volume_attrs, cryptex1, nvram).map_err(|e| anyhow!("the boot payload: {e}"))?;
+        // The SEP's inputs: the SEP core is released only when they are all the owner's real ones
+        // (a missing one fails the AP's wait with its name).
+        gex_kernel::darwin::sep::set_inputs(gex_kernel::darwin::sep::core::Inputs { sepos: opts.darwin_sepos.clone(), seprom: opts.darwin_seprom.clone(), device_dir: opts.darwin_web_device.clone() }).map_err(|e| anyhow!("{e}"))?;
         // The disk nodes' image.
         if let Some(path) = &opts.darwin_disk0 {
             let f = std::fs::OpenOptions::new().read(true).write(true).open(path).map_err(|e| anyhow!("opening {}: {e}", path.display()))?;

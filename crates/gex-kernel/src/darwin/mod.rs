@@ -120,6 +120,7 @@ pub mod storage;
 pub mod storagestack;
 pub mod sandboxes;
 pub mod sched;
+pub mod sep;
 pub mod thinfo;
 pub mod sockbuf;
 pub mod unixsock;

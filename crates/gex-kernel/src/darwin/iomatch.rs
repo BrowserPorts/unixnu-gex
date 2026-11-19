@@ -627,7 +627,7 @@ pub fn existing(t: &[Node], g: &Graph, table: Id, once: bool) -> Result<Vec<u32>
 /// root, `IOPlatformExpertDevice::initWithArgs`).
 fn class_complete(class: &str) -> bool {
     class == "IOPlatformExpertDevice"
-        || super::storagestack::class_complete(class) || super::iopower::class_complete(class) || super::accel::class_complete(class) || super::iosurface::class_complete(class) || super::iomfb::class_complete(class)
+        || super::storagestack::class_complete(class) || super::iopower::class_complete(class) || super::accel::class_complete(class) || super::iosurface::class_complete(class) || super::iomfb::class_complete(class) || super::sep::registry::class_complete(class)
 }
 
 /// Whether every registered service named `name` is in the registry here:
@@ -1220,6 +1220,18 @@ mod tests {
 
     fn s(v: &str) -> Obj {
         Obj::String(v.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn the_sep_manager_is_matched_by_its_class_alone() {
+        let t = super::super::sep::registry::test_tree();
+        let m = t.iter().position(|n| n.class == super::super::sep::registry::MANAGER).unwrap() as u32;
+        // IOServiceMatching("AppleSEPManager"): the one manager, a service that has registered itself.
+        let (g, d) = dict(&[("IOProviderClass", s("AppleSEPManager"))]);
+        assert_eq!(existing(&t, &g, d, false), Ok(vec![m]));
+        // Its superclass chain matches too: AppleSEPManager is an IOSlaveProcessor.
+        let (g, d) = dict(&[("IOProviderClass", s("IOSlaveProcessor"))]);
+        assert_eq!(existing(&t, &g, d, false), Err("the services of class IOSlaveProcessor beyond those here (the drivers' own are not here)".to_string()));
     }
 
     #[test]

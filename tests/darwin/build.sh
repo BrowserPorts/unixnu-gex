@@ -48,6 +48,10 @@ cc -O2 -framework IOKit -framework CoreFoundation -o "$OUT/iokit" "$HERE/src/iok
 cc -O2 -framework IOKit -framework CoreFoundation -o "$OUT/storagereg" "$HERE/src/storagereg.c"
 cc -O2 -framework IOKit -framework CoreFoundation -o "$OUT/ioreg" "$HERE/src/ioreg.c"
 cc -O2 -framework IOKit -framework CoreFoundation -o "$OUT/nvram" "$HERE/src/nvram.c"
+# sepmgr: AppleSEPManager's user client, which needs the entitlement (sepmgrdeny is the
+# same program without it, checking the refusal).
+cc -O2 -framework IOKit -framework CoreFoundation -o "$OUT/sepmgr" "$HERE/src/sepmgr.c"
+cc -O2 -DDENY -framework IOKit -framework CoreFoundation -o "$OUT/sepmgrdeny" "$HERE/src/sepmgr.c"
 cc -O2 -framework IOKit -framework CoreFoundation -o "$OUT/accel" "$HERE/src/accel.c"
 cc -O2 -framework IOKit -framework IOSurface -framework CoreFoundation -o "$OUT/iosurface" "$HERE/src/iosurface.c"
 cc -O2 -framework IOSurface -framework CoreFoundation -o "$OUT/iosurfacex" "$HERE/src/iosurfacex.c"
@@ -154,6 +158,8 @@ codesign -s - -f --entitlements "$HERE/src/gpurestricted.entitlements" "$OUT/acc
 # apfsroles asks APFS for a volume's device by role, which takes launchd's
 # entitlement for it.
 codesign -s - -f --entitlements "$HERE/src/apfsroles.entitlements" "$OUT/apfsroles" 2>/dev/null
+# sepmgr opens AppleSEPManager's user client, which requires its entitlement.
+codesign -s - -f --entitlements "$HERE/src/sepmgr.entitlements" "$OUT/sepmgr" 2>/dev/null
 # ignition reads AppleImage4's ignition blob, which its entitlement allows.
 codesign -s - -f --entitlements "$HERE/src/ignition.entitlements" "$OUT/ignition" 2>/dev/null
 # graftdmg grafts and ungrafts, which its entitlement allows, keeping the

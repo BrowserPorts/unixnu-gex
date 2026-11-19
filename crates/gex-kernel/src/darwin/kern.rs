@@ -547,12 +547,27 @@ pub fn is_preboot(mnt: &Mount) -> bool {
     matches!(mnt.from, From::Volume(i) if super::storage::volume(i).is_some_and(|v| v.role == super::storage::role::PREBOOT))
 }
 
+/// Whether a volume of role `role` mounted at run time has its files
+/// served as the disk0 image holds them
+/// ([`super::graftfs::GraftFs::live`]): the xART volume's, which only
+/// the restore writes before the boot (its gigalocker file).
+pub fn served_from_disk0(role: u16) -> bool {
+    role == super::storage::role::XART
+}
+
+/// Whether mount `mnt` is of a volume served from the disk0 image
+/// ([`served_from_disk0`]).
+pub fn is_disk0_served(mnt: &Mount) -> bool {
+    matches!(mnt.from, From::Volume(i) if super::storage::volume(i).is_some_and(|v| served_from_disk0(v.role)))
+}
+
 /// What of a mount's files is not modelled, if any: a volume mounted at
 /// run time holds its own files, which this root does not have, but for
-/// the Preboot volume's ([`unmodelled_files_at`] says which of those).
+/// the Preboot volume's ([`unmodelled_files_at`] says which of those) and
+/// those served from the disk0 image ([`served_from_disk0`]).
 pub fn unmodelled_files(mnt: &Mount) -> Option<String> {
     match mnt.from {
-        From::Volume(_) if is_preboot(mnt) => None,
+        From::Volume(_) if is_preboot(mnt) || is_disk0_served(mnt) => None,
         From::Volume(i) => {
             let name = super::storage::volume(i).map_or("?", |v| v.name);
             Some(format!("the files of the {name} volume mounted on {}", mnt.on))

@@ -161,27 +161,28 @@ pub fn authentication_required(role: u16) -> Option<bool> {
     Some(true)
 }
 
-/// The kernel's errno of a read failure in a graft, and the gap to report
-/// where this reader does not implement what the image holds.
-fn errno_of(e: &apfsread::Error, what: &str) -> Errno {
+/// The kernel's errno of a read failure in `place` ([`GraftFs::place`]),
+/// and the gap to report where this reader does not implement what the
+/// image holds.
+fn errno_of(e: &apfsread::Error, what: &str, place: &str) -> Errno {
     match e {
         apfsread::Error::Unsupported(u) => {
-            super::note_unimplemented(format!("APFS's {what} in a cryptex graft: {u}"));
+            super::note_unimplemented(format!("APFS's {what} in {place}: {u}"));
             Errno::EIO
         }
         apfsread::Error::Integrity(i) => {
-            super::note_unimplemented(format!("APFS's error for {what} in a cryptex graft whose sealed data does not match its hashes ({i})"));
+            super::note_unimplemented(format!("APFS's error for {what} in {place} whose sealed data does not match its hashes ({i})"));
             Errno::EIO
         }
         apfsread::Error::Io(_) | apfsread::Error::Malformed(_) => {
-            super::note_unimplemented(format!("APFS's error for {what} in a cryptex graft: {e}"));
+            super::note_unimplemented(format!("APFS's error for {what} in {place}: {e}"));
             Errno::EIO
         }
         apfsread::Error::Decmpfs { errno, why } => {
             // decmpfs_read_compressed zero-fills the UPL a failed fetch was
             // to fill and answers with its copy's result; a pagein
             // returns the fetch's error.
-            super::note_unimplemented(format!("APFS's {what} in a cryptex graft of a compressed file whose decmpfs fetch fails ({why}, errno {errno})"));
+            super::note_unimplemented(format!("APFS's {what} in {place} of a compressed file whose decmpfs fetch fails ({why}, errno {errno})"));
             Errno::EIO
         }
     }
@@ -199,6 +200,13 @@ pub fn va_flags(bsd_flags: u32) -> u32 {
 /// `base + n`, the image's root the graft directory's own,
 /// 0xfffffff00668de64..0xfffffff00668de88 and 0xfffffff00668e270) and the
 /// graft's device.
+///
+/// Or (`live`) a volume of disk0's container mounted at run time, served
+/// at its mount point as the disk0 image holds it: its own object
+/// identifiers as its inode numbers (`base` 0, its root 2 and the root's
+/// parent 1, as `apfs_vnop_getattr`'s `va_fileid` gives them), and its
+/// mount's device. Its files can be read; a change to them would be
+/// written to the disk, which is not modelled.
 pub struct GraftFs {
     pub vol: Volume,
     /// The first of the host volume's object identifiers the graft holds
@@ -213,9 +221,44 @@ pub struct GraftFs {
     /// The sealed volume's root hash, which names its contents (none for
     /// an unsealed one).
     pub seal: Option<Vec<u8>>,
+    /// A live volume's name; none for a graft.
+    pub live: Option<&'static str>,
 }
 
 impl GraftFs {
+    /// Where its files are, for what is reported: a cryptex graft, or a
+    /// live volume.
+    pub fn place(&self) -> String {
+        match self.live {
+            Some(name) => format!("the {name} volume"),
+            None => "a cryptex graft".to_string(),
+        }
+    }
+
+    /// The error of `change` (what a call would change of a file): a
+    /// graft's read-only sealed volume refuses it (EROFS); a live volume
+    /// would write it to the disk, which is not modelled (EIO). Either is
+    /// reported.
+    fn refuse_change(&self, change: &str) -> Errno {
+        match self.live {
+            None => {
+                super::note_unimplemented(format!("APFS's error for {change} in a cryptex graft (its read-only sealed volume)"));
+                Errno::EROFS
+            }
+            Some(name) => {
+                super::note_unimplemented(format!("{change} on the {name} volume: a change to a volume mounted at run time, whose files are read from the disk0 image, is not modelled"));
+                Errno::EIO
+            }
+        }
+    }
+
+    /// Volume `vol` of disk0's container, named `name`, mounted at run
+    /// time: unsealed, its own identifiers its inode numbers, on its
+    /// mount's device `devt`.
+    pub fn live(vol: Volume, name: &'static str, devt: u32) -> GraftFs {
+        GraftFs { vol, base: 0, len: u64::MAX, dir_ino: afs::ROOT_DIR_INO_NUM, dir_parent_ino: afs::ROOT_DIR_PARENT, devt, seal: None, live: Some(name) }
+    }
+
     /// The host's inode number of image object `oid`.
     pub fn ino_of(&self, oid: u64) -> u64 {
         match oid {
@@ -252,7 +295,7 @@ impl GraftFs {
                 if !cur.is_dir() {
                     return Err(Errno::ENOTDIR);
                 }
-                let e = self.vol.lookup(cur.oid, p).map_err(|e| errno_of(&e, "lookup"))?.ok_or(Errno::ENOENT)?;
+                let e = self.vol.lookup(cur.oid, p).map_err(|e| errno_of(&e, "lookup", &self.place()))?.ok_or(Errno::ENOENT)?;
                 let next = self.inode(e.file_id)?;
                 let last = i + 1 == parts.len();
                 if next.kind() == afs::mode::S_IFLNK && (!last || follow) {
@@ -260,9 +303,9 @@ impl GraftFs {
                     if hops > 32 {
                         return Err(Errno::ELOOP);
                     }
-                    let target = self.vol.symlink_target(&next).map_err(|e| errno_of(&e, "readlink"))?;
+                    let target = self.vol.symlink_target(&next).map_err(|e| errno_of(&e, "readlink", &self.place()))?;
                     if target.starts_with('/') {
-                        super::note_unimplemented(format!("a link in a cryptex graft to {target}, outside the graft"));
+                        super::note_unimplemented(format!("a link in {} to {target}, outside it", self.place()));
                         return Err(Errno::ENOENT);
                     }
                     let mut base: Vec<String> = parts[..i].to_vec();
@@ -278,8 +321,8 @@ impl GraftFs {
     }
 
     fn inode(&self, oid: u64) -> Result<afs::Inode, Errno> {
-        self.vol.inode(oid).map_err(|e| errno_of(&e, "inode read"))?.ok_or_else(|| {
-            super::note_unimplemented(format!("APFS's error for a directory entry of a cryptex graft naming the missing inode {oid:#x}"));
+        self.vol.inode(oid).map_err(|e| errno_of(&e, "inode read", &self.place()))?.ok_or_else(|| {
+            super::note_unimplemented(format!("APFS's error for a directory entry of {} naming the missing inode {oid:#x}", self.place()));
             Errno::EIO
         })
     }
@@ -294,16 +337,16 @@ impl GraftFs {
             afs::mode::S_IFIFO => FileType::Fifo,
             afs::mode::S_IFSOCK => FileType::Socket,
             k => {
-                super::note_unimplemented(format!("a cryptex graft's inode {:#x} of type {k:#o} (a device node: its rdev)", ino.oid));
+                super::note_unimplemented(format!("an inode {:#x} of {} of type {k:#o} (a device node: its rdev)", ino.oid, self.place()));
                 return Err(Errno::EIO);
             }
         };
-        let size = self.vol.file_size(ino).map_err(|e| errno_of(&e, "getattr"))?;
+        let size = self.vol.file_size(ino).map_err(|e| errno_of(&e, "getattr", &self.place()))?;
         let nlink = if ino.is_dir() {
             // 0xfffffff00669f2d8: a directory's children and two, unless
             // the volume keeps its links another way.
             if self.vol.sb.incompat & 0x200 != 0 || self.vol.sb.ro_compat & 0x2 != 0 {
-                super::note_unimplemented(format!("a cryptex graft directory's link count on a volume with features {:#x}/{:#x}", self.vol.sb.incompat, self.vol.sb.ro_compat));
+                super::note_unimplemented(format!("a directory's link count in {} on a volume with features {:#x}/{:#x}", self.place(), self.vol.sb.incompat, self.vol.sb.ro_compat));
                 return Err(Errno::EIO);
             }
             (i64::from(ino.nchildren_or_nlink) + 2) as u32
@@ -337,7 +380,7 @@ impl GraftFs {
     /// compressed file's own (`decmpfs_hides_xattr`: `com.apple.decmpfs`
     /// and the resource fork).
     fn visible_xattrs(&self, ino: &afs::Inode) -> Result<Vec<afs::Xattr>, Errno> {
-        let all = self.vol.xattrs(ino.oid).map_err(|e| errno_of(&e, "listxattr"))?;
+        let all = self.vol.xattrs(ino.oid).map_err(|e| errno_of(&e, "listxattr", &self.place()))?;
         Ok(all.into_iter().filter(|x| !(ino.compressed() && (x.name == afs::DECMPFS_XATTR_NAME || x.name == afs::RESOURCEFORK_NAME))).collect())
     }
 
@@ -357,7 +400,7 @@ impl GraftFs {
             XattrOp::Get { name, buf } => {
                 let Some(name) = name.strip_prefix("user.") else { return Err(Errno::ENODATA) };
                 let x = self.visible_xattrs(ino)?.into_iter().find(|x| x.name == name).ok_or(Errno::ENODATA)?;
-                let v = self.vol.xattr_value(&x).map_err(|e| errno_of(&e, "getxattr"))?;
+                let v = self.vol.xattr_value(&x).map_err(|e| errno_of(&e, "getxattr", &self.place()))?;
                 out(buf, &v)
             }
             XattrOp::List { buf } => {
@@ -369,10 +412,7 @@ impl GraftFs {
                 }
                 out(buf, &all)
             }
-            XattrOp::Set { .. } | XattrOp::Remove { .. } => {
-                super::note_unimplemented("APFS's error for a change to an extended attribute of a cryptex graft's file (its read-only sealed volume)".to_string());
-                Err(Errno::EROFS)
-            }
+            XattrOp::Set { .. } | XattrOp::Remove { .. } => Err(self.refuse_change(&format!("a change to an extended attribute of inode {:#x}", ino.oid))),
         }
     }
 
@@ -381,7 +421,7 @@ impl GraftFs {
             DirEntry { name: ".".into(), file_type: FileType::Directory, ino: self.ino_of(dir.oid) },
             DirEntry { name: "..".into(), file_type: FileType::Directory, ino: self.ino_of(dir.parent_id) },
         ];
-        for e in self.vol.dir_entries(dir.oid).map_err(|e| errno_of(&e, "readdir"))? {
+        for e in self.vol.dir_entries(dir.oid).map_err(|e| errno_of(&e, "readdir", &self.place()))? {
             let file_type = match e.dtype {
                 8 => FileType::Regular,
                 4 => FileType::Directory,
@@ -391,7 +431,7 @@ impl GraftFs {
                 2 => FileType::CharDevice,
                 6 => FileType::BlockDevice,
                 t => {
-                    super::note_unimplemented(format!("a cryptex graft's directory entry {:?} of type {t}", e.name));
+                    super::note_unimplemented(format!("a directory entry {:?} of {} of type {t}", e.name, self.place()));
                     return Err(Errno::EIO);
                 }
             };
@@ -495,7 +535,7 @@ impl FileHandle for GraftHandle {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> crate::errno::SysResult {
         match self.ino.kind() {
             afs::mode::S_IFDIR => Err(Errno::EISDIR),
-            afs::mode::S_IFREG => self.fs.vol.read_file(&self.ino, offset, buf).map(|n| n as u64).map_err(|e| errno_of(&e, "read")),
+            afs::mode::S_IFREG => self.fs.vol.read_file(&self.ino, offset, buf).map(|n| n as u64).map_err(|e| errno_of(&e, "read", &self.fs.place())),
             _ => Err(Errno::EINVAL),
         }
     }
@@ -522,8 +562,7 @@ impl FileHandle for GraftHandle {
         Some(self.fs.xattr_op(&self.ino, op))
     }
     fn chmod(&self, _mode: u32) -> Option<Result<(), Errno>> {
-        super::note_unimplemented("APFS's error for a chmod of a cryptex graft's file (its read-only sealed volume)".to_string());
-        Some(Err(Errno::EROFS))
+        Some(Err(self.fs.refuse_change(&format!("a chmod of inode {:#x}", self.ino.oid))))
     }
 }
 
@@ -544,8 +583,7 @@ impl FileSystem for GraftMount {
             if ino.as_ref().is_ok_and(|i| i.is_dir()) {
                 return Err(Errno::EISDIR);
             }
-            super::note_unimplemented(format!("APFS's error for an open of {path} in a cryptex graft to write (its read-only sealed volume)"));
-            return Err(Errno::EROFS);
+            return Err(self.0.refuse_change(&format!("an open of {path} to write")));
         }
         let ino = self.0.resolve(path, true)?;
         if ino.kind() == afs::mode::S_IFREG && ino.compressed() {
@@ -557,7 +595,7 @@ impl FileSystem for GraftMount {
                     super::note_unimplemented(format!("APFS's open of {path}, whose decmpfs validation fails ({why}): the conditions on apfs_vnop_open's way to it are not traced; answered with its errno {errno}"));
                     return Err(super::errno::errno_of(errno));
                 }
-                Err(e) => return Err(errno_of(&e, "open")),
+                Err(e) => return Err(errno_of(&e, "open", &self.0.place())),
             }
         }
         Ok(Arc::new(GraftHandle { fs: Arc::clone(&self.0), ino }))
@@ -575,7 +613,7 @@ impl FileSystem for GraftMount {
         if ino.kind() != afs::mode::S_IFLNK {
             return Err(Errno::EINVAL);
         }
-        self.0.vol.symlink_target(&ino).map_err(|e| errno_of(&e, "readlink"))
+        self.0.vol.symlink_target(&ino).map_err(|e| errno_of(&e, "readlink", &self.0.place()))
     }
     fn xattr(&self, path: &str, op: XattrOp<'_>) -> Result<usize, Errno> {
         let ino = self.0.resolve(path, false)?;
@@ -583,13 +621,11 @@ impl FileSystem for GraftMount {
     }
     fn chmod(&self, path: &str, _mode: u32) -> Result<(), Errno> {
         self.0.resolve(path, true)?;
-        super::note_unimplemented(format!("APFS's error for a chmod of {path} in a cryptex graft (its read-only sealed volume)"));
-        Err(Errno::EROFS)
+        Err(self.0.refuse_change(&format!("a chmod of {path}")))
     }
     fn set_mtime(&self, path: &str, _secs: i64) -> Result<(), Errno> {
         self.0.resolve(path, true)?;
-        super::note_unimplemented(format!("APFS's error for a change of the times of {path} in a cryptex graft (its read-only sealed volume)"));
-        Err(Errno::EROFS)
+        Err(self.0.refuse_change(&format!("a change of the times of {path}")))
     }
     fn path_of_ino(&self, ino: u64) -> Option<String> {
         let oid = self.0.oid_of(ino)?;
@@ -932,7 +968,7 @@ mod tests {
     fn the_graft_serves_the_images_files() {
         let (vol, _) = os_image();
         let len = vol.sb.next_obj_id;
-        let g = Arc::new(GraftFs { vol, base: 1000, len, dir_ino: 20, dir_parent_ino: 19, devt: 0x0101_0005, seal: None });
+        let g = Arc::new(GraftFs { vol, base: 1000, len, dir_ino: 20, dir_parent_ino: 19, devt: 0x0101_0005, seal: None, live: None });
         let m = GraftMount(Arc::clone(&g));
         let root = m.metadata("").unwrap();
         assert_eq!((root.ino, root.file_type), (20, FileType::Directory));

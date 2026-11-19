@@ -11483,8 +11483,12 @@ impl Kernel {
         // holds it (a `chdir` changes it there, `PathIo`).
         let me = self.ctx_addr;
         // The mount table as it is now: a thread may have mounted or
-        // unmounted without the lock since this copy's was taken.
+        // unmounted without the lock since this copy's was taken; a Darwin
+        // process's, with what other processes mounted (XNU has one table).
         self.vfs.refresh();
+        if self.darwin {
+            self.vfs.take_system_mounts();
+        }
         self.vfs.enter_cwd(self.fs_of(me).get_call());
         let out = self.syscall_inner(m, pc);
         self.vfs.leave_cwd();

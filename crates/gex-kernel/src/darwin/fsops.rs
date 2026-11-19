@@ -306,7 +306,7 @@ impl Kernel {
         self.vfs.metadata(&from)?;
         match self.vfs.bound_subtree(&from)? {
             Some(fs) => {
-                self.vfs.mount(at, fs);
+                self.vfs.system_mount(at, fs);
                 Ok(0)
             }
             None => {
@@ -686,13 +686,16 @@ impl Kernel {
             return Err(Errno::EIO);
         }
         // The volume's files: the Preboot volume's as the restore left
-        // them (super::preboot); no other volume's are modelled, and a
-        // path below its mount is reported (kern::unmodelled_files_at).
-        let files = match super::storage::volume(mounted.volume).map(|v| v.role) {
-            Some(super::storage::role::PREBOOT) => {
+        // them (super::preboot); the xART volume's as the disk0 image holds
+        // them (super::graftfs::GraftFs::live, read through the image's
+        // latest checkpoint, its inode numbers its own, on this mount's
+        // device); no other volume's are modelled, and a path below its
+        // mount is reported (kern::unmodelled_files_at).
+        let files: Option<std::sync::Arc<dyn crate::vfs::FileSystem>> = match super::storage::volume(mounted.volume) {
+            Some(v) if v.role == super::storage::role::PREBOOT => {
                 let made = super::preboot::volume(&|p| self.darwin_system_file(p));
                 match made {
-                    Ok(fs) => Some(fs),
+                    Ok(fs) => Some(fs as std::sync::Arc<dyn crate::vfs::FileSystem>),
                     Err(why) => {
                         self.darwin_unimplemented(why);
                         self.darwin_mount_close(node.minor, &given);
@@ -700,6 +703,14 @@ impl Kernel {
                     }
                 }
             }
+            Some(v) if super::kern::served_from_disk0(v.role) => match super::disknode::volume(mounted.volume) {
+                Ok(vol) => Some(std::sync::Arc::new(super::graftfs::GraftMount(std::sync::Arc::new(super::graftfs::GraftFs::live(vol, v.name, mounted.fsid0)))) as std::sync::Arc<dyn crate::vfs::FileSystem>),
+                Err(why) => {
+                    self.darwin_unimplemented(format!("mounting {fstype} from {given} on {at}: the {} volume's files from the disk0 image: {why}", v.name));
+                    self.darwin_mount_close(node.minor, &given);
+                    return Err(Errno::EIO);
+                }
+            },
             _ => None,
         };
         // The covered directory's mountedhere, mount_generation, checkdirs
@@ -716,7 +727,7 @@ impl Kernel {
         }
         let mnt = super::kern::mount_list_add(super::kern::Mount::new(Box::leak(at.to_string().into_boxed_str()), super::kern::From::Volume(mounted.volume), u64::from(mounted.fsid0), mounted.flags, super::kern::Fs::Apfs, None, self.dtask.cred.uid, Some(rdonly)));
         if let Some(fs) = files {
-            self.vfs.mount(mnt.on, fs);
+            self.vfs.system_mount(mnt.on, fs);
         }
         // IOBSDMountChange: an empty function in this kernel
         // (0xfffffff007852a84 is a `ret`; no IOPOLLED_COREFILE in a release

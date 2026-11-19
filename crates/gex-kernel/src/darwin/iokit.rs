@@ -410,6 +410,8 @@ pub fn properties(t: &[Node], i: u32) -> Vec<(String, Prop)> {
 ///   compatible, device_type or model beyond its device tree's
 ///   ([`DT_NAME_KEYS`]). On the display's framebuffer and its nub, so are
 ///   the names no driver sets there ([`super::iomfb::property_absent`]).
+///   Nor has an entry a key whose every writer is known
+///   ([`KEY_WRITERS`]) unless it is of a writer's class.
 pub fn property_unknown(t: &[Node], i: u32, name: &str) -> bool {
     let Some(n) = t.get(i as usize) else { return false };
     if name == "IOClassNameOverride" || name == "Target Disk Mode" {
@@ -437,8 +439,59 @@ pub fn property_unknown(t: &[Node], i: u32, name: &str) -> bool {
     if display && super::iomfb::property_absent(t, i, name) {
         return false;
     }
+    if let Some(k) = KEY_WRITERS.iter().find(|k| k.key == name) {
+        // Its whole class chain known, and none of it a writer.
+        let chain = class(t, i).ok().and_then(class_chain);
+        if chain.is_some_and(|c| k.writers.iter().all(|w| !c.contains(&w.class))) {
+            return false;
+        }
+    }
     true
 }
+
+/// A property key whose writers in the device's kernelcache are all known:
+/// every reference to its name there is one of them or a reader, no
+/// personality in its prelink info names it, and the device tree has it
+/// nowhere. Each writer sets it on itself (`setProperty` on `this`), so an
+/// entry has it only when it is of a writer's class.
+#[derive(Debug)]
+pub struct KeyWriters {
+    pub key: &'static str,
+    pub writers: &'static [KeyWriter],
+}
+
+/// A class whose code sets a key on its own objects: its kext, and the
+/// call that sets it.
+#[derive(Debug)]
+pub struct KeyWriter {
+    pub class: &'static str,
+    pub kext: &'static str,
+    pub site: u64,
+}
+
+/// The keys whose every writer is known:
+/// - "image-format-read-only", which the disk image drivers give the
+///   devices of an image they attach. The kernelcache names it four times,
+///   all in kexts' strings (none in the kernel's or the prelink info's):
+///   DiskImages.KernelBacked's IOHDIXHDDriveInKernel copies its image's
+///   value onto itself (its vtable slot 0x540, 0xfffffff005f3bee0), and its
+///   KDIDiskImage sets false on itself (slot 0x550, 0xfffffff005f3d4d8,
+///   which DiskImages.ReadWriteDiskImage's subclass inherits);
+///   DiskImages.UDIFDiskImage's KDIUDIFDiskImage sets true on itself after
+///   its superclass's (slot 0x550, 0xfffffff0064a8314); AppleDiskImages2's
+///   `AppleDiskImageDevice::SetDeviceParams` (0xfffffff006c98104) sets the
+///   image's on itself. APFS only reads it, searching up the parents
+///   (0xfffffff00666ee94), as fsck_apfs's `io_get_device_features` does
+///   from user space.
+pub const KEY_WRITERS: &[KeyWriters] = &[KeyWriters {
+    key: "image-format-read-only",
+    writers: &[
+        KeyWriter { class: "IOHDIXHDDriveInKernel", kext: "com.apple.driver.DiskImages.KernelBacked", site: 0xfffffff005f3c158 },
+        KeyWriter { class: "KDIDiskImage", kext: "com.apple.driver.DiskImages.KernelBacked", site: 0xfffffff005f3d7fc },
+        KeyWriter { class: "KDIUDIFDiskImage", kext: "com.apple.driver.DiskImages.UDIFDiskImage", site: 0xfffffff0064a8358 },
+        KeyWriter { class: "AppleDiskImageDevice", kext: "com.apple.driver.AppleDiskImages2", site: 0xfffffff006c982a4 },
+    ],
+}];
 
 /// A property entry `i`'s driver keeps and may change while it runs,
 /// ahead of its fixed ones: a medium's open state
@@ -1698,6 +1751,42 @@ mod tests {
         let events = chans(&legend[1]);
         assert_eq!(events.len(), 62);
         assert_eq!(events[0], Prop::Array(vec![Prop::Num(0x4576_3030_5072_7430, 64), Prop::Num(0x0001_8000_0001, 64), Prop::Sym(format!("{:<39}", "Port 0 Enable Request"))]));
+    }
+
+    #[test]
+    fn a_key_only_disk_images_set_is_absent_up_the_storage() {
+        let mut b = Vec::new();
+        node(&mut b, "device-tree", &[("compatible", b"J120AP\0iPad7,1\0AppleARM\0")], 1);
+        node(&mut b, "arm-io", &[("compatible", b"arm-io,t8011\0")], 1);
+        node(&mut b, "apcie", &[("compatible", b"apcie,t8011\0")], 1);
+        node(&mut b, "pci-bridge0", &[("compatible", b"apcie-bridge\0"), ("AAPL,unit-string", b"00000000")], 1);
+        node(&mut b, "s3e", &[("AAPL,unit-string", b"00000000")], 0);
+        let mut t = parse(&b).unwrap();
+        let io = super::super::platform::add(&mut t).unwrap();
+        super::super::storagestack::add(&mut t, Some(io));
+        add_root(&mut t);
+        let root = t.len() as u32 - 1;
+        let part = t.iter().position(|n| n.name == super::super::storagestack::PARTITION_NAME && n.class == "IOMedia").unwrap() as u32;
+        // fsck_apfs's search from the container's partition reaches the
+        // registry's root through the PCIe path and the platform's
+        // drivers, none of which is a disk image's.
+        let mut up = vec![part];
+        while let Ok(Some(p)) = provider(&t, *up.last().unwrap()) {
+            up.push(p);
+        }
+        assert_eq!(up.last(), Some(&root));
+        assert!(up.contains(&2) && up.contains(&1) && up.contains(&0) && up.contains(&io));
+        const KEY: &str = "image-format-read-only";
+        for &i in &up {
+            assert!(!property_unknown(&t, i, KEY), "{}", name(&t, i));
+        }
+        assert_eq!(search(&t, part, Plane::Service, 3, KEY, |_| true), Ok((None, false)));
+        // Other keys the platform's drivers may set stay unknown there.
+        assert!(property_unknown(&t, 2, "apcie-unmodelled") && property_unknown(&t, io, "apcie-unmodelled") && property_unknown(&t, 0, "IOPlatformSerialNumber"));
+        // An entry whose class chain is not known may be a writer's.
+        let mut t2 = vec![Node { name: "image".to_string(), props: Vec::new(), class: "KDIUDIFDiskImage", service_props: Vec::new(), parent: None, children: Vec::new(), kernel_only: false, nub: None, dt: None, table: Table::Drivers, power: None }];
+        add_root(&mut t2);
+        assert!(property_unknown(&t2, 0, KEY));
     }
 
     #[test]

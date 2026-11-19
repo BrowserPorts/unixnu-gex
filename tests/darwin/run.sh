@@ -615,7 +615,8 @@ hello from /var/tmp/gex-exec-fat with 1 argument" 0
         check_root inet6 "inet6 user ok" 0 user
         ;;
     # rusage's kept fields, with the reports of the others let pass; then
-    # a strict run stops at the report.
+    # a strict run stops at the report, and reads a child posix_spawn has
+    # just returned whole.
     rusage)
         strict=${GEX_DARWIN_STRICT:-}
         GEX_DARWIN_STRICT=0
@@ -624,6 +625,7 @@ hello from /var/tmp/gex-exec-fat with 1 argument" 0
         if [ "$strict" = 1 ]; then
             check_root rusage "rusage stop" $STRICT_STOP stop
         fi
+        check_root rusage "rusage spawned ok" 0 spawned
         ;;
     sbxmask) check_root sbxmask "sbxmask ok" 0 ;;
     sbxnet) check_root sbxnet "sbxnet ok" 0 ;;

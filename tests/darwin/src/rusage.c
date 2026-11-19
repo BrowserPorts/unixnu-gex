@@ -28,7 +28,8 @@
 // outside it, and its peak after it unmapped what it touched. The fields
 // the kernel does not keep are reported, so a strict run stops at a
 // call that copies one ("stop": V0's after the real timer's signal, the
-// wakeups a thread call's signal made not followed).
+// wakeups a thread call's signal made not followed). A child that
+// posix_spawn has just returned is there to read whole ("spawned").
 //
 // Instructions and cycles (recount's PMC1 and PMC0): a loop of a known
 // count retires exactly that many more instructions for twice as many
@@ -71,9 +72,11 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/time.h>
+#include <spawn.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <mach-o/dyld.h>
 
 int proc_pid_rusage(int pid, int flavor, void *buffer);
 int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int buffersize);
@@ -486,8 +489,53 @@ static int other(void) {
     return 0;
 }
 
+// A child posix_spawn has just returned, read whole at once (strict): its
+// address space is built before the call returns (exec_activate_image), so
+// its footprint and counts are there to look at. Its start is the spawn's,
+// it has no end, and its footprint is within its lifetime peak.
+static int spawned(const char *self) {
+    int down[2];
+    if (pipe(down)) return bad("pipe", errno, 0);
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, down[0], 0);
+    posix_spawn_file_actions_addclose(&fa, down[1]);
+    char *args[] = { (char *)self, "spawned-child", NULL };
+    extern char **environ;
+    uint64_t before = mach_absolute_time();
+    pid_t c;
+    int e = posix_spawn(&c, self, &fa, NULL, args, environ);
+    if (e) return bad("posix_spawn", e, 0);
+    struct rusage_info_v6 r;
+    int got = proc_pid_rusage(c, RUSAGE_INFO_V6, &r);
+    uint64_t after = mach_absolute_time();
+    close(down[0]);
+    close(down[1]);
+    int st;
+    waitpid(c, &st, 0);
+    if (got != 0) return bad("the spawned child", errno, 0);
+    if (r.ri_proc_start_abstime < before || r.ri_proc_start_abstime > after) return bad("the child's start", (long)r.ri_proc_start_abstime, (long)before);
+    if (r.ri_proc_exit_abstime != 0) return bad("the child's end", (long)r.ri_proc_exit_abstime, 0);
+    if (r.ri_lifetime_max_phys_footprint < r.ri_phys_footprint) return bad("the child's peak", (long)r.ri_lifetime_max_phys_footprint, (long)r.ri_phys_footprint);
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) return bad("the child's status", st, 0);
+    printf("rusage spawned ok\n");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     struct rusage_info_v6 r;
+    if (argc > 1 && strcmp(argv[1], "spawned-child") == 0) {
+        // Until its parent closes the pipe.
+        char x;
+        while (read(0, &x, 1) > 0) {}
+        return 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "spawned") == 0) {
+        char self[1024];
+        uint32_t n = sizeof self;
+        if (_NSGetExecutablePath(self, &n) != 0) return bad("its path", 0, 1);
+        return spawned(self);
+    }
     if (argc > 2 && strcmp(argv[1], "exec-count") == 0) {
         uint64_t n = insns();
         write(atoi(argv[2]), &n, sizeof n);

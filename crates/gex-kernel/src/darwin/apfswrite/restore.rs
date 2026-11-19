@@ -466,6 +466,12 @@ fn create_directory(nx: &mut Nx<'_>, vol: usize, path: &str, mode: u16, uid: u32
 
 /// The restore step install_fud is, as a disk0 image's missing steps name
 /// it: its firmware is not written.
+/// The restore step update_device_firmware's list runs first,
+/// update_iBoot (RE@0x100050394), as a disk0 image's missing steps name
+/// it: the SEP firmware it writes into the Preboot directory is not
+/// written.
+pub const UPDATE_SEP_MISSING: &str = "update_device_firmware's update_iBoot (the first entry of _ramrod_update_device_firmware's list, RE@0x100050394): the boot firmware its updater writes to the boot storage (updateBootFirmwareWithCallback, outside the container), then update_sep (RE@0x10005140c, when the device has a SEP, AppleSEPManager, RE@0x100050d0c): <Preboot Root>/usr/standalone/firmware/sep-firmware.img4, and sep-patches.img4 when copy_sep_patch gives patches, each open(O_WRONLY | O_CREAT | O_TRUNC, 0644) and filled by write_data_to_fd (RE@0x100059d0c, in writes of the file's preferred block size) with the host's SEP OS image (the firmware images' \"SEP\" data, RE@0x100050c5c: the erase identity's SEP, Firmware/all_flash/sep-firmware.j120.RELEASE.im4p, personalized with the AP ticket, TICKET_STAND_IN; its container and the chunk sizes not traced)";
+
 pub const INSTALL_FUD_MISSING: &str = "install_fud's firmware on Preboot (<nsih>/usr/standalone/firmware/FUD and the host's personalized images in it, AOP, AVE and StaticTrustCache for the erase identity)";
 
 /// The name of the Preboot volume's directory for this device: the AP
@@ -529,6 +535,10 @@ fn concurrent_steps(nx: &mut Nx<'_>, v: Volumes, host: Option<&str>, now: &mut d
     // fdr_prepare's removefile walk of the empty factorydata directory and
     // the access() checks of the later steps only read.
     missing.push("the FDR local store on Hardware (libFDR's writes into /FactoryData/System/Library/Caches/com.apple.factorydata by fdr_prepare's commit, fdr_recover, fdr_auto_challenge_claim and verify_fdr_data: server and device data, file names not traced)".into());
+    // update_device_firmware (0x10001827c → 0x100032980): its list
+    // (0x100050034) starts with update_iBoot, whose update_sep writes the
+    // SEP's firmware into the Preboot directory, then install_fud.
+    missing.push(UPDATE_SEP_MISSING.into());
     missing.push(INSTALL_FUD_MISSING.into());
     Ok(())
 }
@@ -2588,6 +2598,10 @@ mod tests {
         // xART: without the device, whose platform UUID names the
         // gigalocker file, only its root, the file listed as missing.
         assert!(missing.iter().any(|m| m == GIGALOCKER_FILE_MISSING));
+        // update_device_firmware's list: update_iBoot's SEP firmware, then
+        // install_fud's, neither written.
+        let at = |step: &str| missing.iter().position(|m| m == step).unwrap_or_else(|| panic!("{step} not listed"));
+        assert_eq!(at(UPDATE_SEP_MISSING) + 1, at(INSTALL_FUD_MISSING));
         let x = c.volume(2).unwrap().unwrap();
         // The boot's mount of xART serves it as it is here (GraftFs::live):
         // its root inode 2 with its owner, group and mode, listing nothing

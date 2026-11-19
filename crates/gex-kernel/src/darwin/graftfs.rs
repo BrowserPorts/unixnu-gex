@@ -336,17 +336,22 @@ impl GraftFs {
     /// What of path `rel` (its path below the root; `listing` a listing
     /// of it) the disk0 image does not hold because the restore step that
     /// writes there is missing from it: on the Preboot volume, what is in
-    /// the firmware directory install_fud fills
-    /// (`<nsih>/usr/standalone/firmware`) when the image lacks that step.
+    /// the firmware directory update_iBoot's update_sep and install_fud
+    /// fill (`<nsih>/usr/standalone/firmware`) when the image lacks either
+    /// step.
     fn unwritten(&self, rel: &str, listing: bool) -> Option<String> {
-        use super::apfswrite::restore::{nsih, INSTALL_FUD_MISSING};
-        if self.live.as_ref().map(|l| l.name) != Some("Preboot") || !super::disknode::lacks(INSTALL_FUD_MISSING) {
+        use super::apfswrite::restore::{nsih, INSTALL_FUD_MISSING, UPDATE_SEP_MISSING};
+        if self.live.as_ref().map(|l| l.name) != Some("Preboot") {
+            return None;
+        }
+        let lacking: Vec<&str> = [UPDATE_SEP_MISSING, INSTALL_FUD_MISSING].into_iter().filter(|m| super::disknode::lacks(m)).collect();
+        if lacking.is_empty() {
             return None;
         }
         let fw = format!("{}/usr/standalone/firmware", nsih());
         let rel = rel.trim_matches('/');
         let below = rel.strip_prefix(fw.as_str()).is_some_and(|r| r.starts_with('/'));
-        (below || (listing && rel == fw)).then(|| format!("{rel} on the Preboot volume, which the disk0 image does not hold as the restore leaves it: the image lacks {INSTALL_FUD_MISSING}"))
+        (below || (listing && rel == fw)).then(|| format!("{rel} on the Preboot volume, which the disk0 image does not hold as the restore leaves it: the image lacks {}", lacking.join("; and ")))
     }
 
     /// [`GraftFs::unwritten`], reported: EIO.

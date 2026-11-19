@@ -754,7 +754,7 @@ impl Kernel {
         let dir_parent_ino = self.vfs.metadata(&parent)?.ino;
         let seal = image.integrity().ok().flatten().map(|m| m.root_hash);
         let fs = std::sync::Arc::new(graftfs::GraftFs { vol: image, base, len, dir_ino: dir.md.ino, dir_parent_ino, devt, seal });
-        self.vfs.mount(&dir.path, std::sync::Arc::new(graftfs::GraftMount(std::sync::Arc::clone(&fs))));
+        self.vfs.system_mount(&dir.path, std::sync::Arc::new(graftfs::GraftMount(std::sync::Arc::clone(&fs))));
         graftfs::add(graftfs::Graft { host_volume: volume, host_devt, file_path: file.path.clone(), file_ino: file.md.ino, dir_path: dir.path.clone(), dir_ino: dir.md.ino, flags, fs }, devc, handed);
         if flags & fsctl::PRESERVE_MOUNT != 0 {
             mnt.state().kern_flag |= super::kern::MNTK_SYSTEM;
@@ -813,7 +813,7 @@ impl Kernel {
                 return;
             }
         };
-        self.vfs.mount(mnt.on, fs);
+        self.vfs.system_mount(mnt.on, fs);
         if !super::preboot::has_restore() {
             return;
         }

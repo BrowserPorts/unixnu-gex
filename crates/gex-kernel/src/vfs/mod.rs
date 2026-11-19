@@ -1376,7 +1376,20 @@ pub struct Vfs {
     /// of its own has its directory in `ns` for its call ([`Vfs::enter_cwd`]):
     /// what a publication shows.
     held: Option<String>,
+    /// How many of the system mount table's mounts the table holds
+    /// ([`Vfs::take_system_mounts`]).
+    system: usize,
 }
+
+/// Darwin's mount table, which every process shares (XNU has one, the
+/// `mountlist`): the mounts its `mount`, its grafts and its boot made, in
+/// the order they were made. A process's table takes those it does not
+/// hold before each of its calls ([`Vfs::take_system_mounts`]); a fork's
+/// holds what its parent's did.
+static SYSTEM_MOUNTS: std::sync::Mutex<Vec<(String, Arc<dyn FileSystem>)>> = std::sync::Mutex::new(Vec::new());
+
+/// How many mounts [`SYSTEM_MOUNTS`] holds, read without its lock.
+static SYSTEM_MOUNT_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// A [`Vfs`]'s namespace as other threads read it: replaced whole on every
 /// change, so a reader holds one consistent table and directory for as long
@@ -1492,7 +1505,7 @@ impl Clone for Vfs {
         // since this copy's was taken), the directory as it is here.
         let mut ns = Namespace::clone(&self.view.0.get());
         ns.cwd.clone_from(&self.ns.cwd);
-        Vfs { view: NsCell(Arc::new(VfsView::new(&ns))), ns, mounts: 0, held: None }
+        Vfs { view: NsCell(Arc::new(VfsView::new(&ns))), ns, mounts: 0, held: None, system: self.system }
     }
 }
 
@@ -1507,7 +1520,7 @@ impl Vfs {
     pub fn new() -> Vfs {
         let ns = Namespace::new();
         let view = NsCell(Arc::new(VfsView::new(&ns)));
-        Vfs { ns, view, mounts: 0, held: None }
+        Vfs { ns, view, mounts: 0, held: None, system: 0 }
     }
 
     /// The published namespace, the same view for this table's whole life.
@@ -1564,6 +1577,40 @@ impl Vfs {
     /// Mount `fs` at `at` ([`VfsView::mount`]).
     pub fn mount(&mut self, at: &str, fs: Arc<dyn FileSystem>) {
         self.view.0.mount(at, fs);
+        self.refresh();
+    }
+
+    /// Mount `fs` at absolute path `at` in the system mount table
+    /// ([`SYSTEM_MOUNTS`]), after those this table does not hold yet, and
+    /// here; every other process's table takes it before its next call.
+    pub fn system_mount(&mut self, at: &str, fs: Arc<dyn FileSystem>) {
+        self.take_system_mounts();
+        let mut all = SYSTEM_MOUNTS.lock().unwrap_or_else(|e| e.into_inner());
+        all.push((at.to_string(), Arc::clone(&fs)));
+        SYSTEM_MOUNT_COUNT.store(all.len(), std::sync::atomic::Ordering::Release);
+        // (a mount another process made between the take and the push is
+        // taken at this table's next call, this one again after it: the
+        // table's order)
+        drop(all);
+        self.mount(at, fs);
+    }
+
+    /// Take the system mount table's mounts this table does not hold, in
+    /// their order ([`SYSTEM_MOUNTS`]): a Darwin process's, before each of
+    /// its calls.
+    pub fn take_system_mounts(&mut self) {
+        if SYSTEM_MOUNT_COUNT.load(std::sync::atomic::Ordering::Acquire) == self.system {
+            return;
+        }
+        let new: Vec<(String, Arc<dyn FileSystem>)> = {
+            let all = SYSTEM_MOUNTS.lock().unwrap_or_else(|e| e.into_inner());
+            let from = self.system.min(all.len());
+            self.system = all.len();
+            all[from..].to_vec()
+        };
+        for (at, fs) in new {
+            self.view.0.mount(&at, fs);
+        }
         self.refresh();
     }
 
@@ -2495,6 +2542,29 @@ mod tests {
         // A path that merely starts with the same letters is not inside it.
         let (_, rel) = vfs.resolve("/procession").unwrap();
         assert_eq!(rel, "procession");
+    }
+
+    /// A mount a child makes in the system mount table is its parent's at
+    /// the parent's next take, and a later fork's with its parent's table;
+    /// a plain mount stays the mounting process's own.
+    #[test]
+    fn system_mounts_are_every_processs() {
+        let mut parent = Vfs::new();
+        parent.mount("/", Arc::new(TmpFs::new()));
+        let mut child = parent.clone();
+        let vol = TmpFs::new();
+        vol.add_file("marker", b"x".to_vec());
+        child.system_mount("/vfs-test-system-mount", Arc::new(vol));
+        let own = TmpFs::new();
+        own.add_file("mine", b"y".to_vec());
+        child.mount("/vfs-test-own-mount", Arc::new(own));
+        assert!(child.metadata("/vfs-test-system-mount/marker").is_ok());
+        assert!(parent.metadata("/vfs-test-system-mount/marker").is_err());
+        parent.take_system_mounts();
+        assert!(parent.metadata("/vfs-test-system-mount/marker").is_ok());
+        assert!(parent.metadata("/vfs-test-own-mount/mine").is_err());
+        let later = parent.clone();
+        assert!(later.metadata("/vfs-test-system-mount/marker").is_ok());
     }
 
     #[test]

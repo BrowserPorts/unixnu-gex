@@ -306,7 +306,7 @@ impl Kernel {
         self.vfs.metadata(&from)?;
         match self.vfs.bound_subtree(&from)? {
             Some(fs) => {
-                self.vfs.mount(at, fs);
+                self.vfs.system_mount(at, fs);
                 Ok(0)
             }
             None => {
@@ -716,7 +716,7 @@ impl Kernel {
         }
         let mnt = super::kern::mount_list_add(super::kern::Mount::new(Box::leak(at.to_string().into_boxed_str()), super::kern::From::Volume(mounted.volume), u64::from(mounted.fsid0), mounted.flags, super::kern::Fs::Apfs, None, self.dtask.cred.uid, Some(rdonly)));
         if let Some(fs) = files {
-            self.vfs.mount(mnt.on, fs);
+            self.vfs.system_mount(mnt.on, fs);
         }
         // IOBSDMountChange: an empty function in this kernel
         // (0xfffffff007852a84 is a `ret`; no IOPOLLED_COREFILE in a release

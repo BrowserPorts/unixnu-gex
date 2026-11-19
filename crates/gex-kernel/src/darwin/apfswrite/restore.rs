@@ -2324,6 +2324,31 @@ mod tests {
         let mut buf = vec![1u8; 4096];
         x.read_file(&gl, 0x5f_f000, &mut buf).unwrap();
         assert!(buf.iter().all(|&b| b == 0));
+        // The boot's mount of xART serves them as they are here
+        // (GraftFs::live): its root inode 2, the gigalocker file under its
+        // own number, each with its owner, group and mode; the mount's
+        // root lists the file; a change to it is not modelled.
+        {
+            use crate::darwin::graftfs::{GraftFs, GraftMount};
+            use crate::darwin::vattr::{Owned, RECORD};
+            use crate::vfs::{FileSystem, FileType, XattrOp};
+            let root = x.inode(2).unwrap().unwrap();
+            let live = GraftMount(std::sync::Arc::new(GraftFs::live(c.volume(2).unwrap().unwrap(), "xART", 0x1000_0003)));
+            let md = live.metadata("").unwrap();
+            assert_eq!((md.ino, md.file_type, md.mode), (2, FileType::Directory, u32::from(root.mode) & 0o7777));
+            let mut rec = [0u8; 128];
+            let n = live.xattr("", XattrOp::Get { name: RECORD, buf: &mut rec }).unwrap();
+            assert_eq!(Owned::parse(&rec[..n]), Ok(GraftFs::owned_of(&root)));
+            let name = "00000000-0000-4000-8000-000000000005.gl";
+            let fmd = live.metadata(name).unwrap();
+            assert_eq!((fmd.ino, fmd.file_type, fmd.size, fmd.mode), (e.file_id, FileType::Regular, 0x60_0000, 0o600));
+            let n = live.xattr(name, XattrOp::Get { name: RECORD, buf: &mut rec }).unwrap();
+            assert_eq!(Owned::parse(&rec[..n]), Ok(Owned { uid: 0, gid: 0, mode: 0o600, flags: 0 }));
+            let listed = live.open("", 0, 0).unwrap().read_dir().unwrap();
+            assert!(listed.iter().any(|d| d.name == name && d.ino == e.file_id));
+            assert!(listed.iter().any(|d| d.name == ".." && d.ino == 1));
+            assert_eq!(live.open(name, crate::fs::oflags::O_RDWR, 0).err(), Some(crate::errno::Errno::EIO));
+        }
         // Hardware's dummy FDR path.
         let h = c.volume(3).unwrap().unwrap();
         let mut d = 2;

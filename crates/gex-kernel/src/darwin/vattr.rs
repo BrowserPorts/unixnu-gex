@@ -381,6 +381,10 @@ pub fn of_on(ns: &Namespace, mnt: &super::kern::Mount, path: &str, md: &Metadata
             }
             return recorded(ns, path, handle)?.ok_or_else(|| format!("the owner of {path}: a file of the Preboot volume with no record"));
         }
+        if super::kern::is_disk0_served(mnt) {
+            // Each of its inodes' own (super::graftfs::GraftFs::owned_of).
+            return recorded(ns, path, handle)?.ok_or_else(|| format!("the owner of {path}: a file of the volume mounted on {} with no record", mnt.on));
+        }
         if let Some(what) = super::kern::unmodelled_files(mnt) {
             return Err(format!("the owner of {path}: {what}"));
         }

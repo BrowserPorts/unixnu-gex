@@ -120,6 +120,16 @@ pub fn volume_fs_flags(index: u32) -> Result<Option<u64>, String> {
     Ok(Some(u64::from_le_bytes(sb[0x108..0x110].try_into().unwrap())))
 }
 
+/// The volume in slot `index` of the container in the image, read from
+/// its latest checkpoint, for a mount of it at run time; an error without
+/// an image, for an empty slot, or where the image cannot be read.
+pub fn volume(index: u32) -> Result<super::apfsread::Volume, String> {
+    let d = DISK.get().ok_or("no disk0 image (GEX_DARWIN_DISK0)")?;
+    let (base, size) = storage::partition_extent();
+    let c = Arc::new(super::apfsread::Container::open(Arc::new(PartMedium(Arc::clone(&d.sink), base, size))).map_err(|e| format!("the container in the disk0 image: {e}"))?);
+    c.volume(index as usize).map_err(|e| format!("volume {index} of the container in the disk0 image: {e}"))?.ok_or_else(|| format!("the container in the disk0 image has no volume in slot {index}"))
+}
+
 /// Whether a disk0 image is served.
 pub fn installed() -> bool {
     DISK.get().is_some()

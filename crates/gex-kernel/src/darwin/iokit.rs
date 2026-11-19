@@ -2156,6 +2156,52 @@ mod tests {
         t
     }
 
+    /// The platform's UUID: generatePlatformUUID of /chosen's ECID and chip
+    /// ID on the platform expert device, published as the resource between
+    /// IOKit and IOBSD; with either missing or of another size, none.
+    #[test]
+    fn the_platform_uuid_is_the_chosen_identitys() {
+        use super::super::platform::{self, UUID_KEY};
+        let tree = |chosen: &[(&str, &[u8])]| {
+            let mut b = Vec::new();
+            node(&mut b, "device-tree", &[("compatible", b"J120AP\0iPad7,1\0AppleARM\0")], 2);
+            node(&mut b, "chosen", chosen, 0);
+            node(&mut b, "arm-io", &[("compatible", b"arm-io,t8011\0")], 0);
+            let mut t = parse(&b).unwrap();
+            platform::add(&mut t).unwrap();
+            let r = platform::add_resources(&mut t);
+            add_root(&mut t);
+            (t, r)
+        };
+        // The web device's identity (ECID 0x6890E9700EB4C4BF, chip 0x8011): the UUID computed
+        // apart from this code (Python's hashlib over the same bytes).
+        let ecid = 0x6890_e970_0eb4_c4bfu64.to_le_bytes();
+        let chip = 0x8011u32.to_le_bytes();
+        let (t, r) = tree(&[("unique-chip-id", &ecid), ("chip-id", &chip)]);
+        let want = "0C704128-1B04-5B3D-8500-82B2A6030137";
+        assert_eq!(service_prop(&t[0], UUID_KEY), Some(&Prop::Str(want.to_string())));
+        assert_eq!(lookup(&t, 0, UUID_KEY), Ok(Some(serialize_prop(&Prop::Str(want.to_string())))));
+        let keys: Vec<&str> = t[r as usize].service_props.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["IOKit", UUID_KEY, "IOBSD"]);
+        assert_eq!(service_prop(&t[r as usize], UUID_KEY), Some(&Prop::Str(want.to_string())));
+        assert_eq!(platform::uuid_parse(want), Some([0x0c, 0x70, 0x41, 0x28, 0x1b, 0x04, 0x5b, 0x3d, 0x85, 0x00, 0x82, 0xb2, 0xa6, 0x03, 0x01, 0x37]));
+        assert_eq!(platform::uuid_unparse_upper(&platform::uuid_parse(&want.to_lowercase()).unwrap()), want);
+        // The IPSW's zero placeholders give a UUID of their own (the stand-in's).
+        let (t, _) = tree(&[("unique-chip-id", &[0; 8]), ("chip-id", &[0; 4])]);
+        assert_eq!(service_prop(&t[0], UUID_KEY), Some(&Prop::Str("D6758264-70B5-5D98-A6A0-27FCC55613F9".to_string())));
+        // Missing or of the wrong size: no UUID, no resource.
+        for chosen in [&[("unique-chip-id", &ecid[..])][..], &[("chip-id", &chip[..])], &[("unique-chip-id", &ecid[..4]), ("chip-id", &chip[..])], &[("unique-chip-id", &ecid[..]), ("chip-id", &ecid[..])]] {
+            let (t, r) = tree(chosen);
+            assert_eq!(service_prop(&t[0], UUID_KEY), None);
+            assert!(property_unknown(&t, 0, UUID_KEY));
+            let keys: Vec<&str> = t[r as usize].service_props.iter().map(|(k, _)| k.as_str()).collect();
+            assert_eq!(keys, ["IOKit", "IOBSD"]);
+        }
+        for bad in ["0C704128-1B04-5B3D-8500-82B2A603013", "0C704128-1B04-5B3D-8500-82B2A60301377", "0C704128+1B04-5B3D-8500-82B2A6030137", "0C704128-1B04-5B3D-8500-82B2A60301+7"] {
+            assert_eq!(platform::uuid_parse(bad), None, "{bad}");
+        }
+    }
+
     #[test]
     fn the_target_is_the_roots_first_compatible() {
         assert_eq!(target_name_of(&small_tree()).unwrap(), b"J120AP");

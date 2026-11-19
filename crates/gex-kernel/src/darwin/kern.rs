@@ -981,6 +981,7 @@ impl Kernel {
             sys::SHARED_REGION_MAP_AND_SLIDE_2_NP => res(self.darwin_shared_region_map_and_slide_2_np(m, a)),
             sys::MAP_WITH_LINKING_NP => res(self.darwin_map_with_linking(m, a)),
             sys::GETENTROPY => res(self.canonical(m, nr::GETRANDOM, [a[0], a[1], 0, 0, 0, 0]).map(|_| 0)),
+            sys::GETHOSTUUID => res(self.darwin_gethostuuid(m, a)),
             sys::FCNTL | sys::FCNTL_NOCANCEL => self.darwin_fcntl(m, a),
             sys::FSGETPATH => res(self.darwin_fsgetpath(m, a)),
             sys::PROC_INFO => res(self.darwin_proc_info(m, a)),

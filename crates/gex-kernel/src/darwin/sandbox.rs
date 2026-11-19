@@ -235,6 +235,8 @@ pub mod kind {
     pub const FSCTL: u32 = 5;
     pub const PRIVILEGE: u32 = 0x10;
     pub const MEMORYSTATUS: u32 = 0x1b;
+    /// `mpo_system_check_info`'s: the information type at `args[0xd8]`.
+    pub const INFO: u32 = 0xd;
     pub const SYSCTL: u32 = 0xf;
     pub const POSIX_IPC: u32 = 6;
     pub const HOST_SPECIAL_PORT: u32 = 7;

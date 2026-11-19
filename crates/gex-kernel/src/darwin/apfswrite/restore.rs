@@ -57,7 +57,7 @@ pub const RUN_STAND_IN: &str = "the erase restore's clock readings, transaction 
 /// Every stand-in the build takes, for the caller to report: the image
 /// is the device's only where these are.
 pub fn stand_ins(os: bool, boot: bool) -> Vec<&'static str> {
-    let mut v = vec![RUN_STAND_IN, HOST_UUID_STAND_IN, GIGALOCKER_STAND_IN, CLUSTER_STAND_IN, NSIH_STAND_IN];
+    let mut v = vec![RUN_STAND_IN, GIGALOCKER_STAND_IN, CLUSTER_STAND_IN, NSIH_STAND_IN];
     if boot {
         v.push(SPLAT_STAND_IN);
         v.push(TICKET_STAND_IN);
@@ -237,7 +237,8 @@ pub fn build_disk0_hooked(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() 
     // here is RUN_STAND_IN's. The asr thread's mount of System
     // (mount_partition(0), `mount_apfs -R`) comes first.
     fsops::mount_rw(&mut nx, system, now)?;
-    concurrent_steps(&mut nx, Volumes { system, xart, hardware, preboot, update }, now, &mut missing)?;
+    let host = host_uuid(os)?;
+    concurrent_steps(&mut nx, Volumes { system, xart, hardware, preboot, update }, host.as_deref(), now, &mut missing)?;
     match os {
         Some(os) => {
             // asr's image file written into System (restore_apfs_image_async,
@@ -465,6 +466,12 @@ fn create_directory(nx: &mut Nx<'_>, vol: usize, path: &str, mode: u16, uid: u32
 
 /// The restore step install_fud is, as a disk0 image's missing steps name
 /// it: its firmware is not written.
+/// The restore step update_device_firmware's list runs first,
+/// update_iBoot (RE@0x100050394), as a disk0 image's missing steps name
+/// it: the SEP firmware it writes into the Preboot directory is not
+/// written.
+pub const UPDATE_SEP_MISSING: &str = "update_device_firmware's update_iBoot (the first entry of _ramrod_update_device_firmware's list, RE@0x100050394): the boot firmware its updater writes to the boot storage (updateBootFirmwareWithCallback, outside the container), then update_sep (RE@0x10005140c, when the device has a SEP, AppleSEPManager, RE@0x100050d0c): <Preboot Root>/usr/standalone/firmware/sep-firmware.img4, and sep-patches.img4 when copy_sep_patch gives patches, each open(O_WRONLY | O_CREAT | O_TRUNC, 0644) and filled by write_data_to_fd (RE@0x100059d0c, in writes of the file's preferred block size) with the host's SEP OS image (the firmware images' \"SEP\" data, RE@0x100050c5c: the erase identity's SEP, Firmware/all_flash/sep-firmware.j120.RELEASE.im4p, personalized with the AP ticket, TICKET_STAND_IN; its container and the chunk sizes not traced)";
+
 pub const INSTALL_FUD_MISSING: &str = "install_fud's firmware on Preboot (<nsih>/usr/standalone/firmware/FUD and the host's personalized images in it, AOP, AVE and StaticTrustCache for the erase identity)";
 
 /// The name of the Preboot volume's directory for this device: the AP
@@ -480,12 +487,16 @@ pub(crate) fn nsih() -> String {
 
 /// The main thread's steps between restore_asr and await_asr_and_retry
 /// (drafts/s21/re-ops.md sections 3 and 4) as they reach the container.
-fn concurrent_steps(nx: &mut Nx<'_>, v: Volumes, now: &mut dyn FnMut() -> u64, missing: &mut Missing) -> Result<(), String> {
+fn concurrent_steps(nx: &mut Nx<'_>, v: Volumes, host: Option<&str>, now: &mut dyn FnMut() -> u64, missing: &mut Missing) -> Result<(), String> {
     // init_gigalocker (0x1000176e8 → 0x1000296c8): xART mounted read-write
     // at /mnt7 (`mount_apfs -R`; the `.fseventsd/.ramdisk-boot-done` open
-    // after it fails at its lookup), then `seputil --gigalocker-init`.
+    // after it fails at its lookup), then `seputil --gigalocker-init`,
+    // which names the file by the device's platform UUID.
     fsops::mount_rw(nx, v.xart, now)?;
-    gigalocker_init(nx, v.xart, now)?;
+    match host {
+        Some(uuid) => gigalocker_init(nx, v.xart, uuid, now)?,
+        None => missing.push(GIGALOCKER_FILE_MISSING.into()),
+    }
     // init_permanent_update_volume (0x100017760): Update mounted with
     // `mount -t apfs -o nobrowse`, its hierarchy again (every mkdir finds
     // its directory), `unlink("/mnt4/.reserved")` (ENOENT: a lookup), the
@@ -524,6 +535,10 @@ fn concurrent_steps(nx: &mut Nx<'_>, v: Volumes, now: &mut dyn FnMut() -> u64, m
     // fdr_prepare's removefile walk of the empty factorydata directory and
     // the access() checks of the later steps only read.
     missing.push("the FDR local store on Hardware (libFDR's writes into /FactoryData/System/Library/Caches/com.apple.factorydata by fdr_prepare's commit, fdr_recover, fdr_auto_challenge_claim and verify_fdr_data: server and device data, file names not traced)".into());
+    // update_device_firmware (0x10001827c → 0x100032980): its list
+    // (0x100050034) starts with update_iBoot, whose update_sep writes the
+    // SEP's firmware into the Preboot directory, then install_fud.
+    missing.push(UPDATE_SEP_MISSING.into());
     missing.push(INSTALL_FUD_MISSING.into());
     Ok(())
 }
@@ -930,10 +945,28 @@ fn aks_bootstrap_user_fs(nx: &mut Nx<'_>, user: usize, now: &mut dyn FnMut() -> 
     Ok(())
 }
 
-/// `gethostuuid` on the device (the platform's UUID), which names xART's
-/// gigalocker file.
-pub const HOST_UUID_STAND_IN: &str = "the device's host UUID (gethostuuid), which names the xART volume's gigalocker file (stand-in 00000000-0000-4000-8000-000000000005; measure `ls /private/xarts` on the device)";
-const HOST_UUID: [u8; 16] = [0, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 5];
+/// seputil's `gethostuuid` in the restore ramdisk (SEPU 0x10000cc3c, no
+/// timeout: it waits for the resource): the platform expert device's
+/// "IOPlatformUUID", which the ramdisk's kernel makes as the booted
+/// system's does, from the device tree's `/chosen` `unique-chip-id` and
+/// `chip-id` ([`crate::darwin::platform::platform_uuid`]; the erase
+/// identity's RestoreKernelCache is KernelCache's file,
+/// kernelcache.release.ipad7, and its RestoreDeviceTree DeviceTree's). So
+/// the restore names the gigalocker file as the boot that runs on the same
+/// device asks for it. None without a device: the file is then listed as
+/// missing ([`GIGALOCKER_FILE_MISSING`]). A device whose `/chosen` gives no
+/// UUID leaves seputil waiting for the resource for ever: not modelled.
+fn host_uuid(os: Option<&OsImage>) -> Result<Option<String>, String> {
+    let Some(d) = os.and_then(|o| o.device.as_ref()) else { return Ok(None) };
+    match crate::darwin::platform::platform_uuid(&d.tree) {
+        Some(u) => Ok(Some(u)),
+        None => Err("not implemented: seputil --gigalocker-init's gethostuuid on a device whose /chosen has no unique-chip-id of 8 bytes and chip-id of 4 (the ramdisk's platform expert publishes no IOPlatformUUID, and the call waits for it with no timeout)".into()),
+    }
+}
+
+/// The xART gigalocker file of a build without the device restored, which
+/// `seputil --gigalocker-init` names by its platform UUID.
+pub const GIGALOCKER_FILE_MISSING: &str = "init_gigalocker's file on xART (seputil --gigalocker-init's <platform UUID>.gl, 6 MiB, preallocated and zero-filled): no device given, whose /chosen unique-chip-id and chip-id make the name";
 
 /// What the Secure Enclave writes into the gigalocker file through the
 /// raw device AppleSEPManager opens on it (S 0x63c8af8): records of 0x9000
@@ -941,7 +974,8 @@ const HOST_UUID: [u8; 16] = [0, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 
 pub const GIGALOCKER_STAND_IN: &str = "the records the Secure Enclave writes into the xART volume's gigalocker file (device-only: written in place through the file's raw device) (stand-in: none, the zeros the close's fill left; measure the file on the device)";
 
 /// `seputil --gigalocker-init` (SEPU 0x100008484, /mnt7): with no
-/// gigalocker file, SEPU 0x10000c8b0 makes "<host UUID>.gl" (upper case,
+/// gigalocker file, SEPU 0x10000c8b0 makes "<host UUID>.gl" (`host`,
+/// [`host_uuid`]: gethostuuid's bytes `uuid_unparse_upper`ed, "%s/%s.gl",
 /// SEPU 0x10000cbe0) with `open(O_RDWR | O_CREAT | O_EXCL, 0600)`,
 /// preallocates 6 MiB (`F_PREALLOCATE` {F_ALLOCATEALL, F_PEOFPOSMODE, 0,
 /// 0x600000}, the size already a multiple of the volume's block and the
@@ -949,11 +983,10 @@ pub const GIGALOCKER_STAND_IN: &str = "the records the Secure Enclave writes int
 /// the range in the cluster layer's block maps (drafts/s27/re-zerofill.md:
 /// /mnt7's I/O attributes come from its volume node as /mnt9's do); then the Secure Enclave call (selector 0x2c) opens the file
 /// and its raw device (no file-system write: GIGALOCKER_STAND_IN).
-fn gigalocker_init(nx: &mut Nx<'_>, xart: usize, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+fn gigalocker_init(nx: &mut Nx<'_>, xart: usize, host: &str, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     const SIZE: u64 = 0x60_0000;
-    let u = HOST_UUID;
-    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02X}")).collect::<String>();
-    let name = format!("{}-{}-{}-{}-{}.gl", hex(&u[0..4]), hex(&u[4..6]), hex(&u[6..8]), hex(&u[8..10]), hex(&u[10..16]));
+    let u = crate::darwin::platform::uuid_parse(host).ok_or_else(|| format!("the platform UUID {host:?} is not a UUID"))?;
+    let name = format!("{}.gl", crate::darwin::platform::uuid_unparse_upper(&u));
     if fsops::lookup(nx, xart, ROOT_INO, &name)?.is_some() {
         return Err("not implemented: seputil finding a gigalocker file at its first run".into());
     }
@@ -2562,18 +2595,17 @@ mod tests {
         dir(2, "db", 0o777, 501);
         let hw = dir(2, "Hardware", 0o500, 0);
         dir(hw, "Battery", 0o700, 0);
-        // xART's gigalocker file: 6 MiB, preallocated, zero-filled.
+        // xART: without the device, whose platform UUID names the
+        // gigalocker file, only its root, the file listed as missing.
+        assert!(missing.iter().any(|m| m == GIGALOCKER_FILE_MISSING));
+        // update_device_firmware's list: update_iBoot's SEP firmware, then
+        // install_fud's, neither written.
+        let at = |step: &str| missing.iter().position(|m| m == step).unwrap_or_else(|| panic!("{step} not listed"));
+        assert_eq!(at(UPDATE_SEP_MISSING) + 1, at(INSTALL_FUD_MISSING));
         let x = c.volume(2).unwrap().unwrap();
-        let e = x.lookup(2, "00000000-0000-4000-8000-000000000005.gl").unwrap().unwrap();
-        let gl = x.inode(e.file_id).unwrap().unwrap();
-        assert_eq!((gl.mode & 0o7777, x.file_size(&gl).unwrap()), (0o600, 0x60_0000));
-        let mut buf = vec![1u8; 4096];
-        x.read_file(&gl, 0x5f_f000, &mut buf).unwrap();
-        assert!(buf.iter().all(|&b| b == 0));
-        // The boot's mount of xART serves them as they are here
-        // (GraftFs::live): its root inode 2, the gigalocker file under its
-        // own number, each with its owner, group and mode; the mount's
-        // root lists the file; a change to it is not modelled.
+        // The boot's mount of xART serves it as it is here (GraftFs::live):
+        // its root inode 2 with its owner, group and mode, listing nothing
+        // but its parent.
         {
             use crate::darwin::graftfs::{GraftFs, GraftMount};
             use crate::darwin::vattr::{Owned, RECORD};
@@ -2585,15 +2617,9 @@ mod tests {
             let mut rec = [0u8; 128];
             let n = live.xattr("", XattrOp::Get { name: RECORD, buf: &mut rec }).unwrap();
             assert_eq!(Owned::parse(&rec[..n]), Ok(GraftFs::owned_of(&root)));
-            let name = "00000000-0000-4000-8000-000000000005.gl";
-            let fmd = live.metadata(name).unwrap();
-            assert_eq!((fmd.ino, fmd.file_type, fmd.size, fmd.mode), (e.file_id, FileType::Regular, 0x60_0000, 0o600));
-            let n = live.xattr(name, XattrOp::Get { name: RECORD, buf: &mut rec }).unwrap();
-            assert_eq!(Owned::parse(&rec[..n]), Ok(Owned { uid: 0, gid: 0, mode: 0o600, flags: 0 }));
             let listed = live.open("", 0, 0).unwrap().read_dir().unwrap();
-            assert!(listed.iter().any(|d| d.name == name && d.ino == e.file_id));
+            assert!(listed.iter().all(|d| !d.name.ends_with(".gl")));
             assert!(listed.iter().any(|d| d.name == ".." && d.ino == 1));
-            assert_eq!(live.open(name, crate::fs::oflags::O_RDWR, 0).err(), Some(crate::errno::Errno::EIO));
         }
         // Hardware's dummy FDR path.
         let h = c.volume(3).unwrap().unwrap();
@@ -2618,6 +2644,96 @@ mod tests {
         p.read_file(&a, 0, &mut buf).unwrap();
         assert_eq!(buf, nsih.as_bytes());
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// A device tree whose /chosen holds the web device's ECID
+    /// (0x6890E9700EB4C4BF) and chip ID (0x8011), as its boot fills it.
+    fn web_device_tree() -> Vec<crate::darwin::iokit::Node> {
+        fn node(b: &mut Vec<u8>, props: &[(&str, &[u8])], children: u32) {
+            b.extend_from_slice(&(props.len() as u32).to_le_bytes());
+            b.extend_from_slice(&children.to_le_bytes());
+            for (k, v) in props {
+                let mut name = [0u8; 32];
+                name[..k.len()].copy_from_slice(k.as_bytes());
+                b.extend_from_slice(&name);
+                b.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                b.extend_from_slice(v);
+                b.resize((b.len() + 3) & !3, 0);
+            }
+        }
+        let mut b = Vec::new();
+        node(&mut b, &[("name", b"device-tree\0"), ("compatible", b"J120AP\0iPad7,1\0AppleARM\0")], 1);
+        node(&mut b, &[("name", b"chosen\0"), ("unique-chip-id", &0x6890_e970_0eb4_c4bfu64.to_le_bytes()), ("chip-id", &0x8011u32.to_le_bytes())], 0);
+        crate::darwin::iokit::parse(&b).unwrap()
+    }
+
+    /// `seputil --gigalocker-init` in the restore names the file by the
+    /// device's platform UUID, the one the booted system's gethostuuid gives
+    /// (platform::platform_uuid of the same /chosen): 6 MiB, preallocated,
+    /// zero-filled, 0600 root's; the boot's mount of xART serves it so
+    /// (GraftFs::live), listed under its own number, a change to it not
+    /// modelled. A device tree with no chip ID gives no name.
+    #[test]
+    fn the_gigalocker_file_is_named_by_the_platform_uuid() {
+        use crate::darwin::apfsread::Container;
+        let tree = web_device_tree();
+        let host = crate::darwin::platform::platform_uuid(&tree).unwrap();
+        assert_eq!(host, "0C704128-1B04-5B3D-8500-82B2A6030137");
+        let blocks = 15_625_000u64;
+        let tmp = std::env::temp_dir().join(format!("gex-glname-{}", std::process::id()));
+        let f = std::fs::OpenOptions::new().create(true).truncate(true).read(true).write(true).open(&tmp).unwrap();
+        f.set_len(blocks * 4096).unwrap();
+        let sink = std::sync::Arc::new(super::super::HostFile(f, blocks * 4096));
+        let uuid = *b"gex-gl-name-test";
+        let fm = container::format(&*sink, 4096, blocks, uuid).unwrap();
+        let mut nx = Nx::formatted(&*sink, &fm, uuid, Mode::Kernel).unwrap();
+        nx.mount_rw().unwrap();
+        let mut t = 1_700_000_000_000_000_000u64;
+        let mut now = || {
+            t += 1000;
+            t
+        };
+        let kv = key_os_version(RESTORE_BUILD).unwrap();
+        let times = VolumeTimes { formatted: now(), root: now(), private: now(), modified: now() };
+        let o = nx.create_volume(&NewVolume { name: "xART".into(), role: storage::role::XART, encrypted: false, e_apfs: true, times, uid: 0, gid: 0, key_os_version: kv, size_bytes: Some(10_485_760) }).unwrap();
+        nx.commit().unwrap();
+        let vol = nx.fs_oid.iter().position(|&x| x == o).unwrap();
+        fsops::mount_rw(&mut nx, vol, &mut now).unwrap();
+        gigalocker_init(&mut nx, vol, &host, &mut now).unwrap();
+        assert!(gigalocker_init(&mut nx, vol, &host, &mut now).unwrap_err().contains("finding a gigalocker file"));
+        assert!(gigalocker_init(&mut nx, vol, "not a uuid", &mut now).is_err());
+        fsops::unmount(&mut nx, vol, true, &mut now).unwrap();
+        nx.unmount().unwrap();
+        drop(nx);
+        let c = std::sync::Arc::new(Container::open(sink.clone()).unwrap());
+        let x = c.volume(vol).unwrap().unwrap();
+        let name = format!("{host}.gl");
+        let e = x.lookup(2, &name).unwrap().unwrap();
+        let gl = x.inode(e.file_id).unwrap().unwrap();
+        assert_eq!((gl.mode & 0o7777, gl.owner, gl.group, x.file_size(&gl).unwrap()), (0o600, 0, 0, 0x60_0000));
+        let mut buf = vec![1u8; 4096];
+        x.read_file(&gl, 0x5f_f000, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0));
+        {
+            use crate::darwin::graftfs::{GraftFs, GraftMount};
+            use crate::darwin::vattr::{Owned, RECORD};
+            use crate::vfs::{FileSystem, FileType, XattrOp};
+            let live = GraftMount(std::sync::Arc::new(GraftFs::live_on(c.volume(vol).unwrap().unwrap(), "xART", vol as u32, 0x1000_0003, std::sync::Arc::new(crate::darwin::graftfs::Unheld))));
+            let fmd = live.metadata(&name).unwrap();
+            assert_eq!((fmd.ino, fmd.file_type, fmd.size, fmd.mode), (e.file_id, FileType::Regular, 0x60_0000, 0o600));
+            let mut rec = [0u8; 128];
+            let n = live.xattr(&name, XattrOp::Get { name: RECORD, buf: &mut rec }).unwrap();
+            assert_eq!(Owned::parse(&rec[..n]), Ok(Owned { uid: 0, gid: 0, mode: 0o600, flags: 0 }));
+            let listed = live.open("", 0, 0).unwrap().read_dir().unwrap();
+            assert!(listed.iter().any(|d| d.name == name && d.ino == e.file_id));
+            assert_eq!(live.open(&name, crate::fs::oflags::O_RDWR, 0).err(), Some(crate::errno::Errno::EIO));
+        }
+        let _ = std::fs::remove_file(&tmp);
+        // No chip ID in /chosen: no platform UUID, so no name.
+        let mut tree = web_device_tree();
+        let chosen = crate::darwin::iokit::from_path(&tree, "IODeviceTree:/chosen").unwrap().unwrap();
+        tree[chosen as usize].props.retain(|(k, _)| k != "chip-id");
+        assert_eq!(crate::darwin::platform::platform_uuid(&tree), None);
     }
 
     /// disk0 without the system image (GEX_TEST_FSCK: the device's

@@ -63,6 +63,7 @@ pub fn stand_ins(os: bool, boot: bool) -> Vec<&'static str> {
         v.push(TICKET_STAND_IN);
         v.push(RESTORE_HOST_STAND_IN);
         v.push(super::snapshot::SNAP_UUID_STAND_IN);
+        v.push(POPULATE_STAND_IN);
     }
     if os {
         v.push(fsops::FILE_INODE_STAND_IN);
@@ -310,7 +311,8 @@ pub fn build_disk0_hooked(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() 
             Some(files) => {
                 // The main list after check_mounted's block and the NVRAM
                 // steps (drafts/s27/re-seal-snap.md 0).
-                missing.push("populate_preboot_volume (drafts/s27/re-populate.md: the firmware items copied into Preboot's preallocated files, /mnt9/active's O_TRUNC fast truncate (K 0x669d444 not traced), the directories it makes; its NVRAM reads)".into());
+                populate_preboot_volume(&mut nx, v, now)?;
+                missing.extend(nx.vnode_missing.drain(..));
                 // set_boot_command writes NVRAM only; set_autoboot_delay
                 // syncs, then writes NVRAM.
                 set_autoboot_delay(&mut nx, now)?;
@@ -1257,19 +1259,47 @@ pub const CLUSTER_STAND_IN: &str = "how the cluster layer pushes the gigalocker 
 /// Wc, a 16 KiB multiple, at least 1 MiB) and M (Wc to a 16 KiB multiple).
 fn cluster_sizes() -> (u64, u64) {
     const PAGE: u64 = 16 << 10;
-    let bs = u64::from(storage::nvme().block_size);
-    let (w, b, sg) = crate::darwin::storagestack::disk0_write_limits();
-    let mut wc = if w != 0 { w.min(u64::from(u32::MAX)) } else { 64 << 20 };
-    if b != 0 && (b * bs).min(u64::from(u32::MAX)) < wc {
-        wc = (b * bs).min(u64::from(u32::MAX));
-    }
-    let sc = if sg != 0 { sg.min(0xffff) } else { (wc / PAGE).min(0xffff) };
-    let c = ((sc.min(4096) * PAGE).min(wc) & !(PAGE - 1)).max(1 << 20);
+    let (wc, sc) = io_attributes(crate::darwin::storagestack::disk0_write_limits());
+    let c = cluster_max_io_size(wc, sc);
     let m = match wc & !(PAGE - 1) {
         0 => PAGE,
         x => x,
     };
     (c, m)
+}
+
+/// One direction's I/O attributes of a disk0 volume's mount from the
+/// volume node's (byte, block, segment) counts (vfs_init_io_attributes X
+/// 0xfffffff0073742f4): the byte count, or the block count's bytes when
+/// fewer, 64 MiB with neither; the segment count, else the byte count in
+/// 16 KiB pages, at most 0xffff.
+fn io_attributes((w, b, sg): (u64, u64, u64)) -> (u64, u64) {
+    const PAGE: u64 = 16 << 10;
+    let bs = u64::from(storage::nvme().block_size);
+    let mut wc = if w != 0 { w.min(u64::from(u32::MAX)) } else { 64 << 20 };
+    if b != 0 && (b * bs).min(u64::from(u32::MAX)) < wc {
+        wc = (b * bs).min(u64::from(u32::MAX));
+    }
+    let sc = if sg != 0 { sg.min(0xffff) } else { (wc / PAGE).min(0xffff) };
+    (wc, sc)
+}
+
+/// `cluster_max_io_size` (X 0xfffffff00735ee9c) of a byte count and a
+/// segment count: the segments at most a 64 MiB UPL's pages, their bytes
+/// or the byte count, whichever is less, at least 1 MiB, else to a 16 KiB
+/// multiple.
+fn cluster_max_io_size(maxcnt: u64, segcnt: u64) -> u64 {
+    const PAGE: u64 = 16 << 10;
+    ((segcnt.min(4096) * PAGE).min(maxcnt) & !(PAGE - 1)).max(1 << 20)
+}
+
+/// A disk0 volume's statfs `f_iosize` (apfs_vfsop_getattr K 0x66c961c:
+/// `cluster_max_io_size(mp, 0)`, K 0x66c9934..0x66c993c): the lesser of the
+/// read and write byte counts and of their segment counts.
+fn f_iosize() -> u64 {
+    let (rc, rs) = io_attributes(crate::darwin::storagestack::disk0_read_limits());
+    let (wc, ws) = io_attributes(crate::darwin::storagestack::disk0_write_limits());
+    cluster_max_io_size(rc.min(wc), rs.min(ws))
 }
 
 /// The pushes of one `write(2)` of `n` bytes from offset 0 into a new file
@@ -1787,16 +1817,310 @@ pub fn create_partition_mountpoints(nx: &mut Nx<'_>, system: usize, data: usize,
 /// its file), mount_filesystems' System, Hardware and Preboot
 /// (0x100017654), then Update (0x100017670 → 0x100027f10), each
 /// `mount_apfs -R`.
-fn after_invert_mounts(nx: &mut Nx<'_>, v: Volumes, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
-    for vol in [v.xart, v.system, v.hardware, v.preboot, v.update] {
-        fsops::mount_rw(nx, vol, now)?;
-    }
-    Ok(())
+/// populate_preboot_volume's boot objects (the table at RE@0x1002682c0),
+/// each copied from System's path to the same path under Preboot's
+/// directory for the ticket.
+const PREBOOT_BOOT_OBJECTS: [&str; 5] = [
+    "/System/Library/Caches/com.apple.kernelcaches/kernelcache",
+    "/System/Library/Caches/apticket.der",
+    "/usr/standalone/firmware/",
+    "/usr/local/standalone/firmware/",
+    "/AppleInternal/Diags/bin/diag.img4",
+];
+
+/// copyfile's `COPYFILE_PRESERVE_FLAGS` (copyfile-196.120.5
+/// copyfile_private.h l.41): SF_RESTRICTED, SF_NOUNLINK, UF_DATAVAULT.
+const COPYFILE_PRESERVE_FLAGS: u32 = 0x8_0000 | 0x10_0000 | 0x80;
+
+/// An item's mode, owner, group, BSD flags, modification and access times.
+#[derive(Clone, Copy)]
+struct Owned {
+    mode: u16,
+    uid: u32,
+    gid: u32,
+    flags: u32,
+    mtime: u64,
+    atime: u64,
 }
 
-/// What restored_external checks with libimg4 before the seal that the
-/// image cannot answer.
-const IMAGE4_CHECKS_MISSING: &str = "restored_external's Image4 checks against the AP ticket of the canonical metadata (ramrod_verify_manifest_for_mountpoint, RE@0x100058108 → RE@0x1000583e0) and of /mnt5/root_hash (tag 'isys', RE@0x100058714): TICKET_STAND_IN's ticket signs nothing, so they are not run (the files are the IPSW's, which the device's checks pass)";
+fn owned(nx: &mut Nx<'_>, vol: usize, ino: u64) -> Result<Owned, String> {
+    let v = fsops::inode(nx, vol, ino)?;
+    let q = |o: usize| u64::from_le_bytes(v[o..o + 8].try_into().unwrap());
+    let d = |o: usize| u32::from_le_bytes(v[o..o + 4].try_into().unwrap());
+    Ok(Owned { mode: u16::from_le_bytes([v[0x50], v[0x51]]), uid: d(0x48), gid: d(0x4c), flags: d(0x44), mtime: q(0x18), atime: q(0x28) })
+}
+
+/// Libc's `_mkpath` (C 0x123c8; util/mkpath_np.c) for `comps` below
+/// volume `vol`'s root, as mkpath_np and mkpathat_np call it: a path whose
+/// last component is a directory already is EEXIST, accepted; else the
+/// missing components are made in order by root under umask 0, the
+/// parent's group, the last with `mode`, the ones before it 0777 (C
+/// 0x125cc), each found existing a lookup only. A non-directory in the
+/// way is ENOTDIR, which fails the restore.
+fn mkpath(nx: &mut Nx<'_>, vol: usize, comps: &[&str], mode: u16, now: &mut dyn FnMut() -> u64) -> Result<u64, String> {
+    let mut dir = ROOT_INO;
+    let mut i = 0;
+    while i < comps.len() {
+        match fsops::lookup(nx, vol, dir, comps[i])? {
+            Some(ino) => {
+                if owned(nx, vol, ino)?.mode & 0o170000 != 0o040000 {
+                    return Err(format!("not implemented: mkpath_np meeting a non-directory at {} (ENOTDIR fails the step)", comps[..=i].join("/")));
+                }
+                dir = ino;
+                i += 1;
+            }
+            None => break,
+        }
+    }
+    for (j, name) in comps.iter().enumerate().skip(i) {
+        let m = if j + 1 == comps.len() { mode } else { 0o777 };
+        let gid = owned(nx, vol, dir)?.gid;
+        dir = fsops::mkdir(nx, vol, dir, name, m, 0, gid, now)?.map_err(|e| format!("mkdir {}: errno {e}", comps[..=j].join("/")))?;
+    }
+    Ok(dir)
+}
+
+/// An `lstat` of `comps` below volume `vol`'s root: the last component
+/// not followed; a symbolic link before it, which namei would follow, is
+/// not implemented.
+fn lstat_path(nx: &mut Nx<'_>, vol: usize, comps: &[&str]) -> Result<Option<u64>, String> {
+    let mut dir = ROOT_INO;
+    for (i, name) in comps.iter().enumerate() {
+        match fsops::lookup(nx, vol, dir, name)? {
+            Some(ino) => {
+                if i + 1 < comps.len() && owned(nx, vol, ino)?.mode & 0o170000 == 0o120000 {
+                    return Err(format!("not implemented: a path through the symbolic link {}", comps[..=i].join("/")));
+                }
+                dir = ino;
+            }
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(dir))
+}
+
+/// What populate_preboot_volume takes from the run that only the device
+/// answers.
+pub const POPULATE_STAND_IN: &str = "the reads restored_external's copy of System's /usr/standalone/firmware into Preboot gets (drafts/s27/re-populate.md 4.2): copyfile's buffer and write sizes follow statfs's f_iosize, cluster_max_io_size of the volume node's read and write limits (CLUSTER_STAND_IN's 1 MiB here, so SLAM.sefw in six writes, every other file in one), each read(2) of a buffer returning all of it (stand-in: as many bytes as asked while the file has them; measure the firmware files' write_generation_counter on the device's Preboot)";
+
+/// copyfile's data copy into the new, empty file `f` on Preboot of the
+/// `data` of a System file (copyfile_data, L 0x3f9c..0x43a4): the buffer
+/// sizes from both volumes' f_iosize and block size (copyfile_get_bsizes:
+/// the input's f_iosize, or the size rounded up to the block when
+/// smaller; the output's the lesser of its f_iosize and that), an
+/// F_PREALLOCATE {0, F_PEOFPOSMODE, 0, size} when the file has fewer
+/// blocks than bytes ([`fsops::preallocate`]), each read's bytes written
+/// in output-size writes ([`fsops::extend_into_preallocation`]), then
+/// `ftruncate` to the bytes copied (the equal-size truncate).
+fn copyfile_data(nx: &mut Nx<'_>, vol: usize, f: u64, data: &[u8], now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    let size = data.len() as u64;
+    let bsize = nx.block_size();
+    let io = f_iosize();
+    let mut ib = io;
+    let mut ob = io.min(ib);
+    if size < ib {
+        ib = size.div_ceil(bsize) * bsize;
+        ob = ob.min(ib);
+    }
+    if size == 0 {
+        // No preallocation, no read, no write: ftruncate(0) of the empty
+        // file is the equal-size branch.
+        return fsops::truncate_same(nx, vol, f, now);
+    }
+    fsops::preallocate(nx, vol, f, size, now)?;
+    let mut held = None;
+    let mut at = 0u64;
+    while at < size {
+        let n = ib.min(size - at);
+        let mut left = n;
+        while left > 0 {
+            let w = left.min(ob);
+            held = Some(fsops::extend_into_preallocation(nx, vol, f, w, held, now)?);
+            left -= w;
+        }
+        at += n;
+    }
+    fsops::truncate_equal(nx, vol, f, held.map_or(0, |h| h.1), now)
+}
+
+/// The copy of one System item at `src` to Preboot's `parent`/`name`
+/// (copytree's per-item copyfile calls, drafts/s27/re-populate.md 4.2,
+/// copyfile-196.120.5 copytree l.700-970, copyfile l.1224-1420): a
+/// directory's pre-order copy (an existing one given its own owner, group
+/// and mode by chmodx_np, then its owner and group and mode back by the
+/// epilogue's fchown and fchmod; a new one made by mkdir with the source's
+/// mode and S_IRWXU), its children in the order getattrlistbulk returns
+/// them (the directory's records in key order, [`fsops::read_dir`]), its
+/// cleanup (chmodx_np of its own settings, fchmod to the source's mode,
+/// then copyfile_stat: fsetattrlist of the source's modification and access
+/// times, fchown, fchmod, FSIOC_CAS_BSDFLAGS); a regular file not at the
+/// destination created (O_EXCL, the source's mode with S_IWUSR), its data
+/// ([`copyfile_data`]), fchmodx_np of the source's owner, group and mode,
+/// copyfile_stat's calls, and the close's push and PREV_FSIZE removal
+/// ([`fsops::close_pushed`]); a file at the destination skipped by the
+/// status callback (RE@0x100057120 "already exists"), a symbolic link too
+/// ("skipping symlink"). Extended attributes and ACLs on either side and
+/// other file types are not implemented.
+#[allow(clippy::too_many_arguments)]
+fn populate_item(nx: &mut Nx<'_>, sys: usize, pb: usize, src: u64, parent: u64, name: &str, rel: &str, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    use fsops::SetAttr;
+    let s = owned(nx, sys, src)?;
+    let ids = |u: u32, g: u32| SetAttr { uid: Some(u), gid: Some(g), ..Default::default() };
+    let existing = fsops::lookup(nx, pb, parent, name)?;
+    if s.mode & 0o170000 != 0o120000 && !fsops::xattr_names(nx, sys, src)?.is_empty() {
+        return Err(format!("not implemented: copying /mnt1/{rel}, which has extended attributes (copyfile_xattr)"));
+    }
+    match s.mode & 0o170000 {
+        0o120000 => Ok(()),
+        0o100000 => {
+            if existing.is_some() {
+                return Ok(());
+            }
+            if s.flags & 0x20 != 0 {
+                return Err(format!("not implemented: copying the compressed file /mnt1/{rel}"));
+            }
+            let data = if fsops::dstream_size(&fsops::inode(nx, sys, src)?)? == 0 { Vec::new() } else { file_bytes(nx, sys, src)? };
+            let gid = owned(nx, pb, parent)?.gid;
+            let f = fsops::create(nx, pb, parent, name, (s.mode | 0o200) & 0o7777, 0, gid, now)?.map_err(|e| format!("open {rel}: errno {e}"))?;
+            copyfile_data(nx, pb, f, &data, now)?;
+            fsops::setattr(nx, pb, f, SetAttr { mode: Some(s.mode & 0o7777), ..ids(s.uid, s.gid) }, now)?;
+            fsops::setattr(nx, pb, f, SetAttr { mtime: Some(s.mtime), atime: Some(s.atime), ..Default::default() }, now)?;
+            fsops::setattr(nx, pb, f, ids(s.uid, s.gid), now)?;
+            fsops::fchmod(nx, pb, f, s.mode & 0o7777, now)?;
+            let cur = owned(nx, pb, f)?.flags;
+            fsops::cas_bsdflags(nx, pb, f, cur, (s.flags & !preboot_flags::OMIT) | (cur & COPYFILE_PRESERVE_FLAGS), now)?;
+            if !data.is_empty() {
+                fsops::close_pushed(nx, pb, f, &data, now)?;
+            }
+            Ok(())
+        }
+        0o040000 => {
+            let t = match existing {
+                Some(t) => {
+                    let d = owned(nx, pb, t)?;
+                    if d.mode & 0o170000 != 0o040000 {
+                        return Err(format!("not implemented: copytree of the directory /mnt1/{rel} onto a non-directory"));
+                    }
+                    if !fsops::xattr_names(nx, pb, t)?.is_empty() {
+                        return Err(format!("not implemented: copying onto {rel} on Preboot, which has extended attributes (copyfile_xattr removes them)"));
+                    }
+                    fsops::setattr(nx, pb, t, SetAttr { mode: Some((d.mode | 0o600) & 0o7777), ..ids(d.uid, d.gid) }, now)?;
+                    fsops::setattr(nx, pb, t, ids(d.uid, d.gid), now)?;
+                    // The epilogue's fchmod; copyfile closes the
+                    // directory before its children's copies, the change
+                    // time still held.
+                    fsops::chmod(nx, pb, t, d.mode & 0o7777, now)?;
+                    t
+                }
+                None => {
+                    let gid = owned(nx, pb, parent)?.gid;
+                    fsops::mkdir(nx, pb, parent, name, (s.mode & 0o7777) | 0o700, 0, gid, now)?.map_err(|e| format!("mkdir {rel}: errno {e}"))?
+                }
+            };
+            for (k, ino, _) in fsops::read_dir(nx, sys, src)? {
+                let nl = (u32::from_le_bytes(k[8..12].try_into().unwrap()) & 0x3ff) as usize;
+                let child = std::str::from_utf8(&k[12..12 + nl - 1]).map_err(|_| "a firmware name that is not UTF-8")?.to_string();
+                let m = owned(nx, sys, ino)?.mode & 0o170000;
+                if m != 0o040000 && m != 0o100000 {
+                    return Err(format!("not implemented: copying /mnt1/{rel}/{child} of mode {m:o} (fts's second pass for links, other types)"));
+                }
+                populate_item(nx, sys, pb, ino, t, &child, &format!("{rel}/{child}"), now)?;
+            }
+            let d = owned(nx, pb, t)?;
+            fsops::setattr(nx, pb, t, SetAttr { mode: Some((d.mode | 0o600) & 0o7777), ..ids(d.uid, d.gid) }, now)?;
+            fsops::lookup(nx, pb, parent, name)?;
+            fsops::fchmod(nx, pb, t, s.mode & 0o7777, now)?;
+            fsops::setattr(nx, pb, t, SetAttr { mtime: Some(s.mtime), atime: Some(s.atime), ..Default::default() }, now)?;
+            fsops::setattr(nx, pb, t, ids(s.uid, s.gid), now)?;
+            fsops::fchmod(nx, pb, t, s.mode & 0o7777, now)?;
+            let cur = owned(nx, pb, t)?.flags;
+            fsops::cas_bsdflags(nx, pb, t, cur, (s.flags & !preboot_flags::OMIT) | (cur & COPYFILE_PRESERVE_FLAGS), now)
+        }
+        m => Err(format!("not implemented: copying /mnt1/{rel} of mode {m:o}")),
+    }
+}
+
+/// copyfile's `COPYFILE_OMIT_FLAGS`.
+mod preboot_flags {
+    pub const OMIT: u32 = super::super::super::preboot::cryptex1::COPYFILE_OMIT_FLAGS;
+}
+
+/// populate_preboot_volume (RE@0x10001948c → RE@0x100030be8 →
+/// `_ramrod_populate_preboot_volume` RE@0x100057208; drafts/s27/
+/// re-populate.md, drafts/s31 notes), the last step of the install, with
+/// System at /mnt1:
+/// - force_unmount_partition(9, 0): Preboot's `unmount("/mnt9", 0)`, not
+///   forced, when it is mounted; then `mount_apfs -R` mounts it again (its
+///   `.fseventsd/.ramdisk-boot-done` open fails at its lookup);
+/// - `_ramrod_create_preboot_folder_hierarchy("/mnt9")`: mkpathat_np of
+///   Cryptexes/OS and Cryptexes/App, 0777 (no ExclaveOS: the ticket has no
+///   `exvl` digest);
+/// - for each boot object: mkpath_np of the destination's directory, 0700,
+///   then copyfile(COPYFILE_ALL | RECURSIVE | NOFOLLOW) with the status
+///   callback that skips links and existing files; an absent source is
+///   ENOENT, skipped ([`populate_item`]);
+/// - `/mnt9/active` written again by `_ramrod_write_data_to_file_with_
+///   class`: open(O_WRONLY | O_CREAT | O_TRUNC, 0644) truncates the
+///   existing file ([`fsops::truncate_shrink`]), one write of the ticket's
+///   hash, into the stream the truncate emptied ([`fsops::write_first`]),
+///   and the close;
+/// - `unmount("/mnt9", 0)`, not forced.
+fn populate_preboot_volume(nx: &mut Nx<'_>, v: Volumes, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    let (sys, pb) = (v.system, v.preboot);
+    if nx.mounted.contains(&pb) {
+        fsops::unmount(nx, pb, false, now)?;
+    }
+    fsops::mount_rw(nx, pb, now)?;
+    if fsops::lookup(nx, pb, ROOT_INO, ".fseventsd")?.is_some() {
+        return Err("not implemented: a Preboot volume with .fseventsd (the .ramdisk-boot-done file the mount's open makes)".into());
+    }
+    for p in ["Cryptexes/OS", "Cryptexes/App"] {
+        let c: Vec<&str> = p.split('/').collect();
+        mkpath(nx, pb, &c, 0o777, now)?;
+    }
+    let p = nsih();
+    for entry in PREBOOT_BOOT_OBJECTS {
+        let src: Vec<&str> = entry.split('/').filter(|c| !c.is_empty()).collect();
+        let dst: Vec<&str> = std::iter::once(p.as_str()).chain(src.iter().copied()).collect();
+        // dirname_r of "<p>//entry": the destination less its last
+        // component.
+        mkpath(nx, pb, &dst[..dst.len() - 1], 0o700, now)?;
+        let Some(s) = lstat_path(nx, sys, &src)? else { continue };
+        let parent = lstat_path(nx, pb, &dst[..dst.len() - 1])?.ok_or("mkpath_np's directory gone")?;
+        let last = *dst.last().unwrap();
+        // copytree's destination: a directory destination takes the
+        // source's last component, none when the source's path ends in '/'
+        // (offset = strrchr(src, '/') + 1).
+        let (tparent, tname) = match fsops::lookup(nx, pb, parent, last)? {
+            Some(d) if owned(nx, pb, d)?.mode & 0o170000 == 0o040000 && !entry.ends_with('/') => (d, last.to_string()),
+            _ => (parent, last.to_string()),
+        };
+        if tparent != parent {
+            return Err(format!("not implemented: copyfile of {entry} into an existing directory of its name (dstisdir without a trailing '/')"));
+        }
+        populate_item(nx, sys, pb, s, tparent, &tname, entry.trim_matches('/'), now)?;
+    }
+    // RE@0x100056fa8("/mnt9", ticket, 0): /mnt9/active.
+    let data = p.as_bytes();
+    match fsops::lookup(nx, pb, ROOT_INO, "active")? {
+        Some(f) => {
+            let v = fsops::inode(nx, pb, f)?;
+            if u16::from_le_bytes([v[0x50], v[0x51]]) & 0o170000 != 0o100000 {
+                return Err("not implemented: /mnt9/active not a regular file".into());
+            }
+            if fsops::dstream_size(&v)? != 0 {
+                fsops::truncate_shrink(nx, pb, f, 0, now)?;
+            } else {
+                return Err("not implemented: O_TRUNC of an empty /mnt9/active (the equal-size branch)".into());
+            }
+            fsops::write_first(nx, pb, f, data, &cluster_pushes, now)?;
+        }
+        None => {
+            fsops::write_new_file(nx, pb, ROOT_INO, "active", 0o644, data, &cluster_pushes, now)?;
+        }
+    }
+    fsops::unmount(nx, pb, false, now)
+}
 
 /// The NVRAM changes of set_boot_command and set_autoboot_delay
 /// (drafts/s27/re-seal-snap.md 0.2, 1, 2), which gex's missing NVRAM store
@@ -1810,6 +2134,17 @@ const NVRAM_AUTOBOOT_MISSING: &str = "set_boot_command's and set_autoboot_delay'
 fn set_autoboot_delay(nx: &mut Nx<'_>, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     fsops::sync(nx, now)
 }
+
+fn after_invert_mounts(nx: &mut Nx<'_>, v: Volumes, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    for vol in [v.xart, v.system, v.hardware, v.preboot, v.update] {
+        fsops::mount_rw(nx, vol, now)?;
+    }
+    Ok(())
+}
+
+/// What restored_external checks with libimg4 before the seal that the
+/// image cannot answer.
+const IMAGE4_CHECKS_MISSING: &str = "restored_external's Image4 checks against the AP ticket of the canonical metadata (ramrod_verify_manifest_for_mountpoint, RE@0x100058108 → RE@0x1000583e0) and of /mnt5/root_hash (tag 'isys', RE@0x100058714): TICKET_STAND_IN's ticket signs nothing, so they are not run (the files are the IPSW's, which the device's checks pass)";
 
 /// seal_system_volume (RE@0x10003ab6c; drafts/s27/re-seal-snap.md 3): the
 /// canonical metadata unarchived on the ramdisk's /mnt5 (tmpfs) and
@@ -3922,6 +4257,146 @@ mod tests {
         assert_eq!(fsops::lookup(&mut nx, vol, ROOT_INO, "apticket.j120ap.0.im4m").unwrap(), Some(t));
         assert_eq!(q(&fsops::inode(&mut nx, vol, t).unwrap(), 0x20), rt.file.1);
         nx.jobj_times.remove(&(vol, ROOT_INO));
+        nx.commit().unwrap();
+        nx.unmount().unwrap();
+        sink.0.sync_all().unwrap();
+        let dev = std::process::Command::new(&fsck).args(["-n", "-W", "-s"]).arg(&path).output().unwrap();
+        let host = std::process::Command::new("/sbin/fsck_apfs").args(["-n", "-s"]).arg(&path).output().unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(dev.status.success(), "device fsck: {}{}", String::from_utf8_lossy(&dev.stdout), String::from_utf8_lossy(&dev.stderr));
+        assert!(host.status.success(), "host fsck: {}{}", String::from_utf8_lossy(&host.stdout), String::from_utf8_lossy(&host.stderr));
+    }
+
+    /// populate_preboot_volume on a container of a System volume holding a
+    /// small firmware tree (a file of one write, a file of three 1 MiB
+    /// writes, a subdirectory, an empty file, a dangling link where the AP
+    /// ticket's is) and a Preboot volume as the steps before it leave it:
+    /// the copies (sizes, allocated sizes, bytes written, write generations,
+    /// times, modes, no transient fields, the bytes), the directories
+    /// mkpath_np makes for absent sources, /mnt9/active truncated and
+    /// written again in a new block, Preboot unmounted; device and host
+    /// fsck.
+    #[test]
+    fn populate_copies_firmware_as_the_kernel_writes_it() {
+        let (Ok(dir), Ok(fsck)) = (std::env::var("GEX_TEST_SCRATCH"), std::env::var("GEX_TEST_FSCK")) else { return };
+        let dir = std::path::Path::new(&dir);
+        let path = dir.join(format!("gex-populate-{}", std::process::id()));
+        let blocks = 15_625_000u64;
+        let f = std::fs::OpenOptions::new().create(true).truncate(true).read(true).write(true).open(&path).unwrap();
+        f.set_len(blocks * 4096).unwrap();
+        let sink = super::super::HostFile(f, blocks * 4096);
+        let uuid = *b"gex-populate-tst";
+        let fm = container::format(&sink, 4096, blocks, uuid).unwrap();
+        let mut nx = Nx::formatted(&sink, &fm, uuid, Mode::Kernel).unwrap();
+        nx.mount_rw().unwrap();
+        let mut t = 1_790_000_000_000_000_000u64;
+        let mut now = || {
+            t += 1000;
+            t
+        };
+        let q = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+        let kv = key_os_version(RESTORE_BUILD).unwrap();
+        let make = |nx: &mut Nx<'_>, name: &str, role: u16, now: &mut dyn FnMut() -> u64| {
+            let times = VolumeTimes { formatted: now(), root: now(), private: now(), modified: now() };
+            let o = nx.create_volume(&NewVolume { name: name.into(), role, encrypted: false, e_apfs: true, times, uid: 0, gid: 0, key_os_version: kv, size_bytes: None }).unwrap();
+            nx.commit().unwrap();
+            nx.fs_oid.iter().position(|&x| x == o).unwrap()
+        };
+        let system = make(&mut nx, "System", storage::role::SYSTEM, &mut now);
+        let preboot = make(&mut nx, "Preboot", storage::role::PREBOOT, &mut now);
+        fsops::mount_rw(&mut nx, system, &mut now).unwrap();
+        fsops::mount_rw(&mut nx, preboot, &mut now).unwrap();
+        // System's tree.
+        const T0: u64 = 1_777_573_253_000_000_000;
+        let fw = create_directory(&mut nx, system, "usr/standalone/firmware", 0o755, 0, 0, &mut now).unwrap();
+        create_directory(&mut nx, system, "System/Library/Caches/com.apple.kernelcaches", 0o755, 0, 0, &mut now).unwrap();
+        let caches = resolve(&mut nx, system, "System/Library/Caches").unwrap().unwrap();
+        fsops::symlink(&mut nx, system, caches, "apticket.der", "../../../usr/standalone/firmware/apticket.der", 0o755, 0, 0, &mut now).unwrap().unwrap();
+        let one: Vec<u8> = (0..5000u32).map(|i| (i * 7) as u8).collect();
+        let three: Vec<u8> = (0..(2u32 << 20) + 253_259).map(|i| (i ^ (i >> 9)) as u8).collect();
+        let a = fsops::write_new_file(&mut nx, system, fw, "a.bin", 0o644, &one, &cluster_pushes, &mut now).unwrap();
+        let sub = fsops::mkdir(&mut nx, system, fw, "sub", 0o755, 0, 0, &mut now).unwrap().unwrap();
+        let b = fsops::write_new_file(&mut nx, system, sub, "big.sefw", 0o644, &three, &cluster_pushes, &mut now).unwrap();
+        let e = fsops::create(&mut nx, system, sub, "empty", 0o644, 0, 0, &mut now).unwrap().unwrap();
+        for ino in [a, b, e] {
+            fsops::setattr(&mut nx, system, ino, fsops::SetAttr { mtime: Some(T0), atime: Some(T0), ..Default::default() }, &mut now).unwrap();
+        }
+        fsops::setattr(&mut nx, system, sub, fsops::SetAttr { mtime: Some(T0 + 5), atime: Some(T0), ..Default::default() }, &mut now).unwrap();
+        fsops::setattr(&mut nx, system, fw, fsops::SetAttr { mtime: Some(T0 + 9), atime: Some(T0), ..Default::default() }, &mut now).unwrap();
+        // Preboot as update_device_firmware_pre_fdr and install_kernel_cache leave it.
+        let p = nsih();
+        let pfw = create_directory(&mut nx, preboot, &format!("{p}/usr/standalone/firmware"), 0o755, 0, 0, &mut now).unwrap();
+        create_directory(&mut nx, preboot, &format!("{p}/System/Library/Caches/com.apple.kernelcaches"), 0o755, 0, 0, &mut now).unwrap();
+        let cx = fsops::mkdir(&mut nx, preboot, ROOT_INO, "Cryptexes", 0o777, 0, 0, &mut now).unwrap().unwrap();
+        for n in ["OS", "App"] {
+            fsops::mkdir(&mut nx, preboot, cx, n, 0o777, 0, 0, &mut now).unwrap().unwrap();
+        }
+        let active = fsops::write_new_file(&mut nx, preboot, ROOT_INO, "active", 0o644, p.as_bytes(), &|n| Err(format!("{n}")), &mut now).unwrap();
+        let ext = |nx: &mut Nx<'_>, vol: usize, ino: u64| -> Vec<(u64, u64, u64)> {
+            let (tr, mut st) = nx.fs_tree(vol).unwrap();
+            tr.records(&mut st).unwrap().into_iter().filter(|(k, _)| k.len() == 16 && q(k, 0) == (ino | 8 << 60)).map(|(k, v)| (q(&k, 8), q(v.as_ref().unwrap(), 0) & 0x00ff_ffff_ffff_ffff, q(v.as_ref().unwrap(), 8))).collect()
+        };
+        let old_active = ext(&mut nx, preboot, active)[0].2;
+        let v = Volumes { system, xart: preboot, hardware: preboot, preboot, update: preboot };
+        populate_preboot_volume(&mut nx, v, &mut now).unwrap();
+        assert!(!nx.mounted.contains(&preboot), "Preboot unmounted");
+        assert!(nx.jobj_times.is_empty(), "every time written");
+        let xf = |v: &[u8], t: u8| -> Option<Vec<u8>> {
+            let n = u16::from_le_bytes([v[0x5c], v[0x5d]]) as usize;
+            let mut off = 0x60 + 4 * n;
+            for i in 0..n {
+                let len = u16::from_le_bytes([v[0x60 + 4 * i + 2], v[0x60 + 4 * i + 3]]) as usize;
+                if v[0x60 + 4 * i] == t {
+                    return Some(v[off..off + len].to_vec());
+                }
+                off += (len + 7) & !7;
+            }
+            None
+        };
+        let pa = resolve(&mut nx, preboot, &format!("{p}/usr/standalone/firmware/a.bin")).unwrap().unwrap();
+        let pb = resolve(&mut nx, preboot, &format!("{p}/usr/standalone/firmware/sub/big.sefw")).unwrap().unwrap();
+        let pe = resolve(&mut nx, preboot, &format!("{p}/usr/standalone/firmware/sub/empty")).unwrap().unwrap();
+        let psub = resolve(&mut nx, preboot, &format!("{p}/usr/standalone/firmware/sub")).unwrap().unwrap();
+        for (ino, data, writes) in [(pa, &one, 1u32), (pb, &three, 3)] {
+            let iv = fsops::inode(&mut nx, preboot, ino).unwrap();
+            let ds = xf(&iv, 8).unwrap();
+            let n = data.len() as u64;
+            assert_eq!((q(&ds, 0), q(&ds, 8), q(&ds, 0x18)), (n, n.div_ceil(4096) * 4096, n));
+            assert!(xf(&iv, 5).is_none() && xf(&iv, 0xd).is_none(), "no transient fields");
+            assert_eq!(u32::from_le_bytes(iv[0x40..0x44].try_into().unwrap()), 1 + writes, "a write generation per write");
+            assert_eq!((u16::from_le_bytes([iv[0x50], iv[0x51]]), q(&iv, 0x18), q(&iv, 0x28), q(&iv, 0x10)), (0o100644, T0, T0, T0));
+            let mut back = Vec::new();
+            for (l, len, ph) in ext(&mut nx, preboot, ino) {
+                assert_eq!(l, back.len() as u64);
+                let mut buf = vec![0u8; len as usize];
+                std::os::unix::fs::FileExt::read_exact_at(&sink.0, &mut buf, ph * 4096).unwrap();
+                back.extend_from_slice(&buf);
+            }
+            assert_eq!(&back[..n as usize], &data[..]);
+            assert!(back[n as usize..].iter().all(|&x| x == 0));
+        }
+        let ev = fsops::inode(&mut nx, preboot, pe).unwrap();
+        assert!(xf(&ev, 8).is_none(), "the empty file has no stream");
+        let sv = fsops::inode(&mut nx, preboot, psub).unwrap();
+        assert_eq!((u16::from_le_bytes([sv[0x50], sv[0x51]]), q(&sv, 0x18), q(&sv, 0x28)), (0o040755, T0 + 5, T0));
+        let fv = fsops::inode(&mut nx, preboot, pfw).unwrap();
+        assert_eq!((q(&fv, 0x18), q(&fv, 0x10)), (T0 + 9, T0 + 9), "the existing root's times");
+        assert!(resolve(&mut nx, preboot, &format!("{p}/System/Library/Caches/apticket.der")).unwrap().is_none(), "the link not copied");
+        for (path, mode) in [("usr/local", 0o040777u16), ("usr/local/standalone", 0o040700), ("AppleInternal", 0o040777), ("AppleInternal/Diags", 0o040777), ("AppleInternal/Diags/bin", 0o040700)] {
+            let i = resolve(&mut nx, preboot, &format!("{p}/{path}")).unwrap().unwrap_or_else(|| panic!("{path}"));
+            assert_eq!(u16::from_le_bytes(fsops::inode(&mut nx, preboot, i).unwrap()[0x50..0x52].try_into().unwrap()), mode, "{path}");
+        }
+        let av = fsops::inode(&mut nx, preboot, active).unwrap();
+        let ds = xf(&av, 8).unwrap();
+        assert_eq!((q(&ds, 0), q(&ds, 8), q(&ds, 0x18), u32::from_le_bytes(av[0x40..0x44].try_into().unwrap())), (96, 4096, 192, 4));
+        assert!(xf(&av, 5).is_none() && xf(&av, 0xd).is_none() && q(&av, 0x30) & 0x200 == 0);
+        let ae = ext(&mut nx, preboot, active);
+        assert_eq!(ae.len(), 1);
+        assert_ne!(ae[0].2, old_active, "the old block waits in the free queue");
+        let mut buf = vec![0u8; 4096];
+        std::os::unix::fs::FileExt::read_exact_at(&sink.0, &mut buf, ae[0].2 * 4096).unwrap();
+        assert_eq!(&buf[..96], p.as_bytes());
+        fsops::unmount(&mut nx, system, false, &mut now).unwrap();
         nx.commit().unwrap();
         nx.unmount().unwrap();
         sink.0.sync_all().unwrap();

@@ -1782,7 +1782,9 @@ pub fn write_new_file(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str, mode
 /// The write's end reads the clock for the modification and change times
 /// and counts the bytes written, in memory; the close's fsync removes the
 /// PREV_FSIZE field in its own transaction (K 0x6766d4c) whose inode write
-/// carries them.
+/// carries them. A file whose stream a truncate emptied (size and
+/// allocated size 0, no extent) keeps it: the write takes the deferred
+/// path into it, its bytes written counted on from the stream's.
 pub fn write_first(nx: &mut Nx<'_>, vol: usize, ino: u64, data: &[u8], pushes: &dyn Fn(u64) -> Result<Pushes, String>, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     let bs = nx.l.bs;
     let n = data.len() as u64;
@@ -1805,8 +1807,24 @@ pub fn write_first(nx: &mut Nx<'_>, vol: usize, ino: u64, data: &[u8], pushes: &
         }
     }
     let v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
-    if u16::from_le_bytes([v[INO_MODE], v[INO_MODE + 1]]) & S_IFMT != S_IFREG || dstream_of(&v)?.is_some() {
+    if u16::from_le_bytes([v[INO_MODE], v[INO_MODE + 1]]) & S_IFMT != S_IFREG {
         return Err("not implemented: a first write into other than an empty regular file".into());
+    }
+    // A stream the file already has, emptied by a truncate (drafts/
+    // s27/re-populate.md 6.2): size and allocated size 0, no extent; the
+    // write takes the deferred path (the direct one is chosen only where the
+    // inode has no stream, or by the low-space state) and makes neither the
+    // stream's reference record nor its field.
+    let existing = dstream_of(&v)?;
+    let mut written0 = 0u64;
+    if let Some(d) = &existing {
+        if d.size != 0 || d.alloced != 0 || extent_at(nx, vol, d.oid, 0)?.is_some() || xfields(&v)?.iter().any(|f| f.0 == INO_EXT_TYPE_PREV_FSIZE || f.0 == INO_EXT_TYPE_SPARSE_BYTES) {
+            return Err("not implemented: a write at 0 into a stream with bytes, blocks or transient fields".into());
+        }
+        if u64a(nx.vol_sb(vol)?, 0x50) != 0 {
+            return Err("not implemented: a write into an existing stream on a volume with a quota (the low-space state at fs + 0x3ac)".into());
+        }
+        written0 = u64a(&xfields(&v)?.into_iter().find(|f| f.0 == INO_EXT_TYPE_DSTREAM).unwrap().2, 0x18);
     }
     if u64a(&v, INO_INTERNAL_FLAGS) & 0x410 != 0 {
         return Err("not implemented: a first write into a file with internal flags 0x410 (K 0x66a4410)".into());
@@ -1815,20 +1833,25 @@ pub fn write_first(nx: &mut Nx<'_>, vol: usize, ino: u64, data: &[u8], pushes: &
         return Err("not implemented: a data stream of its own identifier (bsd_flags 0x40000020, K 0x66fb37c)".into());
     }
     let crypt = file_crypt(nx, vol, &v)?;
+    if existing.is_some() && crypt != Crypt::None {
+        return Err("not implemented: a write into an existing stream on an encrypted volume (its crypto identifier)".into());
+    }
     let blocks = n.div_ceil(bs);
-    let direct = n % bs != 0 && n < 0x20000;
+    let direct = existing.is_none() && n % bs != 0 && n < 0x20000;
     // The write's transaction.
     fs_tx_enter(nx, vol)?;
     let oid = u64a(&v, 0x08);
-    if let Crypt::Key(f) = crypt {
-        let cs = class4_crypto_state(nx, vol)?;
-        put_rec(nx, vol, &(f | J_CRYPTO_STATE << 60).to_le_bytes(), &cs)?;
-    }
-    put_rec(nx, vol, &(oid | J_DSTREAM_ID << 60).to_le_bytes(), &1u32.to_le_bytes())?;
     let mut x = xfields(&v)?;
-    let mut dsx = vec![0u8; 0x28];
-    dsx.put64(0x10, crypt.id());
-    x.push((INO_EXT_TYPE_DSTREAM, XF_SYSTEM_FIELD, dsx));
+    if existing.is_none() {
+        if let Crypt::Key(f) = crypt {
+            let cs = class4_crypto_state(nx, vol)?;
+            put_rec(nx, vol, &(f | J_CRYPTO_STATE << 60).to_le_bytes(), &cs)?;
+        }
+        put_rec(nx, vol, &(oid | J_DSTREAM_ID << 60).to_le_bytes(), &1u32.to_le_bytes())?;
+        let mut dsx = vec![0u8; 0x28];
+        dsx.put64(0x10, crypt.id());
+        x.push((INO_EXT_TYPE_DSTREAM, XF_SYSTEM_FIELD, dsx));
+    }
     let mut v = v;
     let mut extents: Vec<(u64, u64, u64)> = Vec::new();
     if direct {
@@ -1883,7 +1906,7 @@ pub fn write_first(nx: &mut Nx<'_>, vol: usize, ino: u64, data: &[u8], pushes: &
             if k == plan.before_end {
                 t_w = Some(now());
             }
-            blockmap_fill(nx, vol, ino, off, &padded[off as usize..(off + len) as usize], t_w.map(|t| (t, n)), now)?;
+            blockmap_fill(nx, vol, ino, off, &padded[off as usize..(off + len) as usize], t_w.map(|t| (t, written0 + n)), now)?;
         }
         match t_w {
             Some(t) => t,
@@ -1900,7 +1923,7 @@ pub fn write_first(nx: &mut Nx<'_>, vol: usize, ino: u64, data: &[u8], pushes: &
     x.retain(|f| f.0 != INO_EXT_TYPE_PREV_FSIZE);
     {
         let d = x.iter_mut().find(|f| f.0 == INO_EXT_TYPE_DSTREAM).unwrap();
-        d.2.put64(0x18, n);
+        d.2.put64(0x18, written0 + n);
     }
     let mut v = with_xfields(&v, &x);
     v.put64(INO_MOD_TIME, t_w);
@@ -1921,26 +1944,89 @@ pub fn write_first(nx: &mut Nx<'_>, vol: usize, ino: u64, data: &[u8], pushes: &
 /// in memory: they are returned, for the inode's next write. The data
 /// reaches the blocks at the close's push ([`close_pushed`]).
 pub fn write_into_preallocation(nx: &mut Nx<'_>, vol: usize, ino: u64, data: &[u8], now: &mut dyn FnMut() -> u64) -> Result<(u64, u64), String> {
-    check_volume(nx, vol)?;
-    let n = data.len() as u64;
     let v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
-    let ds = dstream_of(&v)?.ok_or("not implemented: a write into a preallocation of a file with no data stream")?;
-    if ds.size != 0 || n == 0 || n > ds.alloced || xfields(&v)?.iter().any(|f| f.0 == INO_EXT_TYPE_PREV_FSIZE || f.0 == INO_EXT_TYPE_SPARSE_BYTES) {
-        return Err("not implemented: a write into a preallocation other than the first, within it, of a file with no hole".into());
+    if dstream_of(&v)?.is_some_and(|d| d.size != 0) {
+        return Err("not implemented: a first write into a preallocation of a file with bytes".into());
     }
-    if u64a(nx.vol_sb(vol)?, 0x108) & 1 == 0 {
+    extend_into_preallocation(nx, vol, ino, data.len() as u64, None, now)
+}
+
+/// `write(2)` of `n` bytes at the end of a regular file whose allocated
+/// size already holds them (drafts/s27/re-populate.md 5.2; prepare_write_
+/// and_lock K 0x66a4024): no allocation, and every block of the range in a
+/// data extent, so no intention range or reservation (the range scan's
+/// fs_map_file_offset_ext lookups only read); as the write extends the
+/// file, one file-system transaction (K 0x66a5248, type 4): the size, a
+/// PREV_FSIZE field of the old size when the inode has none (one it has of
+/// at most the old size is kept, K 0x66a5a70..0x66a5aa0), the write
+/// generation (K 0x66a5ae8), the inode rewritten from its in-memory object
+/// (K 0x66a5b0c), which carries `held`, the times and byte count the
+/// file's previous write's end left there (none for the stream's first
+/// write: its record's own). The write's end then reads the clock for the
+/// modification and change times and adds `n` to the bytes written, in
+/// memory (K 0x66a5c80..0x66a5d7c): they are returned, for the inode's
+/// next write. The bytes reach the blocks with the cluster layer's pushes
+/// through the existing extents (no transaction; [`close_pushed`]).
+pub fn extend_into_preallocation(nx: &mut Nx<'_>, vol: usize, ino: u64, n: u64, held: Option<(u64, u64)>, now: &mut dyn FnMut() -> u64) -> Result<(u64, u64), String> {
+    check_volume(nx, vol)?;
+    if u64a(nx.vol_sb(vol)?, SB_FS_FLAGS) & 1 == 0 {
         return Err("not implemented: a write into a preallocation on an encrypted volume".into());
     }
+    let bs = nx.l.bs;
+    let v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
+    if u16::from_le_bytes([v[INO_MODE], v[INO_MODE + 1]]) & S_IFMT != S_IFREG {
+        return Err(format!("{ino:#x} is not a regular file"));
+    }
+    let ds = dstream_of(&v)?.ok_or("not implemented: a write into a preallocation of a file with no data stream")?;
+    let (off, end) = (ds.size, ds.size + n);
+    if n == 0 || end > ds.alloced {
+        return Err(format!("not implemented: a write of {n} bytes at {off} into an allocation of {} (the zero-length write, alloc_space)", ds.alloced));
+    }
+    let x0 = xfields(&v)?;
+    if x0.iter().any(|f| f.0 == INO_EXT_TYPE_SPARSE_BYTES) {
+        return Err("not implemented: a write into a preallocation of a sparse file".into());
+    }
+    if let Some(p) = x0.iter().find(|f| f.0 == INO_EXT_TYPE_PREV_FSIZE) {
+        if u64a(&p.2, 0) > off {
+            return Err("not implemented: a write past a PREV_FSIZE field larger than the old size".into());
+        }
+    }
+    // The range scan: every block of [off, end) in a data extent.
+    let mut pos = off / bs * bs;
+    while pos < end {
+        let (l, len, p) = extent_at(nx, vol, ds.oid, pos)?.ok_or("not implemented: a write into a preallocation over no extent")?;
+        if p == 0 {
+            return Err("not implemented: a write into a preallocation over a hole (the intention range and space reservation)".into());
+        }
+        pos = l + len;
+    }
+    let base = match held {
+        Some((_, w)) => w,
+        None => u64a(&x0.iter().find(|f| f.0 == INO_EXT_TYPE_DSTREAM).unwrap().2, 0x18),
+    };
     fs_tx_enter(nx, vol)?;
+    let mut v = in_memory_inode(nx, vol, ino)?;
     let mut x = xfields(&v)?;
-    x.iter_mut().find(|f| f.0 == INO_EXT_TYPE_DSTREAM).unwrap().2.put64(0, n);
-    x.push((INO_EXT_TYPE_PREV_FSIZE, 0, 0u64.to_le_bytes().to_vec()));
+    {
+        let d = x.iter_mut().find(|f| f.0 == INO_EXT_TYPE_DSTREAM).unwrap();
+        d.2.put64(0, end);
+        if let Some((_, w)) = held {
+            d.2.put64(0x18, w);
+        }
+    }
+    if !x.iter().any(|f| f.0 == INO_EXT_TYPE_PREV_FSIZE) {
+        x.push((INO_EXT_TYPE_PREV_FSIZE, 0, off.to_le_bytes().to_vec()));
+    }
+    if let Some((t, _)) = held {
+        v.put64(INO_MOD_TIME, t);
+        v.put64(INO_CHANGE_TIME, t);
+    }
     let mut v = with_xfields(&v, &x);
     let wgc = u32::from_le_bytes(v[INO_WRITE_GEN..INO_WRITE_GEN + 4].try_into().unwrap());
     v.put32(INO_WRITE_GEN, wgc.wrapping_add(1));
     put_rec(nx, vol, &inode_key(ino), &v)?;
     fs_tx_leave_last(nx, vol, false, now)?;
-    Ok((now(), n))
+    Ok((now(), base + n))
 }
 
 /// `ftruncate` of a file to its own size (apfs_truncate_locked's
@@ -1952,7 +2038,7 @@ pub fn write_into_preallocation(nx: &mut Nx<'_>, vol: usize, ino: u64, data: &[u
 pub fn truncate_equal(nx: &mut Nx<'_>, vol: usize, ino: u64, written: u64, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     check_volume(nx, vol)?;
     fs_tx_enter(nx, vol)?;
-    let v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
+    let v = in_memory_inode(nx, vol, ino)?;
     let mut x = xfields(&v)?;
     x.iter_mut().find(|f| f.0 == INO_EXT_TYPE_DSTREAM).ok_or("not implemented: an equal-size truncate of a file with no data stream")?.2.put64(0x18, written);
     let mut v = with_xfields(&v, &x);
@@ -1961,6 +2047,144 @@ pub fn truncate_equal(nx: &mut Nx<'_>, vol: usize, ino: u64, written: u64, now: 
     v.put64(INO_CHANGE_TIME, t);
     put_rec(nx, vol, &inode_key(ino), &v)?;
     fs_tx_leave_last(nx, vol, false, now)
+}
+
+/// A truncate of regular file `ino` to `new` bytes, less than its size
+/// (`open(O_TRUNC)`'s vnode_setsize or ftruncate: vnode_setattr's
+/// va_data_size → apfs_vnop_setattr, which takes the inode's I/O lock
+/// (`apfs_io_lock_exclusive` K 0x6767084 at K 0x668e628: jobj+0x190 the
+/// thread), → apfs_truncate_locked K 0x66a6bbc's fast path, for an
+/// unsealed volume and an inode neither cloned (internal 0x10) nor
+/// dataless; drafts/s31 notes):
+/// - `ino_shrink_size_tx` (K 0x669d444 → fs_tx_enter(1, 3)): a PREV_FSIZE
+///   field of at least `new` removed (K 0x67641cc), the size, the
+///   modification and change times from one clock reading (K 0x66f3750),
+///   the write generation, the inode written from its in-memory object (K
+///   0x66f3330 → bt_insert, K 0x66a770c); then ubc_setsize and the
+///   in-memory ranges and dirty work past the new end (K 0x66ae7e8, K
+///   0x675a3a4);
+/// - `ino_remove_some_fexts`, inline under the I/O lock (asserted at K
+///   0x66a7924): batches of one file-system transaction (fs_tx_enter(1,
+///   15), K 0x66a7b80) each, which first writes the inode (K 0x66a7ba8),
+///   then walks the stream's extents from the last (K 0x666a4b8, K
+///   0x666a6f4), at most five: an extent ending at or before the new end
+///   rounded to the block ends the walk; one wholly past it has its
+///   record removed (K 0x674cf60) and its blocks' reference dropped (K
+///   0x66b19c0 → K 0x66f7224) or, a hole, its bytes taken from the sparse
+///   count; then the sparse bytes (K 0x66ff7c0), the allocated size (the
+///   last removed extent's offset) and the inode written (K 0x66a7f60).
+/// An extent straddling the new end (K 0x674cd34's split), a new size off
+/// a page (the cluster layer's zero fill of its page), crypto identifiers
+/// (an encrypted volume) and directory statistics are not implemented.
+pub fn truncate_shrink(nx: &mut Nx<'_>, vol: usize, ino: u64, new: u64, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    const PAGE: u64 = 16 << 10;
+    check_volume(nx, vol)?;
+    let bs = nx.l.bs;
+    {
+        let sb = nx.vol_sb(vol)?;
+        if u64a(sb, SB_INCOMPAT) & 0x20 != 0 {
+            return Err("not implemented: a truncate on a sealed volume (apfs_truncate_locked's slow path)".into());
+        }
+        if u64a(sb, SB_FS_FLAGS) & 1 == 0 {
+            return Err("not implemented: a shrinking truncate on an encrypted volume (the extents' crypto identifiers, rsb_unretain_id)".into());
+        }
+    }
+    let v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
+    if u16::from_le_bytes([v[INO_MODE], v[INO_MODE + 1]]) & S_IFMT != S_IFREG {
+        return Err(format!("{ino:#x} is not a regular file"));
+    }
+    let iflags = u64a(&v, INO_INTERNAL_FLAGS);
+    if iflags & (0x10 | INODE_MAINTAIN_DIR_STATS | INODE_HAS_FILE_INFO | INODE_PURGEABLE) != 0 {
+        return Err(format!("not implemented: a shrinking truncate of a file with internal flags {iflags:#x}"));
+    }
+    if u32::from_le_bytes(v[0x44..0x48].try_into().unwrap()) & 0x4000_0000 != 0 {
+        return Err("not implemented: a truncate of a dataless file".into());
+    }
+    let ds = dstream_of(&v)?.ok_or("a shrinking truncate of a file with no data stream")?;
+    if new >= ds.size {
+        return Err(format!("a shrinking truncate to {new} of a file of {} bytes", ds.size));
+    }
+    if new % PAGE != 0 {
+        return Err("not implemented: a truncate to a size off a page (the cluster layer's zero fill, cluster_write 0x80)".into());
+    }
+    // ino_shrink_size_tx.
+    fs_tx_enter(nx, vol)?;
+    let v = in_memory_inode(nx, vol, ino)?;
+    let mut x = xfields(&v)?;
+    if let Some(i) = x.iter().position(|f| f.0 == INO_EXT_TYPE_PREV_FSIZE) {
+        if new <= u64a(&x[i].2, 0) {
+            x.remove(i);
+        }
+    }
+    x.iter_mut().find(|f| f.0 == INO_EXT_TYPE_DSTREAM).unwrap().2.put64(0, new);
+    let mut v = with_xfields(&v, &x);
+    let t = now();
+    v.put64(INO_MOD_TIME, t);
+    v.put64(INO_CHANGE_TIME, t);
+    let wgc = u32::from_le_bytes(v[INO_WRITE_GEN..INO_WRITE_GEN + 4].try_into().unwrap());
+    v.put32(INO_WRITE_GEN, wgc.wrapping_add(1));
+    put_rec(nx, vol, &inode_key(ino), &v)?;
+    fs_tx_leave(nx, vol, now)?;
+    // ino_remove_some_fexts.
+    let end = new.div_ceil(bs) * bs;
+    let last_key = fext_key(ds.oid, 0xffff_ffff_ffff_fffe);
+    loop {
+        let at = |nx: &mut Nx<'_>, key: &[u8]| -> Result<Option<(Vec<u8>, Vec<u8>)>, String> {
+            let (t, mut st) = nx.fs_tree(vol)?;
+            Ok(match t.get_le(&mut st, key)? {
+                Some((k, Some(val))) if u64a(&k, 0) == (ds.oid | J_FILE_EXTENT << 60) => Some((k, val)),
+                _ => None,
+            })
+        };
+        let mut cur = at(nx, &last_key)?.ok_or("not implemented: a shrinking truncate of a stream with no extent (fexts cannot be iterated)")?;
+        fs_tx_enter(nx, vol)?;
+        let v = get_rec(nx, vol, &inode_key(ino))?.ok_or("the file has no inode")?;
+        put_rec(nx, vol, &inode_key(ino), &v)?;
+        let mut alloced = dstream_of(&v)?.unwrap().alloced;
+        let mut sparse = 0i64;
+        let mut done = false;
+        for _ in 0..5 {
+            let (k, val) = cur.clone();
+            let (l, len, p) = (u64a(&k, 8), u64a(&val, 0) & 0x00ff_ffff_ffff_ffff, u64a(&val, 8));
+            if l + len <= end {
+                done = true;
+                break;
+            }
+            if l < end {
+                return Err("not implemented: a truncate inside an extent (K 0x674cd34's split)".into());
+            }
+            remove_rec(nx, vol, &k)?;
+            if p == 0 {
+                sparse -= len as i64;
+            } else {
+                deref_phys_range(nx, vol, p, len / bs)?;
+            }
+            alloced = l;
+            match l.checked_sub(1).map(|b| fext_key(ds.oid, b)) {
+                Some(prev) => match at(nx, &prev)? {
+                    Some(e) => cur = e,
+                    None => {
+                        done = true;
+                        break;
+                    }
+                },
+                None => {
+                    done = true;
+                    break;
+                }
+            }
+        }
+        let v = get_rec(nx, vol, &inode_key(ino))?.ok_or("the file has no inode")?;
+        let mut x = xfields(&v)?;
+        let mut v = v;
+        sparse_bytes(&mut v, &mut x, sparse)?;
+        x.iter_mut().find(|f| f.0 == INO_EXT_TYPE_DSTREAM).unwrap().2.put64(8, alloced);
+        put_rec(nx, vol, &inode_key(ino), &with_xfields(&v, &x))?;
+        fs_tx_leave(nx, vol, now)?;
+        if done {
+            return Ok(());
+        }
+    }
 }
 
 /// The close of a file whose bytes `data` a write put within its data
@@ -3245,16 +3469,7 @@ fn remove_extents(nx: &mut Nx<'_>, vol: usize, oid: u64, rewrite: &mut dyn FnMut
         }
         remove_rec(nx, vol, &k)?;
         if len != 0 {
-            let n = len / bs;
-            let key = (phys | J_EXTENT << 60).to_le_bytes().to_vec();
-            let (mut t, mut st) = nx.extentref_tree(vol)?;
-            let pv = t.get(&mut st, &key)?.ok_or("not implemented: freeing an extent the extent-reference tree has no exact record of")?;
-            if u64a(&pv, 0) & OBJ_MASK != n || i32::from_le_bytes(pv[16..20].try_into().unwrap()) != 1 {
-                return Err("not implemented: freeing part of a referenced extent, or a shared one".into());
-            }
-            t.remove(&mut st, &key)?;
-            nx.set_extentref_tree(vol, t)?;
-            nx.free_data(vol, phys, n)?;
+            deref_phys_range(nx, vol, phys, len / bs)?;
         }
         alloced = Some(logical);
         count += 1;
@@ -3263,6 +3478,23 @@ fn remove_extents(nx: &mut Nx<'_>, vol: usize, oid: u64, rewrite: &mut dyn FnMut
         rewrite(nx, a)?;
     }
     fs_tx_leave_nested(nx, vol, now)
+}
+
+/// The reference of `n` blocks at `phys` dropped (`apfs_update_phys_range`
+/// K 0x66f61b4 with delta -1, through K 0x66f7224 or the unlink's
+/// callback): an exact extent-reference record of one reference removed
+/// and its blocks freed (`spaceman_free`, the volume's counts); part of a
+/// record or a shared one is not implemented.
+fn deref_phys_range(nx: &mut Nx<'_>, vol: usize, phys: u64, n: u64) -> Result<(), String> {
+    let key = (phys | J_EXTENT << 60).to_le_bytes().to_vec();
+    let (mut t, mut st) = nx.extentref_tree(vol)?;
+    let pv = t.get(&mut st, &key)?.ok_or("not implemented: freeing an extent the extent-reference tree has no exact record of")?;
+    if u64a(&pv, 0) & OBJ_MASK != n || i32::from_le_bytes(pv[16..20].try_into().unwrap()) != 1 {
+        return Err("not implemented: freeing part of a referenced extent, or a shared one".into());
+    }
+    t.remove(&mut st, &key)?;
+    nx.set_extentref_tree(vol, t)?;
+    nx.free_data(vol, phys, n)
 }
 
 /// `unlink` of regular file `ino`, the only link to it and not open,

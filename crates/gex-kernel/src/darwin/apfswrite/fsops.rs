@@ -120,8 +120,6 @@ const SB_DOC_ID_TREE: usize = 0x430;
 const SB_DOC_ID_PREV_TREE: usize = 0x438;
 const SB_ER_STATE: usize = 0x3d0;
 const SB_FS_FLAGS: usize = 0x108;
-/// `APFS_FS_UNENCRYPTED`.
-const APFS_FS_UNENCRYPTED: u64 = 0x1;
 const SB_FEATURES: usize = 0x28;
 const SB_RO_COMPAT: usize = 0x30;
 
@@ -2707,9 +2705,10 @@ fn vnode_pass(nx: &mut Nx<'_>, vol: usize, now: &mut dyn FnMut() -> u64) -> Resu
 /// each read-write mount given VFS_SYNC(MNT_NOWAIT): for this container's
 /// volumes apfs_vfsop_sync (K 0x66c9d80), whose vnode pass ([`vnode_pass`])
 /// writes held times, whose purgatory cleaner finds no deleted snapshot,
-/// and whose `tx_finish` (flags 0x11 when the container's sync count, +1,
-/// is a multiple of its mounted volumes, else 1: the same blocks) commits
-/// the open transaction. `nx.mounted` is the volumes' order in the mount
+/// whose `tx_finish` (flags 0x11 when the container's sync count, +1, is
+/// a multiple of its mounted volumes, else 1: the same blocks) commits the
+/// open transaction, and whose encryption-policy work on Data and User
+/// writes nothing (see [`vfs_sync`]). `nx.mounted` is the volumes' order in the mount
 /// list: a mount joins its tail, an unmount leaves it. The ramdisk's own
 /// mounts, older than every disk0 volume's, hold nothing of disk0.
 pub fn sync(nx: &mut Nx<'_>, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
@@ -2752,25 +2751,45 @@ pub mod waitfor {
 ///   (`tx_flush`'s 0x10 << 14, the same blocks written), and a 0x11 sync
 ///   clears `nx + 0x410` (`waitfor` chooses nothing else here);
 /// - `ep_cache_purge_expired(apfs, 0)` (K 0x6736124): the volume's cache of
-///   crypto states with encryption policies, whose expired entries'
-///   inodes it updates.
+///   background-access encryption policies, whose expired entries'
+///   policies it detaches.
 ///
 /// The vnode pass rewrites an inode holding unwritten times with
 /// `update_jobj` (bt_update with the leaf hint its in-memory object holds,
-/// K 0x672c328), each in its own transaction. The encryption-policy work
-/// (`cp_detach_ep`, the ep cache) is reached only on a content-protected
-/// volume (crypto.c's `get_vol_crypto(apfs) == VOL_CPROTECTED`
-/// assertions): on a volume not `APFS_FS_UNENCRYPTED` it is not
-/// implemented (AppleKeyStore's policy checks, K 0x67322b4). Nor is a
-/// volume with snapshots (the cleaner's work on one deleted).
+/// K 0x672c328), each in its own transaction. A volume with snapshots
+/// (the cleaner's work on one deleted) is not implemented.
+///
+/// The encryption-policy work (`cp_detach_ep` per vnode,
+/// `ep_cache_purge_expired` after the commit) writes nothing in this
+/// writer's VFS_SYNCs (sync(2)'s, a non-forced unmount's, this one),
+/// encrypted volumes included: both act only on background-access
+/// policies, and none is attached.
+///
+/// - `cp_detach_ep` acts only on an in-memory object with jobj + 0x98 bit
+///   48 set, and its detach (K 0x67333d4 → K 0x67339e0) only on one with
+///   an entry in the volume's policy cache (`apfs + 0x328`, K 0x67354c8
+///   mode 2; lookup K 0x6736458, which K 0x67329b4 answers 0 without).
+/// - `ep_cache_purge_expired` walks that cache's list (`+ 0x40`): empty,
+///   it stops at once; its tail purges the crypto-state cache (K
+///   0x6735f44, in memory: its entries freed by K 0x673524c) only when
+///   `apfs + 0x120` has bits 2 and 38 set, and bit 38 is set there only by
+///   the detach (K 0x6733d28).
+/// - A cache entry is made only by K 0x6733430 (AppleKeyStore's policy
+///   made through its service's slot 0xc8, then the insert K 0x67366d4
+///   mode 2), from K 0x6732a54, from K 0x66e46b4: apfs_vnop_ioctl's case
+///   for command 108, F_ASSERT_BG_ACCESS (K 0x66d3d04's table at K
+///   0x55aeee2, index 9 past 0x63, K 0x66d5288). Bit 48 is set only there
+///   (K 0x6732d44, 0x6732d58, 0x67330c8, 0x673321c), at an inode's load
+///   from its cache entry (K 0x66a056c, K 0x66ec0b8), or copied from an
+///   object that has it (K 0x665e2e8, 0x665e654, 0x665f970, 0x66fe31c).
+///
+/// `fcntl(F_ASSERT_BG_ACCESS)` (XNU's SPI for platform binaries, which
+/// passes it to VNOP_IOCTL) is no operation of this writer: none of the
+/// restore's transcribed calls makes it, and at run time it is reported
+/// unimplemented. Were one made, these paths would write.
 pub fn vfs_sync(nx: &mut Nx<'_>, vol: usize, _waitfor: u32, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     if !nx.mounted.contains(&vol) {
         return Err(format!("VFS_SYNC of volume slot {vol}, which the container does not hold mounted read-write"));
-    }
-    let (sb, _) = nx.vol_sb_read(vol)?;
-    let fs_flags = u64a(sb, SB_FS_FLAGS);
-    if fs_flags & APFS_FS_UNENCRYPTED == 0 {
-        return Err(format!("not implemented: apfs_vfsop_sync's encryption-policy work on an encrypted volume (apfs_fs_flags {fs_flags:#x}; cp_detach_ep, K 0x66d13d4, and ep_cache_purge_expired, K 0x6736124, with AppleKeyStore's policy checks)"));
     }
     let snaps = {
         let (t, _) = nx.snapmeta_tree(vol)?;

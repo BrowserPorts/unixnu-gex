@@ -4262,9 +4262,10 @@ mod tests {
     /// is changed. `VFS_SYNC` (apfs_vfsop_sync) commits the open
     /// transaction to a checkpoint the reader then finds; the view mounted
     /// before keeps answering through every later commit, as a view of the
-    /// newest checkpoint does. A sync of a volume not held read-write or of
-    /// an encrypted volume is refused; one with inodes holding unwritten
-    /// times writes them.
+    /// newest checkpoint does. A sync of a volume not held read-write is
+    /// refused; one with inodes holding unwritten times writes them, on the
+    /// encrypted Data volume as on Preboot (its encryption-policy work finds
+    /// no policy attached).
     #[test]
     fn a_live_view_follows_its_container_through_a_sync() {
         use super::super::fsops::{self, waitfor};
@@ -4326,17 +4327,26 @@ mod tests {
         assert_eq!(h.metadata().unwrap().mode, 0o644);
         fsops::chmod(&mut held.lock().unwrap(), pb, f, 0o600, &mut now).unwrap();
         assert_eq!(h.metadata().unwrap().mode, 0o600);
-        // The sync: refused for the encrypted volume, then Preboot's
-        // commits.
+        // The sync: Preboot's commits; with nothing open, a second sync and
+        // the encrypted Data volume's write nothing.
         {
             let mut nx = held.lock().unwrap();
-            assert!(fsops::vfs_sync(&mut nx, data, waitfor::MNT_NOWAIT, &mut now).unwrap_err().contains("encryption-policy"));
             let xid = nx.xid;
             fsops::vfs_sync(&mut nx, pb, waitfor::MNT_NOWAIT, &mut now).unwrap();
             assert_eq!((nx.xid, nx.in_tx), (xid + 1, false));
-            // With nothing open, a second sync writes nothing.
             fsops::vfs_sync(&mut nx, pb, waitfor::MNT_WAIT, &mut now).unwrap();
+            fsops::vfs_sync(&mut nx, data, waitfor::MNT_NOWAIT, &mut now).unwrap();
             assert_eq!(nx.xid, xid + 1);
+            // Data's own held times: its vnode pass writes them and commits.
+            let d = fsops::create(&mut nx, data, 2, "d", 0o600, 0, 0, &mut now).unwrap().unwrap();
+            nx.tx_finish().unwrap();
+            fsops::chmod(&mut nx, data, d, 0o600, &mut now).unwrap();
+            let dt = nx.jobj_times[&(data, d)];
+            fsops::vfs_sync(&mut nx, data, waitfor::MNT_NOWAIT, &mut now).unwrap();
+            assert_eq!(nx.xid, xid + 3);
+            assert!(nx.jobj_times.is_empty());
+            let v = fsops::inode(&mut nx, data, d).unwrap();
+            assert_eq!((u64a(&v, 0x18), u64a(&v, 0x20)), dt);
         }
         let c = std::sync::Arc::new(Container::open(std::sync::Arc::clone(&medium)).unwrap());
         assert_eq!(c.xid(), held.lock().unwrap().xid - 1);

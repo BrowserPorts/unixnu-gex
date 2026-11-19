@@ -366,6 +366,31 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             }
             const K_IO_RETURN_BAD_ARGUMENT: i32 = 0xe00002c2_u32 as i32;
             let Some(node) = super::iokit::tree().get(*i as usize) else { return bad() };
+            // IODTNVRAM's and its services' copyProperty, for this task.
+            if let Some(e) = super::nvram::entry(super::iokit::tree(), *i) {
+                let task = k.darwin_nvram_task();
+                let mut g = super::osserialize::Graph::default();
+                let value = match super::nvram::entry_property(e, &task, name, &mut g) {
+                    Ok(Some(id)) => match super::nvram::property_bytes(&g, id) {
+                        Some(v) => v,
+                        None => return Reply::err(K_IO_RETURN_BAD_ARGUMENT),
+                    },
+                    Ok(None) => return Reply::err(K_IO_RETURN_NO_RESOURCES),
+                    Err(why) => {
+                        let mut r = Reply::err(K_IO_RETURN_NO_RESOURCES);
+                        r.unimplemented = Some(format!("the {} property {:?}: {why}", super::iokit::name(super::iokit::tree(), *i), String::from_utf8_lossy(name)));
+                        return r;
+                    }
+                };
+                k.darwin_nvram_report();
+                if (cnt as u32 as usize).min(IO_STRUCT_INBAND_MAX) < value.len() {
+                    return Reply::err(K_IO_RETURN_IPC_ERROR);
+                }
+                let mut o = (value.len() as u32).to_le_bytes().to_vec();
+                o.extend_from_slice(&value);
+                o.resize((o.len() + 3) & !3, 0);
+                return Reply::ok(o);
+            }
             let name = String::from_utf8_lossy(name);
             // An OSString's bytes and its NUL, an OSBoolean's "Yes" or "No",
             // an OSNumber's or OSData's bytes; a collection is not bytes.
@@ -426,6 +451,16 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
                 r.unimplemented = Some(format!("io_registry_entry_get_property_bin_buf of {name} (the property keys)"));
                 return r;
             }
+            // Each entry's copyProperty: IODTNVRAM's and its services'
+            // answer for this task.
+            let task = k.darwin_nvram_task();
+            let look = |e: u32| match super::nvram::entry(t, e) {
+                Some(n) => {
+                    let mut g = super::osserialize::Graph::default();
+                    super::nvram::entry_property(n, &task, name.as_bytes(), &mut g).map(|v| v.map(|id| super::osserialize::serialize_binary(&g, id)))
+                }
+                None => super::iokit::lookup(t, e, &name),
+            };
             let found = if options as u32 & K_IO_REGISTRY_ITERATE_RECURSIVELY != 0 && !plane.is_empty() {
                 let plane = match super::iokit::plane(plane) {
                     Ok(p) => p,
@@ -435,10 +470,11 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
                         return r;
                     }
                 };
-                super::iokit::search(t, *i, plane, options as u32, &name, |e| k.darwin_mac_check_iokit_get_property(super::iokit::sb_entry(e), super::iokit::is_nvram(e), name.as_bytes()) == 0)
+                super::iokit::search_with(t, *i, plane, options as u32, look, |e| k.darwin_mac_check_iokit_get_property(super::iokit::sb_entry(e), super::iokit::is_nvram(e), name.as_bytes()) == 0)
             } else {
-                super::iokit::lookup(t, *i, &name).map(|v| (v, false))
+                look(*i).map(|v| (v, false))
             };
+            k.darwin_nvram_report();
             let bin = match found {
                 Ok((Some(bin), _)) => bin,
                 Ok((None, refused)) => return Reply::err(if refused { super::iokit::ret::NOT_PERMITTED } else { K_IO_RETURN_NOT_FOUND }),
@@ -478,11 +514,33 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             if t.get(*i as usize).is_none() {
                 return bad();
             }
-            let mut props = super::iokit::properties(t, *i);
             let entry = super::iokit::sb_entry(*i);
             let nvram = super::iokit::is_nvram(*i);
-            props.retain(|(name, _)| k.darwin_mac_check_iokit_get_property(entry.clone(), nvram, name.as_bytes()) == 0);
-            let bin = super::iokit::serialize_prop(&super::iokit::Prop::Dict(props));
+            let bin = match super::nvram::entry(t, *i) {
+                // IODTNVRAM's and its services' serializeProperties, for
+                // this task.
+                Some(e) => {
+                    let task = k.darwin_nvram_task();
+                    let mut g = super::osserialize::Graph::default();
+                    let mut props = match super::nvram::entry_properties(e, &task, &mut g) {
+                        Ok(p) => p,
+                        Err(why) => {
+                            let mut r = Reply::err(super::iokit::ret::NOT_READY);
+                            r.unimplemented = Some(format!("io_registry_entry_get_properties_bin_buf of {}: {why}", super::iokit::name(t, *i)));
+                            return r;
+                        }
+                    };
+                    k.darwin_nvram_report();
+                    props.retain(|(name, _)| k.darwin_mac_check_iokit_get_property(entry.clone(), nvram, name) == 0);
+                    let d = g.add(super::osserialize::Obj::Dict(props));
+                    super::osserialize::serialize_binary(&g, d)
+                }
+                None => {
+                    let mut props = super::iokit::properties(t, *i);
+                    props.retain(|(name, _)| k.darwin_mac_check_iokit_get_property(entry.clone(), nvram, name.as_bytes()) == 0);
+                    super::iokit::serialize_prop(&super::iokit::Prop::Dict(props))
+                }
+            };
             let mut out = NDR_RECORD.to_vec();
             let mut r = if buf != 0 && bin.len() as u64 <= bufsize {
                 if let Err(r) = k.darwin_vm_copy_overwrite(buf, &bin) {
@@ -2209,9 +2267,25 @@ fn entry_set_properties(k: &mut Kernel, req: &Kmsg, i: u32) -> Reply {
             return r;
         }
     };
-    if super::iokit::is_nvram(i) {
-        let mut r = result(ret::UNSUPPORTED);
-        r.unimplemented = Some("io_registry_entry_set_properties on the NVRAM entry (Sandbox's nvram-set of each key, and IODTNVRAM::setProperties)".to_string());
+    if let Some(e) = super::nvram::entry(super::iokit::tree(), i).filter(|_| super::iokit::is_nvram(i)) {
+        // Sandbox's NVRAM hook for the entry's keys, then IODTNVRAM's (or
+        // the variables service's) setProperties: neither has an
+        // IORegistryEntryAllowableSetProperties (skipKey).
+        if k.darwin_mac_check_nvram_set_properties(&g, obj) != 0 {
+            return result(ret::NOT_PERMITTED);
+        }
+        let task = k.darwin_nvram_task();
+        let mut r = match super::nvram::entry_set_properties(e, &task, &g, obj, &super::nvram::Uptime) {
+            Ok(code) => result(code),
+            Err(why) => {
+                let mut r = result(ret::UNSUPPORTED);
+                r.unimplemented = Some(format!("io_registry_entry_set_properties on {}: {why}", super::iokit::name(super::iokit::tree(), i)));
+                return r;
+            }
+        };
+        if let Some(what) = k.darwin_nvram_take_errors() {
+            r.unimplemented = Some(what);
+        }
         return r;
     }
     let keys: Vec<Vec<u8>> = match g.get(obj) {
@@ -2224,6 +2298,11 @@ fn entry_set_properties(k: &mut Kernel, req: &Kmsg, i: u32) -> Reply {
     let class = super::iokit::tree().get(i as usize).map(|n| n.class).unwrap_or("");
     if class == super::iomfb::CLASS {
         return result(super::iomfb::set_properties(k, &g, obj));
+    }
+    // IODTNVRAMDiags and IODTNVRAMPlatformNotifier have IORegistryEntry's
+    // setProperties.
+    if class == super::iokit::NVRAM_DIAGS || class == super::iokit::NVRAM_NOTIFIER {
+        return result(ret::UNSUPPORTED);
     }
     let mut r = result(ret::UNSUPPORTED);
     r.unimplemented = Some(format!("setProperties of {} (class {class:?})", super::iokit::name(super::iokit::tree(), i)));

@@ -273,6 +273,10 @@ pub struct RunOptions {
     /// darwin-web-device`'s): with `web-device` tickets, the device the
     /// system boots as.
     pub darwin_web_device: Option<std::path::PathBuf>,
+    /// A device's NVRAM namespace image (`GEX_DARWIN_NVRAM`), dumped from
+    /// it: the NVRAM the system boots with and writes, when it is not the
+    /// web device's own.
+    pub darwin_nvram: Option<std::path::PathBuf>,
     /// Run ahead-of-time code only (`aot_only`): an ejected Windows
     /// program's runtime, with no tier-1 module and no run-time translator.
     pub aot_only: bool,
@@ -299,6 +303,7 @@ impl Default for RunOptions {
             darwin_cryptex1_ticket: None,
             darwin_cryptex1_nonce_hash: None,
             darwin_web_device: None,
+            darwin_nvram: None,
             args: Vec::new(),
             env: Vec::new(),
             trace: false,
@@ -1401,7 +1406,14 @@ fn run_process(
                 None => None,
             },
         };
-        gex_kernel::darwin::boot(tc.as_deref(), sandbox, device_tree.as_deref(), volume_attrs, cryptex1).map_err(|e| anyhow!("the boot payload: {e}"))?;
+        // The NVRAM namespace: the web device's own, or a device's image.
+        let nvram = match (&opts.darwin_web_device, &opts.darwin_nvram) {
+            (Some(_), Some(_)) => anyhow::bail!("a web device is configured (GEX_DARWIN_WEB_DEVICE), whose NVRAM is its own, and a device's NVRAM image (GEX_DARWIN_NVRAM)"),
+            (Some(dir), None) => Some(darwin_nvram_source(&dir.join(gex_kernel::darwin::webdevice::files::NVRAM), false).map_err(|e| anyhow!("{e} (the web device's NVRAM: make its factory one with gexc darwin-web-device nvram {})", dir.display()))?),
+            (None, Some(path)) => Some(darwin_nvram_source(path, true)?),
+            (None, None) => None,
+        };
+        gex_kernel::darwin::boot(tc.as_deref(), sandbox, device_tree.as_deref(), volume_attrs, cryptex1, nvram).map_err(|e| anyhow!("the boot payload: {e}"))?;
         // The disk nodes' image.
         if let Some(path) = &opts.darwin_disk0 {
             let f = std::fs::OpenOptions::new().read(true).write(true).open(path).map_err(|e| anyhow!("opening {}: {e}", path.display()))?;
@@ -9150,6 +9162,16 @@ pub(crate) fn note_wine32_image(base: u64, size: u64, path: &str) {
 fn wine32_image_at(pc: u64) -> Option<(String, u64)> {
     let g = WINE32_IMAGES.lock().unwrap_or_else(|e| e.into_inner());
     g.iter().find(|&&(b, e, _)| b <= pc && pc < e).map(|(b, _, n)| (n.clone(), pc - b))
+}
+
+/// The NVRAM namespace image at `path`, which the system reads at boot
+/// and its controller writes back: the web device's own, or a device's
+/// (`device`).
+fn darwin_nvram_source(path: &std::path::Path, device: bool) -> Result<gex_kernel::darwin::nvram::Source> {
+    let f = std::fs::OpenOptions::new().read(true).write(true).open(path).map_err(|e| anyhow!("opening {}: {e}", path.display()))?;
+    let size = f.metadata().map_err(|e| anyhow!("{}: {e}", path.display()))?.len();
+    let medium: std::sync::Arc<dyn gex_kernel::darwin::nvram::Medium> = std::sync::Arc::new(gex_kernel::darwin::apfswrite::HostFile(f, size));
+    Ok(gex_kernel::darwin::nvram::Source { medium, size: size as usize, device })
 }
 
 /// The web device of directory `dir`: what it has of its own, its root's

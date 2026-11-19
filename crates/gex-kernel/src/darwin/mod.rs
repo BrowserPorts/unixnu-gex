@@ -180,10 +180,12 @@ pub struct SandboxProfiles {
 /// the Sandbox kext's profiles; and the sealed volumes' owners, modes and
 /// flags, by volume ([`volattrs::Vol`]); and where the restore's Cryptex1
 /// comes from ([`preboot::Sources`]); on the web device
-/// ([`webdevice`]), its identity in `/chosen`, as its boot puts it there.
-/// Once per system.
-pub fn boot(trust_cache: Option<&[u8]>, sandbox: SandboxProfiles, device_tree: Option<&[u8]>, volume_attrs: Vec<(volattrs::Vol, Vec<u8>)>, cryptex1: preboot::Sources) -> Result<(), String> {
-    let chosen = match (&cryptex1.ticket, &cryptex1.web_device) {
+/// ([`webdevice`]), its identity in `/chosen`, as its boot puts it there;
+/// and the device's NVRAM namespace ([`nvram::Source`]), which the boot
+/// reads into `/chosen` and IODTNVRAM's controller writes. Once per
+/// system.
+pub fn boot(trust_cache: Option<&[u8]>, sandbox: SandboxProfiles, device_tree: Option<&[u8]>, volume_attrs: Vec<(volattrs::Vol, Vec<u8>)>, cryptex1: preboot::Sources, nvram: Option<nvram::Source>) -> Result<(), String> {
+    let mut chosen = match (&cryptex1.ticket, &cryptex1.web_device) {
         (preboot::Ticket::WebDevice, Some(w)) => {
             webdevice::set(w.clone())?;
             w.identity.chosen()
@@ -192,8 +194,28 @@ pub fn boot(trust_cache: Option<&[u8]>, sandbox: SandboxProfiles, device_tree: O
         (_, Some(_)) => return Err("a web device is configured (GEX_DARWIN_WEB_DEVICE), but the Cryptex1 ticket is not its own (GEX_DARWIN_CRYPTEX1_TICKET=web-device)".into()),
         (_, None) => Vec::new(),
     };
+    // The NVRAM namespace as the boot reads it into /chosen.
+    if let Some(src) = &nvram {
+        chosen.extend(src.chosen()?);
+        if let Some(gaps) = src.unmeasured() {
+            eprintln!("[gex] Darwin: {gaps}");
+        }
+        eprintln!("[gex] Darwin: {NVRAM_WRITERS_UNMODELLED}");
+    }
     match device_tree {
-        Some(t) => iokit::set_tree(t, &chosen)?,
+        Some(t) => {
+            // IODTNVRAM starts over /chosen as the boot left it, before the
+            // registry's matching publishes its services.
+            match nvram {
+                Some(src) => {
+                    let mut probe = iokit::parse(t)?;
+                    iokit::fill_chosen(&mut probe, &chosen)?;
+                    nvram::boot(&nvram::chosen_of(&probe), src.medium)?;
+                }
+                None => nvram::absent(nvram::NO_IMAGE.into()),
+            }
+            iokit::set_tree(t, &chosen, nvram::system_service())?
+        }
         None if !chosen.is_empty() => return Err("the web device's boot fills in /chosen, but the boot payload has no device tree".into()),
         None => {}
     }
@@ -218,6 +240,10 @@ pub fn boot(trust_cache: Option<&[u8]>, sandbox: SandboxProfiles, device_tree: O
     mac::set_platform_profile(sandbox.platform)?;
     sandboxes::set_collections(sandbox.builtin, sandbox.protobox)
 }
+
+/// The device's NVRAM writers at boot that are not modelled: only
+/// IODTNVRAM's own start (the boot-args it makes) is.
+const NVRAM_WRITERS_UNMODELLED: &str = "the boot's NVRAM writes outside IODTNVRAM's start are not modelled: iBoot's before it hands the kernel the bank (encrypted), and the kexts' at boot (AppleMobileApNonce's boot nonce, AppleSEPManager's ART, the backlight's level, AppleLockdownMode, iBootAudioVolumeManager, AppleM68Buttons' sync, RTBuddy's)";
 
 thread_local! {
     /// What code with no kernel to hand met that is not modelled, for the

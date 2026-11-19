@@ -491,6 +491,9 @@ pub mod files {
     /// Its Cryptex1 ticket, which its Preboot volume holds as
     /// `cryptex1/current/apticket.<target>.<ECID>.im4m`.
     pub const CRYPTEX1_TICKET: &str = "cryptex1.im4m";
+    /// Its NVRAM namespace: the bank IODTNVRAM's controller writes
+    /// (`super::super::nvram`), made as its factory left it.
+    pub const NVRAM: &str = "nvram.bin";
 }
 
 /// The web device a run boots: what it has of its own.

@@ -240,6 +240,8 @@ pub mod kind {
     pub const HOST_SPECIAL_PORT: u32 = 7;
     pub const IOKIT: u32 = 8;
     pub const NVRAM: u32 = 0x11;
+    /// boot-arg-set's: a boot argument's name, its length and its value.
+    pub const BOOT_ARG: u32 = 0x12;
     /// `mpo_system_check_reboot`'s: the `RB_*` flags as a halfword.
     pub const REBOOT: u32 = 0x13;
     pub const SYSCALL_UNIX: u32 = 0x14;

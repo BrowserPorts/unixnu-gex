@@ -176,6 +176,16 @@ fn init(dir: &Path) -> Result<()> {
     write_new(&dir.join(files::ROOT_CERT), &root_cert, 0o644)?;
     write_new(&dir.join(files::MANIFEST_CERT), &leaf, 0o644)?;
     write_new(&dir.join(files::IDENTITY), &plist::to_xml(&identity.to_plist()), 0o644)?;
+    write_new(&dir.join(files::NVRAM), &gex_kernel::darwin::nvram::factory_image(), 0o644)?;
+    show(dir)
+}
+
+/// The web device's factory NVRAM, for a device made before it had one
+/// (`gex_kernel::darwin::nvram::factory_image`); one that is there is
+/// kept.
+fn nvram(dir: &Path) -> Result<()> {
+    load(dir)?;
+    write_new(&dir.join(files::NVRAM), &gex_kernel::darwin::nvram::factory_image(), 0o644)?;
     show(dir)
 }
 
@@ -194,6 +204,15 @@ fn show(dir: &Path) -> Result<()> {
     match &w.ticket {
         Some(p) => println!("Cryptex1 ticket {p}"),
         None => println!("Cryptex1 ticket none (gexc darwin-web-ticket {})", dir.display()),
+    }
+    let path = dir.join(files::NVRAM);
+    match std::fs::read(&path) {
+        Ok(image) => {
+            let (version, generation) = gex_kernel::darwin::nvram::chrp::version(&image);
+            println!("NVRAM {} bytes, version {version}, generation {generation}", image.len());
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => println!("NVRAM none (gexc darwin-web-device nvram {})", dir.display()),
+        Err(e) => bail!("reading {}: {e}", path.display()),
     }
     Ok(())
 }
@@ -258,6 +277,7 @@ pub fn cmd_device(args: &[String]) -> Result<ExitCode> {
         [op, dir] if op == "init" => init(Path::new(dir))?,
         [op, dir] if op == "show" => show(Path::new(dir))?,
         [op, dir] if op == "roll" => roll(Path::new(dir))?,
+        [op, dir] if op == "nvram" => nvram(Path::new(dir))?,
         _ => bail!("usage: gexc darwin-web-device init|show|roll <dir>"),
     }
     Ok(ExitCode::SUCCESS)

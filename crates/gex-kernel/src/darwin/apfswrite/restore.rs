@@ -426,6 +426,10 @@ fn create_directory(nx: &mut Nx<'_>, vol: usize, path: &str, mode: u16, uid: u32
     Ok(dir)
 }
 
+/// The restore step install_fud is, as a disk0 image's missing steps name
+/// it: its firmware is not written.
+pub const INSTALL_FUD_MISSING: &str = "install_fud's firmware on Preboot (<nsih>/usr/standalone/firmware/FUD and the host's personalized images in it, AOP, AVE and StaticTrustCache for the erase identity)";
+
 /// The name of the Preboot volume's directory for this device: the AP
 /// ticket's SHA-384 (`/chosen`'s `crypto-hash-method`) in upper-case
 /// hexadecimal (0x10004bf94), the ticket the host sends as RootTicketData,
@@ -433,7 +437,7 @@ fn create_directory(nx: &mut Nx<'_>, vol: usize, path: &str, mode: u16, uid: u32
 /// (0x100066150).
 pub const NSIH_STAND_IN: &str = "the AP ticket's hash that names the Preboot volume's directory and fills its active file (the host's personalized RootTicketData, equal to iBoot's /chosen boot-manifest-hash) (stand-in: 48 zero bytes, 96 '0' digits; measure /private/preboot/active on the device)";
 
-fn nsih() -> String {
+pub(crate) fn nsih() -> String {
     "0".repeat(super::super::preboot::HASH_DIGITS)
 }
 
@@ -483,7 +487,7 @@ fn concurrent_steps(nx: &mut Nx<'_>, v: Volumes, now: &mut dyn FnMut() -> u64, m
     // fdr_prepare's removefile walk of the empty factorydata directory and
     // the access() checks of the later steps only read.
     missing.push("the FDR local store on Hardware (libFDR's writes into /FactoryData/System/Library/Caches/com.apple.factorydata by fdr_prepare's commit, fdr_recover, fdr_auto_challenge_claim and verify_fdr_data: server and device data, file names not traced)".into());
-    missing.push("install_fud's firmware on Preboot (<nsih>/usr/standalone/firmware/FUD and the host's personalized images in it, AOP, AVE and StaticTrustCache for the erase identity)".into());
+    missing.push(INSTALL_FUD_MISSING.into());
     Ok(())
 }
 

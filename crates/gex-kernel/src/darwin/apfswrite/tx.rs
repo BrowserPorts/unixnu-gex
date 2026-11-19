@@ -4019,6 +4019,8 @@ mod tests {
         let pb = nx.fs_oid.iter().position(|&x| x == o).unwrap();
         fsops::mount_rw(&mut nx, pb, &mut now).unwrap();
         let ino = fsops::create(&mut nx, pb, 2, "os.dmg", 0o666, 0, 0, &mut now).unwrap().unwrap();
+        let sub = fsops::mkdir(&mut nx, pb, 2, "sub", 0o755, 0, 0, &mut now).unwrap().unwrap();
+        let f = fsops::create(&mut nx, pb, sub, "f", 0o644, 0, 0, &mut now).unwrap().unwrap();
         nx.commit().unwrap();
         let q = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
         let sb0 = nx.vol_sb_read(pb).unwrap().0.to_vec();
@@ -4045,6 +4047,23 @@ mod tests {
         let vol_uuid: [u8; 16] = sb[0xf0..0x100].try_into().unwrap();
         let range = crate::darwin::graftfs::recorded_jobj_range(&get, &vol_uuid, q(&sb, 0xb0), &|_| None);
         assert_eq!(range, Ok(Some((base, 0x5000))));
+        // Served live, the file shows no attribute: the file system owns
+        // them (APFS's getxattr answers ENOATTR, its listing skips them).
+        {
+            use crate::darwin::graftfs::{GraftFs, GraftMount};
+            use crate::vfs::{FileSystem, XattrOp};
+            let live = GraftMount(std::sync::Arc::new(GraftFs::live(v, "Preboot", 0x1000_0005)));
+            let mut buf = [0u8; 256];
+            assert_eq!(live.xattr("os.dmg", XattrOp::List { buf: &mut buf }), Ok(0));
+            assert_eq!(live.xattr("os.dmg", XattrOp::Get { name: "user.com.apple.fs.graft-vol-uuid", buf: &mut buf }), Err(crate::errno::Errno::ENODATA));
+            assert_eq!(live.metadata("os.dmg").unwrap().ino, ino);
+            // A bind mount of a directory: the same files below it.
+            let b = live.bound_subtree("sub").unwrap();
+            assert_eq!((b.metadata("").unwrap().ino, b.metadata("f").unwrap().ino), (sub, f));
+            assert_eq!(b.path_of_ino(f).as_deref(), Some("f"));
+            assert_eq!(b.path_of_ino(ino), None);
+            assert!(live.bound_subtree("os.dmg").is_none());
+        }
     }
 
     /// The restore's disk0 (GEX_TEST_DISK0: an image `gexc darwin-disk0`

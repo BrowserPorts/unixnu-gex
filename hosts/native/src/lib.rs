@@ -258,10 +258,6 @@ pub struct RunOptions {
     /// directory (`GEX_DARWIN_FRAMES`, [`darwin_frames`]): the test
     /// embedder's panel.
     pub darwin_frames: Option<std::path::PathBuf>,
-    /// The restore's source of the Preboot volume's Cryptex1
-    /// (`GEX_DARWIN_RESTORE`): a directory holding the IPSW's
-    /// `BuildManifest.plist` and its files at their paths in the IPSW.
-    pub darwin_restore: Option<std::path::PathBuf>,
     /// The device's disk0 as its restore made it (`GEX_DARWIN_DISK0`,
     /// `gexc darwin-disk0`'s file, with what its build lacks in the file
     /// beside it named `.missing`): what the disk nodes serve. The guest
@@ -299,7 +295,6 @@ impl Default for RunOptions {
             darwin_dylinker: None,
             darwin_boot: None,
             darwin_frames: None,
-            darwin_restore: None,
             darwin_disk0: None,
             darwin_cryptex1_ticket: None,
             darwin_cryptex1_nonce_hash: None,
@@ -1392,11 +1387,9 @@ fn run_process(
                 volume_attrs.push((vol, spec));
             }
         }
-        // Where the restore's Cryptex1 comes from, read from the host's
-        // files.
-        use gex_kernel::darwin::preboot::{Host, Sources, Ticket};
+        // What the Cryptex1's evaluation takes from the device.
+        use gex_kernel::darwin::preboot::{Sources, Ticket};
         let cryptex1 = Sources {
-            restore: opts.darwin_restore.as_ref().map(|p| p.to_string_lossy().into_owned()),
             ticket: match opts.darwin_cryptex1_ticket.as_deref() {
                 None | Some("") => Ticket::Unset,
                 Some("web-device") => Ticket::WebDevice,
@@ -1407,7 +1400,6 @@ fn run_process(
                 Some(dir) => Some(darwin_web_device(dir)?),
                 None => None,
             },
-            host: Some(Host { size: darwin_host_size, read: darwin_host_read, sha384: Some(darwin_host_sha384) }),
         };
         gex_kernel::darwin::boot(tc.as_deref(), sandbox, device_tree.as_deref(), volume_attrs, cryptex1).map_err(|e| anyhow!("the boot payload: {e}"))?;
         // The disk nodes' image.
@@ -9175,56 +9167,3 @@ fn darwin_web_device(dir: &std::path::Path) -> Result<gex_kernel::darwin::webdev
     of_files(root, &identity, &slot, ticket).map_err(|e| anyhow!("{}: {e}", dir.display()))
 }
 
-/// A host file's size, for the Darwin kernel's copies of the restore's
-/// files: `None` for what is not a readable file.
-fn darwin_host_size(path: &str) -> Option<u64> {
-    std::fs::metadata(path).ok().filter(|m| m.is_file()).map(|m| m.len())
-}
-
-/// A host file's SHA-384, kept in gex's cache ([`gex_cache::digest_dir`])
-/// under a name made of its path and identity (size, modification time,
-/// inode, device): a file hashed whole is read again only once it has
-/// changed. None when it cannot be read.
-fn darwin_host_sha384(path: &str) -> Option<[u8; 48]> {
-    use sha2::Digest;
-    use std::io::Read;
-    use std::os::unix::fs::MetadataExt;
-    let identity = |md: &std::fs::Metadata| format!("{}\0{}.{}\0{}\0{}", md.len(), md.mtime(), md.mtime_nsec(), md.ino(), md.dev());
-    let before = std::fs::metadata(path).ok().filter(|m| m.is_file())?;
-    let key = format!("gex host sha384 1\0{path}\0{}", identity(&before));
-    let name: String = sha2::Sha256::digest(key.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
-    let kept = gex_cache::digest_dir().map(|d| d.join(format!("{name}.sha384")));
-    if let Some(b) = kept.as_ref().and_then(|p| std::fs::read(p).ok()) {
-        if let Ok(d) = <[u8; 48]>::try_from(b.as_slice()) {
-            return Some(d);
-        }
-    }
-    let mut f = std::fs::File::open(path).ok()?;
-    let mut h = sha2::Sha384::new();
-    let mut buf = vec![0u8; 8 << 20];
-    loop {
-        let n = f.read(&mut buf).ok()?;
-        if n == 0 {
-            break;
-        }
-        h.update(&buf[..n]);
-    }
-    let d: [u8; 48] = h.finalize().into();
-    // Kept only when the file did not change while it was read.
-    let after = std::fs::metadata(path).ok()?;
-    if let (Some(p), true) = (kept, identity(&after) == identity(&before)) {
-        if p.parent().is_some_and(|dir| std::fs::create_dir_all(dir).is_ok()) {
-            let tmp = p.with_extension(format!("tmp{}", std::process::id()));
-            if std::fs::write(&tmp, d).is_ok() && std::fs::rename(&tmp, &p).is_err() {
-                let _ = std::fs::remove_file(&tmp);
-            }
-        }
-    }
-    Some(d)
-}
-
-/// A host file's bytes at `offset`, all of `into` or false.
-fn darwin_host_read(path: &str, offset: u64, into: &mut [u8]) -> bool {
-    use std::os::unix::fs::FileExt;
-    std::fs::File::open(path).and_then(|f| f.read_exact_at(into, offset)).is_ok()
-}

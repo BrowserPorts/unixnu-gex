@@ -647,19 +647,10 @@ impl Kernel {
         self.darwin_apfs_graft_make(volume, file, &dir, flags, image)
     }
 
-    /// The image's blocks as the graft reads them: a Preboot file the
-    /// restore copied from the host's IPSW is read there, any other through
-    /// its own handle.
+    /// The image's blocks as the graft reads them: the file's own, through
+    /// its handle (on the Preboot volume, the file the restore wrote to the
+    /// disk0 image, read through the APFS reader).
     fn darwin_graft_medium(&mut self, file: &Found) -> Result<std::sync::Arc<dyn super::apfsread::Medium>, Errno> {
-        let mnt = file.mnt.unwrap_or_else(|| super::kern::mount_of(&file.path));
-        if super::kern::is_preboot(mnt) {
-            let rel = file.path.strip_prefix(mnt.on.trim_end_matches('/')).unwrap_or(&file.path);
-            if let (Some(fs), Some(host)) = (super::preboot::made(), super::preboot::host()) {
-                if let Some((url, size)) = fs.lazy_source(rel) {
-                    return Ok(std::sync::Arc::new(graftfs::ImageMedium::Host { url, size, read: host.read }));
-                }
-            }
-        }
         let handle = self.vfs.open(&file.path, 0, 0)?;
         let size = handle.metadata()?.size;
         Ok(std::sync::Arc::new(graftfs::ImageMedium::Handle { handle, size }))
@@ -708,29 +699,49 @@ impl Kernel {
     /// (`allocate_graft_jobj_range`: from the host's next identifier, ERANGE
     /// past the system identifiers; a read-only host hands them out in
     /// memory, a writable one takes them from its superblock and records
-    /// them in the image file's attributes,
-    /// [`Kernel::darwin_write_graft_file_xattrs`]); its device
-    /// ([`graftfs::graft_devt`], EBUSY); and its volume served at the
-    /// directory ([`graftfs::GraftMount`]). `FSCTL_GRAFT_PRESERVE_MOUNT`
+    /// them in the image file's attributes in a transaction of the kernel's
+    /// container, [`super::disknode::allocate_graft_jobj_range`]); its
+    /// device ([`graftfs::graft_devt`], EBUSY); and its volume served at the
+    /// directory ([`graftfs::GraftMount`]). The host is a volume of the
+    /// disk0 image, whose identifiers, UUID and records are the kernel's
+    /// container's ([`super::disknode`]). `FSCTL_GRAFT_PRESERVE_MOUNT`
     /// marks the host mount a system mount (`vfs_setmntsystem`,
     /// 0xfffffff006686e6c), which keeps it through the first of the
     /// shutdown's `vfs_unmountall` passes; the graft's fsevent goes to no
     /// reader, the fsevents device being reported where it is opened.
     fn darwin_apfs_graft_make(&mut self, volume: u32, file: &Found, dir: &Found, flags: u64, image: super::apfsread::Volume) -> Result<(), Errno> {
         let mnt = file.mnt.unwrap_or_else(|| super::kern::mount_of(&file.path));
-        let Some(host) = super::preboot::made().filter(|_| super::kern::is_preboot(mnt)) else {
-            self.darwin_unimplemented(format!("apfs_graft of {} on the volume mounted on {}: its next object identifier", file.path, mnt.on));
+        if !super::kern::is_disk0_served(mnt) {
+            self.darwin_unimplemented(format!("apfs_graft of {} on the volume mounted on {}: its next object identifier (its files are not served from the disk0 image)", file.path, mnt.on));
             return Err(Errno::EINVAL);
-        };
-        let rel = file.path.strip_prefix(mnt.on.trim_end_matches('/')).unwrap_or(&file.path).to_string();
+        }
         let need = image.sb.next_obj_id;
         let (devc, handed) = graftfs::counters(volume);
-        // The host's next object identifier: the Preboot volume's
-        // (super::preboot::NEXT_OBJ_ID_STAND_IN), and the identifiers its
-        // files have.
-        let next = host.next_ino();
-        let host_uuid = super::storage::volume_uuid(volume);
-        let recorded = graftfs::recorded_jobj_range(&|name| host.owned_xattr(&rel, name).ok().flatten(), &host_uuid, next, &|from| host.ino_at_or_above(from));
+        // The host's next object identifier and UUID, the attributes of
+        // its image file (`get_graft_jobj_range`, which reads them file-
+        // system owned) and its least identifier at or above one.
+        let (next, host_uuid) = match super::disknode::volume_ids(volume) {
+            Ok(ids) => ids,
+            Err(why) => {
+                self.darwin_unimplemented(format!("apfs_graft of {}: the host volume's next object identifier: {why}", file.path));
+                return Err(Errno::EIO);
+            }
+        };
+        let ino = file.md.ino;
+        let failed = std::cell::RefCell::new(None);
+        let get = |name: &str| super::disknode::xattr(volume, ino, name).unwrap_or_else(|e| {
+            failed.borrow_mut().get_or_insert(e);
+            None
+        });
+        let ge = |from: u64| super::disknode::jobj_at_or_above(volume, from).unwrap_or_else(|e| {
+            failed.borrow_mut().get_or_insert(e);
+            None
+        });
+        let recorded = graftfs::recorded_jobj_range(&get, &host_uuid, next, &ge);
+        if let Some(why) = failed.into_inner() {
+            self.darwin_unimplemented(format!("apfs_graft of {}: get_graft_jobj_range: {why}", file.path));
+            return Err(Errno::EIO);
+        }
         let (base, len, handed) = match graftfs::reused_jobj_range(recorded, need) {
             Some((base, len)) => (base, len, handed),
             None => {
@@ -738,9 +749,14 @@ impl Kernel {
                 if mnt.state().apfs_ro == Some(true) {
                     (next + handed, need, handed + need)
                 } else {
-                    let base = host.take_inos(need);
-                    self.darwin_write_graft_file_xattrs(&host, &rel, host_uuid, base, need)?;
-                    (base, need, handed)
+                    match super::disknode::allocate_graft_jobj_range(volume, ino, need) {
+                        Ok(Ok(base)) => (base, need, handed),
+                        Ok(Err(errno)) => return Err(err(errno)),
+                        Err(why) => {
+                            self.darwin_unimplemented(format!("apfs_graft of {}: allocate_graft_jobj_range: {why}", file.path));
+                            return Err(Errno::EIO);
+                        }
+                    }
                 }
             }
         };
@@ -762,61 +778,40 @@ impl Kernel {
         Ok(())
     }
 
-    /// `write_graft_file_xattrs` (0xfffffff006687934): the graft's range
-    /// recorded on its image file `rel` of the writable host `host`, in the
-    /// file-system owned attributes of [`graftfs::graft_file_xattrs`],
-    /// added (`fs_add_xattr`) in their order. The host's files are this
-    /// kernel's, so an add fails only where the image file already has the
-    /// attribute (a record `get_graft_jobj_range` refused), whose
-    /// replacement by `fs_add_xattr` is not implemented (reported).
-    fn darwin_write_graft_file_xattrs(&mut self, host: &crate::vfs::tmpfs::TmpFs, rel: &str, host_uuid: [u8; 16], base: u64, len: u64) -> Result<(), Errno> {
-        let attrs = graftfs::graft_file_xattrs(host_uuid, base, len);
-        for (name, _) in &attrs {
-            if host.owned_xattr(rel, name)?.is_some() {
-                self.darwin_unimplemented(format!("write_graft_file_xattrs: fs_add_xattr of {name} over the record the Preboot volume's {rel} already has"));
-                return Err(Errno::EINVAL);
-            }
-        }
-        for (name, value) in &attrs {
-            host.set_owned_xattr(rel, name, value)?;
-        }
-        Ok(())
-    }
-
-    /// A booted system's Preboot volume as its boot left it: the files the
-    /// restore made there ([`super::preboot::volume`]) on its mount
-    /// ([`super::kern::PREBOOT_ON`]), and the grafts libignition's graft
-    /// stage made of the boot cryptexes, each trust cache loaded after its
-    /// graft ([`super::preboot::BOOTED_GRAFTS`]). This is the result of a
-    /// boot whose evaluations passed: the Cryptex1 ticket's evaluation (the
-    /// device's own ticket, against its nonce) is not made again; each
-    /// image's root hash is authenticated against the restore's payload, as
-    /// the boot's graft authenticated it against the evaluated one; each
-    /// graft is made as `apfs_graft` makes it on the writable host
-    /// libignition mounted ([`Kernel::darwin_apfs_graft_make`]: its range of
-    /// the host's object identifiers taken and recorded on its image, its
-    /// device the host's next), the mount read-write while they are made
-    /// as it was then ([`super::kern::ignition_preboot_mount`]) and as the
-    /// booted system has it after; each trust cache's module is loaded with
-    /// its Cryptex1 boot type. Without a restore source there are no images
-    /// to graft: what the graft directories would hold is reported where it
-    /// is looked up ([`super::preboot::unmodelled`]); a failure is reported.
+    /// A booted system's Preboot volume as its boot left it: its files as
+    /// the disk0 image holds them ([`graftfs::GraftFs::live`]) on its
+    /// mount ([`super::kern::PREBOOT_ON`]), and the grafts libignition's
+    /// graft stage made of the boot cryptexes, each trust cache loaded
+    /// after its graft ([`super::preboot::BOOTED_GRAFTS`]). This is the
+    /// result of a boot whose evaluations passed: the Cryptex1 ticket's
+    /// evaluation (the device's own ticket, against its nonce) is not made
+    /// again; each image's root hash is authenticated against the restore's
+    /// payload, as the boot's graft authenticated it against the evaluated
+    /// one; libignition's mount is read-write while the grafts are made, as
+    /// it was then ([`super::kern::ignition_preboot_mount`], its writes the
+    /// kernel's container's: [`super::disknode::mount_rw`]), and each graft
+    /// is made as `apfs_graft` makes it on that writable host
+    /// ([`Kernel::darwin_apfs_graft_make`]: its range of the host's object
+    /// identifiers taken and recorded on its image, its device the host's
+    /// next); the mount is then as the booted system has it; each trust
+    /// cache's module is loaded with its Cryptex1 boot type. Without a disk0
+    /// image the volume's files are not served, and a path below its mount
+    /// is reported where it is looked up ([`super::kern::unmodelled_files`]);
+    /// a failure is reported.
     pub fn darwin_boot_grafts(&mut self) {
-        if super::kern::boot_state() != super::kern::BootState::Booted {
+        if super::kern::boot_state() != super::kern::BootState::Booted || !super::disknode::installed() {
             return;
         }
         let Some(mnt) = super::kern::mounts().into_iter().find(|m| super::kern::is_preboot(m)) else { return };
-        let fs = match super::preboot::volume(&|p| self.darwin_system_file(p)) {
-            Ok(fs) => fs,
+        let Some(index) = super::kern::mount_volume(mnt) else { return };
+        let vol = match super::disknode::volume(index) {
+            Ok(v) => v,
             Err(why) => {
-                self.darwin_unimplemented(format!("the booted system's Preboot volume: {why}"));
+                self.darwin_unimplemented(format!("the booted system's Preboot volume from the disk0 image: {why}"));
                 return;
             }
         };
-        self.vfs.system_mount(mnt.on, fs);
-        if !super::preboot::has_restore() {
-            return;
-        }
+        self.vfs.system_mount(mnt.on, std::sync::Arc::new(graftfs::GraftMount(std::sync::Arc::new(graftfs::GraftFs::live(vol, "Preboot", mnt.fsid as u32)))));
         let booted = (mnt.flags(), mnt.state().apfs_ro);
         match super::kern::ignition_preboot_mount() {
             Ok(m) => {
@@ -829,11 +824,17 @@ impl Kernel {
                 return;
             }
         }
-        for g in super::preboot::BOOTED_GRAFTS {
-            if let Err(why) = self.darwin_boot_graft(mnt, &g) {
-                self.darwin_unimplemented(format!("the booted system's graft of the {} cryptex on {}/{}: {why}", g.name, mnt.on, g.dir));
-                break;
+        let rw = mnt.state().apfs_ro != Some(true);
+        match if rw { super::disknode::mount_rw(index) } else { Ok(()) } {
+            Ok(()) => {
+                for g in super::preboot::BOOTED_GRAFTS {
+                    if let Err(why) = self.darwin_boot_graft(mnt, &g) {
+                        self.darwin_unimplemented(format!("the booted system's graft of the {} cryptex on {}/{}: {why}", g.name, mnt.on, g.dir));
+                        break;
+                    }
+                }
             }
+            Err(why) => self.darwin_unimplemented(format!("the booted system's grafts: libignition's read-write mount of the Preboot volume: {why}")),
         }
         let mut st = mnt.state();
         (st.flags, st.apfs_ro) = booted;

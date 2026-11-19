@@ -562,6 +562,13 @@ impl Kernel {
         if mnt.fs != kern::Fs::Apfs || mnt.state().apfs_ro == Some(true) {
             return;
         }
+        // A volume the kernel's container in the disk0 image holds
+        // read-write: apfs_vfsop_sync's vnode pass and commit of the
+        // container's transaction (super::apfswrite::fsops::sync) are not
+        // made.
+        if let Some(i) = kern::mount_volume(mnt).filter(|&i| super::disknode::holds_rw(i)) {
+            self.darwin_unimplemented(format!("VFS_SYNC of the volume on {}: apfs_vfsop_sync's vnode pass and commit of the kernel's container in the disk0 image (volume slot {i})", mnt.on));
+        }
         let sync = waitfor & (kern::MNT_WAIT | kern::MNT_DWAIT) != 0;
         super::pagecache::charge(super::pagecache::sync_mount(mnt, sync));
     }
@@ -643,6 +650,15 @@ impl Kernel {
         super::pagecache::charge(super::pagecache::vflush(mnt));
         if mnt.fs == kern::Fs::Devfs {
             mnt.state().flags &= !kern::MNT_LOCAL;
+        }
+        // A writable mount of a volume the kernel's container in the disk0
+        // image holds read-write: apfs_vfsop_unmount's own writes (the
+        // container's commit, the volume's apfs_modified_by entry and
+        // unmount time, super::apfswrite::fsops::unmount) are not made.
+        if let Some(i) = kern::mount_volume(mnt).filter(|_| mnt.fs == kern::Fs::Apfs && mnt.state().apfs_ro == Some(false)) {
+            if super::disknode::holds_rw(i) {
+                self.darwin_unimplemented(format!("the forced unmount of the volume on {}: apfs_vfsop_unmount's writes to the kernel's container in the disk0 image (its commit, the volume's apfs_modified_by entry and unmount time)", mnt.on));
+            }
         }
         kern::mount_list_remove(mnt);
         if mnt.flags() & kern::MNT_ROOTFS == 0 && crate::vnote::any() {

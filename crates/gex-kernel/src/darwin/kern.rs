@@ -350,7 +350,7 @@ const PREBOOT_ARGS: super::apfsmount::Args = super::apfsmount::Args { mode: 1, u
 const PREBOOT_FMOUNT_FLAGS: u32 = MNT_DONTBROWSE;
 
 /// What stands in for the flags of a booted system's Preboot mount.
-pub const PREBOOT_BOOTED_FLAGS_STAND_IN: &str = "the flags of a booted system's Preboot mount (stand-in: libignition's preboot stage's read-write fmount of it, read-only once booted as the device tree's fstab names it, by an update not traced; measure statfs(\"/private/preboot\").f_flags on the device)";
+pub const PREBOOT_BOOTED_FLAGS_STAND_IN: &str = "the flags of a booted system's Preboot mount (stand-in: libignition's preboot stage's read-write fmount of it, read-only once booted as the device tree's fstab names it, by an update not traced, whose own writes are not made: the kernel's container keeps the volume mounted read-write with the mount's and the grafts' writes in its open transaction; measure statfs(\"/private/preboot\").f_flags on the device)";
 
 /// The Preboot volume's mount on a booted system: libignition's, made by
 /// launchd (root, `f_owner` 0) ([`ignition_preboot_mount`]), read-only
@@ -541,36 +541,35 @@ pub fn mount_from(mnt: &Mount) -> String {
     }
 }
 
-/// Whether a mount is of the Preboot volume, whose files are modelled
-/// ([`super::preboot`]) but for those the device's tickets make.
+/// Whether a mount is of the Preboot volume.
 pub fn is_preboot(mnt: &Mount) -> bool {
     matches!(mnt.from, From::Volume(i) if super::storage::volume(i).is_some_and(|v| v.role == super::storage::role::PREBOOT))
 }
 
-/// Whether a volume of role `role` mounted at run time has its files
-/// served as the disk0 image holds them
-/// ([`super::graftfs::GraftFs::live`]): the xART volume's, which only
-/// the restore writes before the boot (its gigalocker file).
+/// Whether a volume of role `role` has its files served as the disk0
+/// image holds them ([`super::graftfs::GraftFs::live`]): the Preboot
+/// volume's (the restore's Cryptex1, boot objects, firmware and `active`)
+/// and the xART volume's (its gigalocker file).
 pub fn served_from_disk0(role: u16) -> bool {
-    role == super::storage::role::XART
+    role == super::storage::role::XART || role == super::storage::role::PREBOOT
 }
 
 /// Whether mount `mnt` is of a volume served from the disk0 image
-/// ([`served_from_disk0`]).
+/// ([`served_from_disk0`]): one there is an image to serve it from.
 pub fn is_disk0_served(mnt: &Mount) -> bool {
-    matches!(mnt.from, From::Volume(i) if super::storage::volume(i).is_some_and(|v| served_from_disk0(v.role)))
+    super::disknode::installed() && matches!(mnt.from, From::Volume(i) if super::storage::volume(i).is_some_and(|v| served_from_disk0(v.role)))
 }
 
 /// What of a mount's files is not modelled, if any: a volume mounted at
 /// run time holds its own files, which this root does not have, but for
-/// the Preboot volume's ([`unmodelled_files_at`] says which of those) and
-/// those served from the disk0 image ([`served_from_disk0`]).
+/// those served from the disk0 image ([`is_disk0_served`]).
 pub fn unmodelled_files(mnt: &Mount) -> Option<String> {
     match mnt.from {
-        From::Volume(_) if is_preboot(mnt) || is_disk0_served(mnt) => None,
+        From::Volume(_) if is_disk0_served(mnt) => None,
         From::Volume(i) => {
             let name = super::storage::volume(i).map_or("?", |v| v.name);
-            Some(format!("the files of the {name} volume mounted on {}", mnt.on))
+            let without = if super::storage::volume(i).is_some_and(|v| served_from_disk0(v.role)) { " (served from the disk0 image: none is given, GEX_DARWIN_DISK0)" } else { "" };
+            Some(format!("the files of the {name} volume mounted on {}{without}", mnt.on))
         }
         _ => None,
     }
@@ -578,10 +577,7 @@ pub fn unmodelled_files(mnt: &Mount) -> Option<String> {
 
 /// The mount with files not modelled that canonical path `path` is
 /// below (or, with `at_root`, at the root of: a listing of it), with what
-/// is not. On the Preboot volume: a path through one of its root's
-/// entries the AP ticket makes, the Cryptex1 ticket or `cryptex1` when they
-/// have no source, and a listing of its root or of a directory holding
-/// such a file (`at_root` with a directory below it).
+/// is not.
 pub fn unmodelled_files_at(path: &str, at_root: bool) -> Option<String> {
     unmodelled_files_on(mount_of(path), path, at_root)
 }
@@ -591,13 +587,6 @@ pub fn unmodelled_files_on(mnt: &Mount, path: &str, at_root: bool) -> Option<Str
     let below = path != mnt.on;
     if !below && !at_root {
         return None;
-    }
-    if is_preboot(mnt) {
-        if !below {
-            return Some(super::preboot::root_listing());
-        }
-        let rel = path[mnt.on.trim_end_matches('/').len()..].trim_start_matches('/');
-        return super::preboot::unmodelled(rel, at_root);
     }
     unmodelled_files(mnt)
 }
@@ -2987,5 +2976,22 @@ mod tests {
         let b = booted_preboot_mount().unwrap();
         assert_eq!(b.flags(), m.flags() | MNT_RDONLY);
         assert_eq!((b.fsid, b.state().apfs_ro), (m.fsid, Some(true)));
+    }
+
+    /// The Preboot and xART volumes' files are the disk0 image's; with no
+    /// image (as in these tests) a path below their mounts, or a listing
+    /// of their roots, is reported, as any other volume's is.
+    #[test]
+    fn the_preboot_volumes_files_are_the_disk0_images() {
+        use super::super::storage::role;
+        assert!(served_from_disk0(role::PREBOOT) && served_from_disk0(role::XART));
+        assert!(!served_from_disk0(role::DATA) && !served_from_disk0(role::SYSTEM));
+        assert!(!super::super::disknode::installed());
+        let m = ignition_preboot_mount().unwrap();
+        assert!(!is_disk0_served(&m));
+        let why = unmodelled_files_on(&m, "/private/preboot/cryptex1/current/os.dmg", false).unwrap();
+        assert!(why.contains("Preboot") && why.contains("GEX_DARWIN_DISK0"), "{why}");
+        assert!(unmodelled_files_on(&m, "/private/preboot", true).is_some());
+        assert_eq!(unmodelled_files_on(&m, "/private/preboot", false), None);
     }
 }

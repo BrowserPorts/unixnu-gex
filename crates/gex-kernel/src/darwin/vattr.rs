@@ -373,16 +373,9 @@ pub fn of_on(ns: &Namespace, mnt: &super::kern::Mount, path: &str, md: &Metadata
         return devfs(path, md);
     }
     let Some(vol) = mnt.vol else {
-        if super::kern::is_preboot(mnt) {
-            // Each of its files has its record: the restore's from the
-            // volume's making (super::preboot), the guest's from its own.
-            if let Some(what) = super::kern::unmodelled_files_on(mnt, path, false) {
-                return Err(format!("the owner of {path}: {what}"));
-            }
-            return recorded(ns, path, handle)?.ok_or_else(|| format!("the owner of {path}: a file of the Preboot volume with no record"));
-        }
         if super::kern::is_disk0_served(mnt) {
-            // Each of its inodes' own (super::graftfs::GraftFs::owned_of).
+            // Each of its inodes' own (super::graftfs::GraftFs::owned_of),
+            // a grafted cryptex's files' among them.
             return recorded(ns, path, handle)?.ok_or_else(|| format!("the owner of {path}: a file of the volume mounted on {} with no record", mnt.on));
         }
         if let Some(what) = super::kern::unmodelled_files(mnt) {

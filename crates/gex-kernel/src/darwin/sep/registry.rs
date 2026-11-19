@@ -42,6 +42,29 @@ pub fn superclasses(class: &str) -> &'static [&'static str] {
     }
 }
 
+/// Whether a driver of `class` here registers itself: the manager does at
+/// the end of its start (`registerService(0)`, K 0xfffffff0063cf544, then
+/// publishes the resource "SEP"); whether AppleA7IOPV2 does is not traced.
+pub fn registers(class: &str) -> Option<bool> {
+    (class == MANAGER).then_some(true)
+}
+
+/// Whether every registered service of `class` is in the registry here:
+/// AppleSEPManager's personality matches `iop-nub,sep` on an AppleA7IOPNub,
+/// and the device tree has one such nub (the `sep` node's child). AppleA7IOPV2
+/// is not complete: `iop,s8000` is also the name other coprocessor nodes
+/// carry, whose nubs and drivers are not here.
+pub fn class_complete(class: &str) -> bool {
+    class == MANAGER
+}
+
+/// Whether `class` is one of the drivers here, whose children in the
+/// `IOService` plane are not all modelled: the nub the A7IOP makes, the
+/// manager's endpoint services and its user clients.
+pub fn is_driver(class: &str) -> bool {
+    matches!(class, A7IOP | MANAGER)
+}
+
 /// Publish the drivers over `/arm-io/sep`; the manager's entry.
 pub fn add(t: &mut Vec<Node>, io: u32) -> Option<u32> {
     let sep = platform::arm_io_nub(t, io, "sep")?;
@@ -80,34 +103,42 @@ pub fn add(t: &mut Vec<Node>, io: u32) -> Option<u32> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::super::super::iokit::{self, build};
+use super::super::iokit::{self, build};
 
-    fn tree() -> Vec<iokit::Node> {
-        let mut b = Vec::new();
-        let node = |b: &mut Vec<u8>, name: &str, props: &[(&str, &[u8])], children: u32| {
-            b.extend_from_slice(&(props.len() as u32 + 1).to_le_bytes());
-            b.extend_from_slice(&children.to_le_bytes());
-            let mut put = |k: &str, v: &[u8]| {
-                let mut kk = [0u8; 32];
-                kk[..k.len()].copy_from_slice(k.as_bytes());
-                b.extend_from_slice(&kk);
-                b.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                b.extend_from_slice(v);
-                b.resize(b.len().div_ceil(4) * 4, 0);
-            };
-            put("name", &[name.as_bytes(), b"\0"].concat());
-            for (k, v) in props {
-                put(k, v);
-            }
+/// A device tree with the `sep` node, its `iop-sep-nub` child and that child's `xART`, built over the
+/// platform's drivers, for the tests of the registry's and the matching's views of the SEP.
+#[cfg(test)]
+pub(crate) fn test_tree() -> Vec<iokit::Node> {
+    let mut b = Vec::new();
+    let node = |b: &mut Vec<u8>, name: &str, props: &[(&str, &[u8])], children: u32| {
+        b.extend_from_slice(&(props.len() as u32 + 1).to_le_bytes());
+        b.extend_from_slice(&children.to_le_bytes());
+        let mut put = |k: &str, v: &[u8]| {
+            let mut kk = [0u8; 32];
+            kk[..k.len()].copy_from_slice(k.as_bytes());
+            b.extend_from_slice(&kk);
+            b.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            b.extend_from_slice(v);
+            b.resize(b.len().div_ceil(4) * 4, 0);
         };
-        node(&mut b, "device-tree", &[("compatible", b"J120AP\0iPad7,1\0AppleARM\0")], 1);
-        node(&mut b, "arm-io", &[("compatible", b"arm-io,t8011\0")], 1);
-        node(&mut b, "sep", &[("compatible", b"iop,t8011\0iop,s8000\0"), ("role", b"SEP\0")], 1);
-        node(&mut b, "iop-sep-nub", &[("compatible", b"iop-nub,sep\0"), ("rom-panic-bytes", &0x38u32.to_le_bytes())], 1);
-        node(&mut b, "xART", &[], 0);
-        build(&b).unwrap()
-    }
+        put("name", &[name.as_bytes(), b"\0"].concat());
+        for (k, v) in props {
+            put(k, v);
+        }
+    };
+    node(&mut b, "device-tree", &[("compatible", b"J120AP\0iPad7,1\0AppleARM\0")], 1);
+    node(&mut b, "arm-io", &[("compatible", b"arm-io,t8011\0")], 1);
+    node(&mut b, "sep", &[("compatible", b"iop,t8011\0iop,s8000\0"), ("role", b"SEP\0")], 1);
+    node(&mut b, "iop-sep-nub", &[("compatible", b"iop-nub,sep\0"), ("rom-panic-bytes", &0x38u32.to_le_bytes())], 1);
+    node(&mut b, "xART", &[], 0);
+    build(&b).unwrap()
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::iokit;
+    use super::test_tree as tree;
 
     #[test]
     fn the_drivers_stand_over_the_sep_node() {

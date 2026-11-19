@@ -286,7 +286,7 @@ pub fn links(t: &[Node], i: u32, plane: Plane, parents: bool) -> Result<Vec<u32>
         // The user clients a service has opened are attached to it, and
         // they are not registry entries here.
         (Plane::Service, false) if n.class == super::accel::CLASS || n.class == super::iomfb::CLASS => Err(format!("the user clients of {} as its children in the IOService plane", n.name)),
-        (Plane::Service, false) if super::platform::is_driver(n.class) => Err(format!("the nubs and clients of {} (its children in the IOService plane)", n.name)),
+        (Plane::Service, false) if super::platform::is_driver(n.class) || super::sep::registry::is_driver(n.class) => Err(format!("the nubs and clients of {} (its children in the IOService plane)", n.name)),
         (Plane::Service, false) if n.class == super::platform::RESOURCES => Err("the services matched on IOResources (its children in the IOService plane)".to_string()),
         (Plane::Service, false) => match super::storagestack::children_unknown(n.class) {
             Some(what) => Err(format!("{what} (children of {} in the IOService plane)", n.name)),

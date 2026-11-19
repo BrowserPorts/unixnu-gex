@@ -155,7 +155,10 @@ pub fn superclasses(class: &str) -> &'static [&'static str] {
 /// does at the end of its start (0xfffffff00598f964), arm-io's driver after
 /// publishing its nubs (0xfffffff006c41910).
 pub fn registers(class: &str) -> Option<bool> {
-    matches!(class, PE | ARM_IO).then_some(true)
+    if matches!(class, PE | ARM_IO) {
+        return Some(true);
+    }
+    super::sep::registry::registers(class)
 }
 
 /// A property of entry `i` the platform's drivers changed in a way not

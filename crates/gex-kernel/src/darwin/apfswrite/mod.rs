@@ -22,6 +22,7 @@ pub mod invert;
 pub mod node;
 pub mod restore;
 pub mod seal;
+pub mod sealvolume;
 pub mod tx;
 
 use super::apfsread::Medium;

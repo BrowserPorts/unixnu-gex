@@ -193,6 +193,10 @@ pub enum Owner {
 struct VObj {
     b: Vec<u8>,
     mapped: Option<(u64, u64)>,
+    /// A headerless object (a sealed tree's node, `OBJ_NOHEADER`): its
+    /// bytes carry no header and no checksum, its mapping
+    /// `OMAP_VAL_NOHEADER`.
+    noheader: bool,
 }
 
 /// An object map: its `omap_phys_t`'s block and its tree.
@@ -1881,9 +1885,10 @@ impl<'a> Nx<'a> {
     }
 
     /// `omap_set` (I:0x10003ecb0) and the old mapping's `omap_delete`
-    /// (I:0x10003eedc) for object `oid` of `owner`, now at `paddr`: without
+    /// (I:0x10003eedc, flags 0) for object `oid` of `owner`, now at `paddr`,
+    /// its value's flags `vflags` past the encryption ones: without
     /// snapshots the old record goes and its block is freed.
-    fn omap_set(&mut self, owner: Owner, oid: u64, paddr: u64, old: Option<(u64, u64)>) -> Result<(), String> {
+    fn omap_set(&mut self, owner: Owner, oid: u64, paddr: u64, old: Option<(u64, u64)>, vflags: u32) -> Result<(), String> {
         let mut om = self.omap_of(owner)?;
         om.phys = self.phys_modify(om.phys)?;
         let mut k = oid.to_le_bytes().to_vec();
@@ -1900,7 +1905,7 @@ impl<'a> Nx<'a> {
             },
             Owner::Container => 0,
         };
-        let mut v = (flags as u32).to_le_bytes().to_vec();
+        let mut v = (flags as u32 | vflags).to_le_bytes().to_vec();
         v.extend_from_slice(&(self.l.bs as u32).to_le_bytes());
         v.extend_from_slice(&paddr.to_le_bytes());
         let vol = match owner {
@@ -1949,7 +1954,7 @@ impl<'a> Nx<'a> {
     fn virt_create(&mut self, owner: Owner, mut b: Vec<u8>) -> u64 {
         let oid = self.new_oid();
         b.put64(8, oid);
-        self.virt.insert((owner, oid), VObj { b, mapped: None });
+        self.virt.insert((owner, oid), VObj { b, mapped: None, noheader: false });
         self.virt_dirty.push((owner, oid));
         oid
     }
@@ -2000,12 +2005,28 @@ impl<'a> Nx<'a> {
                     }
                 }
             }
-            let paddr = self.alloc_meta_class(class)?;
-            let old = self.virt.get(&(owner, oid)).ok_or("a dirty object not in the cache")?.mapped;
-            self.omap_set(owner, oid, paddr, old)?;
+            let (old, noheader) = self.virt.get(&(owner, oid)).map(|v| (v.mapped, v.noheader)).ok_or("a dirty object not in the cache")?;
             let xid = self.xid;
+            // An object already placed in this transaction (`obj_write`
+            // before the flush) keeps its block and its mapping
+            // (obj_write_prepare, I:0x100035c88 = S:0x100056d34: an
+            // object's address is reused, with no omap_set, when its
+            // transaction is the one written).
+            let paddr = match old {
+                Some((x, p)) if x == xid => p,
+                _ => {
+                    let p = self.alloc_meta_class(class)?;
+                    self.omap_set(owner, oid, p, old, if noheader { omap_val::NOHEADER } else { 0 })?;
+                    p
+                }
+            };
             let vo = self.virt.get_mut(&(owner, oid)).unwrap();
             vo.mapped = Some((xid, paddr));
+            if noheader {
+                // Neither header nor checksum, so no count (S:0x100056e00).
+                self.sink.write_at(paddr * self.l.bs, &vo.b)?;
+                continue;
+            }
             vo.b.put64(8, oid);
             vo.b.put64(16, xid);
             let mut b = vo.b.clone();
@@ -2614,7 +2635,7 @@ impl<'a> Nx<'a> {
         sb.put32(0x42c, 2);
         sb.put32(0x450, 2);
         // The superblock's identifier was the volume's first.
-        self.virt.insert((Owner::Container, vol_oid), VObj { b: sb, mapped: None });
+        self.virt.insert((Owner::Container, vol_oid), VObj { b: sb, mapped: None, noheader: false });
         self.virt_dirty.push((Owner::Container, vol_oid));
         self.fs_oid[index] = vol_oid;
         Ok(vol_oid)
@@ -2701,6 +2722,101 @@ impl<'a> Nx<'a> {
         use crate::darwin::apfsread::Medium as _;
         self.sink.read_at(paddr * self.l.bs, buf)
     }
+}
+
+// ---- What apfs_sealvolume makes.
+
+impl<'a> Nx<'a> {
+    /// The nodes of a virtual tree of `owner`, of `subtype`.
+    pub fn virt_store(&mut self, owner: Owner, subtype: u32) -> VirtStore<'_, 'a> {
+        VirtStore { nx: self, owner, subtype }
+    }
+
+    /// The nodes of a physical tree of `subtype`, their blocks from
+    /// metazone class `class`, counted in volume `vol`'s blocks.
+    pub fn phys_store(&mut self, subtype: u32, class: usize, vol: Option<usize>) -> PhysStore<'_, 'a> {
+        PhysStore { nx: self, subtype, class, vol }
+    }
+
+    /// A new virtual object of `owner` (`obj_create` of a virtual
+    /// descriptor), its bytes `b` with its type and subtype in the header,
+    /// dirty: its identifier, the next one.
+    pub fn virt_new(&mut self, owner: Owner, b: Vec<u8>) -> u64 {
+        self.virt_create(owner, b)
+    }
+
+    /// A new headerless virtual object of `owner` (a sealed tree's node,
+    /// `OBJ_NOHEADER`): its bytes `b`, header left zero, dirty; its
+    /// identifier, the next one.
+    pub fn virt_new_noheader(&mut self, owner: Owner, b: Vec<u8>) -> u64 {
+        let oid = self.new_oid();
+        self.virt.insert((owner, oid), VObj { b, mapped: None, noheader: true });
+        self.virt_dirty.push((owner, oid));
+        oid
+    }
+
+    /// Virtual object `oid` of `owner`, changed in this transaction
+    /// (`obj_dirty`).
+    pub fn virt_mut(&mut self, owner: Owner, oid: u64) -> Result<&mut Vec<u8>, String> {
+        if !self.virt.contains_key(&(owner, oid)) {
+            return Err(format!("no virtual object {oid:#x}"));
+        }
+        self.virt_modify(owner, oid);
+        Ok(&mut self.virt.get_mut(&(owner, oid)).unwrap().b)
+    }
+
+    /// Virtual object `oid` of `owner` as it stands.
+    pub fn virt_read(&self, owner: Owner, oid: u64) -> Result<&[u8], String> {
+        self.virt.get(&(owner, oid)).map(|v| v.b.as_slice()).ok_or_else(|| format!("not implemented: reading virtual object {oid:#x} through its object map"))
+    }
+
+    /// `obj_write(o, 1, xid)` of a virtual object made in this transaction
+    /// (`obj_write_prepare` I:0x100035c88 forced, then
+    /// `obj_write_internal` I:0x100036b44): its block now (`spaceman_alloc`
+    /// with 0x48 from its class), its mapping now, its header and checksum
+    /// set and the block written at once. It stays dirty: the flush
+    /// writes it again in the same block.
+    pub fn virt_write_now(&mut self, owner: Owner, oid: u64) -> Result<u64, String> {
+        let enc = matches!(owner, Owner::Volume(i) if self.vols.get(&i).is_some_and(|v| v.encrypted));
+        let vo = self.virt.get(&(owner, oid)).ok_or_else(|| format!("no virtual object {oid:#x}"))?;
+        if vo.mapped.is_some() || vo.noheader {
+            return Err("not implemented: obj_write of a virtual object already placed, or of a headerless one".into());
+        }
+        let paddr = self.alloc_meta_class(if enc { 0 } else { 1 })?;
+        if let Owner::Volume(i) = owner {
+            if !self.precounted.remove(&(owner, oid)) {
+                *self.alloc_delta.entry(i).or_default() += 1;
+            }
+        }
+        self.omap_set(owner, oid, paddr, None, 0)?;
+        let xid = self.xid;
+        let vo = self.virt.get_mut(&(owner, oid)).unwrap();
+        vo.mapped = Some((xid, paddr));
+        vo.b.put64(8, oid);
+        vo.b.put64(16, xid);
+        let mut b = vo.b.clone();
+        let ty = u32::from_le_bytes(b[24..28].try_into().unwrap());
+        if ty & 0xffff == otype::BTREE || ty & 0xffff == otype::BTREE_NODE {
+            let root = Node { b: b.clone() }.is_root();
+            b.put32(24, (ty & !0xffff) | if root { otype::BTREE } else { otype::BTREE_NODE });
+        }
+        self.count(Site::Cached);
+        set_checksum(&mut b);
+        self.sink.write_at(paddr * self.l.bs, &b)?;
+        Ok(paddr)
+    }
+
+    /// The reaper's last completed reap identifier and its next one
+    /// (`nr_completed_id`, `nr_next_reap_id`).
+    pub fn reap_ids(&self) -> (u64, u64) {
+        (self.reaper.completed_id, self.reaper.next_reap_id)
+    }
+}
+
+/// The order of 8-byte unsigned keys (apfs_sealvolume's u64 trees,
+/// S:0x100007eb0).
+pub fn cmp_u64(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    u64a(a, 0).cmp(&u64a(b, 0))
 }
 
 /// A physical tree's nodes.

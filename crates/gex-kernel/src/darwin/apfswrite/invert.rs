@@ -454,21 +454,32 @@ fn dstream_xfield(v: &[u8]) -> Result<Option<Vec<u8>>, String> {
     Ok(None)
 }
 
-/// `apfs_modified_by` (0x1000133d8 → 0x10003455c): "apfs_invert
-/// (2236.140.6)" at the front (an entry of that name moves there, else
-/// the oldest goes), its time and transaction; the clone transaction.
+/// `apfs_modified_by` (0x1000133d8 → 0x10003455c) as apfs_invert calls
+/// it: [`modified_by_as`] with "apfs_invert (2236.140.6)".
 fn modified_by(nx: &mut Nx<'_>, vol: usize, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    modified_by_as(nx, vol, INVERT_ID, now)
+}
+
+/// `apfs_update_last_modified_by` (0x1000133d8 → 0x10003455c) of a user
+/// space tool: `ident` ("%s (%s)" of its name and version) at the front (an
+/// entry of that name moves there, else the oldest goes; the bytes after
+/// its NUL are the old front entry's), its time (one clock reading) and
+/// transaction; the clone transaction and the last change this one.
+pub fn modified_by_as(nx: &mut Nx<'_>, vol: usize, ident: &str, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    if ident.len() >= 32 {
+        return Err(format!("a modified_by name of {} bytes", ident.len()));
+    }
     let xid = nx.xid;
     let ts = now();
     let sb = nx.vol_sb(vol)?;
     let mut id = [0u8; 32];
-    id[..INVERT_ID.len()].copy_from_slice(INVERT_ID.as_bytes());
+    id[..ident.len()].copy_from_slice(ident.as_bytes());
     let entry = |i: usize| 0x140 + 0x30 * i;
     // strncmp of 32 bytes: equal through the name's NUL.
-    let i = (0..7).find(|&i| sb[entry(i)..entry(i) + INVERT_ID.len() + 1] == id[..INVERT_ID.len() + 1]).unwrap_or(7);
+    let i = (0..7).find(|&i| sb[entry(i)..entry(i) + ident.len() + 1] == id[..ident.len() + 1]).unwrap_or(7);
     sb.copy_within(entry(0)..entry(i), entry(1));
-    sb[entry(0)..entry(0) + INVERT_ID.len()].copy_from_slice(INVERT_ID.as_bytes());
-    sb[entry(0) + INVERT_ID.len()] = 0;
+    sb[entry(0)..entry(0) + ident.len()].copy_from_slice(ident.as_bytes());
+    sb[entry(0) + ident.len()] = 0;
     sb.put64(entry(0) + 32, ts);
     sb.put64(entry(0) + 40, xid);
     sb.put64(0x3e0, xid);

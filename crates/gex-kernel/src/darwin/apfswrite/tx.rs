@@ -4449,6 +4449,54 @@ mod tests {
         fsops::run_time_gaps(&mut nx).unwrap();
     }
 
+    /// sync(2) walks the mount list from its tail (VFS_ITERATE_TAIL_FIRST):
+    /// the volume mounted last is synced first, its held times written and
+    /// committed in a transaction of their own, then the one mounted
+    /// before it, in the next.
+    #[test]
+    fn sync_takes_the_newest_mount_first() {
+        use super::super::fsops;
+        let blocks = 15_625_000u64;
+        let sink = Sparse::new(blocks * 4096);
+        let uuid = *b"gex-sync-order!!";
+        let fm = super::super::container::format(&sink, 4096, blocks, uuid).unwrap();
+        let mut nx = Nx::formatted(&sink, &fm, uuid, Mode::Kernel).unwrap();
+        nx.set_barrier(true);
+        nx.mount_rw().unwrap();
+        let mut t = 1_800_000_000_000_000_000u64;
+        let mut now = move || {
+            t += 1000;
+            t
+        };
+        let mut make = |nx: &mut Nx<'_>, name: &str, role: u16, now: &mut dyn FnMut() -> u64| {
+            let times = VolumeTimes { formatted: now(), root: now(), private: now(), modified: now() };
+            let o = nx.create_volume(&NewVolume { name: name.into(), role, encrypted: false, e_apfs: true, times, uid: 0, gid: 0, key_os_version: 0, size_bytes: None }).unwrap();
+            nx.commit().unwrap();
+            nx.fs_oid.iter().position(|&x| x == o).unwrap()
+        };
+        let older = make(&mut nx, "xART", 0x100, &mut now);
+        let newer = make(&mut nx, "Hardware", 0x140, &mut now);
+        fsops::mount_rw(&mut nx, older, &mut now).unwrap();
+        fsops::mount_rw(&mut nx, newer, &mut now).unwrap();
+        assert_eq!(nx.mounted, [older, newer]);
+        let a = fsops::create(&mut nx, older, 2, "a", 0o600, 0, 0, &mut now).unwrap().unwrap();
+        let b = fsops::create(&mut nx, newer, 2, "b", 0o600, 0, 0, &mut now).unwrap().unwrap();
+        nx.tx_finish().unwrap();
+        fsops::chmod(&mut nx, older, a, 0o600, &mut now).unwrap();
+        fsops::chmod(&mut nx, newer, b, 0o600, &mut now).unwrap();
+        let xid = nx.xid;
+        fsops::sync(&mut nx, &mut now).unwrap();
+        assert!(nx.jobj_times.is_empty());
+        assert_eq!(nx.xid, xid + 2, "a transaction for each volume's pass");
+        // Each volume's tree is one leaf: where the pass's rewrite went.
+        let at = |nx: &mut Nx<'_>, vol: usize| {
+            let root = nx.fs_tree(vol).unwrap().0.root;
+            let om = nx.omap_of(Owner::Volume(vol)).unwrap();
+            nx.omap_find(Owner::Volume(vol), om, root).unwrap().unwrap().0
+        };
+        assert_eq!((at(&mut nx, newer), at(&mut nx, older)), (xid, xid + 1));
+    }
+
     /// apfs_vfsop_unmount's tx_finish, as the sync's, writes no checkpoint
     /// when no transaction is open; its apfs_modified_by entry and unmount
     /// time then go into a new transaction, which stays open.

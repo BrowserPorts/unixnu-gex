@@ -2699,15 +2699,21 @@ fn vnode_pass(nx: &mut Nx<'_>, vol: usize, now: &mut dyn FnMut() -> u64) -> Resu
 }
 
 /// `sync(2)` (X 0xfffffff0073843ec): `vfs_iterate(LK_NOWAIT, sync_callback,
-/// NULL)` walks the mount list from its head, the oldest mount first, and
-/// gives each read-write mount VFS_SYNC(MNT_NOWAIT): for this container's
+/// NULL)` (`mov w0, #1` at X 0xfffffff0073843fc), whose `LK_NOWAIT` (1,
+/// `bsd/sys/mount.h`) is `VFS_ITERATE_TAIL_FIRST`: the mount list (each
+/// mount added at its tail by `mount_list_add`) walked from its tail, the
+/// newest mount first (X 0xfffffff00736e7ec..0x736e850 count down from the
+/// last of `mount_fillfsids`'s list when the flag's bit 0 is set), and
+/// each read-write mount given VFS_SYNC(MNT_NOWAIT): for this container's
 /// volumes apfs_vfsop_sync (K 0x66c9d80), whose vnode pass ([`vnode_pass`])
 /// writes held times, whose purgatory cleaner finds no deleted snapshot,
 /// and whose `tx_finish` (flags 0x11 when the container's sync count, +1,
 /// is a multiple of its mounted volumes, else 1: the same blocks) commits
-/// the open transaction. The ramdisk's own mounts hold nothing of disk0.
+/// the open transaction. `nx.mounted` is the volumes' order in the mount
+/// list: a mount joins its tail, an unmount leaves it. The ramdisk's own
+/// mounts, older than every disk0 volume's, hold nothing of disk0.
 pub fn sync(nx: &mut Nx<'_>, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
-    for vol in nx.mounted.clone() {
+    for vol in nx.mounted.clone().into_iter().rev() {
         vnode_pass(nx, vol, now)?;
         nx.tx_finish()?;
     }

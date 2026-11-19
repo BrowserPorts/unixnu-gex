@@ -3,8 +3,9 @@
 //! (`gex_kernel::darwin::apfswrite::restore`), written to a new sparse file
 //! of the device's size, the IPSW's operating system image
 //! (044-76040-038.dmg) restored into it when given, and the boot objects
-//! install_kernel_cache installs read from the extracted IPSW at
-//! `<ipsw-dir>` when given; the restore steps it does not have yet are
+//! install_kernel_cache installs and the canonical metadata and root hash
+//! the seal takes read from the extracted IPSW at `<ipsw-dir>` when given;
+//! the restore steps it does not have yet are
 //! listed in `<out>.missing`.
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -23,13 +24,17 @@ pub fn cmd(args: &[String]) -> Result<ExitCode> {
         None => None,
     };
     let has_boot = boot.is_some();
+    let seal = match ipsw {
+        Some(d) => Some(apfswrite::restore::SealFiles::read(std::path::Path::new(d)).map_err(|e| anyhow!("{e}"))?),
+        None => None,
+    };
     let os = match dmg {
         Some(dmg) => {
             let f = std::fs::File::open(dmg).with_context(|| format!("opening {dmg}"))?;
             let len = f.metadata()?.len();
             let image = gex_kernel::darwin::udif::Udif::open(std::sync::Arc::new(apfswrite::HostFile(f, len))).map_err(|e| anyhow!("{dmg}: {e}"))?;
             let partition = image.partition("Apple_APFS").ok_or_else(|| anyhow!("{dmg}: no Apple_APFS partition"))?;
-            Some(apfswrite::restore::OsImage { image: std::sync::Arc::new(image), partition, boot })
+            Some(apfswrite::restore::OsImage { image: std::sync::Arc::new(image), partition, boot, seal })
         }
         None => None,
     };

@@ -476,15 +476,16 @@ const fn uuid(s: &str) -> [u8; 16] {
     out
 }
 
-/// A volume's UUID. newfs_apfs 2236.140.6 gives every volume it adds the
-/// UUID `uuid_from_role` makes (on unless `-T`; the restore's `-D` asks for
-/// it again): "apfsuuid", the role big-endian, "volum" and the volume's
-/// slot, 61706673-7575-6964-RRRR-766f6c756dII (0x10001b554; the kernel's
-/// volume creation, 0xfffffff006672cc8, sets the same last byte). The
-/// System volume keeps its own: `apfs_invert`, which makes the system
-/// image's volume of the file ASR wrote into it, keeps the outer volume's
-/// UUID (its superblock update, 0x100006d00).
-pub fn volume_uuid(index: u32) -> [u8; 16] {
+/// A volume's UUID as newfs_apfs 2236.140.6 gives it to every volume it
+/// adds: the UUID `uuid_from_role` makes (on unless `-T`; the restore's
+/// `-D` asks for it again): "apfsuuid", the role big-endian, "volum" and the
+/// volume's slot, 61706673-7575-6964-RRRR-766f6c756dII (0x10001b554; the
+/// kernel's volume creation, 0xfffffff006672cc8, sets the same last byte).
+/// The System volume keeps its own through `apfs_invert`, which makes the
+/// system image's volume of the file ASR wrote into it and keeps the outer
+/// volume's UUID (its superblock update, 0x100006d00), up to the seal
+/// ([`volume_uuid`]).
+pub fn formatted_volume_uuid(index: u32) -> [u8; 16] {
     let Some(v) = volume(index) else { return [0; 16] };
     let mut u = uuid("61706673-7575-6964-0000-766f6c756d00");
     u[8..10].copy_from_slice(&v.role.to_be_bytes());
@@ -492,6 +493,18 @@ pub fn volume_uuid(index: u32) -> [u8; 16] {
     u
 }
 
+/// A volume's UUID as the restore leaves it: newfs_apfs's
+/// ([`formatted_volume_uuid`]), but the System volume's byte 14 one more,
+/// as `apfs_sealvolume -R` raises a predefined UUID's (its main between
+/// 0x100006f88 and 0x10000710c, `apfs_is_predefined_volume_uuid`
+/// 0x100046264), so 61706673-7575-6964-0001-766f6c756e00.
+pub fn volume_uuid(index: u32) -> [u8; 16] {
+    let mut u = formatted_volume_uuid(index);
+    if volume(index).is_some_and(|v| v.role == role::SYSTEM) {
+        u[14] = u[14].wrapping_add(1);
+    }
+    u
+}
 
 /// The name of the System volume's sealed snapshot the restore makes and
 /// the root is mounted from: "com.apple.os.update-" and, in hex capitals,
@@ -539,7 +552,8 @@ mod tests {
     fn volumes_take_their_roles_uuids() {
         assert_eq!(volume_uuid(4), uuid("61706673-7575-6964-0010-766f6c756d04"), "Preboot");
         assert_eq!(volume_uuid(3), uuid("61706673-7575-6964-0140-766f6c756d03"), "Hardware");
-        assert_eq!(volume_uuid(0), uuid("61706673-7575-6964-0001-766f6c756d00"), "System");
+        assert_eq!(volume_uuid(0), uuid("61706673-7575-6964-0001-766f6c756e00"), "System, sealed");
+        assert_eq!(formatted_volume_uuid(0), uuid("61706673-7575-6964-0001-766f6c756d00"), "System, formatted");
         assert_eq!(volume_uuid(1), uuid("61706673-7575-6964-0040-766f6c756d01"), "Data");
     }
 }

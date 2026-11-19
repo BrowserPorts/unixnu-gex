@@ -312,7 +312,8 @@ pub fn free_tmp_ino(nx: &mut Nx<'_>, vol: usize, ino: u64, now: &mut dyn FnMut()
 /// cleanup (expanded records: an iteration of the purgeable tombstones,
 /// which only offline purging makes and nothing here has made, then one
 /// file-system transaction clearing fs_flags 0x400), and the
-/// overprovisioning file's flag (none at the first mount).
+/// overprovisioning file's flag 0x800 when it lacks it (no file at the
+/// first mount).
 fn volume_fixup(nx: &mut Nx<'_>, vol: usize, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     let (sb, _) = nx.vol_sb_read(vol)?;
     let role = u16::from_le_bytes([sb[SB_ROLE], sb[SB_ROLE + 1]]);
@@ -349,8 +350,20 @@ fn volume_fixup(nx: &mut Nx<'_>, vol: usize, now: &mut dyn FnMut() -> u64) -> Re
         sb.put64(SB_FS_FLAGS, f & !0x400);
         fs_tx_leave(nx, vol, now)?;
     }
-    if lookup(nx, vol, ROOT_DIR_INO, ".overprovisioning_file")?.is_some() {
-        return Err("not implemented: the fixup thread's overprovisioning file flag (K 0x6713e00, inode flag 0x800)".into());
+    // The overprovisioning fixup (K 0x6714508..0x6714614): the root's
+    // `.overprovisioning_file` (K 0x67018ec), when its in-memory object
+    // lacks internal flag 0x800, given it in a file-system transaction
+    // (4, 1, 0) that writes the object (update_jobj K 0x66f5030, with any
+    // times it held unwritten): "overprovisioning fixup succeeded".
+    if let Some(ino) = lookup(nx, vol, ROOT_DIR_INO, ".overprovisioning_file")? {
+        if u64a(&inode(nx, vol, ino)?, INO_INTERNAL_FLAGS) & 0x800 == 0 {
+            fs_tx_enter(nx, vol)?;
+            let mut v = in_memory_inode(nx, vol, ino)?;
+            let f = u64a(&v, INO_INTERNAL_FLAGS);
+            v.put64(INO_INTERNAL_FLAGS, f | 0x800);
+            put_rec(nx, vol, &inode_key(ino), &v)?;
+            fs_tx_leave(nx, vol, now)?;
+        }
     }
     Ok(())
 }

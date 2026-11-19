@@ -193,6 +193,10 @@ pub enum Owner {
 struct VObj {
     b: Vec<u8>,
     mapped: Option<(u64, u64)>,
+    /// A headerless object (a sealed tree's node, `OBJ_NOHEADER`): its
+    /// bytes carry no header and no checksum, its mapping
+    /// `OMAP_VAL_NOHEADER`.
+    noheader: bool,
 }
 
 /// An object map: its `omap_phys_t`'s block and its tree.
@@ -1881,9 +1885,11 @@ impl<'a> Nx<'a> {
     }
 
     /// `omap_set` (I:0x10003ecb0) and the old mapping's `omap_delete`
-    /// (I:0x10003eedc) for object `oid` of `owner`, now at `paddr`: without
-    /// snapshots the old record goes and its block is freed.
-    fn omap_set(&mut self, owner: Owner, oid: u64, paddr: u64, old: Option<(u64, u64)>) -> Result<(), String> {
+    /// (I:0x10003eedc, flags 0) for object `oid` of `owner`, now at `paddr`,
+    /// its value's flags `vflags` past the encryption ones: the old record
+    /// goes and its block is freed, unless a snapshot of a volume's map
+    /// still needs it (`om_most_recent_snap` not older than it).
+    fn omap_set(&mut self, owner: Owner, oid: u64, paddr: u64, old: Option<(u64, u64)>, vflags: u32) -> Result<(), String> {
         let mut om = self.omap_of(owner)?;
         om.phys = self.phys_modify(om.phys)?;
         let mut k = oid.to_le_bytes().to_vec();
@@ -1900,7 +1906,7 @@ impl<'a> Nx<'a> {
             },
             Owner::Container => 0,
         };
-        let mut v = (flags as u32).to_le_bytes().to_vec();
+        let mut v = (flags as u32 | vflags).to_le_bytes().to_vec();
         v.extend_from_slice(&(self.l.bs as u32).to_le_bytes());
         v.extend_from_slice(&paddr.to_le_bytes());
         let vol = match owner {
@@ -1908,8 +1914,9 @@ impl<'a> Nx<'a> {
             Owner::Container => None,
         };
         om.tree.insert(&mut PhysStore { nx: self, subtype: otype::OMAP_TREE_SUBTYPE, class: 2, vol }, &k, Some(&v))?;
+        let snap = if vol.is_some() { u64a(&self.phys_obj(om.phys)?.b, 0x40) } else { 0 };
         if let Some((oxid, opaddr)) = old {
-            if oxid != self.xid {
+            if oxid != self.xid && snap < oxid {
                 let mut ok = oid.to_le_bytes().to_vec();
                 ok.extend_from_slice(&oxid.to_le_bytes());
                 om.tree.remove(&mut PhysStore { nx: self, subtype: otype::OMAP_TREE_SUBTYPE, class: 2, vol }, &ok)?;
@@ -1949,7 +1956,7 @@ impl<'a> Nx<'a> {
     fn virt_create(&mut self, owner: Owner, mut b: Vec<u8>) -> u64 {
         let oid = self.new_oid();
         b.put64(8, oid);
-        self.virt.insert((owner, oid), VObj { b, mapped: None });
+        self.virt.insert((owner, oid), VObj { b, mapped: None, noheader: false });
         self.virt_dirty.push((owner, oid));
         oid
     }
@@ -2000,12 +2007,28 @@ impl<'a> Nx<'a> {
                     }
                 }
             }
-            let paddr = self.alloc_meta_class(class)?;
-            let old = self.virt.get(&(owner, oid)).ok_or("a dirty object not in the cache")?.mapped;
-            self.omap_set(owner, oid, paddr, old)?;
+            let (old, noheader) = self.virt.get(&(owner, oid)).map(|v| (v.mapped, v.noheader)).ok_or("a dirty object not in the cache")?;
             let xid = self.xid;
+            // An object already placed in this transaction (`obj_write`
+            // before the flush) keeps its block and its mapping
+            // (obj_write_prepare, I:0x100035c88 = S:0x100056d34: an
+            // object's address is reused, with no omap_set, when its
+            // transaction is the one written).
+            let paddr = match old {
+                Some((x, p)) if x == xid => p,
+                _ => {
+                    let p = self.alloc_meta_class(class)?;
+                    self.omap_set(owner, oid, p, old, if noheader { omap_val::NOHEADER } else { 0 })?;
+                    p
+                }
+            };
             let vo = self.virt.get_mut(&(owner, oid)).unwrap();
             vo.mapped = Some((xid, paddr));
+            if noheader {
+                // Neither header nor checksum, so no count (S:0x100056e00).
+                self.sink.write_at(paddr * self.l.bs, &vo.b)?;
+                continue;
+            }
             vo.b.put64(8, oid);
             vo.b.put64(16, xid);
             let mut b = vo.b.clone();
@@ -2614,7 +2637,7 @@ impl<'a> Nx<'a> {
         sb.put32(0x42c, 2);
         sb.put32(0x450, 2);
         // The superblock's identifier was the volume's first.
-        self.virt.insert((Owner::Container, vol_oid), VObj { b: sb, mapped: None });
+        self.virt.insert((Owner::Container, vol_oid), VObj { b: sb, mapped: None, noheader: false });
         self.virt_dirty.push((Owner::Container, vol_oid));
         self.fs_oid[index] = vol_oid;
         Ok(vol_oid)
@@ -2701,6 +2724,184 @@ impl<'a> Nx<'a> {
         use crate::darwin::apfsread::Medium as _;
         self.sink.read_at(paddr * self.l.bs, buf)
     }
+}
+
+// ---- What apfs_sealvolume and the kernel's snapshot creation make.
+
+impl<'a> Nx<'a> {
+    /// The nodes of a virtual tree of `owner`, of `subtype`.
+    pub fn virt_store(&mut self, owner: Owner, subtype: u32) -> VirtStore<'_, 'a> {
+        VirtStore { nx: self, owner, subtype }
+    }
+
+    /// The nodes of a physical tree of `subtype`, their blocks from
+    /// metazone class `class`, counted in volume `vol`'s blocks.
+    pub fn phys_store(&mut self, subtype: u32, class: usize, vol: Option<usize>) -> PhysStore<'_, 'a> {
+        PhysStore { nx: self, subtype, class, vol }
+    }
+
+    /// A new virtual object of `owner` (`obj_create` of a virtual
+    /// descriptor), its bytes `b` with its type and subtype in the header,
+    /// dirty: its identifier, the next one.
+    pub fn virt_new(&mut self, owner: Owner, b: Vec<u8>) -> u64 {
+        self.virt_create(owner, b)
+    }
+
+    /// A new headerless virtual object of `owner` (a sealed tree's node,
+    /// `OBJ_NOHEADER`): its bytes `b`, header left zero, dirty; its
+    /// identifier, the next one.
+    pub fn virt_new_noheader(&mut self, owner: Owner, b: Vec<u8>) -> u64 {
+        let oid = self.new_oid();
+        self.virt.insert((owner, oid), VObj { b, mapped: None, noheader: true });
+        self.virt_dirty.push((owner, oid));
+        oid
+    }
+
+    /// Virtual object `oid` of `owner`, changed in this transaction
+    /// (`obj_dirty`).
+    pub fn virt_mut(&mut self, owner: Owner, oid: u64) -> Result<&mut Vec<u8>, String> {
+        if !self.virt.contains_key(&(owner, oid)) {
+            return Err(format!("no virtual object {oid:#x}"));
+        }
+        self.virt_modify(owner, oid);
+        Ok(&mut self.virt.get_mut(&(owner, oid)).unwrap().b)
+    }
+
+    /// Virtual object `oid` of `owner` as it stands.
+    pub fn virt_read(&self, owner: Owner, oid: u64) -> Result<&[u8], String> {
+        self.virt.get(&(owner, oid)).map(|v| v.b.as_slice()).ok_or_else(|| format!("not implemented: reading virtual object {oid:#x} through its object map"))
+    }
+
+    /// `obj_write(o, 1, xid)` of a virtual object made in this transaction
+    /// (`obj_write_prepare` I:0x100035c88 forced, then
+    /// `obj_write_internal` I:0x100036b44): its block now (`spaceman_alloc`
+    /// with 0x48 from its class), its mapping now, its header and checksum
+    /// set and the block written at once. It stays dirty: the flush
+    /// writes it again in the same block.
+    pub fn virt_write_now(&mut self, owner: Owner, oid: u64) -> Result<u64, String> {
+        let enc = matches!(owner, Owner::Volume(i) if self.vols.get(&i).is_some_and(|v| v.encrypted));
+        let vo = self.virt.get(&(owner, oid)).ok_or_else(|| format!("no virtual object {oid:#x}"))?;
+        if vo.mapped.is_some() || vo.noheader {
+            return Err("not implemented: obj_write of a virtual object already placed, or of a headerless one".into());
+        }
+        let paddr = self.alloc_meta_class(if enc { 0 } else { 1 })?;
+        if let Owner::Volume(i) = owner {
+            if !self.precounted.remove(&(owner, oid)) {
+                *self.alloc_delta.entry(i).or_default() += 1;
+            }
+        }
+        self.omap_set(owner, oid, paddr, None, 0)?;
+        let xid = self.xid;
+        let vo = self.virt.get_mut(&(owner, oid)).unwrap();
+        vo.mapped = Some((xid, paddr));
+        vo.b.put64(8, oid);
+        vo.b.put64(16, xid);
+        let mut b = vo.b.clone();
+        let ty = u32::from_le_bytes(b[24..28].try_into().unwrap());
+        if ty & 0xffff == otype::BTREE || ty & 0xffff == otype::BTREE_NODE {
+            let root = Node { b: b.clone() }.is_root();
+            b.put32(24, (ty & !0xffff) | if root { otype::BTREE } else { otype::BTREE_NODE });
+        }
+        self.count(Site::Cached);
+        set_checksum(&mut b);
+        self.sink.write_at(paddr * self.l.bs, &b)?;
+        Ok(paddr)
+    }
+
+    /// A new physical object (`obj_create` with no address), not a B-tree
+    /// node: its bytes `b` with its type in the header, its block from
+    /// metazone class `class` now; written at the commit as it is then.
+    /// Its address.
+    pub fn phys_new(&mut self, mut b: Vec<u8>, otype_full: u32, subtype: u32, class: usize) -> Result<u64, String> {
+        b.put32(24, otype_full);
+        b.put32(28, subtype);
+        self.phys_create(b, otype_full & otype::STORAGETYPE_MASK, subtype, class)
+    }
+
+    /// Physical object `paddr` as it stands.
+    pub fn phys_read(&mut self, paddr: u64) -> Result<Vec<u8>, String> {
+        Ok(self.phys_obj(paddr)?.b.clone())
+    }
+
+    /// The reaper's last completed reap identifier and its next one
+    /// (`nr_completed_id`, `nr_next_reap_id`).
+    pub fn reap_ids(&self) -> (u64, u64) {
+        (self.reaper.completed_id, self.reaper.next_reap_id)
+    }
+
+    /// Volume `index`'s snapshot metadata tree and its nodes' store.
+    pub fn snapmeta_tree(&mut self, index: usize) -> Result<(Tree, PhysStore<'_, 'a>), String> {
+        let t = self.vols.get(&index).ok_or_else(|| format!("no volume in slot {index}"))?.snapmeta;
+        Ok((t, PhysStore { nx: self, subtype: SNAPMETATREE, class: 1, vol: Some(index) }))
+    }
+
+    /// Volume `index`'s snapshot metadata tree after a change: the
+    /// superblock names its root by address.
+    pub fn set_snapmeta_tree(&mut self, index: usize, t: Tree) -> Result<(), String> {
+        let v = self.vols.get_mut(&index).ok_or_else(|| format!("no volume in slot {index}"))?;
+        let moved = v.snapmeta.root != t.root;
+        v.snapmeta = t;
+        if moved {
+            self.vol_sb(index)?.put64(0x98, t.root);
+        }
+        Ok(())
+    }
+
+    /// `_omap_snapshot_create(apfs, omap, &xid)` (K 0x6749ce0) on volume
+    /// `index`'s object map in this transaction: no room for another
+    /// snapshot is ENOSPC; the map copied (K 0x6748848: `obj_modify` with
+    /// copy-on-write, the superblock naming the copy, its last change this
+    /// transaction); its snapshot tree's kind must be a physical B-tree's
+    /// (EINVAL), made when there is none (`btree_create` of a physical
+    /// tree, flags 0, subtype `OBJECT_TYPE_OMAP_SNAPSHOT`, 8-byte keys and
+    /// 16-byte values: its root a block now, counted in the volume's); the
+    /// transaction's `omap_snapshot_t` {0, 0, 0} inserted under its
+    /// identifier; `om_most_recent_snap` this transaction, `om_snap_count`
+    /// one more.
+    pub fn omap_snapshot_create(&mut self, index: usize) -> Result<Result<(), i32>, String> {
+        const ENOSPC: i32 = 28;
+        const EINVAL: i32 = 22;
+        let owner = Owner::Volume(index);
+        let xid = self.xid;
+        let mut om = self.omap_of(owner)?;
+        let b = self.phys_obj(om.phys)?.b.clone();
+        if u32a(&b, 0x24) == u32::MAX {
+            return Ok(Err(ENOSPC));
+        }
+        om.phys = self.phys_modify(om.phys)?;
+        self.set_omap(owner, om)?;
+        self.vol_sb(index)?.put64(0x420, xid);
+        let ty = u32a(&b, 0x2c);
+        if ty & 0xffff != otype::BTREE {
+            return Ok(Err(EINVAL));
+        }
+        if u64a(&b, 0x38) != 0 {
+            return Err("not implemented: a snapshot of an object map that has a snapshot tree (its btree_get and copy-on-write)".into());
+        }
+        // `(type & 0xffff0000) | OBJ_PHYSICAL` with flags 0: bt_flags
+        // PHYSICAL only.
+        let shape = Shape { bt_flags: tree_flags::PHYSICAL, node_size: self.l.bs as usize, key_size: 8, val_size: 16, hash_size: 0 };
+        let mut st = PhysStore { nx: self, subtype: OBJECT_TYPE_OMAP_SNAPSHOT, class: 1, vol: Some(index) };
+        let mut t = Tree::create(&mut st, shape, cmp_u64)?;
+        t.insert(&mut st, &xid.to_le_bytes(), Some(&[0u8; 16]))?;
+        let p = self.phys_obj(om.phys)?;
+        p.b.put32(0x2c, ty);
+        p.b.put64(0x38, t.root);
+        p.b.put64(0x40, xid);
+        let c = u32a(&p.b, 0x24);
+        p.b.put32(0x24, c + 1);
+        self.phys_dirty_mark(om.phys);
+        Ok(Ok(()))
+    }
+}
+
+/// `OBJECT_TYPE_OMAP_SNAPSHOT`.
+const OBJECT_TYPE_OMAP_SNAPSHOT: u32 = 0x13;
+
+/// The order of 8-byte unsigned keys (an object map's snapshot tree,
+/// apfs_sealvolume's overallocated-ranges tree, S:0x100007eb0).
+pub fn cmp_u64(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    u64a(a, 0).cmp(&u64a(b, 0))
 }
 
 /// A physical tree's nodes.

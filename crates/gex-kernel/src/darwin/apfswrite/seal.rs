@@ -422,6 +422,9 @@ pub fn update_tree(recs: Vec<Rec>, digest: &Digests, extents: &mut Vec<Rec>) -> 
                     let (sid, size, alloced) = (u64a(&val, 4), u64a(&val, 12), u64a(&val, 20));
                     let r = size.div_ceil(BS) * BS;
                     if r < alloced {
+                        if name != b"com.apple.ResourceFork" {
+                            return Err(nim("update_tree's trim of an overallocated attribute stream other than a resource fork (0x1000091c0)"));
+                        }
                         val[20..28].copy_from_slice(&r.to_le_bytes());
                     }
                     val[0x24..0x2c].copy_from_slice(&1u64.to_le_bytes());
@@ -780,6 +783,185 @@ pub fn build(recs: Vec<Rec>) -> Result<(Builder, [u8; 32]), String> {
     Ok((b, h))
 }
 
+/// `asv_process_rsrc_xattr` (0x100015c7c) as update_tree meets each
+/// `com.apple.ResourceFork` attribute kept in a data stream: the streams
+/// whose file extents update_tree cuts at their size rounded up to whole
+/// blocks (FUN_10000adf8): a compressed file's resource fork of a non-zero
+/// size always (its compressed data-stream record, whose +0x38 is that
+/// size), another file's only when it holds more than that
+/// (`asv_track_overallocated_dstream` 0x100015e1c). By stream, that size.
+pub fn extent_limits(recs: &[Rec]) -> Result<HashMap<u64, u64>, String> {
+    let mut comp: HashMap<u64, bool> = HashMap::new();
+    let mut out = HashMap::new();
+    for (k, val) in recs {
+        let (oid, t) = jkey(k);
+        if t == ty::INODE {
+            comp.insert(oid, u32a(val, 68) & 0x20 != 0);
+            continue;
+        }
+        if t != ty::XATTR || u16a(val, 0) & 1 == 0 {
+            continue;
+        }
+        let nl = u16a(k, 8) as usize;
+        if &k[10..10 + nl - 1] != b"com.apple.ResourceFork" {
+            continue;
+        }
+        let (sid, size, alloced) = (u64a(val, 4), u64a(val, 12), u64a(val, 20));
+        let r = size.div_ceil(BS) * BS;
+        if comp.get(&oid) == Some(&true) {
+            if u16a(val, 2) != 0x30 {
+                return Err(format!("Unexpected size of extended attribute record for inode {oid}: expected 48, got {}", u16a(val, 2)));
+            }
+            if size != 0 {
+                out.insert(sid, r);
+            }
+        } else if r < alloced {
+            out.insert(sid, r);
+        }
+    }
+    Ok(out)
+}
+
+/// update_tree's file extents (`extents`, the file-system tree's file
+/// extent records in key order): each of a stream with a limit
+/// ([`extent_limits`]) cut there (FUN_10000adf8: the part past it, the
+/// whole extent at most, recorded in the overallocated-ranges tree by
+/// first block, the extent shortened by it), then one not cut to nothing
+/// inserted into the file extent tree (`fext_tree_insert_with_tree`
+/// 0x10002f104: key {stream, logical address}, value {length, the
+/// extent's flags but bit 0 in its top byte; physical block}). The file
+/// extent tree's records in insertion order and the ranges to free:
+/// first block to blocks.
+pub fn fext_records(extents: &[Rec], limits: &HashMap<u64, u64>, bs: u64) -> Result<(Vec<Rec>, BTreeMap<u64, u64>), String> {
+    let mut out = Vec::with_capacity(extents.len());
+    let mut ranges = BTreeMap::new();
+    for (k, v) in extents {
+        let (oid, t) = jkey(k);
+        if t != ty::FILE_EXTENT {
+            return Err(format!("a record of type {t} among the file extents"));
+        }
+        let logical = u64a(k, 8);
+        let lf = u64a(v, 0);
+        let (mut len, flags, phys) = (lf & 0x00ff_ffff_ffff_ffff, (lf >> 56) as u8, u64a(v, 8));
+        if let Some(&lim) = limits.get(&oid) {
+            let end = logical + len;
+            if lim <= end && end != lim {
+                let excess = (end - lim).min(len);
+                // bt_insert into the u64 tree: a second range at the same
+                // block is EEXIST, which aborts the seal.
+                if ranges.insert(phys + (len - excess) / bs, excess / bs).is_some() {
+                    return Err(format!("Cannot insert range to deallocate at offset {logical} in data stream {oid}: EEXIST"));
+                }
+                len -= excess;
+            }
+        }
+        if len == 0 {
+            continue;
+        }
+        if phys == 0 {
+            return Err(format!("Unexpected sparse extent at the offset {logical} in the data stream {oid}"));
+        }
+        let mut fk = oid.to_le_bytes().to_vec();
+        fk.extend_from_slice(&logical.to_le_bytes());
+        let mut fv = (len | u64::from(flags & 0xfe) << 56).to_le_bytes().to_vec();
+        fv.extend_from_slice(&phys.to_le_bytes());
+        out.push((fk, fv));
+    }
+    Ok((out, ranges))
+}
+
+/// The time `apfs_sealvolume -R` gives every record (seal.md 1, 2): the
+/// remap dictionary `mtree -p /mnt1 -m` writes holds, for each of the five
+/// time keys, the reference value of the first entry whose time on disk
+/// differs from it (the spec's own value, or the spec root's birth time
+/// where the spec has none); `populate_time_from_dict` takes the first of
+/// CHANGE, BIRTH, MODIFICATION, ACCESS, DATEADDED there. With every time
+/// in `mtree_txt` equal to the root's birth time, that is the root's birth
+/// time as soon as one entry differs; the root's own inode (`root`, its
+/// `j_inode_val_t`) is checked first. A spec with other times, or a root
+/// that matches it, would need mtree's whole walk: refused. The dictionary's
+/// identifier keys are not made: apfs_invert keeps the image's inode
+/// numbers, sibling and stream identifiers, which are the spec's.
+pub fn remap_time(mtree_txt: &[u8], root: &[u8]) -> Result<u64, String> {
+    let text = std::str::from_utf8(mtree_txt).map_err(|_| "mtree.txt is not UTF-8")?;
+    let parse = |v: &str| -> Result<u64, String> {
+        let (s, n) = v.split_once('.').ok_or_else(|| format!("a time {v:?} without nanoseconds"))?;
+        let (s, n): (u64, u64) = (s.parse().map_err(|_| format!("time {v:?}"))?, n.parse().map_err(|_| format!("time {v:?}"))?);
+        Ok(s * 1_000_000_000 + n)
+    };
+    let mut times = Vec::new();
+    let mut root_birth = None;
+    let (mut in_root, mut cont, mut seen_root) = (false, false, false);
+    for line in text.lines() {
+        let l = line.trim();
+        if !cont && (l.starts_with('#') || l.is_empty()) {
+            continue;
+        }
+        let words: Vec<&str> = l.split_whitespace().filter(|w| *w != "\\").collect();
+        if !cont {
+            // A new entry: the spec's root is the first "." at the start
+            // of a line.
+            in_root = !seen_root && !line.starts_with(char::is_whitespace) && words.first() == Some(&".");
+            seen_root |= in_root;
+        }
+        for w in &words {
+            if let Some((kw, v)) = w.split_once('=') {
+                if ["time", "btime", "ctime", "atime", "ptime"].contains(&kw) {
+                    let t = parse(v)?;
+                    times.push(t);
+                    if in_root && kw == "btime" {
+                        root_birth = Some(t);
+                    }
+                }
+            }
+        }
+        cont = l.ends_with('\\');
+    }
+    let rb = root_birth.ok_or("mtree.txt's root has no btime")?;
+    if times.iter().any(|&t| t != rb) {
+        return Err(nim("a spec whose times differ from its root's birth time (mtree's walk order decides the remap dictionary's values)"));
+    }
+    // The root's create, modification, change and access times.
+    if [16usize, 24, 32, 40].iter().all(|&o| u64a(root, o) == rb) {
+        return Err(nim("a System root whose times match the spec (mtree's walk of the other entries)"));
+    }
+    Ok(rb)
+}
+
+/// `Img4DecodeInit` of an Image4 file (`IMG4 ::= SEQUENCE { "IMG4", IM4P,
+/// [0] IM4M OPTIONAL, [1] IM4R OPTIONAL }`): its IM4P's type and data.
+pub fn img4_payload(img4: &[u8]) -> Result<(&[u8], &[u8]), String> {
+    use crate::darwin::image4::{der, tag};
+    let it = der::parse_sequence(img4, &[der::spec(tag::IA5_STRING, 0), der::spec(tag::SEQUENCE, der::SAVE_DER), der::spec(tag::context(0), der::OPTIONAL), der::spec(tag::context(1), der::OPTIONAL)]).map_err(|e| format!("failed to decode img4: {e}"))?;
+    if it[0] != Some(b"IMG4".as_slice()) {
+        return Err("failed to decode img4: not an IMG4".into());
+    }
+    crate::darwin::aar::im4p_payload(it[1].ok_or("failed to decode img4: no IM4P")?)
+}
+
+/// What `asv_extract_hash_blob` (0x100015204, without `-P`:
+/// `Img4DecodeInit`) and `authapfs_select_root_hash` (0x100016e98) take
+/// from the root-hash Image4 file: its payload, of type "isys" or "xsys"
+/// and 208 bytes, the hash length at +0xc and the 4, 8 and 16 KiB root
+/// hashes at +0x10, +0x50 and +0x90.
+pub fn root_hashes(img4: &[u8]) -> Result<[Vec<u8>; 3], String> {
+    let (ty_, p) = img4_payload(img4)?;
+    if p.len() != 0xd0 {
+        return Err(format!("unexpected payload data size: {} != 208", p.len()));
+    }
+    if ty_.len() != 4 {
+        return Err(format!("unexpected payload type length : {}", ty_.len()));
+    }
+    if ty_ != b"isys" && ty_ != b"xsys" {
+        return Err(format!("unexpected payload type: {}", String::from_utf8_lossy(ty_)));
+    }
+    let n = u32a(p, 0xc) as usize;
+    if n > 0x40 {
+        return Err(format!("a root hash of {n} bytes"));
+    }
+    Ok([p[0x10..0x10 + n].to_vec(), p[0x50..0x50 + n].to_vec(), p[0x90..0x90 + n].to_vec()])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -811,8 +993,24 @@ mod tests {
         }
         let (recs, extents) = sealed_records(&v, T_SPEC, &digest).unwrap();
         assert!(!extents.is_empty());
-        let (_, h) = build(recs).unwrap();
+        let (_, h) = build(recs.clone()).unwrap();
         let hex: String = h.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(hex, "61f50c6269a33b16100d87e8a69de5797ccf07c1ab54ad68b02d5f236f366745");
+        // The mtree's remap time from its spec and the image's root.
+        if let Ok(mtree) = std::env::var("GEX_TEST_MTREE") {
+            let archive = crate::darwin::aar::mtree_payload(&std::fs::read(&mtree).unwrap()).unwrap();
+            let txt = crate::darwin::aar::file(&archive, "mtree.txt").unwrap();
+            let root = records(&v).unwrap().into_iter().find(|(k, _)| jkey(k) == (2, ty::INODE)).unwrap().1;
+            assert_eq!(remap_time(txt, &root).unwrap(), T_SPEC);
+        }
+        // The one overallocated stream: a compressed file's resource fork
+        // of 1,083,643 bytes in 266 blocks, its last block cut off.
+        let srecs = remap(restore_deletions(records(&v).unwrap()).unwrap().0, T_SPEC).unwrap();
+        let limits = extent_limits(&srecs).unwrap();
+        let (frecs, ranges) = fext_records(&extents, &limits, BS).unwrap();
+        assert_eq!(frecs.len(), extents.len());
+        assert_eq!(ranges.len(), 1);
+        let (&p, &n) = ranges.iter().next().unwrap();
+        assert_eq!((p, n), (0x1594e5 + 265, 1));
     }
 }

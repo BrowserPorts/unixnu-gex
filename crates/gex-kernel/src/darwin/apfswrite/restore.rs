@@ -52,7 +52,7 @@ pub fn key_os_version(build: &str) -> Result<u32, String> {
 /// transactions holds (on internal storage the kernel commits only when a
 /// sync, an unmount or a full transaction asks it to, K 0x675a6a0, so the
 /// grouping follows what else wrote to the container meanwhile).
-pub const RUN_STAND_IN: &str = "the erase restore's clock readings, transaction grouping and the order its concurrent writers reach the kernel on disk0 (stand-in: the clock of the machine building the image; each call joining the open transaction until a sync, an unmount, a volume creation or a volume rename commits it; asr's thread mounting System first, then restored_external's main-thread steps from init_gigalocker to commit_sep_os all reaching the kernel before asr's first call, then asr's file, its size and its four writer threads' pwrites in step order; the kernel's container unmounted (its last transaction committed, block 0 written) after the unmounts of everything and before apfs_invert opens the device, and the kernel's apfs_reaper thread, started by its next mount of the container, running to its end before anything else reaches the container; the threads Data's read-write mount starts making their writes in the order the mount starts them, the pfkur thread's temporary inode then the fixup thread's transaction, both before User's volumeCreate; measure the device's disk0 after its erase restore)";
+pub const RUN_STAND_IN: &str = "the erase restore's clock readings, transaction grouping and the order its concurrent writers reach the kernel on disk0 (stand-in: the clock of the machine building the image; each call joining the open transaction until a sync, an unmount, a volume creation or a volume rename commits it; asr's thread mounting System first, then restored_external's main-thread steps from init_gigalocker to commit_sep_os all reaching the kernel before asr's first call, then asr's file, its size and its four writer threads' pwrites in step order; the kernel's container unmounted (its last transaction committed, block 0 written) after the unmounts of everything and before apfs_invert opens the device, and again before apfs_sealvolume opens it (drafts/s27/re-seal-snap.md U-H), and the kernel's apfs_reaper thread, started by its next mount of the container, running to its end before anything else reaches the container, so that apfs_sealvolume's mount finds no reaper work (re-seal-snap.md U1'); the threads Data's read-write mount starts making their writes in the order the mount starts them, the pfkur thread's temporary inode then the fixup thread's transaction, both before User's volumeCreate; measure the device's disk0 after its erase restore)";
 
 /// Every stand-in the build takes, for the caller to report: the image
 /// is the device's only where these are.
@@ -62,6 +62,7 @@ pub fn stand_ins(os: bool, boot: bool) -> Vec<&'static str> {
         v.push(SPLAT_STAND_IN);
         v.push(TICKET_STAND_IN);
         v.push(RESTORE_HOST_STAND_IN);
+        v.push(super::snapshot::SNAP_UUID_STAND_IN);
     }
     if os {
         v.push(fsops::FILE_INODE_STAND_IN);
@@ -85,6 +86,53 @@ pub struct OsImage {
     /// The IPSW's boot objects install_kernel_cache's list installs
     /// (listed as missing without them).
     pub boot: Option<BootObjects>,
+    /// The host's files seal_system_volume takes (the restore's later
+    /// steps listed as missing without them).
+    pub seal: Option<SealFiles>,
+}
+
+/// What the restore host sends seal_system_volume
+/// (drafts/s27/re-seal-snap.md 3.1): SystemImageCanonicalMetadataFile and
+/// SystemImageRootHashFile, the IPSW's `Firmware/044-76040-038.dmg.mtree`
+/// and `.root_hash` (the latter as the host's Image4 file of it,
+/// TICKET_STAND_IN).
+pub struct SealFiles {
+    /// The `.mtree` IM4P: an Apple Archive of `digest.db` and `mtree.txt`.
+    pub mtree: Vec<u8>,
+    /// The `.root_hash` IM4P.
+    pub root_hash: Vec<u8>,
+}
+
+impl SealFiles {
+    /// The files from an IPSW extracted at `dir`.
+    pub fn read(dir: &std::path::Path) -> Result<Self, String> {
+        let r = |p: &str| std::fs::read(dir.join(p)).map_err(|e| format!("{}: {e}", dir.join(p).display()));
+        Ok(SealFiles { mtree: r("Firmware/044-76040-038.dmg.mtree")?, root_hash: r("Firmware/044-76040-038.dmg.root_hash")? })
+    }
+}
+
+/// Where a caller looks at the build or stops it (see
+/// [`build_disk0_hooked`]).
+pub struct Hooks<'h> {
+    /// Given the container as asr's first call reaches the kernel; the
+    /// build goes on only if it returns true.
+    pub before_asr: &'h mut dyn FnMut(&mut Nx<'_>) -> Result<bool, String>,
+    /// Run when the container is handed to apfs_invert (its state on disk
+    /// then complete).
+    pub before_invert: &'h mut dyn FnMut() -> Result<(), String>,
+    /// Given the container apfs_invert left; the build goes on only if it
+    /// returns true.
+    pub after_invert: &'h mut dyn FnMut(&mut Nx<'_>) -> Result<bool, String>,
+    /// Run when the container is handed to apfs_sealvolume (its state on
+    /// disk then complete).
+    pub before_seal: &'h mut dyn FnMut() -> Result<(), String>,
+    /// Given the container apfs_sealvolume left; the build goes on only if
+    /// it returns true.
+    pub after_seal: &'h mut dyn FnMut(&mut Nx<'_>) -> Result<bool, String>,
+    /// The device apfs_invert and apfs_sealvolume open reporting
+    /// `DK_FEATURE_BARRIER` as this says (the container device's own
+    /// answer when `None`).
+    pub barrier: Option<bool>,
 }
 
 /// Writes disk0 on `disk` (zeroed, the size of [`storage::disk0_bytes`]),
@@ -102,6 +150,12 @@ pub fn build_disk0(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() -> u64,
 /// reporting `DK_FEATURE_BARRIER` as `barrier` says (the container
 /// device's own answer when `None`).
 pub fn build_disk0_with(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() -> u64, os: Option<&OsImage>, before_asr: &mut dyn FnMut(&mut Nx<'_>) -> Result<bool, String>, before_invert: &mut dyn FnMut() -> Result<(), String>, after_invert: &mut dyn FnMut(&mut Nx<'_>) -> Result<bool, String>, barrier: Option<bool>) -> Result<Missing, String> {
+    build_disk0_hooked(disk, now, os, &mut Hooks { before_asr, before_invert, after_invert, before_seal: &mut || Ok(()), after_seal: &mut |_| Ok(true), barrier })
+}
+
+/// [`build_disk0`] with the caller's [`Hooks`].
+pub fn build_disk0_hooked(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() -> u64, os: Option<&OsImage>, hooks: &mut Hooks<'_>) -> Result<Missing, String> {
+    let barrier = hooks.barrier;
     let n = storage::nvme();
     let bs = u64::from(n.block_size);
     if disk.size() != storage::disk0_bytes() {
@@ -156,7 +210,7 @@ pub fn build_disk0_with(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() ->
     fsops::mount_rw(&mut nx, update, now)?;
     update_hierarchy(&mut nx, update, now)?;
     fsops::unmount(&mut nx, update, false, now)?;
-    if !before_asr(&mut nx)? {
+    if !(hooks.before_asr)(&mut nx)? {
         return Ok(missing);
     }
     // 5. restore_asr starts asr on its own queue (0x10003f4f4) and the main
@@ -188,10 +242,10 @@ pub fn build_disk0_with(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() ->
     // tool's own mount.
     nx.unmount()?;
     if let Some(os) = os {
-        before_invert()?;
-        let barrier = barrier.unwrap_or_else(crate::darwin::storagestack::container_barrier);
-        super::invert::invert(&mut nx, system, super::asr::IMAGE_NAME, std::sync::Arc::clone(&disk), base, barrier, now)?;
-        if !after_invert(&mut nx)? {
+        (hooks.before_invert)()?;
+        let tool_barrier = barrier.unwrap_or_else(crate::darwin::storagestack::container_barrier);
+        super::invert::invert(&mut nx, system, super::asr::IMAGE_NAME, std::sync::Arc::clone(&disk), base, tool_barrier, now)?;
+        if !(hooks.after_invert)(&mut nx)? {
             return Ok(missing);
         }
         // The kernel's next mount of the container (await_asr_and_retry
@@ -246,16 +300,39 @@ pub fn build_disk0_with(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() ->
         // create_partition_mountpoints.
         fixup_var_copy(&mut nx, system, data, now)?;
         create_partition_mountpoints(&mut nx, system, data, &RestoreOptions::DEFAULTS, now)?;
+        let v = Volumes { system, xart, hardware, preboot, update };
+        match &os.seal {
+            Some(files) => {
+                // The main list after check_mounted's block and the NVRAM
+                // steps (drafts/s27/re-seal-snap.md 0).
+                missing.push("populate_preboot_volume (drafts/s27/re-populate.md: the firmware items copied into Preboot's preallocated files, /mnt9/active's O_TRUNC fast truncate (K 0x669d444 not traced), the directories it makes; its NVRAM reads)".into());
+                missing.push(autoboot_sync_missing(&mut nx));
+                let tool_barrier = barrier.unwrap_or_else(crate::darwin::storagestack::container_barrier);
+                missing.push(IMAGE4_CHECKS_MISSING.into());
+                if !seal_system_volume(&mut nx, v, data, user, files, tool_barrier, hooks, now)? {
+                    return Ok(missing);
+                }
+                match &os.boot {
+                    Some(_) => {
+                        create_system_snapshot(&mut nx, v, now)?;
+                        // prepare_data_split, convert_eds_volumes,
+                        // split_data_volume and commit_temporary_checkpoint
+                        // log and return on an erase restore
+                        // (re-seal-snap.md 5).
+                        migrate_user_fsevents(&mut nx, v, data, user, now)?;
+                        unmount_filesystems(&mut nx, v, data, user, now)?;
+                    }
+                    None => missing.push("create_system_snapshot, migrate_user_fsevents' mounts and unmount_filesystems (no IPSW boot objects: Preboot has no usr/standalone/firmware/root_hash.img4, whose absence takes the legacy snapshot name and fs_snapshot_root, not implemented)".into()),
+                }
+            }
+            None => missing.push("the restore's later steps, in its order: populate_preboot_volume, set_autoboot_delay's sync, seal_system_volume (its unmounts and apfs_sealvolume), create_system_snapshot, migrate_user_fsevents' mounts and unmount_filesystems (no canonical metadata and root hash given)".into()),
+        }
     }
     if os.is_none() {
         missing.push("the Data and User volumes (newfs_apfs -P), made after apfs_invert".into());
+        // 7.
+        missing.push("the restore's later writes to Preboot (install_kernel_cache's boot objects, populate_preboot_volume, install_splat's cryptex1) and Data's contents".into());
     }
-    // 7.
-    missing.push(if os.is_some() {
-        "the restore's later steps, in its order: populate_preboot_volume, set_autoboot_delay's sync, seal_system_volume (its unmounts and apfs_sealvolume), create_system_snapshot, migrate_user_fsevents' mounts and unmount_filesystems".into()
-    } else {
-        "the restore's later writes to Preboot (install_kernel_cache's boot objects, populate_preboot_volume, install_splat's cryptex1) and Data's contents".into()
-    });
     if os.is_some() {
         missing.push(nvram_missing(&nvram_after_fixup_var(&RestoreOptions::DEFAULTS)?));
     }
@@ -1703,6 +1780,132 @@ fn after_invert_mounts(nx: &mut Nx<'_>, v: Volumes, now: &mut dyn FnMut() -> u64
     Ok(())
 }
 
+/// What restored_external checks with libimg4 before the seal that the
+/// image cannot answer.
+const IMAGE4_CHECKS_MISSING: &str = "restored_external's Image4 checks against the AP ticket of the canonical metadata (ramrod_verify_manifest_for_mountpoint, RE@0x100058108 → RE@0x1000583e0) and of /mnt5/root_hash (tag 'isys', RE@0x100058714): TICKET_STAND_IN's ticket signs nothing, so they are not run (the files are the IPSW's, which the device's checks pass)";
+
+/// set_autoboot_delay's `sync()` (RE@0x100033ef8; drafts/s27/
+/// re-seal-snap.md 2.1), not implemented: XNU's VFS_SYNC of each mounted
+/// read-write volume, oldest mount first, whose vnode pass writes the
+/// times inodes hold in memory (in each mount's vnode-list order, which
+/// depends on the vnodes the restore's copies left: re-txdata.md 4.2,
+/// re-datawrite.md UNSETTLED-4), and the first volume's tx_finish commit.
+/// The times it writes are not written: they leave the kernel's memory
+/// here, as the device's sync leaves them on disk, so that the seal's
+/// forced unmounts find none (the first of those commits the transaction
+/// the sync would have, with the same identifier). The missing entry.
+fn autoboot_sync_missing(nx: &mut Nx<'_>) -> String {
+    let held: Vec<String> = nx.jobj_times.iter().map(|((v, i), t)| format!("slot {v} {i:#x} ({}, {})", t.0, t.1)).collect();
+    nx.jobj_times.clear();
+    format!("set_autoboot_delay's sync(2) (its vnode passes over every read-write volume): the {} inodes' modification and change times it writes are not written: {}", held.len(), held.join(", "))
+}
+
+/// seal_system_volume (RE@0x10003ab6c; drafts/s27/re-seal-snap.md 3): the
+/// canonical metadata unarchived on the ramdisk's /mnt5 (tmpfs) and
+/// `mtree -m` reading /mnt1 (the mounts set MNT_NOATIME: no write);
+/// unmount_filesystems_everything without Update (RE@0x10002ecb8: from
+/// the volume table's last slot down, each mounted volume forced:
+/// Preboot, Hardware, User, Data, xART after `seputil
+/// --gigalocker-shutdown` (a Secure Enclave call only), System), then
+/// Update's `unmount("/mnt4", 0)`; the container handed to
+/// apfs_sealvolume (RUN_STAND_IN, as for apfs_invert); the seal
+/// ([`super::sealvolume::seal_volume`]); then `mount_partition(0, ro)`,
+/// the kernel's next mount of the container (its reaper idle, System
+/// read-only: no write), and Update's read-write mount. Whether the build
+/// goes on.
+#[allow(clippy::too_many_arguments)]
+fn seal_system_volume(nx: &mut Nx<'_>, v: Volumes, data: usize, user: usize, files: &SealFiles, barrier: bool, hooks: &mut Hooks<'_>, now: &mut dyn FnMut() -> u64) -> Result<bool, String> {
+    let archive = crate::darwin::aar::mtree_payload(&files.mtree)?;
+    let digest_db = crate::darwin::aar::file(&archive, "digest.db")?;
+    let mtree_txt = crate::darwin::aar::file(&archive, "mtree.txt")?;
+    // writeToFile:"/mnt5/root_hash": the host's Image4 file of the root
+    // hash (TICKET_STAND_IN).
+    let root_hash = img4(&files.root_hash, &TICKET);
+    for vol in [v.preboot, v.hardware, user, data, v.xart, v.system] {
+        fsops::unmount(nx, vol, true, now)?;
+    }
+    fsops::unmount(nx, v.update, false, now)?;
+    nx.unmount()?;
+    (hooks.before_seal)()?;
+    super::sealvolume::seal_volume(nx, v.system, &super::sealvolume::SealInputs { root_hash: &root_hash, digest_db, mtree_txt }, barrier, now)?;
+    if !(hooks.after_seal)(nx)? {
+        return Ok(false);
+    }
+    nx.set_barrier(crate::darwin::storagestack::container_barrier());
+    nx.remount(Mode::Kernel)?;
+    nx.reaper_run()?;
+    fsops::mount_rw(nx, v.update, now)?;
+    Ok(true)
+}
+
+/// `copy_arv_apfs_system_snapshot_name(data, 1)` (RE@0x10001d74c →
+/// RE@0x10001d558): the Image4 file's payload (Img4DecodeInit), at least
+/// 16 bytes, its hash length at +0xc and at least that many bytes after
+/// +0x10; "com.apple.os.update-" and those bytes in "%02X".
+fn arv_snapshot_name(img4_file: &[u8]) -> Result<String, String> {
+    let (_, p) = super::seal::img4_payload(img4_file)?;
+    if p.len() < 16 {
+        return Err("a root hash payload under 16 bytes".into());
+    }
+    let n = u32::from_le_bytes(p[0xc..0x10].try_into().unwrap()) as usize;
+    if p.len() < 0x10 + n {
+        return Err("a root hash payload shorter than its hash".into());
+    }
+    Ok(format!("com.apple.os.update-{}", p[0x10..0x10 + n].iter().map(|b| format!("{b:02X}")).collect::<String>()))
+}
+
+/// create_system_snapshot (RE@0x100039ab4; drafts/s27/re-seal-snap.md 4):
+/// preboot_path's `mount_partition(9, rw)` and its /mnt9/<nsih>; the root
+/// hash Image4 file install_root_hash wrote there read; the update
+/// snapshot's name made of it (the name the device tree's
+/// `root-snapshot-name` gives the booted kernel, [`storage::ROOT_SNAPSHOT`]);
+/// `fs_snapshot_create` on /mnt1 ([`super::snapshot::fs_snapshot_create`]).
+/// With that name, no `mount_partition(0, 0)` and no `fs_snapshot_root`.
+fn create_system_snapshot(nx: &mut Nx<'_>, v: Volumes, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    fsops::mount_rw(nx, v.preboot, now)?;
+    let dir = nsih();
+    resolve(nx, v.preboot, &dir)?.ok_or_else(|| format!("no /mnt9/{dir}"))?;
+    let f = resolve(nx, v.preboot, &format!("{dir}/usr/standalone/firmware/root_hash.img4"))?.ok_or("not implemented: no root_hash.img4 on Preboot (the legacy snapshot name and fs_snapshot_root)")?;
+    let bytes = file_bytes(nx, v.preboot, f)?;
+    let name = arv_snapshot_name(&bytes)?;
+    if name != storage::ROOT_SNAPSHOT {
+        return Err(format!("the update snapshot {name} is not the one the boot mounts ({})", storage::ROOT_SNAPSHOT));
+    }
+    match super::snapshot::fs_snapshot_create(nx, v.system, &name, now)? {
+        Ok(_) => Ok(()),
+        Err(e) => Err(format!("Failed to create ARV snapshot. (errno {e})")),
+    }
+}
+
+/// migrate_user_fsevents (RE@0x10003c044; re-seal-snap.md 5): with
+/// `e-apfs` the data volume is split, so xART (`seputil
+/// --gigalocker-init` only stats it and calls the Secure Enclave), Data
+/// and User are mounted read-write (`mount_apfs -R`; the
+/// `.ramdisk-boot-done` opens fail at their lookups); neither User's nor
+/// Data's root has `.fseventsd`, so nothing is migrated.
+fn migrate_user_fsevents(nx: &mut Nx<'_>, v: Volumes, data: usize, user: usize, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    for vol in [v.xart, data, user] {
+        fsops::mount_rw(nx, vol, now)?;
+    }
+    for vol in [user, data] {
+        if fsops::lookup(nx, vol, ROOT_INO, ".fseventsd")?.is_some() {
+            return Err("not implemented: migrating user fsevents (RE@0x100058c7c with a .fseventsd)".into());
+        }
+    }
+    Ok(())
+}
+
+/// unmount_filesystems (RE@0x10001af18 → RE@0x10002ef18): the same loop as
+/// the seal's, without Update, forced: Preboot, User, Data, xART (after
+/// `seputil --gigalocker-shutdown`); System is mounted read-only (no
+/// transaction), Hardware not at all.
+fn unmount_filesystems(nx: &mut Nx<'_>, v: Volumes, data: usize, user: usize, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    for vol in [v.preboot, user, data, v.xart] {
+        fsops::unmount(nx, vol, true, now)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1741,7 +1944,8 @@ mod tests {
             let want = storage::volume(v).unwrap();
             let vol = c.volume(v as usize).unwrap().unwrap();
             assert_eq!((vol.sb.volname.as_str(), vol.sb.role, vol.sb.fs_index), (want.name, want.role, v));
-            assert_eq!(vol.sb.uuid, storage::volume_uuid(v));
+            // Without the system image the seal does not run.
+            assert_eq!(vol.sb.uuid, storage::formatted_volume_uuid(v));
             assert!(vol.inode(2).unwrap().is_some_and(|i| i.is_dir()));
             assert_eq!(vol.lookup(2, "nothing").unwrap().map(|e| e.name), None);
         }
@@ -1871,7 +2075,7 @@ mod tests {
         let len = f.metadata().unwrap().len();
         let image = std::sync::Arc::new(crate::darwin::udif::Udif::open(std::sync::Arc::new(super::super::HostFile(f, len))).unwrap());
         let partition = image.partition("Apple_APFS").unwrap();
-        let os = OsImage { image: std::sync::Arc::clone(&image), partition, boot: None };
+        let os = OsImage { image: std::sync::Arc::clone(&image), partition, boot: None, seal: None };
         let size = storage::disk0_bytes();
         let dir = std::path::Path::new(&dir);
         let disk_path = dir.join(format!("gex-disk0-asr-{}", std::process::id()));
@@ -1952,7 +2156,7 @@ mod tests {
         let len = f.metadata().unwrap().len();
         let image = std::sync::Arc::new(crate::darwin::udif::Udif::open(std::sync::Arc::new(super::super::HostFile(f, len))).unwrap());
         let partition = image.partition("Apple_APFS").unwrap();
-        let os = OsImage { image: std::sync::Arc::clone(&image), partition, boot: None };
+        let os = OsImage { image: std::sync::Arc::clone(&image), partition, boot: None, seal: None };
         let size = storage::disk0_bytes();
         let dir = std::path::Path::new(&dir);
         let disk_path = dir.join(format!("gex-inv-disk-{}", std::process::id()));
@@ -2029,6 +2233,135 @@ mod tests {
         assert!(diffs.is_empty(), "{} blocks differ: {:?}", diffs.len(), &diffs[..diffs.len().min(40)]);
     }
 
+    /// apfs_sealvolume against the device's own binary
+    /// (GEX_TEST_SEALVOLUME: the host-runnable copy that takes a container
+    /// file, drafts/s18/bin/sv_file.mac; with GEX_TEST_UDIF, GEX_TEST_MTREE,
+    /// GEX_TEST_ROOT_HASH and GEX_TEST_SCRATCH): the container as the
+    /// restore hands it to apfs_sealvolume, sealed by the binary on a copy
+    /// and by the port, block for block (the port given the binary's two
+    /// clock readings; `-P` gives the binary the root hash's IM4P, whose
+    /// payload the device's Image4 file carries).
+    #[test]
+    fn seal_matches_the_device_binary() {
+        use crate::darwin::apfsread::Container;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let (Ok(dmg), Ok(dir), Ok(tool), Ok(mtree), Ok(rh)) = (std::env::var("GEX_TEST_UDIF"), std::env::var("GEX_TEST_SCRATCH"), std::env::var("GEX_TEST_SEALVOLUME"), std::env::var("GEX_TEST_MTREE"), std::env::var("GEX_TEST_ROOT_HASH")) else { return };
+        let f = std::fs::File::open(&dmg).unwrap();
+        let len = f.metadata().unwrap().len();
+        let image = std::sync::Arc::new(crate::darwin::udif::Udif::open(std::sync::Arc::new(super::super::HostFile(f, len))).unwrap());
+        let partition = image.partition("Apple_APFS").unwrap();
+        let files = SealFiles { mtree: std::fs::read(&mtree).unwrap(), root_hash: std::fs::read(&rh).unwrap() };
+        let archive = crate::darwin::aar::mtree_payload(&files.mtree).unwrap();
+        let os = OsImage { image: std::sync::Arc::clone(&image), partition, boot: None, seal: Some(files) };
+        let dir = std::path::Path::new(&dir);
+        let pid = std::process::id();
+        let disk_path = dir.join(format!("gex-seal-disk-{pid}"));
+        let ctr_path = dir.join(format!("gex-seal-ctr-{pid}"));
+        let db_path = dir.join(format!("gex-seal-digest-{pid}.db"));
+        let plist_path = dir.join(format!("gex-seal-remap-{pid}.plist"));
+        std::fs::write(&db_path, crate::darwin::aar::file(&archive, "digest.db").unwrap()).unwrap();
+        // The remap dictionary mtree -m writes (drafts/s18/exp/remap.plist).
+        let t = "1777576853000000000";
+        let keys = ["ACCESS", "BIRTH", "CHANGE", "DATEADDED", "MODIFICATION"].iter().map(|k| format!("\t<key>{k}</key>\n\t<integer>{t}</integer>\n")).collect::<String>();
+        std::fs::write(&plist_path, format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n{keys}</dict>\n</plist>\n")).unwrap();
+        let size = storage::disk0_bytes();
+        let f = std::fs::OpenOptions::new().create(true).truncate(true).read(true).write(true).open(&disk_path).unwrap();
+        f.set_len(size).unwrap();
+        let disk = std::sync::Arc::new(super::super::HostFile(f, size));
+        let (base, psize) = storage::partition_extent();
+        // Clocks before the checkers' own: fsck warns of times to come.
+        let clock: Rc<RefCell<(u64, Vec<u64>)>> = Rc::new(RefCell::new((1_760_000_000_000_000_000, Vec::new())));
+        let c2 = Rc::clone(&clock);
+        let mut now = move || {
+            let mut c = c2.borrow_mut();
+            if let Some(t) = c.1.pop() {
+                return t;
+            }
+            c.0 += 1000;
+            c.0
+        };
+        let c3 = Rc::clone(&clock);
+        let c4 = Rc::clone(&clock);
+        let d2 = std::sync::Arc::clone(&disk);
+        let (dp, cp, dbp, pp) = (disk_path.clone(), ctr_path.clone(), db_path.clone(), plist_path.clone());
+        let mut before_seal = move || -> Result<(), String> {
+            d2.0.sync_all().map_err(|e| e.to_string())?;
+            copy_container(&dp, &cp, base, psize);
+            let run = std::process::Command::new(&tool).arg("-R").arg(&pp).arg("-I").arg(&rh).arg("-P").arg("-u").arg(&dbp).args(["-d", "-v"]).arg(&cp).output().map_err(|e| e.to_string())?;
+            let log = String::from_utf8_lossy(&run.stderr);
+            eprintln!("{}", log.lines().filter(|l| !l.contains("skipping extended attribute file extent")).collect::<Vec<_>>().join("\n"));
+            assert!(run.status.success(), "apfs_sealvolume failed");
+            // The binary's clock readings, from its volume superblock.
+            let ctr = super::super::HostFile(std::fs::File::open(&cp).unwrap(), psize);
+            let c = std::sync::Arc::new(Container::open(std::sync::Arc::new(ctr)).unwrap());
+            let v = c.volume(0).unwrap().unwrap();
+            let paddr = c.omap().unwrap().lookup(&c, v.sb.header.oid, c.xid()).unwrap().unwrap().paddr;
+            let sb = c.read_raw(paddr).unwrap();
+            let q = |o: usize| u64::from_le_bytes(sb[o..o + 8].try_into().unwrap());
+            // Popped last first: the modified_by time, then the unmount time.
+            c3.borrow_mut().1 = vec![q(0x40), q(0x140 + 32)];
+            Ok(())
+        };
+        let diffs = Rc::new(RefCell::new(None));
+        let dd = Rc::clone(&diffs);
+        let fscks = Rc::new(RefCell::new(Vec::new()));
+        let ff = Rc::clone(&fscks);
+        let (d3, cp2, dp2) = (std::sync::Arc::clone(&disk), ctr_path.clone(), disk_path.clone());
+        let mut after_seal = move |nx: &mut Nx<'_>| -> Result<bool, String> {
+            use crate::darwin::apfsread::Medium;
+            let mut diffs = differing_blocks(&d3, base, psize, &cp2);
+            // The differing words of each differing block, for the report.
+            let theirs = super::super::HostFile(std::fs::File::open(&cp2).unwrap(), psize);
+            for d in diffs.iter_mut() {
+                let blk: u64 = d.split_whitespace().nth(1).unwrap().parse().unwrap();
+                let (mut a, mut b) = (vec![0u8; 4096], vec![0u8; 4096]);
+                d3.read_at(base + blk * 4096, &mut a).unwrap();
+                theirs.read_at(blk * 4096, &mut b).unwrap();
+                let w: Vec<String> = (8..512).filter(|i| a[8 * i..8 * i + 8] != b[8 * i..8 * i + 8]).take(8).map(|i| format!("{:#x}: ours {:#x} theirs {:#x}", 8 * i, u64::from_le_bytes(a[8 * i..8 * i + 8].try_into().unwrap()), u64::from_le_bytes(b[8 * i..8 * i + 8].try_into().unwrap()))).collect();
+                d.push_str(&format!(" [{}]", w.join(", ")));
+            }
+            *dd.borrow_mut() = Some(diffs);
+            // Then the kernel's update snapshot of the sealed volume on the
+            // port's container, checked by the device's and the host's
+            // fsck (GEX_TEST_FSCK).
+            if let Ok(fsck) = std::env::var("GEX_TEST_FSCK") {
+                let mut tick = || {
+                    let mut c = c4.borrow_mut();
+                    c.0 += 1000;
+                    c.0
+                };
+                let system = (0..nx.fs_oid.len()).find(|&i| nx.vol_oid(i).is_some() && nx.vol_sb_read(i).is_ok_and(|(b, _)| u16::from_le_bytes([b[0x3c4], b[0x3c5]]) == storage::role::SYSTEM)).unwrap();
+                nx.remount(Mode::Kernel)?;
+                nx.reaper_run()?;
+                let n = super::super::snapshot::fs_snapshot_create(nx, system, storage::ROOT_SNAPSHOT, &mut tick)?.map_err(|e| format!("fs_snapshot_create: errno {e}"))?;
+                assert_eq!(super::super::snapshot::fs_snapshot_create(nx, system, storage::ROOT_SNAPSHOT, &mut tick)?, Err(17));
+                nx.unmount()?;
+                d3.0.sync_all().map_err(|e| e.to_string())?;
+                copy_container(&dp2, &cp2, base, psize);
+                // -M: the container keybag is KEYS_STAND_IN's plaintext.
+                let dev = std::process::Command::new(&fsck).args(["-n", "-W", "-s", "-M"]).arg(&cp2).output().unwrap();
+                let host = std::process::Command::new("/sbin/fsck_apfs").args(["-n", "-s", "-M"]).arg(&cp2).output().unwrap();
+                eprintln!("snapshot xid {n}\n{}{}", String::from_utf8_lossy(&dev.stdout), String::from_utf8_lossy(&host.stdout));
+                ff.borrow_mut().push((dev.status.success(), String::from_utf8_lossy(&dev.stdout).into_owned() + &String::from_utf8_lossy(&dev.stderr)));
+                ff.borrow_mut().push((host.status.success(), String::from_utf8_lossy(&host.stdout).into_owned() + &String::from_utf8_lossy(&host.stderr)));
+            }
+            Ok(false)
+        };
+        // The binary runs on a regular file: no DK_FEATURE_BARRIER.
+        build_disk0_hooked(disk.clone(), &mut now, Some(&os), &mut Hooks { before_asr: &mut |_| Ok(true), before_invert: &mut || Ok(()), after_invert: &mut |_| Ok(true), before_seal: &mut before_seal, after_seal: &mut after_seal, barrier: Some(false) }).unwrap();
+        let diffs = diffs.borrow_mut().take().expect("the seal ran");
+        if std::env::var("GEX_TEST_KEEP").is_err() {
+            for p in [&disk_path, &ctr_path, &db_path, &plist_path] {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+        assert!(diffs.is_empty(), "{} blocks differ: {:?}", diffs.len(), &diffs[..diffs.len().min(60)]);
+        for (ok, out) in fscks.borrow().iter() {
+            assert!(ok, "fsck after the snapshot: {out}");
+        }
+    }
+
     /// The blocks of `psize` bytes at `base` of `disk` that differ from the
     /// container file `theirs`.
     fn differing_blocks(disk: &super::super::HostFile, base: u64, psize: u64, theirs: &std::path::Path) -> Vec<String> {
@@ -2082,7 +2415,7 @@ mod tests {
         let len = f.metadata().unwrap().len();
         let image = std::sync::Arc::new(crate::darwin::udif::Udif::open(std::sync::Arc::new(super::super::HostFile(f, len))).unwrap());
         let partition = image.partition("Apple_APFS").unwrap();
-        let os = OsImage { image: std::sync::Arc::clone(&image), partition, boot: None };
+        let os = OsImage { image: std::sync::Arc::clone(&image), partition, boot: None, seal: None };
         let size = storage::disk0_bytes();
         let dir = std::path::Path::new(&dir);
         let disk_path = dir.join(format!("gex-reap-disk-{}", std::process::id()));
@@ -2145,7 +2478,7 @@ mod tests {
         let len = f.metadata().unwrap().len();
         let image = std::sync::Arc::new(crate::darwin::udif::Udif::open(std::sync::Arc::new(super::super::HostFile(f, len))).unwrap());
         let partition = image.partition("Apple_APFS").unwrap();
-        let os = OsImage { image: std::sync::Arc::clone(&image), partition, boot: None };
+        let os = OsImage { image: std::sync::Arc::clone(&image), partition, boot: None, seal: None };
         let size = storage::disk0_bytes();
         let dir = std::path::Path::new(&dir);
         let disk_path = dir.join(format!("gex-rm-disk-{}", std::process::id()));
@@ -2314,7 +2647,7 @@ mod tests {
         let len = f.metadata().unwrap().len();
         let image = std::sync::Arc::new(crate::darwin::udif::Udif::open(std::sync::Arc::new(super::super::HostFile(f, len))).unwrap());
         let partition = image.partition("Apple_APFS").unwrap();
-        let os = OsImage { image: std::sync::Arc::clone(&image), partition, boot: None };
+        let os = OsImage { image: std::sync::Arc::clone(&image), partition, boot: None, seal: None };
         let size = storage::disk0_bytes();
         let dir = std::path::Path::new(&dir);
         let disk_path = dir.join(format!("gex-data-disk-{}", std::process::id()));

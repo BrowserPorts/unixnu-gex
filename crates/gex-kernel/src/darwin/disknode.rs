@@ -221,6 +221,23 @@ pub fn vfs_sync(index: u32, waitfor: u32) -> Result<(), String> {
     with_container(|nx| super::apfswrite::fsops::vfs_sync(nx, index as usize, waitfor, &mut nanotime))
 }
 
+/// `dounmount(mp, MNT_FORCE)` of the volume in slot `index`, which the
+/// kernel's container holds mounted read-write: no `VFS_SYNC`; `vflush`'s
+/// reclaims, each vnode's `VNOP_FSYNC` writing the times its inode holds;
+/// then `VFS_UNMOUNT`, apfs_vfsop_unmount's commit and its writes in the
+/// next transaction, left open ([`super::apfswrite::fsops::unmount`]). On
+/// a content-protected volume its teardown of the crypto-state caches
+/// (the ep cache's invalidation, K 0x66cbc24) is not implemented.
+pub fn unmount_forced(index: u32) -> Result<(), String> {
+    with_container(|nx| {
+        let (sb, _) = nx.vol_sb_read(index as usize)?;
+        if u64::from_le_bytes(sb[0x108..0x110].try_into().unwrap()) & super::apfsread::APFS_FS_UNENCRYPTED == 0 {
+            return Err(format!("not implemented: apfs_vfsop_unmount's teardown of the crypto-state caches of volume slot {index}, which is encrypted (the ep cache's invalidation, K 0x66cbc24)"));
+        }
+        super::apfswrite::fsops::unmount(nx, index as usize, true, &mut nanotime)
+    })
+}
+
 /// Inode `ino` of the volume in slot `index` brought into the kernel by a
 /// lookup (`VNOP_LOOKUP`'s `vnode_create`, at the head of the mount's
 /// vnode list), unless it has a vnode: the order a vnode pass visits the

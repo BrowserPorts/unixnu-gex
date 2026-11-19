@@ -658,12 +658,15 @@ impl Kernel {
             mnt.state().flags &= !kern::MNT_LOCAL;
         }
         // A writable mount of a volume the kernel's container in the disk0
-        // image holds read-write: apfs_vfsop_unmount's own writes (the
-        // container's commit, the volume's apfs_modified_by entry and
-        // unmount time, super::apfswrite::fsops::unmount) are not made.
+        // image holds read-write: the reclaims' and apfs_vfsop_unmount's
+        // own writes (the container's commit, then the volume's
+        // apfs_modified_by entry and unmount time in the next transaction,
+        // left open: super::disknode::unmount_forced).
         if let Some(i) = kern::mount_volume(mnt).filter(|_| mnt.fs == kern::Fs::Apfs && mnt.state().apfs_ro == Some(false)) {
             if super::disknode::holds_rw(i) {
-                self.darwin_unimplemented(format!("the forced unmount of the volume on {}: apfs_vfsop_unmount's writes to the kernel's container in the disk0 image (its commit, the volume's apfs_modified_by entry and unmount time)", mnt.on));
+                if let Err(why) = super::disknode::unmount_forced(i) {
+                    self.darwin_unimplemented(format!("the forced unmount of the volume on {}: {why}", mnt.on));
+                }
             }
         }
         kern::mount_list_remove(mnt);

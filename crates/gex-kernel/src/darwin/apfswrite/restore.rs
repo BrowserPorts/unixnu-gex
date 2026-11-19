@@ -56,11 +56,14 @@ pub const RUN_STAND_IN: &str = "the erase restore's clock readings, transaction 
 
 /// Every stand-in the build takes, for the caller to report: the image
 /// is the device's only where these are.
-pub fn stand_ins(os: bool, boot: bool) -> Vec<&'static str> {
-    let mut v = vec![RUN_STAND_IN, GIGALOCKER_STAND_IN, CLUSTER_STAND_IN, NSIH_STAND_IN];
+pub fn stand_ins(os: bool, boot: bool, ap_ticket: bool) -> Vec<&'static str> {
+    let mut v = vec![RUN_STAND_IN, GIGALOCKER_STAND_IN, CLUSTER_STAND_IN];
+    if !ap_ticket {
+        v.push(NSIH_STAND_IN);
+    }
     if boot {
         v.push(SPLAT_STAND_IN);
-        v.push(TICKET_STAND_IN);
+        v.push(if ap_ticket { HOST_IMG4_STAND_IN } else { TICKET_STAND_IN });
         v.push(RESTORE_HOST_STAND_IN);
         v.push(super::snapshot::SNAP_UUID_STAND_IN);
         v.push(POPULATE_STAND_IN);
@@ -238,7 +241,11 @@ pub fn build_disk0_hooked(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() 
     // (mount_partition(0), `mount_apfs -R`) comes first.
     fsops::mount_rw(&mut nx, system, now)?;
     let host = host_uuid(os)?;
-    concurrent_steps(&mut nx, Volumes { system, xart, hardware, preboot, update }, host.as_deref(), now, &mut missing)?;
+    let device = os.and_then(|o| o.device.as_ref());
+    let ap_ticket = device.and_then(|d| d.ap_ticket.as_deref());
+    let p = nsih(ap_ticket);
+    let sep = os.and_then(|o| o.boot.as_ref()).zip(device);
+    concurrent_steps(&mut nx, Volumes { system, xart, hardware, preboot, update }, host.as_deref(), &p, sep, now, &mut missing)?;
     match os {
         Some(os) => {
             // asr's image file written into System (restore_apfs_image_async,
@@ -306,7 +313,7 @@ pub fn build_disk0_hooked(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() 
             (Some(b), Some(d)) => {
                 install_splat(&mut nx, Volumes { system, xart, hardware, preboot, update }, b, d, now)?;
                 missing.push(CRYPTEX1_NONCE_MISSING.into());
-                install_kernel_cache(&mut nx, Volumes { system, xart, hardware, preboot, update }, b, &cluster_pushes, now)?
+                install_kernel_cache(&mut nx, Volumes { system, xart, hardware, preboot, update }, b, d, &cluster_pushes, now)?
             }
             (Some(_), None) => return Err("install_splat: the device restored is not given (its device tree, and TSS's Cryptex1 ticket for it)".into()),
             (None, _) => missing.push("install_splat's Cryptex1 and install_kernel_cache's list (no IPSW given: the Cryptex1 components, the version files, the build manifest and the Cryptex1 ticket in Preboot's cryptex1/current; the kernelcache, devicetree, iBoot and root_hash Image4 files and the AP ticket on Preboot and Hardware)".into()),
@@ -331,7 +338,7 @@ pub fn build_disk0_hooked(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() 
             Some(files) => {
                 // The main list after check_mounted's block and the NVRAM
                 // steps (drafts/s27/re-seal-snap.md 0).
-                populate_preboot_volume(&mut nx, v, now)?;
+                populate_preboot_volume(&mut nx, v, &p, now)?;
                 missing.extend(nx.vnode_missing.drain(..));
                 // set_boot_command writes NVRAM only; set_autoboot_delay
                 // syncs, then writes NVRAM and forces its sync.
@@ -348,13 +355,19 @@ pub fn build_disk0_hooked(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() 
                     None => missing.push(NVRAM_AUTOBOOT_MISSING.into()),
                 }
                 let tool_barrier = barrier.unwrap_or_else(crate::darwin::storagestack::container_barrier);
-                missing.push(IMAGE4_CHECKS_MISSING.into());
-                if !seal_system_volume(&mut nx, v, data, user, files, tool_barrier, hooks, now)? {
+                let checks = match device {
+                    Some(d) if d.ap_ticket.is_some() => Some(d),
+                    _ => {
+                        missing.push(IMAGE4_CHECKS_MISSING.into());
+                        None
+                    }
+                };
+                if !seal_system_volume(&mut nx, v, data, user, files, ap_ticket.unwrap_or(&TICKET), checks, tool_barrier, hooks, now)? {
                     return Ok(missing);
                 }
                 match &os.boot {
                     Some(_) => {
-                        create_system_snapshot(&mut nx, v, now)?;
+                        create_system_snapshot(&mut nx, v, &p, now)?;
                         // prepare_data_split, convert_eds_volumes,
                         // split_data_volume and commit_temporary_checkpoint
                         // log and return on an erase restore
@@ -464,30 +477,39 @@ fn create_directory(nx: &mut Nx<'_>, vol: usize, path: &str, mode: u16, uid: u32
     Ok(dir)
 }
 
-/// The restore step install_fud is, as a disk0 image's missing steps name
-/// it: its firmware is not written.
 /// The restore step update_device_firmware's list runs first,
 /// update_iBoot (RE@0x100050394), as a disk0 image's missing steps name
-/// it: the SEP firmware it writes into the Preboot directory is not
-/// written.
-pub const UPDATE_SEP_MISSING: &str = "update_device_firmware's update_iBoot (the first entry of _ramrod_update_device_firmware's list, RE@0x100050394): the boot firmware its updater writes to the boot storage (updateBootFirmwareWithCallback, outside the container), then update_sep (RE@0x10005140c, when the device has a SEP, AppleSEPManager, RE@0x100050d0c): <Preboot Root>/usr/standalone/firmware/sep-firmware.img4, and sep-patches.img4 when copy_sep_patch gives patches, each open(O_WRONLY | O_CREAT | O_TRUNC, 0644) and filled by write_data_to_fd (RE@0x100059d0c, in writes of the file's preferred block size) with the host's SEP OS image (the firmware images' \"SEP\" data, RE@0x100050c5c: the erase identity's SEP, Firmware/all_flash/sep-firmware.j120.RELEASE.im4p, personalized with the AP ticket, TICKET_STAND_IN; its container and the chunk sizes not traced)";
+/// it when the restore cannot run its update_sep ([`update_sep`]): the SEP
+/// firmware it writes into the Preboot directory is not written.
+pub const UPDATE_SEP_MISSING: &str = "update_device_firmware's update_iBoot (the first entry of _ramrod_update_device_firmware's list, RE@0x100050394): update_sep's <Preboot Root>/usr/standalone/firmware/sep-firmware.img4 (RE@0x10005140c: the host's SEPImageData, the erase identity's SEP IM4P stitched to the AP ticket, written in st_blksize writes), not written: the restore has no AP ticket (RootTicketData) or the IPSW directory no Firmware/all_flash/sep-firmware.j120.RELEASE.im4p";
 
+/// The restore step install_fud is, as a disk0 image's missing steps name
+/// it: its firmware is not written.
 pub const INSTALL_FUD_MISSING: &str = "install_fud's firmware on Preboot (<nsih>/usr/standalone/firmware/FUD and the host's personalized images in it, AOP, AVE and StaticTrustCache for the erase identity)";
 
-/// The name of the Preboot volume's directory for this device: the AP
-/// ticket's SHA-384 (`/chosen`'s `crypto-hash-method`) in upper-case
-/// hexadecimal (0x10004bf94), the ticket the host sends as RootTicketData,
-/// whose hash restored checks against `/chosen`'s `boot-manifest-hash`
-/// (0x100066150).
+/// The name of the Preboot volume's directory for a device with no AP
+/// ticket given ([`nsih`]).
 pub const NSIH_STAND_IN: &str = "the AP ticket's hash that names the Preboot volume's directory and fills its active file (the host's personalized RootTicketData, equal to iBoot's /chosen boot-manifest-hash) (stand-in: 48 zero bytes, 96 '0' digits; measure /private/preboot/active on the device)";
 
-pub(crate) fn nsih() -> String {
-    "0".repeat(super::super::preboot::HASH_DIGITS)
+/// The name of the Preboot volume's directory for the AP ticket `ticket`
+/// (`_ramrod_copy_preboot_path` 0x10004bf94 → `_ramrod_ticket_copy_nsih`
+/// 0x100066dbc → `_ramrod_ticket_copy_hash_data` 0x100065968): the digest
+/// `/chosen`'s `crypto-hash-method` names ("sha2-384" on the J120) of the
+/// whole ticket the host sends as RootTicketData, whose hash restored
+/// checks against `/chosen`'s `boot-manifest-hash` (0x100066150), in
+/// upper-case hexadecimal (`_ramrod_ticket_sprint_hex` 0x100065728,
+/// "0123456789ABCDEF"); without one, [`NSIH_STAND_IN`]'s zeros.
+pub(crate) fn nsih(ticket: Option<&[u8]>) -> String {
+    match ticket {
+        Some(t) => crate::darwin::webdevice::boot_manifest_hash(t).iter().map(|b| format!("{b:02X}")).collect(),
+        None => "0".repeat(super::super::preboot::HASH_DIGITS),
+    }
 }
 
 /// The main thread's steps between restore_asr and await_asr_and_retry
 /// (drafts/s21/re-ops.md sections 3 and 4) as they reach the container.
-fn concurrent_steps(nx: &mut Nx<'_>, v: Volumes, host: Option<&str>, now: &mut dyn FnMut() -> u64, missing: &mut Missing) -> Result<(), String> {
+#[allow(clippy::too_many_arguments)]
+fn concurrent_steps(nx: &mut Nx<'_>, v: Volumes, host: Option<&str>, p: &str, sep: Option<(&BootObjects, &Device)>, now: &mut dyn FnMut() -> u64, missing: &mut Missing) -> Result<(), String> {
     // init_gigalocker (0x1000176e8 → 0x1000296c8): xART mounted read-write
     // at /mnt7 (`mount_apfs -R`; the `.fseventsd/.ramdisk-boot-done` open
     // after it fails at its lookup), then `seputil --gigalocker-init`,
@@ -521,7 +543,6 @@ fn concurrent_steps(nx: &mut Nx<'_>, v: Volumes, host: Option<&str>, now: &mut d
     // 0x100056fa8): Cryptexes/OS and Cryptexes/App at the volume's root by
     // `mkpathat_np` (mode 0777: `mkdirat` of Cryptexes/OS fails twice,
     // Cryptexes is made, then OS and App; no chmod or chown), and `active`.
-    let p = nsih();
     create_directory(nx, v.preboot, &format!("{p}/usr/standalone/firmware"), 0o755, 0, 0, now)?;
     let caches = create_directory(nx, v.preboot, &format!("{p}/System/Library/Caches/com.apple.kernelcaches"), 0o755, 0, 0, now)?;
     let caches = fsops::parent_of(nx, v.preboot, caches)?;
@@ -536,11 +557,86 @@ fn concurrent_steps(nx: &mut Nx<'_>, v: Volumes, host: Option<&str>, now: &mut d
     // the access() checks of the later steps only read.
     missing.push("the FDR local store on Hardware (libFDR's writes into /FactoryData/System/Library/Caches/com.apple.factorydata by fdr_prepare's commit, fdr_recover, fdr_auto_challenge_claim and verify_fdr_data: server and device data, file names not traced)".into());
     // update_device_firmware (0x10001827c → 0x100032980): its list
-    // (0x100050034) starts with update_iBoot, whose update_sep writes the
-    // SEP's firmware into the Preboot directory, then install_fud.
-    missing.push(UPDATE_SEP_MISSING.into());
+    // (0x100050034) starts with update_iBoot, whose boot firmware goes to
+    // the boot storage and whose update_sep writes the SEP's firmware into
+    // the Preboot directory, then install_fud.
+    match sep {
+        Some((boot, device)) if device.ap_ticket.is_some() && boot.sep.is_some() => update_sep(nx, v.preboot, p, boot, device, now)?,
+        _ => missing.push(UPDATE_SEP_MISSING.into()),
+    }
     missing.push(INSTALL_FUD_MISSING.into());
     Ok(())
+}
+
+/// `st_blksize` of a file on the Preboot volume, which write_data_to_fd's
+/// writes are cut to: APFS's `va_iosize` (apfs_pack_vap_common K
+/// 0x669e65c's store at K 0x669eac0, from the volume's container), 4096 as
+/// measured on the host Mac's Preboot volume's files and as attrcall's
+/// `VNODE_IOSIZE`.
+const PREBOOT_BLKSIZE: u64 = 4096;
+
+/// update_sep (RE@0x10005140c, update_iBoot's last step): with the device
+/// having a SEP (`_ramrod_device_has_sep` RE@0x10004e3bc: AppleSEPManager
+/// matched, which the device tree's /arm-io/sep gives) and the host's SEP OS
+/// image (`copy_sep` RE@0x100032610: the restore message's `SEPImageData`),
+/// `<Preboot Root>/usr/standalone/firmware/sep-firmware.img4` (Preboot Root
+/// `<mount>/<nsih>`, RE@0x10002dfe4) opened `O_WRONLY | O_CREAT | O_TRUNC`
+/// 0644 by root under umask 0 (a new file: its parent's group), filled by
+/// write_data_to_fd (RE@0x100059d0c: `fstat`'s `st_blksize`, `lseek(fd, 0,
+/// SEEK_CUR)` 0, writes of `st_blksize - offset % st_blksize` bytes, the
+/// last one short) and closed. The image is the host's personalization of
+/// the identity's SEP component: libauthinstall's
+/// `AMAuthInstallApImg4Stitch` (0x97d8) layout, `IMG4 { "IMG4", the IM4P as
+/// the IPSW has it, [0] the AP ticket }`, with no IM4R
+/// (`AMAuthInstallApImg4StitchRestoreInfo` 0xa088 adds one only for a
+/// `<type>-TBM` entry in the TSS response, which the web device's has
+/// not). sep-patches.img4 follows only when `copy_sep_patch`
+/// (RE@0x100030a24) has the host's `SEPPatchImageData`, which a build
+/// identity with no SEP patch component does not give.
+fn update_sep(nx: &mut Nx<'_>, pb: usize, p: &str, boot: &BootObjects, device: &Device, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    use super::super::plist::Value;
+    let Some(ticket) = device.ap_ticket.as_deref() else {
+        return Err("not implemented: update_sep with no AP ticket for the host to personalize the SEP OS image with (RootTicketData)".into());
+    };
+    if crate::darwin::iokit::from_path(&device.tree, "IODeviceTree:/arm-io/sep")?.is_none() {
+        return Err("not implemented: a restore device tree with no /arm-io/sep (update_iBoot without a SEP)".into());
+    }
+    let manifest = super::super::plist::parse(&boot.manifest).map_err(|e| format!("BuildManifest.plist: {e}"))?;
+    let identity = super::super::preboot::erase_identity(&manifest, "j120ap")?;
+    let comp = identity.get("Manifest").and_then(|m| m.get("SEP")).ok_or("update_sep: the build identity has no SEP component (\"device has a SEP, but no SEP OS firmware image is present in firmare images\")")?;
+    if identity.get("Manifest").and_then(|m| m.get("SEPPatch")).is_some() {
+        return Err("not implemented: update_sep's sep-patches.img4 (the build identity has a SEPPatch component)".into());
+    }
+    let path = comp.get("Info").and_then(|i| i.get("Path")).and_then(Value::as_str).ok_or("the build identity's SEP has no Info.Path")?;
+    let im4p = boot.sep.as_deref().ok_or_else(|| format!("update_sep: the IPSW directory has no {path}"))?;
+    let digest = comp.get("Digest").and_then(Value::as_data).ok_or("the build identity's SEP has no Digest")?;
+    use sha2::Digest;
+    if sha2::Sha384::digest(im4p).as_slice() != digest {
+        return Err(format!("update_sep: {path} is not the build identity's SEP (its SHA-384 is not the Digest)"));
+    }
+    let image = img4(im4p, ticket);
+    let mut fw = ROOT_INO;
+    for c in format!("{p}/usr/standalone/firmware").split('/') {
+        fw = fsops::lookup(nx, pb, fw, c)?.ok_or_else(|| format!("update_sep: no /mnt9/{p}/usr/standalone/firmware (\"failed to open SEP firmware file for writing\")"))?;
+    }
+    if fsops::lookup(nx, pb, fw, "sep-firmware.img4")?.is_some() {
+        return Err("not implemented: update_sep's O_TRUNC of an existing sep-firmware.img4".into());
+    }
+    let gid = u32::from_le_bytes(fsops::inode(nx, pb, fw)?[0x4c..0x50].try_into().unwrap());
+    let ino = fsops::create(nx, pb, fw, "sep-firmware.img4", 0o644, 0, gid, now)?.map_err(|e| format!("update_sep: open sep-firmware.img4: errno {e}"))?;
+    let writes = blksize_writes(image.len() as u64, PREBOOT_BLKSIZE);
+    let (c, m) = cluster_sizes();
+    fsops::write_appends(nx, pb, ino, &writes, &image, c, m, now)
+}
+
+/// write_data_to_fd's writes (RE@0x100059d0c) of `n` bytes from offset 0
+/// in a file of preferred block size `blksize`.
+fn blksize_writes(n: u64, blksize: u64) -> Vec<u64> {
+    let mut v = vec![blksize; (n / blksize) as usize];
+    if n % blksize != 0 {
+        v.push(n % blksize);
+    }
+    v
 }
 
 /// What stands in for `/mnt2/keybags/usersession.kb`: UserManagementLayout
@@ -1012,6 +1108,10 @@ pub struct BootObjects {
     pub iboot: Vec<u8>,
     /// `Firmware/044-76040-038.dmg.root_hash`.
     pub root_hash: Vec<u8>,
+    /// `Firmware/all_flash/sep-firmware.j120.RELEASE.im4p`, the erase
+    /// identity's SEP, which the host personalizes for update_sep, when the
+    /// IPSW directory has it.
+    pub sep: Option<Vec<u8>>,
     /// `BuildManifest.plist`, whose erase identity names install_splat's
     /// Cryptex1 components.
     pub manifest: Vec<u8>,
@@ -1023,7 +1123,12 @@ impl BootObjects {
     /// The objects from an IPSW extracted at `dir`.
     pub fn read(dir: &std::path::Path) -> Result<Self, String> {
         let r = |p: &str| std::fs::read(dir.join(p)).map_err(|e| format!("{}: {e}", dir.join(p).display()));
-        Ok(BootObjects { kernelcache: r("kernelcache.release.ipad7")?, devicetree: r("Firmware/all_flash/DeviceTree.j120ap.im4p")?, iboot: r("Firmware/all_flash/iBoot.j120.RELEASE.im4p")?, root_hash: r("Firmware/044-76040-038.dmg.root_hash")?, manifest: r("BuildManifest.plist")?, dir: dir.to_path_buf() })
+        let sep = match std::fs::read(dir.join("Firmware/all_flash/sep-firmware.j120.RELEASE.im4p")) {
+            Ok(b) => Some(b),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(format!("{}: {e}", dir.join("Firmware/all_flash/sep-firmware.j120.RELEASE.im4p").display())),
+        };
+        Ok(BootObjects { kernelcache: r("kernelcache.release.ipad7")?, devicetree: r("Firmware/all_flash/DeviceTree.j120ap.im4p")?, iboot: r("Firmware/all_flash/iBoot.j120.RELEASE.im4p")?, root_hash: r("Firmware/044-76040-038.dmg.root_hash")?, sep, manifest: r("BuildManifest.plist")?, dir: dir.to_path_buf() })
     }
 }
 
@@ -1032,6 +1137,13 @@ impl BootObjects {
 /// objects with it.
 pub const TICKET_STAND_IN: &str = "the AP ticket (the host's RootTicketData from TSS: its bytes and length decide the personalized files' lengths and so their placement) and the host's Image4 files (KernelCacheFile, DeviceTreeFile, NorImageData's iBoot, SystemImageRootHashFile: drafts/s23/re-kernelcache.md UNSETTLED-3 and 4) (stand-in: the ticket an empty DER SEQUENCE, 30 00; each file IMG4 { \"IMG4\", the IPSW's IM4P, [0] the ticket } in DER, no IM4R; measure /private/preboot/<nsih>/System/Library/Caches/apticket.der and the files beside it on the device)";
 const TICKET: [u8; 2] = [0x30, 0x00];
+
+/// What stands in when the AP ticket is the device's: the host's Image4
+/// files are stitched as the ramdisk's libauthinstall stitches
+/// (`AMAuthInstallApImg4Stitch` 0x97d8: `IMG4 { "IMG4", the IM4P, [0] the
+/// ticket }` in minimal DER, an IM4R only for a TSS response's `-TBM`
+/// entry), the host's own copy of AMAuthInstall not measured.
+pub const HOST_IMG4_STAND_IN: &str = "the restore host's Image4 files (KernelCacheFile, DeviceTreeFile, NorImageData's iBoot, SystemImageRootHashFile, SystemImageCanonicalMetadataFile, SEPImageData): stitched as the restore ramdisk's libauthinstall stitches (AMAuthInstallApImg4Stitch: IMG4 { \"IMG4\", the IPSW's IM4P, [0] the AP ticket } in minimal DER, no IM4R without a TSS -TBM entry), the host's own AMAuthInstall not measured (measure the files beside /private/preboot/<nsih>/System/Library/Caches/apticket.der on the device)";
 
 /// What the host answers that decides which of the list's files exist:
 /// install_device_tree runs only for a RestoreProtocolVersion of 15 or more
@@ -1087,6 +1199,16 @@ pub struct Device {
     /// and its cryptex1 boot nonce), from which install_splat takes each
     /// object's expected digest and which it writes as the ticket.
     pub cryptex1_ticket: Vec<u8>,
+    /// The AP ticket the host sends as RootTicketData, when given: the
+    /// TSS response's AP ticket for the device's ECID and AP nonce, which
+    /// names the Preboot directory ([`nsih`]), is written as apticket.der
+    /// and personalizes the host's Image4 files; without one,
+    /// [`TICKET_STAND_IN`] and [`NSIH_STAND_IN`].
+    pub ap_ticket: Option<Vec<u8>>,
+    /// The root the restore ramdisk's libimage4 verifies the AP ticket's
+    /// chain against: on the web device its platform's root; on a device of
+    /// Apple's the root libimage4 embeds, which is not given (why).
+    pub ap_anchor: Result<Vec<u8>, String>,
 }
 
 /// The device tree the restore ramdisk runs with: the erase identity's
@@ -1358,8 +1480,9 @@ fn install_splat(nx: &mut Nx<'_>, v: Volumes, boot: &BootObjects, device: &Devic
 /// write_ticket's AP ticket there, its symbolic link in the firmware
 /// directory and its copy on Hardware. The /mnt1 `stat`s and the
 /// `access`es only read.
-fn install_kernel_cache(nx: &mut Nx<'_>, v: Volumes, boot: &BootObjects, pushes: &dyn Fn(u64) -> Result<fsops::Pushes, String>, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
-    let p = nsih();
+fn install_kernel_cache(nx: &mut Nx<'_>, v: Volumes, boot: &BootObjects, device: &Device, pushes: &dyn Fn(u64) -> Result<fsops::Pushes, String>, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    let ticket = device.ap_ticket.as_deref().unwrap_or(&TICKET);
+    let p = nsih(device.ap_ticket.as_deref());
     let dir = |nx: &mut Nx<'_>, vol: usize, path: &str| -> Result<u64, String> {
         let mut d = ROOT_INO;
         for c in path.split('/') {
@@ -1368,21 +1491,21 @@ fn install_kernel_cache(nx: &mut Nx<'_>, v: Volumes, boot: &BootObjects, pushes:
         Ok(d)
     };
     let kc = dir(nx, v.preboot, &format!("{p}/System/Library/Caches/com.apple.kernelcaches"))?;
-    fsops::write_new_file(nx, v.preboot, kc, "kernelcache", 0o644, &img4(&boot.kernelcache, &TICKET), pushes, now)?;
+    fsops::write_new_file(nx, v.preboot, kc, "kernelcache", 0o644, &img4(&boot.kernelcache, ticket), pushes, now)?;
     let fw = dir(nx, v.preboot, &format!("{p}/usr/standalone/firmware"))?;
-    fsops::write_new_file(nx, v.preboot, fw, "devicetree.img4", 0o644, &img4(&boot.devicetree, &TICKET), pushes, now)?;
-    fsops::write_new_file(nx, v.preboot, fw, "iBoot.img4", 0o644, &img4(&boot.iboot, &TICKET), pushes, now)?;
-    fsops::write_new_file(nx, v.preboot, fw, "root_hash.img4", 0o644, &img4(&boot.root_hash, &TICKET), pushes, now)?;
+    fsops::write_new_file(nx, v.preboot, fw, "devicetree.img4", 0o644, &img4(&boot.devicetree, ticket), pushes, now)?;
+    fsops::write_new_file(nx, v.preboot, fw, "iBoot.img4", 0o644, &img4(&boot.iboot, ticket), pushes, now)?;
+    fsops::write_new_file(nx, v.preboot, fw, "root_hash.img4", 0o644, &img4(&boot.root_hash, ticket), pushes, now)?;
     // write_ticket (0x1000303d8 → ramrod_ticket_write_explicit 0x1000667a4):
     // the ticket by a plain open(O_WRONLY | O_CREAT | O_TRUNC, 0644), its
     // link (symlink(2) by root under umask 0: ACCESSPERMS, the parent's
     // group) to /private/preboot's path, and the Hardware copy, not linked.
     let caches = dir(nx, v.preboot, &format!("{p}/System/Library/Caches"))?;
-    fsops::write_new_file(nx, v.preboot, caches, "apticket.der", 0o644, &TICKET, pushes, now)?;
+    fsops::write_new_file(nx, v.preboot, caches, "apticket.der", 0o644, ticket, pushes, now)?;
     let gid = u32::from_le_bytes(fsops::inode(nx, v.preboot, fw)?[0x4c..0x50].try_into().unwrap());
     fsops::symlink(nx, v.preboot, fw, "apticket.der", &format!("/private/preboot/{p}/System/Library/Caches/apticket.der"), 0o777, 0, gid, now)?.map_err(|e| format!("symlink apticket.der: errno {e}"))?;
     let hw = dir(nx, v.hardware, "FactoryData/System/Library/Caches")?;
-    fsops::write_new_file(nx, v.hardware, hw, "apticket.der", 0o644, &TICKET, pushes, now)?;
+    fsops::write_new_file(nx, v.hardware, hw, "apticket.der", 0o644, ticket, pushes, now)?;
     Ok(())
 }
 
@@ -2340,7 +2463,7 @@ mod preboot_flags {
 ///   hash, into the stream the truncate emptied ([`fsops::write_first`]),
 ///   and the close;
 /// - `unmount("/mnt9", 0)`, not forced.
-fn populate_preboot_volume(nx: &mut Nx<'_>, v: Volumes, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+fn populate_preboot_volume(nx: &mut Nx<'_>, v: Volumes, p: &str, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     let (sys, pb) = (v.system, v.preboot);
     if nx.mounted.contains(&pb) {
         fsops::unmount(nx, pb, false, now)?;
@@ -2353,10 +2476,9 @@ fn populate_preboot_volume(nx: &mut Nx<'_>, v: Volumes, now: &mut dyn FnMut() ->
         let c: Vec<&str> = p.split('/').collect();
         mkpath(nx, pb, &c, 0o777, now)?;
     }
-    let p = nsih();
     for entry in PREBOOT_BOOT_OBJECTS {
         let src: Vec<&str> = entry.split('/').filter(|c| !c.is_empty()).collect();
-        let dst: Vec<&str> = std::iter::once(p.as_str()).chain(src.iter().copied()).collect();
+        let dst: Vec<&str> = std::iter::once(p).chain(src.iter().copied()).collect();
         // dirname_r of "<p>//entry": the destination less its last
         // component.
         mkpath(nx, pb, &dst[..dst.len() - 1], 0o700, now)?;
@@ -2418,12 +2540,28 @@ fn after_invert_mounts(nx: &mut Nx<'_>, v: Volumes, now: &mut dyn FnMut() -> u64
 }
 
 /// What restored_external checks with libimage4 before the seal that the
-/// image cannot answer: both payloads come from the host stitched to the
-/// AP ticket (RootTicketData, TICKET_STAND_IN), whose `msys` and `isys`
-/// objects are the build identity's `Ap,SystemVolumeCanonicalMetadata`
-/// and `SystemVolume`; the Cryptex1 ticket has only the `Cryptex1,`
-/// objects.
-const IMAGE4_CHECKS_MISSING: &str = "restored_external's Image4 checks of the canonical metadata (ramrod_verify_manifest_for_mountpoint, tag 'msys', RE@0x100058108) and of /mnt5/root_hash (seal_system_volume, tag 'isys', RE@0x100058714) against the AP ticket stitched to them: ramrod_get_trusted_img4_payload (RE@0x1000583e0 → RE@0x100057818) runs libimage4's img4_firmware_new (runtime _img4_runtime_restore, flags 5: the subsequent stage, the manifest attached to the payload) and img4_firmware_execute for img4_chip_select_effective_ap()'s chip; not run: the AP ticket is TICKET_STAND_IN's (the web device's root of trust signs only Cryptex1 tickets, and no owner's AP ticket is taken), and gex has no evaluation for libimage4's AP chips (image4.rs is the kext's CHIP_CRYPTEX1_BOOT_AP); the files are the IPSW's, whose digests are the build identity's (Ap,SystemVolumeCanonicalMetadata 1a9ff873..., SystemVolume dae58a3c...)";
+/// image cannot answer without the device's AP ticket: both payloads come
+/// from the host stitched to the AP ticket (RootTicketData), whose `msys`
+/// and `isys` objects are the build identity's
+/// `Ap,SystemVolumeCanonicalMetadata` and `SystemVolume`; the Cryptex1
+/// ticket has only the `Cryptex1,` objects.
+const IMAGE4_CHECKS_MISSING: &str = "restored_external's Image4 checks of the canonical metadata (ramrod_verify_manifest_for_mountpoint, tag 'msys', RE@0x100058108) and of /mnt5/root_hash (seal_system_volume, tag 'isys', RE@0x100058714) against the AP ticket stitched to them (ramrod_get_trusted_img4_payload RE@0x1000583e0 → RE@0x100057818: libimage4's AP chip, image4ap): not run, the restore has no AP ticket (TICKET_STAND_IN's); the files are the IPSW's, whose digests are the build identity's (Ap,SystemVolumeCanonicalMetadata 1a9ff873..., SystemVolume dae58a3c...)";
+
+/// `ramrod_get_trusted_img4_payload` for the host's Image4 file `img4` of
+/// tag `code` (RE@0x1000583e0 → RE@0x100057818, no separate manifest, no
+/// custom manifest hash: [`crate::darwin::image4ap::restore_trusted_payload`])
+/// on the restore ramdisk of `device`: its authenticated payload, else the
+/// restore's failure (`what` and restored's message).
+fn trusted_payload(device: &Device, code: &[u8; 4], img4: &[u8], what: &str) -> Result<Vec<u8>, String> {
+    use crate::darwin::image4::Outcome;
+    let tree = crate::darwin::image4ap::Tree { nodes: &device.tree, anchor: device.ap_anchor.clone() };
+    match crate::darwin::image4ap::restore_trusted_payload(crate::darwin::image4::fourcc(code), img4, &tree) {
+        Outcome::Authenticated(p) => Ok(p),
+        Outcome::Status(e) => Err(format!("{what}: libimage4 does not authenticate the {} payload against the AP ticket (errno {e}): the restore fails", String::from_utf8_lossy(code))),
+        Outcome::Panic(m) => Err(format!("{what}: libimage4 panics: {m}")),
+        Outcome::Unmodelled(m) => Err(format!("not implemented: {what}'s Image4 check: {m}")),
+    }
+}
 
 /// seal_system_volume (RE@0x10003ab6c; drafts/s27/re-seal-snap.md 3): the
 /// canonical metadata unarchived on the ramdisk's /mnt5 (tmpfs) and
@@ -2439,13 +2577,29 @@ const IMAGE4_CHECKS_MISSING: &str = "restored_external's Image4 checks of the ca
 /// read-only: no write), and Update's read-write mount. Whether the build
 /// goes on.
 #[allow(clippy::too_many_arguments)]
-fn seal_system_volume(nx: &mut Nx<'_>, v: Volumes, data: usize, user: usize, files: &SealFiles, barrier: bool, hooks: &mut Hooks<'_>, now: &mut dyn FnMut() -> u64) -> Result<bool, String> {
-    let archive = crate::darwin::aar::mtree_payload(&files.mtree)?;
+#[allow(clippy::too_many_arguments)]
+fn seal_system_volume(nx: &mut Nx<'_>, v: Volumes, data: usize, user: usize, files: &SealFiles, ticket: &[u8], checks: Option<&Device>, barrier: bool, hooks: &mut Hooks<'_>, now: &mut dyn FnMut() -> u64) -> Result<bool, String> {
+    // ramrod_verify_manifest_for_mountpoint (RE@0x100057fe4 → RE@0x100058108):
+    // the host's canonical metadata file checked against the AP ticket
+    // ('msys'), its authenticated payload the archive unarchived into
+    // /mnt5/manifest_and_db.
+    let metadata = img4(&files.mtree, ticket);
+    let archive = match checks {
+        Some(d) => {
+            let payload = trusted_payload(d, b"msys", &metadata, "ramrod_verify_manifest_for_mountpoint")?;
+            let (_, data) = crate::darwin::aar::im4p_payload(&files.mtree)?;
+            if payload != data {
+                return Err("the authenticated canonical metadata is not the IM4P's data".into());
+            }
+            crate::darwin::aar::mtree_payload(&files.mtree)?
+        }
+        None => crate::darwin::aar::mtree_payload(&files.mtree)?,
+    };
     let digest_db = crate::darwin::aar::file(&archive, "digest.db")?;
     let mtree_txt = crate::darwin::aar::file(&archive, "mtree.txt")?;
     // writeToFile:"/mnt5/root_hash": the host's Image4 file of the root
-    // hash (TICKET_STAND_IN).
-    let root_hash = img4(&files.root_hash, &TICKET);
+    // hash, stitched to the AP ticket.
+    let root_hash = img4(&files.root_hash, ticket);
     for vol in [v.preboot, v.hardware, user, data, v.xart, v.system] {
         if nx.mounted.contains(&vol) {
             fsops::unmount(nx, vol, true, now)?;
@@ -2455,6 +2609,12 @@ fn seal_system_volume(nx: &mut Nx<'_>, v: Volumes, data: usize, user: usize, fil
         fsops::unmount(nx, v.update, false, now)?;
     }
     nx.unmount()?;
+    // ramrod_seal_system_volume_with_root_hash_verify (RE@0x1000584d8 →
+    // RE@0x100058714): the root hash file checked against the AP ticket
+    // ('isys') before it is written to /mnt5/root_hash for apfs_sealvolume.
+    if let Some(d) = checks {
+        trusted_payload(d, b"isys", &root_hash, "ramrod_seal_system_volume_with_root_hash_verify")?;
+    }
     (hooks.before_seal)()?;
     super::sealvolume::seal_volume(nx, v.system, &super::sealvolume::SealInputs { root_hash: &root_hash, digest_db, mtree_txt }, barrier, now)?;
     if !(hooks.after_seal)(nx)? {
@@ -2490,10 +2650,9 @@ fn arv_snapshot_name(img4_file: &[u8]) -> Result<String, String> {
 /// `root-snapshot-name` gives the booted kernel, [`storage::ROOT_SNAPSHOT`]);
 /// `fs_snapshot_create` on /mnt1 ([`super::snapshot::fs_snapshot_create`]).
 /// With that name, no `mount_partition(0, 0)` and no `fs_snapshot_root`.
-fn create_system_snapshot(nx: &mut Nx<'_>, v: Volumes, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+fn create_system_snapshot(nx: &mut Nx<'_>, v: Volumes, dir: &str, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     fsops::mount_rw(nx, v.preboot, now)?;
-    let dir = nsih();
-    resolve(nx, v.preboot, &dir)?.ok_or_else(|| format!("no /mnt9/{dir}"))?;
+    resolve(nx, v.preboot, dir)?.ok_or_else(|| format!("no /mnt9/{dir}"))?;
     let f = resolve(nx, v.preboot, &format!("{dir}/usr/standalone/firmware/root_hash.img4"))?.ok_or("not implemented: no root_hash.img4 on Preboot (the legacy snapshot name and fs_snapshot_root)")?;
     let bytes = file_bytes(nx, v.preboot, f)?;
     let name = arv_snapshot_name(&bytes)?;
@@ -2665,6 +2824,123 @@ mod tests {
         node(&mut b, &[("name", b"device-tree\0"), ("compatible", b"J120AP\0iPad7,1\0AppleARM\0")], 1);
         node(&mut b, &[("name", b"chosen\0"), ("unique-chip-id", &0x6890_e970_0eb4_c4bfu64.to_le_bytes()), ("chip-id", &0x8011u32.to_le_bytes())], 0);
         crate::darwin::iokit::parse(&b).unwrap()
+    }
+
+    /// update_sep's writes: write_data_to_fd's of a file's preferred block
+    /// size, the last one short.
+    #[test]
+    fn write_data_to_fd_writes_by_the_preferred_block_size() {
+        assert_eq!(blksize_writes(4096 * 3, 4096), [4096, 4096, 4096]);
+        assert_eq!(blksize_writes(4096 * 2 + 7, 4096), [4096, 4096, 7]);
+        assert_eq!(blksize_writes(5, 4096), [5]);
+        assert!(blksize_writes(0, 4096).is_empty());
+    }
+
+    /// update_sep on a Preboot volume as update_device_firmware_pre_fdr
+    /// leaves it: `<nsih>/usr/standalone/firmware/sep-firmware.img4` made by
+    /// root, 0644, the parent's group, holding the IMG4 of the identity's
+    /// SEP IM4P and the AP ticket (no IM4R), its Preboot directory named by
+    /// the ticket's SHA-384 in capitals; refused with no SEP in the device
+    /// tree, an IM4P that is not the identity's, or a file there already.
+    #[test]
+    fn update_sep_writes_the_personalized_sep_firmware() {
+        use super::super::super::plist::{self, Value};
+        use crate::darwin::apfsread::Container;
+        use sha2::Digest;
+        fn node(b: &mut Vec<u8>, props: &[(&str, &[u8])], children: u32) {
+            b.extend_from_slice(&(props.len() as u32).to_le_bytes());
+            b.extend_from_slice(&children.to_le_bytes());
+            for (k, v) in props {
+                let mut name = [0u8; 32];
+                name[..k.len()].copy_from_slice(k.as_bytes());
+                b.extend_from_slice(&name);
+                b.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                b.extend_from_slice(v);
+                b.resize((b.len() + 3) & !3, 0);
+            }
+        }
+        let tree = |sep: bool| {
+            let mut b = Vec::new();
+            node(&mut b, &[("name", b"device-tree\0"), ("compatible", b"J120AP\0iPad7,1\0AppleARM\0")], 2);
+            node(&mut b, &[("name", b"chosen\0")], 0);
+            node(&mut b, &[("name", b"arm-io\0")], u32::from(sep));
+            if sep {
+                node(&mut b, &[("name", b"sep\0")], 0);
+            }
+            crate::darwin::iokit::parse(&b).unwrap()
+        };
+        // A SEP IM4P larger than three blocks and not a multiple of one.
+        let im4p = crate::darwin::image4::enc::seq(&[
+            crate::darwin::image4::enc::ia5(b"IM4P"),
+            crate::darwin::image4::enc::ia5(b"sepi"),
+            crate::darwin::image4::enc::ia5(b"test"),
+            crate::darwin::image4::enc::octets(&(0..13_000u32).map(|i| (i * 31 + i / 77) as u8).collect::<Vec<u8>>()),
+        ]);
+        let identity = |digest: &[u8]| {
+            Value::Dict(vec![
+                ("Info".into(), Value::Dict(vec![("DeviceClass".into(), Value::String("j120ap".into())), ("Variant".into(), Value::String(crate::darwin::preboot::cryptex1::ERASE_VARIANT.into()))])),
+                (
+                    "Manifest".into(),
+                    Value::Dict(vec![("SEP".into(), Value::Dict(vec![("Digest".into(), Value::Data(digest.to_vec())), ("Info".into(), Value::Dict(vec![("Path".into(), Value::String("Firmware/all_flash/sep-firmware.j120.RELEASE.im4p".into()))]))]))]),
+                ),
+            ])
+        };
+        let manifest = |digest: &[u8]| plist::to_xml(&Value::Dict(vec![("BuildIdentities".into(), Value::Array(vec![identity(digest)]))]));
+        let boot = |digest: &[u8]| BootObjects { kernelcache: vec![], devicetree: vec![], iboot: vec![], root_hash: vec![], sep: Some(im4p.clone()), manifest: manifest(digest), dir: std::path::PathBuf::new() };
+        let ticket: Vec<u8> = crate::darwin::image4::enc::seq(&[crate::darwin::image4::enc::ia5(b"IM4M"), crate::darwin::image4::enc::int(0), vec![0x31, 0x00]]);
+        let device = |sep: bool| Device { nvram: None, tree: tree(sep), cryptex1_ticket: vec![], ap_ticket: Some(ticket.clone()), ap_anchor: Err("not used".into()) };
+        let p = nsih(Some(&ticket));
+        assert_eq!(p, sha2::Sha384::digest(&ticket).iter().map(|b| format!("{b:02X}")).collect::<String>());
+        assert_eq!(p.len(), crate::darwin::preboot::HASH_DIGITS);
+
+        let blocks = 15_625_000u64;
+        let tmp = std::env::temp_dir().join(format!("gex-updsep-{}", std::process::id()));
+        let f = std::fs::OpenOptions::new().create(true).truncate(true).read(true).write(true).open(&tmp).unwrap();
+        f.set_len(blocks * 4096).unwrap();
+        let sink = std::sync::Arc::new(super::super::HostFile(f, blocks * 4096));
+        let uuid = *b"gex-update-sep!!";
+        let fm = container::format(&*sink, 4096, blocks, uuid).unwrap();
+        let mut nx = Nx::formatted(&*sink, &fm, uuid, Mode::Kernel).unwrap();
+        nx.mount_rw().unwrap();
+        let mut t = 1_700_000_000_000_000_000u64;
+        let mut now = || {
+            t += 1000;
+            t
+        };
+        let kv = key_os_version(RESTORE_BUILD).unwrap();
+        let times = VolumeTimes { formatted: now(), root: now(), private: now(), modified: now() };
+        let o = nx.create_volume(&NewVolume { name: "Preboot".into(), role: storage::role::PREBOOT, encrypted: false, e_apfs: true, times, uid: 0, gid: 0, key_os_version: kv, size_bytes: None }).unwrap();
+        nx.commit().unwrap();
+        let vol = nx.fs_oid.iter().position(|&x| x == o).unwrap();
+        fsops::mount_rw(&mut nx, vol, &mut now).unwrap();
+        let fw = create_directory(&mut nx, vol, &format!("{p}/usr/standalone/firmware"), 0o755, 0, 0, &mut now).unwrap();
+        let good = sha2::Sha384::digest(&im4p).to_vec();
+        assert!(update_sep(&mut nx, vol, &p, &boot(&good), &device(false), &mut now).unwrap_err().contains("/arm-io/sep"));
+        assert!(update_sep(&mut nx, vol, &p, &boot(&[0; 48]), &device(true), &mut now).unwrap_err().contains("not the build identity's SEP"));
+        assert_eq!(fsops::lookup(&mut nx, vol, fw, "sep-firmware.img4").unwrap(), None);
+        update_sep(&mut nx, vol, &p, &boot(&good), &device(true), &mut now).unwrap();
+        assert!(update_sep(&mut nx, vol, &p, &boot(&good), &device(true), &mut now).unwrap_err().contains("O_TRUNC"));
+        fsops::unmount(&mut nx, vol, false, &mut now).unwrap();
+        nx.unmount().unwrap();
+        drop(nx);
+        let c = std::sync::Arc::new(Container::open(sink.clone()).unwrap());
+        let v = c.volume(vol).unwrap().unwrap();
+        let mut d = 2;
+        for comp in format!("{p}/usr/standalone/firmware").split('/') {
+            d = v.lookup(d, comp).unwrap().unwrap().file_id;
+        }
+        let e = v.lookup(d, "sep-firmware.img4").unwrap().unwrap();
+        let ino = v.inode(e.file_id).unwrap().unwrap();
+        let want = img4(&im4p, &ticket);
+        assert_eq!((ino.mode & 0o7777, ino.owner, ino.group, v.file_size(&ino).unwrap()), (0o644, 0, 0, want.len() as u64));
+        let mut got = vec![0u8; want.len()];
+        v.read_file(&ino, 0, &mut got).unwrap();
+        assert_eq!(got, want);
+        // The file as the boot reads it: an IMG4 of the IM4P and the ticket,
+        // the payload's type the IM4P's.
+        let (ty, _) = super::super::seal::img4_payload(&got).unwrap();
+        assert_eq!(ty, b"sepi");
+        let _ = std::fs::remove_file(&tmp);
     }
 
     /// `seputil --gigalocker-init` in the restore names the file by the
@@ -4810,7 +5086,7 @@ mod tests {
         fsops::setattr(&mut nx, system, sub, fsops::SetAttr { mtime: Some(T0 + 5), atime: Some(T0), ..Default::default() }, &mut now).unwrap();
         fsops::setattr(&mut nx, system, fw, fsops::SetAttr { mtime: Some(T0 + 9), atime: Some(T0), ..Default::default() }, &mut now).unwrap();
         // Preboot as update_device_firmware_pre_fdr and install_kernel_cache leave it.
-        let p = nsih();
+        let p = nsih(None);
         let pfw = create_directory(&mut nx, preboot, &format!("{p}/usr/standalone/firmware"), 0o755, 0, 0, &mut now).unwrap();
         create_directory(&mut nx, preboot, &format!("{p}/System/Library/Caches/com.apple.kernelcaches"), 0o755, 0, 0, &mut now).unwrap();
         let cx = fsops::mkdir(&mut nx, preboot, ROOT_INO, "Cryptexes", 0o777, 0, 0, &mut now).unwrap().unwrap();
@@ -4824,7 +5100,7 @@ mod tests {
         };
         let old_active = ext(&mut nx, preboot, active)[0].2;
         let v = Volumes { system, xart: preboot, hardware: preboot, preboot, update: preboot };
-        populate_preboot_volume(&mut nx, v, &mut now).unwrap();
+        populate_preboot_volume(&mut nx, v, &p, &mut now).unwrap();
         assert!(!nx.mounted.contains(&preboot), "Preboot unmounted");
         assert!(nx.jobj_times.is_empty(), "every time written");
         let xf = |v: &[u8], t: u8| -> Option<Vec<u8>> {

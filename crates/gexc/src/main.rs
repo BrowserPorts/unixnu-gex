@@ -227,7 +227,9 @@ usage:
                                    with <ipsw-dir>, for the device
                                    GEX_DARWIN_CRYPTEX1_TICKET names: web-device
                                    (GEX_DARWIN_WEB_DEVICE signs its Cryptex1
-                                   ticket) or the device's ticket file
+                                   ticket; its AP ticket is the restore's) or
+                                   the device's ticket file (its AP ticket
+                                   GEX_DARWIN_AP_TICKET's, when given)
   gexc darwin-web-device init|show|roll|nvram|sep|apkey|apticket <dir>
                                    make the web device (its root, manifest
                                    keys, identity, UIDs, nonce slot and

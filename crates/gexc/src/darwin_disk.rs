@@ -12,10 +12,13 @@
 //! boot names it:
 //!
 //! - `GEX_DARWIN_CRYPTEX1_TICKET=web-device` with
-//!   `GEX_DARWIN_WEB_DEVICE=<dir>`: the web device, whose identity iBoot
-//!   puts in the restore device tree's `/chosen` as its boot does, and
-//!   whose manifest key plays TSS's part for install_splat's Cryptex1
-//!   ticket, signed for its current cryptex1 boot nonce;
+//!   `GEX_DARWIN_WEB_DEVICE=<dir>`: the web device, whose identity, AP
+//!   nonce generator and AP ticket's hash iBoot puts in the restore device
+//!   tree's `/chosen` as its boot does, whose AP ticket (signed by
+//!   `gexc darwin-web-device apticket` for its AP nonce) is the restore's
+//!   RootTicketData, and whose manifest key plays TSS's part for
+//!   install_splat's Cryptex1 ticket, signed for its current cryptex1 boot
+//!   nonce;
 //! - `GEX_DARWIN_NVRAM=<file>`: the device's NVRAM namespace image (the
 //!   web device's `nvram.bin`, or a copy of it), which the restore's NVRAM
 //!   steps change in place, written when its ramdisk's IODTNVRAM syncs;
@@ -24,7 +27,11 @@
 //!   Cryptex1 ticket as its restore wrote it
 //!   (`apticket.j120ap.<ECID>.im4m`, copied from its Preboot volume's
 //!   `cryptex1/current`), the ECID its name holds being the one iBoot put
-//!   in that restore's `/chosen`.
+//!   in that restore's `/chosen`; with `GEX_DARWIN_AP_TICKET=<path>`, its
+//!   AP ticket (`apticket.der` from its Preboot volume's
+//!   `<hash>/System/Library/Caches`) as the restore's RootTicketData, its
+//!   hash the restore's `/chosen` `boot-manifest-hash`; without it the AP
+//!   ticket stands in.
 
 use anyhow::{anyhow, bail, Context, Result};
 use gex_kernel::darwin::{apfswrite, image4, iokit, preboot, storage, webdevice};
@@ -40,12 +47,25 @@ fn device(boot: &apfswrite::restore::BootObjects) -> Result<apfswrite::restore::
     let bytes = apfswrite::restore::restore_device_tree(&boot.devicetree).map_err(|e| anyhow!("Firmware/all_flash/DeviceTree.j120ap.im4p: {e}"))?;
     let mut tree = iokit::parse(&bytes).map_err(|e| anyhow!("the restore device tree: {e}"))?;
     let target = iokit::target_name_of(&tree).map(|n| String::from_utf8_lossy(&n).to_lowercase()).ok_or_else(|| anyhow!("the restore device tree's root has no compatible"))?;
+    let mut ap_ticket = None;
+    let mut ap_anchor: std::result::Result<Vec<u8>, String> = Err("the root the restore ramdisk's libimage4 embeds for the AP chip (\"Apple Secure Boot Root CA - G2\", libimage4 0x2c590): not given for a device of Apple's".into());
     let ticket = match (source.as_deref(), web) {
         (None, _) => bail!("install_splat needs the device's Cryptex1 ticket: GEX_DARWIN_CRYPTEX1_TICKET is not set (web-device, with GEX_DARWIN_WEB_DEVICE, or the path of the device's apticket.{target}.<ECID>.im4m)"),
         (Some("web-device"), None) => bail!("the Cryptex1 ticket is the web device's (GEX_DARWIN_CRYPTEX1_TICKET=web-device), but no web device is configured (GEX_DARWIN_WEB_DEVICE)"),
         (Some("web-device"), Some(dir)) => {
             let w = crate::darwin_web::load(&dir)?;
+            if w.ap_ticket.is_none() {
+                bail!("the web device has no AP ticket for the restore's RootTicketData (gexc darwin-web-device apticket {})", dir.display());
+            }
+            let booted = w.boot_chosen().map_err(|e| anyhow!("{}: {e}", dir.display()))?;
             iokit::fill_chosen(&mut tree, &w.identity.chosen()).map_err(|e| anyhow!("the restore device tree: {e}"))?;
+            iokit::fill_chosen(&mut tree, &booted).map_err(|e| anyhow!("the restore device tree: {e}"))?;
+            let at = w.ap_ticket.clone().expect("checked");
+            let hash: String = webdevice::boot_manifest_hash(&at).iter().map(|b| format!("{b:02X}")).collect();
+            eprintln!("gexc: the restore's RootTicketData: the web device's AP ticket ({} bytes, boot-manifest-hash {hash})", at.len());
+            ap_ticket = Some(at);
+            // The web device's libimage4 trusts its platform's root.
+            ap_anchor = Ok(w.root.clone());
             let manifest = gex_kernel::darwin::plist::parse(&boot.manifest).map_err(|e| anyhow!("BuildManifest.plist: {e}"))?;
             let build = preboot::erase_identity(&manifest, &target).map_err(|e| anyhow!("{e}"))?;
             // The nonce's hash as AppleImage4 makes it, entangled when the
@@ -77,6 +97,18 @@ fn device(boot: &apfswrite::restore::BootObjects) -> Result<apfswrite::restore::
             }
             iokit::fill_chosen(&mut tree, &[("unique-chip-id", ecid.to_le_bytes().to_vec())]).map_err(|e| anyhow!("the restore device tree: {e}"))?;
             eprintln!("gexc: install_splat's Cryptex1 ticket: {path} ({} bytes), the device's of ECID {ecid:X}", ticket.len());
+            if let Some(ap) = std::env::var_os("GEX_DARWIN_AP_TICKET").filter(|v| !v.is_empty()) {
+                let at = std::fs::read(&ap).with_context(|| format!("reading {}", Path::new(&ap).display()))?;
+                let theirs = image4::manifest_property(&at, image4::fourcc(b"ECID"), image4::tag::INTEGER)
+                    .and_then(image4::der::integer64)
+                    .map_err(|e| anyhow!("{}: not an AP ticket with an ECID (libDER {e})", Path::new(&ap).display()))?;
+                if theirs != ecid {
+                    bail!("{}: the AP ticket is personalized for ECID {theirs:X}, not the Cryptex1 ticket's {ecid:X}", Path::new(&ap).display());
+                }
+                iokit::fill_chosen(&mut tree, &[("boot-manifest-hash", webdevice::boot_manifest_hash(&at).to_vec())]).map_err(|e| anyhow!("the restore device tree: {e}"))?;
+                eprintln!("gexc: the restore's RootTicketData: {} ({} bytes)", Path::new(&ap).display(), at.len());
+                ap_ticket = Some(at);
+            }
             ticket
         }
     };
@@ -90,7 +122,7 @@ fn device(boot: &apfswrite::restore::BootObjects) -> Result<apfswrite::restore::
         }
         None => None,
     };
-    Ok(apfswrite::restore::Device { nvram, tree, cryptex1_ticket: ticket })
+    Ok(apfswrite::restore::Device { nvram, tree, cryptex1_ticket: ticket, ap_ticket, ap_anchor })
 }
 
 pub fn cmd(args: &[String]) -> Result<ExitCode> {
@@ -132,7 +164,8 @@ pub fn cmd(args: &[String]) -> Result<ExitCode> {
     if let Some(gaps) = storage::unmeasured() {
         eprintln!("gexc: {gaps}");
     }
-    for s in apfswrite::restore::stand_ins(os.is_some(), has_boot) {
+    let has_ap_ticket = os.as_ref().and_then(|o| o.device.as_ref()).is_some_and(|d| d.ap_ticket.is_some());
+    for s in apfswrite::restore::stand_ins(os.is_some(), has_boot, has_ap_ticket) {
         eprintln!("gexc: {s}");
     }
     // The kernel's clock: the time the restore runs.

@@ -4071,6 +4071,43 @@ mod tests {
         }
     }
 
+    /// apfs_vfsop_unmount's tx_finish, as the sync's, writes no checkpoint
+    /// when no transaction is open; its apfs_modified_by entry and unmount
+    /// time then go into a new transaction, which stays open.
+    #[test]
+    fn an_unmount_with_nothing_open_writes_no_checkpoint() {
+        use super::super::fsops;
+        let blocks = 15_625_000u64;
+        let sink = Sparse::new(blocks * 4096);
+        let uuid = *b"gex-unmount-idle";
+        let fm = super::super::container::format(&sink, 4096, blocks, uuid).unwrap();
+        let mut nx = Nx::formatted(&sink, &fm, uuid, Mode::Kernel).unwrap();
+        nx.mount_rw().unwrap();
+        let mut t = 1_800_000_000_000_000_000u64;
+        let mut now = move || {
+            t += 1000;
+            t
+        };
+        let times = VolumeTimes { formatted: now(), root: now(), private: now(), modified: now() };
+        let o = nx.create_volume(&NewVolume { name: "xART".into(), role: 0x100, encrypted: false, e_apfs: true, times, uid: 0, gid: 0, key_os_version: 0, size_bytes: None }).unwrap();
+        nx.commit().unwrap();
+        let x = nx.fs_oid.iter().position(|&v| v == o).unwrap();
+        for forced in [true, false] {
+            fsops::mount_rw(&mut nx, x, &mut now).unwrap();
+            fsops::mkdir(&mut nx, x, 2, if forced { "f" } else { "n" }, 0o755, 0, 0, &mut now).unwrap().unwrap();
+            nx.tx_finish().unwrap();
+            let (xid, pages) = (nx.xid, sink.pages());
+            assert!(!nx.in_tx);
+            fsops::unmount(&mut nx, x, forced, &mut now).unwrap();
+            assert_eq!((nx.xid, nx.in_tx), (xid, true), "forced {forced}");
+            assert!(sink.pages() == pages, "forced {forced}: the unmount wrote");
+            let sb = nx.vol_sb_read(x).unwrap().0;
+            assert_eq!(&sb[0x140..0x140 + fsops::KEXT_ID.len()], fsops::KEXT_ID.as_bytes());
+            assert_eq!(u64a(sb, 0x140 + 0x28), xid);
+            nx.commit().unwrap();
+        }
+    }
+
     /// The restore's disk0 (GEX_TEST_DISK0: an image `gexc darwin-disk0`
     /// made) mounts from its latest checkpoint, read only: each volume the
     /// restore made, with its trees.

@@ -119,6 +119,8 @@ const SB_DOC_ID_TREE: usize = 0x430;
 const SB_DOC_ID_PREV_TREE: usize = 0x438;
 const SB_ER_STATE: usize = 0x3d0;
 const SB_FS_FLAGS: usize = 0x108;
+/// `APFS_FS_UNENCRYPTED`.
+const APFS_FS_UNENCRYPTED: u64 = 0x1;
 const SB_FEATURES: usize = 0x28;
 const SB_RO_COMPAT: usize = 0x30;
 
@@ -2577,7 +2579,9 @@ pub fn chown(nx: &mut Nx<'_>, vol: usize, ino: u64, uid: u32, gid: u32, now: &mu
 /// which are listed. apfs_vfsop_unmount (K 0x66c8214) stops the volume's
 /// pfkur thread (K 0x66b0ffc at K 0x66c8988), which removes its temporary
 /// inode ([`free_tmp_ino`]), and commits (`tx_finish(0x11)` at K
-/// 0x66c8ef8); then, in the next transaction, which stays open, the
+/// 0x66c8ef8, which, as the sync's, writes nothing when no transaction is
+/// open: drafts/s16/re-kext-update.md 5); then, in the next transaction,
+/// which stays open, the
 /// kernel's `apfs_modified_by` entry (an existing one of the same name
 /// moves to the front, else the entries shift and the oldest goes), the
 /// clone transaction, and the unmount time. vflush reclaims the volume's
@@ -2594,12 +2598,12 @@ pub fn unmount(nx: &mut Nx<'_>, vol: usize, forced: bool, now: &mut dyn FnMut() 
         }
     } else {
         vnode_pass(nx, vol, now)?;
-        nx.commit()?;
+        nx.tx_finish()?;
     }
     if let Some(ino) = nx.pfkur_tmp.remove(&vol) {
         free_tmp_ino(nx, vol, ino, now)?;
     }
-    nx.commit()?;
+    nx.tx_finish()?;
     nx.begin()?;
     let xid = nx.xid;
     let ts = now();

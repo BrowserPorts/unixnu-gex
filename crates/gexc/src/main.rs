@@ -221,8 +221,13 @@ usage:
                                    different programs add up (--split DIR:
                                    one file per object instead of -o)
   gexc profile show [--top N] IN   summarise a profile
-  gexc darwin-disk0 <out> [<dmg>]  write the web device's disk0 as its erase
-                                   restore makes it (exit 2: steps missing)
+  gexc darwin-disk0 <out> [<dmg> [<ipsw-dir>]]
+                                   write the web device's disk0 as its erase
+                                   restore makes it (exit 2: steps missing);
+                                   with <ipsw-dir>, for the device
+                                   GEX_DARWIN_CRYPTEX1_TICKET names: web-device
+                                   (GEX_DARWIN_WEB_DEVICE signs its Cryptex1
+                                   ticket) or the device's ticket file
   gexc darwin-web-device init|show|roll <dir>
                                    make the web device (its root, manifest key,
                                    identity, UID and nonce slot), show it, or

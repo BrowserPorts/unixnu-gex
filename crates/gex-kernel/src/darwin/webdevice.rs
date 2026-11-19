@@ -1004,6 +1004,10 @@ mod tests {
             }
         }
         let cssy = image4::fourcc(b"cssy");
+        // The digest restored_external takes for the object, as
+        // libamsupport finds it: the root hash's.
+        use sha2::Digest;
+        assert_eq!(image4::object_property_data(&t, cssy, image4::fourcc(b"DGST")).unwrap(), &sha2::Sha384::digest(&payload)[..]);
         assert_eq!(execute(cssy, &payload, &t, &Mac(apple_root.clone())), Outcome::Status(e::EACCES));
         let mut bad = t.clone();
         let at = m.signature.as_ptr() as usize - t.as_ptr() as usize + 100;

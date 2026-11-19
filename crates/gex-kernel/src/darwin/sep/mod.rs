@@ -4,4 +4,6 @@ pub mod akf;
 pub mod frame;
 pub mod hw;
 pub mod image;
+pub mod mem;
 pub mod secrets;
+pub mod shm;

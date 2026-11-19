@@ -1841,6 +1841,9 @@ fn run_process(
     if opts.aot_only {
         aot_only::bind_root(&mut store, &instance)?;
     }
+    // Its memory built and published, the image and its stack in place:
+    // a spawning parent's `posix_spawn` returns ([`ImagePlaced`]).
+    image_placed(store.data_mut().with_kernel(|k| k.pid));
     gex_kernel::darwin::workq::thread_started(store.data().thread.tid);
     let stopped = match run_thread_loop(&mut store, &instance, ctx_addr, entry) {
         Ok(s) => s,
@@ -4574,13 +4577,36 @@ fn run_darwin_image(
     }
 }
 
+/// A Darwin `posix_spawn`'s child's image in place in its memory, its
+/// address space as `exec_activate_image` leaves it: XNU activates the
+/// image (step 2 of `posix_spawn`'s order in kern_exec.c) before the call
+/// returns, so its parent's call waits for this. The child's thread builds
+/// the memory and places the image ([`run_program_with`]).
+#[derive(Default)]
+struct ImagePlaced {
+    done: Mutex<bool>,
+    cv: std::sync::Condvar,
+}
+
+/// The spawned children whose images are not yet in place, by pid.
+static IMAGES_PLACING: Mutex<std::collections::BTreeMap<i32, Arc<ImagePlaced>>> = Mutex::new(std::collections::BTreeMap::new());
+
+/// Process `pid`'s image is in place, or its start has failed: its
+/// spawning parent's call may return. Nothing for a process none waits on.
+fn image_placed(pid: i32) {
+    let Some(g) = IMAGES_PLACING.lock().unwrap_or_else(|e| e.into_inner()).remove(&pid) else { return };
+    *g.done.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    g.cv.notify_all();
+}
+
 /// A Darwin `posix_spawn`'s child (`Kernel::darwin_spawned`), started:
 /// its image loaded here, in its parent's call, so that a load that fails
 /// is that call's error (EBADMACHO, EBADEXEC for a bad signature, EIO for
 /// a file that cannot be read) and the child goes unseen; then switched
 /// over to it, the image activated and its task enabled, before the call
 /// returns; then run on a thread of its own, its end recorded for its
-/// parent's `wait4`.
+/// parent's `wait4`. The call returns once that thread has its memory
+/// built and the image placed in it ([`ImagePlaced`]).
 fn start_darwin_spawn(cx: &SpawnContext, mut child: Kernel) -> std::result::Result<i32, gex_kernel::errno::Errno> {
     use gex_kernel::errno::Errno;
     let pid = child.pid;
@@ -4639,12 +4665,23 @@ fn start_darwin_spawn(cx: &SpawnContext, mut child: Kernel) -> std::result::Resu
     // The child goes to its thread through a slot, so that one that cannot
     // be made leaves it here to end.
     let slot = Arc::new(Mutex::new(Some(child)));
+    let placed = Arc::new(ImagePlaced::default());
+    IMAGES_PLACING.lock().unwrap_or_else(|e| e.into_inner()).insert(pid, Arc::clone(&placed));
+    // A start that ends before the image is in place (an error, a panic)
+    // lets the parent's call return as well.
+    struct PlacedOrGone(i32);
+    impl Drop for PlacedOrGone {
+        fn drop(&mut self) {
+            image_placed(self.0);
+        }
+    }
     let started = std::thread::Builder::new()
         .name(format!("gex-pid-{pid}"))
         .stack_size(guest_thread_stack())
         .spawn({
             let (slot, procs) = (Arc::clone(&slot), Arc::clone(&procs));
             move || {
+                let _placed = PlacedOrGone(pid);
                 let child = slot.lock().unwrap_or_else(|e| e.into_inner()).take().expect("the spawned child's kernel");
                 let wstatus = match run_darwin_image(img, loaded, argv, envp, &opts, &xlate, child, child_proc, wayland) {
                     Ok((exit, _)) => {
@@ -4664,11 +4701,20 @@ fn start_darwin_spawn(cx: &SpawnContext, mut child: Kernel) -> std::result::Resu
             }
         });
     match started {
-        Ok(_) => Ok(pid),
-        Err(_) => match slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            Some(mut child) => fail(&mut child, Errno::EAGAIN),
-            None => Err(Errno::EAGAIN),
-        },
+        Ok(_) => {
+            let mut done = placed.done.lock().unwrap_or_else(|e| e.into_inner());
+            while !*done {
+                done = placed.cv.wait(done).unwrap_or_else(|e| e.into_inner());
+            }
+            Ok(pid)
+        }
+        Err(_) => {
+            image_placed(pid);
+            match slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                Some(mut child) => fail(&mut child, Errno::EAGAIN),
+                None => Err(Errno::EAGAIN),
+            }
+        }
     }
 }
 

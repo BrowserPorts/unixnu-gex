@@ -4120,12 +4120,15 @@ mod tests {
     /// holds: a change in the open transaction at once (a view of the
     /// checkpoint does not see it), each inode a lookup reaches given its
     /// vnode at the head of the volume's list, an open file's inode as it
-    /// is changed. Once the open transaction is committed the reader
-    /// finds it; the view mounted before keeps answering through every
-    /// later commit, as a view of the newest checkpoint does.
+    /// is changed. `VFS_SYNC` (apfs_vfsop_sync) commits the open
+    /// transaction to a checkpoint the reader then finds; the view mounted
+    /// before keeps answering through every later commit, as a view of the
+    /// newest checkpoint does. A sync of a volume not held read-write, of
+    /// an encrypted volume, or with inodes holding unwritten times is
+    /// refused.
     #[test]
-    fn a_live_view_follows_its_container() {
-        use super::super::fsops;
+    fn a_live_view_follows_its_container_through_a_sync() {
+        use super::super::fsops::{self, waitfor};
         use crate::darwin::apfsread::{Container, Volume};
         use crate::darwin::graftfs::{GraftFs, GraftMount};
         use crate::errno::Errno;
@@ -4152,6 +4155,7 @@ mod tests {
         };
         let pb = make(&mut nx, "Preboot", 0x10, false, &mut now);
         let data = make(&mut nx, "Data", 0x40, true, &mut now);
+        assert!(fsops::vfs_sync(&mut nx, pb, waitfor::MNT_NOWAIT, &mut now).unwrap_err().contains("does not hold mounted read-write"));
         // Files an earlier mount made, then this mount's own change.
         fsops::mount_rw(&mut nx, pb, &mut now).unwrap();
         let a = fsops::mkdir(&mut nx, pb, 2, "a", 0o755, 0, 0, &mut now).unwrap().unwrap();
@@ -4183,14 +4187,16 @@ mod tests {
         assert_eq!(h.metadata().unwrap().mode, 0o644);
         fsops::chmod(&mut held.lock().unwrap(), pb, f, 0o600, &mut now).unwrap();
         assert_eq!(h.metadata().unwrap().mode, 0o600);
-        // The commit.
+        // The sync: refused for the encrypted volume, then Preboot's
+        // commits.
         {
             let mut nx = held.lock().unwrap();
+            assert!(fsops::vfs_sync(&mut nx, data, waitfor::MNT_NOWAIT, &mut now).unwrap_err().contains("encryption-policy"));
             let xid = nx.xid;
-            nx.tx_finish().unwrap();
+            fsops::vfs_sync(&mut nx, pb, waitfor::MNT_NOWAIT, &mut now).unwrap();
             assert_eq!((nx.xid, nx.in_tx), (xid + 1, false));
-            // With nothing open, a second commit writes nothing.
-            nx.tx_finish().unwrap();
+            // With nothing open, a second sync writes nothing.
+            fsops::vfs_sync(&mut nx, pb, waitfor::MNT_WAIT, &mut now).unwrap();
             assert_eq!(nx.xid, xid + 1);
         }
         let c = std::sync::Arc::new(Container::open(std::sync::Arc::clone(&medium)).unwrap());
@@ -4207,7 +4213,7 @@ mod tests {
                 let d = fsops::mkdir(&mut nx, pb, a, &format!("r{round}-{i}"), 0o700, 0, 0, &mut now).unwrap().unwrap();
                 made.push((format!("r{round}-{i}"), d));
             }
-            nx.tx_finish().unwrap();
+            fsops::vfs_sync(&mut nx, pb, waitfor::MNT_NOWAIT, &mut now).unwrap();
         }
         let c = std::sync::Arc::new(Container::open(std::sync::Arc::clone(&medium)).unwrap());
         let v = c.volume(pb).unwrap().unwrap();
@@ -4217,6 +4223,12 @@ mod tests {
         }
         assert_eq!(live.open("a", 0, 0).unwrap().read_dir().unwrap().len(), 4 + made.len());
         assert_eq!(live.metadata("a/none").unwrap_err(), Errno::ENOENT);
+        // Unwritten times held on an inode: the vnode pass's rewrite is not
+        // implemented.
+        let mut nx = held.lock().unwrap();
+        fsops::chmod(&mut nx, pb, f, 0o600, &mut now).unwrap();
+        assert!(nx.jobj_times.contains_key(&(pb, f)));
+        assert!(fsops::vfs_sync(&mut nx, pb, waitfor::MNT_NOWAIT, &mut now).unwrap_err().contains("held unwritten"));
     }
 
     /// apfs_vfsop_unmount's tx_finish, as the sync's, writes no checkpoint

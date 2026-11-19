@@ -213,6 +213,14 @@ pub fn mount_rw(index: u32) -> Result<(), String> {
     })
 }
 
+/// `VFS_SYNC(mp, waitfor)` of the volume in slot `index`, which the
+/// kernel's container holds mounted read-write: apfs_vfsop_sync's vnode
+/// pass and the commit of the container's open transaction
+/// ([`super::apfswrite::fsops::vfs_sync`]).
+pub fn vfs_sync(index: u32, waitfor: u32) -> Result<(), String> {
+    with_container(|nx| super::apfswrite::fsops::vfs_sync(nx, index as usize, waitfor, &mut nanotime))
+}
+
 /// Inode `ino` of the volume in slot `index` brought into the kernel by a
 /// lookup (`VNOP_LOOKUP`'s `vnode_create`, at the head of the mount's
 /// vnode list), unless it has a vnode: the order a vnode pass visits the

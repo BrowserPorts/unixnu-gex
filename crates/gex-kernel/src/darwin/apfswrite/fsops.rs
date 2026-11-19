@@ -2706,6 +2706,73 @@ pub fn sync(nx: &mut Nx<'_>, now: &mut dyn FnMut() -> u64) -> Result<(), String>
     Ok(())
 }
 
+/// `VFS_SYNC`'s `waitfor` flags (`mount.h`): `MNT_WAIT`, `MNT_NOWAIT`,
+/// `MNT_DWAIT`, `MNT_VOLUME`.
+pub mod waitfor {
+    pub const MNT_WAIT: u32 = 1;
+    pub const MNT_NOWAIT: u32 = 2;
+    pub const MNT_DWAIT: u32 = 4;
+    pub const MNT_VOLUME: u32 = 8;
+}
+
+/// `VFS_SYNC(mp, waitfor)` of slot `vol`, which the container holds
+/// mounted read-write: apfs_vfsop_sync (K 0x66c9d80; drafts/s27/
+/// re-txdata.md 4.1). A volume mounted read-only (`apfs + 0x354`) or a
+/// snapshot mount (`+ 0x380`) returns at once, and a mount being updated
+/// (`MNT_UPDATE`) logs and returns: the caller's, which knows the mount.
+/// Then:
+///
+/// - `vnode_iterate(mp, 0, K 0x66d1748)`: each vnode but a dead one's and
+///   the private directory's given `apfs_fsync_internal(fs, vp, waitfor)`
+///   (its data pushed, then the times its inode holds unwritten,
+///   [`vnode_pass`]) and `cp_detach_ep` (K 0x66d13d4: only for an inode
+///   with an encryption policy attached, jobj+0x98 bit 48);
+/// - the purgatory cleaner (K 0x66cd0cc), whose thread
+///   (`cleanup_snapshot_purgatory`, K 0x66cedfc) writes only for a deleted
+///   snapshot;
+/// - `tx_finish(nx, flags)` (K 0x66c9fe0): the open transaction closed and
+///   committed, the caller waiting for its checkpoint; `flags` is 0x11 for
+///   `MNT_VOLUME`, else 0x11 when the container's sync count (`nx +
+///   0x1e8`, raised here) is a multiple of its mounted volumes and 1
+///   otherwise, which differ only in the barrier after the superblock
+///   (`tx_flush`'s 0x10 << 14, the same blocks written), and a 0x11 sync
+///   clears `nx + 0x410` (`waitfor` chooses nothing else here);
+/// - `ep_cache_purge_expired(apfs, 0)` (K 0x6736124): the volume's cache of
+///   crypto states with encryption policies, whose expired entries'
+///   inodes it updates.
+///
+/// The encryption-policy work (`cp_detach_ep`, the ep cache) is reached
+/// only on a content-protected volume (crypto.c's `get_vol_crypto(apfs) ==
+/// VOL_CPROTECTED` assertions): on a volume not `APFS_FS_UNENCRYPTED` it is
+/// not implemented (AppleKeyStore's policy checks, K 0x67322b4). So are a
+/// volume with snapshots (the cleaner's work on one deleted) and inodes
+/// holding unwritten times, whose rewrite the kernel makes with
+/// `update_jobj` (bt_update with the vnode's leaf hint, K 0x672c328) and
+/// [`vnode_pass`] with this writer's insert.
+pub fn vfs_sync(nx: &mut Nx<'_>, vol: usize, _waitfor: u32, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    if !nx.mounted.contains(&vol) {
+        return Err(format!("VFS_SYNC of volume slot {vol}, which the container does not hold mounted read-write"));
+    }
+    let (sb, _) = nx.vol_sb_read(vol)?;
+    let fs_flags = u64a(sb, SB_FS_FLAGS);
+    if fs_flags & APFS_FS_UNENCRYPTED == 0 {
+        return Err(format!("not implemented: apfs_vfsop_sync's encryption-policy work on an encrypted volume (apfs_fs_flags {fs_flags:#x}; cp_detach_ep, K 0x66d13d4, and ep_cache_purge_expired, K 0x6736124, with AppleKeyStore's policy checks)"));
+    }
+    let snaps = {
+        let (t, _) = nx.snapmeta_tree(vol)?;
+        t.root
+    };
+    if nx.phys_node_counts(snaps)? != (0, 0) {
+        return Err(format!("not implemented: the purgatory cleaner (K 0x66cd0cc → K 0x66cedfc) of volume slot {vol}, which has snapshot records"));
+    }
+    let held: Vec<u64> = nx.jobj_times.keys().filter(|k| k.0 == vol).map(|k| k.1).collect();
+    if !held.is_empty() {
+        return Err(format!("not implemented: the vnode pass's rewrite of inodes {held:#x?} of volume slot {vol}, whose times are held unwritten (update_jobj's bt_update with the vnode's leaf hint, K 0x672c328)"));
+    }
+    vnode_pass(nx, vol, now)?;
+    nx.tx_finish()
+}
+
 /// The attributes a `setattr` sets (XNU's `vnode_attr` as chmodx_np,
 /// fchown, lchown and fsetattrlist fill it): owner, group, mode bits,
 /// modification and access times.

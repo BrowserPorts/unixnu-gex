@@ -13,7 +13,7 @@
 //! (K 0x6737394), taken from `now`.
 
 use super::btree::Tree;
-use super::tx::Nx;
+use super::tx::{self, Nx};
 use super::Put;
 
 const J_INODE: u64 = 3;
@@ -186,6 +186,9 @@ fn doc_id_cleanup(nx: &mut Nx<'_>, vol: usize) -> Result<(), String> {
 /// encryption-rolling resume returns on a ramdisk boot, and the keybag
 /// notification handler only waits: none writes.
 pub fn mount_rw(nx: &mut Nx<'_>, vol: usize, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    if nx.mounted.contains(&vol) {
+        return Err(format!("mounting volume slot {vol}, which is mounted"));
+    }
     check_names(nx, vol)?;
     doc_id_cleanup(nx, vol)?;
     let (sb, _) = nx.vol_sb_read(vol)?;
@@ -199,7 +202,13 @@ pub fn mount_rw(nx: &mut Nx<'_>, vol: usize, now: &mut dyn FnMut() -> u64) -> Re
         fs_tx_leave(nx, vol, now)?;
     }
     pfkur_resume(nx, vol, now)?;
-    volume_fixup(nx, vol, now)
+    volume_fixup(nx, vol, now)?;
+    // mount_list_add; the first path through the mount point (the
+    // restore's `.ramdisk-boot-done` open after its mounts) brings in the
+    // root's vnode (VFS_ROOT).
+    nx.mounted.push(vol);
+    nx.vnode_get(vol, ROOT_DIR_INO, &|| format!("the root of volume slot {vol}"));
+    Ok(())
 }
 
 /// The volume's crypto kind (K 0x671a778, from `fs_flags & 0x109`): 3 for
@@ -401,7 +410,20 @@ pub fn create(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str, mode: u16, u
     create_obj(nx, vol, parent, name, S_IFREG | (mode & 0o7777), uid, gid, now)
 }
 
+/// [`create_obj_in`], with the vnode namei and the VNOP bring in: the new
+/// inode's, or with EEXIST the existing one's.
 fn create_obj(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str, mode: u16, uid: u32, gid: u32, now: &mut dyn FnMut() -> u64) -> Result<Result<u64, i32>, String> {
+    let r = create_obj_in(nx, vol, parent, name, mode, uid, gid, now)?;
+    match r {
+        Ok(ino) => nx.vnode_get(vol, ino, &|| format!("the creation of {name} (inode {ino:#x}) on volume slot {vol}")),
+        Err(_) => {
+            lookup(nx, vol, parent, name)?;
+        }
+    }
+    Ok(r)
+}
+
+fn create_obj_in(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str, mode: u16, uid: u32, gid: u32, now: &mut dyn FnMut() -> u64) -> Result<Result<u64, i32>, String> {
     let dir = mode & S_IFMT == S_IFDIR;
     let link = mode & S_IFMT == S_IFLNK;
     // A directory on Data, or a directory or file on User: the only
@@ -581,7 +603,7 @@ fn obj_create_name(nx: &mut Nx<'_>, vol: usize, parent: u64, pi: &Inode, name: &
         false
     };
     let dk = drec_key(parent, name);
-    nx.jobj_times.remove(&(vol, parent));
+    nx.take_times(vol, parent);
     let t1 = now();
     let mut dv = ino.to_le_bytes().to_vec();
     dv.extend_from_slice(&t1.to_le_bytes());
@@ -1584,7 +1606,7 @@ pub fn rename_in_dir(nx: &mut Nx<'_>, vol: usize, dir: u64, from: &str, to: &str
     // bit.
     let fc = now();
     let dt = now();
-    nx.jobj_times.insert((vol, dir), (dt, dt));
+    nx.hold_times(vol, dir, (dt, dt), false);
     Ok(RenameTimes { file: (u64a(&f, INO_MOD_TIME), fc), dir: (dt, dt) })
 }
 
@@ -2263,12 +2285,23 @@ fn phys_extent_add(nx: &mut Nx<'_>, vol: usize, paddr: u64, len: u64, owner: u64
 /// dirty (jobj + 0x98 |= 0x40000), held for the inode's next write
 /// (`nx.jobj_times`); other bits take [`setattr`]'s general path.
 pub fn chmod(nx: &mut Nx<'_>, vol: usize, ino: u64, mode: u16, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    chmod_through(nx, vol, ino, mode, false, now)
+}
+
+/// [`chmod`] by `fchmod` on a descriptor the caller keeps open until it
+/// writes the inode again through it: the vnode stays referenced, off the
+/// free list, so a full vnode table cannot recycle it meanwhile.
+pub fn fchmod(nx: &mut Nx<'_>, vol: usize, ino: u64, mode: u16, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    chmod_through(nx, vol, ino, mode, true, now)
+}
+
+fn chmod_through(nx: &mut Nx<'_>, vol: usize, ino: u64, mode: u16, open: bool, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     let v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
     let cur = u16::from_le_bytes([v[INO_MODE], v[INO_MODE + 1]]);
     if (cur ^ mode) & 0o7777 != 0 {
         return setattr(nx, vol, ino, SetAttr { mode: Some(mode), ..Default::default() }, now);
     }
-    chmod_same(nx, vol, ino, &v, now);
+    chmod_same(nx, vol, ino, &v, open, now);
     Ok(())
 }
 
@@ -2276,10 +2309,10 @@ pub fn chmod(nx: &mut Nx<'_>, vol: usize, ino: u64, mode: u16, now: &mut dyn FnM
 /// 0x668f290 → K 0x668f348) on the inode whose record is `v`: the change
 /// time read from the clock (K 0x668f35c) into the in-memory object, marked
 /// dirty, nothing written (`nx.jobj_times` holds it for the next write).
-fn chmod_same(nx: &mut Nx<'_>, vol: usize, ino: u64, v: &[u8], now: &mut dyn FnMut() -> u64) {
+fn chmod_same(nx: &mut Nx<'_>, vol: usize, ino: u64, v: &[u8], open: bool, now: &mut dyn FnMut() -> u64) {
     let t = now();
     let m = nx.jobj_times.get(&(vol, ino)).map_or(u64a(v, INO_MOD_TIME), |p| p.0);
-    nx.jobj_times.insert((vol, ino), (m, t));
+    nx.hold_times(vol, ino, (m, t), open);
 }
 
 /// The inode `ino` as its in-memory object holds it, for a rewrite
@@ -2288,7 +2321,7 @@ fn chmod_same(nx: &mut Nx<'_>, vol: usize, ino: u64, v: &[u8], now: &mut dyn FnM
 /// map.
 fn in_memory_inode(nx: &mut Nx<'_>, vol: usize, ino: u64) -> Result<Vec<u8>, String> {
     let mut v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
-    if let Some((m, c)) = nx.jobj_times.remove(&(vol, ino)) {
+    if let Some((m, c)) = nx.take_times(vol, ino) {
         v.put64(INO_MOD_TIME, m);
         v.put64(INO_CHANGE_TIME, c);
     }
@@ -2310,38 +2343,33 @@ pub fn chown(nx: &mut Nx<'_>, vol: usize, ino: u64, uid: u32, gid: u32, now: &mu
 }
 
 /// The unmount of a read-write volume, `forced` (MNT_FORCE) or not:
-/// without it XNU's VFS_SYNC first writes the times the volume's inodes
-/// hold in memory and commits the container's transaction (`tx_finish`);
-/// with it, inodes holding unwritten times are refused (their reclaim is
-/// not transcribed); apfs_vfsop_unmount (K 0x66c8214) stops the volume's
+/// without it XNU's dounmount runs ubc_umount (no dirty pages: every file
+/// was closed after its writes) and VFS_SYNC(MNT_WAIT), whose vnode pass
+/// ([`vnode_pass`]) writes the times the volume's inodes hold in memory,
+/// and whose `tx_finish` commits the container's transaction; with it,
+/// vflush's reclaims would write them (vclean's VNOP_FSYNC, or
+/// apfs_vnop_reclaim's own transaction, not transcribed): refused, but for
+/// inodes whose vnodes the full vnode table may already have recycled,
+/// which are listed. apfs_vfsop_unmount (K 0x66c8214) stops the volume's
 /// pfkur thread (K 0x66b0ffc at K 0x66c8988), which removes its temporary
 /// inode ([`free_tmp_ino`]), and commits (`tx_finish(0x11)` at K
 /// 0x66c8ef8); then, in the next transaction, which stays open, the
 /// kernel's `apfs_modified_by` entry (an existing one of the same name
 /// moves to the front, else the entries shift and the oldest goes), the
-/// clone transaction, and the unmount time.
+/// clone transaction, and the unmount time. vflush reclaims the volume's
+/// vnodes and the mount leaves the mount list.
 pub fn unmount(nx: &mut Nx<'_>, vol: usize, forced: bool, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
-    let pending: Vec<u64> = nx.jobj_times.keys().filter(|k| k.0 == vol).map(|k| k.1).collect();
-    if forced && !pending.is_empty() {
-        return Err(format!("not implemented: a forced unmount reclaiming vnodes whose in-memory times are unwritten (inodes {pending:#x?}; apfs_vnop_reclaim not transcribed)"));
+    if !nx.mounted.contains(&vol) {
+        return Err(format!("unmounting volume slot {vol}, which is not mounted"));
     }
-    if !forced {
-        // apfs_vfsop_sync (K 0x66c9d80): the vnode pass first (K 0x66d1748
-        // → apfs_fsync_internal, whose times write for an inode with only
-        // its times dirty is one file-system transaction rewriting it, K
-        // 0x66a1878), then tx_finish.
-        if pending.len() > 1 {
-            return Err("not implemented: the sync pass's vnode order (vnode_iterate over the mount's list) for more than one inode with unwritten times".into());
+    if forced {
+        drop_at_risk(nx, vol, "this forced unmount's vflush reclaims");
+        let pending: Vec<u64> = nx.jobj_times.keys().filter(|k| k.0 == vol).map(|k| k.1).collect();
+        if !pending.is_empty() {
+            return Err(format!("not implemented: a forced unmount reclaiming vnodes whose in-memory times are unwritten (inodes {pending:#x?}; vclean's VNOP_FSYNC or apfs_vnop_reclaim's transaction not transcribed)"));
         }
-        for ino in pending {
-            let (m, c) = nx.jobj_times.remove(&(vol, ino)).unwrap();
-            fs_tx_enter(nx, vol)?;
-            let mut v = inode(nx, vol, ino)?;
-            v.put64(INO_MOD_TIME, m);
-            v.put64(INO_CHANGE_TIME, c);
-            put_rec(nx, vol, &inode_key(ino), &v)?;
-            fs_tx_leave(nx, vol, now)?;
-        }
+    } else {
+        vnode_pass(nx, vol, now)?;
         nx.commit()?;
     }
     if let Some(ino) = nx.pfkur_tmp.remove(&vol) {
@@ -2369,6 +2397,84 @@ pub fn unmount(nx: &mut Nx<'_>, vol: usize, forced: bool, now: &mut dyn FnMut() 
     let sb = nx.vol_sb(vol)?;
     sb.put64(SB_UNMOUNT_TIME, t);
     sb.put64(SB_LAST_XID, xid);
+    nx.vnode_flush(vol);
+    nx.mounted.retain(|&m| m != vol);
+    Ok(())
+}
+
+/// The inodes of slot `vol` whose times are held unwritten while the
+/// vnode table was full: their vnodes may have been recycled since
+/// (new_vnode's reclaim of the free list's oldest vnode, or the
+/// vn_laundry thread's, at times the device's scheduling decides), and the
+/// recycling's vclean writes the times in a transaction of its own; else
+/// `at` writes them. Which, and so in which transaction and with which
+/// clock readings, the binaries do not settle: the times leave the model's
+/// memory unwritten and are listed.
+fn drop_at_risk(nx: &mut Nx<'_>, vol: usize, at: &str) {
+    let risk: Vec<(u64, (u64, u64))> = nx.jobj_times.iter().filter(|(k, _)| k.0 == vol && nx.vnode_at_risk.contains(k)).map(|(k, t)| (k.1, *t)).collect();
+    if risk.is_empty() {
+        return;
+    }
+    for (ino, _) in &risk {
+        nx.jobj_times.remove(&(vol, *ino));
+        nx.vnode_at_risk.remove(&(vol, *ino));
+    }
+    let held: Vec<String> = risk.iter().map(|(i, t)| format!("{i:#x} ({}, {})", t.0, t.1)).collect();
+    let fill = nx.vnode_fill_at.clone().unwrap_or_default();
+    nx.vnode_missing.push(format!("the modification and change times {} inodes of volume slot {vol} held in memory while XNU's vnode table was full (desiredvnodes {}, the restore's vnodes reaching it at {fill}): each is written by its vnode's recycling (vclean's VNOP_FSYNC or apfs_vnop_reclaim, in a transaction of its own, at a point the run's scheduling of new_vnode and the vn_laundry thread decides, which depends on the restore ramdisk's own vnodes and the ones the model does not count) or by {at}; not written: {}", risk.len(), tx::DESIRED_VNODES, held.join(", ")));
+}
+
+/// apfs_vfsop_sync's vnode pass over slot `vol` (`vnode_iterate(mp, 0,
+/// K 0x66d1748)`, K 0x66c9d80; drafts/s27/re-txdata.md 4): the mount's
+/// vnode list from its head, the newest vnode first ([`Nx::vnode_list`]),
+/// each vnode whose inode holds only its times unwritten (`(jobj+0x98 &
+/// 0x40010) == 0x40000`) given apfs_fsync_internal's times write (K
+/// 0x66a1878): one file-system transaction (type 4, count 1) rewriting the
+/// inode with them, its own `fs_tx_leave`. The private directory's vnode
+/// (fs+0x130) is skipped. Inodes at risk of recycling ([`drop_at_risk`])
+/// are listed, not written.
+fn vnode_pass(nx: &mut Nx<'_>, vol: usize, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    drop_at_risk(nx, vol, "this vnode pass");
+    let mut pending: Vec<u64> = nx.jobj_times.keys().filter(|k| k.0 == vol).map(|k| k.1).collect();
+    if pending.is_empty() {
+        return Ok(());
+    }
+    if pending.contains(&PRIV_DIR_INO) {
+        return Err("not implemented: unwritten times on the private directory, whose vnode the sync pass skips".into());
+    }
+    let list = nx.vnode_list(vol);
+    let at = |i: &u64| list.iter().position(|x| x == i);
+    if pending.len() > 1 {
+        if let Some(i) = pending.iter().find(|i| at(i).is_none()) {
+            return Err(format!("not implemented: the vnode-list place of inode {i:#x}, whose vnode's creation the model does not see, among {} inodes with unwritten times", pending.len()));
+        }
+        pending.sort_by_key(|i| at(i).unwrap());
+    }
+    for ino in pending {
+        let (m, c) = nx.take_times(vol, ino).unwrap();
+        fs_tx_enter(nx, vol)?;
+        let mut v = inode(nx, vol, ino)?;
+        v.put64(INO_MOD_TIME, m);
+        v.put64(INO_CHANGE_TIME, c);
+        put_rec(nx, vol, &inode_key(ino), &v)?;
+        fs_tx_leave(nx, vol, now)?;
+    }
+    Ok(())
+}
+
+/// `sync(2)` (X 0xfffffff0073843ec): `vfs_iterate(LK_NOWAIT, sync_callback,
+/// NULL)` walks the mount list from its head, the oldest mount first, and
+/// gives each read-write mount VFS_SYNC(MNT_NOWAIT): for this container's
+/// volumes apfs_vfsop_sync (K 0x66c9d80), whose vnode pass ([`vnode_pass`])
+/// writes held times, whose purgatory cleaner finds no deleted snapshot,
+/// and whose `tx_finish` (flags 0x11 when the container's sync count, +1,
+/// is a multiple of its mounted volumes, else 1: the same blocks) commits
+/// the open transaction. The ramdisk's own mounts hold nothing of disk0.
+pub fn sync(nx: &mut Nx<'_>, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    for vol in nx.mounted.clone() {
+        vnode_pass(nx, vol, now)?;
+        nx.tx_finish()?;
+    }
     Ok(())
 }
 
@@ -2415,7 +2521,7 @@ pub fn setattr(nx: &mut Nx<'_>, vol: usize, ino: u64, a: SetAttr, now: &mut dyn 
     if a.uid.is_none() && a.gid.is_none() && a.mtime.is_none() && a.atime.is_none() {
         let m = a.mode.unwrap();
         if (m ^ cur) & 0o7777 == 0 {
-            chmod_same(nx, vol, ino, &v, now);
+            chmod_same(nx, vol, ino, &v, false, now);
             return Ok(());
         }
     }
@@ -2826,7 +2932,7 @@ pub fn set_dir_class(nx: &mut Nx<'_>, vol: usize, ino: u64, class: u32, now: &mu
     if crypto == 1 && old == 2 {
         return Err("not implemented: a class change from class B (K 0x66fac40)".into());
     }
-    if let Some((m, c)) = nx.jobj_times.remove(&(vol, ino)) {
+    if let Some((m, c)) = nx.take_times(vol, ino) {
         v.put64(INO_MOD_TIME, m);
         v.put64(INO_CHANGE_TIME, c);
     }
@@ -2978,8 +3084,15 @@ pub fn parent_of(nx: &mut Nx<'_>, vol: usize, ino: u64) -> Result<u64, String> {
 
 /// Looks `name` up in directory `parent`: its inode number.
 pub fn lookup(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str) -> Result<Option<u64>, String> {
-    let (t, mut st): (Tree, _) = nx.fs_tree(vol)?;
-    Ok(t.get(&mut st, &drec_key(parent, name))?.map(|v| u64a(&v, 0)))
+    let found = {
+        let (t, mut st): (Tree, _) = nx.fs_tree(vol)?;
+        t.get(&mut st, &drec_key(parent, name))?.map(|v| u64a(&v, 0))
+    };
+    // VNOP_LOOKUP's hit: the inode's vnode (made unless it has one).
+    if let Some(ino) = found {
+        nx.vnode_get(vol, ino, &|| format!("the lookup of {name} (inode {ino:#x}) on volume slot {vol}"));
+    }
+    Ok(found)
 }
 
 /// What the removals take from the run that only the device has: the
@@ -3236,7 +3349,10 @@ pub fn unlink(nx: &mut Nx<'_>, vol: usize, dir: u64, drec: &[u8], ino: u64, now:
         remove_rec(nx, vol, &idk)?;
     }
     remove_rec(nx, vol, &inode_key(ino))?;
-    fs_tx_leave_last(nx, vol, closing, now)
+    fs_tx_leave_last(nx, vol, closing, now)?;
+    // The unlinked file's last release: VNOP_INACTIVE recycles its vnode.
+    nx.vnode_gone(vol, ino);
+    Ok(())
 }
 
 /// `rmdir` of empty directory `ino` whose entry in `dir` is `drec`
@@ -3268,7 +3384,9 @@ pub fn rmdir(nx: &mut Nx<'_>, vol: usize, dir: u64, drec: &[u8], ino: u64, now: 
     let sb = nx.vol_sb(vol)?;
     let n = u64a(sb, SB_NUM_DIRECTORIES);
     sb.put64(SB_NUM_DIRECTORIES, n - 1);
-    fs_tx_leave_last(nx, vol, false, now)
+    fs_tx_leave_last(nx, vol, false, now)?;
+    nx.vnode_gone(vol, ino);
+    Ok(())
 }
 
 /// The trees restored_external's fixup_var moves from System to Data

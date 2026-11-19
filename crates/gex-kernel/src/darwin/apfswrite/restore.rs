@@ -71,9 +71,14 @@ pub fn stand_ins(os: bool, boot: bool) -> Vec<&'static str> {
         v.push(USERSESSION_STAND_IN);
         v.push(RESTORE_OPTIONS_STAND_IN);
         v.push(BOM_STAND_IN);
+        v.push(VNODE_STAND_IN);
     }
     v
 }
+
+/// What the vnode table's state rests on before the restore's own vnodes
+/// certainly fill it.
+pub const VNODE_STAND_IN: &str = "the vnode table before the vnodes the model counts reach XNU's desiredvnodes (10,000: the J120 device tree's /defaults kern.maxvnodes, which bsd_startupearly reads before its CONFIG_VNODES 1024 rule): the restore ramdisk's own vnodes (its volume's 1,265 files, directories and links, devfs, its processes' open files) and the restore's vnodes the model does not count (namei's lookups of the components it reaches by inode number, fixup_var's System sources, named-stream vnodes) leave room for them, so no vnode holding unwritten times is recycled before that (stand-in; measure vfs.vnstats.num_vnodes and num_recycledvnodes on the restore ramdisk across the restore); after it, inodes holding times in memory are listed (their recycling's timing is the run's)";
 
 /// The restore's build.
 pub const RESTORE_BUILD: &str = "21H461";
@@ -306,7 +311,11 @@ pub fn build_disk0_hooked(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() 
                 // The main list after check_mounted's block and the NVRAM
                 // steps (drafts/s27/re-seal-snap.md 0).
                 missing.push("populate_preboot_volume (drafts/s27/re-populate.md: the firmware items copied into Preboot's preallocated files, /mnt9/active's O_TRUNC fast truncate (K 0x669d444 not traced), the directories it makes; its NVRAM reads)".into());
-                missing.push(autoboot_sync_missing(&mut nx));
+                // set_boot_command writes NVRAM only; set_autoboot_delay
+                // syncs, then writes NVRAM.
+                set_autoboot_delay(&mut nx, now)?;
+                missing.extend(nx.vnode_missing.drain(..));
+                missing.push(NVRAM_AUTOBOOT_MISSING.into());
                 let tool_barrier = barrier.unwrap_or_else(crate::darwin::storagestack::container_barrier);
                 missing.push(IMAGE4_CHECKS_MISSING.into());
                 if !seal_system_volume(&mut nx, v, data, user, files, tool_barrier, hooks, now)? {
@@ -347,6 +356,11 @@ pub fn build_disk0_hooked(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() 
     for v in slots {
         let held: Vec<String> = nx.jobj_times.iter().filter(|(k, _)| k.0 == v).map(|(k, t)| format!("{:#x} ({}, {})", k.1, t.0, t.1)).collect();
         missing.push(format!("the times {} inodes of volume slot {v} hold in memory (modification, change), written by their next rewrite, a sync pass or their vnodes' reclaim: {}", held.len(), held.join(", ")));
+    }
+    missing.extend(nx.vnode_missing.drain(..));
+    if !nx.vnode_risk_written.is_empty() {
+        let w: Vec<String> = nx.vnode_risk_written.iter().map(|(v, i)| format!("slot {v} {i:#x}")).collect();
+        missing.push(format!("the times {} inodes held in memory while XNU's vnode table was full ({}), which the restore's own next rewrite of each wrote: their vnodes' recycling may have written them first, in a transaction of its own at a point the run decides (vclean's VNOP_FSYNC or apfs_vnop_reclaim; not written there): {}", w.len(), nx.vnode_fill_at.clone().unwrap_or_default(), w.join(", ")));
     }
     missing.push("nx_counters[0] and block 0's nx_newest_mounted_version as the kernel's transactions leave them (projected from newfs_apfs's three counting sites; the kext has ten)".into());
     nx.unmount()?;
@@ -1553,7 +1567,7 @@ fn copy_dir(nx: &mut Nx<'_>, system: usize, data: usize, sdir: u64, ddir: u64, r
                     fsops::cas_bsdflags(nx, data, t, 0, 0x20, now)?;
                     fsops::setattr(nx, data, t, times(&s), now)?;
                 } else {
-                    nx.jobj_times.insert((data, t), rt.file);
+                    nx.hold_times(data, t, rt.file, false);
                 }
                 if moved(&path) {
                     fsops::unlink(nx, system, sdir, &k, ino, now)?;
@@ -1784,20 +1798,17 @@ fn after_invert_mounts(nx: &mut Nx<'_>, v: Volumes, now: &mut dyn FnMut() -> u64
 /// image cannot answer.
 const IMAGE4_CHECKS_MISSING: &str = "restored_external's Image4 checks against the AP ticket of the canonical metadata (ramrod_verify_manifest_for_mountpoint, RE@0x100058108 → RE@0x1000583e0) and of /mnt5/root_hash (tag 'isys', RE@0x100058714): TICKET_STAND_IN's ticket signs nothing, so they are not run (the files are the IPSW's, which the device's checks pass)";
 
-/// set_autoboot_delay's `sync()` (RE@0x100033ef8; drafts/s27/
-/// re-seal-snap.md 2.1), not implemented: XNU's VFS_SYNC of each mounted
-/// read-write volume, oldest mount first, whose vnode pass writes the
-/// times inodes hold in memory (in each mount's vnode-list order, which
-/// depends on the vnodes the restore's copies left: re-txdata.md 4.2,
-/// re-datawrite.md UNSETTLED-4), and the first volume's tx_finish commit.
-/// The times it writes are not written: they leave the kernel's memory
-/// here, as the device's sync leaves them on disk, so that the seal's
-/// forced unmounts find none (the first of those commits the transaction
-/// the sync would have, with the same identifier). The missing entry.
-fn autoboot_sync_missing(nx: &mut Nx<'_>) -> String {
-    let held: Vec<String> = nx.jobj_times.iter().map(|((v, i), t)| format!("slot {v} {i:#x} ({}, {})", t.0, t.1)).collect();
-    nx.jobj_times.clear();
-    format!("set_autoboot_delay's sync(2) (its vnode passes over every read-write volume): the {} inodes' modification and change times it writes are not written: {}", held.len(), held.join(", "))
+/// The NVRAM changes of set_boot_command and set_autoboot_delay
+/// (drafts/s27/re-seal-snap.md 0.2, 1, 2), which gex's missing NVRAM store
+/// cannot take.
+const NVRAM_AUTOBOOT_MISSING: &str = "set_boot_command's and set_autoboot_delay's NVRAM changes (IODeviceTree:/options): boot-command deleted when it holds \"upgrade\" (reset_boot_command_if_in_values, RE@0x100033d98), then, after set_autoboot_delay's sync(2), auto-boot set to \"true\" and bootdelay to \"0\" (AutoBootDelay's default 0, RE@0x100033ed4) with IONVRAM-FORCESYNCNOW-PROPERTY: gex has no NVRAM variable store for them";
+
+/// set_autoboot_delay (RE@0x100019524 → RE@0x100033eb0; drafts/s27/
+/// re-seal-snap.md 2): with AutoBootDelay at its default 0, `sync()`
+/// (RE@0x100033ef8, [`fsops::sync`]) before its NVRAM writes
+/// ([`NVRAM_AUTOBOOT_MISSING`]).
+fn set_autoboot_delay(nx: &mut Nx<'_>, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+    fsops::sync(nx, now)
 }
 
 /// seal_system_volume (RE@0x10003ab6c; drafts/s27/re-seal-snap.md 3): the
@@ -1822,9 +1833,13 @@ fn seal_system_volume(nx: &mut Nx<'_>, v: Volumes, data: usize, user: usize, fil
     // hash (TICKET_STAND_IN).
     let root_hash = img4(&files.root_hash, &TICKET);
     for vol in [v.preboot, v.hardware, user, data, v.xart, v.system] {
-        fsops::unmount(nx, vol, true, now)?;
+        if nx.mounted.contains(&vol) {
+            fsops::unmount(nx, vol, true, now)?;
+        }
     }
-    fsops::unmount(nx, v.update, false, now)?;
+    if nx.mounted.contains(&v.update) {
+        fsops::unmount(nx, v.update, false, now)?;
+    }
     nx.unmount()?;
     (hooks.before_seal)()?;
     super::sealvolume::seal_volume(nx, v.system, &super::sealvolume::SealInputs { root_hash: &root_hash, digest_db, mtree_txt }, barrier, now)?;
@@ -1901,7 +1916,9 @@ fn migrate_user_fsevents(nx: &mut Nx<'_>, v: Volumes, data: usize, user: usize, 
 /// transaction), Hardware not at all.
 fn unmount_filesystems(nx: &mut Nx<'_>, v: Volumes, data: usize, user: usize, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     for vol in [v.preboot, user, data, v.xart] {
-        fsops::unmount(nx, vol, true, now)?;
+        if nx.mounted.contains(&vol) {
+            fsops::unmount(nx, vol, true, now)?;
+        }
     }
     Ok(())
 }
@@ -3905,6 +3922,72 @@ mod tests {
         assert_eq!(fsops::lookup(&mut nx, vol, ROOT_INO, "apticket.j120ap.0.im4m").unwrap(), Some(t));
         assert_eq!(q(&fsops::inode(&mut nx, vol, t).unwrap(), 0x20), rt.file.1);
         nx.jobj_times.remove(&(vol, ROOT_INO));
+        nx.commit().unwrap();
+        nx.unmount().unwrap();
+        sink.0.sync_all().unwrap();
+        let dev = std::process::Command::new(&fsck).args(["-n", "-W", "-s"]).arg(&path).output().unwrap();
+        let host = std::process::Command::new("/sbin/fsck_apfs").args(["-n", "-s"]).arg(&path).output().unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(dev.status.success(), "device fsck: {}{}", String::from_utf8_lossy(&dev.stdout), String::from_utf8_lossy(&dev.stderr));
+        assert!(host.status.success(), "host fsck: {}{}", String::from_utf8_lossy(&host.stdout), String::from_utf8_lossy(&host.stderr));
+    }
+
+    /// sync(2) over the mounted volumes: held times written by the vnode
+    /// pass newest vnode first and committed; once the vnodes counted
+    /// reach desiredvnodes, times held then are listed, not written.
+    #[test]
+    fn sync_writes_held_times_by_the_vnode_list() {
+        let (Ok(dir), Ok(fsck)) = (std::env::var("GEX_TEST_SCRATCH"), std::env::var("GEX_TEST_FSCK")) else { return };
+        let dir = std::path::Path::new(&dir);
+        let path = dir.join(format!("gex-sync-{}", std::process::id()));
+        let blocks = 15_625_000u64;
+        let f = std::fs::OpenOptions::new().create(true).truncate(true).read(true).write(true).open(&path).unwrap();
+        f.set_len(blocks * 4096).unwrap();
+        let sink = super::super::HostFile(f, blocks * 4096);
+        let uuid = *b"gex-sync-tests!!";
+        let fm = container::format(&sink, 4096, blocks, uuid).unwrap();
+        let mut nx = Nx::formatted(&sink, &fm, uuid, Mode::Kernel).unwrap();
+        nx.mount_rw().unwrap();
+        let mut t = 1_790_000_000_000_000_000u64;
+        let mut now = || {
+            t += 1000;
+            t
+        };
+        let q = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+        let kv = key_os_version(RESTORE_BUILD).unwrap();
+        let times = VolumeTimes { formatted: now(), root: now(), private: now(), modified: now() };
+        let o = nx.create_volume(&NewVolume { name: "Preboot".into(), role: storage::role::PREBOOT, encrypted: false, e_apfs: true, times, uid: 0, gid: 0, key_os_version: kv, size_bytes: None }).unwrap();
+        nx.commit().unwrap();
+        let vol = nx.fs_oid.iter().position(|&x| x == o).unwrap();
+        fsops::mount_rw(&mut nx, vol, &mut now).unwrap();
+        assert!(fsops::mount_rw(&mut nx, vol, &mut now).is_err(), "a second mount");
+        let a = fsops::create(&mut nx, vol, ROOT_INO, "a", 0o644, 0, 0, &mut now).unwrap().unwrap();
+        let b = fsops::create(&mut nx, vol, ROOT_INO, "b", 0o644, 0, 0, &mut now).unwrap().unwrap();
+        fsops::chmod(&mut nx, vol, a, 0o644, &mut now).unwrap();
+        fsops::chmod(&mut nx, vol, b, 0o644, &mut now).unwrap();
+        let (ta, tb) = (nx.jobj_times[&(vol, a)], nx.jobj_times[&(vol, b)]);
+        assert_eq!(nx.vnode_list(vol), vec![b, a, ROOT_INO], "the newest vnode first");
+        fsops::sync(&mut nx, &mut now).unwrap();
+        assert!(nx.jobj_times.is_empty());
+        assert_eq!(q(&fsops::inode(&mut nx, vol, a).unwrap(), 0x20), ta.1);
+        assert_eq!(q(&fsops::inode(&mut nx, vol, b).unwrap(), 0x20), tb.1);
+        let c = fsops::create(&mut nx, vol, ROOT_INO, "c", 0o644, 0, 0, &mut now).unwrap().unwrap();
+        let before = q(&fsops::inode(&mut nx, vol, c).unwrap(), 0x20);
+        fsops::chmod(&mut nx, vol, c, 0o644, &mut now).unwrap();
+        // The table filled by other vnodes (a slot standing for the rest).
+        for i in 0..super::super::tx::DESIRED_VNODES {
+            nx.vnode_get(99, 0x100 + i, &|| "the test's vnodes".into());
+        }
+        assert!(nx.vnode_full && nx.vnode_at_risk.contains(&(vol, c)));
+        fsops::sync(&mut nx, &mut now).unwrap();
+        assert!(nx.jobj_times.is_empty());
+        assert_eq!(q(&fsops::inode(&mut nx, vol, c).unwrap(), 0x20), before, "listed, not written");
+        assert_eq!(nx.vnode_missing.len(), 1);
+        assert!(nx.vnode_missing[0].contains(&format!("{c:#x}")));
+        nx.vnode_flush(99);
+        assert!(!nx.vnode_full);
+        fsops::unmount(&mut nx, vol, false, &mut now).unwrap();
+        assert!(fsops::unmount(&mut nx, vol, false, &mut now).is_err(), "a second unmount");
         nx.commit().unwrap();
         nx.unmount().unwrap();
         sink.0.sync_all().unwrap();

@@ -55,7 +55,7 @@ use super::container::{Formatted, Layout, NX_CLEANLY_UNMOUNTED};
 use super::node::{flags as node_flags, tree_flags, Node, Shape};
 use super::{put_header, set_checksum, Put, Sink};
 use crate::darwin::apfsread::{omap_val, otype};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// `nx_newest_mounted_version` APFS 2236.140.6 writes
 /// (2236 * 10^12 + 140 * 10^9 + 6 * 10^6).
@@ -218,6 +218,18 @@ pub struct Vol {
     pub snapmeta: Tree,
 }
 
+/// XNU's `desiredvnodes` on this device: bsd_startupearly (X
+/// 0xfffffff007349a14..0xfffffff007349a60) takes the device tree's
+/// /defaults `kern.maxvnodes` (PE_get_default at X 0xfffffff007349a34)
+/// before its memory-size rule (clamped by CONFIG_VNODES, 1024, at X
+/// 0xfffffff007349a4c); the erase identity's RestoreDeviceTree,
+/// DeviceTree.j120ap.im4p, has 0x2710 there. With xnu-10063's iOS
+/// default (DEALLOC_VNODE_ONLY_OVERFLOW) new_vnode recycles the free
+/// list's oldest vnode once the vnodes not dead reach it, and the
+/// vn_laundry thread reclaims more on its own schedule (vntblinit,
+/// new_vnode, vn_laundry_continue).
+pub const DESIRED_VNODES: u64 = 10_000;
+
 /// A mounted container.
 pub struct Nx<'a> {
     sink: &'a dyn Sink,
@@ -305,8 +317,32 @@ pub struct Nx<'a> {
     /// The modification and change times the kernel holds in an inode's
     /// in-memory object and has not written to its record (the jobj's
     /// times-dirty bit 0x40000), by slot and inode: the inode's next
-    /// rewrite or a sync pass over the volume's vnodes writes them.
+    /// rewrite or a sync pass over the volume's vnodes writes them; set and
+    /// taken through [`Nx::hold_times`] and [`Nx::take_times`].
     pub jobj_times: BTreeMap<(usize, u64), (u64, u64)>,
+    /// The kernel's mount list for this container's volumes: the slots
+    /// mounted read-write, oldest mount first (`mount_list_add` appends,
+    /// `vfs_iterate` walks from the head).
+    pub mounted: Vec<usize>,
+    /// The vnodes the restore's own operations bring into the kernel, by
+    /// slot: each inode's vnode with its creation's sequence number (the
+    /// mount's vnode list holds the newest first: `insmntque` inserts at
+    /// the head and an iteration keeps the relative order).
+    pub vnodes: BTreeMap<usize, BTreeMap<u64, u64>>,
+    vnode_seq: u64,
+    /// Whether the vnode table is certainly full (the vnodes counted in
+    /// [`Nx::vnodes`] at XNU's `desiredvnodes` or more), and the operation
+    /// at which it last filled.
+    pub vnode_full: bool,
+    pub vnode_fill_at: Option<String>,
+    /// What the vnode passes could not write, for the build's missing list.
+    pub vnode_missing: Vec<String>,
+    /// The inodes that held unwritten times while the vnode table was full,
+    /// so whose vnodes its recycling may have reached, by slot and inode.
+    pub vnode_at_risk: BTreeSet<(usize, u64)>,
+    /// Inodes of `vnode_at_risk` whose times a later operation of the
+    /// restore wrote, in that order.
+    pub vnode_risk_written: Vec<(usize, u64)>,
 }
 
 /// The container's reaper (`nx_reaper_phys_t`): its lists, and the entry
@@ -453,7 +489,94 @@ impl<'a> Nx<'a> {
             keybag: Vec::new(),
             pfkur_tmp: BTreeMap::new(),
             jobj_times: BTreeMap::new(),
+            mounted: Vec::new(),
+            vnodes: BTreeMap::new(),
+            vnode_seq: 0,
+            vnode_full: false,
+            vnode_fill_at: None,
+            vnode_missing: Vec::new(),
+            vnode_at_risk: BTreeSet::new(),
+            vnode_risk_written: Vec::new(),
         })
+    }
+
+    /// Inode `ino` of slot `vol` brought into the kernel: a vnode made for
+    /// it (`vnode_create` → `insmntque`, at the head of the mount's list)
+    /// unless it has one. When the vnodes counted reach `desiredvnodes`
+    /// the table is full until they fall below it again: `what` names the
+    /// operation ([`Nx::vnode_fill_at`]), and every inode then holding
+    /// unwritten times is at risk.
+    pub fn vnode_get(&mut self, vol: usize, ino: u64, what: &dyn Fn() -> String) {
+        let list = self.vnodes.entry(vol).or_default();
+        if list.contains_key(&ino) {
+            return;
+        }
+        self.vnode_seq += 1;
+        list.insert(ino, self.vnode_seq);
+        if !self.vnode_full && self.vnode_count() >= DESIRED_VNODES {
+            self.vnode_full = true;
+            self.vnode_fill_at = Some(what());
+            let held: Vec<(usize, u64)> = self.jobj_times.keys().copied().collect();
+            self.vnode_at_risk.extend(held);
+        }
+    }
+
+    /// The vnodes counted, over every slot.
+    pub fn vnode_count(&self) -> u64 {
+        self.vnodes.values().map(|l| l.len() as u64).sum()
+    }
+
+    /// Inode `ino`'s vnode reclaimed and its inode gone (an unlinked
+    /// file's or removed directory's last release: `vnode_recycle` from
+    /// VNOP_INACTIVE).
+    pub fn vnode_gone(&mut self, vol: usize, ino: u64) {
+        if let Some(l) = self.vnodes.get_mut(&vol) {
+            l.remove(&ino);
+        }
+        self.vnode_room();
+    }
+
+    /// Every vnode of slot `vol` reclaimed (`vflush` at its unmount).
+    pub fn vnode_flush(&mut self, vol: usize) {
+        self.vnodes.remove(&vol);
+        self.vnode_room();
+    }
+
+    fn vnode_room(&mut self) {
+        if self.vnode_full && self.vnode_count() < DESIRED_VNODES {
+            self.vnode_full = false;
+        }
+    }
+
+    /// Slot `vol`'s vnodes that the restore counted, newest first: the
+    /// mount's vnode list as `vnode_iterate` walks it.
+    pub fn vnode_list(&self, vol: usize) -> Vec<u64> {
+        let mut v: Vec<(u64, u64)> = self.vnodes.get(&vol).map(|l| l.iter().map(|(&i, &s)| (s, i)).collect()).unwrap_or_default();
+        v.sort_unstable_by(|a, b| b.cmp(a));
+        v.into_iter().map(|(_, i)| i).collect()
+    }
+
+    /// Times `times` (modification, change) held unwritten in inode `ino`'s
+    /// in-memory object (the jobj's 0x40000), replacing any it held; with
+    /// the vnode table full, the inode is at risk unless the holder keeps
+    /// its vnode referenced (`open`: a descriptor through which it writes
+    /// the inode again before closing it).
+    pub fn hold_times(&mut self, vol: usize, ino: u64, times: (u64, u64), open: bool) {
+        self.jobj_times.insert((vol, ino), times);
+        if self.vnode_full && !open {
+            self.vnode_at_risk.insert((vol, ino));
+        }
+    }
+
+    /// The times inode `ino` held unwritten, taken for a write of its
+    /// in-memory object (or replaced by its next times): an inode at risk is
+    /// recorded in [`Nx::vnode_risk_written`].
+    pub fn take_times(&mut self, vol: usize, ino: u64) -> Option<(u64, u64)> {
+        let t = self.jobj_times.remove(&(vol, ino));
+        if t.is_some() && self.vnode_at_risk.remove(&(vol, ino)) {
+            self.vnode_risk_written.push((vol, ino));
+        }
+        t
     }
 
     fn count(&mut self, _site: Site) -> u64 {
@@ -2239,6 +2362,10 @@ impl<'a> Nx<'a> {
     /// committed, then block 0 from the last checkpoint, cleanly
     /// unmounted, if this mount wrote a checkpoint.
     pub fn unmount(&mut self) -> Result<(), String> {
+        // The kernel's volume mounts end with its hold of the container.
+        self.mounted.clear();
+        self.vnodes.clear();
+        self.vnode_full = false;
         if !self.rw_mounted {
             return Ok(());
         }

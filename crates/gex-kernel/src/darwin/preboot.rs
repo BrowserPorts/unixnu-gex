@@ -273,12 +273,17 @@ pub fn ticket_name() -> Result<String, String> {
 }
 
 /// [`ticket_name`] of device tree `t`.
+/// `_ticket_file_name_personalized` (restored_external 0x100064b30): the
+/// `hw.target` sysctl lowered, "x86legacyap" when it is empty
+/// (0x100064bc4..0x100064bec), and `/chosen`'s `unique-chip-id` as a
+/// native u64 in `%llX`, 0 when /chosen has none (0x100064c28 →
+/// 0x100064cd4).
 pub fn ticket_name_of(t: &[super::iokit::Node]) -> Result<String, String> {
-    let target = super::iokit::target_name_of(t).map_or_else(|| "x86legacyap".to_string(), |n| String::from_utf8_lossy(&n).to_lowercase());
-    let ecid = super::iokit::dt_prop(t, "IODeviceTree:/chosen", "unique-chip-id")
-        .filter(|v| v.len() == 8)
-        .map(|v| u64::from_le_bytes(v.try_into().unwrap()))
-        .ok_or_else(|| "the Cryptex1 ticket's name: the device tree's /chosen has no 8-byte unique-chip-id".to_string())?;
+    let target = super::iokit::target_name_of(t).filter(|n| !n.is_empty()).map_or_else(|| "x86legacyap".to_string(), |n| String::from_utf8_lossy(&n).to_lowercase());
+    let ecid = match super::iokit::dt_prop(t, "IODeviceTree:/chosen", "unique-chip-id") {
+        None => 0,
+        Some(v) => u64::from_le_bytes(v.get(..8).ok_or("the Cryptex1 ticket's name: /chosen's unique-chip-id is shorter than 8 bytes")?.try_into().unwrap()),
+    };
     Ok(format!("apticket.{target}.{ecid:X}.im4m"))
 }
 

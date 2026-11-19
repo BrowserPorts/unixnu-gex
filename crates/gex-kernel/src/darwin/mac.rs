@@ -119,6 +119,7 @@ pub mod op {
     pub const SYSCTL_WRITE: usize = 157;
     pub const SYSTEM_FCNTL: usize = 163;
     pub const SYSTEM_FSCTL: usize = 164;
+    pub const SYSTEM_INFO: usize = 165;
     pub const SYSTEM_KAS_INFO: usize = 166;
     pub const SYSTEM_MAC_SYSCALL: usize = 173;
     pub const SYSTEM_MEMORYSTATUS_CONTROL: usize = 174;
@@ -1451,6 +1452,15 @@ impl Kernel {
             }
         }
         0
+    }
+
+    /// `mac_system_check_info` of information type `info` (slot 325):
+    /// Sandbox's hook (0xfffffff0069ffea0) evaluates system-info with the
+    /// type at `args[0xd8]` (kind 13, not quiet); AMFI has none (its ops
+    /// fill at init stores no `+0xa28`).
+    pub(crate) fn darwin_mac_check_system_info(&mut self, info: &[u8]) -> u32 {
+        let a = SbArgs { kind: sandbox::kind::INFO, string: Some(info.to_vec()), ..Default::default() };
+        self.darwin_sb_evaluate(op::SYSTEM_INFO, &a)
     }
 
     /// `mac_proc_check_memorystatus_control` (slot 198):

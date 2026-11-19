@@ -104,11 +104,32 @@
 //! - `IOService` itself sets "IOResourceMatched", the resources' keys when
 //!   it last matched drivers on the nub.
 //!
-//! Of these, the nub here has the two the kernel publishes on every boot
-//! before any process runs: "IOKit" (IOPMrootDomain's start) and "IOBSD"
+//! Of these, the nub here has those the kernel publishes on every boot
+//! before any process runs, in their order: "IOKit" (IOPMrootDomain's
+//! start, from `PMInstantiatePowerDomains` in `IOPlatformExpert::start`),
+//! "IOPlatformUUID" (`publishPlatformUUIDAndSerial`, next in that start,
+//! when the platform's UUID was made: [`platform_uuid`]) and "IOBSD"
 //! (`bsd_init`; IOSurfaceRoot's `IOResourceMatch`). Whether the others are
 //! published, and with what, is the kexts', the hardware's and user
 //! space's, so they are reported when read.
+//!
+//! The platform's UUID. `IOPlatformExpert::start` (0xfffffff00780b088)
+//! calls `publishPlatformUUIDAndSerial` (0xfffffff00780c340) once
+//! `PMInstantiatePowerDomains` has run (0xfffffff00780b270). Unless
+//! gIOPlatformUUIDAndSerialDone (0xfffffff007941790) is set, it gives the
+//! expert's provider, the `IOPlatformExpertDevice`, an
+//! "IOPlatformSerialNumber" from its "serial-number" (through the expert's
+//! `createSystemSerialNumberString`, vtable +0x650; not modelled: reported
+//! when read) and calls the device's `generatePlatformUUID`
+//! (0xfffffff00780c4a8); once the flag is set it publishes the device's
+//! "IOPlatformUUID" as the resource of that name, the same `OSString`
+//! (0xfffffff00780c494). On arm64 the UUID is the device's identity in
+//! `/chosen` and nothing else ([`platform_uuid`]); the kernel's other call
+//! of `generatePlatformUUID`, `IOPlatformExpertDevice::configureDefaults`,
+//! publishes no resource, and only this start publishes it
+//! (`registerNVRAMController`'s call is x86's). IOUSBDeviceFamily names
+//! "IOPlatformUUID" too (0xfffffff00547aee2), beside
+//! "IOPlatformSerialNumber", to read them.
 
 use super::iokit::{Node, Prop};
 
@@ -295,6 +316,11 @@ pub fn add(t: &mut Vec<Node>) -> Option<u32> {
     props.push(("Platform Memory Ranges".to_string(), Prop::Array(vec![Prop::Num(0, 64), Prop::Num(0xffff_ffff, 64)])));
     props.push((function_parent(t, 0), Prop::Data(Vec::new())));
     t.push(driver(PE, PE, 0, props));
+    // publishPlatformUUIDAndSerial's generatePlatformUUID, on the expert's
+    // provider, before `configure` publishes the nubs.
+    if let Some(uuid) = platform_uuid(t) {
+        t[0].service_props.push((UUID_KEY.to_string(), Prop::Str(uuid)));
+    }
     if let Some(cpus) = child(t, 0, "cpus", &[]) {
         for c in matching(t, cpus, &[]) {
             make_nub(t, c, PLATFORM_DEVICE, pe);
@@ -345,10 +371,78 @@ pub fn arm_io_nub(t: &mut [Node], io: u32, name: &str) -> Option<u32> {
 }
 
 /// Publish the resources nub, whose provider is the registry's root (see
-/// the module's documentation): its index.
+/// the module's documentation): its index. "IOPlatformUUID" is published
+/// with the platform expert device's value when its start made one.
 pub fn add_resources(t: &mut Vec<Node>) -> u32 {
     let published = |key: &str| (key.to_string(), Prop::Sym("IOService".to_string()));
+    let mut props = vec![published("IOKit")];
+    if let Some(uuid) = t.first().and_then(|r| r.service_props.iter().find(|(k, _)| k == UUID_KEY)) {
+        props.push(uuid.clone());
+    }
+    props.push(published("IOBSD"));
     let at = t.len() as u32;
-    t.push(Node { name: RESOURCES.to_string(), props: Vec::new(), class: RESOURCES, service_props: vec![published("IOKit"), published("IOBSD")], parent: None, children: Vec::new(), kernel_only: false, nub: None, dt: None, table: super::iokit::Table::Drivers, power: None });
+    t.push(Node { name: RESOURCES.to_string(), props: Vec::new(), class: RESOURCES, service_props: props, parent: None, children: Vec::new(), kernel_only: false, nub: None, dt: None, table: super::iokit::Table::Drivers, power: None });
     at
+}
+
+/// The platform's UUID's key (`kIOPlatformUUIDKey`), on the platform expert
+/// device and as a resource.
+pub const UUID_KEY: &str = "IOPlatformUUID";
+
+/// `generatePlatformUUID`'s name space for the arm64 UUID (its `space`,
+/// 0xfffffff007028bd8 in the kernel's `__TEXT,__const`).
+pub const UUID_NAMESPACE: [u8; 16] = [0xA6, 0xDD, 0x4C, 0xCB, 0xB5, 0xE8, 0x4A, 0xF5, 0xAC, 0xDD, 0xB6, 0xDC, 0x6A, 0x05, 0x42, 0xB8];
+
+/// `IOPlatformExpertDevice::generatePlatformUUID` on arm64
+/// (0xfffffff00780c4a8; xnu-10063 IOPlatformExpert.cpp:2205): the device
+/// tree's `/chosen` `unique-chip-id`, which must be `OSData` of 8 bytes
+/// (the ECID), and `chip-id`, of 4; the SHA-1 of the name space
+/// [`UUID_NAMESPACE`], then those two as the device tree holds them; of
+/// the digest's first 16 bytes, byte 6's high nibble made 5 (the version)
+/// and byte 8's top two bits 10 (the variant); written as
+/// "%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X"
+/// (0xfffffff00780c6e0, upper case). None when either property is missing
+/// or of another length: the device then has no "IOPlatformUUID" and the
+/// resource is never published.
+pub fn platform_uuid(t: &[Node]) -> Option<String> {
+    use sha1::Digest;
+    let ecid = super::iokit::dt_prop(t, "IODeviceTree:/chosen", "unique-chip-id").filter(|v| v.len() == 8)?;
+    let chip = super::iokit::dt_prop(t, "IODeviceTree:/chosen", "chip-id").filter(|v| v.len() == 4)?;
+    let mut h = sha1::Sha1::new();
+    h.update(UUID_NAMESPACE);
+    h.update(ecid);
+    h.update(chip);
+    let mut d: [u8; 20] = h.finalize().into();
+    d[6] = (d[6] & 0x0f) | 0x50;
+    d[8] = (d[8] & 0x3f) | 0x80;
+    Some(uuid_unparse_upper(d[..16].try_into().unwrap()))
+}
+
+/// A UUID's 16 bytes as "XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX", upper case
+/// (libkern's and libc's `uuid_unparse_upper`).
+pub fn uuid_unparse_upper(u: &[u8; 16]) -> String {
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02X}")).collect::<String>();
+    format!("{}-{}-{}-{}-{}", hex(&u[0..4]), hex(&u[4..6]), hex(&u[6..8]), hex(&u[8..10]), hex(&u[10..16]))
+}
+
+/// libkern's `uuid_parse` (libkern/uuid/uuid.c:142) of a UUID in the
+/// canonical form [`uuid_unparse_upper`] writes, the only form the platform
+/// expert device's "IOPlatformUUID" takes: 36 characters, hyphens at 8,
+/// 13, 18 and 23 and hexadecimal digit pairs of either case elsewhere.
+/// None for anything else, which its `sscanf` may read otherwise (not
+/// modelled).
+pub fn uuid_parse(s: &str) -> Option<[u8; 16]> {
+    let b = s.as_bytes();
+    if b.len() != 36 || [8, 13, 18, 23].iter().any(|&i| b[i] != b'-') {
+        return None;
+    }
+    let digits: Vec<u8> = b.iter().enumerate().filter(|(i, _)| ![8, 13, 18, 23].contains(i)).map(|(_, &c)| c).collect();
+    let mut out = [0u8; 16];
+    for (i, pair) in digits.chunks(2).enumerate() {
+        if !pair.iter().all(u8::is_ascii_hexdigit) {
+            return None;
+        }
+        out[i] = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+    }
+    Some(out)
 }

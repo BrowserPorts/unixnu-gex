@@ -57,6 +57,7 @@ pub mod iopower;
 pub mod image4;
 pub mod img4;
 pub mod iosurface;
+pub mod hostuuid;
 pub mod osserialize;
 pub mod accel;
 pub mod iomfb;

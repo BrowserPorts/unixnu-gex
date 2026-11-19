@@ -268,7 +268,7 @@ pub fn chosen_stand_in() -> &'static str {
 /// The `/chosen` values the web device's boot does not fill in yet.
 pub const WEB_DEVICE_CHOSEN_STAND_IN: &str = "the /chosen values iBoot fills in beyond the web device's identity (stand-in: the IPSW device tree's, boot-manifest-hash, boot-nonce, die-id, unique-device-id and random-seed zero, and no chip-epoch, esdm-fuses or manifest-properties love; the web device's boot has no AP ticket of its own to give the boot manifest hash)";
 
-pub const CHOSEN_STAND_IN: &str = "the /chosen values iBoot fills in (stand-in: the IPSW device tree's, chip-id, board-id, unique-chip-id, certificate-production-status, certificate-security-mode, effective-production-status-ap and effective-security-mode-ap zero, and no security-domain, chip-epoch, esdm-fuses or manifest-properties love: an ignition blob and a Cryptex1 ticket name of ECID 0; measure IODeviceTree:/chosen on the device, `ioreg -p IODeviceTree -n chosen -l`)";
+pub const CHOSEN_STAND_IN: &str = "the /chosen values iBoot fills in (stand-in: the IPSW device tree's, chip-id, board-id, unique-chip-id, certificate-production-status, certificate-security-mode, effective-production-status-ap and effective-security-mode-ap zero, and no security-domain, chip-epoch, esdm-fuses or manifest-properties love: an ignition blob, a Cryptex1 ticket name of ECID 0 and the platform UUID (gethostuuid, IOPlatformUUID) of ECID 0 and chip 0; measure IODeviceTree:/chosen on the device, `ioreg -p IODeviceTree -n chosen -l`)";
 
 /// The chip environment AppleImage4 evaluates against: this device tree's
 /// `/chosen`, as its runtime reads it ([`read`]), the device's cryptex1

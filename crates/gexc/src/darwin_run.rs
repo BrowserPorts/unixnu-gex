@@ -129,6 +129,11 @@ pub fn run(mut ra: RunArgs, bytes: &[u8]) -> Result<ExitCode> {
     // The web device's directory (gexc darwin-web-device): the device the
     // system boots as, with GEX_DARWIN_CRYPTEX1_TICKET=web-device.
     ra.opts.darwin_web_device = std::env::var_os("GEX_DARWIN_WEB_DEVICE").filter(|v| !v.is_empty()).map(PathBuf::from);
+    // The Secure Enclave's inputs, which the owner supplies: the sepOS payload decrypted with the
+    // SEP's GID key (GEX_DARWIN_SEPOS) and the A10X's SEP ROM (GEX_DARWIN_SEPROM). Without them
+    // everything that needs the SEP stops and names what is missing.
+    ra.opts.darwin_sepos = std::env::var_os("GEX_DARWIN_SEPOS").filter(|v| !v.is_empty()).map(PathBuf::from);
+    ra.opts.darwin_seprom = std::env::var_os("GEX_DARWIN_SEPROM").filter(|v| !v.is_empty()).map(PathBuf::from);
     // Its commpage is folded to its alias at the top of the memory in
     // everything translated for it, which needs the addresses its code
     // builds in registers seen as the constants they are; and its tables

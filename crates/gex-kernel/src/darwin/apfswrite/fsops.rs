@@ -12,7 +12,8 @@
 //! unmount here. Every timestamp is a fresh `nanotime` reading
 //! (K 0x6737394), taken from `now`.
 
-use super::btree::Tree;
+use super::btree::{Store, Tree};
+use super::node::ENOSPC;
 use super::tx::{self, Nx};
 use super::Put;
 
@@ -207,7 +208,9 @@ pub fn mount_rw(nx: &mut Nx<'_>, vol: usize, now: &mut dyn FnMut() -> u64) -> Re
     // restore's `.ramdisk-boot-done` open after its mounts) brings in the
     // root's vnode (VFS_ROOT).
     nx.mounted.push(vol);
-    nx.vnode_get(vol, ROOT_DIR_INO, &|| format!("the root of volume slot {vol}"));
+    if nx.vnode_get(vol, ROOT_DIR_INO, &|| format!("the root of volume slot {vol}")) {
+        hint_load(nx, vol, ROOT_DIR_INO)?;
+    }
     Ok(())
 }
 
@@ -282,7 +285,7 @@ pub fn alloc_tmp_ino(nx: &mut Nx<'_>, vol: usize, now: &mut dyn FnMut() -> u64) 
     ds.put64(0x10, u64::MAX);
     let mut x = xfields(&v)?;
     x.push((INO_EXT_TYPE_DSTREAM, XF_SYSTEM_FIELD, ds));
-    put_rec(nx, vol, &inode_key(ino), &with_xfields(&v, &x))?;
+    update_jobj(nx, vol, ino, &with_xfields(&v, &x), "alloc_tmp_ino")?;
     put_rec(nx, vol, &(u64a(&v, 0x08) | J_DSTREAM_ID << 60).to_le_bytes(), &1u32.to_le_bytes())?;
     fs_tx_leave(nx, vol, now)?;
     Ok(ino)
@@ -370,7 +373,7 @@ fn volume_fixup(nx: &mut Nx<'_>, vol: usize, now: &mut dyn FnMut() -> u64) -> Re
             let mut v = in_memory_inode(nx, vol, ino)?;
             let f = u64a(&v, INO_INTERNAL_FLAGS);
             v.put64(INO_INTERNAL_FLAGS, f | 0x800);
-            put_rec(nx, vol, &inode_key(ino), &v)?;
+            update_jobj(nx, vol, ino, &v, "volume_fixup")?;
             fs_tx_leave(nx, vol, now)?;
         }
     }
@@ -415,7 +418,11 @@ pub fn create(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str, mode: u16, u
 fn create_obj(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str, mode: u16, uid: u32, gid: u32, now: &mut dyn FnMut() -> u64) -> Result<Result<u64, i32>, String> {
     let r = create_obj_in(nx, vol, parent, name, mode, uid, gid, now)?;
     match r {
-        Ok(ino) => nx.vnode_get(vol, ino, &|| format!("the creation of {name} (inode {ino:#x}) on volume slot {vol}")),
+        // The new object holds no hint (fs_obj_create_name_checked zeroes
+        // it, K 0x66f251c).
+        Ok(ino) => {
+            nx.vnode_get(vol, ino, &|| format!("the creation of {name} (inode {ino:#x}) on volume slot {vol}"));
+        }
         Err(_) => {
             lookup(nx, vol, parent, name)?;
         }
@@ -632,7 +639,8 @@ fn obj_create_name(nx: &mut Nx<'_>, vol: usize, parent: u64, pi: &Inode, name: &
     t.insert(&mut st, &dk, Some(&dv))?;
     t.insert(&mut st, &inode_key(ino), Some(&iv))?;
     // The parent: its times (any its in-memory object held are replaced),
-    // children and write generation.
+    // children and write generation; written whole by bt_insert (K
+    // 0x66f2be0, `fs_insert_jobj` with the object's state 2).
     let t2 = now();
     let mut p = pi.0.clone();
     p.put64(0x18, t2);
@@ -974,8 +982,8 @@ fn truncate_grow_unchecked(nx: &mut Nx<'_>, vol: usize, ino: u64, size: u64, now
         v = with_xfields(&v, &x);
         v.put64(INO_MOD_TIME, clock);
         v.put64(INO_CHANGE_TIME, clock);
-        t.insert(&mut st, &inode_key(ino), Some(&v))?;
         nx.set_fs_tree(vol, t);
+        update_jobj(nx, vol, ino, &v, "truncate_grow")?;
         return fs_tx_leave(nx, vol, now);
     }
     if size <= old.size || old.alloced != 0 {
@@ -992,8 +1000,9 @@ fn truncate_grow_unchecked(nx: &mut Nx<'_>, vol: usize, ino: u64, size: u64, now
     d.2.put64(8, alloced);
     sparse_bytes(&mut v, &mut x, alloced as i64)?;
     v = with_xfields(&v, &x);
-    t.insert(&mut st, &inode_key(ino), Some(&v))?;
     nx.set_fs_tree(vol, t);
+    // alloc_space's write of the inode (K 0x6708640).
+    update_jobj(nx, vol, ino, &v, "truncate_grow")?;
     fs_tx_leave(nx, vol, now)
 }
 
@@ -1127,7 +1136,7 @@ fn blockmap_fill(nx: &mut Nx<'_>, vol: usize, ino: u64, off: u64, data: &[u8], t
             v.put64(INO_CHANGE_TIME, t_w);
         }
         let v = with_xfields(&v, &x);
-        put_rec(nx, vol, &inode_key(ino), &v)?;
+        update_jobj(nx, vol, ino, &v, "blockmap_fill")?;
         let at = (pos - off) as usize;
         nx.write_data(a, &data[at..at + n as usize])?;
         fs_tx_leave(nx, vol, now)?;
@@ -1233,7 +1242,7 @@ pub fn preallocate(nx: &mut Nx<'_>, vol: usize, ino: u64, len: u64, now: &mut dy
     let mut v = with_xfields(&v, &x);
     v.put64(INO_MOD_TIME, t);
     v.put64(INO_CHANGE_TIME, t);
-    put_rec(nx, vol, &inode_key(ino), &v)?;
+    update_jobj(nx, vol, ino, &v, "preallocate")?;
     fs_tx_leave(nx, vol, now)?;
     Ok(blocks * bs)
 }
@@ -1415,7 +1424,7 @@ fn preallocate_contig_persist(nx: &mut Nx<'_>, vol: usize, ino: u64, len: u64, n
     v.put64(INO_INTERNAL_FLAGS, f | INODE_PREALLOCATED_PERSIST);
     v.put64(INO_MOD_TIME, t);
     v.put64(INO_CHANGE_TIME, t);
-    put_rec(nx, vol, &inode_key(ino), &v)?;
+    update_jobj(nx, vol, ino, &v, "preallocate_contig_persist")?;
     fs_tx_leave(nx, vol, now)?;
     Ok(Ok(len))
 }
@@ -1502,7 +1511,7 @@ pub fn write_new_protected(nx: &mut Nx<'_>, vol: usize, ino: u64, data: &[u8], n
     let mut v = with_xfields(&v, &x);
     let wgc = u32::from_le_bytes(v[INO_WRITE_GEN..INO_WRITE_GEN + 4].try_into().unwrap());
     v.put32(INO_WRITE_GEN, wgc.wrapping_add(1));
-    put_rec(nx, vol, &inode_key(ino), &v)?;
+    update_jobj(nx, vol, ino, &v, "write_new_protected")?;
     fs_tx_leave(nx, vol, now)?;
     let times = now();
     Ok(PendingWrite { ino, len: data.len() as u64, paddr: p, data: data.to_vec(), times })
@@ -1535,7 +1544,7 @@ pub fn fsync_pending(nx: &mut Nx<'_>, vol: usize, w: &PendingWrite, now: &mut dy
     let mut v = with_xfields(&v, &x);
     v.put64(INO_MOD_TIME, w.times);
     v.put64(INO_CHANGE_TIME, w.times);
-    put_rec(nx, vol, &inode_key(w.ino), &v)?;
+    update_jobj(nx, vol, w.ino, &v, "fsync_pending")?;
     fs_tx_leave(nx, vol, now)
 }
 
@@ -1598,8 +1607,8 @@ pub fn rename_in_dir(nx: &mut Nx<'_>, vol: usize, dir: u64, from: &str, to: &str
     let x: Vec<(u8, u8, Vec<u8>)> = xfields(&f)?.into_iter().map(|(t, fl, dd)| if t == 4 { (t, fl, name.clone()) } else { (t, fl, dd) }).collect();
     let mut f = with_xfields(&f, &x);
     f.put64(0, dir);
-    put_rec(nx, vol, &inode_key(ino), &f)?;
-    put_rec(nx, vol, &inode_key(dir), &d)?;
+    update_jobj(nx, vol, ino, &f, "rename_in_dir")?;
+    update_jobj(nx, vol, dir, &d, "rename_in_dir")?;
     fs_tx_leave(nx, vol, now)?;
     // After the transaction (K 0x6693700, K 0x6693720): the file's change
     // time, then K 0x66f3750 on the directory, each with the times-dirty
@@ -1619,7 +1628,7 @@ pub fn write_times(nx: &mut Nx<'_>, vol: usize, ino: u64, times: (u64, u64), now
     let mut v = get_rec(nx, vol, &inode_key(ino))?.ok_or("the file has no inode")?;
     v.put64(INO_MOD_TIME, times.0);
     v.put64(INO_CHANGE_TIME, times.1);
-    put_rec(nx, vol, &inode_key(ino), &v)?;
+    update_jobj(nx, vol, ino, &v, "write_times")?;
     fs_tx_leave_last(nx, vol, false, now)
 }
 
@@ -1632,7 +1641,7 @@ pub fn barrier_fsync(nx: &mut Nx<'_>, vol: usize, ino: u64, times: (u64, u64), n
     let mut v = get_rec(nx, vol, &inode_key(ino))?.ok_or("the file has no inode")?;
     v.put64(INO_MOD_TIME, times.0);
     v.put64(INO_CHANGE_TIME, times.1);
-    put_rec(nx, vol, &inode_key(ino), &v)?;
+    update_jobj(nx, vol, ino, &v, "barrier_fsync")?;
     fs_tx_leave(nx, vol, now)?;
     nx.tx_finish()
 }
@@ -1648,7 +1657,7 @@ fn trim_active_file(nx: &mut Nx<'_>, vol: usize, ino: u64, now: &mut dyn FnMut()
     let mut v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
     let f = u64a(&v, INO_INTERNAL_FLAGS);
     v.put64(INO_INTERNAL_FLAGS, f | 0x800);
-    put_rec(nx, vol, &inode_key(ino), &v)?;
+    update_jobj(nx, vol, ino, &v, "trim_active_file")?;
     fs_tx_leave(nx, vol, now)
 }
 
@@ -1716,7 +1725,7 @@ pub fn close_after_grow(nx: &mut Nx<'_>, vol: usize, ino: u64, c: u64, m: u64, n
             let v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
             let mut x = xfields(&v)?;
             x.push((INO_EXT_TYPE_PREV_FSIZE, 0, (off + run).to_le_bytes().to_vec()));
-            put_rec(nx, vol, &inode_key(ino), &with_xfields(&v, &x))?;
+            update_jobj(nx, vol, ino, &with_xfields(&v, &x), "close_after_grow")?;
             fs_tx_leave_last(nx, vol, false, now)?;
         }
         nx.write_data(paddr, &zeros[..run as usize])?;
@@ -1727,7 +1736,7 @@ pub fn close_after_grow(nx: &mut Nx<'_>, vol: usize, ino: u64, c: u64, m: u64, n
         let v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
         let mut x = xfields(&v)?;
         x.retain(|f| f.0 != INO_EXT_TYPE_PREV_FSIZE);
-        put_rec(nx, vol, &inode_key(ino), &with_xfields(&v, &x))?;
+        update_jobj(nx, vol, ino, &with_xfields(&v, &x), "close_after_grow")?;
         fs_tx_leave_last(nx, vol, false, now)?;
     }
     Ok(())
@@ -1886,7 +1895,7 @@ pub fn write_first(nx: &mut Nx<'_>, vol: usize, ino: u64, data: &[u8], pushes: &
     let mut v = with_xfields(&v, &x);
     let wgc = u32::from_le_bytes(v[INO_WRITE_GEN..INO_WRITE_GEN + 4].try_into().unwrap());
     v.put32(INO_WRITE_GEN, wgc.wrapping_add(1));
-    put_rec(nx, vol, &inode_key(ino), &v)?;
+    update_jobj(nx, vol, ino, &v, "write_first")?;
     fs_tx_leave(nx, vol, now)?;
     // The data as the pages hold it: the bytes, zeros to the block's end.
     let mut padded = data.to_vec();
@@ -1928,7 +1937,7 @@ pub fn write_first(nx: &mut Nx<'_>, vol: usize, ino: u64, data: &[u8], pushes: &
     let mut v = with_xfields(&v, &x);
     v.put64(INO_MOD_TIME, t_w);
     v.put64(INO_CHANGE_TIME, t_w);
-    put_rec(nx, vol, &inode_key(ino), &v)?;
+    update_jobj(nx, vol, ino, &v, "write_first")?;
     fs_tx_leave(nx, vol, now)?;
     Ok(())
 }
@@ -2024,7 +2033,7 @@ pub fn extend_into_preallocation(nx: &mut Nx<'_>, vol: usize, ino: u64, n: u64, 
     let mut v = with_xfields(&v, &x);
     let wgc = u32::from_le_bytes(v[INO_WRITE_GEN..INO_WRITE_GEN + 4].try_into().unwrap());
     v.put32(INO_WRITE_GEN, wgc.wrapping_add(1));
-    put_rec(nx, vol, &inode_key(ino), &v)?;
+    update_jobj(nx, vol, ino, &v, "extend_into_preallocation")?;
     fs_tx_leave_last(nx, vol, false, now)?;
     Ok((now(), base + n))
 }
@@ -2045,7 +2054,7 @@ pub fn truncate_equal(nx: &mut Nx<'_>, vol: usize, ino: u64, written: u64, now: 
     let t = now();
     v.put64(INO_MOD_TIME, t);
     v.put64(INO_CHANGE_TIME, t);
-    put_rec(nx, vol, &inode_key(ino), &v)?;
+    update_jobj(nx, vol, ino, &v, "truncate_equal")?;
     fs_tx_leave_last(nx, vol, false, now)
 }
 
@@ -2123,6 +2132,7 @@ pub fn truncate_shrink(nx: &mut Nx<'_>, vol: usize, ino: u64, new: u64, now: &mu
     v.put64(INO_CHANGE_TIME, t);
     let wgc = u32::from_le_bytes(v[INO_WRITE_GEN..INO_WRITE_GEN + 4].try_into().unwrap());
     v.put32(INO_WRITE_GEN, wgc.wrapping_add(1));
+    // Written whole by bt_insert (K 0x66a770c → K 0x66f3330, op 1).
     put_rec(nx, vol, &inode_key(ino), &v)?;
     fs_tx_leave(nx, vol, now)?;
     // ino_remove_some_fexts.
@@ -2139,6 +2149,7 @@ pub fn truncate_shrink(nx: &mut Nx<'_>, vol: usize, ino: u64, new: u64, now: &mu
         let mut cur = at(nx, &last_key)?.ok_or("not implemented: a shrinking truncate of a stream with no extent (fexts cannot be iterated)")?;
         fs_tx_enter(nx, vol)?;
         let v = get_rec(nx, vol, &inode_key(ino))?.ok_or("the file has no inode")?;
+        // bt_insert (K 0x66a7ba8 → K 0x66f3330, op 1).
         put_rec(nx, vol, &inode_key(ino), &v)?;
         let mut alloced = dstream_of(&v)?.unwrap().alloced;
         let mut sparse = 0i64;
@@ -2179,7 +2190,7 @@ pub fn truncate_shrink(nx: &mut Nx<'_>, vol: usize, ino: u64, new: u64, now: &mu
         let mut v = v;
         sparse_bytes(&mut v, &mut x, sparse)?;
         x.iter_mut().find(|f| f.0 == INO_EXT_TYPE_DSTREAM).unwrap().2.put64(8, alloced);
-        put_rec(nx, vol, &inode_key(ino), &with_xfields(&v, &x))?;
+        update_jobj(nx, vol, ino, &with_xfields(&v, &x), "truncate_shrink")?;
         fs_tx_leave(nx, vol, now)?;
         if done {
             return Ok(());
@@ -2226,7 +2237,7 @@ pub fn close_pushed(nx: &mut Nx<'_>, vol: usize, ino: u64, data: &[u8], now: &mu
     if x.len() == before {
         return Err("a close with no PREV_FSIZE field to remove".into());
     }
-    put_rec(nx, vol, &inode_key(ino), &with_xfields(&v, &x))?;
+    update_jobj(nx, vol, ino, &with_xfields(&v, &x), "close_pushed")?;
     fs_tx_leave_last(nx, vol, false, now)
 }
 
@@ -2409,7 +2420,7 @@ pub fn write_appends(nx: &mut Nx<'_>, vol: usize, ino: u64, writes: &[u64], src:
         }
         let wgc = u32::from_le_bytes(v[INO_WRITE_GEN..INO_WRITE_GEN + 4].try_into().unwrap());
         v.put32(INO_WRITE_GEN, wgc.wrapping_add(1));
-        put_rec(nx, vol, &inode_key(ino), &v)?;
+        update_jobj(nx, vol, ino, &v, "write_appends")?;
         fs_tx_leave_last(nx, vol, false, now)?;
         // The cluster layer: a fifth cluster pushes the lowest.
         for j in s / c..=(e - 1) / c {
@@ -2439,7 +2450,7 @@ pub fn write_appends(nx: &mut Nx<'_>, vol: usize, ino: u64, writes: &[u64], src:
     let mut v = with_xfields(&v, &x);
     v.put64(INO_MOD_TIME, t);
     v.put64(INO_CHANGE_TIME, t);
-    put_rec(nx, vol, &inode_key(ino), &v)?;
+    update_jobj(nx, vol, ino, &v, "write_appends")?;
     fs_tx_leave_last(nx, vol, false, now)
 }
 
@@ -2562,7 +2573,7 @@ pub fn chown(nx: &mut Nx<'_>, vol: usize, ino: u64, uid: u32, gid: u32, now: &mu
     v.put32(0x48, uid);
     v.put32(0x4c, gid);
     v.put64(INO_CHANGE_TIME, now());
-    put_rec(nx, vol, &inode_key(ino), &v)?;
+    update_jobj(nx, vol, ino, &v, "chown")?;
     fs_tx_leave(nx, vol, now)
 }
 
@@ -2680,7 +2691,7 @@ fn vnode_pass(nx: &mut Nx<'_>, vol: usize, now: &mut dyn FnMut() -> u64) -> Resu
         let mut v = inode(nx, vol, ino)?;
         v.put64(INO_MOD_TIME, m);
         v.put64(INO_CHANGE_TIME, c);
-        put_rec(nx, vol, &inode_key(ino), &v)?;
+        update_jobj(nx, vol, ino, &v, "vnode_pass")?;
         fs_tx_leave(nx, vol, now)?;
     }
     Ok(())
@@ -2783,7 +2794,7 @@ pub fn setattr(nx: &mut Nx<'_>, vol: usize, ino: u64, a: SetAttr, now: &mut dyn 
     if n != 0 {
         v.put64(INO_CHANGE_TIME, now());
     }
-    put_rec(nx, vol, &inode_key(ino), &v)?;
+    update_jobj(nx, vol, ino, &v, "setattr")?;
     fs_tx_leave(nx, vol, now)
 }
 
@@ -2809,7 +2820,7 @@ pub fn truncate_same(nx: &mut Nx<'_>, vol: usize, ino: u64, now: &mut dyn FnMut(
     let t = now();
     v.put64(INO_MOD_TIME, t);
     v.put64(INO_CHANGE_TIME, t);
-    put_rec(nx, vol, &inode_key(ino), &v)?;
+    update_jobj(nx, vol, ino, &v, "truncate_same")?;
     fs_tx_leave(nx, vol, now)
 }
 
@@ -2839,7 +2850,7 @@ pub fn set_decmpfs_xattr(nx: &mut Nx<'_>, vol: usize, ino: u64, data: &[u8], now
     put_rec(nx, vol, &k, &val)?;
     let mut v = in_memory_inode(nx, vol, ino)?;
     v.put64(INO_CHANGE_TIME, now());
-    put_rec(nx, vol, &inode_key(ino), &v)?;
+    update_jobj(nx, vol, ino, &v, "set_decmpfs_xattr")?;
     fs_tx_leave(nx, vol, now)
 }
 
@@ -2967,7 +2978,7 @@ pub fn setxattr_rsrc_fork(nx: &mut Nx<'_>, vol: usize, ino: u64, pos: u64, data:
             let fl = u64a(&fv, INO_INTERNAL_FLAGS);
             if fl & INODE_NO_RSRC_FORK != 0 {
                 fv.put64(INO_INTERNAL_FLAGS, fl & !INODE_NO_RSRC_FORK);
-                put_rec(nx, vol, &inode_key(ino), &fv)?;
+                update_jobj(nx, vol, ino, &fv, "setxattr_rsrc_fork")?;
             }
             fs_tx_leave(nx, vol, now)?;
             (x, crypt, 0, 0, 0)
@@ -3050,11 +3061,11 @@ pub fn setxattr_rsrc_fork(nx: &mut Nx<'_>, vol: usize, ino: u64, pos: u64, data:
     let fl = u64a(&fv, INO_INTERNAL_FLAGS);
     if fl & INODE_HAS_RSRC_FORK == 0 {
         fv.put64(INO_INTERNAL_FLAGS, fl | INODE_HAS_RSRC_FORK);
-        put_rec(nx, vol, &inode_key(ino), &fv)?;
+        update_jobj(nx, vol, ino, &fv, "setxattr_rsrc_fork")?;
     }
     let wgc = u32::from_le_bytes(fv[INO_WRITE_GEN..INO_WRITE_GEN + 4].try_into().unwrap());
     fv.put32(INO_WRITE_GEN, wgc.wrapping_add(1));
-    put_rec(nx, vol, &inode_key(ino), &fv)?;
+    update_jobj(nx, vol, ino, &fv, "setxattr_rsrc_fork")?;
     fs_tx_leave(nx, vol, now)
 }
 
@@ -3102,7 +3113,7 @@ pub fn cas_bsdflags(nx: &mut Nx<'_>, vol: usize, ino: u64, expected: u32, new: u
         let f = u64a(&v, INO_INTERNAL_FLAGS);
         v.put64(INO_INTERNAL_FLAGS, f | 0x4_0000);
     }
-    put_rec(nx, vol, &inode_key(ino), &v)?;
+    update_jobj(nx, vol, ino, &v, "cas_bsdflags")?;
     fs_tx_leave(nx, vol, now)
 }
 
@@ -3165,10 +3176,10 @@ pub fn set_dir_class(nx: &mut Nx<'_>, vol: usize, ino: u64, class: u32, now: &mu
     let f = u64a(&v, INO_INTERNAL_FLAGS);
     v.put64(INO_INTERNAL_FLAGS, f | 0x8);
     v.put64(INO_CHANGE_TIME, now());
-    put_rec(nx, vol, &inode_key(ino), &v)?;
+    update_jobj(nx, vol, ino, &v, "set_dir_class")?;
     fs_tx_leave(nx, vol, now)?;
     fs_tx_enter(nx, vol)?;
-    put_rec(nx, vol, &inode_key(ino), &v)?;
+    update_jobj(nx, vol, ino, &v, "set_dir_class")?;
     fs_tx_leave(nx, vol, now)
 }
 
@@ -3259,7 +3270,7 @@ pub fn chflags(nx: &mut Nx<'_>, vol: usize, ino: u64, flags: u32, securelevel: O
     let new = if new & SF_FIRMLINK == 0 && old & SF_FIRMLINK != 0 { new | SF_FIRMLINK } else { new };
     v.put32(0x44, (old & 0xc000_0000) | (new & 0x3fff_ffff));
     v.put64(INO_CHANGE_TIME, now());
-    put_rec(nx, vol, &inode_key(ino), &v)?;
+    update_jobj(nx, vol, ino, &v, "chflags")?;
     fs_tx_leave(nx, vol, now)?;
     Ok(Ok(()))
 }
@@ -3314,9 +3325,45 @@ pub fn lookup(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str) -> Result<Op
     };
     // VNOP_LOOKUP's hit: the inode's vnode (made unless it has one).
     if let Some(ino) = found {
-        nx.vnode_get(vol, ino, &|| format!("the lookup of {name} (inode {ino:#x}) on volume slot {vol}"));
+        if nx.vnode_get(vol, ino, &|| format!("the lookup of {name} (inode {ino:#x}) on volume slot {vol}")) {
+            hint_load(nx, vol, ino)?;
+        }
     }
     Ok(found)
+}
+
+/// The leaf hint of an inode loaded into a new in-memory object
+/// (`apfs_load_inode_internal` K 0x66a0208 → `fs_get_inode_with_hint` K
+/// 0x66ebdb0): the iteration that reads its records (K 0x66ec698 →
+/// `bt_iterator_init` K 0x672f1ec) leaves the leaf of its inode record,
+/// copied to jobj + 0xb8 and + 0xc8 (K 0x66ebe54..0x66ebe64); then a
+/// symbolic link's `com.apple.fs.symlink` (K 0x66ebf2c) and, for an inode
+/// with neither INODE_HAS_RSRC_FORK nor INODE_NO_RSRC_FORK, its
+/// `com.apple.ResourceFork` (K 0x66ec068) are looked up by name with the
+/// hint, which a found one moves to its leaf.
+fn hint_load(nx: &mut Nx<'_>, vol: usize, ino: u64) -> Result<(), String> {
+    let (t, mut st) = nx.fs_tree(vol)?;
+    let key = inode_key(ino);
+    let v = t.get(&mut st, &key)?.ok_or_else(|| format!("no inode {ino:#x}"))?;
+    let mut leaf = *tree_path(&t, &mut st, &key)?.0.last().unwrap();
+    let attr_leaf = |st: &mut dyn Store, name: &str| -> Result<Option<u64>, String> {
+        let k = xattr_key(ino, name);
+        let (path, idx) = tree_path(&t, st, &k)?;
+        Ok(idx.map(|_| *path.last().unwrap()))
+    };
+    if u16::from_le_bytes([v[INO_MODE], v[INO_MODE + 1]]) & S_IFMT == S_IFLNK {
+        if let Some(l) = attr_leaf(&mut st, "com.apple.fs.symlink")? {
+            leaf = l;
+        }
+    }
+    if u64a(&v, INO_INTERNAL_FLAGS) & 0xc000 == 0 {
+        if let Some(l) = attr_leaf(&mut st, "com.apple.ResourceFork")? {
+            leaf = l;
+        }
+    }
+    let root = t.root;
+    nx.hint_set(vol, ino, leaf, root);
+    Ok(())
 }
 
 /// What the removals take from the run that only the device has: the
@@ -3349,6 +3396,13 @@ fn get_rec(nx: &mut Nx<'_>, vol: usize, key: &[u8]) -> Result<Option<Vec<u8>>, S
     t.get(&mut st, key)
 }
 
+/// A record put by `bt_insert` (`fs_insert_jobj`'s path, K 0x66f3330
+/// with op 1, or a new record): a new one inserted, an existing one's value
+/// replaced. A record the kernel replaces by `update_jobj` (K 0x66f5030)
+/// goes through `bt_update` instead, which makes no room on its way down:
+/// for an inode that is [`update_jobj`]; for another record the two leave
+/// the same tree unless `bt_insert`'s descent splits a node above a leaf
+/// that had room for the value, which is refused here.
 fn put_rec(nx: &mut Nx<'_>, vol: usize, key: &[u8], val: &[u8]) -> Result<(), String> {
     if key.len() == 8 && u64a(key, 0) >> 60 == J_INODE {
         let ino = u64a(key, 0) & OBJ_MASK;
@@ -3357,9 +3411,199 @@ fn put_rec(nx: &mut Nx<'_>, vol: usize, key: &[u8], val: &[u8]) -> Result<(), St
         }
     }
     let (mut t, mut st) = nx.fs_tree(vol)?;
+    let inode = key.len() == 8 && u64a(key, 0) >> 60 == J_INODE;
+    let above = if !inode && leaf_room(&t, &mut st, key, val.len())? == Some(true) { Some(index_shape(&t, &mut st, key)?) } else { None };
     t.insert(&mut st, key, Some(val))?;
+    if let Some(a) = above {
+        if index_shape(&t, &mut st, key)? != a {
+            return Err(format!("not implemented: a replacement of record {:#x} whose bt_insert descent split or shifted a node above a leaf with room for it (the site's kernel call, bt_insert or update_jobj's bt_update, which makes no room, is not mapped)", u64a(key, 0)));
+        }
+    }
     nx.set_fs_tree(vol, t);
     Ok(())
+}
+
+/// The tree's node count and the record counts of the index nodes on
+/// `key`'s path: what a split or shift above its leaf changes.
+fn index_shape(t: &Tree, st: &mut dyn Store, key: &[u8]) -> Result<(u64, Vec<(u64, usize)>), String> {
+    let count = super::node::Info::read(&st.get(t.root)?.b).node_count;
+    let (path, _) = tree_path(t, st, key)?;
+    let mut out = Vec::new();
+    for &id in &path[..path.len() - 1] {
+        out.push((id, st.get(id)?.nkeys()));
+    }
+    Ok((count, out))
+}
+
+/// For an existing record `key`: whether its leaf has room for a value of
+/// `vlen` bytes (`btree_node_entry_update`'s ENOSPC test, K 0x6729a84); none
+/// for a new record.
+fn leaf_room(t: &Tree, st: &mut dyn Store, key: &[u8], vlen: usize) -> Result<Option<bool>, String> {
+    let (path, idx) = tree_path(t, st, key)?;
+    let Some(i) = idx else { return Ok(None) };
+    let n = st.get(*path.last().unwrap())?;
+    let s = t.shape;
+    let old = n.val_len(&s, i);
+    let grow = s.r(vlen) as isize - s.r(old) as isize;
+    Ok(Some(vlen == old || n.free(&s) as isize >= grow))
+}
+
+/// The nodes from the root to the leaf where `key` is or would be, and its
+/// slot there when it is.
+fn tree_path(t: &Tree, st: &mut dyn Store, key: &[u8]) -> Result<(Vec<u64>, Option<usize>), String> {
+    let s = t.shape;
+    let mut id = t.root;
+    let mut path = vec![id];
+    loop {
+        let n = st.get(id)?;
+        if n.is_leaf() {
+            let (i, f) = super::btree::search(&s, &n, t.cmp, key);
+            return Ok((path, f.then_some(i)));
+        }
+        if n.nkeys() == 0 {
+            return Ok((path, None));
+        }
+        let (i, _) = super::btree::search_index(&s, &n, t.cmp, key);
+        let c = n.child(&s, i);
+        id = if n.flags() & super::node::flags::HASHED != 0 { c + t.root } else { c };
+        path.push(id);
+    }
+}
+
+/// `update_jobj` (K 0x66f5030) of inode `ino` with value `val`: the whole
+/// in-memory object encoded (K 0x66f3830) and put by `fs_update_jobj`'s
+/// op 2 (K 0x66efc60): `bt_update` (K 0x672c328) with the object's leaf
+/// hint (jobj + 0xb8), then, when the leaf has no room, `bt_insert` (K
+/// 0x66f05cc: on ENOSPC only). The hint the update leaves is kept
+/// ([`Nx::hint_set`]); one the insert fallback follows stays as it was.
+///
+/// What the hint changes is which nodes the transaction changes, and in
+/// which order: a hint naming the record's leaf changes that leaf alone,
+/// one naming another node changes it too before the descent. When the
+/// hint is not settled ([`tx::Hint`]: the object's vnode recyclable, or a
+/// lookup the model does not run), every hint it may hold is tried; when
+/// they change different nodes the update is listed
+/// ([`Nx::hint_unsettled`]) and the hint the restore's own operations left
+/// is used.
+fn update_jobj(nx: &mut Nx<'_>, vol: usize, ino: u64, val: &[u8], site: &'static str) -> Result<(), String> {
+    const ENOENT: i32 = 2;
+    if nx.jobj_times.contains_key(&(vol, ino)) {
+        return Err(format!("not implemented: a rewrite of inode {ino:#x} that does not carry the times its in-memory object holds"));
+    }
+    let key = inode_key(ino);
+    let root = nx.fs_tree(vol)?.0.root;
+    let h = nx.jobj_hints.get(&(vol, ino)).cloned().unwrap_or_default();
+    let kept = h.leaf.filter(|l| l.1 == root).map(|l| l.0);
+    let mut cands: Vec<Option<u64>> = vec![kept];
+    if h.maybe_none && kept.is_some() {
+        cands.push(None);
+    }
+    let mut leaves = h.attr_leaves.clone();
+    leaves.extend(attr_leaves(nx, vol, ino)?);
+    // An object the model neither loaded nor updated, with no vnode it
+    // counts: one a lookup the model does not run may have loaded, its
+    // hint the leaf then holding the record.
+    if h.leaf.is_none() && !nx.vnode_counted(vol, ino) {
+        leaves.extend(h.rec_leaves.iter().copied());
+        let (t, mut st) = nx.fs_tree(vol)?;
+        leaves.insert(*tree_path(&t, &mut st, &inode_key(ino))?.0.last().unwrap());
+    }
+    for l in leaves {
+        if !cands.contains(&Some(l)) {
+            cands.push(Some(l));
+        }
+    }
+    if cands.len() > 1 {
+        let first = update_effect(nx, vol, &key, val.len(), cands[0])?;
+        for c in &cands[1..] {
+            if update_effect(nx, vol, &key, val.len(), *c)? != first {
+                nx.hint_unsettled.push((vol, ino, site));
+                break;
+            }
+        }
+    }
+    let (mut t, mut st) = nx.fs_tree(vol)?;
+    match t.update(&mut st, &key, val, kept)? {
+        Ok(leaf) => {
+            let r = t.root;
+            nx.set_fs_tree(vol, t);
+            nx.hint_set(vol, ino, leaf, r);
+        }
+        Err(ENOSPC) => {
+            t.insert(&mut st, &key, Some(val))?;
+            nx.set_fs_tree(vol, t);
+        }
+        Err(ENOENT) => return Err(format!("update_jobj of inode {ino:#x}, whose record is not in the tree (bt_update: ENOENT)")),
+        Err(e) => return Err(format!("update_jobj of inode {ino:#x}: bt_update failed ({e})")),
+    }
+    Ok(())
+}
+
+/// The leaves holding inode `ino`'s extended-attribute records.
+fn attr_leaves(nx: &mut Nx<'_>, vol: usize, ino: u64) -> Result<Vec<u64>, String> {
+    let (t, mut st) = nx.fs_tree(vol)?;
+    let mut out = Vec::new();
+    let mut k = inode_key(ino);
+    while let Some((nk, _)) = t.get_gt(&mut st, &k)? {
+        if u64a(&nk, 0) != (ino | J_XATTR << 60) {
+            break;
+        }
+        let (path, _) = tree_path(&t, &mut st, &nk)?;
+        let l = *path.last().unwrap();
+        if !out.contains(&l) {
+            out.push(l);
+        }
+        k = nk;
+    }
+    Ok(out)
+}
+
+/// The nodes `bt_update` of inode record `key` with a value of `vlen` bytes
+/// and `hint` adds to the transaction's changed objects, in order: the
+/// hinted node fetched for modification (the root by `obj_modify`), then,
+/// unless it is the leaf holding the record, the root and every node of the
+/// descent; when the leaf has no room, `bt_insert`'s descent from the root
+/// after it (what its splits add is the same whatever the hint); else the
+/// root when the tree's longest value or key grows.
+fn update_effect(nx: &mut Nx<'_>, vol: usize, key: &[u8], vlen: usize, hint: Option<u64>) -> Result<Vec<u64>, String> {
+    let (t, mut st) = nx.fs_tree(vol)?;
+    let (path, idx) = tree_path(&t, &mut st, key)?;
+    if idx.is_none() {
+        return Err(format!("an inode update of record {:#x}, which is not in the tree", u64a(key, 0)));
+    }
+    let room = leaf_room(&t, &mut st, key, vlen)?.unwrap_or(true);
+    let info = super::node::Info::read(&st.get(t.root)?.b);
+    let grows = info.longest_key < key.len() as u32 || info.longest_val < vlen as u32 || t.shape.bt_flags & super::node::tree_flags::HASHED != 0;
+    let root = t.root;
+    drop(st);
+    let mut out: Vec<u64> = Vec::new();
+    let touch = |nx: &Nx<'_>, out: &mut Vec<u64>, id: u64| {
+        if !nx.virt_is_dirty(vol, id) && !out.contains(&id) {
+            out.push(id);
+        }
+    };
+    let mut direct = false;
+    if let Some(h) = hint {
+        let fetched = h == root || nx.fs_node_exists(vol, h);
+        if fetched {
+            touch(nx, &mut out, h);
+            let n = nx.fs_tree(vol)?.1.get(h)?;
+            direct = n.is_leaf() && super::btree::search(&t.shape, &n, t.cmp, key).1;
+        }
+    }
+    if !direct {
+        for &p in &path {
+            touch(nx, &mut out, p);
+        }
+    }
+    if !room {
+        for &p in &path {
+            touch(nx, &mut out, p);
+        }
+    } else if grows {
+        touch(nx, &mut out, root);
+    }
+    Ok(out)
 }
 
 fn remove_rec(nx: &mut Nx<'_>, vol: usize, key: &[u8]) -> Result<(), String> {
@@ -3422,7 +3666,7 @@ fn remove_dir_entry(nx: &mut Nx<'_>, vol: usize, dir: u64, drec: &[u8], now: &mu
     d.put32(INO_NCHILDREN, (n - 1) as u32);
     let g = u32::from_le_bytes(d[INO_WRITE_GEN..INO_WRITE_GEN + 4].try_into().unwrap());
     d.put32(INO_WRITE_GEN, g.wrapping_add(1));
-    put_rec(nx, vol, &inode_key(dir), &d)
+    update_jobj(nx, vol, dir, &d, "remove_dir_entry")
 }
 
 /// The extent-removal loop for a stream truncated to nothing (K
@@ -3575,7 +3819,7 @@ pub fn unlink(nx: &mut Nx<'_>, vol: usize, dir: u64, drec: &[u8], ino: u64, now:
             if v.len() != f.len() {
                 return Err("an inode rewrite changing its length".into());
             }
-            put_rec(nx, vol, &inode_key(ino), &v)
+            update_jobj(nx, vol, ino, &v, "unlink")
         };
         closing |= remove_extents(nx, vol, ds.oid, &mut rewrite, now)?;
         remove_rec(nx, vol, &idk)?;

@@ -354,7 +354,7 @@ impl Manager {
     pub fn send_message(&self, endpoint: u8, m: Message, wait: bool) -> Result<(), MgrError> {
         let state = self.g().state;
         let ok = match state {
-            State::RomIdle | State::RomPanic | State::Booting | State::Waking => endpoint & !1 == 0xfe,
+            State::RomIdle | State::Booting | State::Waking => endpoint & !1 == 0xfe,
             State::OsActive | State::OsSleeping => {
                 if endpoint == ep::BOOTSTRAP {
                     return Err(MgrError::Panic("*endpointHandle != EP_BOOTSTRAP".into()));
@@ -365,7 +365,7 @@ impl Manager {
                 true
             }
             State::Napping => return Err(MgrError::Unimplemented("sending to a napping SEP (the wake from nap)".into())),
-            State::ColdOff | State::Asleep | State::Failed => false,
+            State::ColdOff | State::Asleep | State::RomPanic | State::Failed => false,
         };
         if !ok {
             let mut g = self.g();
@@ -397,21 +397,18 @@ impl Manager {
 
     fn route(&self, m: Message) {
         let mut g = self.g();
-        // The control wake fast path: opcode 0x15 and 0x0f at endpoint 0.
-        if m.endpoint() == ep::CONTROL && matches!(m.opcode(), frame::control::OS_ACTIVE | frame::control::WAKE_ACK) && !g.wake_flag {
-            g.wake_flag = true;
-            self.cv.notify_all();
-            // A 0x15 is also the OS-active message: the fast path only wakes a waiter
-            // when the SEP is napping, and falls through otherwise.
-            if m.opcode() == frame::control::WAKE_ACK || g.state != State::Napping {
-                if m.opcode() == frame::control::WAKE_ACK {
-                    return;
-                }
-            } else {
+        // The doorbell's wake fast path (K 0xfffffff0063cfae4): control opcodes 0x15 and 0x0f
+        // set the wake byte and wake a waiter, and are consumed; with the byte already set an
+        // 0x0f is dropped and an 0x15 goes on to the endpoint like any other message.
+        if m.endpoint() == ep::CONTROL && matches!(m.opcode(), frame::control::OS_ACTIVE | frame::control::WAKE_ACK) {
+            if !g.wake_flag {
+                g.wake_flag = true;
+                self.cv.notify_all();
                 return;
             }
-        } else if m.endpoint() == ep::CONTROL && m.opcode() == frame::control::WAKE_ACK {
-            return;
+            if m.opcode() == frame::control::WAKE_ACK {
+                return;
+            }
         }
         if g.state == State::RomPanic {
             self.rom_message(&mut g, m);
@@ -1042,7 +1039,7 @@ mod tests {
             let mut out = base(msg);
             match (msg.endpoint(), msg.opcode()) {
                 // After the L4 info message the sepOS comes up: it says so on the control endpoint.
-                (0xfe, _) => out.push(Message::new(0, 0, frame::control::OS_ACTIVE, 0, 0)),
+                (0xfe, _) => out.push(Message::new(0, 0, frame::control::OS_ACTIVE_ASYNC, 0, 0)),
                 // Control requests: the reply is the request with its status in byte 3.
                 (0, frame::control::PING) => out.push(Message::new(0, msg.tag(), frame::control::PING, 0, 0)),
                 (0, frame::control::STATUS) => out.push(Message::new(0, msg.tag(), frame::control::STATUS, 0, 3)),
@@ -1074,10 +1071,27 @@ mod tests {
         let (m, _p, hw, door) = manager(rom_script_two_phase());
         m.power_on().unwrap();
         m.set_firmware_bytes(&[3; 0x1000], [0x1000, 0, 0], false, true).unwrap();
-        hw.core_push(Message::new(0, 0, frame::control::OS_ACTIVE, 0, 0).0).unwrap();
+        hw.core_push(Message::new(0, 0, frame::control::OS_ACTIVE_ASYNC, 0, 0).0).unwrap();
         assert!(m.wait_os_active(10_000).unwrap());
         assert_eq!(m.ping(), Err(MgrError::Io(io::TIMEOUT)));
         assert!(m.log().iter().any(|l| l.contains("timeout waiting for reply")));
+        finish(&m, &hw, door);
+    }
+
+    #[test]
+    fn the_wake_fast_path_consumes_the_first_0x15_and_dispatches_the_second() {
+        let (m, _p, hw, door) = manager(rom_script_two_phase());
+        m.power_on().unwrap();
+        m.set_firmware_bytes(&[3; 0x1000], [0x1000, 0, 0], false, true).unwrap();
+        // The first 0x15 sets the wake byte and wakes a waiter: the manager is not told the OS is up.
+        hw.core_push(Message::new(0, 0, frame::control::OS_ACTIVE, 0, 0).0).unwrap();
+        assert!(wait(|| m.g().wake_flag));
+        assert_eq!(m.state(), State::Booting);
+        // An 0x0f with the byte set is dropped; the second 0x15 reaches the control endpoint.
+        hw.core_push(Message::new(0, 0, frame::control::WAKE_ACK, 0, 0).0).unwrap();
+        hw.core_push(Message::new(0, 0, frame::control::OS_ACTIVE, 0, 0).0).unwrap();
+        assert!(wait(|| m.state() == State::OsActive));
+        assert!(m.log().iter().all(|l| !l.contains("unsolicited message")));
         finish(&m, &hw, door);
     }
 

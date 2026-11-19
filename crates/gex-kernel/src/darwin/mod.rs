@@ -55,6 +55,7 @@ pub mod iodt;
 pub mod iomatch;
 pub mod iopower;
 pub mod image4;
+pub mod image4ap;
 pub mod img4;
 pub mod iosurface;
 pub mod hostuuid;

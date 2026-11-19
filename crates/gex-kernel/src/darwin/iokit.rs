@@ -257,6 +257,23 @@ pub fn nvram_services(t: &[Node], options: u32) -> Vec<u32> {
     t.iter().enumerate().filter(|(_, n)| n.parent == Some(options) && matches!(n.class, NVRAM_DIAGS | NVRAM_NOTIFIER | NVRAM_VARIABLES)).map(|(i, _)| i as u32).collect()
 }
 
+/// Whether a service of an NVRAM class registers itself (`registerService`,
+/// IOService's vtable slot 0x2a0), each of them once its start succeeds:
+/// - IODTNVRAM: not in its start (K 0xfffffff0078141c0), but
+///   `IOPlatformExpert::publishNVRAM` (K 0xfffffff00780d660, from
+///   `IODTPlatformExpert::processTopLevel`) registers it after
+///   `createNVRAM` has started it (`registerService(0)`, K 0xfffffff00780d76c).
+/// - IODTNVRAMDiags: its start, after setting "Stats" (K 0xfffffff00781cb00).
+/// - IODTNVRAMPlatformNotifier: its start, after setting
+///   IOPlatformWakeAction (K 0xfffffff00781c784).
+/// - IODTNVRAMVariables: its start, once its provider is an IODTNVRAM
+///   (K 0xfffffff0078155f0).
+///
+/// None for any other class.
+pub fn nvram_registers(class: &str) -> Option<bool> {
+    matches!(class, NVRAM_CLASS | NVRAM_DIAGS | NVRAM_NOTIFIER | NVRAM_VARIABLES).then_some(true)
+}
+
 /// Whether the kernel sets the root entry's property `name`: the planes
 /// (`IORegistryEntry::initialize`), IOKit's build version and diagnostics
 /// and the OS build version (`StartIOKit`), the console's lock and users

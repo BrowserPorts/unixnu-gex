@@ -208,6 +208,16 @@ fn copy_property(t: &[Node], i: u32, name: &str) -> Result<Option<Prop>, String>
     if n.class == super::accel::CLASS {
         return Err(format!("{}'s copyProperty of {name:?}", n.class));
     }
+    // IODTNVRAM and IODTNVRAMVariables override IORegistryEntry's property
+    // accessors (slots from 0xb8 to 0x160 of their vtables) to answer for
+    // the task asking, and IODTNVRAMDiags' table holds what the NVRAM sets
+    // in it ("Stats", an OSSerializer, set by its start at
+    // K 0xfffffff00781caec): the NVRAM model answers them
+    // ([`super::nvram::entry_property`]), not this registry, and matching
+    // does not reach it.
+    if super::nvram::entry(t, i).is_some() {
+        return Err(format!("the {} property {name:?} as the NVRAM's entries answer it in matching", iokit::name(t, i)));
+    }
     if let Some(p) = iokit::live_prop(t, i, name) {
         return Ok(Some(p));
     }
@@ -343,11 +353,14 @@ fn compare_name(t: &[Node], i: u32, name: &[u8]) -> Result<bool, String> {
 /// Whether the entry is registered: an instance its class's metaclass
 /// tracks (`doServiceMatch` adds it, 0xfffffff0077b5174's caller) and a
 /// service in the matched state. The platform expert device, the nubs the
-/// platform's drivers published and IOResources are; every driver that
-/// calls `registerService` on itself ([`super::storagestack::registers`]);
-/// the GPU's accelerator, the display's framebuffer and IOSurfaceRoot,
-/// which their frameworks find by matching. A device tree entry no driver
-/// made a nub of is not a service of the plane.
+/// platform's drivers published and IOResources are, and so are the nubs
+/// made of device tree entries elsewhere: the SEP's AppleA7IOPNub
+/// ([`super::sep::registry::registers`]) and IODTNVRAM
+/// ([`iokit::nvram_registers`]); every driver that calls `registerService`
+/// on itself ([`super::storagestack::registers`]); the GPU's accelerator,
+/// the display's framebuffer and IOSurfaceRoot, which their frameworks find
+/// by matching. A device tree entry no driver made a nub of is not a
+/// service of the plane.
 fn registered(t: &[Node], i: u32) -> Result<bool, String> {
     let n = &t[i as usize];
     if n.class.is_empty() {
@@ -355,6 +368,9 @@ fn registered(t: &[Node], i: u32) -> Result<bool, String> {
     }
     if n.class == super::platform::RESOURCES {
         return Ok(true);
+    }
+    if let Some(r) = iokit::nvram_registers(n.class) {
+        return Ok(r);
     }
     if n.class == super::accel::CLASS || n.class == super::iomfb::CLASS || n.class == super::iosurface::CLASS {
         return Ok(true);
@@ -1259,6 +1275,48 @@ mod tests {
         assert_eq!(compare_name(&t, m, b"iop-nub,sep"), Ok(false));
         assert_eq!(match_location(&t, nub), Ok(Some(nub)));
         assert_eq!(match_location(&t, m), Ok(Some(nub)));
+    }
+
+    #[test]
+    fn the_nvram_services_registered_and_answer_their_own_properties() {
+        let mut b = Vec::new();
+        let node = |b: &mut Vec<u8>, name: &str, props: &[(&str, &[u8])], children: u32| {
+            b.extend_from_slice(&(props.len() as u32 + 1).to_le_bytes());
+            b.extend_from_slice(&children.to_le_bytes());
+            let mut put = |k: &str, v: &[u8]| {
+                let mut kk = [0u8; 32];
+                kk[..k.len()].copy_from_slice(k.as_bytes());
+                b.extend_from_slice(&kk);
+                b.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                b.extend_from_slice(v);
+                b.resize(b.len().div_ceil(4) * 4, 0);
+            };
+            put("name", &[name.as_bytes(), b"\0"].concat());
+            for (k, v) in props {
+                put(k, v);
+            }
+        };
+        node(&mut b, "device-tree", &[("compatible", b"J120AP\0iPad7,1\0AppleARM\0")], 2);
+        node(&mut b, "arm-io", &[("compatible", b"arm-io,t8011\0")], 0);
+        node(&mut b, "options", &[("boot-args", b"\0")], 0);
+        let t = iokit::build_nvram(&b, &[], Some(true)).unwrap();
+        let options = iokit::from_path(&t, "IODeviceTree:/options").unwrap().unwrap();
+        let services = iokit::nvram_services(&t, options);
+        assert_eq!(services.len(), 4);
+        // IODTNVRAM (publishNVRAM) and each service its start made (their own starts) registered.
+        for &i in std::iter::once(&options).chain(&services) {
+            assert_eq!(registered(&t, i), Ok(true), "{}", iokit::name(&t, i));
+        }
+        let surface = t.iter().position(|n| n.class == super::super::iosurface::CLASS).unwrap() as u32;
+        let (g, d) = dict(&[("IONameMatch", s("IOCoreSurfaceRoot"))]);
+        assert_eq!(existing(&t, &g, d, false), Ok(vec![surface]));
+        // Their properties are the NVRAM's, which matching does not reach: the
+        // device tree's /options table is not IODTNVRAM's.
+        assert!(copy_property(&t, options, "boot-args").is_err());
+        let diags = services.iter().copied().find(|&i| t[i as usize].class == iokit::NVRAM_DIAGS).unwrap();
+        assert!(copy_property(&t, diags, "Stats").is_err());
+        let notifier = services.iter().copied().find(|&i| t[i as usize].class == iokit::NVRAM_NOTIFIER).unwrap();
+        assert_eq!(copy_property(&t, notifier, "IOPlatformWakeAction"), Ok(Some(Prop::Num(1000, 32))));
     }
 
     #[test]

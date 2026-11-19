@@ -405,9 +405,6 @@ pub fn unmeasured() -> Option<String> {
     gaps.push(format!("whether the System volume is unencrypted without a disk0 image (stand-in {SYSTEM_UNENCRYPTED}, no MNT_CPROTECT on /; measure {SYSTEM_UNENCRYPTED_MEASUREMENT})"));
     gaps.push(format!("whether the Preboot volume is unencrypted without a disk0 image (stand-in {PREBOOT_UNENCRYPTED}, no MNT_CPROTECT on its mount; measure {PREBOOT_UNENCRYPTED_MEASUREMENT})"));
     gaps.push(super::img4::chosen_stand_in().to_string());
-    gaps.push(super::preboot::TIMES_STAND_IN.to_string());
-    gaps.push(super::preboot::FOUNDATION_MODE_STAND_IN.to_string());
-    gaps.push(super::preboot::NEXT_OBJ_ID_STAND_IN.to_string());
     gaps.push(super::kern::DEVFS_STAT_STAND_IN.to_string());
     gaps.push(super::kern::PREBOOT_BOOTED_FLAGS_STAND_IN.to_string());
     gaps.push(super::mig::machine::MEM_ACTUAL_STAND_IN.to_string());

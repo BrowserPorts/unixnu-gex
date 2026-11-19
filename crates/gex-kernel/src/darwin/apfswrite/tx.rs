@@ -536,6 +536,393 @@ impl<'a> Nx<'a> {
         })
     }
 
+    /// The container on `sink` mounted as the kernel mounts one it finds
+    /// there ("Mounting an Apple File System Partition", steps 1 to 6):
+    /// block 0's superblock, then the checkpoint descriptor area's
+    /// superblock with the largest transaction whose checkpoint-mapping
+    /// blocks are valid, and that checkpoint's ephemeral objects (the space
+    /// manager, the reaper and its lists, the free queues' nodes) read
+    /// from the data area into the object cache in map order; the space
+    /// manager's chunk-info blocks, the internal pool's bitmap, the object
+    /// map, each volume's superblock (through the object map) and the
+    /// container keybag. What this writer keeps of each is checked to be
+    /// all the object holds, and a layout other than the one `newfs_apfs`
+    /// sizes for the container's blocks is refused, as is a container
+    /// block 0 does not mark cleanly unmounted (what the kernel's mount
+    /// does after an unclean unmount is not traced). Nothing is written:
+    /// the read-write mount is [`Nx::mount_rw`].
+    pub fn mounted(sink: &'a dyn Sink, mode: Mode) -> Result<Nx<'a>, String> {
+        use crate::darwin::apfsread::checksum_ok;
+        let read = |paddr: u64, bs: u64| -> Result<Vec<u8>, String> {
+            let mut b = vec![0u8; bs as usize];
+            sink.read_at(paddr * bs, &mut b)?;
+            Ok(b)
+        };
+        let mut head = vec![0u8; 4096];
+        sink.read_at(0, &mut head)?;
+        let bs = u64::from(u32a(&head, 0x24));
+        let b0 = read(0, bs.max(4096))?;
+        if u32a(&b0, 0x20) != crate::darwin::apfsread::NX_MAGIC || !checksum_ok(&b0) {
+            return Err("block 0 holds no valid container superblock".into());
+        }
+        let l = Layout::new(bs, u64a(&b0, 0x28))?;
+        let laid = [(u64::from(u32a(&b0, 0x68)), l.desc_blocks), (u64::from(u32a(&b0, 0x6c)), l.data_blocks), (u64a(&b0, 0x70), l.desc_base), (u64a(&b0, 0x78), l.data_base), (u64::from(u32a(&b0, 0xb4)), l.max_file_systems)];
+        if laid.iter().any(|&(got, want)| got != want) {
+            return Err(format!("not implemented: a container laid out other than newfs_apfs lays out {} blocks of {bs} bytes (checkpoint areas and file-system count {laid:?})", l.blocks));
+        }
+        if u64a(&b0, 0x4f0) & NX_CLEANLY_UNMOUNTED == 0 {
+            return Err("not implemented: mounting a container that was not cleanly unmounted (block 0's nx_flags lack 0x2; what the kernel's mount does then is not traced)".into());
+        }
+        // The latest valid checkpoint.
+        let mut found: Vec<(u64, Vec<u8>)> = Vec::new();
+        for i in 0..l.desc_blocks {
+            let b = read(l.desc_base + i, bs)?;
+            if u32a(&b, 24) & 0xffff == otype::NX_SUPERBLOCK && u32a(&b, 0x20) == crate::darwin::apfsread::NX_MAGIC && checksum_ok(&b) {
+                found.push((u64a(&b, 16), b));
+            }
+        }
+        found.sort_by_key(|f| std::cmp::Reverse(f.0));
+        let mut chosen = None;
+        'sb: for (xid, sb) in found {
+            let (index, len) = (u64::from(u32a(&sb, 0x88)), u64::from(u32a(&sb, 0x8c)));
+            if len == 0 || len > l.desc_blocks || index >= l.desc_blocks {
+                continue;
+            }
+            let mut maps = Vec::new();
+            for j in 0..len - 1 {
+                let m = read(l.desc_base + (index + j) % l.desc_blocks, bs)?;
+                let last = u32a(&m, 0x20) & CHECKPOINT_MAP_LAST != 0;
+                if u32a(&m, 24) & 0xffff != otype::CHECKPOINT_MAP || u64a(&m, 16) != xid || !checksum_ok(&m) || last != (j + 2 == len) {
+                    continue 'sb;
+                }
+                maps.push(m);
+            }
+            chosen = Some((xid, sb, maps));
+            break;
+        }
+        let (ck_xid, sb_copy, maps) = chosen.ok_or("no valid checkpoint in the checkpoint descriptor area")?;
+        if u64a(&sb_copy, 0x60) != ck_xid + 1 {
+            return Err(format!("the checkpoint of transaction {ck_xid:#x} names its next transaction {:#x}", u64a(&sb_copy, 0x60)));
+        }
+        let mut nx = Nx {
+            sink,
+            l,
+            uuid: sb_copy[0x48..0x58].try_into().unwrap(),
+            mode,
+            xid: ck_xid,
+            in_tx: false,
+            next_oid: u64a(&sb_copy, 0x58),
+            counter: u64a(&sb_copy, 0x3d8),
+            newest_mounted: u64a(&sb_copy, 0x568),
+            desc_index: u64::from(u32a(&sb_copy, 0x88)),
+            desc_len: u64::from(u32a(&sb_copy, 0x8c)),
+            data_index: u64::from(u32a(&sb_copy, 0x90)),
+            data_len: u64::from(u32a(&sb_copy, 0x94)),
+            wrote_checkpoint: false,
+            chunks: Vec::with_capacity(l.chunks as usize),
+            cib_addr: Vec::new(),
+            cib_xid: Vec::new(),
+            cib_dirty: vec![false; l.cibs as usize],
+            ip_used: vec![false; l.ip_blocks as usize],
+            ip_cursor: 0,
+            ipbm_index: 0,
+            ipbm_xid: 0,
+            ipbm_next: Vec::new(),
+            ipbm_head: 0,
+            ipbm_tail: 0,
+            fq: [FreeQueue::default(), FreeQueue::default()],
+            sm_free: 0,
+            reserve: (0, 0),
+            zones: [Zone::default(); 4],
+            classes: [Class::default(); 3],
+            age_limit: 8,
+            main_count_limit: l.blocks >> 5,
+            omap: Omap { phys: 0, tree: Tree { root: 0, shape: omap_shape(bs), cmp: btree::cmp_omap } },
+            phys: HashMap::new(),
+            phys_dirty: Vec::new(),
+            eph: HashMap::new(),
+            eph_order: Vec::new(),
+            virt: HashMap::new(),
+            virt_dirty: Vec::new(),
+            fs_oid: (0..l.max_file_systems as usize).map(|i| u64a(&sb_copy, 0xb8 + 8 * i)).collect(),
+            vols: BTreeMap::new(),
+            rw_mounted: false,
+            sb_copy: sb_copy.clone(),
+            fxc: None,
+            rove: 0,
+            reaper: Reaper { next_reap_id: 0, completed_id: 0, head: 0, tail: 0, flags: 0, rlcount: 0, ty: 0, size: 0, fs_oid: 0, oid: 0, xid: 0, nrle_flags: 0 },
+            reap_lists: BTreeMap::new(),
+            alloc_delta: BTreeMap::new(),
+            precounted: Default::default(),
+            tx_ops: 0,
+            solid_state: true,
+            alloc_log: None,
+            keylocker: None,
+            keybag: Vec::new(),
+            pfkur_tmp: BTreeMap::new(),
+            jobj_times: BTreeMap::new(),
+            mounted: Vec::new(),
+            vnodes: BTreeMap::new(),
+            vnode_seq: 0,
+            vnode_full: false,
+            vnode_fill_at: None,
+            vnode_missing: Vec::new(),
+            vnode_at_risk: BTreeSet::new(),
+            vnode_risk_written: Vec::new(),
+            jobj_hints: HashMap::new(),
+            hint_unsettled: Vec::new(),
+        };
+        // The checkpoint's ephemeral objects, in map order.
+        let (mut spaceman, mut reaper) = (None, None);
+        for m in &maps {
+            for j in 0..u32a(m, 0x24) as usize {
+                let o = 0x28 + 40 * j;
+                let (ty, sub, size, oid, paddr) = (u32a(m, o), u32a(m, o + 4), u64::from(u32a(m, o + 8)), u64a(m, o + 0x18), u64a(m, o + 0x20));
+                if size == 0 || size % bs != 0 || paddr < l.data_base || paddr >= l.data_base + l.data_blocks {
+                    return Err(format!("a checkpoint mapping of object {oid:#x} of {size} bytes at {paddr:#x}"));
+                }
+                let mut b = Vec::with_capacity(size as usize);
+                for k in 0..size / bs {
+                    b.extend_from_slice(&read(l.data_base + (paddr - l.data_base + k) % l.data_blocks, bs)?);
+                }
+                if !checksum_ok(&b) || u64a(&b, 8) != oid || u64a(&b, 16) != ck_xid || u32a(&b, 24) != ty || u32a(&b, 28) != sub {
+                    return Err(format!("the checkpoint's ephemeral object {oid:#x} (type {ty:#x}) is not valid"));
+                }
+                match (ty & 0xffff, sub) {
+                    (0x5, 0) if oid == OID_SPACEMAN && size == l.sm_bytes => spaceman = Some(b),
+                    (0x11, 0) if oid == OID_REAPER && size == bs => reaper = Some(b),
+                    (OBJECT_TYPE_NX_REAP_LIST, 0) if size == bs => {
+                        nx.reap_lists.insert(oid, b);
+                    }
+                    (otype::BTREE | otype::BTREE_NODE, SPACEMAN_FREE_QUEUE) if size == bs => {
+                        nx.eph.insert(oid, Obj { b, storage: ty & otype::STORAGETYPE_MASK, subtype: sub, class: 1 });
+                    }
+                    _ => return Err(format!("not implemented: a checkpoint's ephemeral object {oid:#x} of type {ty:#x}/{sub:#x} and {size} bytes")),
+                }
+                nx.eph_order.push(oid);
+            }
+        }
+        let sm = spaceman.ok_or("the checkpoint has no space manager")?;
+        let r = reaper.ok_or("the checkpoint has no reaper")?;
+        // The space manager.
+        let sized = [
+            (u64::from(u32a(&sm, 0x20)), l.bs),
+            (u64::from(u32a(&sm, 0x24)), l.blocks_per_chunk),
+            (u64::from(u32a(&sm, 0x28)), l.chunks_per_cib),
+            (u64::from(u32a(&sm, 0x2c)), l.cibs_per_cab),
+            (u64a(&sm, 0x30), l.blocks),
+            (u64a(&sm, 0x38), l.chunks),
+            (u64::from(u32a(&sm, 0x40)), l.cibs),
+            (u64::from(u32a(&sm, 0x44)), l.cabs),
+            (u64a(&sm, 0x98), l.ip_blocks),
+            (u64::from(u32a(&sm, 0xa0)), l.ip_bm_size),
+            (u64::from(u32a(&sm, 0xa4)), l.ip_bm_count),
+            (u64a(&sm, 0xa8), l.ip_bm_base),
+            (u64a(&sm, 0xb0), l.ip_base),
+        ];
+        if sized.iter().any(|&(got, want)| got != want) {
+            return Err(format!("not implemented: a space manager sized other than newfs_apfs sizes this container ({sized:?})"));
+        }
+        nx.sm_free = u64a(&sm, 0x48);
+        nx.reserve = (u64a(&sm, 0xb8), u64a(&sm, 0xc0));
+        for (q, base) in [(FQ_IP, 0xc8usize), (FQ_MAIN, 0xf0)] {
+            let root = u64a(&sm, base + 8);
+            nx.fq[q] = FreeQueue {
+                tree: (root != 0).then(|| Tree { root, shape: fq_shape(bs), cmp: btree::cmp_fq }),
+                count: u64a(&sm, base),
+                oldest_xid: u64a(&sm, base + 16),
+                limit: u16::from_le_bytes([sm[base + 24], sm[base + 25]]),
+            };
+        }
+        nx.ipbm_head = u16::from_le_bytes([sm[0x140], sm[0x141]]);
+        nx.ipbm_tail = u16::from_le_bytes([sm[0x142], sm[0x143]]);
+        nx.ipbm_xid = u64a(&sm, l.xid_offset as usize);
+        nx.ipbm_index = u16::from_le_bytes([sm[l.bitmap_offset as usize], sm[l.bitmap_offset as usize + 1]]);
+        nx.ipbm_next = (0..l.ip_bm_count as usize).map(|i| u16::from_le_bytes([sm[l.free_next_offset as usize + 2 * i], sm[l.free_next_offset as usize + 2 * i + 1]])).collect();
+        nx.cib_addr = (0..l.cibs as usize).map(|i| u64a(&sm, l.addr_offset as usize + 8 * i)).collect();
+        for (z, zone) in nx.zones.iter_mut().enumerate() {
+            let o = 0x158 + 136 * z;
+            if u16::from_le_bytes([sm[o + 0x80], sm[o + 0x81]]) == 0 {
+                continue;
+            }
+            let mut prev = [(0u64, 0u64); 7];
+            for (i, p) in prev.iter_mut().enumerate() {
+                *p = (u64a(&sm, o + 0x10 + 0x10 * i), u64a(&sm, o + 0x18 + 0x10 * i));
+            }
+            *zone = Zone { start: u64a(&sm, o), end: u64a(&sm, o + 8), enabled: true, prev, index: u16::from_le_bytes([sm[o + 0x82], sm[o + 0x83]]) };
+        }
+        // The chunk-info blocks.
+        for (cib, &addr) in nx.cib_addr.iter().enumerate() {
+            let b = read(addr, bs)?;
+            if !checksum_ok(&b) || u64a(&b, 8) != addr || u32a(&b, 24) != otype::PHYSICAL | 0x7 || u32a(&b, 0x20) != cib as u32 {
+                return Err(format!("chunk-info block {cib} at {addr:#x} is not valid"));
+            }
+            let first = cib * l.chunks_per_cib as usize;
+            let n = (l.chunks as usize - first).min(l.chunks_per_cib as usize);
+            if u32a(&b, 0x24) as usize != n {
+                return Err(format!("chunk-info block {cib} holds {} chunks, not {n}", u32a(&b, 0x24)));
+            }
+            for j in 0..n {
+                let (c, o) = (first + j, 0x28 + 32 * j);
+                let len = (l.blocks - c as u64 * l.blocks_per_chunk).min(l.blocks_per_chunk);
+                if u64a(&b, o + 8) != c as u64 * l.blocks_per_chunk || u64::from(u32a(&b, o + 16)) != len {
+                    return Err(format!("chunk {c}'s information names other blocks"));
+                }
+                nx.chunks.push(Chunk { xid: u64a(&b, o), free: u64::from(u32a(&b, o + 20)), bitmap_addr: u64a(&b, o + 24), bitmap: None, dirty: false });
+            }
+            nx.cib_xid.push(u64a(&b, 16));
+        }
+        if nx.chunks.iter().map(|c| c.free).sum::<u64>() != nx.sm_free {
+            return Err("the chunks' free counts do not add up to the space manager's".into());
+        }
+        let ipbm = read(l.ip_bm_base + u64::from(nx.ipbm_index), bs)?;
+        for (i, u) in nx.ip_used.iter_mut().enumerate() {
+            *u = ipbm[i / 8] & (1 << (i % 8)) != 0;
+        }
+        // The reaper.
+        nx.reaper = Reaper {
+            next_reap_id: u64a(&r, 0x20),
+            completed_id: u64a(&r, 0x28),
+            head: u64a(&r, 0x30),
+            tail: u64a(&r, 0x38),
+            flags: u32a(&r, 0x40),
+            rlcount: u32a(&r, 0x44),
+            ty: u32a(&r, 0x48),
+            size: u32a(&r, 0x4c),
+            fs_oid: u64a(&r, 0x50),
+            oid: u64a(&r, 0x58),
+            xid: u64a(&r, 0x60),
+            nrle_flags: u32a(&r, 0x68),
+        };
+        // What this writer would write back is the objects as they are.
+        let mut want = nx.spaceman_bytes();
+        set_checksum(&mut want);
+        if want != sm {
+            return Err("not implemented: a space manager holding state this writer does not keep".into());
+        }
+        let mut want = nx.reaper_bytes(ck_xid);
+        set_checksum(&mut want);
+        if want != r {
+            return Err("not implemented: a reaper holding state this writer does not keep".into());
+        }
+        // The object map and the volumes.
+        let omap = u64a(&sb_copy, 0xa0);
+        let root = u64a(&nx.phys_obj(omap)?.b, 0x30);
+        nx.omap = Omap { phys: omap, tree: Tree { root, shape: omap_shape(bs), cmp: btree::cmp_omap } };
+        for index in 0..nx.fs_oid.len() {
+            let oid = nx.fs_oid[index];
+            if oid == 0 {
+                continue;
+            }
+            let om = nx.omap;
+            let (mx, _, paddr) = nx.omap_find(Owner::Container, om, oid)?.ok_or_else(|| format!("volume {index}'s superblock {oid:#x} is not in the container's object map"))?;
+            let sb = read(paddr, bs)?;
+            if !checksum_ok(&sb) || u64a(&sb, 8) != oid || u32a(&sb, 24) & 0xffff != otype::FS || u32a(&sb, 0x24) != index as u32 {
+                return Err(format!("volume {index}'s superblock at {paddr:#x} is not valid"));
+            }
+            let vom = u64a(&sb, 0x80);
+            let vroot = u64a(&nx.phys_obj(vom)?.b, 0x30);
+            let (incompat, fs_flags) = (u64a(&sb, 0x38), u64a(&sb, 0x108));
+            let jobj_cmp: btree::Cmp = if incompat & 0x8 != 0 { btree::cmp_jobj_hashed } else { btree::cmp_jobj_plain };
+            nx.virt.insert((Owner::Container, oid), VObj { b: sb.clone(), mapped: Some((mx, paddr)), noheader: false });
+            let vol_omap = Omap { phys: vom, tree: Tree { root: vroot, shape: omap_shape(bs), cmp: btree::cmp_omap } };
+            let placeholder = Tree { root: 0, shape: jtree_shape(bs, true), cmp: btree::cmp_jobj_hashed };
+            nx.vols.insert(index, Vol { oid, omap: vol_omap, encrypted: fs_flags & APFS_FS_UNENCRYPTED == 0, secondary_key: incompat & 0x100 != 0, fs_tree: placeholder, extentref: placeholder, snapmeta: placeholder });
+            let (fs_root, extentref, snapmeta) = (u64a(&sb, 0x88), u64a(&sb, 0x90), u64a(&sb, 0x98));
+            nx.virt_load(Owner::Volume(index), fs_root)?;
+            let root_node = nx.virt[&(Owner::Volume(index), fs_root)].b.clone();
+            let fs_shape = nx.tree_shape(&root_node, &sb)?;
+            let root_node = nx.phys_obj(extentref)?.b.clone();
+            let er_shape = nx.tree_shape(&root_node, &sb)?;
+            let root_node = nx.phys_obj(snapmeta)?.b.clone();
+            let sm_shape = nx.tree_shape(&root_node, &sb)?;
+            let v = nx.vols.get_mut(&index).unwrap();
+            v.fs_tree = Tree { root: fs_root, shape: fs_shape, cmp: jobj_cmp };
+            v.extentref = Tree { root: extentref, shape: er_shape, cmp: btree::cmp_jobj_hashed };
+            v.snapmeta = Tree { root: snapmeta, shape: sm_shape, cmp: btree::cmp_jobj_hashed };
+        }
+        // The container keybag.
+        let (kpaddr, kn) = (u64a(&sb_copy, 0x510), u64a(&sb_copy, 0x518));
+        if kpaddr != 0 {
+            if kn != 1 {
+                return Err("not implemented: a container keybag of more than one block".into());
+            }
+            let b = read(kpaddr, bs)?;
+            if !checksum_ok(&b) || u32a(&b, 24) != OBJECT_TYPE_CONTAINER_KEYBAG || u16::from_le_bytes([b[0x20], b[0x21]]) != 2 {
+                return Err(format!("the container keybag at {kpaddr:#x} is not valid"));
+            }
+            let mut at = 0x30;
+            for _ in 0..u16::from_le_bytes([b[0x22], b[0x23]]) {
+                let len = u16::from_le_bytes([b[at + 18], b[at + 19]]) as usize;
+                let uuid: [u8; 16] = b[at..at + 16].try_into().unwrap();
+                nx.keybag.push((uuid, u16::from_le_bytes([b[at + 16], b[at + 17]]), b[at + 0x18..at + 0x18 + len].to_vec()));
+                at += (len + 0x18).div_ceil(16) * 16;
+            }
+            nx.keylocker = Some((kpaddr, kn));
+        }
+        nx.xid = ck_xid + 1;
+        Ok(nx)
+    }
+
+    /// A tree's shape as its root node's `btree_info_t` gives it: its
+    /// flags, node size and fixed key and value sizes; a hashed tree's
+    /// hashes the size of the volume's (superblock `sb`) integrity hash.
+    fn tree_shape(&mut self, root: &[u8], sb: &[u8]) -> Result<Shape, String> {
+        let i = super::node::Info::read(root);
+        if i.node_size as u64 != self.l.bs {
+            return Err(format!("not implemented: a tree of {}-byte nodes", i.node_size));
+        }
+        let hash_size = if i.flags & tree_flags::HASHED != 0 {
+            let im = u64a(sb, 0x400);
+            let owner = Owner::Volume(u32a(sb, 0x24) as usize);
+            let om = self.omap_of(owner)?;
+            let (_, _, paddr) = self.omap_find(owner, om, im)?.ok_or("a hashed tree's volume has no integrity metadata")?;
+            let mut b = vec![0u8; self.l.bs as usize];
+            self.sink.read_at(paddr * self.l.bs, &mut b)?;
+            crate::darwin::apfsread::HashType::of(u32a(&b, 0x28)).map_err(|e| e.to_string())?.size()
+        } else {
+            0
+        };
+        Ok(Shape { bt_flags: i.flags, node_size: i.node_size as usize, key_size: i.key_size as usize, val_size: i.val_size as usize, hash_size })
+    }
+
+    /// The newest mapping of virtual object `oid` in `owner`'s object map
+    /// `om` (`omap_get`): its transaction, its value's flags and its
+    /// address; none for an object it does not map, or maps deleted.
+    fn omap_find(&mut self, owner: Owner, om: Omap, oid: u64) -> Result<Option<(u64, u32, u64)>, String> {
+        let vol = match owner {
+            Owner::Volume(i) => Some(i),
+            Owner::Container => None,
+        };
+        let mut k = oid.to_le_bytes().to_vec();
+        k.extend_from_slice(&self.xid.to_le_bytes());
+        let found = om.tree.get_le(&mut PhysStore { nx: self, subtype: otype::OMAP_TREE_SUBTYPE, class: 2, vol }, &k)?;
+        let Some((key, Some(v))) = found else { return Ok(None) };
+        if u64a(&key, 0) != oid || u32a(&v, 0) & omap_val::DELETED != 0 {
+            return Ok(None);
+        }
+        Ok(Some((u64a(&key, 8), u32a(&v, 0), u64a(&v, 8))))
+    }
+
+    /// Virtual object `oid` of `owner` brought into the cache from its
+    /// object map's newest mapping, when it is not there: its block read
+    /// and, unless it is headerless, its header and checksum checked.
+    fn virt_load(&mut self, owner: Owner, oid: u64) -> Result<(), String> {
+        if self.virt.contains_key(&(owner, oid)) {
+            return Ok(());
+        }
+        let om = self.omap_of(owner)?;
+        let (mx, flags, paddr) = self.omap_find(owner, om, oid)?.ok_or_else(|| format!("virtual object {oid:#x} is not in its object map"))?;
+        let mut b = vec![0u8; self.l.bs as usize];
+        self.sink.read_at(paddr * self.l.bs, &mut b)?;
+        let noheader = flags & omap_val::NOHEADER != 0;
+        if !noheader && (!crate::darwin::apfsread::checksum_ok(&b) || u64a(&b, 8) != oid) {
+            return Err(format!("virtual object {oid:#x} at {paddr:#x} is not valid"));
+        }
+        self.virt.insert((owner, oid), VObj { b, mapped: Some((mx, paddr)), noheader });
+        Ok(())
+    }
+
     /// Inode `ino` of slot `vol` brought into the kernel: a vnode made for
     /// it (`vnode_create` → `insmntque`, at the head of the mount's list)
     /// unless it has one. When the vnodes counted reach `desiredvnodes`
@@ -2341,25 +2728,7 @@ impl<'a> Nx<'a> {
         for oid in self.eph_order.clone() {
             match oid {
                 OID_SPACEMAN => eph.push((otype::EPHEMERAL | 0x5, 0, OID_SPACEMAN, self.spaceman_bytes())),
-                OID_REAPER => {
-                    let r = self.reaper;
-                    let mut reaper = vec![0u8; bsz];
-                    put_header(&mut reaper, OID_REAPER, xid, otype::EPHEMERAL | 0x11, 0);
-                    reaper.put64(0x20, r.next_reap_id);
-                    reaper.put64(0x28, r.completed_id);
-                    reaper.put64(0x30, r.head);
-                    reaper.put64(0x38, r.tail);
-                    reaper.put32(0x40, r.flags);
-                    reaper.put32(0x44, r.rlcount);
-                    reaper.put32(0x48, r.ty);
-                    reaper.put32(0x4c, r.size);
-                    reaper.put64(0x50, r.fs_oid);
-                    reaper.put64(0x58, r.oid);
-                    reaper.put64(0x60, r.xid);
-                    reaper.put32(0x68, r.nrle_flags);
-                    reaper.put32(0x6c, bs as u32 - 0x70);
-                    eph.push((otype::EPHEMERAL | 0x11, 0, OID_REAPER, reaper));
-                }
+                OID_REAPER => eph.push((otype::EPHEMERAL | 0x11, 0, OID_REAPER, self.reaper_bytes(xid))),
                 oid if self.reap_lists.contains_key(&oid) => {
                     let mut b = self.reap_lists[&oid].clone();
                     let ty = otype::EPHEMERAL | OBJECT_TYPE_NX_REAP_LIST;
@@ -2488,6 +2857,29 @@ impl<'a> Nx<'a> {
         }
         self.rw_mounted = false;
         Ok(())
+    }
+
+    /// The reaper (`nx_reaper_phys_t`) as transaction `xid`'s checkpoint
+    /// writes it.
+    fn reaper_bytes(&self, xid: u64) -> Vec<u8> {
+        let r = self.reaper;
+        let bs = self.l.bs as usize;
+        let mut reaper = vec![0u8; bs];
+        put_header(&mut reaper, OID_REAPER, xid, otype::EPHEMERAL | 0x11, 0);
+        reaper.put64(0x20, r.next_reap_id);
+        reaper.put64(0x28, r.completed_id);
+        reaper.put64(0x30, r.head);
+        reaper.put64(0x38, r.tail);
+        reaper.put32(0x40, r.flags);
+        reaper.put32(0x44, r.rlcount);
+        reaper.put32(0x48, r.ty);
+        reaper.put32(0x4c, r.size);
+        reaper.put64(0x50, r.fs_oid);
+        reaper.put64(0x58, r.oid);
+        reaper.put64(0x60, r.xid);
+        reaper.put32(0x68, r.nrle_flags);
+        reaper.put32(0x6c, bs as u32 - 0x70);
+        reaper
     }
 
     fn spaceman_bytes(&self) -> Vec<u8> {
@@ -2987,9 +3379,7 @@ impl<'a> Nx<'a> {
     /// Virtual object `oid` of `owner`, changed in this transaction
     /// (`obj_dirty`).
     pub fn virt_mut(&mut self, owner: Owner, oid: u64) -> Result<&mut Vec<u8>, String> {
-        if !self.virt.contains_key(&(owner, oid)) {
-            return Err(format!("no virtual object {oid:#x}"));
-        }
+        self.virt_load(owner, oid)?;
         self.virt_modify(owner, oid);
         Ok(&mut self.virt.get_mut(&(owner, oid)).unwrap().b)
     }
@@ -3215,10 +3605,8 @@ pub struct VirtStore<'n, 'a> {
 
 impl Store for VirtStore<'_, '_> {
     fn get(&mut self, id: u64) -> Result<Node, String> {
-        if let Some(o) = self.nx.virt.get(&(self.owner, id)) {
-            return Ok(Node { b: o.b.clone() });
-        }
-        Err(format!("not implemented: reading virtual object {id:#x} through its object map"))
+        self.nx.virt_load(self.owner, id)?;
+        Ok(Node { b: self.nx.virt[&(self.owner, id)].b.clone() })
     }
     fn put(&mut self, id: u64, n: Node) -> Result<(), String> {
         self.nx.virt.get_mut(&(self.owner, id)).ok_or_else(|| format!("no virtual object {id:#x}"))?.b = n.b;
@@ -3587,5 +3975,239 @@ mod tests {
         let mut vols = vec![("System", 0x1u16, None), ("xART", 0x100, Some(10_485_760)), ("Hardware", 0x140, Some(6_291_456)), ("Preboot", 0x10, None), ("Update", 0xc0, None), ("Data", 0x40, None), ("User", 0x2, None)];
         vols.extend(["V8", "V9", "V10", "V11", "V12", "V13", "V14"].iter().map(|n| (*n, 0u16, None)));
         replay(&path, &vols);
+    }
+
+    /// A sparse medium in memory: 4 KiB pages, zero where none was
+    /// written.
+    #[derive(Default)]
+    pub(crate) struct Sparse(pub std::sync::Mutex<HashMap<u64, Vec<u8>>>, pub u64);
+
+    impl Sparse {
+        pub fn new(size: u64) -> Sparse {
+            Sparse(Default::default(), size)
+        }
+        /// Another medium holding the same bytes.
+        pub fn copy(&self) -> Sparse {
+            Sparse(std::sync::Mutex::new(self.0.lock().unwrap().clone()), self.1)
+        }
+        /// Its pages that are not all zero.
+        pub fn pages(&self) -> BTreeMap<u64, Vec<u8>> {
+            self.0.lock().unwrap().iter().filter(|(_, b)| b.iter().any(|&x| x != 0)).map(|(&k, v)| (k, v.clone())).collect()
+        }
+    }
+
+    impl crate::darwin::apfsread::Medium for Sparse {
+        fn size(&self) -> u64 {
+            self.1
+        }
+        fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<(), String> {
+            if off + buf.len() as u64 > self.1 {
+                return Err(format!("a read of {off}+{} past {}", buf.len(), self.1));
+            }
+            let g = self.0.lock().unwrap();
+            for (i, b) in buf.iter_mut().enumerate() {
+                let at = off + i as u64;
+                *b = g.get(&(at >> 12)).map_or(0, |p| p[(at & 0xfff) as usize]);
+            }
+            Ok(())
+        }
+    }
+
+    impl Sink for Sparse {
+        fn write_at(&self, off: u64, buf: &[u8]) -> Result<(), String> {
+            if off + buf.len() as u64 > self.1 {
+                return Err(format!("a write of {off}+{} past {}", buf.len(), self.1));
+            }
+            let mut g = self.0.lock().unwrap();
+            for (i, &b) in buf.iter().enumerate() {
+                let at = off + i as u64;
+                g.entry(at >> 12).or_insert_with(|| vec![0u8; 4096])[(at & 0xfff) as usize] = b;
+            }
+            Ok(())
+        }
+    }
+
+    /// A container the kernel unmounted cleanly, mounted again from what is
+    /// on its medium, is the container the kernel's own next mount has:
+    /// the same operations on it and on the kernel's in-memory one
+    /// (remounted, its counter from the newest checkpoint's copy) write
+    /// the same bytes. A container left mounted is refused.
+    #[test]
+    fn a_container_mounts_from_its_latest_checkpoint() {
+        use super::super::fsops;
+        let blocks = 15_625_000u64;
+        let sink = Sparse::new(blocks * 4096);
+        let uuid = *b"gex-mount-twins!";
+        let fm = super::super::container::format(&sink, 4096, blocks, uuid).unwrap();
+        let mut nx = Nx::formatted(&sink, &fm, uuid, Mode::Kernel).unwrap();
+        nx.set_barrier(true);
+        nx.mount_rw().unwrap();
+        let mut t = 1_800_000_000_000_000_000u64;
+        let mut now = move || {
+            t += 1000;
+            t
+        };
+        let kv = super::super::restore::key_os_version(super::super::restore::RESTORE_BUILD).unwrap();
+        let mut make = |nx: &mut Nx<'_>, name: &str, role: u16, encrypted: bool, now: &mut dyn FnMut() -> u64| {
+            let times = VolumeTimes { formatted: now(), root: now(), private: now(), modified: now() };
+            let o = nx.create_volume(&NewVolume { name: name.into(), role, encrypted, e_apfs: true, times, uid: 0, gid: 0, key_os_version: kv, size_bytes: None }).unwrap();
+            nx.commit().unwrap();
+            nx.fs_oid.iter().position(|&x| x == o).unwrap()
+        };
+        make(&mut nx, "System", 0x1, false, &mut now);
+        let pb = make(&mut nx, "Preboot", 0x10, false, &mut now);
+        make(&mut nx, "Data", 0x40, true, &mut now);
+        fsops::mount_rw(&mut nx, pb, &mut now).unwrap();
+        let d = fsops::mkdir(&mut nx, pb, 2, "cryptex1", 0o777, 0, 0, &mut now).unwrap().unwrap();
+        for i in 0..300 {
+            fsops::mkdir(&mut nx, pb, d, &format!("d{i}"), 0o755, 0, 0, &mut now).unwrap().unwrap();
+        }
+        fsops::unmount(&mut nx, pb, false, &mut now).unwrap();
+        nx.unmount().unwrap();
+        let twin = sink.copy();
+        // Left mounted (block 0 written by a read-write mount): refused.
+        {
+            let open = sink.copy();
+            let mut o = Nx::mounted(&open, Mode::Kernel).unwrap();
+            o.mount_rw().unwrap();
+            assert!(Nx::mounted(&open, Mode::Kernel).err().unwrap().contains("not cleanly unmounted"));
+        }
+        let mut m = Nx::mounted(&twin, Mode::Kernel).unwrap();
+        assert_eq!((m.xid, m.next_oid, m.fs_oid.clone(), m.counter), (nx.xid, nx.next_oid, nx.fs_oid.clone(), u64a(&nx.sb_copy, 0x3d8)));
+        assert_eq!(m.eph_order, nx.eph_order);
+        assert_eq!(m.keybag, nx.keybag);
+        assert_eq!(m.vols.keys().collect::<Vec<_>>(), nx.vols.keys().collect::<Vec<_>>());
+        for (i, v) in &nx.vols {
+            let w = &m.vols[i];
+            assert_eq!((w.oid, w.omap.phys, w.omap.tree.root, w.encrypted, w.secondary_key), (v.oid, v.omap.phys, v.omap.tree.root, v.encrypted, v.secondary_key));
+            for (a, b) in [(w.fs_tree, v.fs_tree), (w.extentref, v.extentref), (w.snapmeta, v.snapmeta)] {
+                assert_eq!((a.root, a.shape), (b.root, b.shape), "volume {i}'s trees");
+            }
+        }
+        m.set_barrier(true);
+        nx.remount(Mode::Kernel).unwrap();
+        m.mount_rw().unwrap();
+        let mut t2 = 1_900_000_000_000_000_000u64;
+        let mut now2 = move || {
+            t2 += 1000;
+            t2
+        };
+        let mut t3 = 1_900_000_000_000_000_000u64;
+        let mut now3 = move || {
+            t3 += 1000;
+            t3
+        };
+        for (x, now) in [(&mut nx, &mut now2 as &mut dyn FnMut() -> u64), (&mut m, &mut now3)] {
+            fsops::mount_rw(x, pb, now).unwrap();
+            let d = fsops::lookup(x, pb, 2, "cryptex1").unwrap().unwrap();
+            let c = fsops::mkdir(x, pb, d, "current", 0o777, 0, 0, now).unwrap().unwrap();
+            fsops::chmod(x, pb, c, 0o755, now).unwrap();
+            for i in 0..40 {
+                fsops::mkdir(x, pb, c, &format!("e{i}"), 0o700, 0, 0, now).unwrap().unwrap();
+            }
+            x.commit().unwrap();
+            fsops::unmount(x, pb, false, now).unwrap();
+            x.unmount().unwrap();
+        }
+        assert!(sink.pages() == twin.pages(), "the two containers differ");
+    }
+
+    /// A graft's range of a volume mounted read-write: the volume's next
+    /// object identifier taken and moved past it, and the range recorded
+    /// on the image file in three file-system owned attributes, all in one
+    /// file-system transaction that stays open (`fs_tx_leave`'s rule); once
+    /// committed, the reader finds them and the range they record is the
+    /// one `get_graft_jobj_range` takes back. A second range for the same
+    /// file (its attributes there) is not implemented; a range past the
+    /// identifiers is ERANGE with nothing changed.
+    #[test]
+    fn a_graft_range_is_taken_and_recorded() {
+        use super::super::fsops;
+        use crate::darwin::apfsread::{fs::XattrData, Container};
+        let blocks = 15_625_000u64;
+        let sink = std::sync::Arc::new(Sparse::new(blocks * 4096));
+        let uuid = *b"gex-graft-range!";
+        let fm = super::super::container::format(&*sink, 4096, blocks, uuid).unwrap();
+        let mut nx = Nx::formatted(&*sink, &fm, uuid, Mode::Kernel).unwrap();
+        nx.mount_rw().unwrap();
+        let mut t = 1_800_000_000_000_000_000u64;
+        let mut now = move || {
+            t += 1000;
+            t
+        };
+        let times = VolumeTimes { formatted: now(), root: now(), private: now(), modified: now() };
+        let o = nx.create_volume(&NewVolume { name: "Preboot".into(), role: 0x10, encrypted: false, e_apfs: true, times, uid: 0, gid: 0, key_os_version: 0, size_bytes: None }).unwrap();
+        nx.commit().unwrap();
+        let pb = nx.fs_oid.iter().position(|&x| x == o).unwrap();
+        fsops::mount_rw(&mut nx, pb, &mut now).unwrap();
+        let ino = fsops::create(&mut nx, pb, 2, "os.dmg", 0o666, 0, 0, &mut now).unwrap().unwrap();
+        let sub = fsops::mkdir(&mut nx, pb, 2, "sub", 0o755, 0, 0, &mut now).unwrap().unwrap();
+        let f = fsops::create(&mut nx, pb, sub, "f", 0o644, 0, 0, &mut now).unwrap().unwrap();
+        nx.commit().unwrap();
+        let q = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+        let sb0 = nx.vol_sb_read(pb).unwrap().0.to_vec();
+        let xid = nx.xid;
+        assert_eq!(fsops::allocate_graft_jobj_range(&mut nx, pb, ino, u64::MAX - 4, &mut now).unwrap(), Err(34));
+        assert_eq!(nx.vol_sb_read(pb).unwrap().0, &sb0[..], "ERANGE changes nothing");
+        let base = fsops::allocate_graft_jobj_range(&mut nx, pb, ino, 0x5000, &mut now).unwrap().unwrap();
+        let sb = nx.vol_sb_read(pb).unwrap().0.to_vec();
+        assert_eq!((base, q(&sb, 0xb0)), (q(&sb0, 0xb0), q(&sb0, 0xb0) + 0x5000));
+        assert_eq!((nx.xid, nx.in_tx), (xid, true), "the transaction stays open");
+        assert_eq!(q(&sb, 0x420), xid);
+        let rec = fsops::xattr_record(&mut nx, pb, ino, "com.apple.fs.graft-jobj-id-base").unwrap().unwrap();
+        assert_eq!(rec, [&6u16.to_le_bytes()[..], &8u16.to_le_bytes(), &base.to_le_bytes()].concat());
+        assert!(fsops::allocate_graft_jobj_range(&mut nx, pb, ino, 0x5000, &mut now).unwrap_err().contains("already has"));
+        nx.commit().unwrap();
+        let c = std::sync::Arc::new(Container::open(sink.clone()).unwrap());
+        let v = c.volume(pb).unwrap().unwrap();
+        let xs = v.xattrs(ino).unwrap();
+        assert_eq!(xs.iter().map(|x| (x.name.as_str(), x.flags)).collect::<Vec<_>>(), [("com.apple.fs.graft-jobj-id-base", 6), ("com.apple.fs.graft-jobj-id-len", 6), ("com.apple.fs.graft-vol-uuid", 6)]);
+        let get = |name: &str| xs.iter().find(|x| x.name == name).and_then(|x| match &x.data {
+            XattrData::Embedded(d) => Some(d.clone()),
+            _ => None,
+        });
+        let vol_uuid: [u8; 16] = sb[0xf0..0x100].try_into().unwrap();
+        let range = crate::darwin::graftfs::recorded_jobj_range(&get, &vol_uuid, q(&sb, 0xb0), &|_| None);
+        assert_eq!(range, Ok(Some((base, 0x5000))));
+        let crt = q(&fsops::inode(&mut nx, pb, ino).unwrap(), 0x10);
+        // Served live, the file shows no attribute: the file system owns
+        // them (APFS's getxattr answers ENOATTR, its listing skips them).
+        {
+            use crate::darwin::graftfs::{GraftFs, GraftMount};
+            use crate::vfs::{FileSystem, XattrOp};
+            let live = GraftMount(std::sync::Arc::new(GraftFs::live(v, "Preboot", 0x1000_0005)));
+            let mut buf = [0u8; 256];
+            assert_eq!(live.xattr("os.dmg", XattrOp::List { buf: &mut buf }), Ok(0));
+            assert_eq!(live.xattr("os.dmg", XattrOp::Get { name: "user.com.apple.fs.graft-vol-uuid", buf: &mut buf }), Err(crate::errno::Errno::ENODATA));
+            let md = live.metadata("os.dmg").unwrap();
+            assert_eq!(md.ino, ino);
+            // Its creation time is the inode's create_time.
+            assert_eq!(md.times.birth, Some(((crt / 1_000_000_000) as i64, (crt % 1_000_000_000) as u32)));
+            assert!(crt != 0);
+            // A bind mount of a directory: the same files below it.
+            let b = live.bound_subtree("sub").unwrap();
+            assert_eq!((b.metadata("").unwrap().ino, b.metadata("f").unwrap().ino), (sub, f));
+            assert_eq!(b.path_of_ino(f).as_deref(), Some("f"));
+            assert_eq!(b.path_of_ino(ino), None);
+            assert!(live.bound_subtree("os.dmg").is_none());
+        }
+    }
+
+    /// The restore's disk0 (GEX_TEST_DISK0: an image `gexc darwin-disk0`
+    /// made) mounts from its latest checkpoint, read only: each volume the
+    /// restore made, with its trees.
+    #[test]
+    fn the_restores_container_mounts() {
+        let Ok(path) = std::env::var("GEX_TEST_DISK0") else { return };
+        let f = std::fs::File::open(&path).unwrap();
+        let size = f.metadata().unwrap().len();
+        let disk = crate::darwin::apfswrite::HostFile(f, size);
+        let (base, psize) = crate::darwin::storage::partition_extent();
+        let part = crate::darwin::apfswrite::Window { sink: &disk, base, size: psize };
+        let nx = Nx::mounted(&part, Mode::Kernel).unwrap();
+        for v in [0usize, 1, 2, 3, 4, 5, 6] {
+            assert!(nx.vols.contains_key(&v), "volume {v}");
+        }
+        assert!(nx.keylocker.is_some());
     }
 }

@@ -32,12 +32,44 @@ const VNODE_IOSIZE: u32 = 4096;
 /// `f_fssubtype`. Measured on the same volume.
 pub const APFS_FSSUBTYPE: u32 = 1;
 
-/// The volume capabilities an APFS volume reports
-/// (`ATTR_VOL_CAPABILITIES` before XNU adds its own), measured on a Mac's
-/// APFS and cut to the bits `sys/attr.h` of this kernel defines (the
-/// newer release's APFS sets two more interface bits, which an iPadOS 17
-/// kernel does not name).
-pub const APFS_CAPS: VolCaps = VolCaps { capabilities: [0x039b_6edf, 0x00ad_6fc7, 0, 0], valid: [0x07ff_ffff, 0x007f_ffff, 0, 0] };
+/// What of a volume's superblock `apfs_vfsop_getattr` makes its
+/// capabilities of: its role, incompatible and read-only-compatible
+/// features, `apfs_fs_flags`, and whether it has a volume group
+/// (`apfs_volume_group_id` not null).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CapsFacts {
+    pub role: u16,
+    pub incompat: u64,
+    pub ro_compat: u64,
+    pub fs_flags: u64,
+    pub grouped: bool,
+}
+
+/// The volume capabilities `apfs_vfsop_getattr` gives a mount
+/// (`f_capabilities`, 0xfffffff0066c9b3c..0xfffffff0066c9be0), before
+/// XNU adds its own: the format word 0x009b6fdf with, flipped in,
+/// `VOL_CAP_FMT_VOL_GROUPS` for a System or Data volume in a volume group,
+/// `VOL_CAP_FMT_CASE_SENSITIVE` for a case-insensitive one (so cleared),
+/// `VOL_CAP_FMT_SEALED` for a sealed one (`APFS_INCOMPAT_SEALED_VOLUME`)
+/// and `VOL_CAP_FMT_CLONE_MAPPING` for one with read-only-compatible
+/// feature 0x4; the interfaces word 0x2d63c2, with
+/// `VOL_CAP_INT_ATTRIBUTION_TAG` for `apfs_fs_flags` 0x800 and
+/// `VOL_CAP_INT_SNAPSHOT` but on a snapshot's mount (whose APFS mount
+/// names its live volume's at +0x138, `handle_snapshot_mount`
+/// 0xfffffff0066ccb14); every format bit to 0x04000000 and every
+/// interface bit to 0x00400000 valid.
+pub fn apfs_caps(f: &CapsFacts, snapshot_mount: bool) -> VolCaps {
+    let groups = u32::from(f.grouped && (f.role == 0x40 || f.role == 0x1)) << 24;
+    let fmt = groups | (f.incompat as u32 & 1) << 8 | ((f.incompat as u32 >> 5) & 1) << 25 | ((f.ro_compat as u32 >> 2) & 1) << 26;
+    let mut int = 0x002d_63c2;
+    if f.fs_flags & 0x800 != 0 {
+        int |= 0x0040_0000;
+    }
+    if !snapshot_mount {
+        int |= 0x0002_0000;
+    }
+    VolCaps { capabilities: [fmt ^ 0x009b_6fdf, int, 0, 0], valid: [0x07ff_ffff, 0x007f_ffff, 0, 0] }
+}
 
 /// `f_attributes` of APFS, measured: what a volume can return
 /// (`validattr`) and what it keeps itself (`nativeattr`), cut to this
@@ -142,7 +174,9 @@ fn vnode(pio: &PathIo<'_>, path: &str, md: &Metadata, name: Option<&str>, want_c
         }
     };
     let t = |s: i64, ns: u32| (s, i64::from(ns));
-    let birth = t(st.mtime, st.mtime_ns);
+    // ATTR_CMN_CRTIME: the creation time `vn_stat` gives too, 0 where
+    // the filesystem keeps none.
+    let birth = st.birth.map_or((0, 0), |(s, ns)| t(s, ns));
     let owned = if want_owner { super::vattr::get_on(pio.ns, mnt, path, md, None)? } else { super::vattr::Owned { uid: 0, gid: 0, mode: md.mode & 0o7777, flags: 0 } };
     let (data_alloc, rdev) = match md.file_type {
         FileType::Regular => (roundup(md.size, u64::from(vfsstat::BSIZE)), 0),
@@ -269,10 +303,24 @@ fn volume_uuid(mnt: &Mount) -> [u8; 16] {
 
 /// The volume `mnt` as `getvolattrlist` has it, its root's owner read
 /// when `want_owner`.
-fn volume(pio: &PathIo<'_>, mnt: &'static Mount, want_owner: bool) -> Result<VolInfo, Errno> {
+fn volume(pio: &PathIo<'_>, mnt: &'static Mount, want_owner: bool, want_caps: bool) -> Result<VolInfo, Errno> {
     if mnt.fs == super::kern::Fs::Devfs {
         return devfs_volume(pio, mnt);
     }
+    // The capabilities, of the volume's superblock as the kernel holds it
+    // (super::disknode::caps_facts), when they are asked for.
+    let caps = if want_caps {
+        let index = super::kern::mount_volume(mnt).ok_or(Errno::EIO)?;
+        match super::disknode::caps_facts(index) {
+            Ok(f) => apfs_caps(&f, matches!(mnt.from, super::kern::From::Snapshot(_))),
+            Err(why) => {
+                super::note_unimplemented(format!("the capabilities of the volume mounted on {} (apfs_vfsop_getattr's f_capabilities, of its superblock): {why}", mnt.on));
+                return Err(Errno::EIO);
+            }
+        }
+    } else {
+        VolCaps::default()
+    };
     let md = pio.ns.metadata(mnt.on)?;
     let root = vnode(pio, mnt.on, &md, None, false, want_owner, Some(mnt))?;
     let from = super::kern::mount_from(mnt);
@@ -289,7 +337,7 @@ fn volume(pio: &PathIo<'_>, mnt: &'static Mount, want_owner: bool) -> Result<Vol
         bfree: counts.bfree,
         bavail: counts.bavail,
         fssubtype: APFS_FSSUBTYPE,
-        caps: APFS_CAPS,
+        caps,
         attributes: apfs_attributes(),
         uuid: volume_uuid(mnt),
         // `f_maxobjcount`, as APFS says it: no limit.
@@ -851,7 +899,7 @@ impl Kernel {
                 return (Err(Errno::EINVAL), missing);
             }
             let mnt = on.unwrap_or_else(|| mount_of(path));
-            let r = volume(pio, mnt, want_owner).and_then(|mut vi| {
+            let r = volume(pio, mnt, want_owner, alist.set.vol & vol::CAPABILITIES != 0).and_then(|mut vi| {
                 if want_access {
                     vi.root.user_access = self.darwin_user_access(mnt.on, &vi.root);
                 }
@@ -1028,7 +1076,30 @@ mod tests {
         assert_eq!(valid.vol & VOL_UNSUPPORTED, 0);
         assert_eq!(valid.fork & ext::PRIVATESIZE, 0);
         assert_eq!(native.file, 0x62f);
-        assert_eq!(APFS_CAPS.valid[1] & !0x007f_ffff, 0);
+    }
+
+    /// The traced words: a Mac's sealed, grouped, case-insensitive System
+    /// volume gives the format word measured there (0x039b6edf); this
+    /// kernel's volumes, case-sensitive: the sealed System snapshot root,
+    /// unsealed Preboot and xART mounted live, Data with clone mapping and
+    /// attribution tags.
+    #[test]
+    fn apfs_gives_each_volume_its_capabilities() {
+        let f = |role, incompat, ro_compat, fs_flags, grouped| CapsFacts { role, incompat, ro_compat, fs_flags, grouped };
+        assert_eq!(apfs_caps(&f(0x1, 0x21, 0, 1, true), true).capabilities[0], 0x039b_6edf);
+        let system = apfs_caps(&f(0x1, 0x28, 0, 1, false), true);
+        assert_eq!(system.capabilities, [0x029b_6fdf, 0x002d_63c2, 0, 0]);
+        assert_eq!(system.valid, [0x07ff_ffff, 0x007f_ffff, 0, 0]);
+        let sealed = 0x0200_0000;
+        for role in [0x10u16, 0x100] {
+            let c = apfs_caps(&f(role, 0x8, 0, 1, false), false);
+            assert_eq!(c.capabilities[0] & sealed, 0, "role {role:#x}");
+            assert_eq!(c.capabilities[1], 0x002f_63c2);
+        }
+        let data = apfs_caps(&f(0x40, 0x248, 0xc, 0x800, false), false);
+        assert_eq!(data.capabilities, [0x049b_6fdf, 0x006f_63c2, 0, 0]);
+        assert_eq!(apfs_caps(&f(0x40, 0x248, 0xc, 0x800, true), false).capabilities[0], 0x059b_6fdf);
+        assert_eq!(apfs_caps(&f(0x10, 0x8, 0, 1, true), false).capabilities[0] & 0x0100_0000, 0, "volume groups are System's and Data's");
     }
 
     #[test]

@@ -201,12 +201,17 @@ pub fn va_flags(bsd_flags: u32) -> u32 {
 /// 0xfffffff00668de64..0xfffffff00668de88 and 0xfffffff00668e270) and the
 /// graft's device.
 ///
-/// Or (`live`) a volume of disk0's container mounted at run time, served
-/// at its mount point as the disk0 image holds it: its own object
+/// Or (`live`) a volume of disk0's container (Preboot, xART), served at
+/// its mount point as the disk0 image holds it: its own object
 /// identifiers as its inode numbers (`base` 0, its root 2 and the root's
 /// parent 1, as `apfs_vnop_getattr`'s `va_fileid` gives them), and its
-/// mount's device. Its files can be read; a change to them would be
-/// written to the disk, which is not modelled.
+/// mount's device, read through the checkpoint the image had when it was
+/// mounted. The writes the kernel makes to it are the kernel's
+/// container's ([`super::disknode`]): a writing mount's, and a graft's
+/// range and the attributes recording it, none of which changes what this
+/// view reads (the volume superblock and file-system owned attributes,
+/// which no attribute call sees); a change to its files through a file
+/// call is not routed there and is reported.
 pub struct GraftFs {
     pub vol: Volume,
     /// The first of the host volume's object identifiers the graft holds
@@ -246,9 +251,36 @@ impl GraftFs {
                 Errno::EROFS
             }
             Some(name) => {
-                super::note_unimplemented(format!("{change} on the {name} volume: a change to a volume mounted at run time, whose files are read from the disk0 image, is not modelled"));
+                super::note_unimplemented(format!("{change} on the {name} volume: a change to its files through a file call, written to the kernel's container in the disk0 image and read back by this view, is not implemented"));
                 Errno::EIO
             }
+        }
+    }
+
+    /// What of path `rel` (its path below the root; `listing` a listing
+    /// of it) the disk0 image does not hold because the restore step that
+    /// writes there is missing from it: on the Preboot volume, what is in
+    /// the firmware directory install_fud fills
+    /// (`<nsih>/usr/standalone/firmware`) when the image lacks that step.
+    fn unwritten(&self, rel: &str, listing: bool) -> Option<String> {
+        use super::apfswrite::restore::{nsih, INSTALL_FUD_MISSING};
+        if self.live != Some("Preboot") || !super::disknode::lacks(INSTALL_FUD_MISSING) {
+            return None;
+        }
+        let fw = format!("{}/usr/standalone/firmware", nsih());
+        let rel = rel.trim_matches('/');
+        let below = rel.strip_prefix(fw.as_str()).is_some_and(|r| r.starts_with('/'));
+        (below || (listing && rel == fw)).then(|| format!("{rel} on the Preboot volume, which the disk0 image does not hold as the restore leaves it: the image lacks {INSTALL_FUD_MISSING}"))
+    }
+
+    /// [`GraftFs::unwritten`], reported: EIO.
+    fn check_written(&self, rel: &str, listing: bool) -> Result<(), Errno> {
+        match self.unwritten(rel, listing) {
+            Some(why) => {
+                super::note_unimplemented(why);
+                Err(Errno::EIO)
+            }
+            None => Ok(()),
         }
     }
 
@@ -357,6 +389,7 @@ impl GraftFs {
         let (m, mn) = t(ino.mod_time);
         let (a, an) = t(ino.access_time);
         let (c, cn) = t(ino.change_time);
+        let birth = Some(t(ino.create_time));
         Ok(Metadata {
             file_type,
             size,
@@ -366,7 +399,7 @@ impl GraftFs {
             nlink,
             rdev: 0,
             dev: 0,
-            times: Times { mtime_ns: mn, atime: a, atime_ns: an, ctime: c, ctime_ns: cn },
+            times: Times { mtime_ns: mn, atime: a, atime_ns: an, ctime: c, ctime_ns: cn, birth },
         })
     }
 
@@ -376,12 +409,14 @@ impl GraftFs {
         super::vattr::Owned { uid: ino.owner, gid: ino.group, mode: u32::from(ino.mode) & 0o7777, flags: va_flags(ino.bsd_flags) }
     }
 
-    /// An inode's extended attributes a caller sees: decmpfs hides a
-    /// compressed file's own (`decmpfs_hides_xattr`: `com.apple.decmpfs`
+    /// An inode's extended attributes a caller sees: none the file system
+    /// owns (`XATTR_FILE_SYSTEM_OWNED`: APFS's getxattr answers ENOATTR for
+    /// one, 0xfffffff0067657f8, and its listing skips it), and decmpfs hides
+    /// a compressed file's own (`decmpfs_hides_xattr`: `com.apple.decmpfs`
     /// and the resource fork).
     fn visible_xattrs(&self, ino: &afs::Inode) -> Result<Vec<afs::Xattr>, Errno> {
         let all = self.vol.xattrs(ino.oid).map_err(|e| errno_of(&e, "listxattr", &self.place()))?;
-        Ok(all.into_iter().filter(|x| !(ino.compressed() && (x.name == afs::DECMPFS_XATTR_NAME || x.name == afs::RESOURCEFORK_NAME))).collect())
+        Ok(all.into_iter().filter(|x| x.flags & XATTR_FILE_SYSTEM_OWNED == 0 && !(ino.compressed() && (x.name == afs::DECMPFS_XATTR_NAME || x.name == afs::RESOURCEFORK_NAME))).collect())
     }
 
     fn xattr_op(&self, ino: &afs::Inode, op: XattrOp<'_>) -> Result<usize, Errno> {
@@ -575,6 +610,7 @@ impl FileSystem for GraftMount {
         "apfs"
     }
     fn open(&self, path: &str, flags: u64, _mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
+        self.0.check_written(path, true)?;
         if flags & crate::fs::oflags::O_CREAT != 0 || crate::vfs::writes(flags) {
             let ino = self.0.resolve(path, true);
             if ino.is_err() && flags & crate::fs::oflags::O_CREAT == 0 {
@@ -601,14 +637,17 @@ impl FileSystem for GraftMount {
         Ok(Arc::new(GraftHandle { fs: Arc::clone(&self.0), ino }))
     }
     fn metadata(&self, path: &str) -> Result<Metadata, Errno> {
+        self.0.check_written(path, false)?;
         let ino = self.0.resolve(path, true)?;
         self.0.metadata_of(&ino)
     }
     fn metadata_nofollow(&self, path: &str) -> Result<Metadata, Errno> {
+        self.0.check_written(path, false)?;
         let ino = self.0.resolve(path, false)?;
         self.0.metadata_of(&ino)
     }
     fn read_link(&self, path: &str) -> Result<String, Errno> {
+        self.0.check_written(path, false)?;
         let ino = self.0.resolve(path, false)?;
         if ino.kind() != afs::mode::S_IFLNK {
             return Err(Errno::EINVAL);
@@ -616,6 +655,7 @@ impl FileSystem for GraftMount {
         self.0.vol.symlink_target(&ino).map_err(|e| errno_of(&e, "readlink", &self.0.place()))
     }
     fn xattr(&self, path: &str, op: XattrOp<'_>) -> Result<usize, Errno> {
+        self.0.check_written(path, false)?;
         let ino = self.0.resolve(path, false)?;
         self.0.xattr_op(&ino, op)
     }
@@ -631,6 +671,73 @@ impl FileSystem for GraftMount {
         let oid = self.0.oid_of(ino)?;
         let p = self.0.vol.path_of(oid).ok().flatten()?;
         Some(p.trim_start_matches('/').to_string())
+    }
+    /// A bind mount of directory `rel` (bindfs): its files as this volume
+    /// serves them ([`GraftSub`]).
+    fn bound_subtree(&self, rel: &str) -> Option<Arc<dyn FileSystem>> {
+        let rel = rel.trim_matches('/');
+        let ino = self.0.resolve(rel, true).ok()?;
+        ino.is_dir().then(|| Arc::new(GraftSub { fs: GraftMount(Arc::clone(&self.0)), prefix: rel.to_string() }) as Arc<dyn FileSystem>)
+    }
+}
+
+/// The files below directory `prefix` of a volume a [`GraftFs`] serves,
+/// as a bind mount of that directory shows them (bindfs passes each call
+/// to the vnode below it): the same files, inode numbers and attributes,
+/// and what the volume reports of them reported the same way.
+pub struct GraftSub {
+    fs: GraftMount,
+    prefix: String,
+}
+
+impl GraftSub {
+    fn at(&self, path: &str) -> String {
+        let path = path.trim_matches('/');
+        match (self.prefix.as_str(), path) {
+            ("", p) => p.to_string(),
+            (pre, "") => pre.to_string(),
+            (pre, p) => format!("{pre}/{p}"),
+        }
+    }
+}
+
+impl FileSystem for GraftSub {
+    fn fs_type(&self) -> &'static str {
+        self.fs.fs_type()
+    }
+    fn bound_subtree(&self, rel: &str) -> Option<Arc<dyn FileSystem>> {
+        self.fs.bound_subtree(&self.at(rel))
+    }
+    fn open(&self, path: &str, flags: u64, mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
+        self.fs.open(&self.at(path), flags, mode)
+    }
+    fn metadata(&self, path: &str) -> Result<Metadata, Errno> {
+        self.fs.metadata(&self.at(path))
+    }
+    fn metadata_nofollow(&self, path: &str) -> Result<Metadata, Errno> {
+        self.fs.metadata_nofollow(&self.at(path))
+    }
+    fn read_link(&self, path: &str) -> Result<String, Errno> {
+        self.fs.read_link(&self.at(path))
+    }
+    fn xattr(&self, path: &str, op: XattrOp<'_>) -> Result<usize, Errno> {
+        self.fs.xattr(&self.at(path), op)
+    }
+    fn chmod(&self, path: &str, mode: u32) -> Result<(), Errno> {
+        self.fs.chmod(&self.at(path), mode)
+    }
+    fn set_mtime(&self, path: &str, secs: i64) -> Result<(), Errno> {
+        self.fs.set_mtime(&self.at(path), secs)
+    }
+    fn path_of_ino(&self, ino: u64) -> Option<String> {
+        let p = self.fs.path_of_ino(ino)?;
+        if self.prefix.is_empty() {
+            return Some(p);
+        }
+        if p == self.prefix {
+            return Some(String::new());
+        }
+        p.strip_prefix(&format!("{}/", self.prefix)).map(str::to_string)
     }
 }
 
@@ -727,6 +834,9 @@ pub mod graft_xattr {
     pub const JOBJ_ID_BASE: &str = "com.apple.fs.graft-jobj-id-base";
     pub const JOBJ_ID_LEN: &str = "com.apple.fs.graft-jobj-id-len";
 }
+
+/// `XATTR_FILE_SYSTEM_OWNED`.
+const XATTR_FILE_SYSTEM_OWNED: u16 = 4;
 
 /// The values `write_graft_file_xattrs` adds, in its order.
 pub fn graft_file_xattrs(host_uuid: [u8; 16], base: u64, len: u64) -> [(&'static str, Vec<u8>); 3] {

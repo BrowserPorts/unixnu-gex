@@ -295,7 +295,8 @@ pub struct Metadata {
     pub times: Times,
 }
 
-/// `st_atim`, `st_ctim` and the nanoseconds of `st_mtim`.
+/// `st_atim`, `st_ctim` and the nanoseconds of `st_mtim`, and the
+/// creation time where the filesystem keeps one.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Times {
     pub mtime_ns: u32,
@@ -303,6 +304,11 @@ pub struct Times {
     pub atime_ns: u32,
     pub ctime: i64,
     pub ctime_ns: u32,
+    /// When the file was made (seconds, nanoseconds), as its filesystem
+    /// records it (Darwin's `va_create_time`: an APFS inode's
+    /// `create_time`, a host file's own birth time); none for a
+    /// filesystem that keeps none.
+    pub birth: Option<(i64, u32)>,
 }
 
 impl Metadata {

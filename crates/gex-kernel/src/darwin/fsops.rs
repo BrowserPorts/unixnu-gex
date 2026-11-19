@@ -667,6 +667,17 @@ impl Kernel {
                 });
             }
         };
+        // A writing mount's own writes, inside apfs_vfsop_mount: the
+        // container's update to read-write, then the volume's mount
+        // (super::disknode::mount_rw), on the kernel's container in the
+        // disk0 image.
+        if mounted.flags & MNT_RDONLY as u32 == 0 {
+            if let Err(why) = super::disknode::mount_rw(mounted.volume) {
+                self.darwin_unimplemented(format!("mounting {fstype} from {given} on {at} read-write: {why}"));
+                self.darwin_mount_close(node.minor, &given);
+                return Err(Errno::EIO);
+            }
+        }
         // mac_mount_check_mount_late: Sandbox's (0xfffffff0069fa500), for a
         // writable mount with a mount point and the sync roots not loaded
         // yet, looks up /private/var and asks APFS its volume's role
@@ -685,24 +696,12 @@ impl Kernel {
             self.darwin_mount_close(node.minor, &given);
             return Err(Errno::EIO);
         }
-        // The volume's files: the Preboot volume's as the restore left
-        // them (super::preboot); the xART volume's as the disk0 image holds
-        // them (super::graftfs::GraftFs::live, read through the image's
-        // latest checkpoint, its inode numbers its own, on this mount's
-        // device); no other volume's are modelled, and a path below its
-        // mount is reported (kern::unmodelled_files_at).
+        // The volume's files: the Preboot and xART volumes' as the disk0
+        // image holds them (super::graftfs::GraftFs::live, read through the
+        // image's latest checkpoint, its inode numbers its own, on this
+        // mount's device); no other volume's are modelled, and a path below
+        // its mount is reported (kern::unmodelled_files_at).
         let files: Option<std::sync::Arc<dyn crate::vfs::FileSystem>> = match super::storage::volume(mounted.volume) {
-            Some(v) if v.role == super::storage::role::PREBOOT => {
-                let made = super::preboot::volume(&|p| self.darwin_system_file(p));
-                match made {
-                    Ok(fs) => Some(fs as std::sync::Arc<dyn crate::vfs::FileSystem>),
-                    Err(why) => {
-                        self.darwin_unimplemented(why);
-                        self.darwin_mount_close(node.minor, &given);
-                        return Err(Errno::EIO);
-                    }
-                }
-            }
             Some(v) if super::kern::served_from_disk0(v.role) => match super::disknode::volume(mounted.volume) {
                 Ok(vol) => Some(std::sync::Arc::new(super::graftfs::GraftMount(std::sync::Arc::new(super::graftfs::GraftFs::live(vol, v.name, mounted.fsid0)))) as std::sync::Arc<dyn crate::vfs::FileSystem>),
                 Err(why) => {
@@ -734,19 +733,6 @@ impl Kernel {
         // build, whose configuration has no CONFIG_KDP_INTERACTIVE_DEBUGGING):
         // no kernel core file is opened.
         Ok(0)
-    }
-
-    /// A file of the system volume at `path`, its bytes and attributes,
-    /// as `copyfile` reads them; `None` when the volume has none there.
-    pub(crate) fn darwin_system_file(&self, path: &str) -> Result<Option<(Vec<u8>, super::vattr::Owned)>, String> {
-        let md = match self.vfs.metadata(path) {
-            Ok(md) => md,
-            Err(crate::errno::Errno::ENOENT) => return Ok(None),
-            Err(e) => return Err(format!("{path}: {e:?}")),
-        };
-        let owned = super::vattr::of(&self.vfs, path, &md, None)?;
-        let bytes = self.read_file(path).ok_or_else(|| format!("{path}: not readable"))?;
-        Ok(Some((bytes, owned)))
     }
 
     /// mount_common's failure after the device's open: VNOP_CLOSE of the

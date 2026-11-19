@@ -135,8 +135,138 @@ pub fn installed() -> bool {
     DISK.get().is_some()
 }
 
+/// Whether the image served lacks restore step `step` (as its build named
+/// it in what it reported missing).
+pub fn lacks(step: &str) -> bool {
+    DISK.get().is_some_and(|d| d.missing.iter().any(|m| m == step))
+}
+
+/// The kernel's APFS container on the image (`nx_mount`'s state: its
+/// object cache, space manager and open transaction), the writer the
+/// restore model writes with ([`super::apfswrite::tx::Nx`]): mounted from
+/// the image's latest checkpoint the first time the kernel needs its
+/// state, kept for the system's life. Its writes go to the image as the
+/// kernel's reach the device (block 0 at its read-write update, a
+/// checkpoint when a transaction commits); what a file-system call changes
+/// stays in the open transaction until a sync, an unmount or the
+/// transaction's own close rule commits it, as on internal storage nothing
+/// commits on a timer.
+static KERNEL_NX: Mutex<Option<super::apfswrite::tx::Nx<'static>>> = Mutex::new(None);
+
+/// `f` on the kernel's container, mounted first when it is not.
+fn with_container<R>(f: impl FnOnce(&mut super::apfswrite::tx::Nx<'static>) -> Result<R, String>) -> Result<R, String> {
+    use super::apfswrite::tx::{Mode, Nx};
+    let d = DISK.get().ok_or("no disk0 image (GEX_DARWIN_DISK0)")?;
+    let mut g = KERNEL_NX.lock().unwrap_or_else(|e| e.into_inner());
+    if g.is_none() {
+        let (base, size) = storage::partition_extent();
+        let part: &'static PartMedium = Box::leak(Box::new(PartMedium(Arc::clone(&d.sink), base, size)));
+        let mut nx = Nx::mounted(part, Mode::Kernel).map_err(|e| format!("the kernel's mount of the container in the disk0 image: {e}"))?;
+        // The device's DK_FEATURE_BARRIER and DKIOCISSOLIDSTATE answers.
+        nx.set_barrier(super::storagestack::container_barrier());
+        nx.set_solid_state(super::storagestack::container_solid_state());
+        *g = Some(nx);
+    }
+    let nx = g.as_mut().expect("mounted above");
+    let xid = nx.xid;
+    let r = f(nx);
+    if nx.xid != xid {
+        // The volumes served from the image read the checkpoint they were
+        // mounted at (super::graftfs::GraftFs::live); once a later one is
+        // written, blocks that one freed can be given out again.
+        super::note_unimplemented(format!("the kernel's container committed transaction {xid:#x}: the views of the volumes served from the disk0 image read the checkpoint they were mounted at, and moving them to the newer one is not implemented"));
+    }
+    r
+}
+
+/// The kernel's clock as APFS reads it (`nanotime`): nanoseconds since
+/// 1970.
+fn nanotime() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+}
+
+/// A writing mount of the volume in slot `index` (`apfs_vfsop_mount`):
+/// the container updated to read-write when it is not yet
+/// (`nx_rw_update`'s `nx_ro_to_rw`: block 0 rewritten, the allocation
+/// zones and cursors set up, [`super::apfswrite::tx::Nx::mount_rw`]), then
+/// the volume's read-write mount and the writes it makes
+/// ([`super::apfswrite::fsops::mount_rw`]).
+pub fn mount_rw(index: u32) -> Result<(), String> {
+    with_container(|nx| {
+        nx.mount_rw()?;
+        super::apfswrite::fsops::mount_rw(nx, index as usize, &mut nanotime)
+    })
+}
+
+/// Whether the kernel's container holds the volume in slot `index`
+/// mounted read-write.
+pub fn holds_rw(index: u32) -> bool {
+    KERNEL_NX.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|nx| nx.mounted.contains(&(index as usize)))
+}
+
+/// What of the volume in slot `index`'s superblock, as the kernel holds
+/// it, `apfs_vfsop_getattr` makes its capabilities of.
+pub fn caps_facts(index: u32) -> Result<super::attrcall::CapsFacts, String> {
+    with_container(|nx| {
+        let (sb, _) = nx.vol_sb_read(index as usize)?;
+        let q = |o: usize| u64::from_le_bytes(sb[o..o + 8].try_into().unwrap());
+        Ok(super::attrcall::CapsFacts { role: u16::from_le_bytes([sb[0x3c4], sb[0x3c5]]), incompat: q(0x38), ro_compat: q(0x30), fs_flags: q(0x108), grouped: sb[0x3f0..0x400].iter().any(|&b| b != 0) })
+    })
+}
+
+/// The volume in slot `index` as the kernel holds it: its next object
+/// identifier (`apfs_next_obj_id`) and its UUID.
+pub fn volume_ids(index: u32) -> Result<(u64, [u8; 16]), String> {
+    with_container(|nx| {
+        let (sb, _) = nx.vol_sb_read(index as usize)?;
+        Ok((u64::from_le_bytes(sb[0xb0..0xb8].try_into().unwrap()), sb[0xf0..0x100].try_into().unwrap()))
+    })
+}
+
+/// The value of attribute `name` of object `ino` on the volume in slot
+/// `index` as the kernel holds it, file-system owned or not; none when
+/// the object has no such record. A value kept in a data stream is not
+/// read here (reported).
+pub fn xattr(index: u32, ino: u64, name: &str) -> Result<Option<Vec<u8>>, String> {
+    with_container(|nx| {
+        let Some(v) = super::apfswrite::fsops::xattr_record(nx, index as usize, ino, name)? else { return Ok(None) };
+        let flags = u16::from_le_bytes([v[0], v[1]]);
+        if flags & 2 == 0 {
+            return Err(format!("not implemented: attribute {name} of object {ino:#x}, kept in a data stream"));
+        }
+        let len = u16::from_le_bytes([v[2], v[3]]) as usize;
+        v.get(4..4 + len).map(<[u8]>::to_vec).map(Some).ok_or_else(|| format!("attribute {name} of object {ino:#x}: a record shorter than its length"))
+    })
+}
+
+/// `apfs_lookup_ge_jobj_id`: the least object identifier at or above
+/// `from` that a record of the volume in slot `index`'s file-system tree
+/// is keyed by, if any.
+pub fn jobj_at_or_above(index: u32, from: u64) -> Result<Option<u64>, String> {
+    with_container(|nx| {
+        let (t, mut st) = nx.fs_tree(index as usize)?;
+        Ok(t.get_gt(&mut st, &from.to_le_bytes())?.map(|(k, _)| u64::from_le_bytes(k[..8].try_into().unwrap()) & 0x0fff_ffff_ffff_ffff))
+    })
+}
+
+/// `allocate_graft_jobj_range` on the volume in slot `index`, mounted
+/// read-write, for image file `ino`'s graft of a volume whose next object
+/// identifier is `len` ([`super::apfswrite::fsops::allocate_graft_jobj_range`]).
+pub fn allocate_graft_jobj_range(index: u32, ino: u64, len: u64) -> Result<Result<u64, i32>, String> {
+    with_container(|nx| super::apfswrite::fsops::allocate_graft_jobj_range(nx, index as usize, ino, len, &mut nanotime))
+}
+
 /// The partition's bytes as a medium of their own.
 struct PartMedium(Arc<dyn Sink>, u64, u64);
+
+impl Sink for PartMedium {
+    fn write_at(&self, off: u64, buf: &[u8]) -> Result<(), String> {
+        if off + buf.len() as u64 > self.2 {
+            return Err(format!("a write of {off}+{} past the partition's {} bytes", buf.len(), self.2));
+        }
+        self.0.write_at(self.1 + off, buf)
+    }
+}
 
 impl super::apfsread::Medium for PartMedium {
     fn size(&self) -> u64 {

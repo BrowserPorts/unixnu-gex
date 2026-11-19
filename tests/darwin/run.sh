@@ -5,9 +5,10 @@
 # With program names, only those run; without, all of them.
 #
 # A dynamic program needs a Darwin root (GEX_DARWIN_ROOT: dyld, as UniXNU's
-# webroot lays it out) and runs from inside it, and the restore source
-# (GEX_DARWIN_RESTORE) whose OS cryptex image, grafted on the booted
-# system's Preboot volume, holds the shared cache. Without them it is
+# webroot lays it out) and runs from inside it, and the restore's disk0
+# image (GEX_DARWIN_DISK0: gexc darwin-disk0's, with its .missing) whose
+# Preboot volume holds the OS cryptex image, grafted on the booted system's
+# Preboot volume, which holds the shared cache. Without them it is
 # skipped, or fails when it was asked for by name.
 #
 # The system boots with the device's payload (GEX_DARWIN_BOOT: its trust
@@ -178,6 +179,45 @@ if [ -n "${GEX_DARWIN_ROOT:-}" ]; then
     GEX_DARWIN_ROOT=$RUN/root
 fi
 
+# Each run boots from a disk0 image of its own. The booted system's
+# container is mounted read-write, as a booting device's is (the Preboot
+# volume, for its grafts), which leaves the image not cleanly unmounted:
+# a run after it would find the disk as a device does after losing power.
+# So every gexc run gets a clone of GEX_DARWIN_DISK0 as the restore left
+# it, with its .missing, made beside it (clonefile(2) on APFS, a reflink
+# copy elsewhere) and removed when the run ends; one a killed run left is
+# removed by the next run once that run's runner is gone.
+DISK0=${GEX_DARWIN_DISK0:-}
+unset GEX_DARWIN_DISK0
+if [ -n "$DISK0" ]; then
+    for d in "$(dirname "$DISK0")"/.gex-disk0-*; do
+        [ -f "$d" ] || continue
+        owner=${d##*/.gex-disk0-}
+        kill -0 "${owner%%-*}" 2>/dev/null && continue
+        rm -f "$d"
+    done
+fi
+
+# with_disk0 CMD [ARGS...]: CMD, given a fresh clone of the disk0 image
+# when there is one.
+with_disk0() {
+    if [ -z "$DISK0" ]; then
+        "$@"
+        return
+    fi
+    d=$(dirname "$DISK0")/.gex-disk0-$$-$(date +%s)$RANDOM
+    if ! python3 -I -c 'import ctypes, sys; c = ctypes.CDLL(None, use_errno=True); sys.exit(ctypes.get_errno() if c.clonefile(sys.argv[1].encode(), sys.argv[2].encode(), 1) else 0)' "$DISK0" "$d" 2>/dev/null &&
+        ! cp --reflink=always "$DISK0" "$d" 2>/dev/null; then
+        echo "FAIL run.sh: $DISK0 cannot be cloned beside it (it needs APFS's clonefile or a reflink copy)" >&2
+        return 1
+    fi
+    [ -f "$DISK0.missing" ] && cp "$DISK0.missing" "$d.missing"
+    GEX_DARWIN_DISK0=$d "$@"
+    ran=$?
+    rm -f "$d" "$d.missing"
+    return $ran
+}
+
 fail=0
 as=
 overlay=
@@ -203,7 +243,7 @@ report() {
 
 check() {
     name=$1 want_out=$2 want_status=$3
-    out=$("$GEXC" run "$HERE/bin/$name" 2>/dev/null)
+    out=$(with_disk0 "$GEXC" run "$HERE/bin/$name" 2>/dev/null)
     report "$name" "$out" $? "$want_out" "$want_status"
 }
 
@@ -212,9 +252,10 @@ check() {
 check_root() {
     name=$1 want_out=$2 want_status=$3
     shift 3
-    for v in GEX_DARWIN_ROOT GEX_DARWIN_RESTORE; do
+    for v in GEX_DARWIN_ROOT DISK0; do
         eval "val=\${$v:-}"
         [ -n "$val" ] && continue
+        [ "$v" = DISK0 ] && v=GEX_DARWIN_DISK0
         if [ "$named" -gt 0 ]; then
             echo "FAIL $name: no $v (set it)"
             fail=1
@@ -226,7 +267,7 @@ check_root() {
     mkdir -p "$GEX_DARWIN_ROOT/var/tmp"
     place "$HERE/bin/$name" "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-$name"
     # shellcheck disable=SC2086
-    out=$("$GEXC" run --sysroot "$GEX_DARWIN_ROOT" ${overlay:+--overlay "$overlay"} ${as:+--uid "$as"} "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-$name" "$@" 2>/dev/null)
+    out=$(with_disk0 "$GEXC" run --sysroot "$GEX_DARWIN_ROOT" ${overlay:+--overlay "$overlay"} ${as:+--uid "$as"} "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-$name" "$@" 2>/dev/null)
     report "$name" "$out" $? "$want_out" "$want_status"
 }
 
@@ -240,9 +281,10 @@ check_root() {
 check_machine() {
     name=$1 as=$2 want_out=$3 want_status=$4 want_console=$5
     shift 5
-    for v in GEX_DARWIN_ROOT GEX_DARWIN_RESTORE; do
+    for v in GEX_DARWIN_ROOT DISK0; do
         eval "val=\${$v:-}"
         [ -n "$val" ] && continue
+        [ "$v" = DISK0 ] && v=GEX_DARWIN_DISK0
         if [ "$named" -gt 0 ]; then
             echo "FAIL $name: no $v (set it)"
             fail=1
@@ -257,7 +299,7 @@ check_machine() {
     place "$HERE/bin/$prog" "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-$prog"
     err=$(mktemp "$GEX_DARWIN_ROOT/var/tmp/.gex-machine.XXXXXX")
     # shellcheck disable=SC2086
-    out=$("$GEXC" run --sysroot "$GEX_DARWIN_ROOT" ${as:+--uid "$as"} "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-$prog" "$@" 2>"$err")
+    out=$(with_disk0 "$GEXC" run --sysroot "$GEX_DARWIN_ROOT" ${as:+--uid "$as"} "$GEX_DARWIN_ROOT/var/tmp/gex-darwin-$prog" "$@" 2>"$err")
     status=$?
     as=
     ended=$(grep -c '^\[gex\] the system ' "$err")
@@ -460,14 +502,14 @@ hello from /var/tmp/gex-exec-fat with 1 argument" 0
     # its build left incomplete is reported at the open, where a strict
     # run stops.
     diskio)
-        if [ -z "${GEX_DARWIN_DISK0:-}" ]; then
+        if [ -z "$DISK0" ]; then
             if [ "$named" -gt 0 ]; then echo "FAIL diskio: no GEX_DARWIN_DISK0 (set it)"; fail=1; else echo "SKIP diskio (set GEX_DARWIN_DISK0)"; fi
         else
             strict=${GEX_DARWIN_STRICT:-}
             GEX_DARWIN_STRICT=0
             check_root_as 0:0 diskio "diskio ok" 0
             GEX_DARWIN_STRICT=$strict
-            if [ "$strict" = 1 ] && [ -s "$GEX_DARWIN_DISK0.missing" ]; then
+            if [ "$strict" = 1 ] && [ -s "$DISK0.missing" ]; then
                 check_root_as 0:0 diskio "" $STRICT_STOP
             fi
         fi ;;
@@ -720,7 +762,7 @@ system /dev/disk1s1
             check_machine rebootcall-full 0:0 "rebootcall full: shutting down
 rebootcall W: a second reboot: -1 EBUSY
 rebootcall W: T exit 3, SIGTERM from the rebooter; S signal 9, SIGTERM from the rebooter; I signal 9" $RESTART "" full
-            if [ -n "${GEX_DARWIN_ROOT:-}" ] && [ -n "${GEX_DARWIN_RESTORE:-}" ]; then
+            if [ -n "${GEX_DARWIN_ROOT:-}" ] && [ -n "$DISK0" ]; then
                 if ! grep -aq '^rebootcall dirty write$' "$data" 2>/dev/null || ! grep -aq 'rebootcall dirty map' "$data" 2>/dev/null; then
                     echo "FAIL rebootcall-full: the file's data did not reach the disk"
                     fail=1

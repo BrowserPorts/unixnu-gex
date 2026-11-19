@@ -2854,6 +2854,79 @@ pub fn set_decmpfs_xattr(nx: &mut Nx<'_>, vol: usize, ino: u64, data: &[u8], now
     fs_tx_leave(nx, vol, now)
 }
 
+/// `XATTR_FILE_SYSTEM_OWNED`, `XATTR_DATA_EMBEDDED`.
+const XATTR_FILE_SYSTEM_OWNED: u16 = 4;
+const XATTR_DATA_EMBEDDED: u16 = 2;
+
+/// The names `fs_add_xattr` makes file-system owned whatever its caller
+/// asks (K 0x66f4250..0x66f4294).
+const FS_OWNED_NAMES: [&str; 3] = ["com.apple.fs.symlink", "com.apple.fs.altlink", "com.apple.system.fs.speculative_telemetry"];
+
+/// `fs_add_xattr(apfs, ino, name, value, len, flags, tx)` (K 0x66f4048) in
+/// the open file-system transaction, of a value it embeds: the record
+/// (`j_xattr_key_t` of the object, the name's length with its NUL and
+/// the name; `j_xattr_val_t` of `flags`, file-system owned for the three
+/// names it always owns, `XATTR_DATA_EMBEDDED`, the length and the value)
+/// inserted in the file-system tree, nothing else of the object changed.
+/// A value too large to embed (past 0xedc bytes, or a record past what a
+/// node takes) goes in a data stream, an object of the secondary tree's
+/// identifier range in another tree, and an attribute already there is
+/// replaced: neither is implemented.
+fn fs_add_xattr(nx: &mut Nx<'_>, vol: usize, ino: u64, name: &str, value: &[u8], flags: u16) -> Result<(), String> {
+    if ino & 0x0fff_ffff_ffff_0000 == 0x0fff_ffff_ffff_0000 {
+        return Err(format!("not implemented: fs_add_xattr on object {ino:#x}, of the secondary file-system tree (K 0x66ed638 kind 4)"));
+    }
+    let k = xattr_key(ino, name);
+    let mut f = flags;
+    if FS_OWNED_NAMES.contains(&name) {
+        f |= XATTR_FILE_SYSTEM_OWNED;
+    }
+    let mut val = (f | XATTR_DATA_EMBEDDED).to_le_bytes().to_vec();
+    val.extend_from_slice(&(value.len() as u16).to_le_bytes());
+    val.extend_from_slice(value);
+    if value.len() > 0xedc || k.len() + val.len() > 0xedd {
+        return Err(format!("not implemented: fs_add_xattr of {name}, a value too large to embed (its data stream, K 0x66f40f8)"));
+    }
+    if get_rec(nx, vol, &k)?.is_some() {
+        return Err(format!("not implemented: fs_add_xattr of {name} over the record inode {ino:#x} already has"));
+    }
+    put_rec(nx, vol, &k, &val)
+}
+
+/// `allocate_graft_jobj_range` (K 0x668747c) of a volume mounted
+/// read-write (its `+0x354` clear), for the graft of image file `ino`
+/// whose volume's next object identifier is `len`: a range past the
+/// volume's identifier space, or one past the system identifiers
+/// (0x0fffffff00000001 on), is ERANGE before anything changes; else, in a
+/// file-system transaction (`fs_tx_enter(apfs, 1, 3, 0, 0)`), the volume's
+/// `apfs_next_obj_id` taken as the range's first identifier and moved
+/// past it, and `write_graft_file_xattrs` (K 0x6687934) adding to the
+/// image file, file-system owned, the volume's UUID
+/// (`com.apple.fs.graft-vol-uuid`), the range's first identifier and its
+/// length, each [`fs_add_xattr`]; then `fs_tx_leave(apfs, 1, 1, 0, tx,
+/// 0)`. The range's first identifier.
+pub fn allocate_graft_jobj_range(nx: &mut Nx<'_>, vol: usize, ino: u64, len: u64, now: &mut dyn FnMut() -> u64) -> Result<Result<u64, i32>, String> {
+    const ERANGE: i32 = 34;
+    let next = u64a(nx.vol_sb_read(vol)?.0, SB_NEXT_OBJ_ID);
+    match next.checked_add(len) {
+        Some(end) if end < 0x0fff_ffff_0000_0001 => {}
+        _ => return Ok(Err(ERANGE)),
+    }
+    check_volume(nx, vol)?;
+    fs_tx_enter(nx, vol)?;
+    let (base, uuid) = {
+        let sb = nx.vol_sb(vol)?;
+        let base = u64a(sb, SB_NEXT_OBJ_ID);
+        sb.put64(SB_NEXT_OBJ_ID, base + len);
+        (base, sb[0xf0..0x100].to_vec())
+    };
+    for (name, value) in [("com.apple.fs.graft-vol-uuid", uuid), ("com.apple.fs.graft-jobj-id-base", base.to_le_bytes().to_vec()), ("com.apple.fs.graft-jobj-id-len", len.to_le_bytes().to_vec())] {
+        fs_add_xattr(nx, vol, ino, name, &value, XATTR_FILE_SYSTEM_OWNED)?;
+    }
+    fs_tx_leave(nx, vol, now)?;
+    Ok(Ok(base))
+}
+
 /// The key of inode `ino`'s extended attribute `name`.
 fn xattr_key(ino: u64, name: &str) -> Vec<u8> {
     let mut k = (ino | J_XATTR << 60).to_le_bytes().to_vec();

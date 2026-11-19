@@ -1944,7 +1944,8 @@ mod tests {
             let want = storage::volume(v).unwrap();
             let vol = c.volume(v as usize).unwrap().unwrap();
             assert_eq!((vol.sb.volname.as_str(), vol.sb.role, vol.sb.fs_index), (want.name, want.role, v));
-            assert_eq!(vol.sb.uuid, storage::volume_uuid(v));
+            // Without the system image the seal does not run.
+            assert_eq!(vol.sb.uuid, storage::formatted_volume_uuid(v));
             assert!(vol.inode(2).unwrap().is_some_and(|i| i.is_dir()));
             assert_eq!(vol.lookup(2, "nothing").unwrap().map(|e| e.name), None);
         }

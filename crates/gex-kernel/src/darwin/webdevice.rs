@@ -47,10 +47,15 @@
 //! identity with its digest and the properties its restore request rules
 //! give a device in production and secure mode.
 //!
+//! - The SEP's UID ([`files::SEP_UID`]): the Secure Enclave has its own
+//!   fused key, which only its AES engine uses ([`super::sep::secrets`]).
+//!
 //! The secrets (the two private keys, the UID) live per installation
 //! outside every repository, and only the tools that make and sign read
 //! them; a run reads what the device has: the root's certificate, the
-//! identity, the nonce slot and the ticket ([`WebDevice`]).
+//! identity, the nonce slot and the ticket ([`WebDevice`]). The SEP's UID
+//! is read by the run's SEP core, as the fuse is read by the engine that
+//! holds it, and by no other code.
 
 use super::image4::{enc, fourcc, nonce, Fail};
 use super::plist::Value;
@@ -486,6 +491,11 @@ pub mod files {
     pub const MANIFEST_CERT: &str = "manifest.der";
     pub const IDENTITY: &str = "device.plist";
     pub const UID: &str = "uid.bin";
+    /// The Secure Enclave's own UID, 32 bytes: the AES engine's UID key as
+    /// the SEP's code sees it, distinct from the AP's ([`UID`]), as the
+    /// fuses of the two engines are. The sepOS derives every key it keeps
+    /// from it ([`super::sep::secrets`]).
+    pub const SEP_UID: &str = "sep-uid.bin";
     /// The cryptex1 boot slot of its nonce magazine.
     pub const CRYPTEX1_BOOT_SLOT: &str = "nonce-cryptex1-boot.slot";
     /// Its Cryptex1 ticket, which its Preboot volume holds as

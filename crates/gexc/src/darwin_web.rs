@@ -3,19 +3,22 @@
 //! ```text
 //!   gexc darwin-web-device init <dir>   make a web device: its root, manifest key, identity, UID, nonce slot
 //!   gexc darwin-web-device show <dir>   its identity and current cryptex1 boot nonce hash
+//!   gexc darwin-web-device sep <dir>    add the Secure Enclave's UID to a device made without one
 //!   gexc darwin-web-device roll <dir>   roll its cryptex1 boot nonce (its tickets go stale)
 //!   gexc darwin-web-ticket <dir>        sign its Cryptex1 ticket for its current nonce
 //! ```
 //!
 //! `init` and `darwin-web-ticket` read the IPSW's build identity of the
 //! device (GEX_DARWIN_RESTORE). The directory holds the device's secrets,
-//! its private keys and UID (mode 0600, the directory 0700): it belongs to
-//! one installation, outside every repository. Random bytes come from the
+//! its private keys and UIDs (the AP's and the Secure Enclave's; mode 0600,
+//! the directory 0700): it belongs to one installation, outside every
+//! repository. No tool prints a UID. Random bytes come from the
 //! host's (`getrandom`), as the kernel's random source gives AppleImage4's.
 
 use anyhow::{anyhow, bail, Context, Result};
 use gex_kernel::darwin::image4::{self, nonce, Outcome};
 use gex_kernel::darwin::plist::{self, Value};
+use gex_kernel::darwin::sep::secrets::SepUid;
 use gex_kernel::darwin::webdevice::{self, files, Identity, Signer, WebDevice};
 use rsa::pkcs1::{DecodeRsaPrivateKey, EncodeRsaPrivateKey};
 use rsa::rand_core::{OsRng, RngCore};
@@ -172,6 +175,7 @@ fn init(dir: &Path) -> Result<()> {
     write_new(&dir.join(files::ROOT_KEY), &key_der(&root)?, 0o600)?;
     write_new(&dir.join(files::MANIFEST_KEY), &key_der(&manifest)?, 0o600)?;
     write_new(&dir.join(files::UID), &random::<32>(), 0o600)?;
+    write_new(&dir.join(files::SEP_UID), &random::<32>(), 0o600)?;
     write_new(&dir.join(files::CRYPTEX1_BOOT_SLOT), &slot.to_bytes(), 0o600)?;
     write_new(&dir.join(files::ROOT_CERT), &root_cert, 0o644)?;
     write_new(&dir.join(files::MANIFEST_CERT), &leaf, 0o644)?;
@@ -191,10 +195,25 @@ fn show(dir: &Path) -> Result<()> {
         i.production, i.security, i.effective_production, i.effective_security
     );
     println!("cryptex1 boot nonce hash {}", hex(&nonce_hash(&w)?));
+    match SepUid::load(dir) {
+        Ok(_) => println!("SEP UID present"),
+        Err(e) => println!("SEP UID absent: {e}"),
+    }
     match &w.ticket {
         Some(p) => println!("Cryptex1 ticket {p}"),
         None => println!("Cryptex1 ticket none (gexc darwin-web-ticket {})", dir.display()),
     }
+    Ok(())
+}
+
+/// Add the Secure Enclave's UID to the web device of `dir` that has none:
+/// 32 bytes from the host's random source, as `init` makes it. A device
+/// that has one keeps it (a UID is fused once: replacing it would make
+/// every key derived from the old one unreachable).
+fn add_sep_uid(dir: &Path) -> Result<()> {
+    load(dir)?;
+    write_new(&dir.join(files::SEP_UID), &random::<32>(), 0o600).with_context(|| format!("{} has a SEP UID already, or cannot be written", dir.display()))?;
+    println!("SEP UID made");
     Ok(())
 }
 
@@ -252,13 +271,14 @@ fn sign(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `gexc darwin-web-device init|show|roll <dir>`.
+/// `gexc darwin-web-device init|show|roll|sep <dir>`.
 pub fn cmd_device(args: &[String]) -> Result<ExitCode> {
     match args {
         [op, dir] if op == "init" => init(Path::new(dir))?,
         [op, dir] if op == "show" => show(Path::new(dir))?,
         [op, dir] if op == "roll" => roll(Path::new(dir))?,
-        _ => bail!("usage: gexc darwin-web-device init|show|roll <dir>"),
+        [op, dir] if op == "sep" => add_sep_uid(Path::new(dir))?,
+        _ => bail!("usage: gexc darwin-web-device init|show|roll|sep <dir>"),
     }
     Ok(ExitCode::SUCCESS)
 }

@@ -101,6 +101,7 @@ pub mod mig;
 pub mod mman;
 pub mod mk_timer;
 pub mod mwl;
+pub mod nvram;
 pub mod persona;
 pub mod pipe;
 pub mod priority;

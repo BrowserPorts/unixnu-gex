@@ -206,6 +206,12 @@ fn add_root(t: &mut Vec<Node>) {
     t.push(Node { name: "Root".to_string(), props: Vec::new(), class: "IORegistryEntry", service_props: Vec::new(), parent: None, children: vec![0], kernel_only: false, nub: None, dt: None, table: Table::Drivers, power: None });
 }
 
+/// IODTNVRAM's class, and those of the services its start attaches to it.
+pub const NVRAM_CLASS: &str = "IODTNVRAM";
+pub const NVRAM_VARIABLES: &str = "IODTNVRAMVariables";
+pub const NVRAM_DIAGS: &str = "IODTNVRAMDiags";
+pub const NVRAM_NOTIFIER: &str = "IODTNVRAMPlatformNotifier";
+
 /// Whether the kernel sets the root entry's property `name`: the planes
 /// (`IORegistryEntry::initialize`), IOKit's build version and diagnostics
 /// and the OS build version (`StartIOKit`), the console's lock and users

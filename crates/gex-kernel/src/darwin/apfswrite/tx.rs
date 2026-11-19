@@ -3990,6 +3990,63 @@ mod tests {
         assert!(sink.pages() == twin.pages(), "the two containers differ");
     }
 
+    /// A graft's range of a volume mounted read-write: the volume's next
+    /// object identifier taken and moved past it, and the range recorded
+    /// on the image file in three file-system owned attributes, all in one
+    /// file-system transaction that stays open (`fs_tx_leave`'s rule); once
+    /// committed, the reader finds them and the range they record is the
+    /// one `get_graft_jobj_range` takes back. A second range for the same
+    /// file (its attributes there) is not implemented; a range past the
+    /// identifiers is ERANGE with nothing changed.
+    #[test]
+    fn a_graft_range_is_taken_and_recorded() {
+        use super::super::fsops;
+        use crate::darwin::apfsread::{fs::XattrData, Container};
+        let blocks = 15_625_000u64;
+        let sink = std::sync::Arc::new(Sparse::new(blocks * 4096));
+        let uuid = *b"gex-graft-range!";
+        let fm = super::super::container::format(&*sink, 4096, blocks, uuid).unwrap();
+        let mut nx = Nx::formatted(&*sink, &fm, uuid, Mode::Kernel).unwrap();
+        nx.mount_rw().unwrap();
+        let mut t = 1_800_000_000_000_000_000u64;
+        let mut now = move || {
+            t += 1000;
+            t
+        };
+        let times = VolumeTimes { formatted: now(), root: now(), private: now(), modified: now() };
+        let o = nx.create_volume(&NewVolume { name: "Preboot".into(), role: 0x10, encrypted: false, e_apfs: true, times, uid: 0, gid: 0, key_os_version: 0, size_bytes: None }).unwrap();
+        nx.commit().unwrap();
+        let pb = nx.fs_oid.iter().position(|&x| x == o).unwrap();
+        fsops::mount_rw(&mut nx, pb, &mut now).unwrap();
+        let ino = fsops::create(&mut nx, pb, 2, "os.dmg", 0o666, 0, 0, &mut now).unwrap().unwrap();
+        nx.commit().unwrap();
+        let q = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+        let sb0 = nx.vol_sb_read(pb).unwrap().0.to_vec();
+        let xid = nx.xid;
+        assert_eq!(fsops::allocate_graft_jobj_range(&mut nx, pb, ino, u64::MAX - 4, &mut now).unwrap(), Err(34));
+        assert_eq!(nx.vol_sb_read(pb).unwrap().0, &sb0[..], "ERANGE changes nothing");
+        let base = fsops::allocate_graft_jobj_range(&mut nx, pb, ino, 0x5000, &mut now).unwrap().unwrap();
+        let sb = nx.vol_sb_read(pb).unwrap().0.to_vec();
+        assert_eq!((base, q(&sb, 0xb0)), (q(&sb0, 0xb0), q(&sb0, 0xb0) + 0x5000));
+        assert_eq!((nx.xid, nx.in_tx), (xid, true), "the transaction stays open");
+        assert_eq!(q(&sb, 0x420), xid);
+        let rec = fsops::xattr_record(&mut nx, pb, ino, "com.apple.fs.graft-jobj-id-base").unwrap().unwrap();
+        assert_eq!(rec, [&6u16.to_le_bytes()[..], &8u16.to_le_bytes(), &base.to_le_bytes()].concat());
+        assert!(fsops::allocate_graft_jobj_range(&mut nx, pb, ino, 0x5000, &mut now).unwrap_err().contains("already has"));
+        nx.commit().unwrap();
+        let c = std::sync::Arc::new(Container::open(sink.clone()).unwrap());
+        let v = c.volume(pb).unwrap().unwrap();
+        let xs = v.xattrs(ino).unwrap();
+        assert_eq!(xs.iter().map(|x| (x.name.as_str(), x.flags)).collect::<Vec<_>>(), [("com.apple.fs.graft-jobj-id-base", 6), ("com.apple.fs.graft-jobj-id-len", 6), ("com.apple.fs.graft-vol-uuid", 6)]);
+        let get = |name: &str| xs.iter().find(|x| x.name == name).and_then(|x| match &x.data {
+            XattrData::Embedded(d) => Some(d.clone()),
+            _ => None,
+        });
+        let vol_uuid: [u8; 16] = sb[0xf0..0x100].try_into().unwrap();
+        let range = crate::darwin::graftfs::recorded_jobj_range(&get, &vol_uuid, q(&sb, 0xb0), &|_| None);
+        assert_eq!(range, Ok(Some((base, 0x5000))));
+    }
+
     /// The restore's disk0 (GEX_TEST_DISK0: an image `gexc darwin-disk0`
     /// made) mounts from its latest checkpoint, read only: each volume the
     /// restore made, with its trees.

@@ -398,6 +398,9 @@ fn ia5_cmp(c: &[u8], code: u32) -> i32 {
 pub struct Payload<'a> {
     pub whole: &'a [u8],
     pub data: Option<&'a [u8]>,
+    /// The compression's sequence content, `{ INTEGER algorithm, INTEGER
+    /// size }`, when the IM4P has one.
+    pub compression: Option<&'a [u8]>,
 }
 
 const IM4P6: [Spec; 6] = [
@@ -476,7 +479,7 @@ pub fn init_as_payload(b: &[u8]) -> Result<Payload<'_>, i32> {
         return Err(dr::PARAM_ERR);
     }
     let it = decode_payload(b)?;
-    Ok(Payload { whole: b, data: it[3] })
+    Ok(Payload { whole: b, data: it[3], compression: it[5] })
 }
 
 /// An IM4M, as `Img4DecodeInitAsManifest` keeps it.
@@ -588,6 +591,50 @@ fn property_of_tag(c: &[u8], t: u64, value_tag: u64) -> Result<&[u8], i32> {
 /// 0xfffffff005aa473c: the value of the property tagged `t` in `content`.
 fn find_property(content: &[u8], t: u64, value_tag: u64) -> Result<&[u8], i32> {
     property_of_tag(find(content, t)?, t, value_tag)
+}
+
+/// The manifest body's `MANB` and its `MANP`, as libamsupport's
+/// `DERImg4DecodeParseManifestProperties` (0xea54) finds them: the body a
+/// set (else -1), `MANB` a sequence in a version 2 manifest and a set in
+/// the others, and `MANP` a set in it, which must be there.
+fn manifest_sections<'a>(m: &Manifest<'a>) -> Result<(&'a [u8], &'a [u8]), i32> {
+    let set = der::decode_item(m.body)?;
+    if set.tag != tag::SET {
+        return Err(-1);
+    }
+    let manb_tag = if m.version == 2 { tag::SEQUENCE } else { tag::SET };
+    let manb = find_property(set.content, tag::private(fourcc(b"MANB")), manb_tag)?;
+    let manp = find_property(manb, tag::private(fourcc(b"MANP")), tag::SET)?;
+    Ok((manb, manp))
+}
+
+/// The data of `object`'s property `property` in the IM4M `manifest`, as
+/// the restore ramdisk's libamsupport (`/usr/lib/libamsupport.dylib`,
+/// which `restored_external` links) gives it to
+/// `ramrod_ticket_copy_data_object_property_from_ticket_data`:
+/// `Img4DecodeInitManifest` (0x10b40: `DERImg4DecodeManifest` with the
+/// kext's item specifications, an `IM4M` of version at most 2 whose body
+/// is there and whose item fills the buffer), then
+/// `Img4DecodeGetObjectPropertyData` (0xfff0 → 0xfdf8): `MANB` and `MANP`
+/// ([`manifest_sections`]), the object's set in `MANB`, and the
+/// property's OCTET STRING in it. Both are the libDER and DERImg4Decode
+/// code the kext has ([`init_as_manifest`], [`find_property`]); no
+/// signature or certificate is looked at. A failure is the code of the
+/// step that failed, which the restore only logs.
+pub fn object_property_data(manifest: &[u8], object: u32, property: u32) -> Result<&[u8], i32> {
+    let m = init_as_manifest(manifest)?;
+    let (manb, _) = manifest_sections(&m)?;
+    let o = find_property(manb, tag::private(object), tag::SET)?;
+    find_property(o, tag::private(property), tag::OCTET_STRING)
+}
+
+/// The value tagged `value_tag` of the manifest property `property`, in
+/// `MANP` (libamsupport's `Img4DecodeGetPropertyFromSection`, 0x101b0,
+/// for the manifest's section).
+pub fn manifest_property(manifest: &[u8], property: u32, value_tag: u64) -> Result<&[u8], i32> {
+    let m = init_as_manifest(manifest)?;
+    let (_, manp) = manifest_sections(&m)?;
+    find_property(manp, tag::private(property), value_tag)
 }
 
 /// The errors of the evaluation's steps: the code a step returns (libDER's,
@@ -2050,6 +2097,32 @@ mod tests {
         assert!(matches!(run(&f, vec![prop("cnch", octets(&[5; 48])), prop("ndom", int(2))]), Err(Fail::Unmodelled(_))));
         f.nonce = None;
         assert!(matches!(run(&f, vec![prop("cnch", octets(&[5; 48])), prop("ndom", int(1))]), Err(Fail::Unmodelled(_))));
+    }
+
+    #[test]
+    fn a_tickets_object_and_manifest_properties_are_found_as_libamsupport_finds_them() {
+        let d = [7u8; 48];
+        let objects = vec![("csos", vec![prop("DGST", octets(&d)), prop("EPRO", boolean(true))]), ("trcs", vec![prop("ESEC", boolean(true))])];
+        let t = im4m(vec![prop("ECID", int(0x6890_e970_0eb4_c4bf)), prop("CHIP", int(0x8011))], objects, &[0; 4], &[]);
+        assert_eq!(object_property_data(&t, fourcc(b"csos"), fourcc(b"DGST")), Ok(&d[..]));
+        assert_eq!(der::integer64(manifest_property(&t, fourcc(b"ECID"), tag::INTEGER).unwrap()), Ok(0x6890_e970_0eb4_c4bf));
+        // An object the ticket has no digest in, one it does not have, a
+        // property of another type: libDER's end of the sequence and
+        // unexpected tag.
+        assert_eq!(object_property_data(&t, fourcc(b"trcs"), fourcc(b"DGST")), Err(dr::END_OF_SEQUENCE));
+        assert_eq!(object_property_data(&t, fourcc(b"caos"), fourcc(b"DGST")), Err(dr::END_OF_SEQUENCE));
+        assert_eq!(object_property_data(&t, fourcc(b"csos"), fourcc(b"EPRO")), Err(dr::UNEXPECTED_TAG));
+        // MANB without MANP: the object is not looked for.
+        let no_manp = {
+            let body = set(&[prop("MANB", set(&[prop("csos", set(&[prop("DGST", octets(&d))]))]))]);
+            seq(&[ia5("IM4M"), int(0), body, octets(&[0; 4]), tlv(&[0x30], &[])])
+        };
+        assert_eq!(object_property_data(&no_manp, fourcc(b"csos"), fourcc(b"DGST")), Err(dr::END_OF_SEQUENCE));
+        // Not a manifest: what the restore's 30 00 placeholder was.
+        assert!(object_property_data(&[0x30, 0x00], fourcc(b"csos"), fourcc(b"DGST")).is_err());
+        let mut long = t.clone();
+        long.push(0);
+        assert_eq!(object_property_data(&long, fourcc(b"csos"), fourcc(b"DGST")), Err(dr::BUF_OVERFLOW));
     }
 
     #[test]

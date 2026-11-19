@@ -48,6 +48,7 @@ cc -O2 -framework IOKit -framework CoreFoundation -o "$OUT/iokit" "$HERE/src/iok
 cc -O2 -framework IOKit -framework CoreFoundation -o "$OUT/storagereg" "$HERE/src/storagereg.c"
 cc -O2 -framework IOKit -framework CoreFoundation -o "$OUT/ioreg" "$HERE/src/ioreg.c"
 cc -O2 -framework IOKit -framework CoreFoundation -o "$OUT/nvram" "$HERE/src/nvram.c"
+cc -O2 -framework IOKit -framework CoreFoundation -o "$OUT/hostuuid" "$HERE/src/hostuuid.c"
 # sepmgr: AppleSEPManager's user client, which needs the entitlement (sepmgrdeny is the
 # same program without it, checking the refusal).
 cc -O2 -framework IOKit -framework CoreFoundation -o "$OUT/sepmgr" "$HERE/src/sepmgr.c"

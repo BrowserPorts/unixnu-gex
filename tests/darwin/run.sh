@@ -533,6 +533,33 @@ EOF2
             fi
             with_web_device check_root_as 501:501 nvram "nvram user ok" 0 user
         fi ;;
+    # gethostuuid and IOPlatformUUID on a copy of the web device: the UUID
+    # its identity in /chosen gives (generatePlatformUUID's SHA-1 name-space
+    # UUID of unique-chip-id and chip-id, little-endian as its boot puts
+    # them), as root and as a user.
+    hostuuid)
+        if [ -z "${GEX_TEST_WEB_DEVICE:-}" ]; then
+            if [ "$named" -gt 0 ]; then
+                echo "FAIL hostuuid: no GEX_TEST_WEB_DEVICE (set it)"
+                fail=1
+            else
+                echo "SKIP hostuuid (set GEX_TEST_WEB_DEVICE)"
+            fi
+        else
+            want=$(python3 -I - "$GEX_TEST_WEB_DEVICE/device.plist" <<'EOF2'
+import hashlib, plistlib, struct, sys
+d = plistlib.load(open(sys.argv[1], 'rb'))
+space = bytes.fromhex('A6DD4CCBB5E84AF5ACDDB6DC6A0542B8')
+h = bytearray(hashlib.sha1(space + struct.pack('<Q', d['ApECID']) + struct.pack('<I', d['ApChipID'])).digest()[:16])
+h[6] = (h[6] & 0x0f) | 0x50
+h[8] = (h[8] & 0x3f) | 0x80
+x = h.hex().upper()
+print('-'.join((x[:8], x[8:12], x[12:16], x[16:20], x[20:])))
+EOF2
+)
+            with_web_device check_root hostuuid "hostuuid ok" 0 "$want" root
+            with_web_device check_root_as 501:501 hostuuid "hostuuid user ok" 0 "$want" user
+        fi ;;
     kernproc) check_root kernproc "kernproc ok" 0 ;;
     vmregion) check_root vmregion "vmregion ok" 0 ;;
     msync) check_root msync "msync ok" 0 ;;
@@ -860,7 +887,7 @@ if [ "$named" -gt 0 ]; then
         run "$p"
     done
 else
-    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate thinfo tasksuspend portrefs crosstask spawnports taskname taskreg procfind debugport excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl iokit storagereg ioreg accel accelr metalwire metal iosurface iosurfacex iosurfacesplash iosurfacexpreboard iogpudev iomfb iomfbmain xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts evsock pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit sbxinit sbxexec sbxkill hostspecial sbxmask sbxnet sbxiokit sepmgr sepmgrdeny sbxpriv sbxfile sbxscrub cfrunloop xpc-anon layout overlay stackfb launchcon shregion console owners apfsroles disknodes diskio fsfreeze fmount mntupdate fsstatwait ignition graftdmg tcload inet6 rusage vmshare remap vmwrite freezer ment ubcmap purgeable mentreuse mapfirst ignitionweb nvram crashpanic crashpanic-exit crashpanic-onexit crashpanic-deadline crashpanic-crash crashpanic-abort crashpanic-terminate crashpanic-spawnfail rebootcall rebootcall-panic rebootcall-halt rebootcall-restart rebootcall-hostrestart rebootcall-upsdelay rebootcall-hostupsdelay rebootcall-full rebootcall-fullhalt corpse corpsefork; do
+    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate thinfo tasksuspend portrefs crosstask spawnports taskname taskreg procfind debugport excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl iokit storagereg ioreg accel accelr metalwire metal iosurface iosurfacex iosurfacesplash iosurfacexpreboard iogpudev iomfb iomfbmain xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts evsock pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit sbxinit sbxexec sbxkill hostspecial sbxmask sbxnet sbxiokit sepmgr sepmgrdeny sbxpriv sbxfile sbxscrub cfrunloop xpc-anon layout overlay stackfb launchcon shregion console owners apfsroles disknodes diskio fsfreeze fmount mntupdate fsstatwait ignition graftdmg tcload inet6 rusage vmshare remap vmwrite freezer ment ubcmap purgeable mentreuse mapfirst ignitionweb nvram hostuuid crashpanic crashpanic-exit crashpanic-onexit crashpanic-deadline crashpanic-crash crashpanic-abort crashpanic-terminate crashpanic-spawnfail rebootcall rebootcall-panic rebootcall-halt rebootcall-restart rebootcall-hostrestart rebootcall-upsdelay rebootcall-hostupsdelay rebootcall-full rebootcall-fullhalt corpse corpsefork; do
         run "$p"
     done
 fi

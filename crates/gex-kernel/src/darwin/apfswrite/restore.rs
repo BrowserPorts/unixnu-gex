@@ -95,6 +95,9 @@ pub struct OsImage {
     /// The host's files seal_system_volume takes (the restore's later
     /// steps listed as missing without them).
     pub seal: Option<SealFiles>,
+    /// The device restored, which install_splat needs with the boot
+    /// objects.
+    pub device: Option<Device>,
 }
 
 /// What the restore host sends seal_system_volume
@@ -289,12 +292,14 @@ pub fn build_disk0_hooked(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() 
         // read_new_os_build_version only reads System; install_splat
         // (0x1000185a8 → 0x10003af24) writes the Cryptex1 under Preboot's
         // cryptex1/current, then install_kernel_cache's list.
-        match &os.boot {
-            Some(b) => {
-                install_splat(&mut nx, Volumes { system, xart, hardware, preboot, update }, b, now)?;
+        match (&os.boot, &os.device) {
+            (Some(b), Some(d)) => {
+                install_splat(&mut nx, Volumes { system, xart, hardware, preboot, update }, b, d, now)?;
+                missing.push(CRYPTEX1_NONCE_MISSING.into());
                 install_kernel_cache(&mut nx, Volumes { system, xart, hardware, preboot, update }, b, &cluster_pushes, now)?
             }
-            None => missing.push("install_splat's Cryptex1 and install_kernel_cache's list (no IPSW given: the Cryptex1 components, the version files, the build manifest and the Cryptex1 ticket in Preboot's cryptex1/current; the kernelcache, devicetree, iBoot and root_hash Image4 files and the AP ticket on Preboot and Hardware)".into()),
+            (Some(_), None) => return Err("install_splat: the device restored is not given (its device tree, and TSS's Cryptex1 ticket for it)".into()),
+            (None, _) => missing.push("install_splat's Cryptex1 and install_kernel_cache's list (no IPSW given: the Cryptex1 components, the version files, the build manifest and the Cryptex1 ticket in Preboot's cryptex1/current; the kernelcache, devicetree, iBoot and root_hash Image4 files and the AP ticket on Preboot and Hardware)".into()),
         }
         // check_mounted (0x100018b6c): fixup_var (0x10002ef8c):
         // MKBKeyBagCreateSystem writes nothing with enhanced APFS, then the
@@ -997,15 +1002,57 @@ fn img4(im4p: &[u8], ticket: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The device a restore runs on, as install_splat sees it: its device
+/// tree, which names the Cryptex1 ticket, and the ticket TSS personalized
+/// for it.
+pub struct Device {
+    /// The device tree the restore ramdisk runs with
+    /// ([`restore_device_tree`]), its `/chosen` as iBoot fills it in for
+    /// this device: `_ticket_file_name_personalized` (RE@0x100064b30) reads
+    /// `hw.target` (the root's `compatible`) and `/chosen`'s
+    /// `unique-chip-id` ([`super::super::preboot::ticket_name_of`]).
+    pub tree: Vec<crate::darwin::iokit::Node>,
+    /// `TicketData` (RE@0x10003b734): the TSS response's
+    /// `kAMAuthInstallTagCryptex1Img4Ticket` for `_personalize_splat_ticket`'s
+    /// request (RE@0x10003b6f8: the device's ECID, chip and production mode
+    /// and its cryptex1 boot nonce), from which install_splat takes each
+    /// object's expected digest and which it writes as the ticket.
+    pub cryptex1_ticket: Vec<u8>,
+}
+
+/// The device tree the restore ramdisk runs with: the erase identity's
+/// `RestoreDeviceTree`, `Firmware/all_flash/DeviceTree.j120ap.im4p`
+/// (the `DeviceTree` component's file too, as the boot's), whose IM4P
+/// payload iBoot expands: LZFSE (compression algorithm 1) to the size
+/// the IM4P gives, or the data as it is with no compression.
+pub fn restore_device_tree(im4p: &[u8]) -> Result<Vec<u8>, String> {
+    use crate::darwin::image4;
+    let p = image4::init_as_payload(im4p).map_err(|e| format!("the device tree's IM4P does not decode (libDER {e})"))?;
+    let data = p.data.ok_or("the device tree's IM4P has no data")?;
+    let Some(c) = p.compression else { return Ok(data.to_vec()) };
+    let spec = image4::der::spec(image4::tag::INTEGER, 0);
+    let it = image4::der::parse_content(c, &[spec, spec]).map_err(|e| format!("the device tree's IM4P compression does not decode (libDER {e})"))?;
+    let algorithm = image4::der::integer(it[0].unwrap_or(&[])).map_err(|e| format!("the device tree's IM4P compression algorithm (libDER {e})"))?;
+    let size = image4::der::integer64(it[1].unwrap_or(&[])).map_err(|e| format!("the device tree's IM4P expanded size (libDER {e})"))?;
+    if algorithm != 1 {
+        return Err(format!("not implemented: a device tree IM4P compressed with algorithm {algorithm}"));
+    }
+    let mut out = vec![0u8; usize::try_from(size).map_err(|_| "the device tree's expanded size")?];
+    crate::darwin::lzfse::decode(data, &mut out).map_err(|e| format!("the device tree's IM4P payload: {e}"))?;
+    Ok(out)
+}
+
+/// What `_personalize_splat_ticket` does to the device's NVRAM before its
+/// TSS request that the image cannot hold.
+pub const CRYPTEX1_NONCE_MISSING: &str = "install_splat's roll of the cryptex1 boot nonce before its TSS request (_personalize_splat_ticket: img4_nonce_domain_preroll_nonce, then img4_nonce_domain_roll_nonce, of the cryptex1 boot domain, RE@0x10003b108 and RE@0x10003b224: AppleImage4's slot in NVRAM nonce-seeds, a proposal made and then taken as the nonce; the kext's proposal paths (its roll 0xfffffff005a9a5dc with a proposal, and the preroll) are not modelled and gex has no NVRAM store): the device's nonce slot is left as it was, and the Cryptex1 ticket is the one personalized for its current nonce";
+
 /// What install_splat takes from the restore host and the device's own
 /// randomness that only a device run has (drafts/s27/re-splat.md
 /// UNSETTLED 1, 4, 5, 9, 12).
-pub const SPLAT_STAND_IN: &str = "what install_splat's Cryptex1 on Preboot takes from the restore host and the run (drafts/s27/re-splat.md): the host's SourceBootObjectV4 message sizes, which make the write(2) calls (stand-in: idevicerestore's 8192-byte FileData chunks), the time the transfer takes, which decides when the kernel's grow-ahead starts on os.dmg and app.dmg (stand-in: the model's clock), the build identity the host sends back and CoreFoundation's XML of it (stand-in: the IPSW's erase identity, written by this model's plist writer), the TSS Cryptex1 ticket (stand-in: an empty DER SEQUENCE, 30 00) and Foundation's temporary name for it (stand-in .dat.nosync0000.AAAAAA); measure /private/preboot/cryptex1/current on the device: its files' extents, BuildManifest.plist's bytes and the ticket";
+pub const SPLAT_STAND_IN: &str = "what install_splat's Cryptex1 on Preboot takes from the restore host and the run (drafts/s27/re-splat.md): the host's SourceBootObjectV4 message sizes, which make the write(2) calls (stand-in: idevicerestore's 8192-byte FileData chunks), the time the transfer takes, which decides when the kernel's grow-ahead starts on os.dmg and app.dmg (stand-in: the model's clock), the build identity the host sends back and CoreFoundation's XML of it (stand-in: the IPSW's erase identity, written by this model's plist writer) and Foundation's temporary name for the Cryptex1 ticket (stand-in .dat.nosync0000.AAAAAA); measure /private/preboot/cryptex1/current on the device: its files' extents and BuildManifest.plist's bytes";
 
 /// The host's FileData message size ([`SPLAT_STAND_IN`]).
 const SPLAT_HOST_CHUNK: u64 = 8192;
-/// The Cryptex1 ticket ([`SPLAT_STAND_IN`]).
-const SPLAT_TICKET: [u8; 2] = [0x30, 0x00];
 /// Foundation's temporary file for the ticket (`.dat.nosync%04x.XXXXXX`,
 /// F 0x1d63c: the process's identifier and mktemp's random characters;
 /// [`SPLAT_STAND_IN`]).
@@ -1081,20 +1128,46 @@ fn file_bytes(nx: &mut Nx<'_>, vol: usize, ino: u64) -> Result<Vec<u8>, String> 
     Ok(out)
 }
 
+/// The check `_get_and_save_large_file_internal` (0x10003bbcc) makes of
+/// the stream it saved against the expected digest, after its last chunk
+/// is written: a 20-byte digest is SHA-1's, a 48-byte one SHA-384's, and
+/// one of another length is not checked (`None`).
+fn splat_stream_matches(src: &dyn fsops::Bytes, expected: &[u8]) -> Result<Option<bool>, String> {
+    fn digest<D: sha2::Digest>(src: &dyn fsops::Bytes) -> Result<Vec<u8>, String> {
+        let mut d = D::new();
+        let mut buf = vec![0u8; (8u64 << 20).min(src.len()) as usize];
+        let mut at = 0;
+        while at < src.len() {
+            let n = (src.len() - at).min(8 << 20) as usize;
+            src.read_at(at, &mut buf[..n])?;
+            d.update(&buf[..n]);
+            at += n as u64;
+        }
+        Ok(d.finalize().to_vec())
+    }
+    Ok(match expected.len() {
+        20 => Some(digest::<sha1::Sha1>(src)? == expected),
+        48 => Some(digest::<sha2::Sha384>(src)? == expected),
+        _ => None,
+    })
+}
+
 /// install_splat (0x10003af24; drafts/s27/re-splat.md), with Preboot
-/// mounted read-write at /mnt9 and System at /mnt1: the build identity's
-/// Cryptex1 components (none: nothing), then ramrod_splat_install
-/// (0x10006419c): cryptex1/current made by NSFileManager's mkpath_np
-/// (mkdirat 0777 under umask 0, so no chmod); each component of the
-/// table (0x100268528) present in the identity `fopen(dest, "wb")` (0666)
-/// and written in the host's chunks through stdio, its SHA-384 checked;
+/// mounted read-write at /mnt9 and System at /mnt1, for `device`: the
+/// build identity's Cryptex1 components (none: nothing), then
+/// ramrod_splat_install (0x10006419c): cryptex1/current made by
+/// NSFileManager's mkpath_np (mkdirat 0777 under umask 0, so no chmod);
+/// each component of the table (0x100268528) present in the identity
+/// `fopen(dest, "wb")` (0666) and written in the host's chunks through
+/// stdio, checked against the digest the device's Cryptex1 ticket has for
+/// its object;
 /// RestoreVersion.plist and SystemVersion.plist copyfile'd from System
 /// (COPYFILE_ALL, no state); BuildManifest.plist by -[NSDictionary
 /// writeToFile:atomically:NO] (one write, fsync); the Cryptex1 ticket
 /// written atomically through a temporary file (write, fsync, rename). No
 /// LocalPolicy: J120's chip 0x8011 is in the restore's list of chips
 /// without one (0x10027e8d8).
-fn install_splat(nx: &mut Nx<'_>, v: Volumes, boot: &BootObjects, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+fn install_splat(nx: &mut Nx<'_>, v: Volumes, boot: &BootObjects, device: &Device, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     use super::super::plist::Value;
     use super::super::preboot;
     use fsops::SetAttr;
@@ -1117,25 +1190,19 @@ fn install_splat(nx: &mut Nx<'_>, v: Volumes, boot: &BootObjects, now: &mut dyn 
     for (key, name) in preboot::cryptex1::OBJECTS {
         let Some(comp) = comps.get(key) else { continue };
         let path = comp.get("Info").and_then(|i| i.get("Path")).and_then(Value::as_str).ok_or_else(|| format!("the build identity's {key} has no Info.Path"))?;
-        let digest = comp.get("Digest").and_then(Value::as_data).ok_or_else(|| format!("the build identity's {key} has no Digest"))?;
+        // The handler (0x10003b914): the object's tag from the table
+        // (0x1000652b8) and its expected digest, the ticket's DGST for it
+        // (0x10003bb08 → 0x100067434), asked before the file is opened.
+        let code = crate::darwin::webdevice::CRYPTEX1_OBJECTS.iter().find(|(k, _)| *k == key).map(|(_, c)| crate::darwin::image4::fourcc(c)).ok_or_else(|| format!("{key} has no object in restored's table"))?;
+        let digest = crate::darwin::image4::object_property_data(&device.cryptex1_ticket, code, crate::darwin::image4::fourcc(b"DGST")).map_err(|e| {
+            format!("install_splat fails: the Cryptex1 ticket gives no digest for {key} (libamsupport {e}; restored_external: \"Failed to get expected digest\", then \"failed to install splat\")")
+        })?;
         let host = boot.dir.join(path);
         let f = std::fs::File::open(&host).map_err(|e| format!("{}: {e}", host.display()))?;
         let size = f.metadata().map_err(|e| e.to_string())?.len();
         let src = IpswFile(f, size);
-        {
-            use sha2::Digest as _;
-            let mut d = sha2::Sha384::new();
-            let mut buf = vec![0u8; 8 << 20];
-            let mut at = 0;
-            while at < size {
-                let n = (size - at).min(8 << 20) as usize;
-                fsops::Bytes::read_at(&src, at, &mut buf[..n])?;
-                d.update(&buf[..n]);
-                at += n as u64;
-            }
-            if d.finalize()[..] != digest[..] {
-                return Err(format!("not implemented: install_splat's {key} whose SHA-384 is not its digest (the file left written, the restore failing)"));
-            }
+        if splat_stream_matches(&src, digest)? == Some(false) {
+            return Err(format!("not implemented: install_splat's {key} whose digest is not the Cryptex1 ticket's (the file left written, the restore failing: \"digest mismatch\")"));
         }
         let writes = stdio_writes(size, SPLAT_HOST_CHUNK)?;
         if writes.len() == 1 {
@@ -1207,8 +1274,8 @@ fn install_splat(nx: &mut Nx<'_>, v: Volumes, boot: &BootObjects, now: &mut dyn 
     // The ticket: a temporary file (open 0xa02, 0666), write, fsync, the
     // rename onto its name, then the close, whose fsync writes the change
     // time the rename left in the file's memory (K 0x66a1878).
-    let tname = preboot::ticket_name()?;
-    let t = fsops::write_new_file(nx, pb, cur, SPLAT_TICKET_TEMP, 0o666, &SPLAT_TICKET, &cluster_pushes, now)?;
+    let tname = preboot::ticket_name_of(&device.tree)?;
+    let t = fsops::write_new_file(nx, pb, cur, SPLAT_TICKET_TEMP, 0o666, &device.cryptex1_ticket, &cluster_pushes, now)?;
     let rt = fsops::rename_in_dir(nx, pb, cur, SPLAT_TICKET_TEMP, &tname, t, now)?;
     fsops::write_times(nx, pb, t, rt.file, now)?;
     Ok(())
@@ -2146,9 +2213,13 @@ fn after_invert_mounts(nx: &mut Nx<'_>, v: Volumes, now: &mut dyn FnMut() -> u64
     Ok(())
 }
 
-/// What restored_external checks with libimg4 before the seal that the
-/// image cannot answer.
-const IMAGE4_CHECKS_MISSING: &str = "restored_external's Image4 checks against the AP ticket of the canonical metadata (ramrod_verify_manifest_for_mountpoint, RE@0x100058108 → RE@0x1000583e0) and of /mnt5/root_hash (tag 'isys', RE@0x100058714): TICKET_STAND_IN's ticket signs nothing, so they are not run (the files are the IPSW's, which the device's checks pass)";
+/// What restored_external checks with libimage4 before the seal that the
+/// image cannot answer: both payloads come from the host stitched to the
+/// AP ticket (RootTicketData, TICKET_STAND_IN), whose `msys` and `isys`
+/// objects are the build identity's `Ap,SystemVolumeCanonicalMetadata`
+/// and `SystemVolume`; the Cryptex1 ticket has only the `Cryptex1,`
+/// objects.
+const IMAGE4_CHECKS_MISSING: &str = "restored_external's Image4 checks of the canonical metadata (ramrod_verify_manifest_for_mountpoint, tag 'msys', RE@0x100058108) and of /mnt5/root_hash (seal_system_volume, tag 'isys', RE@0x100058714) against the AP ticket stitched to them: ramrod_get_trusted_img4_payload (RE@0x1000583e0 → RE@0x100057818) runs libimage4's img4_firmware_new (runtime _img4_runtime_restore, flags 5: the subsequent stage, the manifest attached to the payload) and img4_firmware_execute for img4_chip_select_effective_ap()'s chip; not run: the AP ticket is TICKET_STAND_IN's (the web device's root of trust signs only Cryptex1 tickets, and no owner's AP ticket is taken), and gex has no evaluation for libimage4's AP chips (image4.rs is the kext's CHIP_CRYPTEX1_BOOT_AP); the files are the IPSW's, whose digests are the build identity's (Ap,SystemVolumeCanonicalMetadata 1a9ff873..., SystemVolume dae58a3c...)";
 
 /// seal_system_volume (RE@0x10003ab6c; drafts/s27/re-seal-snap.md 3): the
 /// canonical metadata unarchived on the ramdisk's /mnt5 (tmpfs) and
@@ -2431,7 +2502,7 @@ mod tests {
         let len = f.metadata().unwrap().len();
         let image = std::sync::Arc::new(crate::darwin::udif::Udif::open(std::sync::Arc::new(super::super::HostFile(f, len))).unwrap());
         let partition = image.partition("Apple_APFS").unwrap();
-        let os = OsImage { image: std::sync::Arc::clone(&image), partition, boot: None, seal: None };
+        let os = OsImage { image: std::sync::Arc::clone(&image), partition, boot: None, seal: None, device: None };
         let size = storage::disk0_bytes();
         let dir = std::path::Path::new(&dir);
         let disk_path = dir.join(format!("gex-disk0-asr-{}", std::process::id()));
@@ -2512,7 +2583,7 @@ mod tests {
         let len = f.metadata().unwrap().len();
         let image = std::sync::Arc::new(crate::darwin::udif::Udif::open(std::sync::Arc::new(super::super::HostFile(f, len))).unwrap());
         let partition = image.partition("Apple_APFS").unwrap();
-        let os = OsImage { image: std::sync::Arc::clone(&image), partition, boot: None, seal: None };
+        let os = OsImage { image: std::sync::Arc::clone(&image), partition, boot: None, seal: None, device: None };
         let size = storage::disk0_bytes();
         let dir = std::path::Path::new(&dir);
         let disk_path = dir.join(format!("gex-inv-disk-{}", std::process::id()));
@@ -2609,7 +2680,7 @@ mod tests {
         let partition = image.partition("Apple_APFS").unwrap();
         let files = SealFiles { mtree: std::fs::read(&mtree).unwrap(), root_hash: std::fs::read(&rh).unwrap() };
         let archive = crate::darwin::aar::mtree_payload(&files.mtree).unwrap();
-        let os = OsImage { image: std::sync::Arc::clone(&image), partition, boot: None, seal: Some(files) };
+        let os = OsImage { image: std::sync::Arc::clone(&image), partition, boot: None, seal: Some(files), device: None };
         let dir = std::path::Path::new(&dir);
         let pid = std::process::id();
         let disk_path = dir.join(format!("gex-seal-disk-{pid}"));
@@ -2771,7 +2842,7 @@ mod tests {
         let len = f.metadata().unwrap().len();
         let image = std::sync::Arc::new(crate::darwin::udif::Udif::open(std::sync::Arc::new(super::super::HostFile(f, len))).unwrap());
         let partition = image.partition("Apple_APFS").unwrap();
-        let os = OsImage { image: std::sync::Arc::clone(&image), partition, boot: None, seal: None };
+        let os = OsImage { image: std::sync::Arc::clone(&image), partition, boot: None, seal: None, device: None };
         let size = storage::disk0_bytes();
         let dir = std::path::Path::new(&dir);
         let disk_path = dir.join(format!("gex-reap-disk-{}", std::process::id()));
@@ -2834,7 +2905,7 @@ mod tests {
         let len = f.metadata().unwrap().len();
         let image = std::sync::Arc::new(crate::darwin::udif::Udif::open(std::sync::Arc::new(super::super::HostFile(f, len))).unwrap());
         let partition = image.partition("Apple_APFS").unwrap();
-        let os = OsImage { image: std::sync::Arc::clone(&image), partition, boot: None, seal: None };
+        let os = OsImage { image: std::sync::Arc::clone(&image), partition, boot: None, seal: None, device: None };
         let size = storage::disk0_bytes();
         let dir = std::path::Path::new(&dir);
         let disk_path = dir.join(format!("gex-rm-disk-{}", std::process::id()));
@@ -3003,7 +3074,7 @@ mod tests {
         let len = f.metadata().unwrap().len();
         let image = std::sync::Arc::new(crate::darwin::udif::Udif::open(std::sync::Arc::new(super::super::HostFile(f, len))).unwrap());
         let partition = image.partition("Apple_APFS").unwrap();
-        let os = OsImage { image: std::sync::Arc::clone(&image), partition, boot: None, seal: None };
+        let os = OsImage { image: std::sync::Arc::clone(&image), partition, boot: None, seal: None, device: None };
         let size = storage::disk0_bytes();
         let dir = std::path::Path::new(&dir);
         let disk_path = dir.join(format!("gex-data-disk-{}", std::process::id()));
@@ -4159,6 +4230,62 @@ mod tests {
     /// rename and the close's time write; the records and the device's and
     /// host's fsck.
     #[test]
+    fn splat_streams_are_checked_by_their_digests_length() {
+        use sha2::Digest;
+        let data: Vec<u8> = (0..9000u32).map(|i| (i * 31) as u8).collect();
+        let s384 = sha2::Sha384::digest(&data).to_vec();
+        let s1 = sha1::Sha1::digest(&data).to_vec();
+        assert_eq!(splat_stream_matches(&data, &s384), Ok(Some(true)));
+        assert_eq!(splat_stream_matches(&data, &s1), Ok(Some(true)));
+        let mut other = s384.clone();
+        other[47] ^= 1;
+        assert_eq!(splat_stream_matches(&data, &other), Ok(Some(false)));
+        assert_eq!(splat_stream_matches(&data, &s1[..19]), Ok(None), "no check for another length");
+        assert_eq!(splat_stream_matches(&Vec::<u8>::new(), &sha2::Sha384::digest(b"").to_vec()), Ok(Some(true)));
+    }
+
+    #[test]
+    fn device_trees_are_expanded_as_their_im4p_says() {
+        use crate::darwin::image4::enc;
+        let tree = b"a device tree's bytes".to_vec();
+        let im4p = |comp: Option<(u64, u64)>, data: &[u8]| {
+            let mut items = vec![enc::ia5(b"IM4P"), enc::ia5(b"dtre"), enc::ia5(b"EmbeddedDeviceTrees-1"), enc::octets(data)];
+            if let Some((a, n)) = comp {
+                items.push(enc::seq(&[enc::int(a), enc::int(n)]));
+            }
+            enc::seq(&items)
+        };
+        assert_eq!(restore_device_tree(&im4p(None, &tree)).unwrap(), tree);
+        // An LZFSE stream of one uncompressed block, and its end.
+        let mut lzfse = b"bvx-".to_vec();
+        lzfse.extend_from_slice(&(tree.len() as u32).to_le_bytes());
+        lzfse.extend_from_slice(&tree);
+        lzfse.extend_from_slice(b"bvx$");
+        assert_eq!(restore_device_tree(&im4p(Some((1, tree.len() as u64)), &lzfse)).unwrap(), tree);
+        assert!(restore_device_tree(&im4p(Some((1, tree.len() as u64 + 1)), &lzfse)).is_err(), "the stream must fill the size");
+        assert!(restore_device_tree(&im4p(Some((0, tree.len() as u64)), &lzfse)).unwrap_err().starts_with("not implemented"));
+        assert!(restore_device_tree(b"\x30\x00").is_err());
+    }
+
+    /// The IPSW's DeviceTree.j120ap.im4p (GEX_TEST_DEVICE_TREE_IM4P)
+    /// expands to the boot payload's DeviceTree (GEX_DARWIN_BOOT), whose
+    /// /chosen names the Cryptex1 ticket by the unique-chip-id the device's
+    /// iBoot fills in.
+    #[test]
+    #[ignore = "needs GEX_TEST_DEVICE_TREE_IM4P (21H461's Firmware/all_flash/DeviceTree.j120ap.im4p) and GEX_DARWIN_BOOT"]
+    fn the_restore_device_tree_is_the_boots() {
+        use crate::darwin::{iokit, preboot};
+        let im4p = std::fs::read(std::env::var("GEX_TEST_DEVICE_TREE_IM4P").unwrap()).unwrap();
+        let boot = std::fs::read(format!("{}/DeviceTree", std::env::var("GEX_DARWIN_BOOT").unwrap())).unwrap();
+        let t = restore_device_tree(&im4p).unwrap();
+        assert!(t == boot, "the expanded IM4P ({} bytes) is not the boot payload's DeviceTree ({} bytes)", t.len(), boot.len());
+        let mut tree = iokit::parse(&t).unwrap();
+        assert_eq!(preboot::ticket_name_of(&tree).unwrap(), "apticket.j120ap.0.im4m");
+        iokit::fill_chosen(&mut tree, &[("unique-chip-id", 0x6890_e970_0eb4_c4bfu64.to_le_bytes().to_vec())]).unwrap();
+        assert_eq!(preboot::ticket_name_of(&tree).unwrap(), "apticket.j120ap.6890E9700EB4C4BF.im4m");
+    }
+
+    #[test]
     fn splat_files_are_written_as_the_kernel_writes_them() {
         let (Ok(dir), Ok(fsck)) = (std::env::var("GEX_TEST_SCRATCH"), std::env::var("GEX_TEST_FSCK")) else { return };
         let dir = std::path::Path::new(&dir);
@@ -4254,8 +4381,10 @@ mod tests {
         std::os::unix::fs::FileExt::read_exact_at(&sink.0, &mut b, ext[0].2 * 4096).unwrap();
         assert_eq!(&b[..574], &small[..]);
         assert!(b[574..].iter().all(|&x| x == 0));
-        // The ticket's temporary file renamed, then its close.
-        let t = fsops::write_new_file(&mut nx, vol, ROOT_INO, SPLAT_TICKET_TEMP, 0o666, &SPLAT_TICKET, &cluster_pushes, &mut now).unwrap();
+        // The ticket's temporary file renamed, then its close (a ticket of
+        // the web device's ticket's length).
+        let ticket: Vec<u8> = (0..3450u32).map(|i| (i * 7) as u8).collect();
+        let t = fsops::write_new_file(&mut nx, vol, ROOT_INO, SPLAT_TICKET_TEMP, 0o666, &ticket, &cluster_pushes, &mut now).unwrap();
         let rt = fsops::rename_in_dir(&mut nx, vol, ROOT_INO, SPLAT_TICKET_TEMP, "apticket.j120ap.0.im4m", t, &mut now).unwrap();
         fsops::write_times(&mut nx, vol, t, rt.file, &mut now).unwrap();
         assert_eq!(fsops::lookup(&mut nx, vol, ROOT_INO, "apticket.j120ap.0.im4m").unwrap(), Some(t));

@@ -128,7 +128,9 @@ fn build_identity(chip: Option<(u32, u32)>) -> Result<(PathBuf, Value)> {
     Ok((dir, id.clone()))
 }
 
-fn load(dir: &Path) -> Result<WebDevice> {
+/// The web device of directory `dir`, as a run has it: its root's
+/// certificate, identity, cryptex1 boot slot and the path of its ticket.
+pub(crate) fn load(dir: &Path) -> Result<WebDevice> {
     let ticket = dir.join(files::CRYPTEX1_TICKET);
     let ticket = ticket.exists().then(|| ticket.to_string_lossy().into_owned());
     webdevice::of_files(read(dir, files::ROOT_CERT)?, &read(dir, files::IDENTITY)?, &read(dir, files::CRYPTEX1_BOOT_SLOT)?, ticket).map_err(|e| anyhow!("{}: {e}", dir.display()))
@@ -204,28 +206,47 @@ fn roll(dir: &Path) -> Result<()> {
     show(dir)
 }
 
-/// Sign the device's Cryptex1 ticket for its current nonce, and check it
-/// as its AppleImage4 will: the SystemOS cryptex's root hash evaluated
-/// against it must authenticate.
+/// The Image4 payloads of a Cryptex1 the device's AppleImage4 evaluates
+/// against its ticket when the cryptexes are grafted: the root hashes and
+/// trust caches (the disk images are not Image4 payloads).
+const CRYPTEX1_PAYLOADS: [(&str, &[u8; 4]); 4] = [("Cryptex1,SystemVolume", b"cssy"), ("Cryptex1,SystemTrustCache", b"trcs"), ("Cryptex1,AppVolume", b"casy"), ("Cryptex1,AppTrustCache", b"trca")];
+
+/// The web device's Cryptex1 ticket for build identity `build` and its
+/// cryptex1 boot nonce hash `cnch`, as TSS signs a device's: its manifest
+/// key (from `dir`, which holds it) signs the body
+/// ([`webdevice::cryptex1_ticket`]), with 20 random bytes of the signer's
+/// own. Then checked as the device's AppleImage4 will check it: each
+/// Image4 payload the ticket has an object for, read from `ipsw` (the
+/// extracted IPSW) at the identity's paths, must authenticate on the
+/// device `w`.
+pub(crate) fn signed_cryptex1_ticket(dir: &Path, w: &WebDevice, build: &Value, cnch: &[u8], ipsw: &Path) -> Result<Vec<u8>> {
+    let manifest = Key(RsaPrivateKey::from_pkcs1_der(&read(dir, files::MANIFEST_KEY)?).map_err(|e| anyhow!("{}: {e}", dir.join(files::MANIFEST_KEY).display()))?);
+    let leaf = read(dir, files::MANIFEST_CERT)?;
+    let ticket = webdevice::cryptex1_ticket(&w.identity, build, cnch, &random::<20>(), &manifest, &leaf).map_err(|e| anyhow!("{e}"))?;
+    for (key, code) in CRYPTEX1_PAYLOADS {
+        let path = build
+            .get("Manifest")
+            .and_then(|m| m.get(key))
+            .and_then(|c| c.get("Info"))
+            .and_then(|i| i.get("Path"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("the build identity has no {key} path"))?;
+        let payload = std::fs::read(ipsw.join(path)).with_context(|| format!("reading {}", ipsw.join(path).display()))?;
+        match image4::execute(image4::fourcc(code), &payload, &ticket, &webdevice::DeviceEnv(w)) {
+            Outcome::Authenticated(_) => {}
+            other => bail!("the signed ticket does not authenticate {key} on this device: {other:?}"),
+        }
+    }
+    Ok(ticket)
+}
+
+/// Sign the device's Cryptex1 ticket for its current nonce, checked as its
+/// AppleImage4 will check it ([`signed_cryptex1_ticket`]).
 fn sign(dir: &Path) -> Result<()> {
     let w = load(dir)?;
     let (restore, build) = build_identity(Some((w.identity.chip, w.identity.board)))?;
-    let manifest = Key(RsaPrivateKey::from_pkcs1_der(&read(dir, files::MANIFEST_KEY)?).map_err(|e| anyhow!("{}: {e}", dir.join(files::MANIFEST_KEY).display()))?);
-    let leaf = read(dir, files::MANIFEST_CERT)?;
     let cnch = nonce_hash(&w)?;
-    let ticket = webdevice::cryptex1_ticket(&w.identity, &build, &cnch, &random::<20>(), &manifest, &leaf).map_err(|e| anyhow!("{e}"))?;
-    let path = build
-        .get("Manifest")
-        .and_then(|m| m.get("Cryptex1,SystemVolume"))
-        .and_then(|c| c.get("Info"))
-        .and_then(|i| i.get("Path"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("the build identity has no Cryptex1,SystemVolume path"))?;
-    let root_hash = std::fs::read(restore.join(path)).with_context(|| format!("reading {}", restore.join(path).display()))?;
-    match image4::execute(image4::fourcc(b"cssy"), &root_hash, &ticket, &webdevice::DeviceEnv(&w)) {
-        Outcome::Authenticated(_) => {}
-        other => bail!("the signed ticket does not authenticate the SystemOS cryptex's root hash on this device: {other:?}"),
-    }
+    let ticket = signed_cryptex1_ticket(dir, &w, &build, &cnch, &restore)?;
     replace(&dir.join(files::CRYPTEX1_TICKET), &ticket, 0o644)?;
     println!("Cryptex1 ticket {} ({} bytes) for nonce hash {}", dir.join(files::CRYPTEX1_TICKET).display(), ticket.len(), hex(&cnch));
     Ok(())

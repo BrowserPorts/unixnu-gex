@@ -2099,8 +2099,14 @@ impl Kernel {
     /// (0xfffffff005a94a9c): the ignition blob's callers alone, else EPERM;
     /// `sysctl_handle_opaque` of the failure blob (its 0xa0 bytes out, and
     /// a new value of as many in), whose error is the call's; then, read or
-    /// written, the blob's NVRAM keys go to IODTNVRAM and NVRAM is synced
-    /// ([`super::img4`]), which is not modelled: no NVRAM variable store.
+    /// written, the blob's NVRAM keys go to IODTNVRAM ([`super::img4`]):
+    /// its runtime (0xfffffff005a92c60) waits for the IONVRAM resource and
+    /// IODTNVRAM, then gives each key `setProperties` of a one-key
+    /// dictionary of an OSData of its bytes, in the calling task (whose
+    /// permission IODTNVRAM checks; a failure is only logged), and forces
+    /// a sync (0xfffffff005a92f70, type 3: `setProperty` of
+    /// `IONVRAM-FORCESYNCNOW-PROPERTY` to the symbol "1", its result not
+    /// looked at).
     fn darwin_sysctl_ignition_failure_blob(&mut self, m: &mut GuestMem<'_>, req: &mut SysctlReq) -> Result<(), Errno> {
         if !self.darwin_task_entitled(super::img4::IGNITION_BLOB_ENTITLEMENT) && self.pid != 1 {
             return Err(Errno::EPERM);
@@ -2112,13 +2118,21 @@ impl Kernel {
             super::img4::set_ignition_failure_blob(b.try_into().expect("the failure blob's size"));
         }
         let blob = super::img4::ignition_failure_blob();
-        let keys: Vec<String> = super::img4::ignition_failure_nvram(&blob).into_iter().map(|(k, v)| format!("{k} ({} bytes)", v.len())).collect();
-        self.darwin_unimplemented(format!(
-            "AppleImage4's NVRAM write of the ignition failure blob ({}): IODTNVRAM::setProperties of {}, then its forced sync (IONVRAM-FORCESYNCNOW-PROPERTY); no NVRAM variable store is modelled (IODTNVRAM and its format handler, over the device's NVRAM contents)",
-            super::img4::ignition_failure_summary(&blob),
-            keys.join(", ")
-        ));
-        Err(Errno::EOPNOTSUPP)
+        let task = self.darwin_nvram_task();
+        let wrote = super::nvram::with(|n| {
+            use super::nvram::{key, Given, Uptime, Value};
+            for (k, v) in super::img4::ignition_failure_nvram(&blob) {
+                let _ = n.set_property_clocked(&task, k.as_bytes(), &Given::Value(Value::Data(v)), None, &Uptime);
+            }
+            let _ = n.set_property_clocked(&task, key::FORCE_SYNC_NOW, &Given::Value(Value::Symbol(b"1".to_vec())), None, &Uptime);
+        });
+        if let Err(why) = wrote {
+            let keys: Vec<String> = super::img4::ignition_failure_nvram(&blob).into_iter().map(|(k, v)| format!("{k} ({} bytes)", v.len())).collect();
+            self.darwin_unimplemented(format!("AppleImage4's NVRAM write of the ignition failure blob ({}): IODTNVRAM::setProperties of {}, then its forced sync: {why}", super::img4::ignition_failure_summary(&blob), keys.join(", ")));
+            return Err(Errno::EOPNOTSUPP);
+        }
+        self.darwin_nvram_report();
+        Ok(())
     }
 
     /// `sysctl_dyld_flags`: launchd's to set, and the commpage says it.

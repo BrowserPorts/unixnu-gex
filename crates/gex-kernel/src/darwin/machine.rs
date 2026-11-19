@@ -41,7 +41,9 @@
 //! its panic log namespace, NS 7) are not modelled: [`Panic::UNMODELLED`]
 //! says so with every panic. The kernel writes no NVRAM variable on a
 //! panic or a restart (the arm `SavePanicInfo` writes the panic region);
-//! the boot-args NVRAM keeps for the next boot are this boot's (none).
+//! a halt or a restart syncs IODTNVRAM (`handlePlatformHaltRestart`'s
+//! `PESyncNVRAM`), which writes the NVRAM namespace when a variable changed
+//! since its last write ([`super::nvram`]); a panic does not.
 
 use std::sync::{Mutex, OnceLock};
 

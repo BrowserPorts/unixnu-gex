@@ -344,6 +344,7 @@ impl Kernel {
                 if self.dtask.strict && self.dtask.stop.is_some() {
                     return Err(Errno::EIO);
                 }
+                self.darwin_nvram_halt_restart();
                 machine::end(self.darwin_machine_event(host_reboot_kind(options), Cause::Reboot { howto }))
             }
         }
@@ -352,6 +353,7 @@ impl Kernel {
     /// `host_reboot(host_priv, options)` on the host's privileged port
     /// ([`host_reboot_kind`]): the machine's end.
     pub(crate) fn darwin_host_reboot(&mut self, options: u32) -> ! {
+        self.darwin_nvram_halt_restart();
         machine::end(self.darwin_machine_event(host_reboot_kind(options), Cause::HostReboot { options }))
     }
 

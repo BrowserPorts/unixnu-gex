@@ -103,6 +103,9 @@ pub mod op {
     pub const PROCESS_LEGACY_CODESIGNING_STATUS_SET: usize = 142;
     pub const NETWORK_INBOUND: usize = 110;
     pub const NVRAM_GET: usize = 115;
+    pub const NVRAM_DELETE: usize = 114;
+    pub const NVRAM_SET: usize = 116;
+    pub const BOOT_ARG_SET: usize = 3;
     pub const NETWORK_BIND: usize = 111;
     pub const NETWORK_OUTBOUND: usize = 112;
     pub const SIGNAL: usize = 146;
@@ -196,8 +199,12 @@ pub struct SbArgs {
     pub number: u32,
     pub number2: u32,
     /// `args[0xd8]` as a string (a MAC policy's name, a Mach service's, a
-    /// POSIX IPC object's, a preference domain...).
+    /// POSIX IPC object's, a preference domain, an NVRAM variable's or a
+    /// boot argument's name...).
     pub string: Option<Vec<u8>>,
+    /// A boot argument's value (`args[0xe8]`, after its `=`), none
+    /// without one.
+    pub value: Option<Vec<u8>>,
     /// A Mach service name's: a global name (`args[0xe0]`), an XPC
     /// service's (`args[0xe1]`).
     pub global: bool,
@@ -693,6 +700,54 @@ impl Facts for KernelFacts<'_> {
     }
 }
 
+/// A boot argument `boot-args` names: its name and the value after its
+/// `=`, if any.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BootArg {
+    pub name: Vec<u8>,
+    pub value: Option<Vec<u8>>,
+}
+
+/// Sandbox's split of a `boot-args` string (0xfffffff006a00724, on its
+/// copy): words separated by NUL, tab or space, each a name up to an `=`
+/// or a separator and, after an `=`, a value up to the next separator.
+/// The words up to the first malformed one (a name that is empty, as a
+/// word that starts with `=` has), and whether the string had none.
+pub fn boot_arg_words(s: &[u8]) -> (Vec<BootArg>, bool) {
+    let sep = |c: u8| matches!(c, 0 | b'\t' | b' ');
+    let end = s.len();
+    let mut out = Vec::new();
+    let mut at = 0;
+    loop {
+        while at < end && sep(s[at]) {
+            at += 1;
+        }
+        if at >= end {
+            return (out, true);
+        }
+        let start = at;
+        while at < end && !sep(s[at]) && s[at] != b'=' {
+            at += 1;
+        }
+        if at == start {
+            return (out, false);
+        }
+        let name = s[start..at].to_vec();
+        let value = if at < end && s[at] == b'=' {
+            at += 1;
+            let v = at;
+            while at < end && !sep(s[at]) {
+                at += 1;
+            }
+            Some(s[v..at].to_vec())
+        } else {
+            None
+        };
+        out.push(BootArg { name, value });
+        at += 1;
+    }
+}
+
 /// The Sandbox's platform profile, as the boot loaded it.
 static PLATFORM: std::sync::OnceLock<Option<(Vec<u8>, sandbox::Profile)>> = std::sync::OnceLock::new();
 
@@ -1091,6 +1146,75 @@ impl Kernel {
         for key in keys {
             let a = SbArgs { kind: sandbox::kind::IOKIT, iokit: Some(sandbox::IoKitObject { property: Some(key.clone()), ..entry.clone() }), ..Default::default() };
             let r = self.darwin_sb_evaluate(op::IOKIT_SET_PROPERTIES, &a);
+            if r != 0 {
+                return r;
+            }
+        }
+        0
+    }
+
+    /// Sandbox's set-properties hook for the NVRAM entry (0xfffffff0069ff5cc
+    /// when 0xfffffff0069f2940 says the entry is IODTNVRAM's or an
+    /// IODTNVRAMVariables): properties that are no dictionary pass; else
+    /// each key in the dictionary's order (0xfffffff0069f272c, the key's C
+    /// string) goes to 0xfffffff006a00724, the first refusal ending it:
+    /// - `IONVRAM-SYNCNOW-PROPERTY`: nothing asked.
+    /// - `IONVRAM-DELETE-PROPERTY`: nvram-delete of its value's string
+    ///   (`args[0xd8]`); a value that is no string is not asked about.
+    /// - `boot-args` with a string value: its words (separated by NUL, tab
+    ///   or space) each asked as boot-arg-set (kind 0x12, quiet: the name,
+    ///   its length and the value after an `=`, [`boot_arg_words`]); all of
+    ///   them allowed is the answer, else (or for a word that starts with
+    ///   `=`, or no string) nvram-set of the key, its argument block's flags
+    ///   with bit 1 (which only changes its report).
+    /// - Any other key: nvram-set of it (`args[0xd8]`, the value at
+    ///   `args[0xf8]`).
+    pub(crate) fn darwin_mac_check_nvram_set_properties(&mut self, g: &super::osserialize::Graph, obj: super::osserialize::Id) -> u32 {
+        use super::osserialize::Obj;
+        let Obj::Dict(entries) = g.get(obj) else { return 0 };
+        let entries = entries.clone();
+        for (key, v) in entries {
+            let key = &key[..key.iter().position(|&c| c == 0).unwrap_or(key.len())];
+            let string = match g.get(v) {
+                Obj::String(s) | Obj::Symbol(s) => Some(s[..s.iter().position(|&c| c == 0).unwrap_or(s.len())].to_vec()),
+                _ => None,
+            };
+            let set = |k: &mut Kernel| {
+                let a = SbArgs { kind: sandbox::kind::NVRAM, string: Some(key.to_vec()), ..Default::default() };
+                k.darwin_sb_evaluate(op::NVRAM_SET, &a)
+            };
+            let r = if key == b"IONVRAM-SYNCNOW-PROPERTY" {
+                0
+            } else if key == b"IONVRAM-DELETE-PROPERTY" {
+                match string {
+                    Some(name) => {
+                        let a = SbArgs { kind: sandbox::kind::NVRAM, string: Some(name), ..Default::default() };
+                        self.darwin_sb_evaluate(op::NVRAM_DELETE, &a)
+                    }
+                    None => 0,
+                }
+            } else if key == b"boot-args" {
+                match string.as_deref().map(boot_arg_words) {
+                    Some((words, clean)) => {
+                        let mut allowed = true;
+                        for w in words {
+                            let a = SbArgs { kind: sandbox::kind::BOOT_ARG, quiet: true, string: Some(w.name), value: w.value, ..Default::default() };
+                            if self.darwin_sb_evaluate(op::BOOT_ARG_SET, &a) != 0 {
+                                allowed = false;
+                                break;
+                            }
+                        }
+                        if allowed && clean {
+                            0
+                        } else {
+                            set(self)
+                        }
+                    }
+                    None => set(self),
+                }
+            } else {
+                set(self)
+            };
             if r != 0 {
                 return r;
             }

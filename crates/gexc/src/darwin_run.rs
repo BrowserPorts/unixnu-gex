@@ -129,6 +129,9 @@ pub fn run(mut ra: RunArgs, bytes: &[u8]) -> Result<ExitCode> {
     // The web device's directory (gexc darwin-web-device): the device the
     // system boots as, with GEX_DARWIN_CRYPTEX1_TICKET=web-device.
     ra.opts.darwin_web_device = std::env::var_os("GEX_DARWIN_WEB_DEVICE").filter(|v| !v.is_empty()).map(PathBuf::from);
+    // A device's NVRAM namespace image, dumped from it: the NVRAM the
+    // system boots with when it is not the web device.
+    ra.opts.darwin_nvram = std::env::var_os("GEX_DARWIN_NVRAM").filter(|v| !v.is_empty()).map(PathBuf::from);
     // Its commpage is folded to its alias at the top of the memory in
     // everything translated for it, which needs the addresses its code
     // builds in registers seen as the constants they are; and its tables

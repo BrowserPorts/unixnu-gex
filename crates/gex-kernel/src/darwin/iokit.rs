@@ -92,6 +92,10 @@ pub fn superclasses(class: &str) -> &'static [&'static str] {
         "IOPlatformExpertDevice" => &["IOPlatformExpertDevice", "IOService", "IORegistryEntry"],
         "IORegistryEntry" => &["IORegistryEntry"],
         "IOUserClient" => &["IOUserClient", "IOService", "IORegistryEntry"],
+        NVRAM_CLASS => &[NVRAM_CLASS, "IOService", "IORegistryEntry"],
+        NVRAM_VARIABLES => &[NVRAM_VARIABLES, "IOService", "IORegistryEntry"],
+        NVRAM_DIAGS => &[NVRAM_DIAGS, "IOService", "IORegistryEntry"],
+        NVRAM_NOTIFIER => &[NVRAM_NOTIFIER, "IOService", "IORegistryEntry"],
         "AppleAPFSUserClient" => &["AppleAPFSUserClient", "IOUserClient", "IOService", "IORegistryEntry"],
         "IOSurfaceRoot" | "IOSurfaceRootUserClient" => super::iosurface::superclasses(class),
         super::iopower::ROOT_DOMAIN | super::iopower::ROOT_PARENT | super::iopower::CONNECTION => super::iopower::superclasses(class),
@@ -141,9 +145,10 @@ pub fn parse(b: &[u8]) -> Result<Vec<Node>, String> {
 /// Install the device tree the boot payload carries, with what the boot
 /// puts in `/chosen` (`chosen`: each property set, added when the tree
 /// has no placeholder of it), and the services published over it
-/// ([`build_with`]).
-pub fn set_tree(b: &[u8], chosen: &[(&str, Vec<u8>)]) -> Result<(), String> {
-    let t = build_with(b, chosen)?;
+/// ([`build_with`]); `nvram` is whether IODTNVRAM's start made its system
+/// region's service, none when no NVRAM is modelled ([`add_nvram`]).
+pub fn set_tree(b: &[u8], chosen: &[(&str, Vec<u8>)], nvram: Option<bool>) -> Result<(), String> {
+    let t = build_nvram(b, chosen, nvram)?;
     let _ = TREE.set(t);
     Ok(())
 }
@@ -177,6 +182,12 @@ pub fn build(b: &[u8]) -> Result<Vec<Node>, String> {
 /// display's and the storage's ([`super::storagestack`]), the resources nub
 /// and IOSurfaceRoot, the power plane's links, and the registry's root.
 pub fn build_with(b: &[u8], chosen: &[(&str, Vec<u8>)]) -> Result<Vec<Node>, String> {
+    build_nvram(b, chosen, None)
+}
+
+/// [`build_with`], with IODTNVRAM's services as its start made them
+/// ([`add_nvram`]).
+pub fn build_nvram(b: &[u8], chosen: &[(&str, Vec<u8>)], nvram: Option<bool>) -> Result<Vec<Node>, String> {
     let mut t = parse(b)?;
     fill_chosen(&mut t, chosen)?;
     super::iodt::alloc(&mut t)?;
@@ -191,6 +202,7 @@ pub fn build_with(b: &[u8], chosen: &[(&str, Vec<u8>)]) -> Result<Vec<Node>, Str
         }
     }
     super::storagestack::add(&mut t, io);
+    add_nvram(&mut t, nvram);
     let resources = super::platform::add_resources(&mut t);
     super::iosurface::add_service(&mut t, resources);
     if let Some(rd) = rd {
@@ -204,6 +216,43 @@ pub fn build_with(b: &[u8], chosen: &[(&str, Vec<u8>)]) -> Result<Vec<Node>, Str
 /// tree hangs from it in the `IODeviceTree` plane.
 fn add_root(t: &mut Vec<Node>) {
     t.push(Node { name: "Root".to_string(), props: Vec::new(), class: "IORegistryEntry", service_props: Vec::new(), parent: None, children: vec![0], kernel_only: false, nub: None, dt: None, table: Table::Drivers, power: None });
+}
+
+/// IODTNVRAM's class, and those of the services its start attaches to it.
+pub const NVRAM_CLASS: &str = "IODTNVRAM";
+pub const NVRAM_VARIABLES: &str = "IODTNVRAMVariables";
+pub const NVRAM_DIAGS: &str = "IODTNVRAMDiags";
+pub const NVRAM_NOTIFIER: &str = "IODTNVRAMPlatformNotifier";
+
+/// `IOPlatformExpertDevice::createNVRAM`: an IODTNVRAM made of `/options`
+/// (`init(options, gIODTPlane)`: it takes the entry's place in the device
+/// tree, and its property table is emptied) and attached to the platform
+/// expert device. Its start attaches, in order, its diagnostics
+/// (`IODTNVRAMDiags`, named as its class), its platform notifier (its
+/// "IOPlatformWakeAction" a 32-bit 1000), the system region's variables
+/// ("options-system", only when the image's system region held any:
+/// `system`) and the common ones' ("options-common"), each an
+/// `IODTNVRAMVariables`. With no NVRAM modelled (`system` none) the
+/// services are not made, and asking for them is reported.
+fn add_nvram(t: &mut Vec<Node>, system: Option<bool>) {
+    let Ok(Some(o)) = from_path(t, "IODeviceTree:/options") else { return };
+    t[o as usize].nub = Some((NVRAM_CLASS, 0));
+    t[o as usize].table = Table::Complete;
+    let Some(system) = system else { return };
+    let service = |t: &mut Vec<Node>, name: &str, class: &'static str, props: Vec<(String, Prop)>| {
+        t.push(Node { name: name.to_string(), props: Vec::new(), class, service_props: props, parent: Some(o), children: Vec::new(), kernel_only: false, nub: None, dt: None, table: Table::Complete, power: None });
+    };
+    service(t, NVRAM_DIAGS, NVRAM_DIAGS, Vec::new());
+    service(t, NVRAM_NOTIFIER, NVRAM_NOTIFIER, vec![("IOPlatformWakeAction".to_string(), Prop::Num(1000, 32))]);
+    if system {
+        service(t, "options-system", NVRAM_VARIABLES, Vec::new());
+    }
+    service(t, "options-common", NVRAM_VARIABLES, Vec::new());
+}
+
+/// IODTNVRAM's services, in the order its start attached them.
+pub fn nvram_services(t: &[Node], options: u32) -> Vec<u32> {
+    t.iter().enumerate().filter(|(_, n)| n.parent == Some(options) && matches!(n.class, NVRAM_DIAGS | NVRAM_NOTIFIER | NVRAM_VARIABLES)).map(|(i, _)| i as u32).collect()
 }
 
 /// Whether the kernel sets the root entry's property `name`: the planes
@@ -272,6 +321,10 @@ pub fn links(t: &[Node], i: u32, plane: Plane, parents: bool) -> Result<Vec<u32>
             (Plane::DeviceTree, false) => Ok(n.children.iter().copied().chain(dt_children()).collect()),
             (Plane::Service, true) => provider(t, i).map(|p| p.into_iter().collect()),
             (Plane::Service, false) if i == 0 => Err("the platform expert device's children in the IOService plane (its drivers)".to_string()),
+            (Plane::Service, false) if n.nub.is_some_and(|(c, _)| c == NVRAM_CLASS) => match nvram_services(t, i) {
+                s if !s.is_empty() => Ok(s),
+                _ => Err(format!("IODTNVRAM's services on {} ({})", n.name, super::nvram::NO_IMAGE)),
+            },
             (Plane::Service, false) if n.nub.is_some() => Err(format!("the drivers matched on {} (its children in the IOService plane)", n.name)),
             (Plane::Service, false) => Err(format!("whether the platform made {} a nub in the IOService plane", n.name)),
         };
@@ -370,6 +423,10 @@ pub fn properties_missing(t: &[Node], i: u32) -> Option<String> {
 /// values in place of their keys.
 pub fn properties(t: &[Node], i: u32) -> Vec<(String, Prop)> {
     let Some(n) = t.get(i as usize) else { return Vec::new() };
+    // IODTNVRAM emptied the table it took over.
+    if n.nub.is_some_and(|(c, _)| c == NVRAM_CLASS) {
+        return Vec::new();
+    }
     let mut out: Vec<(String, Prop)> = dt_table(n).map(|(k, v)| (k.clone(), Prop::Data(if n.kernel_only { Vec::new() } else { v.clone() }))).collect();
     for (k, v) in &n.service_props {
         match out.iter_mut().find(|(o, _)| o == k) {
@@ -529,6 +586,11 @@ pub fn service_prop<'a>(n: &'a Node, name: &str) -> Option<&'a Prop> {
 /// ([`property_unknown`]).
 pub fn lookup(t: &[Node], i: u32, name: &str) -> Result<Option<Vec<u8>>, String> {
     let Some(node) = t.get(i as usize) else { return Ok(None) };
+    // IODTNVRAM's and its variables' services' copyProperty answers for the
+    // task asking ([`super::nvram`]), which this has not.
+    if matches!(node.nub, Some((NVRAM_CLASS, _))) || matches!(node.class, NVRAM_VARIABLES | NVRAM_DIAGS) {
+        return Err(format!("the {} property {name:?} without the task asking for it (IODTNVRAM's copyProperty)", self::name(t, i)));
+    }
     if let Some(what) = super::storagestack::property_override(t, i, name).or_else(|| super::platform::property_override(t, i, name)) {
         return Err(what);
     }
@@ -559,14 +621,20 @@ pub fn lookup(t: &[Node], i: u32, name: &str) -> Result<Option<Vec<u8>>, String>
 /// `allowed` (the MAC check of that entry) refuses. The value, and whether
 /// a refusal passed one over (kIOReturnNotPermitted rather than
 /// kIOReturnNotFound when none is found).
-pub fn search(t: &[Node], i: u32, plane: Plane, options: u32, name: &str, mut allowed: impl FnMut(u32) -> bool) -> Result<(Option<Vec<u8>>, bool), String> {
-    if let Some(v) = lookup(t, i, name)? {
+pub fn search(t: &[Node], i: u32, plane: Plane, options: u32, name: &str, allowed: impl FnMut(u32) -> bool) -> Result<(Option<Vec<u8>>, bool), String> {
+    search_with(t, i, plane, options, |e| lookup(t, e, name), allowed)
+}
+
+/// [`search`], each entry's property found by `look` (the serialized
+/// value or none).
+pub fn search_with(t: &[Node], i: u32, plane: Plane, options: u32, mut look: impl FnMut(u32) -> Result<Option<Vec<u8>>, String>, mut allowed: impl FnMut(u32) -> bool) -> Result<(Option<Vec<u8>>, bool), String> {
+    if let Some(v) = look(i)? {
         return Ok((Some(v), false));
     }
     let mut it = RegistryIter::new(i, plane, options);
     let mut refused = false;
     while let Some(e) = it.next(t)? {
-        let Some(v) = lookup(t, e, name)? else { continue };
+        let Some(v) = look(e)? else { continue };
         if !allowed(e) {
             refused = true;
             continue;
@@ -1291,10 +1359,11 @@ pub fn sb_client(c: &UserClient) -> super::sandbox::IoKitObject {
     super::sandbox::IoKitObject { chains, usb_class: num("bDeviceClass"), usb_subclass: num("bDeviceSubClass"), ..Default::default() }
 }
 
-/// Whether entry `i` is the NVRAM's (IODTNVRAM, which the platform expert
-/// publishes on `/options`: `createNVRAM`).
+/// Whether entry `i` is the NVRAM's as Sandbox asks (0xfffffff0069f2940:
+/// an IODTNVRAM, which the platform expert publishes on `/options`, or an
+/// IODTNVRAMVariables by its class name).
 pub fn is_nvram(i: u32) -> bool {
-    from_path(tree(), "IODeviceTree:/options").ok().flatten() == Some(i)
+    matches!(class(tree(), i), Ok(NVRAM_CLASS | NVRAM_VARIABLES))
 }
 
 /// The client's `clientClose`. A framebuffer client's may sleep in the
@@ -1464,6 +1533,9 @@ pub fn tree() -> &'static [Node] {
 /// plane whose entries are not here.
 pub fn from_path(tree: &[Node], path: &str) -> Result<Option<u32>, String> {
     let Some((plane, rest)) = path.split_once(':') else { return Err(format!("a registry path with no plane: {path}")) };
+    if plane == "IOService" {
+        return service_path(tree, path, rest);
+    }
     if plane != "IODeviceTree" {
         return Err(format!("the {plane} plane ({path})"));
     }
@@ -1479,6 +1551,39 @@ pub fn from_path(tree: &[Node], path: &str) -> Result<Option<u32>, String> {
         }
     }
     Ok(Some(at))
+}
+
+/// `IORegistryEntry::fromPath` in the IOService plane, for what of it is
+/// known here: an absolute path starts at the registry root's first child
+/// there (`getChildEntry`), the platform expert device (StartIOKit
+/// attaches it before `setPlatform` attaches IOResources), and each
+/// component is the child `getChildFromComponent` finds by its name.
+/// Of the platform expert device's children only IODTNVRAM (`options`,
+/// `createNVRAM`'s attach) is known, and IODTNVRAM's are all known; a
+/// path that does not reach an entry (a residual left) finds none.
+fn service_path(tree: &[Node], path: &str, rest: &str) -> Result<Option<u32>, String> {
+    let unknown = || Err(format!("the IOService plane ({path})"));
+    let Some(rest) = rest.strip_prefix('/') else { return unknown() };
+    if tree.is_empty() {
+        return Ok(None);
+    }
+    let parts: Vec<&str> = rest.split('/').collect();
+    if parts.iter().any(|p| p.is_empty() || p.contains('@') || p.contains(':')) {
+        return unknown();
+    }
+    let options = match from_path(tree, "IODeviceTree:/options")? {
+        Some(o) if matches!(tree[o as usize].nub, Some((NVRAM_CLASS, _))) => o,
+        _ => return unknown(),
+    };
+    match parts.as_slice() {
+        ["options"] => Ok(Some(options)),
+        ["options", child] => match links(tree, options, Plane::Service, false) {
+            Ok(kids) => Ok(kids.into_iter().find(|&k| tree[k as usize].name == *child)),
+            Err(what) => Err(what),
+        },
+        ["options", _, ..] => Ok(None),
+        _ => unknown(),
+    }
 }
 
 /// `OSData::serialize` into OSSerializeBinary: the signature, then the

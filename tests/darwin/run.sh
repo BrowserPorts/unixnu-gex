@@ -218,6 +218,31 @@ with_disk0() {
     return $ran
 }
 
+# with_web_device CMD [ARGS...]: CMD booting as a copy of the web device
+# (GEX_TEST_WEB_DEVICE) made for it beside that directory, of the files a
+# run reads (its root's certificate, identity, nonce slot, Cryptex1 ticket
+# and NVRAM image, not its keys), so that what the run writes to its NVRAM
+# stays in the copy; WEBDEV names the copy while CMD runs, and the copy
+# is removed after unless KEEP_WEBDEV is set (the caller removes it).
+with_web_device() {
+    WEBDEV=$(mktemp -d "$(dirname "$GEX_TEST_WEB_DEVICE")/.gex-webdev-$$.XXXXXX") || return 1
+    for f in root.der device.plist nonce-cryptex1-boot.slot cryptex1.im4m nvram.bin; do
+        [ -f "$GEX_TEST_WEB_DEVICE/$f" ] && cp -p "$GEX_TEST_WEB_DEVICE/$f" "$WEBDEV/"
+    done
+    GEX_DARWIN_WEB_DEVICE=$WEBDEV GEX_DARWIN_CRYPTEX1_TICKET=web-device "$@"
+    ran=$?
+    [ -n "${KEEP_WEBDEV:-}" ] || rm -rf "$WEBDEV"
+    return $ran
+}
+if [ -n "${GEX_TEST_WEB_DEVICE:-}" ]; then
+    for d in "$(dirname "$GEX_TEST_WEB_DEVICE")"/.gex-webdev-*; do
+        [ -d "$d" ] || continue
+        owner=${d##*/.gex-webdev-}
+        kill -0 "${owner%%.*}" 2>/dev/null && continue
+        rm -rf "$d"
+    done
+fi
+
 fail=0
 as=
 overlay=
@@ -468,9 +493,45 @@ hello from /var/tmp/gex-exec-fat with 1 argument" 0
             fi
         else
             ecid=$("$GEXC" darwin-web-device show "$GEX_TEST_WEB_DEVICE" | sed -n 's/^ECID //p')
-            export GEX_DARWIN_WEB_DEVICE="$GEX_TEST_WEB_DEVICE" GEX_DARWIN_CRYPTEX1_TICKET=web-device
-            check_root ignition "ignition J120AP ecid $ecid chip 8011 level 0 version \"\"" 0
-            unset GEX_DARWIN_WEB_DEVICE GEX_DARWIN_CRYPTEX1_TICKET
+            with_web_device check_root ignition "ignition J120AP ecid $ecid chip 8011 level 0 version \"\"" 0
+        fi ;;
+    # The NVRAM variables (IODTNVRAM), on a copy of the web device whose
+    # NVRAM is its factory one: as root, then as a user. The root run's
+    # forced sync leaves its variables in the copy's NVRAM image, a valid
+    # version 2 bank.
+    nvram)
+        if [ -z "${GEX_TEST_WEB_DEVICE:-}" ]; then
+            if [ "$named" -gt 0 ]; then
+                echo "FAIL nvram: no GEX_TEST_WEB_DEVICE (set it)"
+                fail=1
+            else
+                echo "SKIP nvram (set GEX_TEST_WEB_DEVICE)"
+            fi
+        else
+            KEEP_WEBDEV=1 with_web_device check_root_as 0:0 nvram "nvram ok" 0 root
+            if [ -d "${WEBDEV:-}" ]; then
+                if ! python3 -I - "$WEBDEV/nvram.bin" <<'EOF2'
+import struct, sys
+b = open(sys.argv[1], 'rb').read()
+def adler(d):
+    a, c = 1, 0
+    for x in d:
+        a = (a + x) % 65521
+        c = (c + a) % 65521
+    return (c << 16) | a
+ok = len(b) == 0x2000 and b[4:10] == b'2nvram' and struct.unpack_from('<I', b, 16)[0] == adler(b[20:])
+for v in (b'boot-args=-v debug=0x14e\0', b'gex-synced=1\0', b'root-live-fs=1\0'):
+    ok = ok and v in b[48:]
+ok = ok and b'gex-data=' not in b and b'gex-tool=' not in b
+sys.exit(0 if ok else 1)
+EOF2
+                then
+                    echo "FAIL nvram: the web device's NVRAM image after the run lacks what the run synced"
+                    fail=1
+                fi
+                rm -rf "$WEBDEV"
+            fi
+            with_web_device check_root_as 501:501 nvram "nvram user ok" 0 user
         fi ;;
     kernproc) check_root kernproc "kernproc ok" 0 ;;
     vmregion) check_root vmregion "vmregion ok" 0 ;;
@@ -786,7 +847,7 @@ if [ "$named" -gt 0 ]; then
         run "$p"
     done
 else
-    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate thinfo tasksuspend portrefs crosstask spawnports taskname taskreg procfind debugport excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl iokit storagereg ioreg accel accelr metalwire metal iosurface iosurfacex iosurfacesplash iosurfacexpreboard iogpudev iomfb iomfbmain xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts evsock pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit sbxinit sbxexec sbxkill hostspecial sbxmask sbxnet sbxiokit sbxpriv sbxfile sbxscrub cfrunloop xpc-anon layout overlay stackfb launchcon shregion console owners apfsroles disknodes diskio fsfreeze fmount mntupdate fsstatwait ignition graftdmg tcload inet6 rusage vmshare remap vmwrite freezer ment ubcmap purgeable mentreuse mapfirst ignitionweb crashpanic crashpanic-exit crashpanic-onexit crashpanic-deadline crashpanic-crash crashpanic-abort crashpanic-terminate crashpanic-spawnfail rebootcall rebootcall-panic rebootcall-halt rebootcall-restart rebootcall-hostrestart rebootcall-upsdelay rebootcall-hostupsdelay rebootcall-full rebootcall-fullhalt corpse corpsefork; do
+    for p in hello-static bsd-carry commpage exclusive-pair aes hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate thinfo tasksuspend portrefs crosstask spawnports taskname taskreg procfind debugport excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl iokit storagereg ioreg accel accelr metalwire metal iosurface iosurfacex iosurfacesplash iosurfacexpreboard iogpudev iomfb iomfbmain xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts evsock pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit sbxinit sbxexec sbxkill hostspecial sbxmask sbxnet sbxiokit sbxpriv sbxfile sbxscrub cfrunloop xpc-anon layout overlay stackfb launchcon shregion console owners apfsroles disknodes diskio fsfreeze fmount mntupdate fsstatwait ignition graftdmg tcload inet6 rusage vmshare remap vmwrite freezer ment ubcmap purgeable mentreuse mapfirst ignitionweb nvram crashpanic crashpanic-exit crashpanic-onexit crashpanic-deadline crashpanic-crash crashpanic-abort crashpanic-terminate crashpanic-spawnfail rebootcall rebootcall-panic rebootcall-halt rebootcall-restart rebootcall-hostrestart rebootcall-upsdelay rebootcall-hostupsdelay rebootcall-full rebootcall-fullhalt corpse corpsefork; do
         run "$p"
     done
 fi

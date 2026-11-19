@@ -8,8 +8,8 @@
 // its nub there;
 // disk0 matched by its BSD major and minor as numbers, every IOMedia, the
 // firmware namespace's whole disk, the controller's children in the order
-// it makes them, its storage driver's statistics, and a search up the
-// parents for a key no entry has.
+// it makes them, its storage driver's statistics, and searches up the
+// parents for keys no entry has.
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
@@ -167,6 +167,12 @@ int main(void) {
     // No entry up the plane has Target Disk Mode.
     CFTypeRef tdm = IORegistryEntrySearchCFProperty(media, kIOServicePlane, CFSTR("Target Disk Mode"), kCFAllocatorDefault, kIORegistryIterateRecursively | kIORegistryIterateParents);
     if (tdm != NULL) return bad("Target Disk Mode up the plane", 1, 0);
+
+    // Nor image-format-read-only, which only the disk image drivers set, on
+    // their own devices: fsck_apfs's search from the container's partition,
+    // past the controller and the platform's drivers to the registry's root.
+    CFTypeRef ro = IORegistryEntrySearchCFProperty(up[1], kIOServicePlane, CFSTR("image-format-read-only"), kCFAllocatorDefault, kIORegistryIterateRecursively | kIORegistryIterateParents);
+    if (ro != NULL) return bad("image-format-read-only up the plane", 1, 0);
 
     printf("storagereg ok\n");
     return 0;

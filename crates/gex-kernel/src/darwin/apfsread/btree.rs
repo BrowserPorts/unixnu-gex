@@ -39,12 +39,36 @@ const INFO_SIZE: usize = 40;
 const BTOFF_INVALID: u16 = 0xffff;
 
 /// How a tree's nodes name their children.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum Children {
     /// By physical address (`BTREE_PHYSICAL`).
     Physical,
     /// By virtual object identifier, mapped by `omap` at `xid`.
     Virtual { omap: Arc<Omap>, xid: u64 },
+    /// By virtual object identifier, each node as a mounted container's
+    /// object cache holds it now ([`LiveNodes`]): the tree as its owner's
+    /// last change left it, committed or not.
+    Live(Arc<dyn LiveNodes>),
+}
+
+impl std::fmt::Debug for Children {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Children::Physical => f.write_str("Physical"),
+            Children::Virtual { xid, .. } => write!(f, "Virtual {{ xid: {xid} }}"),
+            Children::Live(_) => f.write_str("Live"),
+        }
+    }
+}
+
+/// A virtual tree's nodes as the container that writes them holds them:
+/// the root node's identifier now, and a node's bytes, from its object
+/// cache or, when not there, from the block its object map's newest
+/// mapping names. An object in memory carries no valid checksum (the
+/// flush sets it), so its header is not checked here.
+pub trait LiveNodes: Send + Sync {
+    fn root(&self) -> Result<u64>;
+    fn node(&self, oid: u64) -> Result<Arc<[u8]>>;
 }
 
 /// A hashed tree's algorithm and its root node's expected hash.
@@ -168,7 +192,14 @@ impl Tree {
     /// information parsed. `subtype` is the object subtype its nodes with
     /// headers carry.
     pub fn open(c: &Container, root_oid: u64, children: Children, hashed: Option<Hashed>, subtype: u32) -> Result<Tree> {
+        let root_oid = match &children {
+            Children::Live(nodes) => nodes.root()?,
+            _ => root_oid,
+        };
         let mut t = Tree { root_oid, children, hash_type: hashed.as_ref().map(|h| h.hash_type), info: Info { flags: 0, node_size: c.block_size(), key_size: 0, val_size: 0, longest_key: 0, longest_val: 0, key_count: 0, node_count: 0 }, subtype };
+        if matches!(t.children, Children::Live(_)) && hashed.is_some() {
+            return Err(Error::Unsupported("a hashed tree read through a container's object cache".into()));
+        }
         let root = t.read_node(c, root_oid, hashed.as_ref().map(|h| &h.root_hash[..]), true)?;
         if root.flags & node_flags::ROOT == 0 {
             return malformed(format!("the B-tree root {root_oid:#x} without BTNODE_ROOT"));
@@ -217,6 +248,16 @@ impl Tree {
                 let v = omap.lookup(c, oid, *xid)?.ok_or_else(|| Error::Malformed(format!("the B-tree node {oid:#x} is not in its object map")))?;
                 (v.paddr, v.flags & super::omap_val::NOHEADER != 0)
             }
+            Children::Live(nodes) => {
+                let node = Node::parse(nodes.node(oid)?)?;
+                if node.flags & node_flags::NOHEADER != 0 {
+                    return Err(Error::Unsupported(format!("the headerless B-tree node {oid:#x} read through a container's object cache")));
+                }
+                if root != (node.flags & node_flags::ROOT != 0) {
+                    return malformed(format!("the B-tree node {oid:#x} with flags {:#x} where a {} is", node.flags, if root { "root" } else { "node below the root" }));
+                }
+                return Ok(node);
+            }
         };
         let bytes = c.block(paddr)?;
         if let (Some(t), Some(want)) = (self.hash_type, hash) {
@@ -260,8 +301,13 @@ impl Tree {
         }
     }
 
+    /// The root node: for a tree read through a container's object cache,
+    /// the one its owner names now.
     fn root(&self, c: &Container) -> Result<Node> {
-        self.read_node(c, self.root_oid, None, true)
+        match &self.children {
+            Children::Live(nodes) => self.read_node(c, nodes.root()?, None, true),
+            _ => self.read_node(c, self.root_oid, None, true),
+        }
     }
 
     fn child(&self, c: &Container, parent: &Node, v: Option<&[u8]>) -> Result<Node> {

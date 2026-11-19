@@ -120,14 +120,37 @@ pub fn volume_fs_flags(index: u32) -> Result<Option<u64>, String> {
     Ok(Some(u64::from_le_bytes(sb[0x108..0x110].try_into().unwrap())))
 }
 
-/// The volume in slot `index` of the container in the image, read from
-/// its latest checkpoint, for a mount of it at run time; an error without
+/// The volume in slot `index` of the container in the image, for a mount
+/// of it at run time, read as the kernel's container holds it
+/// ([`KERNEL_NX`]): its file-system tree's nodes from the container's object
+/// cache, through the volume's object map's newest mappings, so that what
+/// a file-system call changes reads back at once, committed or not, and a
+/// block a commit freed is never read for the tree; its file data from the
+/// image, where the container writes it as it writes it. An error without
 /// an image, for an empty slot, or where the image cannot be read.
 pub fn volume(index: u32) -> Result<super::apfsread::Volume, String> {
     let d = DISK.get().ok_or("no disk0 image (GEX_DARWIN_DISK0)")?;
     let (base, size) = storage::partition_extent();
     let c = Arc::new(super::apfsread::Container::open(Arc::new(PartMedium(Arc::clone(&d.sink), base, size))).map_err(|e| format!("the container in the disk0 image: {e}"))?);
-    c.volume(index as usize).map_err(|e| format!("volume {index} of the container in the disk0 image: {e}"))?.ok_or_else(|| format!("the container in the disk0 image has no volume in slot {index}"))
+    let sb = with_container(|nx| {
+        if nx.vol_oid(index as usize).is_none() {
+            return Err(format!("the container in the disk0 image has no volume in slot {index}"));
+        }
+        Ok(nx.vol_sb_read(index as usize)?.0.to_vec())
+    })?;
+    super::apfsread::Volume::live(c, &sb, Arc::new(KernelTree(index))).map_err(|e| format!("volume {index} of the container in the disk0 image: {e}"))
+}
+
+/// Volume `index`'s file-system tree as the kernel's container holds it.
+struct KernelTree(u32);
+
+impl super::apfsread::btree::LiveNodes for KernelTree {
+    fn root(&self) -> super::apfsread::Result<u64> {
+        with_container(|nx| nx.fs_tree_root(self.0 as usize)).map_err(super::apfsread::Error::Io)
+    }
+    fn node(&self, oid: u64) -> super::apfsread::Result<Arc<[u8]>> {
+        with_container(|nx| nx.fs_tree_node(self.0 as usize, oid)).map(Into::into).map_err(super::apfsread::Error::Io)
+    }
 }
 
 /// Whether a disk0 image is served.
@@ -150,7 +173,8 @@ pub fn lacks(step: &str) -> bool {
 /// checkpoint when a transaction commits); what a file-system call changes
 /// stays in the open transaction until a sync, an unmount or the
 /// transaction's own close rule commits it, as on internal storage nothing
-/// commits on a timer.
+/// commits on a timer. The volumes served from the image read through it
+/// ([`volume`]).
 static KERNEL_NX: Mutex<Option<super::apfswrite::tx::Nx<'static>>> = Mutex::new(None);
 
 /// `f` on the kernel's container, mounted first when it is not.
@@ -167,16 +191,7 @@ fn with_container<R>(f: impl FnOnce(&mut super::apfswrite::tx::Nx<'static>) -> R
         nx.set_solid_state(super::storagestack::container_solid_state());
         *g = Some(nx);
     }
-    let nx = g.as_mut().expect("mounted above");
-    let xid = nx.xid;
-    let r = f(nx);
-    if nx.xid != xid {
-        // The volumes served from the image read the checkpoint they were
-        // mounted at (super::graftfs::GraftFs::live); once a later one is
-        // written, blocks that one freed can be given out again.
-        super::note_unimplemented(format!("the kernel's container committed transaction {xid:#x}: the views of the volumes served from the disk0 image read the checkpoint they were mounted at, and moving them to the newer one is not implemented"));
-    }
-    r
+    f(g.as_mut().expect("mounted above"))
 }
 
 /// The kernel's clock as APFS reads it (`nanotime`): nanoseconds since
@@ -195,6 +210,17 @@ pub fn mount_rw(index: u32) -> Result<(), String> {
     with_container(|nx| {
         nx.mount_rw()?;
         super::apfswrite::fsops::mount_rw(nx, index as usize, &mut nanotime)
+    })
+}
+
+/// Inode `ino` of the volume in slot `index` brought into the kernel by a
+/// lookup (`VNOP_LOOKUP`'s `vnode_create`, at the head of the mount's
+/// vnode list), unless it has a vnode: the order a vnode pass visits the
+/// volume's inodes in ([`super::apfswrite::tx::Nx::vnode_get`]).
+pub fn vnode_get(index: u32, ino: u64) -> Result<(), String> {
+    with_container(|nx| {
+        nx.vnode_get(index as usize, ino, &|| format!("a lookup of inode {ino:#x} on volume slot {index} at run time"));
+        Ok(())
     })
 }
 

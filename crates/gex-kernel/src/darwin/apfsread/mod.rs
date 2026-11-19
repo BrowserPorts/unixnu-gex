@@ -636,15 +636,22 @@ pub struct VolumeSuperblock {
 
 impl VolumeSuperblock {
     pub fn parse(b: &[u8]) -> Result<VolumeSuperblock> {
+        let sb = Self::parse_held(b)?;
+        if !checksum_ok(b) {
+            return malformed("a volume superblock whose checksum is wrong");
+        }
+        Ok(sb)
+    }
+
+    /// The fields of a superblock as a mounted container holds it in
+    /// memory, where its checksum is not kept (the flush sets it).
+    pub fn parse_held(b: &[u8]) -> Result<VolumeSuperblock> {
         let header = ObjHeader::parse(b)?;
         if header.kind() != otype::FS {
             return malformed(format!("a volume superblock of object type {:#x}", header.otype));
         }
         if b.u32_at(0x20)? != APFS_MAGIC {
             return malformed("a volume superblock without APFS_MAGIC");
-        }
-        if !checksum_ok(b) {
-            return malformed("a volume superblock whose checksum is wrong");
         }
         let name = b.slice_at(0x2c0, 256)?;
         let name = &name[..name.iter().position(|&c| c == 0).unwrap_or(name.len())];
@@ -683,7 +690,9 @@ impl VolumeSuperblock {
 pub struct Volume {
     pub container: Arc<Container>,
     pub sb: VolumeSuperblock,
-    pub omap: Omap,
+    /// Its object map at the checkpoint read; none for a volume read
+    /// through its container's object cache ([`Volume::live`]).
+    pub omap: Option<Omap>,
     /// Its file-system tree.
     pub fs_tree: btree::Tree,
     /// A sealed volume's file extent tree.
@@ -753,7 +762,35 @@ impl Volume {
         } else {
             None
         };
-        Ok(Volume { container, sb, omap, fs_tree, fext_tree, hash_type, verified: Arc::new(Mutex::new(Default::default())) })
+        Ok(Volume { container, sb, omap: Some(omap), fs_tree, fext_tree, hash_type, verified: Arc::new(Mutex::new(Default::default())) })
+    }
+
+    /// An unsealed volume of a container mounted read-write, read as that
+    /// container holds it now: `sb` its superblock's bytes as it holds them,
+    /// its file-system tree's nodes from `nodes` (its object cache, with
+    /// changes not yet committed), and file data from `container`'s medium,
+    /// where the writer puts it as it writes it. What a sealed volume needs
+    /// (its object map's integrity metadata and file extent tree, its hashed
+    /// nodes) is not read this way.
+    pub fn live(container: Arc<Container>, sb: &[u8], nodes: Arc<dyn btree::LiveNodes>) -> Result<Volume> {
+        let sb = VolumeSuperblock::parse_held(sb)?;
+        if sb.incompat & incompat::CASE_INSENSITIVE != 0 {
+            return Err(Error::Unsupported("a case-insensitive volume (its names' Unicode case folding)".into()));
+        }
+        if sb.incompat & !READABLE_INCOMPAT != 0 {
+            return Err(Error::Unsupported(format!("a volume's incompatible features {:#x}", sb.incompat)));
+        }
+        if sb.fs_flags & APFS_FS_UNENCRYPTED == 0 {
+            return Err(Error::Unsupported(format!("the encrypted volume {:?} (apfs_fs_flags {:#x})", sb.volname, sb.fs_flags)));
+        }
+        if sb.sealed() {
+            return Err(Error::Unsupported(format!("the sealed volume {:?} read through its container's object cache", sb.volname)));
+        }
+        if sb.root_tree_type & otype::STORAGETYPE_MASK != 0 {
+            return Err(Error::Unsupported(format!("a file-system tree of storage type {:#x} read through its container's object cache", sb.root_tree_type & otype::STORAGETYPE_MASK)));
+        }
+        let fs_tree = btree::Tree::open(&container, sb.root_tree_oid, btree::Children::Live(nodes), None, otype::FSTREE)?;
+        Ok(Volume { container, sb, omap: None, fs_tree, fext_tree: None, hash_type: None, verified: Arc::new(Mutex::new(Default::default())) })
     }
 
     fn integrity_of(c: &Container, omap: &Omap, sb: &VolumeSuperblock) -> Result<IntegrityMeta> {
@@ -772,7 +809,8 @@ impl Volume {
         if !self.sb.sealed() {
             return Ok(None);
         }
-        Self::integrity_of(&self.container, &self.omap, &self.sb).map(Some)
+        let omap = self.omap.as_ref().ok_or_else(|| Error::Unsupported("a sealed volume's integrity metadata read through its container's object cache".into()))?;
+        Self::integrity_of(&self.container, omap, &self.sb).map(Some)
     }
 }
 

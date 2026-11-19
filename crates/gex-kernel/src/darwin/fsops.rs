@@ -696,14 +696,14 @@ impl Kernel {
             self.darwin_mount_close(node.minor, &given);
             return Err(Errno::EIO);
         }
-        // The volume's files: the Preboot and xART volumes' as the disk0
-        // image holds them (super::graftfs::GraftFs::live, read through the
-        // image's latest checkpoint, its inode numbers its own, on this
-        // mount's device); no other volume's are modelled, and a path below
-        // its mount is reported (kern::unmodelled_files_at).
+        // The volume's files: the Preboot and xART volumes' as the kernel's
+        // container in the disk0 image holds them (super::graftfs::GraftFs::
+        // live, read through its object cache, its inode numbers its own,
+        // on this mount's device); no other volume's are modelled, and a
+        // path below its mount is reported (kern::unmodelled_files_at).
         let files: Option<std::sync::Arc<dyn crate::vfs::FileSystem>> = match super::storage::volume(mounted.volume) {
             Some(v) if super::kern::served_from_disk0(v.role) => match super::disknode::volume(mounted.volume) {
-                Ok(vol) => Some(std::sync::Arc::new(super::graftfs::GraftMount(std::sync::Arc::new(super::graftfs::GraftFs::live(vol, v.name, mounted.fsid0)))) as std::sync::Arc<dyn crate::vfs::FileSystem>),
+                Ok(vol) => Some(std::sync::Arc::new(super::graftfs::GraftMount(std::sync::Arc::new(super::graftfs::GraftFs::live(vol, v.name, mounted.volume, mounted.fsid0)))) as std::sync::Arc<dyn crate::vfs::FileSystem>),
                 Err(why) => {
                     self.darwin_unimplemented(format!("mounting {fstype} from {given} on {at}: the {} volume's files from the disk0 image: {why}", v.name));
                     self.darwin_mount_close(node.minor, &given);

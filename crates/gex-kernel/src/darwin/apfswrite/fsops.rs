@@ -210,10 +210,7 @@ pub fn mount_rw(nx: &mut Nx<'_>, vol: usize, now: &mut dyn FnMut() -> u64) -> Re
     // restore's `.ramdisk-boot-done` open after its mounts) brings in the
     // root's vnode (VFS_ROOT).
     nx.mounted.push(vol);
-    if nx.vnode_get(vol, ROOT_DIR_INO, &|| format!("the root of volume slot {vol}")) {
-        hint_load(nx, vol, ROOT_DIR_INO)?;
-    }
-    Ok(())
+    vnode_load(nx, vol, ROOT_DIR_INO, &|| format!("the root of volume slot {vol}"))
 }
 
 /// The volume's crypto kind (K 0x671a778, from `fs_flags & 0x109`): 3 for
@@ -2752,14 +2749,14 @@ pub mod waitfor {
 ///   crypto states with encryption policies, whose expired entries'
 ///   inodes it updates.
 ///
-/// The encryption-policy work (`cp_detach_ep`, the ep cache) is reached
-/// only on a content-protected volume (crypto.c's `get_vol_crypto(apfs) ==
-/// VOL_CPROTECTED` assertions): on a volume not `APFS_FS_UNENCRYPTED` it is
-/// not implemented (AppleKeyStore's policy checks, K 0x67322b4). So are a
-/// volume with snapshots (the cleaner's work on one deleted) and inodes
-/// holding unwritten times, whose rewrite the kernel makes with
-/// `update_jobj` (bt_update with the vnode's leaf hint, K 0x672c328) and
-/// [`vnode_pass`] with this writer's insert.
+/// The vnode pass rewrites an inode holding unwritten times with
+/// `update_jobj` (bt_update with the leaf hint its in-memory object holds,
+/// K 0x672c328), each in its own transaction. The encryption-policy work
+/// (`cp_detach_ep`, the ep cache) is reached only on a content-protected
+/// volume (crypto.c's `get_vol_crypto(apfs) == VOL_CPROTECTED`
+/// assertions): on a volume not `APFS_FS_UNENCRYPTED` it is not
+/// implemented (AppleKeyStore's policy checks, K 0x67322b4). Nor is a
+/// volume with snapshots (the cleaner's work on one deleted).
 pub fn vfs_sync(nx: &mut Nx<'_>, vol: usize, _waitfor: u32, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     if !nx.mounted.contains(&vol) {
         return Err(format!("VFS_SYNC of volume slot {vol}, which the container does not hold mounted read-write"));
@@ -2775,10 +2772,6 @@ pub fn vfs_sync(nx: &mut Nx<'_>, vol: usize, _waitfor: u32, now: &mut dyn FnMut(
     };
     if nx.phys_node_counts(snaps)? != (0, 0) {
         return Err(format!("not implemented: the purgatory cleaner (K 0x66cd0cc → K 0x66cedfc) of volume slot {vol}, which has snapshot records"));
-    }
-    let held: Vec<u64> = nx.jobj_times.keys().filter(|k| k.0 == vol).map(|k| k.1).collect();
-    if !held.is_empty() {
-        return Err(format!("not implemented: the vnode pass's rewrite of inodes {held:#x?} of volume slot {vol}, whose times are held unwritten (update_jobj's bt_update with the vnode's leaf hint, K 0x672c328)"));
     }
     vnode_pass(nx, vol, now)?;
     nx.tx_finish()
@@ -3469,11 +3462,47 @@ pub fn lookup(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str) -> Result<Op
     };
     // VNOP_LOOKUP's hit: the inode's vnode (made unless it has one).
     if let Some(ino) = found {
-        if nx.vnode_get(vol, ino, &|| format!("the lookup of {name} (inode {ino:#x}) on volume slot {vol}")) {
-            hint_load(nx, vol, ino)?;
-        }
+        vnode_load(nx, vol, ino, &|| format!("the lookup of {name} (inode {ino:#x}) on volume slot {vol}"))?;
     }
     Ok(found)
+}
+
+/// Inode `ino` of slot `vol` brought into the kernel by a lookup
+/// (`VNOP_LOOKUP`, or `VFS_ROOT` for the root) of an object already on the
+/// volume: its vnode made unless it has one ([`Nx::vnode_get`], `what`
+/// naming the lookup), and with a new vnode its in-memory object loaded,
+/// holding the leaf hint the load leaves ([`hint_load`]).
+pub fn vnode_load(nx: &mut Nx<'_>, vol: usize, ino: u64, what: &dyn Fn() -> String) -> Result<(), String> {
+    if nx.vnode_get(vol, ino, what) {
+        hint_load(nx, vol, ino)?;
+    }
+    Ok(())
+}
+
+/// What the file-system calls made at run time on the kernel's container
+/// left undecided, taken from `nx`, as an error: an inode update whose
+/// nodes depend on a leaf hint the run's other lookups decide
+/// ([`Nx::hint_unsettled`]), times a vnode pass could not write because the
+/// vnode table was full ([`Nx::vnode_missing`]), or times written by a
+/// later rewrite of an inode whose vnode the full table may have recycled
+/// first ([`Nx::vnode_risk_written`]). The restore lists these as missing
+/// steps of its image; a running system's call that leaves one has written
+/// what the device may not have.
+pub fn run_time_gaps(nx: &mut Nx<'_>) -> Result<(), String> {
+    let mut gaps: Vec<String> = Vec::new();
+    if !nx.hint_unsettled.is_empty() {
+        let w: Vec<String> = nx.hint_unsettled.drain(..).map(|(v, i, s)| format!("slot {v} {i:#x} ({s})")).collect();
+        gaps.push(format!("the nodes {} inode updates change (update_jobj's bt_update, K 0x672c328, fetches the leaf the in-memory object's hint at jobj + 0xb8 names): the hints the objects may hold (left by lookups of their extended attributes by calls the model does not follow, or none for an object the full vnode table may have recycled) change different nodes, and the kept one was used: {}", w.len(), w.join(", ")));
+    }
+    gaps.extend(nx.vnode_missing.drain(..));
+    if !nx.vnode_risk_written.is_empty() {
+        let w: Vec<String> = nx.vnode_risk_written.drain(..).map(|(v, i)| format!("slot {v} {i:#x}")).collect();
+        gaps.push(format!("the times {} inodes held in memory while XNU's vnode table was full, written by their next rewrite: their vnodes' recycling may have written them first, in a transaction of its own: {}", w.len(), w.join(", ")));
+    }
+    if gaps.is_empty() {
+        return Ok(());
+    }
+    Err(format!("not implemented: {}", gaps.join("; ")))
 }
 
 /// The leaf hint of an inode loaded into a new in-memory object

@@ -194,6 +194,17 @@ fn with_container<R>(f: impl FnOnce(&mut super::apfswrite::tx::Nx<'static>) -> R
     f(g.as_mut().expect("mounted above"))
 }
 
+/// File-system call `f` on the kernel's container: what it left undecided
+/// ([`super::apfswrite::fsops::run_time_gaps`]) is its error.
+fn kernel_op<R>(f: impl FnOnce(&mut super::apfswrite::tx::Nx<'static>) -> Result<R, String>) -> Result<R, String> {
+    with_container(|nx| {
+        let r = f(nx);
+        let gaps = super::apfswrite::fsops::run_time_gaps(nx);
+        let r = r?;
+        gaps.map(|()| r)
+    })
+}
+
 /// The kernel's clock as APFS reads it (`nanotime`): nanoseconds since
 /// 1970.
 fn nanotime() -> u64 {
@@ -207,7 +218,7 @@ fn nanotime() -> u64 {
 /// the volume's read-write mount and the writes it makes
 /// ([`super::apfswrite::fsops::mount_rw`]).
 pub fn mount_rw(index: u32) -> Result<(), String> {
-    with_container(|nx| {
+    kernel_op(|nx| {
         nx.mount_rw()?;
         super::apfswrite::fsops::mount_rw(nx, index as usize, &mut nanotime)
     })
@@ -218,7 +229,7 @@ pub fn mount_rw(index: u32) -> Result<(), String> {
 /// pass and the commit of the container's open transaction
 /// ([`super::apfswrite::fsops::vfs_sync`]).
 pub fn vfs_sync(index: u32, waitfor: u32) -> Result<(), String> {
-    with_container(|nx| super::apfswrite::fsops::vfs_sync(nx, index as usize, waitfor, &mut nanotime))
+    kernel_op(|nx| super::apfswrite::fsops::vfs_sync(nx, index as usize, waitfor, &mut nanotime))
 }
 
 /// `dounmount(mp, MNT_FORCE)` of the volume in slot `index`, which the
@@ -229,7 +240,7 @@ pub fn vfs_sync(index: u32, waitfor: u32) -> Result<(), String> {
 /// a content-protected volume its teardown of the crypto-state caches
 /// (the ep cache's invalidation, K 0x66cbc24) is not implemented.
 pub fn unmount_forced(index: u32) -> Result<(), String> {
-    with_container(|nx| {
+    kernel_op(|nx| {
         let (sb, _) = nx.vol_sb_read(index as usize)?;
         if u64::from_le_bytes(sb[0x108..0x110].try_into().unwrap()) & super::apfsread::APFS_FS_UNENCRYPTED == 0 {
             return Err(format!("not implemented: apfs_vfsop_unmount's teardown of the crypto-state caches of volume slot {index}, which is encrypted (the ep cache's invalidation, K 0x66cbc24)"));
@@ -241,12 +252,11 @@ pub fn unmount_forced(index: u32) -> Result<(), String> {
 /// Inode `ino` of the volume in slot `index` brought into the kernel by a
 /// lookup (`VNOP_LOOKUP`'s `vnode_create`, at the head of the mount's
 /// vnode list), unless it has a vnode: the order a vnode pass visits the
-/// volume's inodes in ([`super::apfswrite::tx::Nx::vnode_get`]).
+/// volume's inodes in, and the leaf hint its in-memory object holds from
+/// its load, which its updates start from
+/// ([`super::apfswrite::fsops::vnode_load`]).
 pub fn vnode_get(index: u32, ino: u64) -> Result<(), String> {
-    with_container(|nx| {
-        nx.vnode_get(index as usize, ino, &|| format!("a lookup of inode {ino:#x} on volume slot {index} at run time"));
-        Ok(())
-    })
+    kernel_op(|nx| super::apfswrite::fsops::vnode_load(nx, index as usize, ino, &|| format!("a lookup of inode {ino:#x} on volume slot {index} at run time")))
 }
 
 /// Whether the kernel's container holds the volume in slot `index`
@@ -304,7 +314,7 @@ pub fn jobj_at_or_above(index: u32, from: u64) -> Result<Option<u64>, String> {
 /// read-write, for image file `ino`'s graft of a volume whose next object
 /// identifier is `len` ([`super::apfswrite::fsops::allocate_graft_jobj_range`]).
 pub fn allocate_graft_jobj_range(index: u32, ino: u64, len: u64) -> Result<Result<u64, i32>, String> {
-    with_container(|nx| super::apfswrite::fsops::allocate_graft_jobj_range(nx, index as usize, ino, len, &mut nanotime))
+    kernel_op(|nx| super::apfswrite::fsops::allocate_graft_jobj_range(nx, index as usize, ino, len, &mut nanotime))
 }
 
 /// The partition's bytes as a medium of their own.

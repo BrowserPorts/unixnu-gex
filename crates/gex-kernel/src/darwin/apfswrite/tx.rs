@@ -4228,13 +4228,15 @@ mod tests {
         }
     }
 
-    /// The held container's vnode table.
+    /// The held container's vnode table, as the kernel's lookups fill it
+    /// (disknode::vnode_get).
     struct HeldKernel(Held);
 
     impl crate::darwin::graftfs::LiveKernel for HeldKernel {
         fn vnode_get(&self, slot: u32, ino: u64) -> Result<(), String> {
-            self.0.lock().unwrap().vnode_get(slot as usize, ino, &|| format!("a lookup of {ino:#x}"));
-            Ok(())
+            let mut nx = self.0.lock().unwrap();
+            super::super::fsops::vnode_load(&mut nx, slot as usize, ino, &|| format!("a lookup of {ino:#x}"))?;
+            super::super::fsops::run_time_gaps(&mut nx)
         }
     }
 
@@ -4245,9 +4247,9 @@ mod tests {
     /// is changed. `VFS_SYNC` (apfs_vfsop_sync) commits the open
     /// transaction to a checkpoint the reader then finds; the view mounted
     /// before keeps answering through every later commit, as a view of the
-    /// newest checkpoint does. A sync of a volume not held read-write, of
-    /// an encrypted volume, or with inodes holding unwritten times is
-    /// refused.
+    /// newest checkpoint does. A sync of a volume not held read-write or of
+    /// an encrypted volume is refused; one with inodes holding unwritten
+    /// times writes them.
     #[test]
     fn a_live_view_follows_its_container_through_a_sync() {
         use super::super::fsops::{self, waitfor};
@@ -4345,12 +4347,106 @@ mod tests {
         }
         assert_eq!(live.open("a", 0, 0).unwrap().read_dir().unwrap().len(), 4 + made.len());
         assert_eq!(live.metadata("a/none").unwrap_err(), Errno::ENOENT);
-        // Unwritten times held on an inode: the vnode pass's rewrite is not
-        // implemented.
+        // Unwritten times held on an inode: the vnode pass writes them.
         let mut nx = held.lock().unwrap();
         fsops::chmod(&mut nx, pb, f, 0o600, &mut now).unwrap();
-        assert!(nx.jobj_times.contains_key(&(pb, f)));
-        assert!(fsops::vfs_sync(&mut nx, pb, waitfor::MNT_NOWAIT, &mut now).unwrap_err().contains("held unwritten"));
+        let ft = nx.jobj_times[&(pb, f)];
+        let xid = nx.xid;
+        fsops::vfs_sync(&mut nx, pb, waitfor::MNT_NOWAIT, &mut now).unwrap();
+        assert!(nx.jobj_times.is_empty());
+        assert_eq!(nx.xid, xid + 1);
+        fsops::run_time_gaps(&mut nx).unwrap();
+        let v = fsops::inode(&mut nx, pb, f).unwrap();
+        assert_eq!((u64a(&v, 0x18), u64a(&v, 0x20)), ft);
+        drop(nx);
+        let c = live.metadata("a/f").unwrap();
+        assert_eq!((c.times.ctime as u64 * 1_000_000_000 + u64::from(c.times.ctime_ns)), ft.1);
+    }
+
+    /// A lookup through a live view loads the inode's object with the leaf
+    /// hint of its record (fs_get_inode_with_hint), and the vnode pass's
+    /// update_jobj starts from it: with the leaf holding the record, only
+    /// that leaf changes, no node above it. An inode the kernel has no
+    /// vnode for, held times on it by a call the model does not follow,
+    /// would update from a hint that depends on lookups the model cannot
+    /// see: at run time that is an error.
+    #[test]
+    fn a_sync_updates_an_inode_from_its_lookups_leaf_hint() {
+        use super::super::fsops::{self, waitfor};
+        use crate::darwin::apfsread::{Container, Volume};
+        use crate::darwin::graftfs::{GraftFs, GraftMount};
+        use crate::vfs::FileSystem;
+        let blocks = 15_625_000u64;
+        let sink: &'static Sparse = Box::leak(Box::new(Sparse::new(blocks * 4096)));
+        let medium: std::sync::Arc<dyn crate::darwin::apfsread::Medium> = std::sync::Arc::new(super::super::Window { sink, base: 0, size: blocks * 4096 });
+        let uuid = *b"gex-hinted-syncs";
+        let fm = super::super::container::format(sink, 4096, blocks, uuid).unwrap();
+        let mut nx = Nx::formatted(sink, &fm, uuid, Mode::Kernel).unwrap();
+        nx.set_barrier(true);
+        nx.mount_rw().unwrap();
+        let mut t = 1_800_000_000_000_000_000u64;
+        let mut now = move || {
+            t += 1000;
+            t
+        };
+        let kv = super::super::restore::key_os_version(super::super::restore::RESTORE_BUILD).unwrap();
+        let times = VolumeTimes { formatted: now(), root: now(), private: now(), modified: now() };
+        let o = nx.create_volume(&NewVolume { name: "Preboot".into(), role: 0x10, encrypted: false, e_apfs: true, times, uid: 0, gid: 0, key_os_version: kv, size_bytes: None }).unwrap();
+        nx.commit().unwrap();
+        let pb = nx.fs_oid.iter().position(|&x| x == o).unwrap();
+        // Enough files that the tree's root is an index node; then a new
+        // mount, whose vnodes are only its root's.
+        fsops::mount_rw(&mut nx, pb, &mut now).unwrap();
+        let mut files = Vec::new();
+        for i in 0..400 {
+            files.push(fsops::create(&mut nx, pb, 2, &format!("f{i:03}"), 0o644, 0, 0, &mut now).unwrap().unwrap());
+        }
+        fsops::unmount(&mut nx, pb, false, &mut now).unwrap();
+        nx.commit().unwrap();
+        fsops::mount_rw(&mut nx, pb, &mut now).unwrap();
+        nx.tx_finish().unwrap();
+        assert_eq!(nx.vnode_list(pb), [2]);
+        let sb = nx.vol_sb_read(pb).unwrap().0.to_vec();
+        let held: Held = std::sync::Arc::new(std::sync::Mutex::new(nx));
+        let checkpoint = std::sync::Arc::new(Container::open(std::sync::Arc::clone(&medium)).unwrap());
+        let vol = Volume::live(checkpoint, &sb, std::sync::Arc::new(HeldTree(std::sync::Arc::clone(&held), pb))).unwrap();
+        let live = GraftMount(std::sync::Arc::new(GraftFs::live_on(vol, "Preboot", pb as u32, 0x1000_0005, std::sync::Arc::new(HeldKernel(std::sync::Arc::clone(&held))))));
+        let (name, ino) = ("f200", files[200]);
+        assert_eq!(live.metadata(name).unwrap().ino, ino);
+        let mut nx = held.lock().unwrap();
+        assert_eq!(nx.vnode_list(pb), [ino, 2]);
+        // The hint: the leaf holding the record, in the tree as it is.
+        let key = (ino | 3 << 60).to_le_bytes();
+        let (leaf, root) = nx.jobj_hints[&(pb, ino)].leaf.unwrap();
+        {
+            let (tr, mut st) = nx.fs_tree(pb).unwrap();
+            assert_eq!(root, tr.root);
+            assert!(!st.get(root).unwrap().is_leaf(), "an index root");
+            let n = st.get(leaf).unwrap();
+            assert!(n.is_leaf() && super::super::btree::search(&tr.shape, &n, tr.cmp, &key).1);
+        }
+        // Times held, then the sync: the leaf alone of the tree's nodes
+        // is mapped anew at the sync's transaction.
+        fsops::chmod(&mut nx, pb, ino, 0o644, &mut now).unwrap();
+        let ft = nx.jobj_times[&(pb, ino)];
+        let xid = nx.xid;
+        fsops::vfs_sync(&mut nx, pb, waitfor::MNT_NOWAIT, &mut now).unwrap();
+        fsops::run_time_gaps(&mut nx).unwrap();
+        assert_eq!(nx.xid, xid + 1);
+        let om = nx.omap_of(Owner::Volume(pb)).unwrap();
+        let at = |nx: &mut Nx<'_>, oid: u64| nx.omap_find(Owner::Volume(pb), om, oid).unwrap().unwrap().0;
+        assert_eq!(at(&mut nx, leaf), xid);
+        assert!(at(&mut nx, root) < xid, "the root is not changed");
+        let v = fsops::inode(&mut nx, pb, ino).unwrap();
+        assert_eq!((u64a(&v, 0x18), u64a(&v, 0x20)), ft);
+        assert_eq!(nx.jobj_hints[&(pb, ino)].leaf, Some((leaf, root)));
+        // An inode with no vnode: its object's hint is whatever loaded it.
+        let other = files[10];
+        fsops::chmod(&mut nx, pb, other, 0o644, &mut now).unwrap();
+        fsops::vfs_sync(&mut nx, pb, waitfor::MNT_NOWAIT, &mut now).unwrap();
+        let gap = fsops::run_time_gaps(&mut nx).unwrap_err();
+        assert!(gap.contains(&format!("slot {pb} {other:#x} (vnode_pass)")), "{gap}");
+        fsops::run_time_gaps(&mut nx).unwrap();
     }
 
     /// apfs_vfsop_unmount's tx_finish, as the sync's, writes no checkpoint

@@ -343,6 +343,40 @@ pub struct Nx<'a> {
     /// Inodes of `vnode_at_risk` whose times a later operation of the
     /// restore wrote, in that order.
     pub vnode_risk_written: Vec<(usize, u64)>,
+    /// What each inode's in-memory object may hold as its leaf hint, by
+    /// slot and inode ([`Hint`]).
+    pub jobj_hints: HashMap<(usize, u64), Hint>,
+    /// The inode updates whose effect depends on a hint the binaries do not
+    /// settle ([`Hint`]): slot, inode and the update's site.
+    pub hint_unsettled: Vec<(usize, u64, &'static str)>,
+}
+
+/// The leaf hint an inode's in-memory object (jobj) may hold at +0xb8:
+/// the leaf `bt_update` last found its record in (K 0x672c754, stored
+/// with the tree, which it must match), or the leaf a lookup by name of
+/// one of its extended attributes found that record in (`bt_lookup` with
+/// the hint, K 0x672e95c: `apfs_inode_getxattr` K 0x6765594,
+/// `apfs_setxattr_internal` K 0x6766138, `apfs_pack_vap_common`'s
+/// resource-fork, decmpfs and Finder-info lookups K 0x669e65c, the symbolic
+/// link's K 0x6766ec4, the named stream's K 0x665f0f4). The object lives as
+/// long as the inode's vnode; a new one holds no hint.
+#[derive(Clone, Debug, Default)]
+pub struct Hint {
+    /// The leaf the restore's own last update left, and the tree's root.
+    pub leaf: Option<(u64, u64)>,
+    /// The leaves that have held one of the inode's attribute records since
+    /// then: a lookup the model does not run (a getattr or getxattr of the
+    /// run's tools, a kernel path not transcribed) may have left any there.
+    pub attr_leaves: BTreeSet<u64>,
+    /// The leaves its inode record has moved through: for an inode whose
+    /// object the model never loaded or updated (its vnode made by a lookup
+    /// the model does not run, which leaves the leaf holding the record),
+    /// any of them may be its hint.
+    pub rec_leaves: BTreeSet<u64>,
+    /// Whether the object may have been freed and made again since (no
+    /// hint): its vnode one a full vnode table may recycle, or one the model
+    /// does not count.
+    pub maybe_none: bool,
 }
 
 /// The container's reaper (`nx_reaper_phys_t`): its lists, and the entry
@@ -497,6 +531,8 @@ impl<'a> Nx<'a> {
             vnode_missing: Vec::new(),
             vnode_at_risk: BTreeSet::new(),
             vnode_risk_written: Vec::new(),
+            jobj_hints: HashMap::new(),
+            hint_unsettled: Vec::new(),
         })
     }
 
@@ -505,11 +541,11 @@ impl<'a> Nx<'a> {
     /// unless it has one. When the vnodes counted reach `desiredvnodes`
     /// the table is full until they fall below it again: `what` names the
     /// operation ([`Nx::vnode_fill_at`]), and every inode then holding
-    /// unwritten times is at risk.
-    pub fn vnode_get(&mut self, vol: usize, ino: u64, what: &dyn Fn() -> String) {
+    /// unwritten times is at risk. Whether a vnode was made.
+    pub fn vnode_get(&mut self, vol: usize, ino: u64, what: &dyn Fn() -> String) -> bool {
         let list = self.vnodes.entry(vol).or_default();
         if list.contains_key(&ino) {
-            return;
+            return false;
         }
         self.vnode_seq += 1;
         list.insert(ino, self.vnode_seq);
@@ -518,7 +554,12 @@ impl<'a> Nx<'a> {
             self.vnode_fill_at = Some(what());
             let held: Vec<(usize, u64)> = self.jobj_times.keys().copied().collect();
             self.vnode_at_risk.extend(held);
+            // Any object holding a hint may now be recycled with its vnode.
+            for h in self.jobj_hints.values_mut() {
+                h.maybe_none = true;
+            }
         }
+        true
     }
 
     /// The vnodes counted, over every slot.
@@ -533,13 +574,69 @@ impl<'a> Nx<'a> {
         if let Some(l) = self.vnodes.get_mut(&vol) {
             l.remove(&ino);
         }
+        self.jobj_hints.remove(&(vol, ino));
         self.vnode_room();
     }
 
     /// Every vnode of slot `vol` reclaimed (`vflush` at its unmount).
     pub fn vnode_flush(&mut self, vol: usize) {
         self.vnodes.remove(&vol);
+        self.jobj_hints.retain(|k, _| k.0 != vol);
         self.vnode_room();
+    }
+
+    /// `bt_update` of inode `ino`'s record left `leaf` (of the tree whose
+    /// root is `root`) in its in-memory object: what the lookups the model
+    /// does not run may have left there before no longer counts. The object
+    /// may be freed with its vnode when the vnode table is full, and may be
+    /// one made for the operation alone when the model counts no vnode of
+    /// the inode.
+    pub fn hint_set(&mut self, vol: usize, ino: u64, leaf: u64, root: u64) {
+        let counted = self.vnodes.get(&vol).is_some_and(|l| l.contains_key(&ino));
+        let full = self.vnode_full;
+        let h = self.jobj_hints.entry((vol, ino)).or_default();
+        h.leaf = Some((leaf, root));
+        h.attr_leaves.clear();
+        h.rec_leaves.clear();
+        h.maybe_none = full || !counted;
+    }
+
+    /// Records of slot `vol`'s file-system tree with keys `keys` moved from
+    /// leaf `from` to node `to`: an extended attribute's moves are where a
+    /// lookup of it may have left its inode's hint, an inode record's where
+    /// a load of the inode the model does not run may have.
+    fn fs_records_moved(&mut self, vol: usize, from: u64, to: u64, keys: &[Vec<u8>]) {
+        const J_INODE: u64 = 3;
+        const J_XATTR: u64 = 4;
+        for k in keys {
+            let hdr = u64a(k, 0);
+            let set = match hdr >> 60 {
+                J_INODE if k.len() == 8 => false,
+                J_XATTR => true,
+                _ => continue,
+            };
+            let h = self.jobj_hints.entry((vol, hdr & 0x0fff_ffff_ffff_ffff)).or_default();
+            let l = if set { &mut h.attr_leaves } else { &mut h.rec_leaves };
+            l.insert(from);
+            l.insert(to);
+        }
+    }
+
+    /// Whether the model counts a vnode of inode `ino` of slot `vol`.
+    pub fn vnode_counted(&self, vol: usize, ino: u64) -> bool {
+        self.vnodes.get(&vol).is_some_and(|l| l.contains_key(&ino))
+    }
+
+    /// Whether virtual object `oid` of slot `vol` is changed in this
+    /// transaction (on the dirty list).
+    pub fn virt_is_dirty(&self, vol: usize, oid: u64) -> bool {
+        self.virt_dirty.contains(&(Owner::Volume(vol), oid))
+    }
+
+    /// Whether virtual object `oid` of slot `vol` is a node of its
+    /// file-system tree that exists (not deleted).
+    pub fn fs_node_exists(&self, vol: usize, oid: u64) -> bool {
+        self.virt.get(&(Owner::Volume(vol), oid)).is_some_and(|v| is_tree_node(&v.b, FSTREE))
     }
 
     fn vnode_room(&mut self) {
@@ -1776,9 +1873,11 @@ impl<'a> Nx<'a> {
         self.fs_oid.get(index).copied().filter(|&o| o != 0)
     }
 
-    /// Volume `index`'s file-system tree replaced by `t` (a new tree).
+    /// Volume `index`'s file-system tree replaced by `t` (a new tree): a
+    /// hint names the old tree, which `bt_update` checks (K 0x672c41c).
     pub fn replace_fs_tree(&mut self, index: usize, t: Tree) -> Result<(), String> {
         self.vols.get_mut(&index).ok_or_else(|| format!("no volume in slot {index}"))?.fs_tree = t;
+        self.jobj_hints.retain(|k, _| k.0 != index);
         Ok(())
     }
 
@@ -2365,6 +2464,7 @@ impl<'a> Nx<'a> {
         // The kernel's volume mounts end with its hold of the container.
         self.mounted.clear();
         self.vnodes.clear();
+        self.jobj_hints.clear();
         self.vnode_full = false;
         if !self.rw_mounted {
             return Ok(());
@@ -3100,6 +3200,12 @@ impl Store for EphStore<'_, '_> {
     }
 }
 
+/// Whether object bytes `b` are a node of a B-tree of `subtype`.
+fn is_tree_node(b: &[u8], subtype: u32) -> bool {
+    let ty = u32a(b, 24) & 0xffff;
+    (ty == otype::BTREE || ty == otype::BTREE_NODE) && u32a(b, 28) == subtype
+}
+
 /// A volume's virtual tree's nodes.
 pub struct VirtStore<'n, 'a> {
     nx: &'n mut Nx<'a>,
@@ -3131,6 +3237,20 @@ impl Store for VirtStore<'_, '_> {
         b.put32(24, otype::BTREE | if enc { OBJ_ENCRYPTED } else { 0 });
         b.put32(28, self.subtype);
         Ok(self.nx.virt_create(self.owner, b))
+    }
+    fn modify_kept(&mut self, id: u64) -> Result<Option<u64>, String> {
+        // obj_get by the identifier with the tree's type (K 0x6725bb4): no
+        // object, a deleted one or another kind is not found.
+        if !self.nx.virt.get(&(self.owner, id)).is_some_and(|v| is_tree_node(&v.b, self.subtype)) {
+            return Ok(None);
+        }
+        self.nx.virt_modify(self.owner, id);
+        Ok(Some(id))
+    }
+    fn moved(&mut self, from: u64, to: u64, keys: &[Vec<u8>]) {
+        if let (Owner::Volume(v), FSTREE) = (self.owner, self.subtype) {
+            self.nx.fs_records_moved(v, from, to, keys);
+        }
     }
     fn delete(&mut self, id: u64) -> Result<(), String> {
         let vol = match self.owner {

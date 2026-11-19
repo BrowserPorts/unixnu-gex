@@ -364,6 +364,10 @@ pub fn build_disk0_hooked(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() 
         let w: Vec<String> = nx.vnode_risk_written.iter().map(|(v, i)| format!("slot {v} {i:#x}")).collect();
         missing.push(format!("the times {} inodes held in memory while XNU's vnode table was full ({}), which the restore's own next rewrite of each wrote: their vnodes' recycling may have written them first, in a transaction of its own at a point the run decides (vclean's VNOP_FSYNC or apfs_vnop_reclaim; not written there): {}", w.len(), nx.vnode_fill_at.clone().unwrap_or_default(), w.join(", ")));
     }
+    if !nx.hint_unsettled.is_empty() {
+        let w: Vec<String> = nx.hint_unsettled.iter().map(|(v, i, s)| format!("slot {v} {i:#x} ({s})")).collect();
+        missing.push(format!("the nodes {} inode updates change (update_jobj's bt_update, K 0x672c328, which fetches the leaf its in-memory object's hint at jobj + 0xb8 names and, when that leaf holds the record, changes nothing above it): the hint each object holds is the run's (its vnode recyclable by the full vnode table at points the run's scheduling decides, or a lookup by name of one of its extended attributes by a tool or kernel path the model does not run), and the hints it may hold change different nodes; the hint the restore's own operations left was used: {}", w.len(), w.join(", ")));
+    }
     missing.push("nx_counters[0] and block 0's nx_newest_mounted_version as the kernel's transactions leave them (projected from newfs_apfs's three counting sites; the kext has ten)".into());
     nx.unmount()?;
     Ok(missing)

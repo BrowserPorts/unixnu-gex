@@ -3,7 +3,8 @@
 //! (0x100027afc), `bt_remove_internal` (0x10002b138) with `bt_merge_up`
 //! (0x10002c4a4) and `bt_merge_nodes` (0x100030548), and the comparators
 //! of the trees the writer keeps (0x10001a1a4, 0x10003d0b4, 0x100043c64,
-//! 0x100009fc0).
+//! 0x100009fc0); and the kernel's `bt_update` (K 0x672c328), which
+//! replaces a record's value where it is.
 //!
 //! Nodes come from a [`Store`]: fetched for modification top-down (the
 //! root first), a physical tree's node taking a new address at its first
@@ -28,6 +29,15 @@ pub trait Store {
     fn create(&mut self, n: Node) -> Result<u64, String>;
     /// Node `id` deleted.
     fn delete(&mut self, id: u64) -> Result<(), String>;
+    /// Node `id` fetched for modification by an identifier a caller kept,
+    /// which may name a node deleted since: none then (`obj_get` finds no
+    /// object, or a deleted one: ENOENT, K 0x6725bb4).
+    fn modify_kept(&mut self, id: u64) -> Result<Option<u64>, String> {
+        Err(format!("not implemented: fetching node {id:#x} of this tree by a kept identifier"))
+    }
+    /// Leaf `from`'s records with keys `keys` moved to node `to`
+    /// (`bt_move_entries`).
+    fn moved(&mut self, _from: u64, _to: u64, _keys: &[Vec<u8>]) {}
 }
 
 /// A key comparator.
@@ -219,13 +229,26 @@ impl Tree {
         let s = self.shape;
         let mut an = st.get(a)?;
         let mut bn = st.get(b)?;
+        // The records moved out of a leaf, for the store's record.
+        let (from, to, keys) = if count > 0 && an.is_leaf() {
+            let n = an.nkeys();
+            (a, b, (n - count as usize..n).map(|i| an.key(&s, i).to_vec()).collect())
+        } else if count < 0 && bn.is_leaf() {
+            (b, a, (0..count.unsigned_abs()).map(|i| bn.key(&s, i).to_vec()).collect())
+        } else {
+            (a, b, Vec::new())
+        };
         if count > 0 {
             an.move_last_to_front(&s, &mut bn, count as usize);
         } else if count < 0 {
             an.append_from_front(&s, &mut bn, count.unsigned_abs());
         }
         st.put(a, an)?;
-        st.put(b, bn)
+        st.put(b, bn)?;
+        if !keys.is_empty() {
+            st.moved(from, to, &keys);
+        }
+        Ok(())
     }
 
     /// Looks `key` up: its value.
@@ -592,6 +615,86 @@ impl Tree {
             }
         }
         Ok(())
+    }
+
+    /// `bt_update` (K 0x672c328): record `key`'s value replaced with
+    /// `val` where the record is, by `btree_node_entry_update` (K
+    /// 0x6729a84) in its leaf; nothing is split or moved. Its answer is the
+    /// leaf that holds the record, or the error: ENOENT when the record is
+    /// not there, ENOSPC when its leaf has no room for the new value (the
+    /// caller then inserts the record, `bt_insert`), EINVAL for a key or
+    /// value of the wrong fixed size.
+    ///
+    /// `hint` is a leaf's identifier the caller kept from an earlier update
+    /// or lookup of the record (jobj + 0xb8 for an inode); on a tree that is
+    /// not physical that node alone is fetched for modification (the root
+    /// by `obj_modify`, another by `obj_get` with modification), and when it
+    /// is a leaf holding the record nothing above it is touched. Otherwise
+    /// (no hint, a deleted node, or one without the record) the descent
+    /// fetches the root and each child on the way for modification, as
+    /// `bt_insert` does, but makes no room on the way: an index node with no
+    /// keys ends it with ENOENT. After the change the tree's longest key and
+    /// value grow to the record's, and the root is changed (`obj_dirty`, K
+    /// 0x6746bf0) only when one grew or the tree is hashed.
+    pub fn update(&mut self, st: &mut dyn Store, key: &[u8], val: &[u8], hint: Option<u64>) -> Result<Result<u64, i32>, String> {
+        const ENOENT: i32 = 2;
+        const EINVAL: i32 = 22;
+        let s = self.shape;
+        if (s.key_size != 0 && s.key_size != key.len()) || (s.val_size != 0 && s.val_size != val.len()) {
+            return Ok(Err(EINVAL));
+        }
+        // The hint (K 0x672c40c..0x672c4dc, 0x672c76c..0x672c7a0).
+        let mut at: Option<(u64, usize)> = None;
+        if let Some(h) = hint.filter(|&h| h != 0 && s.bt_flags & tree_flags::PHYSICAL == 0) {
+            let got = if h == self.root { Some(st.modify(self.root)?) } else { st.modify_kept(h)? };
+            if let Some(id) = got {
+                let n = st.get(id)?;
+                if n.is_leaf() {
+                    let (i, f) = search(&s, &n, self.cmp, key);
+                    if f {
+                        at = Some((id, i));
+                    }
+                }
+            }
+        }
+        // The descent (K 0x672c4e0..0x672c704).
+        let (id, idx) = match at {
+            Some(a) => a,
+            None => {
+                self.root = st.modify(self.root)?;
+                let mut id = self.root;
+                loop {
+                    let n = st.get(id)?;
+                    if n.is_leaf() {
+                        let (i, f) = search(&s, &n, self.cmp, key);
+                        if !f {
+                            return Ok(Err(ENOENT));
+                        }
+                        break (id, i);
+                    }
+                    if n.nkeys() == 0 {
+                        return Ok(Err(ENOENT));
+                    }
+                    let (i, _) = search_index(&s, &n, self.cmp, key);
+                    id = self.child_modify(st, id, i)?;
+                }
+            }
+        };
+        let mut n = st.get(id)?;
+        match n.update(&s, idx, Some(key), Some(val), false) {
+            Ok(()) => st.put(id, n)?,
+            Err(e) => return Ok(Err(e)),
+        }
+        // The tree's longest key and value (K 0x672c6dc..0x672c748).
+        let info = self.info(st)?;
+        let grew = (info.longest_key < key.len() as u32) as u32 + (info.longest_val < val.len() as u32) as u32;
+        if grew != 0 || s.bt_flags & tree_flags::HASHED != 0 {
+            self.set_info(st, |i| {
+                i.longest_key = i.longest_key.max(key.len() as u32);
+                i.longest_val = i.longest_val.max(val.len() as u32);
+            })?;
+        }
+        Ok(Ok(id))
     }
 
     /// `bt_shift_or_split` (0x100027afc): room in node `n` (entry `pidx`
@@ -1389,7 +1492,7 @@ mod tests {
 
     /// Nodes in memory, numbered in creation order, kept where they are
     /// (a virtual tree within one transaction).
-    #[derive(Default)]
+    #[derive(Default, Clone)]
     pub(crate) struct Mem {
         pub nodes: HashMap<u64, Node>,
         next: u64,
@@ -1415,6 +1518,9 @@ mod tests {
         fn delete(&mut self, id: u64) -> Result<(), String> {
             self.nodes.remove(&id);
             Ok(())
+        }
+        fn modify_kept(&mut self, id: u64) -> Result<Option<u64>, String> {
+            Ok(self.nodes.contains_key(&id).then_some(id))
         }
     }
 
@@ -1466,6 +1572,78 @@ mod tests {
         assert_eq!(t.records(&mut m).unwrap().len(), recs.len());
     }
 
+    /// `bt_update` leaves a record's leaf as `bt_insert`'s replacement
+    /// does (both end in `btree_node_entry_update`), with a hint naming the
+    /// leaf, another leaf or none; it never splits, answering ENOSPC where
+    /// the leaf has no room, after which the insert does the split; a
+    /// record not there is ENOENT.
+    #[test]
+    fn update_leaves_the_leaf_insert_leaves() {
+        let s = Shape { bt_flags: 0x42, node_size: 4096, key_size: 0, val_size: 0, hash_size: 0 };
+        let mut m = Mem::default();
+        let mut t = Tree::create(&mut m, s, cmp_jobj_hashed).unwrap();
+        let mut x = 0x9e37_79b9u64;
+        let mut rnd = |n: u64| {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (x >> 33) % n
+        };
+        let key = |i: u64| ((16 + i) | 3 << 60).to_le_bytes().to_vec();
+        let mut order: Vec<u64> = (0..3000).collect();
+        for i in (1..order.len()).rev() {
+            order.swap(i, rnd(i as u64 + 1) as usize);
+        }
+        for &i in &order {
+            let v = vec![i as u8; 20 + rnd(280) as usize];
+            t.insert(&mut m, &key(i), Some(&v)).unwrap();
+        }
+        assert_eq!(t.update(&mut m, &key(5000), &[1; 30], None).unwrap(), Err(2));
+        let (mut same, mut fallback) = (0, 0);
+        for _ in 0..600 {
+            let i = rnd(3000);
+            let v = vec![(i + 7) as u8; 20 + rnd(280) as usize];
+            let (mut a, mut ta) = (m.clone(), t);
+            ta.insert(&mut a, &key(i), Some(&v)).unwrap();
+            let leaf = {
+                let mut id = t.root;
+                loop {
+                    let n = m.get(id).unwrap();
+                    if n.is_leaf() {
+                        break id;
+                    }
+                    id = t.child_of(&n, search_index(&s, &n, t.cmp, &key(i)).0);
+                }
+            };
+            let other = *m.nodes.iter().find(|(&id, n)| id != leaf && n.is_leaf()).unwrap().0;
+            let mut results = Vec::new();
+            for hint in [None, Some(leaf), Some(other), Some(9_999_999)] {
+                let (mut b, mut tb) = (m.clone(), t);
+                match tb.update(&mut b, &key(i), &v, hint).unwrap() {
+                    Ok(l) => assert_eq!(l, leaf),
+                    Err(ENOSPC) => {
+                        assert_eq!(b.nodes, m.nodes, "an update answering ENOSPC changed nothing");
+                        tb.insert(&mut b, &key(i), Some(&v)).unwrap();
+                    }
+                    Err(e) => panic!("bt_update: {e}"),
+                }
+                results.push((b, tb));
+            }
+            for (b, _) in &results[1..] {
+                assert_eq!(b.nodes, results[0].0.nodes, "the hint changed the tree");
+            }
+            let (b, tb) = results.swap_remove(0);
+            if a.nodes.len() == m.nodes.len() {
+                assert_eq!(a.nodes, b.nodes);
+                same += 1;
+            } else {
+                assert_eq!(tb.records(&mut b.clone()).unwrap(), ta.records(&mut a.clone()).unwrap());
+                fallback += 1;
+            }
+            m = b;
+            t = tb;
+        }
+        assert!(same > 0 && fallback > 0, "{same} {fallback}");
+    }
+
     /// The tree's signature as the oracle computes it after each
     /// operation: FNV-1a over the nodes past their headers in preorder,
     /// index values replaced by the children's preorder numbers.
@@ -1491,10 +1669,11 @@ mod tests {
     }
 
     /// Operation sequences replayed against the device library's own
-    /// `btree_create`, `bt_insert` and `bt_remove` (GEX_TEST_BT_ORACLE: a
-    /// directory of `NAME.ops` and the nodes the device made, `NAME.out`):
-    /// every node byte for byte past its object header, in the same tree
-    /// shape.
+    /// `btree_create`, `bt_insert`, `bt_remove` and `bt_update` (newfs_apfs
+    /// 0x100022458, followed by `bt_insert` on ENOSPC as `fs_update_jobj`
+    /// does) (GEX_TEST_BT_ORACLE: a directory of `NAME.ops` and the nodes
+    /// the device made, `NAME.out`): every node byte for byte past its
+    /// object header, in the same tree shape.
     #[test]
     fn operations_match_the_device_library() {
         let Ok(dir) = std::env::var("GEX_TEST_BT_ORACLE") else { return };
@@ -1531,7 +1710,17 @@ mod tests {
                 let k = b[at + 5..at + 5 + kl].to_vec();
                 let v = b[at + 5 + kl..at + 5 + kl + vl].to_vec();
                 at += 5 + kl + vl;
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| if op == 1 { t.insert(&mut m, &k, (vl != 0).then_some(&v[..])) } else { t.remove(&mut m, &k).map(|_| ()) })).unwrap_or_else(|_| Err("panicked".into()));
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match op {
+                    1 => t.insert(&mut m, &k, (vl != 0).then_some(&v[..])),
+                    // fs_update_jobj's op 2: bt_update, bt_insert on ENOSPC.
+                    3 => match t.update(&mut m, &k, &v, None)? {
+                        Ok(_) => Ok(()),
+                        Err(ENOSPC) => t.insert(&mut m, &k, (vl != 0).then_some(&v[..])),
+                        Err(e) => Err(format!("bt_update: {e}")),
+                    },
+                    _ => t.remove(&mut m, &k).map(|_| ()),
+                }))
+                .unwrap_or_else(|_| Err("panicked".into()));
                 if std::env::var("GEX_TEST_BT_DUMPAT").is_ok_and(|d| d.parse() == Ok(n)) {
                     let mut f = Vec::new();
                     for id in t.node_ids(&mut m).unwrap() {

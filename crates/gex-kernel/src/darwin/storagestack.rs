@@ -1173,6 +1173,14 @@ pub fn disk0_write_limits() -> (u64, u64, u64) {
     (max, max >> 12, max >> 12)
 }
 
+/// The read limits the same lookup finds (the main namespace publishes its
+/// type's limit for both directions): IOMaximumByteCountRead,
+/// IOMaximumBlockCountRead and IOMaximumSegmentCountRead.
+pub fn disk0_read_limits() -> (u64, u64, u64) {
+    let max = u64::from(NAMESPACE_MAX_BYTES[namespace_type(1) as usize]);
+    (max, max >> 12, max >> 12)
+}
+
 fn namespace_type(nsid: u32) -> u32 {
     match nsid {
         7 => 8,

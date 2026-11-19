@@ -1236,7 +1236,7 @@ fn verify_cert(key: &[u8], cert: &Cert<'_>) -> Result<(), i32> {
 /// manifest's chain is one certificate under 128 KiB (0xfffffff005aa8be8),
 /// issued by the anchor's subject and signed by its key. The leaf's key and
 /// Image4 constraints.
-pub(crate) fn verify_chain<'a>(anchor: &'a [u8], chain: &'a [u8]) -> Result<(&'a [u8], Option<&'a [u8]>), i32> {
+pub fn verify_chain<'a>(anchor: &'a [u8], chain: &'a [u8]) -> Result<(&'a [u8], Option<&'a [u8]>), i32> {
     let mut certs = vec![anchor];
     let mut rest = chain;
     loop {

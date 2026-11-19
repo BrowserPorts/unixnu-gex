@@ -220,13 +220,13 @@ with_disk0() {
 
 # with_web_device CMD [ARGS...]: CMD booting as a copy of the web device
 # (GEX_TEST_WEB_DEVICE) made for it beside that directory, of the files a
-# run reads (its root's certificate, identity, nonce slot, Cryptex1 ticket
-# and NVRAM image, not its keys), so that what the run writes to its NVRAM
+# run reads (its root's certificate, identity, nonce slot, Cryptex1 ticket,
+# AP ticket and NVRAM image, not its keys), so that what the run writes to its NVRAM
 # stays in the copy; WEBDEV names the copy while CMD runs, and the copy
 # is removed after unless KEEP_WEBDEV is set (the caller removes it).
 with_web_device() {
     WEBDEV=$(mktemp -d "$(dirname "$GEX_TEST_WEB_DEVICE")/.gex-webdev-$$.XXXXXX") || return 1
-    for f in root.der device.plist nonce-cryptex1-boot.slot cryptex1.im4m nvram.bin; do
+    for f in root.der device.plist nonce-cryptex1-boot.slot cryptex1.im4m apticket.der nvram.bin; do
         [ -f "$GEX_TEST_WEB_DEVICE/$f" ] && cp -p "$GEX_TEST_WEB_DEVICE/$f" "$WEBDEV/"
     done
     GEX_DARWIN_WEB_DEVICE=$WEBDEV GEX_DARWIN_CRYPTEX1_TICKET=web-device "$@"

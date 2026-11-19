@@ -9184,17 +9184,27 @@ fn darwin_nvram_source(path: &std::path::Path, device: bool) -> Result<gex_kerne
 }
 
 /// The web device of directory `dir`: what it has of its own, its root's
-/// certificate, identity and cryptex1 boot nonce slot, and the Cryptex1
-/// ticket its manifest key signed for it, when there is one (its private
-/// keys and UID are the tools', which this does not read).
+/// certificate, identity and cryptex1 boot nonce slot, the Cryptex1
+/// ticket and the AP ticket its manifest keys signed for it, when there
+/// are, and the AP nonce generator its NVRAM holds (its private keys and
+/// UID are the tools', which this does not read).
 fn darwin_web_device(dir: &std::path::Path) -> Result<gex_kernel::darwin::webdevice::WebDevice> {
     use gex_kernel::darwin::webdevice::{files, of_files};
     let read = |name: &str| std::fs::read(dir.join(name)).map_err(|e| anyhow!("the web device's {}: {e}", dir.join(name).display()));
+    let optional = |name: &str| -> Result<Option<Vec<u8>>> {
+        match std::fs::read(dir.join(name)) {
+            Ok(b) => Ok(Some(b)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(anyhow!("the web device's {}: {e}", dir.join(name).display())),
+        }
+    };
     let root = read(files::ROOT_CERT)?;
     let identity = read(files::IDENTITY)?;
     let slot = read(files::CRYPTEX1_BOOT_SLOT)?;
     let ticket = dir.join(files::CRYPTEX1_TICKET);
     let ticket = ticket.exists().then(|| ticket.to_string_lossy().into_owned());
-    of_files(root, &identity, &slot, ticket).map_err(|e| anyhow!("{}: {e}", dir.display()))
+    let ap_ticket = optional(files::AP_TICKET)?;
+    let nvram = optional(files::NVRAM)?;
+    of_files(root, &identity, &slot, ticket, ap_ticket, nvram.as_deref()).map_err(|e| anyhow!("{}: {e}", dir.display()))
 }
 

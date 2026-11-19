@@ -154,11 +154,13 @@ impl Identity {
 
     /// What the web device's boot puts in `/chosen`, as iBoot fills it in
     /// on a device: the properties AppleImage4's instances read (its
-    /// runtime, 0xfffffff005a9280c), in their sizes, little-endian. The
-    /// IPSW's device tree has each but `security-domain` as a zero
-    /// placeholder; the web device's boot adds that one, which the Cryptex1
-    /// ticket's SDOM is held to. The mix-n-match prevention status is a
-    /// production device's (prevented).
+    /// runtime, 0xfffffff005a9280c) and libimage4's AP chip reads, in their
+    /// sizes, little-endian. The IPSW's device tree has each but
+    /// `security-domain` and `chip-epoch` as a zero placeholder; the web
+    /// device's boot adds those, which the tickets' SDOM and the AP ticket's
+    /// CEPO are held to (libimage4's AP chip queries `chip-epoch` for CEPO,
+    /// `ge`, with no answer of its own). The mix-n-match prevention status
+    /// is a production device's (prevented).
     pub fn chosen(&self) -> Vec<(&'static str, Vec<u8>)> {
         let b = |v: bool| u32::from(v).to_le_bytes().to_vec();
         vec![
@@ -166,6 +168,7 @@ impl Identity {
             ("board-id", self.board.to_le_bytes().to_vec()),
             ("unique-chip-id", self.ecid.to_le_bytes().to_vec()),
             ("security-domain", self.security_domain.to_le_bytes().to_vec()),
+            ("chip-epoch", (AP_CERTIFICATE_EPOCH as u32).to_le_bytes().to_vec()),
             ("certificate-production-status", b(self.production)),
             ("certificate-security-mode", b(self.security)),
             ("effective-production-status-ap", b(self.effective_production)),
@@ -383,21 +386,86 @@ pub const CRYPTEX1_OBJECTS: [(&str, &[u8; 4]); 6] = [
 /// least.
 pub const CRYPTEX1_EPOCH: u64 = 1;
 
-/// A restore request rule's conditions against the device's: each must
-/// be the device's value; one the device does not have fails the rule.
-fn rule_applies(conditions: &Value, device: &[(&str, bool)]) -> Result<bool, String> {
+/// The device's values a restore request rule's conditions name
+/// (`__AMAuthInstallBundleGetValueForReservedKey`, libauthinstall 0x24210):
+/// the raw production and security modes (the certificate's), the current
+/// ones (the effective), whether it takes Image4, whether it is in the
+/// ROM's DFU (a restore from iBoot's recovery is not), and its demotion
+/// policy override, which the web device does not ask for (the empty
+/// string the rules for a device without one test).
+fn device_conditions(id: &Identity) -> [(&'static str, Value); 7] {
+    [
+        ("ApRawProductionMode", Value::Bool(id.production)),
+        ("ApRawSecurityMode", Value::Bool(id.security)),
+        ("ApCurrentProductionMode", Value::Bool(id.effective_production)),
+        ("ApCurrentSecurityMode", Value::Bool(id.effective_security)),
+        ("ApRequiresImage4", Value::Bool(true)),
+        ("ApInRomDFU", Value::Bool(false)),
+        ("ApDemotionPolicyOverride", Value::String(String::new())),
+    ]
+}
+
+/// A restore request rule's conditions against the device's
+/// (`__AMAuthInstallBundleCheckCondition` 0x24628 and
+/// `__AMAuthInstallBundleGetValueForCondition` 0x244b0): all must hold; a
+/// boolean or string condition holds when it is the device's value; one
+/// naming none of the device's values holds when its value is false, the
+/// empty string, zero or empty data (`__AMAuthInstallBundleGetDefaultResult`
+/// 0x243b8).
+fn rule_applies(conditions: &Value, id: &Identity) -> Result<bool, String> {
     let Value::Dict(c) = conditions else { return Err("a restore request rule's Conditions is not a dictionary".into()) };
-    for (k, v) in c {
-        let Value::Bool(want) = v else {
-            // ApDemotionPolicyOverride names a policy the device has none of.
-            return Ok(false);
+    let device = device_conditions(id);
+    for (k, want) in c {
+        let holds = match device.iter().find(|(n, _)| n == k) {
+            Some((_, have)) => match (have, want) {
+                (Value::Bool(h), Value::Bool(w)) => h == w,
+                (Value::String(h), Value::String(w)) => h == w,
+                (Value::Bool(_), _) => false,
+                (Value::String(_), _) => false,
+                _ => return Err(format!("a restore request rule's condition {k} of a kind the device's value is not")),
+            },
+            None => match want {
+                Value::Bool(b) => !b,
+                Value::String(s) => s.is_empty(),
+                Value::Integer(i) => *i == 0,
+                Value::Data(d) => d.is_empty(),
+                _ => false,
+            },
         };
-        match device.iter().find(|(n, _)| n == k) {
-            Some((_, have)) if have == want => {}
-            _ => return Ok(false),
+        if !holds {
+            return Ok(false);
         }
     }
     Ok(true)
+}
+
+/// What a component's restore request rules give the device, in order
+/// (`AMAuthInstallBundleProcessRules`, libauthinstall 0x248d4: each rule
+/// whose conditions hold sets its actions, a later one replacing an
+/// earlier's).
+fn rule_actions(component: &Value, key: &str, id: &Identity) -> Result<Vec<(u32, bool)>, String> {
+    let mut out: Vec<(u32, bool)> = Vec::new();
+    let Some(rules) = component.get("Info").and_then(|i| i.get("RestoreRequestRules")) else { return Ok(out) };
+    let rules = rules.as_array().ok_or_else(|| format!("the build identity's {key} RestoreRequestRules is not an array"))?;
+    for r in rules {
+        let cond = r.get("Conditions").ok_or_else(|| format!("a restore request rule of {key} has no Conditions"))?;
+        if !rule_applies(cond, id)? {
+            continue;
+        }
+        let Some(Value::Dict(actions)) = r.get("Actions") else {
+            return Err(format!("a restore request rule of {key} has no Actions"));
+        };
+        for (name, v) in actions {
+            let code: [u8; 4] = name.as_bytes().try_into().map_err(|_| format!("a restore request rule of {key} sets {name:?}, not a property"))?;
+            let Value::Bool(b) = v else {
+                return Err(format!("a restore request rule of {key} sets {name} to a value that is not a boolean"));
+            };
+            let code = cc(&code);
+            out.retain(|(c, _)| *c != code);
+            out.push((code, *b));
+        }
+    }
+    Ok(out)
 }
 
 /// A component's object properties: its digest and what its restore
@@ -405,29 +473,9 @@ fn rule_applies(conditions: &Value, device: &[(&str, bool)]) -> Result<bool, Str
 fn object_properties(component: &Value, key: &str, id: &Identity) -> Result<Vec<Vec<u8>>, String> {
     let digest = component.get("Digest").and_then(Value::as_data).ok_or_else(|| format!("the build identity's {key} has no Digest"))?;
     let mut props: Vec<(u32, Vec<u8>)> = vec![(cc(b"DGST"), enc::octets(digest))];
-    // The device's restore parameters the rules ask about: in production
-    // mode, secure, an Image4 device, not in DFU.
-    let device = [("ApRequiresImage4", true), ("ApCurrentProductionMode", id.effective_production), ("ApRawSecurityMode", id.security), ("ApInRomDFU", false)];
-    if let Some(rules) = component.get("Info").and_then(|i| i.get("RestoreRequestRules")) {
-        let rules = rules.as_array().ok_or_else(|| format!("the build identity's {key} RestoreRequestRules is not an array"))?;
-        for r in rules {
-            let cond = r.get("Conditions").ok_or_else(|| format!("a restore request rule of {key} has no Conditions"))?;
-            if !rule_applies(cond, &device)? {
-                continue;
-            }
-            let Some(Value::Dict(actions)) = r.get("Actions") else {
-                return Err(format!("a restore request rule of {key} has no Actions"));
-            };
-            for (name, v) in actions {
-                let code: [u8; 4] = name.as_bytes().try_into().map_err(|_| format!("a restore request rule of {key} sets {name:?}, not a property"))?;
-                let Value::Bool(b) = v else {
-                    return Err(format!("a restore request rule of {key} sets {name} to a value that is not a boolean"));
-                };
-                let code = cc(&code);
-                props.retain(|(c, _)| *c != code);
-                props.push((code, enc::boolean(*b)));
-            }
-        }
+    for (code, v) in rule_actions(component, key, id)? {
+        props.retain(|(c, _)| *c != code);
+        props.push((code, enc::boolean(v)));
     }
     Ok(props.into_iter().map(|(c, v)| enc::property(c, v)).collect())
 }
@@ -475,6 +523,342 @@ pub fn im4m(body: &[u8], signature: &[u8], chain: &[Vec<u8>]) -> Vec<u8> {
     enc::seq(&[enc::ia5(b"IM4M"), enc::int(0), body.to_vec(), enc::octets(signature), enc::seq(chain)])
 }
 
+/// The AP manifest key's name. As Apple's TSS signs an AP ticket with a
+/// leaf of its own for the chip and security domain
+/// ("T8132-SDOM1-TssLive-ManifestKey-...", the host Mac's AP ticket), a
+/// key other than its Cryptex1 key, the web device's AP tickets are
+/// signed by an AP manifest key its root issues.
+pub const AP_MANIFEST_KEY_NAME: &str = "UniXNU Web Device AP Manifest Key - G1";
+
+/// The web device's AP certificate epoch: what its boot puts in `/chosen`'s
+/// `chip-epoch` ([`Identity::chosen`]), the request's `ApCertificateEpoch`
+/// its AP tickets carry as CEPO (`AMAuthInstallApImg4LocalCreateManifestBody`'s
+/// first property) and its AP manifest key fixes, as Apple's AP manifest
+/// keys fix theirs (the host Mac's: CEPO 1).
+pub const AP_CERTIFICATE_EPOCH: u64 = 1;
+
+/// The AP manifest key's Image4 constraints, in the form of Apple's AP
+/// manifest keys (the host Mac's: `MANP` {BORD [0], CEPO, CHIP, SDOM, ...},
+/// `OBJP` {DGST [0], EKEY [0]}): its chip, security domain and certificate
+/// epoch fixed; the board, the modes, the ECID and the boot nonce hash
+/// present, the ticket being personalized; each object's digest and its
+/// encryption flag present.
+pub fn ap_manifest_constraints(id: &Identity, epoch: u64) -> Vec<u8> {
+    let manp = enc::set(&[
+        present(b"BNCH", true),
+        present(b"BORD", true),
+        enc::property(cc(b"CEPO"), enc::int(epoch)),
+        enc::property(cc(b"CHIP"), enc::int(id.chip.into())),
+        present(b"CPRO", true),
+        present(b"CSEC", true),
+        present(b"ECID", true),
+        enc::property(cc(b"SDOM"), enc::int(id.security_domain.into())),
+    ]);
+    let objp = enc::set(&[present(b"DGST", true), present(b"EKEY", true)]);
+    enc::set(&[enc::property(cc(b"MANP"), manp), enc::property(cc(b"OBJP"), objp)])
+}
+
+/// The AP manifest key's certificate's description, issued by the root of
+/// key `root_key`.
+pub fn ap_manifest_key_spec(serial: [u8; 20], not_before: &str, not_after: &str, key: Vec<u8>, root_key: &[u8], id: &Identity, epoch: u64) -> CertSpec {
+    CertSpec {
+        serial,
+        issuer: name(ROOT_NAME, ORGANIZATION),
+        subject: name(AP_MANIFEST_KEY_NAME, ORGANIZATION),
+        not_before: not_before.into(),
+        not_after: not_after.into(),
+        key,
+        authority_key_id: Some(key_id(root_key)),
+        ca: false,
+        img4: Some(ap_manifest_constraints(id, epoch)),
+    }
+}
+
+/// The AP nonce: its generator, NVRAM's `com.apple.System.boot-nonce`, and
+/// the hash a TSS request's `ApNonce` and the AP ticket's `BNCH` carry.
+pub mod apnonce {
+    use super::super::nvram;
+    use std::sync::{Arc, Mutex};
+
+    /// The variable (`AppleMobileApNonce::start`, 0xfffffff006581618: its
+    /// symbol; IODTNVRAM keeps it as a string, for the kernel only).
+    pub const KEY: &[u8] = b"com.apple.System.boot-nonce";
+    /// The variable's length: "0x" and 16 hexadecimal digits
+    /// (0xfffffff006582840 refuses any other; 0xfffffff006581f1c too).
+    pub const TEXT_LENGTH: usize = 0x12;
+    /// The hash's length for `/chosen`'s `crypto-hash-method` "sha2-384":
+    /// AppleMobileApNonce's method record 0xfffffff005581738 {2, 0x20}
+    /// (SHA-384, 32 bytes; "sha1" is {1, 0x14}).
+    pub const HASH_LENGTH: usize = 0x20;
+
+    /// `_generateNonceHash` (0xfffffff006582224) without `/defaults`'
+    /// `entangle-nonce` (the J120's has none): SHA-384 of the generator's
+    /// eight bytes as the kext holds them (little-endian), its first
+    /// [`HASH_LENGTH`] bytes.
+    pub fn hash(generator: u64) -> Vec<u8> {
+        use sha2::Digest;
+        sha2::Sha384::digest(generator.to_le_bytes())[..HASH_LENGTH].to_vec()
+    }
+
+    /// The variable's text for a generator: `_generateNonce`'s
+    /// "0x%016llx" (0xfffffff006581b50).
+    pub fn text(generator: u64) -> String {
+        format!("0x{generator:016x}")
+    }
+
+    /// The generator of the variable's bytes, as `_retrieveNonce`
+    /// (0xfffffff006581f1c) takes it: 18 bytes, "0x", then `strtouq`
+    /// in base 16 consuming the rest.
+    pub fn parse(v: &[u8]) -> Result<u64, String> {
+        if v.len() != TEXT_LENGTH {
+            return Err(format!("nonce length {} expected {TEXT_LENGTH}", v.len()));
+        }
+        let digits = v.strip_prefix(b"0x").ok_or("the nonce does not start with 0x")?;
+        let s = std::str::from_utf8(digits).map_err(|_| "the nonce is not hexadecimal")?;
+        if !s.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return Err(format!("invalid nonce {s:?}"));
+        }
+        u64::from_str_radix(s, 16).map_err(|e| format!("invalid nonce {s:?}: {e}"))
+    }
+
+    /// The bank as the device's NVRAM namespace holds it.
+    struct Mem(Mutex<Vec<u8>>);
+
+    impl nvram::Medium for Mem {
+        fn read(&self, len: usize) -> Result<Vec<u8>, String> {
+            let b = self.0.lock().unwrap();
+            b.get(..len).map(<[u8]>::to_vec).ok_or_else(|| format!("{len} bytes asked of a {}-byte namespace", b.len()))
+        }
+        fn write(&self, bytes: &[u8]) -> Result<(), String> {
+            let mut b = self.0.lock().unwrap();
+            if bytes.len() > b.len() {
+                return Err(format!("{} bytes written to a {}-byte namespace", bytes.len(), b.len()));
+            }
+            b[..bytes.len()].copy_from_slice(bytes);
+            Ok(())
+        }
+    }
+
+    /// The clock the save's forced sync reads, which it does not rate
+    /// limit.
+    struct Start;
+
+    impl nvram::Clock for Start {
+        fn uptime_secs(&self) -> i64 {
+            0
+        }
+    }
+
+    fn started(image: &[u8]) -> Result<(nvram::Nvram, Arc<Mem>), String> {
+        let mut chosen = nvram::Chosen::default();
+        for (k, v) in nvram::chosen_for(image) {
+            match k {
+                "nvram-bank-size" => chosen.bank_size = Some(v),
+                "nvram-bank-count" => chosen.bank_count = Some(v),
+                "nvram-current-bank" => chosen.current_bank = Some(v),
+                _ => chosen.proxy_data = Some(v),
+            }
+        }
+        let mut nv = nvram::Nvram::start(&chosen).map_err(|p| format!("IODTNVRAM's start panics: {}", p.0))?;
+        let medium = Arc::new(Mem(Mutex::new(image.to_vec())));
+        nv.register_controller(medium.clone())?;
+        Ok((nv, medium))
+    }
+
+    /// The generator the NVRAM image `image` holds, read as the kernel's
+    /// IODTNVRAM gives it to AppleMobileApNonce (`copyProperty` by the
+    /// kernel); none when the variable is not there.
+    pub fn read(image: &[u8]) -> Result<Option<u64>, String> {
+        let (mut nv, _) = started(image)?;
+        match nv.copy_property(&nvram::Kernel, KEY) {
+            None => Ok(None),
+            Some(nvram::Value::String(s) | nvram::Value::Symbol(s) | nvram::Value::Data(s)) => parse(&s).map(Some),
+            Some(v) => Err(format!("com.apple.System.boot-nonce holds {v:?}, not the nonce's text")),
+        }
+    }
+
+    /// The NVRAM image `image` with the generator saved as
+    /// `_saveNonceInNVRAM` (0xfffffff006582840) saves it: IODTNVRAM's
+    /// `setProperty` of the variable to its text (a string), then
+    /// `IONVRAM-FORCESYNCNOW-PROPERTY`, whose sync writes the namespace.
+    pub fn saved(image: &[u8], generator: u64) -> Result<Vec<u8>, String> {
+        let (mut nv, medium) = started(image)?;
+        let r = nv.set_property_clocked(&nvram::Kernel, KEY, &nvram::Given::Value(nvram::Value::String(text(generator).into_bytes())), None, &Start);
+        if r != nvram::ret::SUCCESS {
+            return Err(format!("IODTNVRAM refuses com.apple.System.boot-nonce: {r:#x}"));
+        }
+        let sync = nvram::key::FORCE_SYNC_NOW;
+        let r = nv.set_property_clocked(&nvram::Kernel, sync, &nvram::Given::Value(nvram::Value::String(sync.to_vec())), None, &Start);
+        if !nv.write_errors.is_empty() {
+            return Err(nv.write_errors.join("; "));
+        }
+        if r != nvram::ret::SUCCESS {
+            return Err(format!("IODTNVRAM's forced sync: {r:#x}"));
+        }
+        let out = medium.0.lock().unwrap().clone();
+        match read(&out)? {
+            Some(g) if g == generator => Ok(out),
+            other => Err(format!("the synced namespace holds {other:?}, not the generator saved")),
+        }
+    }
+}
+
+/// The AP ticket's digest as the boot's `/chosen` `boot-manifest-hash`
+/// holds it and the Preboot volume's directory is named by: SHA-384 (the
+/// J120's `crypto-hash-method` "sha2-384") of the whole IM4M, as AppleImage4
+/// keeps the manifest's (0xfffffff005aa6df8's digest of the whole
+/// manifest), restored's `ramrod_ticket_copy_nsih` names the directory and
+/// the kernel's `kern.bootobjectspath` reads it back; on the host Mac the
+/// three agree (its `/chosen` boot-manifest-hash, its Preboot
+/// `boot/<hash>` and SHA-384 of the apticket.der there).
+pub fn boot_manifest_hash(ticket: &[u8]) -> [u8; 48] {
+    sha384(ticket)
+}
+
+/// The objects of the AP ticket by the build identity's component name:
+/// libauthinstall's entry-name table (`_kImg4Types`, 0xc9240, which
+/// `AMAuthInstallApImg4GetTypeForEntryName` gives a request tag's object by)
+/// for the J120 identity's components, the four of no file whose names are
+/// their tags, and the two restored evaluates by tag ('msys'
+/// RE@0x100058108, 'isys' RE@0x100058714), which the table has not. The
+/// `Cryptex1,` components are the Cryptex1 ticket's (restored's
+/// `_personalize_splat_ticket` asks for theirs); `OS`, a disk image
+/// restored by digest alone, has no object code in any 21H461 binary.
+pub const AP_OBJECTS: [(&str, &[u8; 4]); 30] = [
+    ("AOP", b"aopf"),
+    ("AVE", b"avef"),
+    ("Ap,SystemVolumeCanonicalMetadata", b"msys"),
+    ("AppleLogo", b"logo"),
+    ("BatteryCharging0", b"chg0"),
+    ("BatteryCharging1", b"chg1"),
+    ("BatteryFull", b"batF"),
+    ("BatteryLow0", b"bat0"),
+    ("BatteryLow1", b"bat1"),
+    ("BatteryPlugin", b"glyP"),
+    ("DeviceTree", b"dtre"),
+    ("KernelCache", b"krnl"),
+    ("LLB", b"illb"),
+    ("RecoveryMode", b"recm"),
+    ("RestoreDeviceTree", b"rdtr"),
+    ("RestoreKernelCache", b"rkrn"),
+    ("RestoreLogo", b"rlgo"),
+    ("RestoreRamDisk", b"rdsk"),
+    ("RestoreSEP", b"rsep"),
+    ("RestoreTrustCache", b"rtsc"),
+    ("SEP", b"sepi"),
+    ("StaticTrustCache", b"trst"),
+    ("SystemVolume", b"isys"),
+    ("ftap", b"ftap"),
+    ("ftsp", b"ftsp"),
+    ("iBEC", b"ibec"),
+    ("iBSS", b"ibss"),
+    ("iBoot", b"ibot"),
+    ("rfta", b"rfta"),
+    ("rfts", b"rfts"),
+];
+
+/// The components the AP ticket leaves to others.
+fn not_ap(key: &str) -> bool {
+    key.starts_with("Cryptex1,") || key == "OS"
+}
+
+/// The build identity's manifest properties the request copies
+/// (`__AMAuthInstallBundlePopulateManifestProperties`, libauthinstall
+/// 0x26304: Ap,OSLongVersion, Ap,TargetType, Ap,ProductType, Ap,SDKPlatform,
+/// Ap,Target among them) and the AP ticket's properties TSS makes of them
+/// (the host Mac's AP ticket: love, tatp, prtp, sdkp and tagt hold its build
+/// identity's values as octet strings).
+pub const AP_IDENTITY_PROPERTIES: [(&str, &[u8; 4]); 5] = [("Ap,OSLongVersion", b"love"), ("Ap,ProductType", b"prtp"), ("Ap,SDKPlatform", b"sdkp"), ("Ap,Target", b"tagt"), ("Ap,TargetType", b"tatp")];
+
+/// An AP component's object properties (`AMAuthInstallApImg4LocalAddImageProperties`,
+/// libauthinstall 0xe19c, from the request entry
+/// `__AMAuthInstallBundleCreateServerRequestDictionary` 0x1f478 makes of
+/// the build identity's): its digest when the entry has one and it is
+/// personalized (an entry with `Personalize` false is asked for with an
+/// empty digest, which the ticket leaves out), `EKEY` its `Trusted`, and
+/// what its restore request rules give the device.
+fn ap_object_properties(component: &Value, key: &str, id: &Identity) -> Result<Vec<Vec<u8>>, String> {
+    let info = component.get("Info").ok_or_else(|| format!("the build identity's {key} has no Info"))?;
+    let personalize = match info.get("Personalize") {
+        None => true,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err(format!("the build identity's {key} Personalize is not a boolean")),
+    };
+    let mut props: Vec<(u32, Vec<u8>)> = Vec::new();
+    if personalize {
+        if let Some(d) = component.get("Digest") {
+            let d = d.as_data().ok_or_else(|| format!("the build identity's {key} Digest is not data"))?;
+            if !d.is_empty() {
+                props.push((cc(b"DGST"), enc::octets(d)));
+            }
+        }
+    }
+    match component.get("Trusted") {
+        None => {}
+        Some(Value::Bool(t)) => props.push((cc(b"EKEY"), enc::boolean(*t))),
+        Some(_) => return Err(format!("the build identity's {key} Trusted is not a boolean")),
+    }
+    for (code, v) in rule_actions(component, key, id)? {
+        props.retain(|(c, _)| *c != code);
+        props.push((code, enc::boolean(v)));
+    }
+    Ok(props.into_iter().map(|(c, v)| enc::property(c, v)).collect())
+}
+
+/// The AP ticket's manifest body (the set holding `MANB`) for the device
+/// `id` and build identity `build`, with the AP nonce hash `bnch`, the
+/// device's certificate epoch `epoch` and the signer's random `srvn`
+/// (TSS's 20 bytes, as in the host Mac's AP ticket). `MANP` is what
+/// `AMAuthInstallApImg4LocalCreateManifestBody` (libauthinstall 0xca18)
+/// makes of the request (CEPO, CHIP, BORD, ECID, SDOM, CPRO, CSEC, BNCH;
+/// no SEP nonce, the web device's SEP having none to give), the
+/// identity's properties ([`AP_IDENTITY_PROPERTIES`]) and `srvn`; one
+/// object per component of [`AP_OBJECTS`].
+pub fn ap_body(id: &Identity, build: &Value, bnch: &[u8], epoch: u64, srvn: &[u8; 20]) -> Result<Vec<u8>, String> {
+    let what = "the build identity";
+    if get_u32(build, "ApChipID", what)? != id.chip || get_u32(build, "ApBoardID", what)? != id.board || get_u32(build, "ApSecurityDomain", what)? != id.security_domain {
+        return Err("the build identity is not the web device's chip, board and security domain".into());
+    }
+    let mut manp = vec![
+        enc::property(cc(b"BNCH"), enc::octets(bnch)),
+        enc::property(cc(b"BORD"), enc::int(id.board.into())),
+        enc::property(cc(b"CEPO"), enc::int(epoch)),
+        enc::property(cc(b"CHIP"), enc::int(id.chip.into())),
+        enc::property(cc(b"CPRO"), enc::boolean(id.production)),
+        enc::property(cc(b"CSEC"), enc::boolean(id.security)),
+        enc::property(cc(b"ECID"), enc::int(id.ecid)),
+        enc::property(cc(b"SDOM"), enc::int(id.security_domain.into())),
+        enc::property(cc(b"srvn"), enc::octets(srvn)),
+    ];
+    for (k, code) in AP_IDENTITY_PROPERTIES {
+        let v = build.get(k).and_then(Value::as_str).ok_or_else(|| format!("{what} has no {k}"))?;
+        manp.push(enc::property(cc(code), enc::octets(v.as_bytes())));
+    }
+    let Some(Value::Dict(components)) = build.get("Manifest") else { return Err("the build identity has no Manifest".into()) };
+    let mut manb = vec![enc::property(cc(b"MANP"), enc::set(&manp))];
+    let mut seen: Vec<u32> = Vec::new();
+    for (key, c) in components {
+        if not_ap(key) {
+            continue;
+        }
+        let code = AP_OBJECTS.iter().find(|(k, _)| k == key).map(|(_, c)| cc(c)).ok_or_else(|| format!("not implemented: the AP ticket's object for the build identity's {key} (no object code for it)"))?;
+        if seen.contains(&code) {
+            return Err(format!("the build identity's {key} names an object another component has"));
+        }
+        seen.push(code);
+        manb.push(enc::property(code, enc::set(&ap_object_properties(c, key, id)?)));
+    }
+    Ok(enc::set(&[enc::property(cc(b"MANB"), enc::set(&manb))]))
+}
+
+/// The AP ticket, signed by the AP manifest key `signer` whose certificate
+/// is `leaf`.
+pub fn ap_ticket(id: &Identity, build: &Value, bnch: &[u8], epoch: u64, srvn: &[u8; 20], signer: &dyn Signer, leaf: &[u8]) -> Result<Vec<u8>, String> {
+    let body = ap_body(id, build, bnch, epoch, srvn)?;
+    let sig = signer.sign_sha384(&sha384(&body))?;
+    Ok(im4m(&body, &sig, &[leaf.to_vec()]))
+}
+
 /// The Cryptex1 ticket, signed by the manifest key `signer` whose
 /// certificate is `leaf`.
 pub fn cryptex1_ticket(id: &Identity, build: &Value, cnch: &[u8], srvn: &[u8; 20], signer: &dyn Signer, leaf: &[u8]) -> Result<Vec<u8>, String> {
@@ -504,6 +888,13 @@ pub mod files {
     /// Its NVRAM namespace: the bank IODTNVRAM's controller writes
     /// (`super::super::nvram`), made as its factory left it.
     pub const NVRAM: &str = "nvram.bin";
+    /// The AP manifest key and its certificate.
+    pub const AP_MANIFEST_KEY: &str = "ap-manifest.key";
+    pub const AP_MANIFEST_CERT: &str = "ap-manifest.der";
+    /// Its AP ticket: the RootTicketData its restore takes and the ticket
+    /// its boot boots with (`boot-manifest-hash`), which its Preboot volume
+    /// holds as `<hash>/System/Library/Caches/apticket.der`.
+    pub const AP_TICKET: &str = "apticket.der";
 }
 
 /// The web device a run boots: what it has of its own.
@@ -516,6 +907,10 @@ pub struct WebDevice {
     pub slot: nonce::Slot,
     /// Its Cryptex1 ticket's host path, when one is signed.
     pub ticket: Option<String>,
+    /// Its AP ticket, when one is signed.
+    pub ap_ticket: Option<Vec<u8>>,
+    /// Its AP nonce generator, when its NVRAM holds one.
+    pub boot_nonce: Option<u64>,
 }
 
 static WEB: OnceLock<WebDevice> = OnceLock::new();
@@ -538,12 +933,62 @@ pub fn nonce_hash(w: &WebDevice, entangle_nonce: bool) -> Result<Vec<u8>, Fail> 
 }
 
 /// The web device from its directory's files as the host read them: its
-/// root's certificate, its identity, its cryptex1 boot slot, and the path
-/// of its Cryptex1 ticket when it has one.
-pub fn of_files(root: Vec<u8>, identity: &[u8], slot: &[u8], ticket: Option<String>) -> Result<WebDevice, String> {
+/// root's certificate, its identity, its cryptex1 boot slot, the path of
+/// its Cryptex1 ticket when it has one, its AP ticket when it has one and
+/// its NVRAM image when it has one (its AP nonce generator read from it).
+pub fn of_files(root: Vec<u8>, identity: &[u8], slot: &[u8], ticket: Option<String>, ap_ticket: Option<Vec<u8>>, nvram: Option<&[u8]>) -> Result<WebDevice, String> {
     let identity = Identity::of_plist(&super::plist::parse(identity).map_err(|e| format!("the web device's {}: {e}", files::IDENTITY))?)?;
     let slot = nonce::Slot::parse(slot).map_err(|e| format!("the web device's {}: not a nonce slot AppleImage4 takes (errno {e})", files::CRYPTEX1_BOOT_SLOT))?;
-    Ok(WebDevice { root, identity, slot, ticket })
+    let boot_nonce = match nvram {
+        Some(image) => apnonce::read(image).map_err(|e| format!("the web device's {}: {e}", files::NVRAM))?,
+        None => None,
+    };
+    Ok(WebDevice { root, identity, slot, ticket, ap_ticket, boot_nonce })
+}
+
+impl WebDevice {
+    /// Whether its AP ticket is its own for its current AP nonce: the
+    /// ticket's ECID, chip, board and security domain its identity's and its
+    /// BNCH the hash of the generator its NVRAM holds ([`apnonce::hash`]),
+    /// which iBoot holds a ticket to before it boots with it. An error says
+    /// what differs.
+    pub fn check_ap_ticket(&self) -> Result<(), String> {
+        use super::image4::{der, fourcc, manifest_property, tag};
+        let Some(t) = &self.ap_ticket else { return Err(format!("the web device has no AP ticket ({})", files::AP_TICKET)) };
+        let int = |code: &[u8; 4]| manifest_property(t, fourcc(code), tag::INTEGER).and_then(der::integer64).map_err(|e| format!("the AP ticket has no {} (libDER {e})", String::from_utf8_lossy(code)));
+        let i = &self.identity;
+        for (code, want) in [(b"ECID", i.ecid), (b"CHIP", i.chip.into()), (b"BORD", i.board.into()), (b"SDOM", i.security_domain.into())] {
+            let have = int(code)?;
+            if have != want {
+                return Err(format!("the AP ticket's {} is {have:#x}, the web device's {want:#x}", String::from_utf8_lossy(code)));
+            }
+        }
+        let bnch = manifest_property(t, fourcc(b"BNCH"), tag::OCTET_STRING).map_err(|e| format!("the AP ticket has no BNCH (libDER {e})"))?;
+        let Some(g) = self.boot_nonce else { return Err("the web device's NVRAM holds no AP nonce generator (com.apple.System.boot-nonce)".into()) };
+        if bnch != apnonce::hash(g).as_slice() {
+            return Err("the AP ticket was signed for another AP nonce than the one the web device's NVRAM generator gives (the generator changed since)".into());
+        }
+        Ok(())
+    }
+
+    /// What its boot puts in `/chosen` beyond its identity
+    /// ([`Identity::chosen`]), as iBoot does for the ticket it boots with:
+    /// `boot-nonce`, the AP nonce generator's eight bytes (the
+    /// IPSW's placeholder's size; restored hashes them for its ApNonce,
+    /// RE@0x10005b158, and takes them as BNCN, RE@0x10001e59c), and
+    /// `boot-manifest-hash` ([`boot_manifest_hash`]), when it has an AP
+    /// ticket, which must be its own ([`WebDevice::check_ap_ticket`]).
+    pub fn boot_chosen(&self) -> Result<Vec<(&'static str, Vec<u8>)>, String> {
+        let mut v = Vec::new();
+        if let Some(g) = self.boot_nonce {
+            v.push(("boot-nonce", g.to_le_bytes().to_vec()));
+        }
+        if let Some(t) = &self.ap_ticket {
+            self.check_ap_ticket()?;
+            v.push(("boot-manifest-hash", boot_manifest_hash(t).to_vec()));
+        }
+        Ok(v)
+    }
 }
 
 /// The web device as its AppleImage4 sees it with nothing else in
@@ -701,6 +1146,8 @@ mod tests {
             identity,
             slot: nonce::Slot { flags: 0, nonce: [7; 16], proposal: [0; 16] },
             ticket: None,
+            ap_ticket: None,
+            boot_nonce: None,
         }
     }
 
@@ -1048,6 +1495,246 @@ mod tests {
             let path = comps.get(key).unwrap().get("Info").unwrap().get("Path").unwrap().as_str().unwrap();
             let p = std::fs::read(format!("{dir}/{path}")).unwrap();
             assert!(matches!(execute(image4::fourcc(code), &p, &t, &DeviceEnv(&w)), Outcome::Authenticated(_)), "{key}");
+        }
+    }
+
+    fn ap_leaf_cert(by: &Key, id: &Identity) -> Vec<u8> {
+        certificate(&ap_manifest_key_spec([0x33; 20], FROM, TO, keys().manifest.public_key(), &by.public_key(), id, AP_CERTIFICATE_EPOCH), by).unwrap()
+    }
+
+    /// A build identity shaped as 21H461's J120AP erase identity, with a
+    /// few of its components: the SEP (rules on the raw modes, DSEC for a
+    /// demoted development device), the system volume (rules on the current
+    /// production mode), a component of no file (ftap: no digest, not
+    /// personalized) and the two the AP ticket leaves to others.
+    fn ap_build() -> Value {
+        let b = Value::Bool;
+        let rule = |actions: Vec<(&str, bool)>, cond: Vec<(&str, Value)>| {
+            Value::Dict(vec![
+                ("Actions".into(), Value::Dict(actions.into_iter().map(|(k, v)| (k.to_string(), Value::Bool(v))).collect())),
+                ("Conditions".into(), Value::Dict(cond.into_iter().map(|(k, v)| (k.to_string(), v)).collect())),
+            ])
+        };
+        let sep_rules = Value::Array(vec![
+            rule(vec![("ESEC", false)], vec![("ApRawSecurityMode", b(false))]),
+            rule(vec![("ESEC", true)], vec![("ApRawSecurityMode", b(true))]),
+            rule(vec![("DSEC", true), ("ESEC", false)], vec![("ApDemotionPolicyOverride", Value::String(String::new())), ("ApRawProductionMode", b(false)), ("ApRawSecurityMode", b(true))]),
+            rule(vec![("EPRO", false)], vec![("ApRawProductionMode", b(false))]),
+            rule(vec![("EPRO", true)], vec![("ApRawProductionMode", b(true))]),
+        ]);
+        let comp = |digest: Option<u8>, trusted: Option<bool>, personalize: bool, rules: Value| {
+            let mut d = Vec::new();
+            if let Some(x) = digest {
+                d.push(("Digest".to_string(), Value::Data(vec![x; 48])));
+            }
+            d.push(("Info".to_string(), Value::Dict(vec![("Personalize".into(), b(personalize)), ("RestoreRequestRules".into(), rules)])));
+            if let Some(t) = trusted {
+                d.push(("Trusted".to_string(), b(t)));
+            }
+            Value::Dict(d)
+        };
+        let mut id = match build() {
+            Value::Dict(d) => d,
+            _ => unreachable!(),
+        };
+        id.retain(|(k, _)| k != "Manifest");
+        let s = |v: &str| Value::String(v.into());
+        id.push(("Ap,OSLongVersion".into(), s("21.8.461.0.0,0")));
+        id.push(("Ap,ProductType".into(), s("iPad7,1")));
+        id.push(("Ap,SDKPlatform".into(), s("iphoneos")));
+        id.push(("Ap,Target".into(), s("J120AP")));
+        id.push(("Ap,TargetType".into(), s("j120")));
+        id.push((
+            "Manifest".into(),
+            Value::Dict(vec![
+                ("SEP".into(), comp(Some(0x5e), Some(true), true, sep_rules.clone())),
+                ("SystemVolume".into(), comp(Some(0xda), Some(true), true, rules())),
+                ("ftap".into(), comp(None, Some(true), false, rules())),
+                ("OS".into(), comp(Some(0xd4), Some(true), false, rules())),
+                ("Cryptex1,SystemVolume".into(), comp(Some(0x56), None, true, rules())),
+            ]),
+        ));
+        Value::Dict(id)
+    }
+
+    /// An object's property's value (its content) in ticket `t`.
+    fn object_value(t: &[u8], object: &[u8; 4], prop: &[u8; 4]) -> Vec<u8> {
+        use super::super::image4::der;
+        let m = image4::init_as_manifest(t).unwrap();
+        let find = |c: &[u8], code: &[u8; 4]| -> Vec<u8> {
+            let mut s = der::Seq::of(c);
+            while let Ok(it) = s.next() {
+                if (it.tag as u32).to_be_bytes() == *code {
+                    return image4::property(it.content, it.tag).unwrap().value.to_vec();
+                }
+            }
+            panic!("no {code:?}")
+        };
+        let body = der::decode_item(m.body).unwrap();
+        let manb = find(body.content, b"MANB");
+        find(&find(&manb, object), prop)
+    }
+
+    #[test]
+    fn an_ap_ticket_has_what_tss_gives_the_device() {
+        let w = device();
+        let bnch = apnonce::hash(0x1122_3344_5566_7788);
+        let t = ap_ticket(&w.identity, &ap_build(), &bnch, AP_CERTIFICATE_EPOCH, &[4; 20], &keys().manifest, &ap_leaf_cert(&keys().root, &w.identity)).unwrap();
+        let (manp, objects) = layout(&t);
+        assert_eq!(manp, ["BNCH", "BORD", "CEPO", "CHIP", "CPRO", "CSEC", "ECID", "SDOM", "love", "prtp", "sdkp", "srvn", "tagt", "tatp"]);
+        let names: Vec<&str> = objects.iter().map(|(c, _)| c.as_str()).collect();
+        assert_eq!(names, ["ftap", "isys", "sepi"]);
+        let props = |c: &str| objects.iter().find(|(n, _)| n == c).unwrap().1.clone();
+        assert_eq!(props("sepi"), ["DGST", "EKEY", "EPRO", "ESEC"]);
+        assert_eq!(props("isys"), ["DGST", "EKEY", "EPRO", "ESEC"]);
+        // Not personalized: asked for with an empty digest, so none.
+        assert_eq!(props("ftap"), ["EKEY", "EPRO", "ESEC"]);
+        let get = |o: &[u8; 4], p: &[u8; 4]| object_value(&t, o, p);
+        assert_eq!(get(b"sepi", b"DGST"), [0x5e; 48]);
+        assert_eq!(get(b"isys", b"DGST"), [0xda; 48]);
+        // A production, secure device: EPRO and ESEC true, EKEY the
+        // component's Trusted.
+        for o in [b"sepi", b"isys", b"ftap"] {
+            for p in [b"EKEY", b"EPRO", b"ESEC"] {
+                assert_eq!(get(o, p), [0xff], "{o:?} {p:?}");
+            }
+        }
+        let mp = |p: &[u8; 4], tag| image4::manifest_property(&t, image4::fourcc(p), tag).unwrap().to_vec();
+        assert_eq!(mp(b"BNCH", image4::tag::OCTET_STRING), bnch);
+        assert_eq!(mp(b"love", image4::tag::OCTET_STRING), b"21.8.461.0.0,0");
+        assert_eq!(mp(b"tagt", image4::tag::OCTET_STRING), b"J120AP");
+        assert_eq!(mp(b"srvn", image4::tag::OCTET_STRING), [4; 20]);
+        assert_eq!(image4::der::integer64(&mp(b"ECID", image4::tag::INTEGER)).unwrap(), w.identity.ecid);
+        // A development device (raw production false): the SEP's rules
+        // demote it.
+        let dev = Identity { production: false, ..w.identity };
+        let body = ap_body(&dev, &ap_build(), &bnch, AP_CERTIFICATE_EPOCH, &[4; 20]).unwrap();
+        let t2 = im4m(&body, &[0; 512], &[vec![0x30, 0x00]]);
+        let get2 = |o: &[u8; 4], p: &[u8; 4]| object_value(&t2, o, p);
+        assert_eq!((get2(b"sepi", b"DSEC"), get2(b"sepi", b"ESEC"), get2(b"sepi", b"EPRO")), (vec![0xff], vec![0x00], vec![0x00]));
+        // A component the AP ticket has no object code for is refused.
+        let mut other = ap_build();
+        if let Value::Dict(d) = &mut other {
+            if let Some((_, Value::Dict(m))) = d.iter_mut().find(|(k, _)| k == "Manifest") {
+                m.push(("Unknown".into(), Value::Dict(vec![("Info".into(), Value::Dict(vec![]))])));
+            }
+        }
+        assert!(ap_body(&w.identity, &other, &bnch, 1, &[4; 20]).unwrap_err().contains("Unknown"));
+    }
+
+    #[test]
+    fn the_ap_manifest_key_carries_ap_constraints() {
+        let k = keys();
+        let w = device();
+        let root = root_cert(&k.root);
+        let leaf = ap_leaf_cert(&k.root, &w.identity);
+        let (key, constraints) = image4::verify_chain(&root, &leaf).unwrap();
+        assert_eq!(key, &k.manifest.public_key()[..]);
+        assert_eq!(constraints, Some(&ap_manifest_constraints(&w.identity, AP_CERTIFICATE_EPOCH)[..]));
+        assert_eq!(image4::verify_chain(&root_cert(&k.other), &leaf), Err(-1));
+    }
+
+    /// The generator as AppleMobileApNonce keeps it in NVRAM and hashes
+    /// it; the web device's factory NVRAM has none, and one saved there is
+    /// read back after the forced sync, the bank's generation moved on.
+    #[test]
+    fn the_ap_nonce_is_apple_mobile_ap_nonces() {
+        use sha2::Digest;
+        let g = 0x0123_4567_89ab_cdefu64;
+        assert_eq!(apnonce::hash(g), sha2::Sha384::digest([0xef, 0xcd, 0xab, 0x89, 0x67, 0x45, 0x23, 0x01])[..32].to_vec());
+        assert_eq!(apnonce::text(g), "0x0123456789abcdef");
+        assert_eq!(apnonce::parse(b"0x0123456789abcdef"), Ok(g));
+        assert_eq!(apnonce::parse(b"0x0123456789ABCDEF"), Ok(g));
+        assert!(apnonce::parse(b"0x0123456789abcde").is_err());
+        assert!(apnonce::parse(b"010123456789abcdef").is_err());
+        assert!(apnonce::parse(b"0x0123456789abcdeg").is_err());
+        assert!(apnonce::parse(b"0x+123456789abcdef").is_err());
+        let factory = super::super::nvram::factory_image();
+        assert_eq!(apnonce::read(&factory), Ok(None));
+        let saved = apnonce::saved(&factory, g).unwrap();
+        assert_eq!(saved.len(), factory.len());
+        assert_eq!(apnonce::read(&saved), Ok(Some(g)));
+        assert!(super::super::nvram::chrp::version(&saved).1 > super::super::nvram::chrp::version(&factory).1);
+        let again = apnonce::saved(&saved, 0x42).unwrap();
+        assert_eq!(apnonce::read(&again), Ok(Some(0x42)));
+    }
+
+    /// The boot's /chosen for its AP ticket: boot-nonce the generator's
+    /// eight bytes and boot-manifest-hash SHA-384 of the whole ticket, for
+    /// a ticket of its own; a ticket of another nonce or device is refused.
+    #[test]
+    fn the_boot_puts_its_ap_tickets_hash_in_chosen() {
+        use sha2::Digest;
+        let w = device();
+        let g = 0x5555_aaaa_1234_9876u64;
+        let leaf = ap_leaf_cert(&keys().root, &w.identity);
+        let t = ap_ticket(&w.identity, &ap_build(), &apnonce::hash(g), AP_CERTIFICATE_EPOCH, &[4; 20], &keys().manifest, &leaf).unwrap();
+        let mine = WebDevice { ap_ticket: Some(t.clone()), boot_nonce: Some(g), ..w.clone() };
+        assert_eq!(mine.check_ap_ticket(), Ok(()));
+        let c = mine.boot_chosen().unwrap();
+        assert_eq!(c, vec![("boot-nonce", g.to_le_bytes().to_vec()), ("boot-manifest-hash", sha2::Sha384::digest(&t).to_vec())]);
+        assert_eq!(boot_manifest_hash(&t).to_vec(), sha2::Sha384::digest(&t).to_vec());
+        // The generator changed since the ticket was signed.
+        let rolled = WebDevice { boot_nonce: Some(g + 1), ..mine.clone() };
+        assert!(rolled.boot_chosen().unwrap_err().contains("another AP nonce"));
+        // No generator at all.
+        assert!(WebDevice { boot_nonce: None, ..mine.clone() }.check_ap_ticket().unwrap_err().contains("no AP nonce generator"));
+        // Another device's ticket.
+        let other = WebDevice { identity: Identity { ecid: w.identity.ecid + 1, ..w.identity }, ..mine.clone() };
+        assert!(other.check_ap_ticket().unwrap_err().contains("ECID"));
+        // No ticket: only the generator.
+        let bare = WebDevice { ap_ticket: None, ..mine };
+        assert_eq!(bare.boot_chosen().unwrap(), vec![("boot-nonce", g.to_le_bytes().to_vec())]);
+    }
+
+    /// The IPSW's build identity (GEX_DARWIN_RESTORE): the AP ticket has an
+    /// object for each of the J120AP erase identity's components but the
+    /// Cryptex1 ones and OS, each with the identity's digest when the
+    /// component is personalized, EKEY its Trusted, EPRO and ESEC true; and
+    /// the digests are of the IPSW's files where the directory has them
+    /// (msys, isys, sepi).
+    #[test]
+    #[ignore = "needs GEX_DARWIN_RESTORE (21H461)"]
+    fn an_ap_ticket_for_the_ipsws_identity_has_every_component() {
+        use sha2::Digest;
+        let dir = std::env::var("GEX_DARWIN_RESTORE").expect("GEX_DARWIN_RESTORE");
+        let m = super::super::plist::parse(&std::fs::read(format!("{dir}/BuildManifest.plist")).unwrap()).unwrap();
+        let b = super::super::preboot::erase_identity(&m, "j120ap").unwrap().clone();
+        let id = Identity::for_build(&b, 0x0001_2345_6789_abcd).unwrap();
+        let bnch = apnonce::hash(7);
+        let t = ap_ticket(&id, &b, &bnch, AP_CERTIFICATE_EPOCH, &[4; 20], &keys().manifest, &ap_leaf_cert(&keys().root, &id)).unwrap();
+        let (_, objects) = layout(&t);
+        assert_eq!(objects.len(), AP_OBJECTS.len());
+        let Some(Value::Dict(comps)) = b.get("Manifest") else { panic!() };
+        for (key, c) in comps {
+            let Some((_, code)) = AP_OBJECTS.iter().find(|(k, _)| k == key) else {
+                assert!(key.starts_with("Cryptex1,") || key == "OS", "{key}");
+                continue;
+            };
+            let props = &objects.iter().find(|(n, _)| n.as_bytes() == *code).unwrap().1;
+            let personalize = c.get("Info").and_then(|i| i.get("Personalize")) != Some(&Value::Bool(false));
+            let digest = c.get("Digest").and_then(Value::as_data).filter(|d| !d.is_empty());
+            assert_eq!(props.contains(&"DGST".to_string()), personalize && digest.is_some(), "{key}");
+            if let (true, Some(d)) = (personalize, digest) {
+                assert_eq!(image4::object_property_data(&t, image4::fourcc(code), image4::fourcc(b"DGST")).unwrap(), d, "{key}");
+                if let Some(path) = c.get("Info").and_then(|i| i.get("Path")).and_then(Value::as_str) {
+                    if let Ok(file) = std::fs::read(format!("{dir}/{path}")) {
+                        if c.get("Info").and_then(|i| i.get("Img4PayloadType")).is_none() {
+                            assert_eq!(sha2::Sha384::digest(&file).as_slice(), d, "{key}");
+                            // The file's IM4P type is the object's code.
+                            if let Ok((ty, _)) = super::super::aar::im4p_payload(&file) {
+                                assert_eq!(ty, code.as_slice(), "{key}");
+                            }
+                        }
+                    }
+                }
+            }
+            for p in [b"EPRO", b"ESEC"] {
+                assert_eq!(object_value(&t, code, p), [0xff], "{key} {p:?}");
+            }
+            if let Some(Value::Bool(tr)) = c.get("Trusted") {
+                assert_eq!(object_value(&t, code, b"EKEY"), [if *tr { 0xff } else { 0 }], "{key}");
+            }
         }
     }
 }

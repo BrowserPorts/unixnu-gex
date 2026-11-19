@@ -5,11 +5,14 @@
 //!   gexc darwin-web-device show <dir>   its identity and current cryptex1 boot nonce hash
 //!   gexc darwin-web-device sep <dir>    add the Secure Enclave's UID to a device made without one
 //!   gexc darwin-web-device roll <dir>   roll its cryptex1 boot nonce (its tickets go stale)
+//!   gexc darwin-web-device apkey <dir>  add the AP manifest key to a device made without one
+//!   gexc darwin-web-device apticket <dir>  sign its AP ticket for its AP nonce (making the
+//!                                       nonce's generator in its NVRAM when it has none)
 //!   gexc darwin-web-ticket <dir>        sign its Cryptex1 ticket for its current nonce
 //! ```
 //!
-//! `init` and `darwin-web-ticket` read the IPSW's build identity of the
-//! device (GEX_DARWIN_RESTORE). The directory holds the device's secrets,
+//! `init`, `apticket` and `darwin-web-ticket` read the IPSW's build
+//! identity of the device (GEX_DARWIN_RESTORE). The directory holds the device's secrets,
 //! its private keys and UIDs (the AP's and the Secure Enclave's; mode 0600,
 //! the directory 0700): it belongs to one installation, outside every
 //! repository. No tool prints a UID. Random bytes come from the
@@ -136,7 +139,17 @@ fn build_identity(chip: Option<(u32, u32)>) -> Result<(PathBuf, Value)> {
 pub(crate) fn load(dir: &Path) -> Result<WebDevice> {
     let ticket = dir.join(files::CRYPTEX1_TICKET);
     let ticket = ticket.exists().then(|| ticket.to_string_lossy().into_owned());
-    webdevice::of_files(read(dir, files::ROOT_CERT)?, &read(dir, files::IDENTITY)?, &read(dir, files::CRYPTEX1_BOOT_SLOT)?, ticket).map_err(|e| anyhow!("{}: {e}", dir.display()))
+    let ap_ticket = read_optional(dir, files::AP_TICKET)?;
+    let nvram = read_optional(dir, files::NVRAM)?;
+    webdevice::of_files(read(dir, files::ROOT_CERT)?, &read(dir, files::IDENTITY)?, &read(dir, files::CRYPTEX1_BOOT_SLOT)?, ticket, ap_ticket, nvram.as_deref()).map_err(|e| anyhow!("{}: {e}", dir.display()))
+}
+
+fn read_optional(dir: &Path, name: &str) -> Result<Option<Vec<u8>>> {
+    match std::fs::read(dir.join(name)) {
+        Ok(b) => Ok(Some(b)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow!("reading {}: {e}", dir.join(name).display())),
+    }
 }
 
 fn hex(b: &[u8]) -> String {
@@ -156,6 +169,7 @@ fn init(dir: &Path) -> Result<()> {
     eprintln!("gexc: making the root's and the manifest key's RSA-{} keys", webdevice::KEY_BITS);
     let root = Key(RsaPrivateKey::new(&mut OsRng, webdevice::KEY_BITS).context("making the root's key")?);
     let manifest = Key(RsaPrivateKey::new(&mut OsRng, webdevice::KEY_BITS).context("making the manifest key")?);
+    let ap_manifest = Key(RsaPrivateKey::new(&mut OsRng, webdevice::KEY_BITS).context("making the AP manifest key")?);
     let (from, to) = validity()?;
     let root_cert = webdevice::certificate(&webdevice::root_spec(serial(), &from, &to, root.public_key()), &root).map_err(|e| anyhow!("the root's certificate: {e}"))?;
     let leaf = webdevice::certificate(&webdevice::manifest_key_spec(serial(), &from, &to, manifest.public_key(), &root.public_key()), &root).map_err(|e| anyhow!("the manifest key's certificate: {e}"))?;
@@ -164,6 +178,7 @@ fn init(dir: &Path) -> Result<()> {
         ecid = u64::from_be_bytes(random::<8>());
     }
     let identity = Identity::for_build(&build, ecid).map_err(|e| anyhow!("{e}"))?;
+    let ap_leaf = webdevice::certificate(&webdevice::ap_manifest_key_spec(serial(), &from, &to, ap_manifest.public_key(), &root.public_key(), &identity, webdevice::AP_CERTIFICATE_EPOCH), &root).map_err(|e| anyhow!("the AP manifest key's certificate: {e}"))?;
     // The magazine's cryptex1 boot slot: version 0, a nonce from the random
     // source as the kext's roll takes one, no flags, no proposal.
     let slot = nonce::Slot {
@@ -174,11 +189,13 @@ fn init(dir: &Path) -> Result<()> {
     let key_der = |k: &Key| k.0.to_pkcs1_der().map(|d| d.as_bytes().to_vec()).map_err(|e| anyhow!("encoding a key: {e}"));
     write_new(&dir.join(files::ROOT_KEY), &key_der(&root)?, 0o600)?;
     write_new(&dir.join(files::MANIFEST_KEY), &key_der(&manifest)?, 0o600)?;
+    write_new(&dir.join(files::AP_MANIFEST_KEY), &key_der(&ap_manifest)?, 0o600)?;
     write_new(&dir.join(files::UID), &random::<32>(), 0o600)?;
     write_new(&dir.join(files::SEP_UID), &random::<32>(), 0o600)?;
     write_new(&dir.join(files::CRYPTEX1_BOOT_SLOT), &slot.to_bytes(), 0o600)?;
     write_new(&dir.join(files::ROOT_CERT), &root_cert, 0o644)?;
     write_new(&dir.join(files::MANIFEST_CERT), &leaf, 0o644)?;
+    write_new(&dir.join(files::AP_MANIFEST_CERT), &ap_leaf, 0o644)?;
     write_new(&dir.join(files::IDENTITY), &plist::to_xml(&identity.to_plist()), 0o644)?;
     write_new(&dir.join(files::NVRAM), &gex_kernel::darwin::nvram::factory_image(), 0o644)?;
     show(dir)
@@ -213,6 +230,22 @@ fn show(dir: &Path) -> Result<()> {
         Some(p) => println!("Cryptex1 ticket {p}"),
         None => println!("Cryptex1 ticket none (gexc darwin-web-ticket {})", dir.display()),
     }
+    match w.boot_nonce {
+        Some(g) => println!("AP nonce {}", hex(&webdevice::apnonce::hash(g))),
+        None => println!("AP nonce none (its NVRAM holds no com.apple.System.boot-nonce; gexc darwin-web-device apticket {} makes one)", dir.display()),
+    }
+    match &w.ap_ticket {
+        Some(t) => {
+            println!("AP ticket {} ({} bytes), boot-manifest-hash {}", dir.join(files::AP_TICKET).display(), t.len(), hex(&webdevice::boot_manifest_hash(t)).to_uppercase());
+            if let Err(e) = w.check_ap_ticket() {
+                println!("AP ticket not this device's current one: {e}");
+            }
+        }
+        None => println!("AP ticket none (gexc darwin-web-device apticket {})", dir.display()),
+    }
+    if !dir.join(files::AP_MANIFEST_KEY).exists() {
+        println!("AP manifest key absent (gexc darwin-web-device apkey {})", dir.display());
+    }
     let path = dir.join(files::NVRAM);
     match std::fs::read(&path) {
         Ok(image) => {
@@ -233,6 +266,73 @@ fn add_sep_uid(dir: &Path) -> Result<()> {
     load(dir)?;
     write_new(&dir.join(files::SEP_UID), &random::<32>(), 0o600).with_context(|| format!("{} has a SEP UID already, or cannot be written", dir.display()))?;
     println!("SEP UID made");
+    Ok(())
+}
+
+/// Add the AP manifest key to the web device of `dir` made without one:
+/// a new RSA key whose certificate its root issues
+/// ([`webdevice::ap_manifest_key_spec`]). A device that has one keeps it.
+fn add_ap_key(dir: &Path) -> Result<()> {
+    let w = load(dir)?;
+    if dir.join(files::AP_MANIFEST_KEY).exists() || dir.join(files::AP_MANIFEST_CERT).exists() {
+        bail!("{} has an AP manifest key already", dir.display());
+    }
+    let root = Key(RsaPrivateKey::from_pkcs1_der(&read(dir, files::ROOT_KEY)?).map_err(|e| anyhow!("{}: {e}", dir.join(files::ROOT_KEY).display()))?);
+    // The root that signs is the one the device trusts.
+    let (key, _) = image4::verify_chain(&w.root, &w.root).map_err(|e| anyhow!("{}: the root's certificate does not verify ({e})", dir.join(files::ROOT_CERT).display()))?;
+    if key != root.public_key().as_slice() {
+        bail!("{} is not the key of {}", dir.join(files::ROOT_KEY).display(), dir.join(files::ROOT_CERT).display());
+    }
+    eprintln!("gexc: making the AP manifest key's RSA-{} key", webdevice::KEY_BITS);
+    let ap = Key(RsaPrivateKey::new(&mut OsRng, webdevice::KEY_BITS).context("making the AP manifest key")?);
+    let (from, to) = validity()?;
+    let leaf = webdevice::certificate(&webdevice::ap_manifest_key_spec(serial(), &from, &to, ap.public_key(), &root.public_key(), &w.identity, webdevice::AP_CERTIFICATE_EPOCH), &root).map_err(|e| anyhow!("the AP manifest key's certificate: {e}"))?;
+    let der = ap.0.to_pkcs1_der().map(|d| d.as_bytes().to_vec()).map_err(|e| anyhow!("encoding a key: {e}"))?;
+    write_new(&dir.join(files::AP_MANIFEST_KEY), &der, 0o600)?;
+    write_new(&dir.join(files::AP_MANIFEST_CERT), &leaf, 0o644)?;
+    println!("AP manifest key made");
+    Ok(())
+}
+
+/// The web device's AP ticket for build identity `build` and AP nonce
+/// hash `bnch`, as TSS signs a device's: its AP manifest key (from `dir`)
+/// signs the body ([`webdevice::ap_ticket`]), with 20 random bytes of the
+/// signer's own.
+pub(crate) fn signed_ap_ticket(dir: &Path, w: &WebDevice, build: &Value, bnch: &[u8]) -> Result<Vec<u8>> {
+    let key = Key(RsaPrivateKey::from_pkcs1_der(&read(dir, files::AP_MANIFEST_KEY)?).map_err(|e| anyhow!("{}: {e}", dir.join(files::AP_MANIFEST_KEY).display()))?);
+    let leaf = read(dir, files::AP_MANIFEST_CERT)?;
+    let (_, constraints) = image4::verify_chain(&w.root, &leaf).map_err(|e| anyhow!("{}: not issued by the device's root ({e})", dir.join(files::AP_MANIFEST_CERT).display()))?;
+    if constraints != Some(&webdevice::ap_manifest_constraints(&w.identity, webdevice::AP_CERTIFICATE_EPOCH)[..]) {
+        bail!("{}: not this device's AP manifest key (its constraints differ)", dir.join(files::AP_MANIFEST_CERT).display());
+    }
+    webdevice::ap_ticket(&w.identity, build, bnch, webdevice::AP_CERTIFICATE_EPOCH, &random::<20>(), &key, &leaf).map_err(|e| anyhow!("{e}"))
+}
+
+/// Sign the device's AP ticket for its AP nonce. A device whose NVRAM
+/// holds no generator gets one first, made and saved as AppleMobileApNonce
+/// makes and saves one (`_generateNonce`: 8 bytes from the random source,
+/// "0x%016llx", IODTNVRAM's `setProperty` and a forced sync).
+fn sign_ap(dir: &Path) -> Result<()> {
+    let w = load(dir)?;
+    let (_, build) = build_identity(Some((w.identity.chip, w.identity.board)))?;
+    let nvram_path = dir.join(files::NVRAM);
+    let image = read(dir, files::NVRAM)?;
+    let generator = match webdevice::apnonce::read(&image).map_err(|e| anyhow!("{}: {e}", nvram_path.display()))? {
+        Some(g) => g,
+        None => {
+            let g = u64::from_be_bytes(random::<8>());
+            let saved = webdevice::apnonce::saved(&image, g).map_err(|e| anyhow!("{}: {e}", nvram_path.display()))?;
+            replace(&nvram_path, &saved, 0o644)?;
+            println!("AP nonce generator made in {}", nvram_path.display());
+            g
+        }
+    };
+    let bnch = webdevice::apnonce::hash(generator);
+    let ticket = signed_ap_ticket(dir, &w, &build, &bnch)?;
+    let signed = WebDevice { ap_ticket: Some(ticket.clone()), boot_nonce: Some(generator), ..w };
+    signed.check_ap_ticket().map_err(|e| anyhow!("the signed AP ticket: {e}"))?;
+    replace(&dir.join(files::AP_TICKET), &ticket, 0o644)?;
+    println!("AP ticket {} ({} bytes) for AP nonce {}, boot-manifest-hash {}", dir.join(files::AP_TICKET).display(), ticket.len(), hex(&bnch), hex(&webdevice::boot_manifest_hash(&ticket)).to_uppercase());
     Ok(())
 }
 
@@ -298,7 +398,9 @@ pub fn cmd_device(args: &[String]) -> Result<ExitCode> {
         [op, dir] if op == "roll" => roll(Path::new(dir))?,
         [op, dir] if op == "nvram" => nvram(Path::new(dir))?,
         [op, dir] if op == "sep" => add_sep_uid(Path::new(dir))?,
-        _ => bail!("usage: gexc darwin-web-device init|show|roll|nvram|sep <dir>"),
+        [op, dir] if op == "apkey" => add_ap_key(Path::new(dir))?,
+        [op, dir] if op == "apticket" => sign_ap(Path::new(dir))?,
+        _ => bail!("usage: gexc darwin-web-device init|show|roll|nvram|sep|apkey|apticket <dir>"),
     }
     Ok(ExitCode::SUCCESS)
 }

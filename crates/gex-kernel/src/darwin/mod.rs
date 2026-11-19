@@ -190,7 +190,9 @@ pub fn boot(trust_cache: Option<&[u8]>, sandbox: SandboxProfiles, device_tree: O
     let mut chosen = match (&cryptex1.ticket, &cryptex1.web_device) {
         (preboot::Ticket::WebDevice, Some(w)) => {
             webdevice::set(w.clone())?;
-            w.identity.chosen()
+            let mut c = w.identity.chosen();
+            c.extend(w.boot_chosen()?);
+            c
         }
         (preboot::Ticket::WebDevice, None) => return Err("the Cryptex1 ticket is the web device's (GEX_DARWIN_CRYPTEX1_TICKET=web-device), but no web device is configured (GEX_DARWIN_WEB_DEVICE)".into()),
         (_, Some(_)) => return Err("a web device is configured (GEX_DARWIN_WEB_DEVICE), but the Cryptex1 ticket is not its own (GEX_DARWIN_CRYPTEX1_TICKET=web-device)".into()),

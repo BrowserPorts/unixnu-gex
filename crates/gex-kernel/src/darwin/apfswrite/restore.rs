@@ -171,6 +171,15 @@ pub fn build_disk0_hooked(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() 
         return Err(format!("a disk of {} bytes for disk0's {}", disk.size(), storage::disk0_bytes()));
     }
     let mut missing = Missing::new();
+    // The ramdisk's boot: IODTNVRAM over the device's NVRAM, when given.
+    let mut nvram = match os.and_then(|o| o.device.as_ref()).and_then(|d| d.nvram.as_ref()) {
+        Some(d) => {
+            missing.push(NVRAM_BOOT_MISSING.into());
+            Some(RestoreNvram::boot(d)?)
+        }
+        None => None,
+    };
+    let mut nvram_synced = false;
     // 2. The GPT, as the device's facts (or their stand-ins) have it.
     let map = gpt::Map::new(bs, n.blocks);
     let g = storage::gpt();
@@ -311,6 +320,11 @@ pub fn build_disk0_hooked(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() 
         // create_partition_mountpoints.
         fixup_var_copy(&mut nx, system, data, now)?;
         create_partition_mountpoints(&mut nx, system, data, &RestoreOptions::DEFAULTS, now)?;
+        // The NVRAM changes of the steps from create_partition_mountpoints
+        // to set_tdm, which no file-system call of theirs depends on.
+        if let Some(nv) = &mut nvram {
+            nv.apply(&nvram_after_fixup_var(&RestoreOptions::DEFAULTS)?)?;
+        }
         let v = Volumes { system, xart, hardware, preboot, update };
         match &os.seal {
             Some(files) => {
@@ -319,10 +333,19 @@ pub fn build_disk0_hooked(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() 
                 populate_preboot_volume(&mut nx, v, now)?;
                 missing.extend(nx.vnode_missing.drain(..));
                 // set_boot_command writes NVRAM only; set_autoboot_delay
-                // syncs, then writes NVRAM.
+                // syncs, then writes NVRAM and forces its sync.
+                if let Some(nv) = &mut nvram {
+                    nv.set_boot_command()?;
+                }
                 set_autoboot_delay(&mut nx, now)?;
                 missing.extend(nx.vnode_missing.drain(..));
-                missing.push(NVRAM_AUTOBOOT_MISSING.into());
+                match &mut nvram {
+                    Some(nv) => {
+                        nv.set_autoboot_delay()?;
+                        nvram_synced = true;
+                    }
+                    None => missing.push(NVRAM_AUTOBOOT_MISSING.into()),
+                }
                 let tool_barrier = barrier.unwrap_or_else(crate::darwin::storagestack::container_barrier);
                 missing.push(IMAGE4_CHECKS_MISSING.into());
                 if !seal_system_volume(&mut nx, v, data, user, files, tool_barrier, hooks, now)? {
@@ -349,8 +372,13 @@ pub fn build_disk0_hooked(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() 
         // 7.
         missing.push("the restore's later writes to Preboot (install_kernel_cache's boot objects, populate_preboot_volume, install_splat's cryptex1) and Data's contents".into());
     }
-    if os.is_some() {
-        missing.push(nvram_missing(&nvram_after_fixup_var(&RestoreOptions::DEFAULTS)?));
+    match (&nvram, os.is_some()) {
+        (None, true) => missing.push(nvram_missing(&nvram_after_fixup_var(&RestoreOptions::DEFAULTS)?)),
+        // The changes are in the ramdisk's IODTNVRAM only: the namespace is
+        // written at set_autoboot_delay's forced sync, which the build did
+        // not reach.
+        (Some(_), _) if !nvram_synced => missing.push("the restore's NVRAM changes, made in the ramdisk's IODTNVRAM but not in the NVRAM namespace: its write is set_autoboot_delay's forced sync, a step the build does not reach".into()),
+        _ => {}
     }
     // The kernel's own counting of the checksums it sets (its kext has
     // sites newfs_apfs's copy does not) and whether its read-write mount's
@@ -1010,6 +1038,10 @@ fn img4(im4p: &[u8], ticket: &[u8]) -> Vec<u8> {
 /// tree, which names the Cryptex1 ticket, and the ticket TSS personalized
 /// for it.
 pub struct Device {
+    /// The device's NVRAM namespace the restore changes (its image, read
+    /// into the ramdisk's `/chosen` and written by its controller), when
+    /// given: else the restore's NVRAM steps are listed as missing.
+    pub nvram: Option<NvramDevice>,
     /// The device tree the restore ramdisk runs with
     /// ([`restore_device_tree`]), its `/chosen` as iBoot fills it in for
     /// this device: `_ticket_file_name_personalized` (RE@0x100064b30) reads
@@ -1048,7 +1080,7 @@ pub fn restore_device_tree(im4p: &[u8]) -> Result<Vec<u8>, String> {
 
 /// What `_personalize_splat_ticket` does to the device's NVRAM before its
 /// TSS request that the image cannot hold.
-pub const CRYPTEX1_NONCE_MISSING: &str = "install_splat's roll of the cryptex1 boot nonce before its TSS request (_personalize_splat_ticket: img4_nonce_domain_preroll_nonce, then img4_nonce_domain_roll_nonce, of the cryptex1 boot domain, RE@0x10003b108 and RE@0x10003b224: AppleImage4's slot in NVRAM nonce-seeds, a proposal made and then taken as the nonce; the kext's proposal paths (its roll 0xfffffff005a9a5dc with a proposal, and the preroll) are not modelled and gex has no NVRAM store): the device's nonce slot is left as it was, and the Cryptex1 ticket is the one personalized for its current nonce";
+pub const CRYPTEX1_NONCE_MISSING: &str = "install_splat's roll of the cryptex1 boot nonce before its TSS request (_personalize_splat_ticket: img4_nonce_domain_preroll_nonce, then img4_nonce_domain_roll_nonce, of the cryptex1 boot domain, RE@0x10003b108 and RE@0x10003b224: AppleImage4's slot in its NVRAM nonce magazine, nonce-seeds, a proposal made and then taken as the nonce; the kext's proposal paths (its roll 0xfffffff005a9a5dc with a proposal, and the preroll) and the magazine's NVRAM encoding are not modelled, and the web device keeps its slot in a file of its own): the device's nonce slot is left as it was, and the Cryptex1 ticket is the one personalized for its current nonce";
 
 /// What install_splat takes from the restore host and the device's own
 /// randomness that only a device run has (drafts/s27/re-splat.md
@@ -1739,6 +1771,8 @@ pub enum NvramValue {
 pub enum NvramOp {
     Delete(&'static str),
     Set(&'static str, NvramValue),
+    /// A set the kernel refuses (its value is not of the variable's type).
+    Attempt(&'static str, NvramValue),
 }
 
 /// set_filesystem_permissions (RE@0x10002f430), the first act of
@@ -1777,6 +1811,7 @@ pub fn nvram_after_fixup_var(o: &RestoreOptions) -> Result<Vec<NvramOp>, String>
         set_filesystem_permissions(o, &mut nv);
     }
     nv.push(if o.set_field_diagnostics_boot { NvramOp::Set("one-time-boot-command", NvramValue::Data(b"checkerboard")) } else { NvramOp::Delete("one-time-boot-command") });
+    nv.push(NvramOp::Attempt("boot-args", NvramValue::Data(b"")));
     nv.push(NvramOp::Set("boot-args", NvramValue::String("")));
     if o.set_target_disk_mode == Some(true) {
         return Err("not implemented: set_tdm's enter-tdm-mode and auto-boot-x86-once (restored's type attempts for each against the kernel's variable types)".into());
@@ -1793,9 +1828,141 @@ pub fn nvram_missing(nv: &[NvramOp]) -> String {
             NvramOp::Delete(n) => format!("delete {n}"),
             NvramOp::Set(n, NvramValue::Data(d)) => format!("set {n} to the data {:?}", String::from_utf8_lossy(d)),
             NvramOp::Set(n, NvramValue::String(s)) => format!("set {n} to the string {s:?}"),
+            NvramOp::Attempt(n, NvramValue::Data(d)) => format!("try {n} as the data {:?} (refused)", String::from_utf8_lossy(d)),
+            NvramOp::Attempt(n, NvramValue::String(s)) => format!("try {n} as the string {s:?} (refused)"),
         })
         .collect();
     format!("the restore's NVRAM changes after fixup_var (IODeviceTree:/options, in order, no sync asked: {}): gex has no NVRAM variable store for them (needed: IODTNVRAM's variables over an image of the device's NVRAM that a restore run writes and the next boot reads; the boot's /options is the boot payload's device tree, read-only)", ops.join(", "))
+}
+
+/// The device's NVRAM namespace: its image and its size (the bank the
+/// boot reads into `/chosen`).
+pub struct NvramDevice {
+    pub medium: std::sync::Arc<dyn crate::darwin::nvram::Medium>,
+    pub size: usize,
+}
+
+/// The restore ramdisk's IODTNVRAM, over the device's NVRAM: started as
+/// the boot hands it the namespace's bank (the web device's boot puts it
+/// in `/chosen` as one bank, [`crate::darwin::nvram::chosen_for`]), its
+/// controller writing the namespace back. restored's calls are root's
+/// (its security token's uid 0), and none of the variables it changes is
+/// one an entitlement decides (none of them is in the system namespace or
+/// has a variable-specific entitlement); Sandbox's NVRAM operations are a
+/// plain allow in the platform profile (nvram-set, nvram-delete,
+/// boot-arg-set: one terminal, errno 0), and restored has no sandbox.
+pub struct RestoreNvram {
+    nv: crate::darwin::nvram::Nvram,
+}
+
+/// What the restore's NVRAM model cannot have: iBoot's changes when it
+/// hands the ramdisk its NVRAM, and the kexts' writes at that boot.
+pub const NVRAM_BOOT_MISSING: &str = "the restore boot's NVRAM changes outside restored and IODTNVRAM's start: what iBEC writes before it hands the ramdisk the NVRAM namespace's bank (its code is encrypted), and the kexts that write NVRAM when the ramdisk boots (AppleMobileApNonce's boot nonce, AppleSEPManager's ART, the backlight's level, AppleLockdownMode, iBootAudioVolumeManager, AppleM68Buttons' sync, RTBuddy's)";
+
+/// restored's caller for IODTNVRAM ([`RestoreNvram`]).
+fn restored_task() -> crate::darwin::nvram::Task {
+    crate::darwin::nvram::Task::new(true, |_| false)
+}
+
+impl RestoreNvram {
+    /// IODTNVRAM's start and the controller's registration at the ramdisk's
+    /// boot.
+    pub fn boot(d: &NvramDevice) -> Result<RestoreNvram, String> {
+        use crate::darwin::nvram;
+        let image = d.medium.read(d.size)?;
+        let mut chosen = nvram::Chosen::default();
+        for (k, v) in nvram::chosen_for(&image) {
+            match k {
+                "nvram-bank-size" => chosen.bank_size = Some(v),
+                "nvram-bank-count" => chosen.bank_count = Some(v),
+                "nvram-current-bank" => chosen.current_bank = Some(v),
+                _ => chosen.proxy_data = Some(v),
+            }
+        }
+        let mut nv = nvram::Nvram::start(&chosen).map_err(|p| format!("the restore ramdisk's kernel panics at IODTNVRAM's start: {}", p.0))?;
+        nv.register_controller(d.medium.clone())?;
+        Ok(RestoreNvram { nv })
+    }
+
+    fn errors(&mut self) -> Result<(), String> {
+        let e = std::mem::take(&mut self.nv.write_errors);
+        if e.is_empty() {
+            Ok(())
+        } else {
+            Err(e.join("; "))
+        }
+    }
+
+    /// One of restored's IORegistryEntrySetCFProperty calls on
+    /// IODeviceTree:/options: its result.
+    fn set(&mut self, key: &[u8], given: crate::darwin::nvram::Given) -> Result<i32, String> {
+        let r = self.nv.set_property_clocked(&restored_task(), key, &given, None, &crate::darwin::nvram::Uptime);
+        self.errors()?;
+        Ok(r)
+    }
+
+    /// The changes `ops` make, as restored makes them: a delete is
+    /// `IONVRAM-DELETE-PROPERTY` = its name, whose result is not looked at
+    /// (and a missing variable is no error); a set gives the value as
+    /// restored does (a data variable's value as a string, which the kernel
+    /// keeps as data), and its failure is the restore's; a refused attempt
+    /// must be refused.
+    pub fn apply(&mut self, ops: &[NvramOp]) -> Result<(), String> {
+        use crate::darwin::nvram::{key, ret, Given, Value};
+        for op in ops {
+            let (name, given, refused) = match *op {
+                NvramOp::Delete(n) => {
+                    self.set(key::DELETE, Given::Value(Value::String(n.as_bytes().to_vec())))?;
+                    continue;
+                }
+                NvramOp::Set(n, NvramValue::Data(d)) => (n, Given::Value(Value::String(d.to_vec())), false),
+                NvramOp::Set(n, NvramValue::String(v)) => (n, Given::Value(Value::String(v.as_bytes().to_vec())), false),
+                NvramOp::Attempt(n, NvramValue::Data(d)) => (n, Given::Value(Value::Data(d.to_vec())), true),
+                NvramOp::Attempt(n, NvramValue::String(v)) => (n, Given::Value(Value::String(v.as_bytes().to_vec())), true),
+            };
+            let r = self.set(name.as_bytes(), given)?;
+            if (r == ret::SUCCESS) == refused {
+                return Err(format!("restored's NVRAM set of {name}: the kernel answers {r:#x}, where the restore {} it", if refused { "is refused" } else { "succeeds with" }));
+            }
+        }
+        Ok(())
+    }
+
+    /// set_boot_command (RE@0x1000193f8 → reset_boot_command_if_in_values,
+    /// RE@0x100033d98): boot-command read; when it is the string
+    /// "upgrade", deleted (a failure ends the restore).
+    pub fn set_boot_command(&mut self) -> Result<(), String> {
+        use crate::darwin::nvram::{key, ret, Given, Value};
+        let v = self.nv.copy_property(&restored_task(), b"boot-command");
+        if matches!(&v, Some(Value::String(s) | Value::Symbol(s)) if s == b"upgrade") {
+            let r = self.set(key::DELETE, Given::Value(Value::String(b"boot-command".to_vec())))?;
+            if r != ret::SUCCESS {
+                return Err(format!("set_boot_command: clearing boot-command failed ({r:#x})"));
+            }
+        }
+        Ok(())
+    }
+
+    /// set_autoboot_delay's NVRAM writes, after its sync(2): auto-boot =
+    /// "true" (`ramrod_set_NVRAM_variable_sync`, no sync), then bootdelay
+    /// = "0" (AutoBootDelay's default) and `ramrod_sync_NVRAM`
+    /// (RE@0x1000633b4: IONVRAM-FORCESYNCNOW-PROPERTY set to its own name),
+    /// which writes the namespace; a failure ends the restore ("could not
+    /// set autoboot delay").
+    pub fn set_autoboot_delay(&mut self) -> Result<(), String> {
+        use crate::darwin::nvram::{key, ret, Given, Value};
+        for (name, value) in [(&b"auto-boot"[..], &b"true"[..]), (b"bootdelay", b"0")] {
+            let r = self.set(name, Given::Value(Value::String(value.to_vec())))?;
+            if r != ret::SUCCESS {
+                return Err(format!("set_autoboot_delay: setting {} failed ({r:#x}): could not set autoboot delay", String::from_utf8_lossy(name)));
+            }
+        }
+        let r = self.set(key::FORCE_SYNC_NOW, Given::Value(Value::String(key::FORCE_SYNC_NOW.to_vec())))?;
+        if r != ret::SUCCESS {
+            return Err(format!("ramrod_sync_NVRAM: failed to sync NVRAM ({r:#x})"));
+        }
+        Ok(())
+    }
 }
 
 /// restored's volume table (RE@0x100285668, 64-byte records): each
@@ -3544,18 +3711,59 @@ mod tests {
     /// the options that change them.
     #[test]
     fn nvram_changes_follow_the_restore_options() {
-        use NvramOp::{Delete, Set};
+        use NvramOp::{Attempt, Delete, Set};
         let d = RestoreOptions::DEFAULTS;
+        let boot_args = [Attempt("boot-args", NvramValue::Data(b"")), Set("boot-args", NvramValue::String(""))];
         assert_eq!(
             nvram_after_fixup_var(&d).unwrap(),
-            vec![Delete("root-live-fs"), Delete("allow-root-hash-mismatch"), Delete("oblit-inprogress"), Delete("oblit-begins"), Delete("oblit-failure"), Delete("one-time-boot-command"), Set("boot-args", NvramValue::String(""))]
+            [&[Delete("root-live-fs"), Delete("allow-root-hash-mismatch"), Delete("oblit-inprogress"), Delete("oblit-begins"), Delete("oblit-failure"), Delete("one-time-boot-command")][..], &boot_args].concat()
         );
         let o = RestoreOptions { read_only_root_filesystem: false, create_filesystem_partitions: false, set_field_diagnostics_boot: true, ..d };
-        assert_eq!(nvram_after_fixup_var(&o).unwrap(), vec![Set("root-live-fs", NvramValue::Data(b"1")), Delete("allow-root-hash-mismatch"), Set("one-time-boot-command", NvramValue::Data(b"checkerboard")), Set("boot-args", NvramValue::String(""))]);
+        assert_eq!(nvram_after_fixup_var(&o).unwrap(), [&[Set("root-live-fs", NvramValue::Data(b"1")), Delete("allow-root-hash-mismatch"), Set("one-time-boot-command", NvramValue::Data(b"checkerboard"))][..], &boot_args].concat());
         let o = RestoreOptions { system_image: false, ..d };
-        assert_eq!(nvram_after_fixup_var(&o).unwrap(), vec![Delete("one-time-boot-command"), Set("boot-args", NvramValue::String(""))]);
+        assert_eq!(nvram_after_fixup_var(&o).unwrap(), [&[Delete("one-time-boot-command")][..], &boot_args].concat());
         assert!(nvram_after_fixup_var(&RestoreOptions { set_target_disk_mode: Some(true), ..d }).is_err());
         assert_eq!(nvram_after_fixup_var(&RestoreOptions { set_target_disk_mode: Some(false), ..d }).unwrap(), nvram_after_fixup_var(&d).unwrap());
+    }
+
+    /// The restore's NVRAM steps on the web device's factory NVRAM, one
+    /// holding boot-command "upgrade": the changes after fixup_var stay in
+    /// the ramdisk's IODTNVRAM, set_boot_command clears boot-command, and
+    /// set_autoboot_delay's forced sync writes the namespace once.
+    #[test]
+    fn the_restores_nvram_steps_reach_the_namespace() {
+        use crate::darwin::nvram::{self, chrp, Given, Value};
+        struct Mem(std::sync::Mutex<Vec<u8>>, std::sync::Mutex<u32>);
+        impl nvram::Medium for Mem {
+            fn read(&self, len: usize) -> Result<Vec<u8>, String> {
+                Ok(self.0.lock().unwrap()[..len].to_vec())
+            }
+            fn write(&self, b: &[u8]) -> Result<(), String> {
+                *self.0.lock().unwrap() = b.to_vec();
+                *self.1.lock().unwrap() += 1;
+                Ok(())
+            }
+        }
+        // The device as an earlier boot left it: boot-command "upgrade".
+        let m = std::sync::Arc::new(Mem(std::sync::Mutex::new(nvram::factory_image()), std::sync::Mutex::new(0)));
+        let d = NvramDevice { medium: m.clone(), size: nvram::FACTORY_BANK_SIZE as usize };
+        let mut before = RestoreNvram::boot(&d).unwrap();
+        assert_eq!(before.set(b"boot-command", Given::Value(Value::String(b"upgrade".to_vec()))).unwrap(), nvram::ret::SUCCESS);
+        assert_eq!(before.nv.sync(&nvram::Uptime), nvram::ret::SUCCESS);
+        *m.1.lock().unwrap() = 0;
+        let mut r = RestoreNvram::boot(&d).unwrap();
+        r.apply(&nvram_after_fixup_var(&RestoreOptions::DEFAULTS).unwrap()).unwrap();
+        r.set_boot_command().unwrap();
+        assert_eq!(*m.1.lock().unwrap(), 0);
+        r.set_autoboot_delay().unwrap();
+        assert_eq!(*m.1.lock().unwrap(), 1);
+        let img = m.0.lock().unwrap().clone();
+        assert_eq!(chrp::version(&img), (2, 4));
+        let want: &[u8] = b"boot-args=\0auto-boot=true\0bootdelay=0\0";
+        assert_eq!(&img[48..48 + want.len()], want);
+        assert!(img[48 + want.len()..].iter().all(|&c| c == 0));
+        // A refused attempt that the kernel takes is the restore's error.
+        assert!(r.apply(&[NvramOp::Attempt("bootdelay", NvramValue::Data(b"1"))]).is_err());
     }
 
     /// check_mounted's create_partition_mountpoints on a container of its

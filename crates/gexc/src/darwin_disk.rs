@@ -16,6 +16,10 @@
 //!   puts in the restore device tree's `/chosen` as its boot does, and
 //!   whose manifest key plays TSS's part for install_splat's Cryptex1
 //!   ticket, signed for its current cryptex1 boot nonce;
+//! - `GEX_DARWIN_NVRAM=<file>`: the device's NVRAM namespace image (the
+//!   web device's `nvram.bin`, or a copy of it), which the restore's NVRAM
+//!   steps change in place, written when its ramdisk's IODTNVRAM syncs;
+//!   without it they are listed as missing;
 //! - `GEX_DARWIN_CRYPTEX1_TICKET=<path>`: a device of Apple's, its own
 //!   Cryptex1 ticket as its restore wrote it
 //!   (`apticket.j120ap.<ECID>.im4m`, copied from its Preboot volume's
@@ -76,7 +80,17 @@ fn device(boot: &apfswrite::restore::BootObjects) -> Result<apfswrite::restore::
             ticket
         }
     };
-    Ok(apfswrite::restore::Device { tree, cryptex1_ticket: ticket })
+    // The device's NVRAM namespace the restore changes, updated in place.
+    let nvram = match std::env::var_os("GEX_DARWIN_NVRAM").filter(|v| !v.is_empty()) {
+        Some(path) => {
+            let f = std::fs::OpenOptions::new().read(true).write(true).open(&path).with_context(|| format!("opening {}", Path::new(&path).display()))?;
+            let size = f.metadata()?.len();
+            eprintln!("gexc: the restore's NVRAM changes go to {} ({size} bytes)", Path::new(&path).display());
+            Some(apfswrite::restore::NvramDevice { medium: std::sync::Arc::new(apfswrite::HostFile(f, size)), size: size as usize })
+        }
+        None => None,
+    };
+    Ok(apfswrite::restore::Device { nvram, tree, cryptex1_ticket: ticket })
 }
 
 pub fn cmd(args: &[String]) -> Result<ExitCode> {

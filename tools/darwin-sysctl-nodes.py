@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
-"""Generate crates/gex-kernel/src/darwin/sysctl_nodes.rs from a kernelcache.
+"""Generate gex's table of a Darwin kernel's sysctl nodes (sysctl_nodes.rs) from a kernelcache.
 
 The kernel registers its sysctl nodes through STARTUP entries
 (`sysctl_register_oid_early`), so its `__init_entry_set` section lists every
 built-in `struct sysctl_oid`. Nodes a kext registers later are not there.
+The kernelcache is the decompressed 64-bit Mach-O. LABEL, when given, names
+the kernel in the output's header (the device and build).
 
-usage: darwin-sysctl-nodes.py KERNELCACHE OUT.rs
+gex's crates/gex-kernel/src/darwin/sysctl_nodes.rs is this table for the
+iPad7,1 kernelcache of build 21H461, the build it was checked on; from the
+tree's root:
+
+  tools/darwin-sysctl-nodes.py --label "iPad7,1 21H461" KERNELCACHE crates/gex-kernel/src/darwin/sysctl_nodes.rs
+
+usage: darwin-sysctl-nodes.py [--label LABEL] KERNELCACHE OUT.rs
 """
+import argparse
 import collections
 import struct
 import sys
@@ -18,7 +27,7 @@ OID_ANCHOR_NAME = "__anchor__"
 CTLTYPE_NODE = 1
 
 
-def main(path, out):
+def main(path, out, label):
     data = open(path, "rb").read()
     magic, _, _, _, ncmds, _, _, _ = struct.unpack_from("<8I", data, 0)
     if magic != 0xfeedfacf:
@@ -114,7 +123,7 @@ def main(path, out):
 
     with open(out, "w") as f:
         f.write("//! The kernel's sysctl nodes, from its `__init_entry_set` section\n")
-        f.write("//! (`tools/darwin-sysctl-nodes.py`, iPad7,1 21H461). Generated: do not edit.\n\n")
+        f.write(f"//! (`tools/darwin-sysctl-nodes.py`{', ' + label if label else ''}). Generated: do not edit.\n\n")
         f.write("use super::sysctl::Node;\n\n")
         f.write("#[rustfmt::skip]\n")
         f.write("pub static NODES: &[Node] = &[\n")
@@ -126,6 +135,10 @@ def main(path, out):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        sys.exit(__doc__)
-    main(sys.argv[1], sys.argv[2])
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], epilog=__doc__[__doc__.index("gex's"):__doc__.index("usage:")].rstrip(),
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("kernelcache", help="the decompressed kernelcache (a 64-bit Mach-O)")
+    ap.add_argument("out", help="the Rust file to write")
+    ap.add_argument("--label", help='the kernel\'s name in the header, e.g. "iPad7,1 21H461"')
+    a = ap.parse_args()
+    main(a.kernelcache, a.out, a.label)

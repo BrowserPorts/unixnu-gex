@@ -26,8 +26,11 @@ SHA-256.
 The kernelcache is the decompressed Mach-O: a prelinked one (its kexts in
 __PRELINK_TEXT, named by __PRELINK_INFO), or a fileset (LC_FILESET_ENTRY).
 
+Checked on build 21H461's iPad7,1 kernelcache.
+
 usage: darwin-sandbox-blobs.py KERNELCACHE OUTDIR
 """
+import argparse
 import hashlib
 import os
 import re
@@ -255,9 +258,11 @@ def check(b, collection):
 
 
 def main():
-    if len(sys.argv) != 3:
-        sys.exit(__doc__.strip().splitlines()[-1])
-    path, out = sys.argv[1:]
+    ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
+    ap.add_argument('kernelcache', help='the decompressed kernelcache (a 64-bit Mach-O)')
+    ap.add_argument('outdir', help='the directory to write the three blobs in (made when missing)')
+    a = ap.parse_args()
+    path, out = a.kernelcache, a.outdir
     with open(path, 'rb') as f:
         data = f.read()
     if data[:4] != struct.pack('<I', MH_MAGIC_64):

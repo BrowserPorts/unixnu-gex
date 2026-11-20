@@ -5,18 +5,21 @@ AppleImage4 (com.apple.security.AppleImage4) embeds its Image4 root
 certificates in its __TEXT,__const, each followed by its length as a 64-bit
 word at the next 8-byte boundary, which the trust store's anchor loaders
 read with it. CHIP_CRYPTEX1_BOOT_AP's decode implementation loads the one
-at ADDRESS ("Apple DDI Secure Boot Root CA - G1"; 0xfffffff0052d4640 in
-21H461's iPad7,1 kernelcache, the default).
+at ADDRESS ("Apple DDI Secure Boot Root CA - G1"), the address its anchor
+loader takes the certificate from in the given kernelcache. Checked on
+build 21H461's iPad7,1 kernelcache, where it is 0xfffffff0052d4640.
 
 The certificate's length is its DER header's (a SEQUENCE with a definite
 length); it must be inside the kext's __TEXT,__const and equal to the length
-word after it. It is written as img4_anchor.der with its SHA-256.
+word after it. It is written to OUTDIR as img4_anchor.der and its SHA-256
+printed.
 
 The kernelcache is the decompressed Mach-O: a prelinked one (its kexts in
 __PRELINK_TEXT, named by __PRELINK_INFO), or a fileset (LC_FILESET_ENTRY).
 
-usage: darwin-img4-anchor.py KERNELCACHE OUTDIR [ADDRESS]
+usage: darwin-img4-anchor.py KERNELCACHE OUTDIR ADDRESS
 """
+import argparse
 import hashlib
 import importlib.util
 import os
@@ -28,8 +31,6 @@ spec = importlib.util.spec_from_file_location('sandbox_blobs', os.path.join(HERE
 kcmod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(kcmod)
 kcmod.BUNDLE = 'com.apple.security.AppleImage4'
-
-DEFAULT = 0xfffffff0052d4640
 
 
 def die(msg):
@@ -49,10 +50,12 @@ def der_length(b):
 
 
 def main():
-    if len(sys.argv) not in (3, 4):
-        sys.exit(__doc__.strip().splitlines()[-1])
-    path, out = sys.argv[1:3]
-    address = int(sys.argv[3], 0) if len(sys.argv) == 4 else DEFAULT
+    ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
+    ap.add_argument('kernelcache', help='the decompressed kernelcache (a 64-bit Mach-O)')
+    ap.add_argument('outdir', help='the directory to write img4_anchor.der in (made when missing)')
+    ap.add_argument('address', type=lambda v: int(v, 0), help="the anchor's address in the kernelcache: hexadecimal with 0x, or decimal")
+    a = ap.parse_args()
+    path, out, address = a.kernelcache, a.outdir, a.address
     with open(path, 'rb') as f:
         data = f.read()
     if data[:4] != struct.pack('<I', kcmod.MH_MAGIC_64):

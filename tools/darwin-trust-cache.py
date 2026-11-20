@@ -10,7 +10,8 @@ module), with the cdhashes of the given Mach-O files added (each slice's
 best CodeDirectory), as an owner adds their own code to it. The entries
 are version 2 (cdhash, hash type, flags, constraint category), sorted by
 cdhash; added code has flags 0 and launch constraint category 0, or the
-category a --category CAT:MACHO names for that file.
+category a --category CAT:MACHO names for that file. Checked on build
+21H461's static trust cache.
 
 usage: darwin-trust-cache.py -o BUNDLE [--static FILE | --bundle FILE]
                              [--category CAT:MACHO]... [MACHO...]
@@ -114,11 +115,11 @@ def cdhash(macho):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
-    ap.add_argument('-o', required=True, help='the bundle to write')
-    ap.add_argument('--static', help='an IM4P trust cache or a raw module')
-    ap.add_argument('--bundle', help="another bundle, whose first module is taken")
+    ap.add_argument('-o', metavar='BUNDLE', required=True, help='the bundle to write')
+    ap.add_argument('--static', metavar='FILE', help='an IM4P trust cache or a raw module')
+    ap.add_argument('--bundle', metavar='FILE', help="another bundle, whose first module is taken")
     ap.add_argument('--category', action='append', default=[], metavar='CAT:MACHO', help='a Mach-O file whose entries have launch constraint category CAT')
-    ap.add_argument('files', nargs='*')
+    ap.add_argument('files', nargs='*', metavar='MACHO', help='a signed Mach-O file whose cdhashes are added')
     a = ap.parse_args()
     uuid, entries = bytes(16), {}
     if a.static:

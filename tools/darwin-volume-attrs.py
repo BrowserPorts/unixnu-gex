@@ -18,7 +18,7 @@ names). A directory's entry is followed by its own entries and then `..`.
 The root is `.`.
 
 A directory the caller cannot read is reported and its entries are left
-out: run as root to read every one.
+out: run as root to read every one. Checked on build 21H461's system volume.
 
 usage: darwin-volume-attrs.py MOUNTPOINT -o SPEC
 """
@@ -60,9 +60,9 @@ def keys(st):
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('root')
-    ap.add_argument('-o', required=True)
+    ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
+    ap.add_argument('root', metavar='MOUNTPOINT', help="the volume's mount point (or any directory) to describe")
+    ap.add_argument('-o', metavar='SPEC', required=True, help='the specification to write')
     a = ap.parse_args()
     out = open(a.o, 'w', encoding='ascii')
     unread = []

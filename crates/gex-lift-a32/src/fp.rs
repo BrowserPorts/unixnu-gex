@@ -324,7 +324,7 @@ impl<'a> Lifter<'a> {
     fn fp_data_processing(&mut self, i: &FpInst) -> Flow {
         use FpInst::*;
         match i {
-            Vfp3 { .. } | Vfp2 { .. } | Vcmp { .. } | VmovImm { .. } => {
+            Vfp3 { .. } | Vfp2 { .. } | Vcmp { .. } | VmovImm { .. } | VcvtInt { .. } | VcvtFixed { .. } | VcvtDs { .. } | VcvtHalf { .. } => {
                 let a = self.c64(self.raw as u64);
                 let z = self.c64(0);
                 self.sys(abi::sys::FP, a, z);

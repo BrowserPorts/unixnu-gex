@@ -296,6 +296,7 @@ impl Core {
         let imp = self.fp_imp()?;
         match i {
             FpInst::Vfp3 { .. } | FpInst::Vfp2 { .. } | FpInst::Vcmp { .. } | FpInst::VmovImm { .. } => self.vfp_dp(regs, pc, &imp, &i)?,
+            FpInst::VcvtInt { .. } | FpInst::VcvtFixed { .. } | FpInst::VcvtDs { .. } | FpInst::VcvtHalf { .. } => self.vfp_cvt(regs, &i)?,
             _ => return unimpl(format!("Floating-point/Advanced SIMD data processing {raw:#010x} ({i:?}) at {at:#x}")),
         }
         Ok(0)

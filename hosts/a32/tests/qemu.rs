@@ -203,3 +203,8 @@ fn fp_registers_and_system_registers() {
 fn vfp_arithmetic() {
     same("vfp");
 }
+
+#[test]
+fn vfp_conversions() {
+    same("vcvt");
+}

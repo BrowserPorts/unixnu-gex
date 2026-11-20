@@ -189,4 +189,76 @@ impl Core {
         Ok(())
     }
 
+    /// A8.8.307 VCVT, VCVTR (between floating-point and integer), A8.8.309
+    /// VCVT (between floating-point and fixed-point), A8.8.310 VCVT (between
+    /// double-precision and single-precision), A8.8.312 VCVTB, VCVTT.
+    pub(crate) fn vfp_cvt(&mut self, regs: &mut dyn Regs, i: &FpInst) -> Result<(), Stop> {
+        let fpscr = regs.fpscr();
+        let mut exc = 0u32;
+        let x = &mut exc;
+        match *i {
+            FpInst::VcvtInt { to, from, d, m, round_zero } => {
+                if to.is_float() {
+                    // FixedToFP(S[m], N, 0, unsigned, FALSE, TRUE).
+                    let (dn, w) = sd(d);
+                    let v = get(regs, sd(m).0, 32);
+                    let r = soft::from_fixed(v, 32, w, 0, from.is_unsigned(), false, fpscr, x);
+                    set(regs, dn, w, r);
+                } else {
+                    // FPToFixed(S[m] or D[m], 32, 0, unsigned, round_zero, TRUE).
+                    let (mn, w) = sd(m);
+                    let v = get(regs, mn, w);
+                    let r = soft::to_fixed(v, w, 32, 0, to.is_unsigned(), round_zero, fpscr, x);
+                    set(regs, sd(d).0, 32, r);
+                }
+            }
+            FpInst::VcvtFixed { to, from, d, fbits } => {
+                let (dn, w) = sd(d);
+                let fixed = if to.is_float() { from } else { to };
+                let size = fixed.esize();
+                let unsigned = fixed.is_unsigned();
+                let fbits = fbits as u32;
+                let v = get(regs, dn, w);
+                let r = if to.is_float() {
+                    soft::from_fixed(v, size, w, fbits, unsigned, true, fpscr, x)
+                } else {
+                    let r = soft::to_fixed(v, w, size, fbits, unsigned, true, fpscr, x);
+                    // ZeroExtend or SignExtend to the register.
+                    if unsigned || r >> (size - 1) & 1 == 0 {
+                        r
+                    } else {
+                        r | !0u64 << size
+                    }
+                };
+                set(regs, dn, w, r & if w == 64 { u64::MAX } else { 0xffff_ffff });
+            }
+            FpInst::VcvtDs { d, m } => match (d, m) {
+                (VReg::S(dn), VReg::D(mn)) => {
+                    let r = soft::double_to_single(regs.d(mn), fpscr, x);
+                    set(regs, dn, 32, r as u64);
+                }
+                (VReg::D(dn), VReg::S(mn)) => {
+                    let r = soft::single_to_double(get(regs, mn, 32) as u32, fpscr, x);
+                    regs.set_d(dn, r);
+                }
+                _ => unreachable!("VCVT between double and single precision: {i:?}"),
+            },
+            FpInst::VcvtHalf { to_half, top, d, m } => {
+                let lowbit = if top { 16 } else { 0 };
+                if to_half {
+                    let h = soft::single_to_half(get(regs, m, 32) as u32, fpscr, x);
+                    let old = get(regs, d, 32);
+                    let v = (old & !(0xffff << lowbit)) | (h as u64) << lowbit;
+                    set(regs, d, 32, v);
+                } else {
+                    let h = (get(regs, m, 32) >> lowbit) as u16;
+                    let r = soft::half_to_single(h, fpscr, x);
+                    set(regs, d, 32, r as u64);
+                }
+            }
+            _ => unreachable!("not a VFP conversion: {i:?}"),
+        }
+        regs.set_fpscr(fpscr | exc);
+        Ok(())
+    }
 }

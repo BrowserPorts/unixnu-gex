@@ -10,7 +10,7 @@
 	branch = wink
 [submodule "third_party/WebMetal"]
 	path = third_party/WebMetal
-	url = https://github.com/MovByte/WebMetal.git
+	url = https://github.com/BrowserPorts/WebMetal.git
 [submodule "third_party/AirWgsl"]
 	path = third_party/AirWgsl
-	url = https://github.com/MovByte/AirWgsl.git
+	url = https://github.com/BrowserPorts/AirWgsl.git

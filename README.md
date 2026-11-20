@@ -448,12 +448,12 @@ In 21H461's iPad7,1 kernelcache the platform profile is 0x22111 bytes at
 0xfffffff0056ca320, the builtin collection 0xd6d7b bytes at
 0xfffffff0056ecab0 and the protobox collection 0x75bd1 bytes at
 0xfffffff0057c3840. `tools/darwin-img4-anchor.py` writes `img4_anchor.der`,
-the certificate AppleImage4 keeps at the address given (21H461's iPad7,1:
-0xfffffff0052d4640, the default), checked against the length the kext
+the certificate AppleImage4 keeps at the address given (in 21H461's iPad7,1
+kernelcache, 0xfffffff0052d4640), checked against the length the kext
 stores after it:
 
 ```sh
-python3 tools/darwin-img4-anchor.py <kernelcache> <ipados-boot> [address]
+python3 tools/darwin-img4-anchor.py <kernelcache> <ipados-boot> <address>
 ```
  The repository has no tool to unwrap the device tree's
 IM4P.
@@ -585,8 +585,9 @@ The Darwin work, beside upstream's tree:
 | `tests/darwin/src/` | the test programs, and the entitlements some are signed with |
 | `tests/darwin/build.sh`, `run.sh` | building and running them |
 | `tools/darwin-trust-cache.py` | making a trust cache bundle |
-| `tools/darwin-gen-sysno.py` | `sysno.rs` from XNU's `syscalls.master` at a tag (fetched from Apple's open source) |
+| `tools/darwin-gen-sysno.py` | `sysno.rs` from XNU's `syscalls.master` at a tag (fetched from Apple's open source) or in a checkout |
 | `tools/darwin-sysctl-nodes.py` | `sysctl_nodes.rs` from a kernelcache (a 64-bit Mach-O) |
+| `tools/darwin-sandbox-blobs.py`, `darwin-img4-anchor.py`, `darwin-volume-attrs.py` | the boot payload's Sandbox blobs, Image4 anchor and volume attributes |
 
 ## Status
 

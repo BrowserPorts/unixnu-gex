@@ -6,12 +6,15 @@ use crate::*;
 use gex_abi::a32::{exc, key, key_addr, key_it, key_thumb, mem as acc, sys, KEY_USER};
 
 #[derive(Default)]
-struct R {
-    r: [u32; 15],
-    key: u64,
+pub(crate) struct R {
+    pub(crate) r: [u32; 15],
+    pub(crate) key: u64,
     nzcv: u32,
     q: bool,
     ge: u8,
+    pub(crate) d: [u64; 32],
+    pub(crate) fpscr: u32,
+    pub(crate) fpen: u64,
 }
 
 impl Regs for R {
@@ -45,6 +48,21 @@ impl Regs for R {
     fn set_ge(&mut self, g: u8) {
         self.ge = g;
     }
+    fn d(&self, n: u8) -> u64 {
+        self.d[n as usize]
+    }
+    fn set_d(&mut self, n: u8, v: u64) {
+        self.d[n as usize] = v;
+    }
+    fn fpscr(&self) -> u32 {
+        self.fpscr
+    }
+    fn set_fpscr(&mut self, v: u32) {
+        self.fpscr = v;
+    }
+    fn set_fpen(&mut self, v: u64) {
+        self.fpen = v;
+    }
 }
 
 /// 4MB of RAM at PA 0, at host offset `HOST`; a second 64KB region at PA
@@ -54,7 +72,7 @@ const HOST: u64 = 0x1000_0000;
 const HI: u64 = 0x8000_0000;
 const HI_HOST: u64 = 0x2000_0000;
 
-struct M {
+pub(crate) struct M {
     ram: Vec<u8>,
     hi: Vec<u8>,
 }
@@ -104,7 +122,7 @@ const MIDR: u32 = 0x412f_c0f1;
 
 /// A Cortex-A15-like core without the Security and Virtualization
 /// Extensions.
-fn imp() -> ImpDef {
+pub(crate) fn imp() -> ImpDef {
     ImpDef {
         midr: Some(MIDR),
         ctr: Some(0x8444_c004),
@@ -133,6 +151,9 @@ fn imp() -> ImpDef {
         cpacr_asedis: Some(true),
         cpacr_d32dis: Some(true),
         joscr_rw: Some(false),
+        fpsid: Some(0x4104_30f0),
+        mvfr0: Some(0x1011_0222),
+        mvfr1: Some(0x1111_1111),
         dbgdidr: Some(0x3515_f005),
         dbgdrar: Some(0),
         dbgdsar: Some(0),
@@ -147,11 +168,11 @@ fn imp() -> ImpDef {
     }
 }
 
-fn features() -> Features {
+pub(crate) fn features() -> Features {
     Features { security: false, virtualization: false, lpae: false, ..Features::ALL }
 }
 
-fn new_core_with(features: Features, imp: ImpDef) -> (Core, R, M) {
+pub(crate) fn new_core_with(features: Features, imp: ImpDef) -> (Core, R, M) {
     let mut c = Core::new(Config { features, imp }).unwrap();
     let mut r = R::default();
     c.reset(&mut r).unwrap();
@@ -159,7 +180,7 @@ fn new_core_with(features: Features, imp: ImpDef) -> (Core, R, M) {
     (c, r, M::new())
 }
 
-fn new_core() -> (Core, R, M) {
+pub(crate) fn new_core() -> (Core, R, M) {
     new_core_with(features(), imp())
 }
 
@@ -1312,4 +1333,93 @@ fn unprivileged_access() {
     // LDRT from SVC is checked as PL0.
     assert_eq!(c.mem(&mut r, &mut m, k(PC), 0x0010_0000, acc::access(2, false, true, 0)), Err(Stop::Resume));
     assert_eq!(dabt(&mut c, &mut r, &mut m).0, 0x00d);
+}
+
+// -- the Advanced SIMD and Floating-point system level (B1.11) ---------------
+
+/// CPACR (c1, c0, 2) and FPEXC through VMSR.
+fn fp_enable(c: &mut Core, r: &mut R, m: &mut M, cpacr: u32, en: bool) {
+    mcr(c, r, m, 0, 1, 0, 2, cpacr).unwrap();
+    s(c, r, m, sys::VMSR, 0b1000, if en { 1 << 30 } else { 0 }).unwrap();
+}
+
+#[test]
+fn fpen_follows_cpacr_and_fpexc() {
+    use gex_abi::a32::fpen::*;
+    let (mut c, mut r, mut m) = new_core();
+    assert_eq!(r.fpen, 0, "CPACR and FPEXC.EN reset to 0");
+    fp_enable(&mut c, &mut r, &mut m, 0x00f0_0000, false);
+    assert_eq!(r.fpen, 0, "FPEXC.EN = 0");
+    fp_enable(&mut c, &mut r, &mut m, 0x00f0_0000, true);
+    assert_eq!(r.fpen, VFP_PL1 | VFP_PL0 | SIMD_PL1 | SIMD_PL0 | D32);
+    fp_enable(&mut c, &mut r, &mut m, 0x0050_0000, true);
+    assert_eq!(r.fpen, VFP_PL1 | SIMD_PL1 | D32, "cp10/cp11 = 0b01: PL1 only");
+    fp_enable(&mut c, &mut r, &mut m, 0x80f0_0000, true);
+    assert_eq!(r.fpen, VFP_PL1 | VFP_PL0 | D32, "ASEDIS");
+    fp_enable(&mut c, &mut r, &mut m, 0xc0f0_0000, true);
+    assert_eq!(r.fpen, VFP_PL1 | VFP_PL0, "D32DIS");
+    mcr(&mut c, &mut r, &mut m, 0, 1, 0, 2, 0x0030_0000).unwrap();
+    assert_eq!(r.fpen, 0, "cp10 != cp11 is UNPREDICTABLE: left to the full check");
+}
+
+#[test]
+fn fp_check_trap_takes_undefined_or_stops() {
+    let (mut c, mut r, mut m) = new_core();
+    let pc = key(0x2000, false, 0);
+    let code = gex_abi::a32::BRK_FP_CHECK;
+    // Disabled: the Undefined Instruction exception at the instruction.
+    assert_eq!(c.fp_check_failed(&mut r, pc, code), Err(Stop::Resume));
+    assert_eq!(c.mode(), UND);
+    assert_eq!(r.r[14], 0x2004);
+    // cp10 != cp11: UNPREDICTABLE.
+    let (mut c, mut r, mut m2) = new_core();
+    mcr(&mut c, &mut r, &mut m2, 0, 1, 0, 2, 0x0030_0000).unwrap();
+    assert!(matches!(c.fp_check_failed(&mut r, pc, code), Err(Stop::Unpredictable(_))));
+    // D32DIS without ASEDIS: UNPREDICTABLE for an access to D16-D31 only.
+    let (mut c, mut r, mut m3) = new_core();
+    fp_enable(&mut c, &mut r, &mut m3, 0x40f0_0000, true);
+    let d32 = code - gex_abi::a32::FP_CHECK_D32;
+    assert!(matches!(c.fp_check_failed(&mut r, pc, d32), Err(Stop::Unpredictable(_))));
+    // Enabled: a trap that should not have been taken stops loudly.
+    fp_enable(&mut c, &mut r, &mut m3, 0x00f0_0000, true);
+    assert!(matches!(c.fp_check_failed(&mut r, pc, code), Err(Stop::Unimplemented(_))));
+    // ASEDIS: an Advanced SIMD instruction is UNDEFINED.
+    fp_enable(&mut c, &mut r, &mut m3, 0x80f0_0000, true);
+    assert_eq!(c.fp_check_failed(&mut r, pc, code - gex_abi::a32::FP_CHECK_SIMD), Err(Stop::Resume));
+    let _ = &mut m;
+}
+
+#[test]
+fn vmrs_vmsr_special_registers() {
+    let (mut c, mut r, mut m) = new_core();
+    let pc = key(0x2000, false, 0);
+    // CPACR denies: UNDEFINED even for FPSID.
+    assert_eq!(c.sys(&mut r, &mut m, pc, sys::VMRS, 0, 0), Err(Stop::Resume));
+    let (mut c, mut r, mut m) = new_core();
+    mcr(&mut c, &mut r, &mut m, 0, 1, 0, 2, 0x00f0_0000).unwrap();
+    // FPSID, MVFR0/1, FPEXC: not affected by FPEXC.EN.
+    assert_eq!(c.sys(&mut r, &mut m, pc, sys::VMRS, 0b0000, 0), Ok(0x4104_30f0));
+    assert_eq!(c.sys(&mut r, &mut m, pc, sys::VMRS, 0b0111, 0), Ok(0x1011_0222));
+    assert_eq!(c.sys(&mut r, &mut m, pc, sys::VMRS, 0b0110, 0), Ok(0x1111_1111));
+    assert_eq!(c.sys(&mut r, &mut m, pc, sys::VMRS, 0b1000, 0), Ok(0));
+    // The FPSCR needs FPEXC.EN.
+    assert_eq!(c.sys(&mut r, &mut m, pc, sys::VMSR, 0b0001, 0), Err(Stop::Resume));
+    let (mut c, mut r, mut m) = new_core();
+    fp_enable(&mut c, &mut r, &mut m, 0x00f0_0000, true);
+    // Read/write bits kept, trap enables RAZ/WI, UNK/SBZP bits refused.
+    assert_eq!(c.sys(&mut r, &mut m, pc, sys::VMSR, 0b0001, 0xfff7_9f9f), Ok(0));
+    assert_eq!(r.fpscr, 0xfff7_009f);
+    assert!(matches!(c.sys(&mut r, &mut m, pc, sys::VMSR, 0b0001, 1 << 19), Err(Stop::Unpredictable(_))));
+    assert!(matches!(c.sys(&mut r, &mut m, pc, sys::VMSR, 0b0001, 1 << 5), Err(Stop::Unpredictable(_))));
+    // Unallocated registers, MVFR writes: UNPREDICTABLE; FPEXC.EX: loud.
+    assert!(matches!(c.sys(&mut r, &mut m, pc, sys::VMRS, 0b0011, 0), Err(Stop::Unpredictable(_))));
+    assert!(matches!(c.sys(&mut r, &mut m, pc, sys::VMSR, 0b0111, 0), Err(Stop::Unpredictable(_))));
+    assert!(matches!(c.sys(&mut r, &mut m, pc, sys::VMSR, 0b1000, 1 << 31), Err(Stop::Unimplemented(_))));
+    assert!(matches!(c.sys(&mut r, &mut m, pc, sys::VMRS, 0b1001, 0), Err(Stop::Unimplemented(_))));
+    // A write to FPSID only serializes.
+    assert_eq!(c.sys(&mut r, &mut m, pc, sys::VMSR, 0b0000, 5), Ok(0));
+    // User mode: the non-FPSCR registers are UNDEFINED.
+    set_mode(&mut c, &mut r, &mut m, USR);
+    assert_eq!(c.sys(&mut r, &mut m, pc | KEY_USER, sys::VMRS, 0b1000, 0), Err(Stop::Resume));
+    assert_eq!(c.mode(), UND);
 }

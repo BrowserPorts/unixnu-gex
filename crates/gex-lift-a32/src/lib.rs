@@ -30,6 +30,7 @@
 #![forbid(unsafe_code)]
 
 pub mod block;
+mod fp;
 mod media;
 mod mem;
 mod sys;
@@ -762,7 +763,7 @@ impl<'a> Lifter<'a> {
             Op::Smc { imm } => self.exception(abi::exc::SMC, *imm as u64),
             Op::Hvc { imm } => self.exception(abi::exc::HVC, *imm as u64),
             Op::Udf { .. } | Op::Undefined => self.undefined(),
-            Op::Fp(_) => self.unimplemented(abi::unimpl::FP),
+            Op::Fp(i) => self.fp(i),
             Op::Mrs { .. }
             | Op::Msr { .. }
             | Op::MrsBanked { .. }

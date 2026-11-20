@@ -116,6 +116,9 @@ fn a15() -> Config {
         cpacr_asedis: Some(true),
         cpacr_d32dis: Some(true),
         joscr_rw: Some(false),
+        fpsid: Some(0x4104_30f0),
+        mvfr0: Some(0x1011_0222),
+        mvfr1: Some(0x1111_1111),
         dbgdidr: Some(0x3515_f005),
         dbgdrar: Some(0),
         dbgdsar: Some(0),
@@ -189,4 +192,9 @@ fn modes_and_exceptions() {
 #[test]
 fn short_descriptor_translation() {
     same("mmu");
+}
+
+#[test]
+fn fp_registers_and_system_registers() {
+    same("fpregs");
 }

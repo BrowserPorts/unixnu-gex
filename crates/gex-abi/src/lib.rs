@@ -1035,6 +1035,39 @@ pub mod a32 {
     /// not word aligned. The host fails loudly.
     pub const BRK_UNPREDICTABLE_PC: i32 = -64;
 
+    /// `ctx::x(FPSCR)` holds the FPSCR (B4.1.58), zero-extended; the
+    /// extension registers D0-D31 are `ctx::v(0..16)`, `Q<n>` being
+    /// `v(n)`, `D<2n>` its low and `D<2n+1>` its high doubleword, `S<k>` the
+    /// `k`-th word of the sixteen (A2.6.1, little-endian lanes).
+    pub const FPSCR: u8 = 19;
+    /// `ctx::x(FPEN)` holds [`fpen`] bits: which of the Floating-point and
+    /// Advanced SIMD enable checks (B1.11.1 `CheckAdvSIMDOrVFPEnabled()`)
+    /// pass in the current state, kept by the host whenever the CPACR or
+    /// FPEXC changes. Translated code tests it before every such
+    /// instruction and traps ([`BRK_FP_CHECK`]) where a check it needs is
+    /// clear.
+    pub const FPEN: u8 = 20;
+    /// The bits of [`FPEN`].
+    pub mod fpen {
+        /// `CheckVFPEnabled(TRUE)` passes at PL1, at PL0.
+        pub const VFP_PL1: u64 = 1;
+        pub const VFP_PL0: u64 = 2;
+        /// `CheckAdvSIMDEnabled()` passes at PL1, at PL0.
+        pub const SIMD_PL1: u64 = 4;
+        pub const SIMD_PL0: u64 = 8;
+        /// `VFPSmallRegisterBank()` is FALSE: D16-D31 are accessible.
+        pub const D32: u64 = 16;
+    }
+    /// The code of the `Stmt::Trap` an instruction raises where a check of
+    /// [`FPEN`] fails, less [`FP_CHECK_SIMD`] for an Advanced SIMD
+    /// instruction and less [`FP_CHECK_D32`] for one that accesses D16-D31.
+    /// The host makes the full check (`CheckAdvSIMDOrVFPEnabled()`, `D[]`)
+    /// and takes the Undefined Instruction exception, or stops where the
+    /// state makes the access UNPREDICTABLE.
+    pub const BRK_FP_CHECK: i32 = -65;
+    pub const FP_CHECK_SIMD: i32 = 1;
+    pub const FP_CHECK_D32: i32 = 2;
+
     /// A block's key, and what `ctx::PC` holds: the instruction's address,
     /// bit 0 set in the Thumb state (an ARM instruction is word aligned and
     /// a Thumb one halfword aligned, so the bit is free, and it is the
@@ -1130,6 +1163,18 @@ pub mod a32 {
         /// A runtime UNPREDICTABLE case the lifter checked: `a` names it
         /// ([`unpred`]), `b` the value.
         pub const UNPREDICTABLE_VALUE: i32 = 26;
+        /// A Floating-point or Advanced SIMD data-processing instruction
+        /// whose enable checks passed: `a` is its encoding (as
+        /// `gex_isa_a32::Inst::raw`), executed by the host's exact software
+        /// implementation of its pseudocode on the extension registers and
+        /// the FPSCR in the context.
+        pub const FP: i32 = 27;
+        /// VMRS (B9.3.21) of the special register `a` (`reg`, not the
+        /// FPSCR): returns its value.
+        pub const VMRS: i32 = 28;
+        /// VMSR (B9.3.22) of the special register `a` (`reg`, the FPSCR
+        /// included), `b` the value.
+        pub const VMSR: i32 = 29;
 
         /// A coprocessor register operand: coproc (19:16), opc1 (14:12),
         /// CRn (11:8), CRm (7:4), opc2 (2:0).

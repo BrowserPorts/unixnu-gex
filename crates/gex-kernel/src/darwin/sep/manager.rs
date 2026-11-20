@@ -827,6 +827,7 @@ mod tests {
     /// (03-boot-handshake.md section 11); the manager never makes these
     /// replies itself.
     struct Peer {
+        hw: Arc<Hw>,
         seen: Arc<Mutex<Vec<Message>>>,
         stop: Arc<AtomicBool>,
         t: Option<std::thread::JoinHandle<()>>,
@@ -841,9 +842,12 @@ mod tests {
                     if !h.wait_until(Duration::from_millis(20), |a, _| a.a2i_len() > 0) {
                         continue;
                     }
+                    // Taken and recorded under one lock: an empty inbox means every message is in `seen`.
+                    let mut taken = s.lock().unwrap();
                     let Ok(m) = h.core_pop() else { continue };
                     let m = Message(m);
-                    s.lock().unwrap().push(m);
+                    taken.push(m);
+                    drop(taken);
                     for r in script(m) {
                         // The AP's doorbell drains the outbox as it fills.
                         while h.core_push(r.0).is_err() {
@@ -852,10 +856,14 @@ mod tests {
                     }
                 }
             });
-            Peer { seen, stop, t: Some(t) }
+            Peer { hw: Arc::clone(hw), seen, stop, t: Some(t) }
         }
 
+        /// Every message the AP has posted, once the SEP has taken them all:
+        /// the AP's calls return on the SEP's replies, which may come before
+        /// the SEP reads a message posted after the request they answer.
         fn seen(&self) -> Vec<Message> {
+            assert!(self.hw.wait_until(Duration::from_secs(10), |a, _| a.a2i_len() == 0), "the SEP did not take every message the AP posted");
             self.seen.lock().unwrap().clone()
         }
     }

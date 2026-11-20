@@ -175,11 +175,14 @@ pub fn build_disk0_hooked(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() 
     }
     let mut missing = Missing::new();
     // The ramdisk's boot: IODTNVRAM over the device's NVRAM, when given.
-    let mut nvram = match os.and_then(|o| o.device.as_ref()).and_then(|d| d.nvram.as_ref()) {
-        Some(d) => {
-            missing.push(NVRAM_BOOT_MISSING.into());
-            Some(RestoreNvram::boot(d)?)
-        }
+    let mut nvram = match os.and_then(|o| o.device.as_ref()) {
+        Some(dev) => match &dev.nvram {
+            Some(d) => {
+                missing.push(NVRAM_BOOT_MISSING.into());
+                Some(RestoreNvram::boot(d, &dev.tree)?)
+            }
+            None => None,
+        },
         None => None,
     };
     let mut nvram_synced = false;
@@ -311,8 +314,9 @@ pub fn build_disk0_hooked(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() 
         // cryptex1/current, then install_kernel_cache's list.
         match (&os.boot, &os.device) {
             (Some(b), Some(d)) => {
-                install_splat(&mut nx, Volumes { system, xart, hardware, preboot, update }, b, d, now)?;
-                missing.push(CRYPTEX1_NONCE_MISSING.into());
+                if install_splat(&mut nx, Volumes { system, xart, hardware, preboot, update }, b, d, nvram.as_mut(), now)? {
+                    missing.push(CRYPTEX1_NONCE_MISSING.into());
+                }
                 install_kernel_cache(&mut nx, Volumes { system, xart, hardware, preboot, update }, b, d, &cluster_pushes, now)?
             }
             (Some(_), None) => return Err("install_splat: the device restored is not given (its device tree, and TSS's Cryptex1 ticket for it)".into()),
@@ -1328,7 +1332,7 @@ pub struct Device {
     /// request (RE@0x10003b6f8: the device's ECID, chip and production mode
     /// and its cryptex1 boot nonce), from which install_splat takes each
     /// object's expected digest and which it writes as the ticket.
-    pub cryptex1_ticket: Vec<u8>,
+    pub cryptex1: Cryptex1Ticket,
     /// The AP ticket the host sends as RootTicketData, when given: the
     /// TSS response's AP ticket for the device's ECID and AP nonce, which
     /// names the Preboot directory ([`nsih`]), is written as apticket.der
@@ -1363,9 +1367,51 @@ pub fn restore_device_tree(im4p: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// Where install_splat's Cryptex1 ticket comes from.
+pub enum Cryptex1Ticket {
+    /// TSS: the ticket it signs for `_personalize_splat_ticket`'s request,
+    /// given the request's `Nonce` (the device's ECID, chip and production
+    /// mode being the device's own).
+    Tss(Box<dyn Fn(&[u8]) -> Result<Vec<u8>, String>>),
+    /// The ticket the device's own restore was given, for the nonce its
+    /// own roll proposed.
+    Given(Vec<u8>),
+}
+
 /// What `_personalize_splat_ticket` does to the device's NVRAM before its
-/// TSS request that the image cannot hold.
-pub const CRYPTEX1_NONCE_MISSING: &str = "install_splat's roll of the cryptex1 boot nonce before its TSS request (_personalize_splat_ticket: img4_nonce_domain_preroll_nonce, then img4_nonce_domain_roll_nonce, of the cryptex1 boot domain, RE@0x10003b108 and RE@0x10003b224: AppleImage4's slot in its NVRAM nonce magazine, nonce-seeds, a proposal made and then taken as the nonce; the kext's proposal paths (its roll 0xfffffff005a9a5dc with a proposal, and the preroll) and the magazine's NVRAM encoding are not modelled, and the web device keeps its slot in a file of its own): the device's nonce slot is left as it was, and the Cryptex1 ticket is the one personalized for its current nonce";
+/// TSS request when the device's NVRAM is not given.
+pub const CRYPTEX1_NONCE_MISSING: &str = "install_splat's roll of the cryptex1 boot nonce before its TSS request (_personalize_splat_ticket: img4_nonce_domain_preroll_nonce, then img4_nonce_domain_roll_nonce, of the cryptex1 boot domain, RE@0x10003b108 and RE@0x10003b224: AppleImage4's proposal in its nonce magazine's cryptex1 boot slot, 40A0DDD2-77F8-4392-B4A3-1E7304206516:krn.c1bt, the slot marked spent, the magazine written to the NVRAM, then restored's deletion of cryptex1-boot-handoff): the device's NVRAM is not given (GEX_DARWIN_NVRAM), so the Cryptex1 ticket is the one the device's restore was given";
+
+/// restored's NVRAM variable `_personalize_splat_ticket` deletes after the
+/// roll (RE@0x10003b23c, `ramrod_delete_NVRAM_variable`).
+const CRYPTEX1_BOOT_HANDOFF: &str = "cryptex1-boot-handoff";
+
+/// `_personalize_splat_ticket` (RE@0x10003af24's first part, after the
+/// build identity's splat check): "prerolling splat nonce",
+/// `img4_nonce_domain_preroll_nonce` of the cryptex1 boot domain (the
+/// kext's `nonce proposal generate` trap: [`crate::darwin::noncemag::Magazine::generate_proposal`]),
+/// "rolling splat nonce", `img4_nonce_domain_roll_nonce` (the `nonce roll`
+/// trap: [`crate::darwin::noncemag::Magazine::roll_nonce`]), each failure
+/// ending the restore ("failed to preroll nonce", "failed to roll nonce");
+/// then `cryptex1-boot-handoff` deleted and the TSS request made with the
+/// proposal's hash as its `Nonce`: TSS's ticket. With no NVRAM given the
+/// ticket is the device's own, and the roll is listed as missing (true).
+fn personalize_splat_ticket(device: &Device, nvram: Option<&mut RestoreNvram>) -> Result<(Vec<u8>, bool), String> {
+    use crate::darwin::noncemag::CRYPTEX1_BOOT;
+    let Some(nv) = nvram else {
+        return match &device.cryptex1 {
+            Cryptex1Ticket::Given(t) => Ok((t.clone(), true)),
+            Cryptex1Ticket::Tss(_) => Err("_personalize_splat_ticket: TSS's Cryptex1 ticket is for the nonce the device's AppleImage4 proposes, and the device's NVRAM, which holds its nonce magazine, is not given".into()),
+        };
+    };
+    let nonce = nv.preroll(CRYPTEX1_BOOT).map_err(|e| format!("_personalize_splat_ticket: failed to preroll nonce: {e}"))?;
+    nv.roll(CRYPTEX1_BOOT).map_err(|e| format!("_personalize_splat_ticket: failed to roll nonce: {e}"))?;
+    nv.apply(&[NvramOp::Delete(CRYPTEX1_BOOT_HANDOFF)])?;
+    match &device.cryptex1 {
+        Cryptex1Ticket::Tss(tss) => Ok((tss(&nonce)?, false)),
+        Cryptex1Ticket::Given(_) => Err("not implemented: _personalize_splat_ticket with a given Cryptex1 ticket and the device's NVRAM: the restore proposes a new cryptex1 boot nonce, which a ticket given beforehand cannot be for (TSS's answer to the request is needed)".into()),
+    }
+}
 
 /// What install_splat takes from the restore host and the device's own
 /// randomness that only a device run has (drafts/s27/re-splat.md
@@ -1488,7 +1534,7 @@ fn splat_stream_matches(src: &dyn fsops::Bytes, expected: &[u8]) -> Result<Optio
 /// written atomically through a temporary file (write, fsync, rename). No
 /// LocalPolicy: J120's chip 0x8011 is in the restore's list of chips
 /// without one (0x10027e8d8).
-fn install_splat(nx: &mut Nx<'_>, v: Volumes, boot: &BootObjects, device: &Device, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
+fn install_splat(nx: &mut Nx<'_>, v: Volumes, boot: &BootObjects, device: &Device, nvram: Option<&mut RestoreNvram>, now: &mut dyn FnMut() -> u64) -> Result<bool, String> {
     use super::super::plist::Value;
     use super::super::preboot;
     use fsops::SetAttr;
@@ -1497,8 +1543,9 @@ fn install_splat(nx: &mut Nx<'_>, v: Volumes, boot: &BootObjects, device: &Devic
     let comps = identity.get("Manifest").ok_or("the build identity has no Manifest")?;
     let Value::Dict(keys) = comps else { return Err("the build identity's Manifest is not a dictionary".into()) };
     if !keys.iter().any(|(k, _)| k.starts_with("Cryptex1,")) {
-        return Ok(());
+        return Ok(false);
     }
+    let (cryptex1_ticket, roll_missing) = personalize_splat_ticket(device, nvram)?;
     let pb = v.preboot;
     if fsops::lookup(nx, pb, ROOT_INO, preboot::cryptex1::DIR)?.is_some() {
         return Err("not implemented: install_splat finding a cryptex1 directory (removeItemAtPath of proposed and current)".into());
@@ -1515,7 +1562,7 @@ fn install_splat(nx: &mut Nx<'_>, v: Volumes, boot: &BootObjects, device: &Devic
         // (0x1000652b8) and its expected digest, the ticket's DGST for it
         // (0x10003bb08 → 0x100067434), asked before the file is opened.
         let code = crate::darwin::webdevice::CRYPTEX1_OBJECTS.iter().find(|(k, _)| *k == key).map(|(_, c)| crate::darwin::image4::fourcc(c)).ok_or_else(|| format!("{key} has no object in restored's table"))?;
-        let digest = crate::darwin::image4::object_property_data(&device.cryptex1_ticket, code, crate::darwin::image4::fourcc(b"DGST")).map_err(|e| {
+        let digest = crate::darwin::image4::object_property_data(&cryptex1_ticket, code, crate::darwin::image4::fourcc(b"DGST")).map_err(|e| {
             format!("install_splat fails: the Cryptex1 ticket gives no digest for {key} (libamsupport {e}; restored_external: \"Failed to get expected digest\", then \"failed to install splat\")")
         })?;
         let host = boot.dir.join(path);
@@ -1596,10 +1643,10 @@ fn install_splat(nx: &mut Nx<'_>, v: Volumes, boot: &BootObjects, device: &Devic
     // rename onto its name, then the close, whose fsync writes the change
     // time the rename left in the file's memory (K 0x66a1878).
     let tname = preboot::ticket_name_of(&device.tree)?;
-    let t = fsops::write_new_file(nx, pb, cur, SPLAT_TICKET_TEMP, 0o666, &device.cryptex1_ticket, &cluster_pushes, now)?;
+    let t = fsops::write_new_file(nx, pb, cur, SPLAT_TICKET_TEMP, 0o666, &cryptex1_ticket, &cluster_pushes, now)?;
     let rt = fsops::rename_in_dir(nx, pb, cur, SPLAT_TICKET_TEMP, &tname, t, now)?;
     fsops::write_times(nx, pb, t, rt.file, now)?;
-    Ok(())
+    Ok(roll_missing)
 }
 
 /// install_kernel_cache's nested list (0x100018620; drafts/s23/
@@ -2139,11 +2186,29 @@ pub struct NvramDevice {
 /// boot-arg-set: one terminal, errno 0), and restored has no sandbox.
 pub struct RestoreNvram {
     nv: crate::darwin::nvram::Nvram,
+    /// AppleImage4's nonce magazine, as the ramdisk's boot left it.
+    magazine: crate::darwin::noncemag::Magazine,
 }
 
 /// What the restore's NVRAM model cannot have: iBoot's changes when it
 /// hands the ramdisk its NVRAM, and the kexts' writes at that boot.
 pub const NVRAM_BOOT_MISSING: &str = "the restore boot's NVRAM changes outside restored and IODTNVRAM's start: what iBEC writes before it hands the ramdisk the NVRAM namespace's bank (its code is encrypted), and the kexts that write NVRAM when the ramdisk boots (AppleMobileApNonce's boot nonce, AppleSEPManager's ART, the backlight's level, AppleLockdownMode, iBootAudioVolumeManager, AppleM68Buttons' sync, RTBuddy's)";
+
+/// The ramdisk's kernel's random source (`read_random`).
+fn kernel_random(b: &mut [u8]) -> Result<(), String> {
+    crate::vfs::devfs::fill_random(b);
+    Ok(())
+}
+
+/// A failure of AppleImage4's magazine in the ramdisk's kernel.
+fn magazine_failure(what: &str, e: crate::darwin::image4::Fail) -> String {
+    use crate::darwin::image4::Fail;
+    match e {
+        Fail::Panic(p) => format!("the restore ramdisk's kernel panics in AppleImage4's nonce magazine ({what}): {p}"),
+        Fail::Unmodelled(w) => format!("not implemented: AppleImage4's nonce magazine ({what}) in the restore ramdisk: {w}"),
+        Fail::Code(c) => format!("AppleImage4's nonce magazine ({what}): errno {c}"),
+    }
+}
 
 /// restored's caller for IODTNVRAM ([`RestoreNvram`]).
 fn restored_task() -> crate::darwin::nvram::Task {
@@ -2152,8 +2217,11 @@ fn restored_task() -> crate::darwin::nvram::Task {
 
 impl RestoreNvram {
     /// IODTNVRAM's start and the controller's registration at the ramdisk's
-    /// boot.
-    pub fn boot(d: &NvramDevice) -> Result<RestoreNvram, String> {
+    /// boot, then AppleImage4's boot over it and the restore device tree
+    /// `tree` and its service's start ([`crate::darwin::noncemag`]: iBEC's
+    /// `bootx` makes its i/o strategy the demand one, which writes nothing
+    /// until a trap asks).
+    pub fn boot(d: &NvramDevice, tree: &Vec<crate::darwin::iokit::Node>) -> Result<RestoreNvram, String> {
         use crate::darwin::nvram;
         let image = d.medium.read(d.size)?;
         let mut chosen = nvram::Chosen::default();
@@ -2167,7 +2235,40 @@ impl RestoreNvram {
         }
         let mut nv = nvram::Nvram::start(&chosen).map_err(|p| format!("the restore ramdisk's kernel panics at IODTNVRAM's start: {}", p.0))?;
         nv.register_controller(d.medium.clone())?;
-        Ok(RestoreNvram { nv })
+        let magazine = {
+            use crate::darwin::noncemag;
+            let mut st = noncemag::NvramStorage { nv: &mut nv, clock: &nvram::Uptime };
+            let mut m = noncemag::boot(tree, &mut st, &mut kernel_random).map_err(|e| magazine_failure("boot", e))?;
+            m.uncork(&mut st).map_err(|e| magazine_failure("service start", e))?;
+            m
+        };
+        let mut r = RestoreNvram { nv, magazine };
+        r.errors()?;
+        Ok(r)
+    }
+
+    /// The `nonce proposal generate` trap restored's
+    /// `img4_nonce_domain_preroll_nonce` makes of slot `i`: the proposal's
+    /// hash, or the trap's errno.
+    fn preroll(&mut self, i: usize) -> Result<Vec<u8>, String> {
+        use crate::darwin::noncemag;
+        let mut st = noncemag::NvramStorage { nv: &mut self.nv, clock: &crate::darwin::nvram::Uptime };
+        let r = self.magazine.generate_proposal(&mut st, i, &mut kernel_random).map_err(|e| magazine_failure("preroll", e))?;
+        self.errors()?;
+        r.map_err(|e| format!("errno {e}"))
+    }
+
+    /// The `nonce roll` trap restored's `img4_nonce_domain_roll_nonce`
+    /// makes of slot `i`.
+    fn roll(&mut self, i: usize) -> Result<(), String> {
+        use crate::darwin::noncemag;
+        let mut st = noncemag::NvramStorage { nv: &mut self.nv, clock: &crate::darwin::nvram::Uptime };
+        let r = self.magazine.roll_nonce(&mut st, i).map_err(|e| magazine_failure("roll", e))?;
+        self.errors()?;
+        match r {
+            0 => Ok(()),
+            e => Err(format!("errno {e}")),
+        }
     }
 
     fn errors(&mut self) -> Result<(), String> {
@@ -3018,7 +3119,7 @@ mod tests {
         let manifest = |digest: &[u8]| plist::to_xml(&Value::Dict(vec![("BuildIdentities".into(), Value::Array(vec![identity(digest)]))]));
         let boot = |digest: &[u8]| BootObjects { kernelcache: vec![], devicetree: vec![], iboot: vec![], root_hash: vec![], sep: Some(im4p.clone()), manifest: manifest(digest), dir: std::path::PathBuf::new() };
         let ticket: Vec<u8> = crate::darwin::image4::enc::seq(&[crate::darwin::image4::enc::ia5(b"IM4M"), crate::darwin::image4::enc::int(0), vec![0x31, 0x00]]);
-        let device = |sep: bool| Device { nvram: None, tree: tree(sep), cryptex1_ticket: vec![], ap_ticket: Some(ticket.clone()), ap_anchor: Err("not used".into()) };
+        let device = |sep: bool| Device { nvram: None, tree: tree(sep), cryptex1: Cryptex1Ticket::Given(vec![]), ap_ticket: Some(ticket.clone()), ap_anchor: Err("not used".into()) };
         let p = nsih(Some(&ticket));
         assert_eq!(p, sha2::Sha384::digest(&ticket).iter().map(|b| format!("{b:02X}")).collect::<String>());
         assert_eq!(p.len(), crate::darwin::preboot::HASH_DIGITS);
@@ -3128,7 +3229,7 @@ mod tests {
         std::fs::create_dir_all(&empty).unwrap();
         let boot = |set: &[&str], retype: Option<&str>, dir: &std::path::Path| BootObjects { kernelcache: vec![], devicetree: vec![], iboot: vec![], root_hash: vec![], sep: None, manifest: manifest(set, retype), dir: dir.to_path_buf() };
         let ticket: Vec<u8> = enc::seq(&[enc::ia5(b"IM4M"), enc::int(0), vec![0x31, 0x00]]);
-        let device = Device { nvram: None, tree: web_device_tree(), cryptex1_ticket: vec![], ap_ticket: Some(ticket.clone()), ap_anchor: Err("not used".into()) };
+        let device = Device { nvram: None, tree: web_device_tree(), cryptex1: Cryptex1Ticket::Given(vec![]), ap_ticket: Some(ticket.clone()), ap_anchor: Err("not used".into()) };
         let p = nsih(Some(&ticket));
 
         let blocks = 15_625_000u64;
@@ -4367,7 +4468,9 @@ mod tests {
     }
 
     /// The restore's NVRAM steps on the web device's factory NVRAM, one
-    /// holding boot-command "upgrade": the changes after fixup_var stay in
+    /// holding boot-command "upgrade": the ramdisk's boot writes the
+    /// namespace once (AppleImage4's start asks IODTNVRAM to sync, and its
+    /// first sync is not rate-limited), the changes after fixup_var stay in
     /// the ramdisk's IODTNVRAM, set_boot_command clears boot-command, and
     /// set_autoboot_delay's forced sync writes the namespace once.
     #[test]
@@ -4387,23 +4490,77 @@ mod tests {
         // The device as an earlier boot left it: boot-command "upgrade".
         let m = std::sync::Arc::new(Mem(std::sync::Mutex::new(nvram::factory_image()), std::sync::Mutex::new(0)));
         let d = NvramDevice { medium: m.clone(), size: nvram::FACTORY_BANK_SIZE as usize };
-        let mut before = RestoreNvram::boot(&d).unwrap();
+        let mut before = RestoreNvram::boot(&d, &web_device_tree()).unwrap();
+        assert_eq!(*m.1.lock().unwrap(), 1);
         assert_eq!(before.set(b"boot-command", Given::Value(Value::String(b"upgrade".to_vec()))).unwrap(), nvram::ret::SUCCESS);
         assert_eq!(before.nv.sync(&nvram::Uptime), nvram::ret::SUCCESS);
         *m.1.lock().unwrap() = 0;
-        let mut r = RestoreNvram::boot(&d).unwrap();
+        let mut r = RestoreNvram::boot(&d, &web_device_tree()).unwrap();
+        assert_eq!(*m.1.lock().unwrap(), 1);
+        *m.1.lock().unwrap() = 0;
         r.apply(&nvram_after_fixup_var(&RestoreOptions::DEFAULTS).unwrap()).unwrap();
         r.set_boot_command().unwrap();
         assert_eq!(*m.1.lock().unwrap(), 0);
         r.set_autoboot_delay().unwrap();
         assert_eq!(*m.1.lock().unwrap(), 1);
         let img = m.0.lock().unwrap().clone();
-        assert_eq!(chrp::version(&img), (2, 4));
+        // The header two past the handler's generation, which counts its
+        // syncs from the one read at its start: the earlier boot's 2 and
+        // 3, the ramdisk boot's 5, set_autoboot_delay's 6.
+        assert_eq!(chrp::version(&img), (2, 6));
         let want: &[u8] = b"boot-args=\0auto-boot=true\0bootdelay=0\0";
         assert_eq!(&img[48..48 + want.len()], want);
         assert!(img[48 + want.len()..].iter().all(|&c| c == 0));
         // A refused attempt that the kernel takes is the restore's error.
         assert!(r.apply(&[NvramOp::Attempt("bootdelay", NvramValue::Data(b"1"))]).is_err());
+    }
+
+    /// _personalize_splat_ticket on the web device's factory NVRAM booted
+    /// as iBEC's bootx boots the ramdisk: TSS is asked for the proposal's
+    /// hash, the magazine reaches the namespace at set_autoboot_delay's
+    /// forced sync, and the system's next boot (fsboot, the same AP
+    /// ticket) holds the nonce the ticket is for.
+    #[test]
+    fn the_restore_rolls_the_cryptex1_boot_nonce_its_ticket_is_for() {
+        use crate::darwin::{iokit, noncemag, nvram};
+        let hash = [0x42u8; 48];
+        let chosen = |command: u32| vec![("boot-command", command.to_le_bytes().to_vec()), ("boot-manifest-hash", hash.to_vec()), ("mix-n-match-prevention-status", 1u32.to_le_bytes().to_vec())];
+        let ramdisk = || {
+            let mut t = web_device_tree();
+            iokit::fill_chosen(&mut t, &chosen(noncemag::boot_command::BOOTX)).unwrap();
+            t
+        };
+        let tree = ramdisk();
+        let m = std::sync::Arc::new(nvram::MemMedium(std::sync::Mutex::new(nvram::factory_image())));
+        let d = NvramDevice { medium: m.clone(), size: nvram::FACTORY_BANK_SIZE as usize };
+        let mut r = RestoreNvram::boot(&d, &tree).unwrap();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let device = Device {
+            nvram: None,
+            tree: ramdisk(),
+            cryptex1: Cryptex1Ticket::Tss(Box::new(move |n: &[u8]| {
+                seen.lock().unwrap().push(n.to_vec());
+                Ok(b"the ticket".to_vec())
+            })),
+            ap_ticket: None,
+            ap_anchor: Err("not used".into()),
+        };
+        let (ticket, missing) = personalize_splat_ticket(&device, Some(&mut r)).unwrap();
+        assert_eq!((ticket.as_slice(), missing), (&b"the ticket"[..], false));
+        let nonce = asked.lock().unwrap()[0].clone();
+        assert_eq!(nonce.len(), 32);
+        r.set_autoboot_delay().unwrap();
+        let mut booted = web_device_tree();
+        iokit::fill_chosen(&mut booted, &chosen(noncemag::boot_command::FSBOOT)).unwrap();
+        let slot = noncemag::next_boot_cryptex1_slot(&m.bytes(), &booted).unwrap();
+        assert_eq!(crate::darwin::image4::nonce::cryptex1_boot_hash(&slot, false).unwrap(), nonce);
+        // A ticket given beforehand cannot be for the proposal.
+        let mut r = RestoreNvram::boot(&d, &tree).unwrap();
+        let given = Device { cryptex1: Cryptex1Ticket::Given(vec![1]), ..device };
+        assert!(personalize_splat_ticket(&given, Some(&mut r)).is_err());
+        // With no NVRAM it is the ticket, and the roll is missing.
+        assert_eq!(personalize_splat_ticket(&given, None).unwrap(), (vec![1], true));
     }
 
     /// check_mounted's create_partition_mountpoints on a container of its

@@ -16,12 +16,12 @@
 //!   nonce generator and AP ticket's hash iBoot puts in the restore device
 //!   tree's `/chosen` as its boot does, whose AP ticket (signed by
 //!   `gexc darwin-web-device apticket` for its AP nonce) is the restore's
-//!   RootTicketData, and whose manifest key plays TSS's part for
-//!   install_splat's Cryptex1 ticket, signed for its current cryptex1 boot
-//!   nonce;
-//! - `GEX_DARWIN_NVRAM=<file>`: the device's NVRAM namespace image (the
-//!   web device's `nvram.bin`, or a copy of it), which the restore's NVRAM
-//!   steps change in place, written when its ramdisk's IODTNVRAM syncs;
+//!   RootTicketData, whose NVRAM (its `nvram.bin`) the restore changes in
+//!   place (written when its ramdisk's IODTNVRAM syncs), and whose
+//!   manifest key plays TSS's part for install_splat's Cryptex1 ticket,
+//!   signed for the cryptex1 boot nonce the restore rolls in that NVRAM;
+//! - `GEX_DARWIN_NVRAM=<file>`: for a device of Apple's, its NVRAM
+//!   namespace image, which the restore's NVRAM steps change in place;
 //!   without it they are listed as missing;
 //! - `GEX_DARWIN_CRYPTEX1_TICKET=<path>`: a device of Apple's, its own
 //!   Cryptex1 ticket as its restore wrote it
@@ -48,18 +48,23 @@ fn device(boot: &apfswrite::restore::BootObjects) -> Result<apfswrite::restore::
     let mut tree = iokit::parse(&bytes).map_err(|e| anyhow!("the restore device tree: {e}"))?;
     let target = iokit::target_name_of(&tree).map(|n| String::from_utf8_lossy(&n).to_lowercase()).ok_or_else(|| anyhow!("the restore device tree's root has no compatible"))?;
     let mut ap_ticket = None;
+    let mut web_nvram = None;
     let mut ap_anchor: std::result::Result<Vec<u8>, String> = Err("the root the restore ramdisk's libimage4 embeds for the AP chip (\"Apple Secure Boot Root CA - G2\", libimage4 0x2c590): not given for a device of Apple's".into());
     let ticket = match (source.as_deref(), web) {
         (None, _) => bail!("install_splat needs the device's Cryptex1 ticket: GEX_DARWIN_CRYPTEX1_TICKET is not set (web-device, with GEX_DARWIN_WEB_DEVICE, or the path of the device's apticket.{target}.<ECID>.im4m)"),
         (Some("web-device"), None) => bail!("the Cryptex1 ticket is the web device's (GEX_DARWIN_CRYPTEX1_TICKET=web-device), but no web device is configured (GEX_DARWIN_WEB_DEVICE)"),
         (Some("web-device"), Some(dir)) => {
             let w = crate::darwin_web::load(&dir)?;
+            web_nvram = Some(dir.join(webdevice::files::NVRAM));
             if w.ap_ticket.is_none() {
                 bail!("the web device has no AP ticket for the restore's RootTicketData (gexc darwin-web-device apticket {})", dir.display());
             }
             let booted = w.boot_chosen().map_err(|e| anyhow!("{}: {e}", dir.display()))?;
             iokit::fill_chosen(&mut tree, &w.identity.chosen()).map_err(|e| anyhow!("the restore device tree: {e}"))?;
             iokit::fill_chosen(&mut tree, &booted).map_err(|e| anyhow!("the restore device tree: {e}"))?;
+            if std::env::var_os("GEX_DARWIN_NVRAM").is_some_and(|v| !v.is_empty()) {
+                bail!("GEX_DARWIN_NVRAM is a device of Apple's: the web device's NVRAM is its own {}", dir.join(webdevice::files::NVRAM).display());
+            }
             let at = w.ap_ticket.clone().expect("checked");
             let hash: String = webdevice::boot_manifest_hash(&at).iter().map(|b| format!("{b:02X}")).collect();
             eprintln!("gexc: the restore's RootTicketData: the web device's AP ticket ({} bytes, boot-manifest-hash {hash})", at.len());
@@ -68,14 +73,16 @@ fn device(boot: &apfswrite::restore::BootObjects) -> Result<apfswrite::restore::
             ap_anchor = Ok(w.root.clone());
             let manifest = gex_kernel::darwin::plist::parse(&boot.manifest).map_err(|e| anyhow!("BuildManifest.plist: {e}"))?;
             let build = preboot::erase_identity(&manifest, &target).map_err(|e| anyhow!("{e}"))?;
-            // The nonce's hash as AppleImage4 makes it, entangled when the
-            // device tree's /defaults asks.
-            let entangle = iokit::dt_prop(&tree, "IODeviceTree:/defaults", "entangle-nonce").is_some();
-            let cnch = webdevice::nonce_hash(&w, entangle).map_err(|e| anyhow!("the web device's cryptex1 boot nonce hash: {e:?}"))?;
-            let ticket = crate::darwin_web::signed_cryptex1_ticket(&dir, &w, build, &cnch, &boot.dir)?;
-            let hex: String = cnch.iter().map(|b| format!("{b:02x}")).collect();
-            eprintln!("gexc: install_splat's Cryptex1 ticket: the web device's (ECID {:X}), signed by its manifest key for cryptex1 boot nonce hash {hex}, {} bytes", w.identity.ecid, ticket.len());
-            ticket
+            // TSS for _personalize_splat_ticket's request: the web device's
+            // manifest key signs for the nonce its restore proposes.
+            let (build, ipsw, ecid) = (build.clone(), boot.dir.clone(), w.identity.ecid);
+            let tss = move |cnch: &[u8]| -> std::result::Result<Vec<u8>, String> {
+                let ticket = crate::darwin_web::signed_cryptex1_ticket(&dir, &w, &build, cnch, &ipsw).map_err(|e| format!("{e:#}"))?;
+                let hex: String = cnch.iter().map(|b| format!("{b:02x}")).collect();
+                eprintln!("gexc: install_splat's Cryptex1 ticket: the web device's (ECID {ecid:X}), signed by its manifest key for the proposed cryptex1 boot nonce's hash {hex}, {} bytes", ticket.len());
+                Ok(ticket)
+            };
+            apfswrite::restore::Cryptex1Ticket::Tss(Box::new(tss))
         }
         (Some(_), Some(_)) => bail!("a web device is configured (GEX_DARWIN_WEB_DEVICE), but the Cryptex1 ticket is not its own (GEX_DARWIN_CRYPTEX1_TICKET=web-device)"),
         (Some(path), None) => {
@@ -109,11 +116,19 @@ fn device(boot: &apfswrite::restore::BootObjects) -> Result<apfswrite::restore::
                 eprintln!("gexc: the restore's RootTicketData: {} ({} bytes)", Path::new(&ap).display(), at.len());
                 ap_ticket = Some(at);
             }
-            ticket
+            apfswrite::restore::Cryptex1Ticket::Given(ticket)
         }
     };
-    // The device's NVRAM namespace the restore changes, updated in place.
-    let nvram = match std::env::var_os("GEX_DARWIN_NVRAM").filter(|v| !v.is_empty()) {
+    // iBEC's bootx boots the restore ramdisk, adding its boot command to
+    // /chosen (iBoot-10151.140.19 0x1800b0e74 → 0x1800ccc44, 0x1800f07b8).
+    iokit::fill_chosen(&mut tree, &[("boot-command", gex_kernel::darwin::noncemag::boot_command::BOOTX.to_le_bytes().to_vec())]).map_err(|e| anyhow!("the restore device tree: {e}"))?;
+    // The device's NVRAM namespace the restore changes, updated in place:
+    // the web device's own, or a device's image.
+    let nvram_path = match &web_nvram {
+        Some(p) => Some(p.clone().into_os_string()),
+        None => std::env::var_os("GEX_DARWIN_NVRAM").filter(|v| !v.is_empty()),
+    };
+    let nvram = match nvram_path {
         Some(path) => {
             let f = std::fs::OpenOptions::new().read(true).write(true).open(&path).with_context(|| format!("opening {}", Path::new(&path).display()))?;
             let size = f.metadata()?.len();
@@ -122,7 +137,7 @@ fn device(boot: &apfswrite::restore::BootObjects) -> Result<apfswrite::restore::
         }
         None => None,
     };
-    Ok(apfswrite::restore::Device { nvram, tree, cryptex1_ticket: ticket, ap_ticket, ap_anchor })
+    Ok(apfswrite::restore::Device { nvram, tree, cryptex1: ticket, ap_ticket, ap_anchor })
 }
 
 pub fn cmd(args: &[String]) -> Result<ExitCode> {

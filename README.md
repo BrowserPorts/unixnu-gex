@@ -195,7 +195,7 @@ The Darwin work, beside the parent's tree:
 | `hosts/metal/` | the page's GPU Worker: WebMetal's executor on the browser's WebGPU |
 | `third_party/WebMetal`, `third_party/AirWgsl` | the submodules, at pinned commits |
 | `tests/darwin/` | the test programs, and the scripts that build and run them |
-| `tools/darwin-*.py` | generators and helpers for the Darwin personality |
+| `tools/darwin-*.py` | generators and helpers for the Darwin personality (`docs/darwin.md`, Tools) |
 | `docs/darwin.md` | the Darwin personality's reference notes and known gaps |
 
 ## Licence

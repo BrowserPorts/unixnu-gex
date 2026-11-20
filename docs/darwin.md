@@ -1,8 +1,9 @@
 # The Darwin personality
 
 Reference notes on unixnu-gex's Darwin personality: what each part of the
-kernel ports, the principles it follows, what the test suite covers, and
-the known gaps. The README gives the overview, building and running.
+kernel ports, the principles it follows, the tools, what the test suite
+covers, and the known gaps. The README gives the overview, building and
+running.
 
 ## The personality
 
@@ -242,6 +243,38 @@ Outside the kernel crate:
   ```
   [gex:<pid>] GEX_DARWIN_STRICT: stopping at pc <pc>: <what>
   ```
+
+## Tools
+
+The scripts in `tools/` make the generated tables and the boot payload's
+files from inputs you give them, and write where you say. Each prints its
+usage with `--help`. Each was checked on build 21H461.
+
+- `darwin-gen-sysno.py (--tag TAG | --xnu DIR) [-o OUT]`: the BSD call
+  table (`sysno.rs`) from XNU's `syscalls.master`, at a tag of Apple's
+  open-source XNU (fetched) or in an XNU checkout, under the iPhoneOS
+  RELEASE configuration.
+- `darwin-sysctl-nodes.py [--label LABEL] KERNELCACHE OUT`: the kernel's
+  built-in sysctl nodes (`sysctl_nodes.rs`) from a decompressed
+  kernelcache's `__init_entry_set`.
+- `darwin-sandbox-blobs.py KERNELCACHE OUTDIR`: the Sandbox kext's platform
+  profile and its builtin and protobox collections (`sandbox_profile.bin`,
+  `sandbox_builtin.bin`, `sandbox_protobox.bin`), found where the kext's
+  `policy_init` loads them and checked as its loader checks them.
+- `darwin-img4-anchor.py KERNELCACHE OUTDIR ADDRESS`: AppleImage4's
+  Cryptex1 trust anchor at ADDRESS (`img4_anchor.der`), checked against the
+  length the kext stores after it.
+- `darwin-trust-cache.py -o BUNDLE [--static FILE | --bundle FILE]
+  [--category CAT:MACHO]... [MACHO...]`: a trust cache bundle
+  (`TrustCache`), a static trust cache's module with the cdhashes of signed
+  Mach-O files added.
+- `darwin-volume-attrs.py MOUNTPOINT -o SPEC`: the owners, modes and file
+  flags of a mounted volume's files (`SystemVolume.attrs`), in mtree(5)'s
+  layout.
+
+`sysno.rs` and `sysctl_nodes.rs` are committed, generated; the header of
+`sysno.rs` names the command that regenerates it, and
+`darwin-sysctl-nodes.py --help` gives the one for `sysctl_nodes.rs`.
 
 ## Status
 

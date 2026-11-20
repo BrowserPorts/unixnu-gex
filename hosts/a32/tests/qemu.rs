@@ -33,7 +33,14 @@ fn run(cmd: &mut Command) {
 
 /// The programs a generator in `tests/programs` writes: the program, and
 /// the generator with its arguments before the output path.
-const GENERATED: &[(&str, &[&str])] = &[("a32_alu", &["gen_alu.py"])];
+const GENERATED: &[(&str, &[&str])] = &[
+    ("a32_alu", &["gen_alu.py"]),
+    ("vfp", &["gen_vfp.py"]),
+    ("vcvt", &["gen_vcvt.py"]),
+    ("neon_int", &["gen_neon.py", "int"]),
+    ("neon_perm", &["gen_neon.py", "perm"]),
+    ("neon_fp", &["gen_neon.py", "fp"]),
+];
 
 /// `name`'s source: `tests/programs/<name>.s`, or for a generated program
 /// the file its generator writes into the work directory.

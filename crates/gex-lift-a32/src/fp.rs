@@ -34,6 +34,17 @@ fn is_advsimd(i: &FpInst) -> bool {
     }
 }
 
+/// An Advanced SIMD integer or polynomial data-processing instruction.
+fn is_simd_int(i: &FpInst) -> bool {
+    use gex_isa_a32::fp::Simd2Op::*;
+    match i {
+        FpInst::Simd3 { dt, .. } | FpInst::Simd3Scalar { dt, .. } => *dt != Dt::F32,
+        FpInst::Simd2 { op, dt, .. } => !matches!(op, Vrev16 | Vrev32 | Vrev64 | Vswp | Vtrn | Vuzp | Vzip | Vrecpe | Vrsqrte) && *dt != Dt::F32,
+        FpInst::SimdShift { .. } | FpInst::SimdImm { .. } => true,
+        _ => false,
+    }
+}
+
 fn reg_d32(r: VReg) -> bool {
     match r {
         VReg::S(_) => false,
@@ -325,6 +336,12 @@ impl<'a> Lifter<'a> {
         use FpInst::*;
         match i {
             Vfp3 { .. } | Vfp2 { .. } | Vcmp { .. } | VmovImm { .. } | VcvtInt { .. } | VcvtFixed { .. } | VcvtDs { .. } | VcvtHalf { .. } => {
+                let a = self.c64(self.raw as u64);
+                let z = self.c64(0);
+                self.sys(abi::sys::FP, a, z);
+                Flow::Next
+            }
+            _ if is_simd_int(i) => {
                 let a = self.c64(self.raw as u64);
                 let z = self.c64(0);
                 self.sys(abi::sys::FP, a, z);

@@ -208,3 +208,8 @@ fn vfp_arithmetic() {
 fn vfp_conversions() {
     same("vcvt");
 }
+
+#[test]
+fn neon_integer() {
+    same("neon_int");
+}

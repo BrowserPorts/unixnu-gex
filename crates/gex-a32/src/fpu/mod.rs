@@ -9,6 +9,8 @@
 //! Floating-point or Advanced SIMD instruction, and traps to
 //! [`Core::fp_check_failed`] where a check it needs does not pass.
 
+mod simd;
+mod simd_int;
 pub mod soft;
 mod vfp;
 
@@ -297,8 +299,51 @@ impl Core {
         match i {
             FpInst::Vfp3 { .. } | FpInst::Vfp2 { .. } | FpInst::Vcmp { .. } | FpInst::VmovImm { .. } => self.vfp_dp(regs, pc, &imp, &i)?,
             FpInst::VcvtInt { .. } | FpInst::VcvtFixed { .. } | FpInst::VcvtDs { .. } | FpInst::VcvtHalf { .. } => self.vfp_cvt(regs, &i)?,
+            _ if simd_class(&i) == Some(SimdClass::Int) => {
+                if simd_int::exec(regs, &i) {
+                    regs.set_fpscr(regs.fpscr() | fpscr::QC);
+                }
+            }
             _ => return unimpl(format!("Floating-point/Advanced SIMD data processing {raw:#010x} ({i:?}) at {at:#x}")),
         }
         Ok(0)
     }
+}
+
+/// The kinds of Advanced SIMD data-processing instruction.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub(crate) enum SimdClass {
+    /// Integer and polynomial arithmetic, shifts, narrows and widens,
+    /// compares, bitwise operations and immediates.
+    Int,
+    /// VEXT, VTBL/VTBX, VDUP (scalar), VREV, VSWP, VTRN, VUZP, VZIP.
+    Permute,
+    /// Floating-point arithmetic and compares, the conversions, and the
+    /// reciprocal and reciprocal square root estimates and steps.
+    Float,
+}
+
+/// The class of an Advanced SIMD data-processing instruction, `None` for
+/// the rest.
+pub(crate) fn simd_class(i: &FpInst) -> Option<SimdClass> {
+    use gex_isa_a32::fp::{Dt, Simd2Op::*};
+    Some(match i {
+        FpInst::Simd3 { dt, .. } | FpInst::Simd3Scalar { dt, .. } => {
+            if *dt == Dt::F32 {
+                SimdClass::Float
+            } else {
+                SimdClass::Int
+            }
+        }
+        FpInst::Simd2 { op, dt, .. } => match op {
+            Vrev16 | Vrev32 | Vrev64 | Vswp | Vtrn | Vuzp | Vzip => SimdClass::Permute,
+            Vrecpe | Vrsqrte => SimdClass::Float,
+            _ if *dt == Dt::F32 => SimdClass::Float,
+            _ => SimdClass::Int,
+        },
+        FpInst::SimdShift { .. } | FpInst::SimdImm { .. } => SimdClass::Int,
+        FpInst::SimdCvt { .. } => SimdClass::Float,
+        FpInst::Vext { .. } | FpInst::Vtbl { .. } | FpInst::VdupScalar { .. } => SimdClass::Permute,
+        _ => return None,
+    })
 }

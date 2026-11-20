@@ -34,18 +34,6 @@ fn is_advsimd(i: &FpInst) -> bool {
     }
 }
 
-/// An Advanced SIMD integer, polynomial or permute data-processing
-/// instruction.
-fn is_simd_int(i: &FpInst) -> bool {
-    use gex_isa_a32::fp::Simd2Op::*;
-    match i {
-        FpInst::Simd3 { dt, .. } | FpInst::Simd3Scalar { dt, .. } => *dt != Dt::F32,
-        FpInst::Simd2 { op, dt, .. } => !matches!(op, Vrecpe | Vrsqrte) && *dt != Dt::F32,
-        FpInst::SimdShift { .. } | FpInst::SimdImm { .. } | FpInst::Vext { .. } | FpInst::Vtbl { .. } | FpInst::VdupScalar { .. } => true,
-        _ => false,
-    }
-}
-
 fn reg_d32(r: VReg) -> bool {
     match r {
         VReg::S(_) => false,
@@ -314,7 +302,7 @@ impl<'a> Lifter<'a> {
                 Flow::Next
             }
             Vldm { .. } | Vldr { .. } | SimdLdSt { .. } => self.unimplemented(abi::unimpl::FP),
-            _ => self.fp_data_processing(i),
+            _ => self.fp_data_processing(),
         }
     }
 
@@ -333,22 +321,10 @@ impl<'a> Lifter<'a> {
 
     /// A data-processing instruction, executed by the host where its
     /// condition passes.
-    fn fp_data_processing(&mut self, i: &FpInst) -> Flow {
-        use FpInst::*;
-        match i {
-            Vfp3 { .. } | Vfp2 { .. } | Vcmp { .. } | VmovImm { .. } | VcvtInt { .. } | VcvtFixed { .. } | VcvtDs { .. } | VcvtHalf { .. } => {
-                let a = self.c64(self.raw as u64);
-                let z = self.c64(0);
-                self.sys(abi::sys::FP, a, z);
-                Flow::Next
-            }
-            _ if is_simd_int(i) => {
-                let a = self.c64(self.raw as u64);
-                let z = self.c64(0);
-                self.sys(abi::sys::FP, a, z);
-                Flow::Next
-            }
-            _ => self.unimplemented(abi::unimpl::FP),
-        }
+    fn fp_data_processing(&mut self) -> Flow {
+        let a = self.c64(self.raw as u64);
+        let z = self.c64(0);
+        self.sys(abi::sys::FP, a, z);
+        Flow::Next
     }
 }

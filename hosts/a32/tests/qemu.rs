@@ -218,3 +218,8 @@ fn neon_integer() {
 fn neon_permutes() {
     same("neon_perm");
 }
+
+#[test]
+fn neon_floating_point() {
+    same("neon_fp");
+}

@@ -1,7 +1,8 @@
 # The Advanced SIMD data-processing test programs: every instruction of a
 # class, in each of its element types, over a table of operand sets; each
 # destination and the FPSCR after it recorded.
-# `python3 gen_neon.py int neon_int.s`, `python3 gen_neon.py perm neon_perm.s`.
+# `python3 gen_neon.py int neon_int.s`, `python3 gen_neon.py perm neon_perm.s`,
+# `python3 gen_neon.py fp neon_fp.s`.
 import sys
 
 def rng(seed):
@@ -169,7 +170,37 @@ def perm_ops():
         A(f'vzip.{e} d20, d24')
     return ops
 
-CLASSES = {'int': (int_ops, 'integer and polynomial'), 'perm': (perm_ops, 'permute')}
+def fp_ops():
+    ops = []
+    A = ops.append
+    for op in ['vadd', 'vsub', 'vmul', 'vabd', 'vmla', 'vmls', 'vfma', 'vfms', 'vceq', 'vcge', 'vcgt', 'vacge', 'vacgt',
+               'vmax', 'vmin', 'vrecps', 'vrsqrts']:
+        A(f'{op}.f32 q10, q8, q9')
+    for op in ['vpadd', 'vpmax', 'vpmin']:
+        A(f'{op}.f32 d20, d16, d19')
+    for i in [0, 1]:
+        for op in ['vmul', 'vmla', 'vmls']:
+            A(f'{op}.f32 q10, q8, d6[{i}]')
+    for op in ['vabs', 'vneg', 'vrecpe', 'vrsqrte']:
+        A(f'{op}.f32 q10, q8')
+        A(f'{op}.f32 d20, d19')
+    for op in ['vrecpe', 'vrsqrte']:
+        A(f'{op}.u32 q10, q9')
+    for op in ['vceq', 'vcge', 'vcgt', 'vcle', 'vclt']:
+        A(f'{op}.f32 q10, q8, #0')
+    for t in ['s32', 'u32']:
+        A(f'vcvt.{t}.f32 q10, q8')
+        A(f'vcvt.f32.{t} q10, q9')
+        for fb in [1, 16, 32]:
+            A(f'vcvt.{t}.f32 q10, q8, #{fb}')
+            A(f'vcvt.f32.{t} q10, q9, #{fb}')
+    A('vcvt.f16.f32 d20, q8')
+    A('vcvt.f32.f16 q10, d17')
+    A('vcvt.f32.f16 q10, d19')
+    return ops
+
+
+CLASSES = {'int': (int_ops, 'integer and polynomial'), 'perm': (perm_ops, 'permute'), 'fp': (fp_ops, 'floating-point')}
 
 kind, path = sys.argv[1], sys.argv[2]
 ops_fn, what = CLASSES[kind]
@@ -187,8 +218,25 @@ for k in range(10):
             r = edges[(k * 3 + j) % len(edges)]
         q.append(r)
     sets.append(q)
+# Floating-point operand sets: two single-precision values in each
+# doubleword, from signed zeros, denormals, the normal limits, infinities,
+# NaNs, integers, halves' limits and random values.
+FLOATS = [0, 0x80000000, 0x3f800000, 0xbf800000, 0x3fc00000, 0x40200000, 0xc0200000, 0x3eaaaaab, 0x00000001,
+          0x807fffff, 0x00800000, 0x7f7fffff, 0xff7fffff, 0x7f800000, 0xff800000, 0x7fc00001, 0x7f800005,
+          0xffc00007, 0x4f000000, 0xcf000000, 0x4f800000, 0x477fe000, 0x477ff000, 0x33800000, 0x387fc000,
+          0x3f000001, 0x7e800000, 0x00400000, 0x40490fdb, 0xc61c4000, 0x4b7fffff, 0x3a83126f]
+if kind == 'fp':
+    sets = []
+    for k in range(14):
+        q = []
+        for j in range(8):
+            a, b = next(g), next(g)
+            fa = FLOATS[a % len(FLOATS)] if a % 5 else a & 0xffffffff
+            fb = FLOATS[b % len(FLOATS)] if b % 5 else b & 0xffffffff
+            q.append(fb << 32 | fa)
+        sets.append(q)
 # Sets whose bytes are small signed shift counts for the shifts by register.
-for k in range(3):
+for k in range(3 if kind != 'fp' else 0):
     q = []
     for j in range(8):
         v = 0
@@ -212,6 +260,10 @@ P('  li sp, STACK_SVC')
 P('  li r10, OUT')
 P('  fpon')
 P('  mov r8, #0')
+if kind == 'fp':
+    P('  li r7, fpscrs')
+    P('0:')
+    P('  ldr r8, [r7], #4')
 P('  li r4, sets')
 P('  li r5, sets_end')
 P('1:')
@@ -235,12 +287,23 @@ P('  cmp r4, r5')
 P('  bhs 2f')
 P('  b 1b')
 P('2:')
+if kind == 'fp':
+    P('  li r0, fpscrs_end')
+    P('  cmp r7, r0')
+    P('  blo 0b')
 P('  finish')
 P('')
 for h in ['undef_handler', 'svc_handler', 'pabt_handler', 'dabt_handler', 'irq_handler', 'fiq_handler']:
     P(f'unexpected {h}')
 P('')
 P('.align 2')
+if kind == 'fp':
+    # Advanced SIMD uses the standard FPSCR value, which keeps only AHP:
+    # the class runs again under every other control set.
+    P('fpscrs:')
+    for v in [0, 0x07c00000]:
+        P(f'  .word {v:#010x}')
+    P('fpscrs_end:')
 P('sets:')
 for q in sets:
     for v in q:

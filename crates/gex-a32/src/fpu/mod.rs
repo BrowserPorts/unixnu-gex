@@ -10,6 +10,7 @@
 //! [`Core::fp_check_failed`] where a check it needs does not pass.
 
 mod simd;
+mod simd_fp;
 mod simd_int;
 mod simd_perm;
 pub mod soft;
@@ -306,6 +307,10 @@ impl Core {
                 }
             }
             _ if simd_class(&i) == Some(SimdClass::Permute) => simd_perm::exec(regs, at, &i)?,
+            _ if simd_class(&i) == Some(SimdClass::Float) => {
+                let exc = simd_fp::exec(regs, &i);
+                regs.set_fpscr(regs.fpscr() | exc);
+            }
             _ => return unimpl(format!("Floating-point/Advanced SIMD data processing {raw:#010x} ({i:?}) at {at:#x}")),
         }
         Ok(0)

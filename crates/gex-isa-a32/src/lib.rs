@@ -27,6 +27,7 @@
 pub mod a32;
 pub mod fmt;
 pub mod fp;
+pub mod t32;
 
 /// The instruction set an encoding is in (B1.4, the CPSR's J and T bits:
 /// ARMv7-A's Jazelle is the trivial implementation, and ThumbEE is a
@@ -658,6 +659,12 @@ impl ItState {
 /// Decode one ARM instruction word.
 pub fn decode_arm(word: u32, f: &Features) -> Inst {
     a32::decode(word, f)
+}
+
+/// Decode the Thumb instruction starting with halfword `hw1`, `hw2` the
+/// next halfword (ignored for a 16-bit instruction), in IT state `it`.
+pub fn decode_thumb(hw1: u16, hw2: u16, it: ItState, f: &Features) -> Inst {
+    t32::decode(hw1, hw2, it, f)
 }
 
 /// Whether `hw1` begins a 32-bit Thumb instruction (A6.1).

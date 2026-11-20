@@ -1038,8 +1038,8 @@ pub mod a32 {
     /// A block's key, and what `ctx::PC` holds: the instruction's address,
     /// bit 0 set in the Thumb state (an ARM instruction is word aligned and
     /// a Thumb one halfword aligned, so the bit is free, and it is the
-    /// interworking branches' own convention), and the ITSTATE it starts
-    /// in at bits 32..40, zero outside an IT block.
+    /// interworking branches' own convention), the ITSTATE it starts in at
+    /// bits 32..40, zero outside an IT block, and [`KEY_USER`].
     pub const fn key(addr: u32, thumb: bool, it: u8) -> u64 {
         (it as u64) << 32 | (addr & !1) as u64 | thumb as u64
     }
@@ -1054,6 +1054,15 @@ pub mod a32 {
 
     pub const fn key_it(key: u64) -> u8 {
         (key >> 32) as u8
+    }
+
+    /// Set in the key of code that runs at PL0 (User mode): instruction
+    /// fetches are checked by the privilege level that makes them, so a
+    /// block is translated per level, and a branch keeps its block's.
+    pub const KEY_USER: u64 = 1 << 40;
+
+    pub const fn key_user(key: u64) -> bool {
+        key & KEY_USER != 0
     }
 
     /// The operations of [`super::imports::A32_SYS`]: `(pc, op, a, b) ->
@@ -1184,6 +1193,9 @@ pub mod a32 {
         pub const SKIP: i32 = 1 << 7;
         /// An exclusive access (LDREX, STREX).
         pub const EXCL: i32 = 1 << 8;
+        /// SWP/SWPB's access: with the Multiprocessing Extensions the
+        /// instruction is UNDEFINED while SCTLR.SW is 0 (B4.1.130).
+        pub const SWP: i32 = 1 << 9;
 
         pub const fn access(size_log2: u32, write: bool, unpriv: bool, align_log2: u32) -> i32 {
             (size_log2 as i32 & 3)

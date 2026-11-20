@@ -908,6 +908,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "gex-lift-a32"
+version = "0.0.1"
+dependencies = [
+ "gex-abi",
+ "gex-ir",
+ "gex-isa-a32",
+]
+
+[[package]]
 name = "gex-lift-x86"
 version = "0.0.1"
 dependencies = [

@@ -155,17 +155,20 @@ pub fn set_tree(b: &[u8], chosen: &[(&str, Vec<u8>)], nvram: Option<bool>) -> Re
 }
 
 /// `chosen`'s properties set on tree `t`'s `/chosen`, as the boot loader
-/// fills it in before the kernel starts.
+/// fills it in before the kernel starts: a name `node/property` is the
+/// property of `/chosen`'s child `node` (`manifest-properties/love`),
+/// which the tree must have.
 pub fn fill_chosen(t: &mut [Node], chosen: &[(&str, Vec<u8>)]) -> Result<(), String> {
-    if chosen.is_empty() {
-        return Ok(());
-    }
-    let at = from_path(t, "IODeviceTree:/chosen")?.ok_or("the device tree has no /chosen for the boot to fill in")?;
-    let props = &mut t[at as usize].props;
     for (name, value) in chosen {
-        match props.iter_mut().find(|(k, _)| k == name) {
+        let (path, prop) = match name.split_once('/') {
+            Some((node, prop)) => (format!("IODeviceTree:/chosen/{node}"), prop),
+            None => ("IODeviceTree:/chosen".to_string(), *name),
+        };
+        let at = from_path(t, &path)?.ok_or_else(|| format!("the device tree has no {} for the boot to fill in", &path["IODeviceTree:".len()..]))?;
+        let props = &mut t[at as usize].props;
+        match props.iter_mut().find(|(k, _)| k == prop) {
             Some((_, v)) => *v = value.clone(),
-            None => props.push((name.to_string(), value.clone())),
+            None => props.push((prop.to_string(), value.clone())),
         }
     }
     Ok(())
@@ -1752,6 +1755,36 @@ impl crate::syscalls::Kernel {
 
 #[cfg(test)]
 mod tests {
+    /// The boot's /chosen: a property set or added on /chosen, one of a
+    /// child node's by `node/property`; a child the tree lacks is refused.
+    #[test]
+    fn the_boot_fills_chosen_and_its_children() {
+        use super::*;
+        fn node(b: &mut Vec<u8>, props: &[(&str, &[u8])], children: u32) {
+            b.extend_from_slice(&(props.len() as u32).to_le_bytes());
+            b.extend_from_slice(&children.to_le_bytes());
+            for (k, v) in props {
+                let mut name = [0u8; 32];
+                name[..k.len()].copy_from_slice(k.as_bytes());
+                b.extend_from_slice(&name);
+                b.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                b.extend_from_slice(v);
+                b.resize((b.len() + 3) & !3, 0);
+            }
+        }
+        let mut b = Vec::new();
+        node(&mut b, &[("name", b"device-tree\0")], 1);
+        node(&mut b, &[("name", b"chosen\0"), ("board-id", &[0; 4])], 1);
+        node(&mut b, &[("name", b"manifest-properties\0"), ("UnusedStringProperty0", &[0; 64])], 0);
+        let mut t = parse(&b).unwrap();
+        fill_chosen(&mut t, &[("board-id", vec![0xc, 0, 0, 0]), ("chip-epoch", vec![1, 0, 0, 0]), ("manifest-properties/love", b"21.8.461.0.0,0".to_vec())]).unwrap();
+        assert_eq!(dt_prop(&t, "IODeviceTree:/chosen", "board-id"), Some(&[0xc, 0, 0, 0][..]));
+        assert_eq!(dt_prop(&t, "IODeviceTree:/chosen", "chip-epoch"), Some(&[1, 0, 0, 0][..]));
+        assert_eq!(dt_prop(&t, "IODeviceTree:/chosen/manifest-properties", "love"), Some(&b"21.8.461.0.0,0"[..]));
+        assert_eq!(dt_prop(&t, "IODeviceTree:/chosen/manifest-properties", "UnusedStringProperty0"), Some(&[0; 64][..]));
+        assert!(fill_chosen(&mut t, &[("manifest-object-properties/DGST", vec![0; 48])]).unwrap_err().contains("/chosen/manifest-object-properties"));
+    }
+
     #[test]
     fn the_apfs_entries_are_as_appleapfs_makes_them() {
         use super::*;

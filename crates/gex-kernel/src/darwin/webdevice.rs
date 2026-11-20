@@ -976,7 +976,8 @@ impl WebDevice {
     /// `boot-nonce`, the AP nonce generator's eight bytes (the
     /// IPSW's placeholder's size; restored hashes them for its ApNonce,
     /// RE@0x10005b158, and takes them as BNCN, RE@0x10001e59c), and
-    /// `boot-manifest-hash` ([`boot_manifest_hash`]), when it has an AP
+    /// `boot-manifest-hash` ([`boot_manifest_hash`]) and the ticket's
+    /// manifest properties ([`manifest_properties`]), when it has an AP
     /// ticket, which must be its own ([`WebDevice::check_ap_ticket`]).
     pub fn boot_chosen(&self) -> Result<Vec<(&'static str, Vec<u8>)>, String> {
         let mut v = Vec::new();
@@ -986,9 +987,34 @@ impl WebDevice {
         if let Some(t) = &self.ap_ticket {
             self.check_ap_ticket()?;
             v.push(("boot-manifest-hash", boot_manifest_hash(t).to_vec()));
+            v.extend(manifest_properties(t)?);
         }
         Ok(v)
     }
+}
+
+/// The AP ticket's manifest properties the boot publishes in
+/// `/chosen/manifest-properties` (as [`super::iokit::fill_chosen`]'s
+/// `manifest-properties/<code>` names), as iBoot fills that node from the
+/// ticket it boots with: the IPSW's device tree holds it as placeholders
+/// by type (UnusedIntegerProperty0-19 of 8 bytes, UnusedBooleanProperty0-19
+/// of 4, UnusedStringProperty0-9 of 64), and the 21H461 readers ask it for
+/// these by their codes: `love` (AppleImage4's ignition blob and version
+/// query, 0xfffffff005a99b7c, and libimage4's,
+/// `__darwin_el0_query_property_version` 0x6e54: read into 64 bytes, their
+/// length the property's, which the version's string requires to hold no
+/// NUL: the octets as they are), `BNCH` (the kext's digest dump
+/// 0xfffffff005a98b6c and its odometer's nonce entanglement
+/// 0xfffffff005a96578: the octets, a digest of their length) and `ECID`
+/// (the kext's query of the original ECID, 0xfffffff005a94e9c: 8 bytes,
+/// little-endian). Which of the ticket's other manifest properties iBoot
+/// publishes, and what becomes of the placeholders it does not use, no
+/// reader shows ([`super::img4::WEB_DEVICE_CHOSEN_STAND_IN`]).
+pub fn manifest_properties(ticket: &[u8]) -> Result<Vec<(&'static str, Vec<u8>)>, String> {
+    use super::image4::{der, fourcc, manifest_property, tag};
+    let octets = |code: &[u8; 4]| manifest_property(ticket, fourcc(code), tag::OCTET_STRING).map(<[u8]>::to_vec).map_err(|e| format!("the AP ticket has no {} (libDER {e})", String::from_utf8_lossy(code)));
+    let ecid = manifest_property(ticket, fourcc(b"ECID"), tag::INTEGER).and_then(der::integer64).map_err(|e| format!("the AP ticket has no ECID (libDER {e})"))?;
+    Ok(vec![("manifest-properties/love", octets(b"love")?), ("manifest-properties/BNCH", octets(b"BNCH")?), ("manifest-properties/ECID", ecid.to_le_bytes().to_vec())])
 }
 
 /// The web device as its AppleImage4 sees it with nothing else in
@@ -1672,7 +1698,16 @@ mod tests {
         let mine = WebDevice { ap_ticket: Some(t.clone()), boot_nonce: Some(g), ..w.clone() };
         assert_eq!(mine.check_ap_ticket(), Ok(()));
         let c = mine.boot_chosen().unwrap();
-        assert_eq!(c, vec![("boot-nonce", g.to_le_bytes().to_vec()), ("boot-manifest-hash", sha2::Sha384::digest(&t).to_vec())]);
+        assert_eq!(
+            c,
+            vec![
+                ("boot-nonce", g.to_le_bytes().to_vec()),
+                ("boot-manifest-hash", sha2::Sha384::digest(&t).to_vec()),
+                ("manifest-properties/love", b"21.8.461.0.0,0".to_vec()),
+                ("manifest-properties/BNCH", apnonce::hash(g)),
+                ("manifest-properties/ECID", w.identity.ecid.to_le_bytes().to_vec()),
+            ]
+        );
         assert_eq!(boot_manifest_hash(&t).to_vec(), sha2::Sha384::digest(&t).to_vec());
         // The generator changed since the ticket was signed.
         let rolled = WebDevice { boot_nonce: Some(g + 1), ..mine.clone() };

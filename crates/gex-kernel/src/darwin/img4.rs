@@ -166,16 +166,42 @@ pub fn ignition_blob_of(t: &[Node]) -> Result<[u8; IGNITION_BLOB_SIZE], String> 
     }
     blob[0x2a..0x2e].copy_from_slice(&esdm.unwrap_or(0).to_le_bytes());
     blob[0x2e..0x32].copy_from_slice(&level.to_le_bytes());
-    // The long OS version: what the kext's parse (0xfffffff005a9dc3c) and
-    // its string (0xfffffff005a9de9c) make of a `love` there is not
-    // modelled; without one the string is empty.
-    if dt_prop(t, MANIFEST_PROPERTIES, "love").is_some() {
-        return Err("AppleImage4's ignition blob: the long OS version from /chosen/manifest-properties' love (its parse, 0xfffffff005a9dc3c, and its string, 0xfffffff005a9de9c)".into());
+    if let Some(s) = long_os_version(t)? {
+        blob[0x32..0x32 + s.len()].copy_from_slice(&s);
     }
     if let Some(u) = udid {
         blob[0x72..0x82].copy_from_slice(&u);
     }
     Ok(blob)
+}
+
+/// The blob's long OS version, as the kext's start makes it: the
+/// expert's version query (0xfffffff005a9c58c → the runtime's
+/// 0xfffffff005a99b7c) reads `/chosen/manifest-properties`' `love`
+/// (0xfffffff005a9c7a4 → the runtime's read, 0xfffffff005a9280c: into a
+/// zeroed 64-byte buffer, EOVERFLOW when longer, its length the
+/// property's), and the version parse (0xfffffff005a9dc3c) keeps it as a
+/// string (0xfffffff005a9df64, libimage4's `cstring_init_with_buff`: a
+/// trap for an empty one or one whose bytes hold a NUL within its length;
+/// the first `min(length, 63)` bytes); the blob takes that string
+/// (0xfffffff005a9de9c, `strlcpy` of 64). No `love` (ENOENT, or the
+/// property's default) leaves it empty; another failure is the start's
+/// panic. The parse's numbers (the components split at "," and ".") are
+/// not in the blob.
+fn long_os_version(t: &[Node]) -> Result<Option<Vec<u8>>, String> {
+    let Some(v) = dt_prop(t, MANIFEST_PROPERTIES, "love") else { return Ok(None) };
+    if v.len() > 64 {
+        return Err(format!("AppleImage4's ignition blob: the kext's start panics (failed to init ignition blob): /chosen/manifest-properties' love: {EOVERFLOW}"));
+    }
+    let mut buf = [0u8; 64];
+    buf[..v.len()].copy_from_slice(v);
+    // strlen of the buffer: past its end when it holds no NUL, which is at
+    // least the length.
+    let strlen = buf.iter().position(|&c| c == 0).unwrap_or(64);
+    if v.is_empty() || strlen < v.len() {
+        return Err(format!("AppleImage4's ignition blob: the kext's start panics: /chosen/manifest-properties' love of {} bytes holds a string of {strlen} (the version's string trap, 0xfffffff005a9df64)", v.len()));
+    }
+    Ok(Some(buf[..v.len().min(63)].to_vec()))
 }
 
 /// The blob as it is now: made from the device tree when first asked
@@ -266,7 +292,7 @@ pub fn chosen_stand_in() -> &'static str {
 }
 
 /// The `/chosen` values the web device's boot does not fill in yet.
-pub const WEB_DEVICE_CHOSEN_STAND_IN: &str = "the /chosen values iBoot fills in beyond the web device's identity, its AP ticket's boot-manifest-hash and its NVRAM's boot-nonce (stand-in: the IPSW device tree's, die-id, unique-device-id and random-seed zero, the manifest-properties and manifest-object-properties placeholders not given the AP ticket's properties, and no esdm-fuses; boot-manifest-hash and boot-nonce zero when the web device has no AP ticket or generator)";
+pub const WEB_DEVICE_CHOSEN_STAND_IN: &str = "the /chosen values iBoot fills in beyond the web device's identity, its AP ticket's boot-manifest-hash, its NVRAM's boot-nonce and the AP ticket's manifest properties the 21H461 readers name in /chosen/manifest-properties (love, BNCH, ECID) (stand-in: the IPSW device tree's, die-id, unique-device-id and random-seed zero, no esdm-fuses; in manifest-properties the ticket's other properties (BORD, CEPO, CHIP, CPRO, CSEC, SDOM, srvn, prtp, sdkp, tagt, tatp) not published and the Unused*Property placeholders left as they are, and manifest-object-properties left with its placeholders: iBoot (encrypted in the IPSW) is what decides them, and no 21H461 binary reads them; boot-manifest-hash and boot-nonce zero when the web device has no AP ticket or generator)";
 
 pub const CHOSEN_STAND_IN: &str = "the /chosen values iBoot fills in (stand-in: the IPSW device tree's, chip-id, board-id, unique-chip-id, certificate-production-status, certificate-security-mode, effective-production-status-ap and effective-security-mode-ap zero, and no security-domain, chip-epoch, esdm-fuses or manifest-properties love: an ignition blob, a Cryptex1 ticket name of ECID 0 and the platform UUID (gethostuuid, IOPlatformUUID) of ECID 0 and chip 0; measure IODeviceTree:/chosen on the device, `ioreg -p IODeviceTree -n chosen -l`)";
 
@@ -408,7 +434,25 @@ mod tests {
         assert!(ignition_blob_of(&t).unwrap_err().contains("panics"));
         assert!(ignition_blob_of(&tree(&[], &[])).is_err(), "no hash method");
         assert!(ignition_blob_of(&tree(&[("crypto-hash-method", b"sha2-384\0"), ("allow-ecid-mismatch", b"")], &[])).is_err());
-        assert!(ignition_blob_of(&tree(&[("crypto-hash-method", b"sha2-384\0")], &[("love", b"21.8.461.0.0,0\0")])).is_err());
+        // A love whose length runs past its string's NUL is the version
+        // string's trap, as are an empty one and one too long to read.
+        let sha = [("crypto-hash-method", &b"sha2-384\0"[..])];
+        assert!(ignition_blob_of(&tree(&sha, &[("love", b"21.8.461.0.0,0\0")])).unwrap_err().contains("panics"));
+        assert!(ignition_blob_of(&tree(&sha, &[("love", b"")])).unwrap_err().contains("panics"));
+        assert!(ignition_blob_of(&tree(&sha, &[("love", &[b'1'; 65])])).unwrap_err().contains("panics"));
+    }
+
+    /// The long OS version is the manifest's love as a string: its bytes
+    /// when they hold no NUL, the first 63 of a 64-byte one.
+    #[test]
+    fn the_blob_holds_the_manifests_long_os_version() {
+        let sha = [("crypto-hash-method", &b"sha2-384\0"[..])];
+        let b = ignition_blob_of(&tree(&sha, &[("love", b"21.8.461.0.0,0")])).unwrap();
+        assert_eq!(&b[0x32..0x40], b"21.8.461.0.0,0");
+        assert!(b[0x40..0x72].iter().all(|&c| c == 0));
+        let b = ignition_blob_of(&tree(&sha, &[("love", &[b'7'; 64])])).unwrap();
+        assert_eq!(&b[0x32..0x71], &[b'7'; 63][..]);
+        assert_eq!(b[0x71], 0, "the string's terminator");
     }
 
     /// libignition's `ignition_write_BRA_blob`: the boot spec's and the

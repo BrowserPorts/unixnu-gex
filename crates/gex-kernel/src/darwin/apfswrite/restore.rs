@@ -3552,7 +3552,7 @@ mod tests {
         let mut hook = move || -> Result<(), String> {
             d2.0.sync_all().map_err(|e| e.to_string())?;
             let copy = std::process::Command::new("python3")
-                .args(["-I", "/Volumes/Ferrochrome/offloaded-builds/gex-cryptex/drafts/s16/tools/sparsecopy.py"])
+                .args(["-I", SPARSECOPY])
                 .arg(&dp)
                 .arg(&cp)
                 .args([base.to_string(), psize.to_string()])
@@ -3758,12 +3758,16 @@ mod tests {
         diffs
     }
 
+    /// sparsecopy.py beside this file: a byte range of a sparse file copied
+    /// with its holes kept.
+    const SPARSECOPY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/darwin/apfswrite/sparsecopy.py");
+
     /// The container partition of disk file `disk` copied to the
     /// container file `ctr`.
     fn copy_container(disk: &std::path::Path, ctr: &std::path::Path, base: u64, psize: u64) {
         let _ = std::fs::remove_file(ctr);
         let copy = std::process::Command::new("python3")
-            .args(["-I", "/Volumes/Ferrochrome/offloaded-builds/gex-cryptex/drafts/s16/tools/sparsecopy.py"])
+            .args(["-I", SPARSECOPY])
             .arg(disk)
             .arg(ctr)
             .args([base.to_string(), psize.to_string()])

@@ -482,7 +482,9 @@ hello from /var/tmp/gex-exec-fat with 1 argument" 0
     # zero (img4::CHOSEN_STAND_IN).
     ignition) check_root ignition 'ignition J120AP ecid 0 chip 0 level 0 version ""' 0 ;;
     # The web device (GEX_TEST_WEB_DEVICE, gexc darwin-web-device's): its
-    # boot puts its identity in /chosen, which the blob takes.
+    # boot puts its identity in /chosen, which the blob takes, and its AP
+    # ticket's love in /chosen/manifest-properties, the blob's version
+    # (empty without an AP ticket).
     ignitionweb)
         if [ -z "${GEX_TEST_WEB_DEVICE:-}" ]; then
             if [ "$named" -gt 0 ]; then
@@ -492,8 +494,10 @@ hello from /var/tmp/gex-exec-fat with 1 argument" 0
                 echo "SKIP ignitionweb (set GEX_TEST_WEB_DEVICE)"
             fi
         else
-            ecid=$("$GEXC" darwin-web-device show "$GEX_TEST_WEB_DEVICE" | sed -n 's/^ECID //p')
-            with_web_device check_root ignition "ignition J120AP ecid $ecid chip 8011 level 0 version \"\"" 0
+            shown=$("$GEXC" darwin-web-device show "$GEX_TEST_WEB_DEVICE")
+            ecid=$(echo "$shown" | sed -n 's/^ECID //p')
+            love=$(echo "$shown" | sed -n 's/^manifest-properties love //p')
+            with_web_device check_root ignition "ignition J120AP ecid $ecid chip 8011 level 0 version \"$love\"" 0
         fi ;;
     # The NVRAM variables (IODTNVRAM), on a copy of the web device whose
     # NVRAM is its factory one: as root, then as a user. The root run's

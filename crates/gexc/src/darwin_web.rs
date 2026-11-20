@@ -237,6 +237,19 @@ fn show(dir: &Path) -> Result<()> {
     match &w.ap_ticket {
         Some(t) => {
             println!("AP ticket {} ({} bytes), boot-manifest-hash {}", dir.join(files::AP_TICKET).display(), t.len(), hex(&webdevice::boot_manifest_hash(t)).to_uppercase());
+            // What its boot publishes in /chosen/manifest-properties.
+            match webdevice::manifest_properties(t) {
+                Ok(props) => {
+                    for (name, v) in props {
+                        let code = name.trim_start_matches("manifest-properties/");
+                        match code {
+                            "love" => println!("manifest-properties {code} {}", String::from_utf8_lossy(&v)),
+                            _ => println!("manifest-properties {code} {}", hex(&v)),
+                        }
+                    }
+                }
+                Err(e) => println!("manifest-properties none: {e}"),
+            }
             if let Err(e) = w.check_ap_ticket() {
                 println!("AP ticket not this device's current one: {e}");
             }

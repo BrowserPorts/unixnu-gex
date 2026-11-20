@@ -1,5 +1,6 @@
 # The ARM data-processing test program (a32_alu.s): every operation under
-# a sweep of operands, shifts and carry-in. `python3 gen_alu.py a32_alu.s`.
+# a sweep of operands, shifts and carry-in. `python3 gen_alu.py a32_alu.s`;
+# tests/qemu.rs writes it into its work directory before assembling it.
 import sys
 out = []
 P = out.append

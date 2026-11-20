@@ -1,4 +1,5 @@
-//! End-to-end runs of ARMv7-A programs (`tests/programs/*.s`): each is
+//! End-to-end runs of ARMv7-A programs (`tests/programs/*.s`, and the ones
+//! a generator there writes, [`GENERATED`]): each is
 //! assembled with the host's clang, linked at address 0 with ld.lld, and
 //! run twice to its semihosting SYS_EXIT: through gex (lifted, compiled by
 //! the tier-1 emitter, run on wasmtime against the gex-a32 model) and on
@@ -30,10 +31,24 @@ fn run(cmd: &mut Command) {
     assert!(out.status.success(), "{cmd:?}: {}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
 }
 
+/// The programs a generator in `tests/programs` writes: the program, and
+/// the generator with its arguments before the output path.
+const GENERATED: &[(&str, &[&str])] = &[("a32_alu", &["gen_alu.py"])];
+
+/// `name`'s source: `tests/programs/<name>.s`, or for a generated program
+/// the file its generator writes into the work directory.
+fn source(name: &str) -> PathBuf {
+    let Some((_, gen)) = GENERATED.iter().find(|g| g.0 == name) else { return Path::new(PROGRAMS).join(format!("{name}.s")) };
+    let src = work().join(format!("{name}.s"));
+    let (script, args) = gen.split_first().unwrap();
+    run(Command::new("python3").arg("-I").arg(Path::new(PROGRAMS).join(script)).args(args).arg(&src));
+    src
+}
+
 /// Assemble and link `name`, giving the image's bytes.
 fn build(name: &str) -> (PathBuf, Vec<u8>) {
     let w = work();
-    let src = Path::new(PROGRAMS).join(format!("{name}.s"));
+    let src = source(name);
     let obj = w.join(format!("{name}.o"));
     let elf = w.join(format!("{name}.elf"));
     let bin = w.join(format!("{name}.bin"));

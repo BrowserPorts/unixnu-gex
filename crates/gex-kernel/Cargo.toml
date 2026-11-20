@@ -10,6 +10,9 @@ gex-abi.workspace = true
 # Atomic operations on guest words (PI futexes); the one unsafe view.
 gex-atomic.workspace = true
 gex-f80.workspace = true
+# The SEP's core (ARMv7): its system-level model, which the core harness
+# sets up for an AArch32 front end (`darwin::sep::core`).
+gex-a32.workspace = true
 # PE parsing and mapping for the NT personality.
 gex-ld.workspace = true
 # The code signature's digests: a CodeDirectory's cdhash.

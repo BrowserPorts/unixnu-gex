@@ -880,6 +880,7 @@ version = "0.0.1"
 name = "gex-kernel"
 version = "0.0.1"
 dependencies = [
+ "gex-a32",
  "gex-abi",
  "gex-atomic",
  "gex-f80",

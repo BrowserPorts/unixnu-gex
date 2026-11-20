@@ -14,10 +14,16 @@
 //! 2. the SEP ROM (`GEX_DARWIN_SEPROM`): the AP's first protocol (status,
 //!    BootTz0, Boot) is the ROM's, whose replies are not the AP's to make;
 //! 3. the SEP's UID (the web device's `sep-uid.bin`): the AES engine's key;
-//! 4. a core that can execute the image. gex's translators decode A64 only,
-//!    and the SEP's peripherals (its side of the mailbox, the AES engine,
-//!    the memory protection engine, its interrupt controller and timers)
-//!    have no model: their registers are in the SEP ROM and the sepOS.
+//! 4. a core that can execute the image: gex's AArch32 front end (the
+//!    decoder `gex-isa-a32`, the lifter `gex-lift-a32`, the system-level
+//!    model `gex-a32`, run by `gex-a32-host`) executes ARMv7 code; what it
+//!    is not given is the SEP's platform ([`Platform`]: where the ROM, the
+//!    SRAM and TZ0 are in the core's physical address space, how the
+//!    decrypted sepOS enters it, the core's IMPLEMENTATION DEFINED identity
+//!    and optional extensions), and the SEP's peripherals (its side of the
+//!    mailbox, the AES engine, the PKA, the TRNG, the memory protection
+//!    engine, its interrupt controller and timers) have no model: all of
+//!    them are in the SEP ROM and the sepOS.
 //!
 //! Each gap fails the wait the AP is in with its own words
 //! ([`super::manager::MgrError::CoreGone`]); nothing here replies in the
@@ -62,8 +68,16 @@ pub enum Gap {
     NoSepRom,
     SepRomUnreadable(PathBuf, String),
     NoUid(Missing),
-    /// Everything given: the core still cannot execute the image.
-    NoTranslator(Arch),
+    /// The core is AArch64: gex has no system-level A64 model.
+    NoA64SystemModel,
+    /// Everything given: the SEP's platform, which no input gives, is not
+    /// known ([`Platform`]); the list names each missing part.
+    NoPlatform(Vec<&'static str>),
+    /// The core's configuration is one the AArch32 model refuses.
+    CoreModel(gex_a32::Stop),
+    /// The core is set up ([`Boot`]): the SEP's peripherals, which the ROM
+    /// and the sepOS reach at once, have no model.
+    NoPeripherals,
 }
 
 impl std::fmt::Display for Gap {
@@ -74,8 +88,10 @@ impl std::fmt::Display for Gap {
             Gap::NoSepRom => f.write_str("the SEP needs its boot ROM (GEX_DARWIN_SEPROM=<file>), which is in the A10X's mask ROM and is in no IPSW: the AP's boot protocol (status, BootTz0, Boot) is the ROM's, and its replies are not made up"),
             Gap::SepRomUnreadable(p, e) => write!(f, "GEX_DARWIN_SEPROM={}: {e}", p.display()),
             Gap::NoUid(m) => write!(f, "{m}"),
-            Gap::NoTranslator(Arch::Armv7) => f.write_str("the SEP core is ARMv7 (the J120's sep node has no aarch64 property) and gex decodes A64 only: an AArch32 (ARM and Thumb-2) decoder, its lifter and a system-level model of the SEP's peripherals are not built (drafts/sep/07-sep-core.md)"),
-            Gap::NoTranslator(Arch::Aarch64) => f.write_str("the SEP core is AArch64 (the sep node has an aarch64 property): gex's translator runs user-mode A64 and has no system-level model of the SEP's peripherals"),
+            Gap::NoA64SystemModel => f.write_str("the SEP core is AArch64 (the sep node has an aarch64 property): gex's translator runs user-mode A64 and has no system-level A64 model"),
+            Gap::NoPlatform(missing) => write!(f, "the SEP core is ARMv7 and gex's AArch32 front end can run it, but the SEP's platform is not known: {} (in the SEP ROM and the sepOS; drafts/sep/07-sep-core.md)", missing.join("; ")),
+            Gap::CoreModel(s) => write!(f, "the SEP core's configuration is not one gex's AArch32 model implements: {s:?}"),
+            Gap::NoPeripherals => f.write_str("the SEP core is set up, but its peripherals (the SEP side of the mailbox, the AES engine with the UID and GID keys, the PKA, the TRNG, the memory protection engine over TZ0, the interrupt controller, the timers) have no model: their registers are in the SEP ROM and the sepOS"),
         }
     }
 }
@@ -106,13 +122,94 @@ pub fn load(inputs: &Inputs, arch: Arch) -> Result<Loaded, Gap> {
     Ok(Loaded { sepos, seprom, uid, arch })
 }
 
-/// What runs when the SEP core is released: the checks, and then the
-/// gap that remains. There is no core to run past them, so the result is
-/// always the gap that ended the attempt.
+/// What running the core needs that no input gives: the SEP's physical
+/// memory map and the core's identity.
+#[derive(Clone, Debug)]
+pub struct Platform {
+    /// Where the boot ROM is in the core's physical address space.
+    pub rom_pa: u64,
+    /// The SEP's SRAM: physical address and size.
+    pub sram: (u64, u64),
+    /// TZ0, the SEP's DRAM carve-out, as the core sees it: its physical
+    /// address, and its size (the sepi image's `tz0s`, 0xd38000 on J120).
+    pub tz0: (u64, u64),
+    /// Where the decrypted sepOS payload is in the core's memory when the
+    /// ROM hands over to it (the ROM's own decryption, which the web
+    /// device cannot do, is what would put it there).
+    pub sepos_pa: u64,
+    /// The core: its optional extensions and IMPLEMENTATION DEFINED values.
+    pub config: gex_a32::Config,
+}
+
+/// The SEP's platform, as far as the evidence gives it. The AP's binaries
+/// say only that the core is ARMv7 with 4 KiB pages (07-sep-core.md §1);
+/// everything [`Platform`] holds is in the SEP ROM and the sepOS.
+pub fn platform() -> Result<Platform, Gap> {
+    Err(Gap::NoPlatform(vec![
+        "the physical addresses of the ROM, the SRAM and TZ0",
+        "where the decrypted sepOS is placed for the ROM to hand over to it",
+        "the core's identity (MIDR and the ID registers) and its optional extensions (Floating-point and Advanced SIMD, the divide instructions, the Security Extensions)",
+        "the core's reset configuration inputs (SCTLR.V, TE, EE, NMFI)",
+    ]))
+}
+
+/// A memory region of the SEP's core, with what it holds at reset.
+#[derive(Clone, Debug)]
+pub struct BootRegion {
+    pub pa: u64,
+    pub size: u64,
+    pub writable: bool,
+    /// Bytes at its start; the rest is zero.
+    pub init: Vec<u8>,
+}
+
+/// The core set up to run: its model, reset, and its memory.
+pub struct Boot {
+    pub core: gex_a32::Core,
+    pub regions: Vec<BootRegion>,
+}
+
+/// Set the core up on `platform`: the model of the core (refused where it
+/// does not implement the configuration), the ROM read-only at its
+/// address, the SRAM, and TZ0 holding the decrypted sepOS where the
+/// platform says the ROM leaves it.
+pub fn boot(l: &Loaded, p: &Platform) -> Result<Boot, Gap> {
+    let core = gex_a32::Core::new(p.config.clone()).map_err(Gap::CoreModel)?;
+    let (tz0_pa, tz0_size) = p.tz0;
+    let at = p.sepos_pa.checked_sub(tz0_pa).filter(|o| o + l.sepos.bytes.len() as u64 <= tz0_size).ok_or_else(|| {
+        Gap::NoPlatform(vec!["a sepOS placement inside TZ0 (the platform's does not hold the payload)"])
+    })?;
+    let mut tz0 = vec![0u8; at as usize];
+    tz0.extend_from_slice(&l.sepos.bytes);
+    Ok(Boot {
+        core,
+        regions: vec![
+            BootRegion { pa: p.rom_pa, size: l.seprom.len() as u64, writable: false, init: l.seprom.clone() },
+            BootRegion { pa: p.sram.0, size: p.sram.1, writable: true, init: Vec::new() },
+            BootRegion { pa: tz0_pa, size: tz0_size, writable: true, init: tz0 },
+        ],
+    })
+}
+
+/// What runs when the SEP core is released: the checks, the platform and
+/// the core's set-up, and then the gap that remains. Nothing runs the
+/// core past them yet, so the result is always the gap that ended the
+/// attempt.
 pub fn release(inputs: &Inputs, arch: Arch) -> Gap {
-    match load(inputs, arch) {
+    let l = match load(inputs, arch) {
+        Err(g) => return g,
+        Ok(l) => l,
+    };
+    if l.arch == Arch::Aarch64 {
+        return Gap::NoA64SystemModel;
+    }
+    let p = match platform() {
+        Err(g) => return g,
+        Ok(p) => p,
+    };
+    match boot(&l, &p) {
         Err(g) => g,
-        Ok(l) => Gap::NoTranslator(l.arch),
+        Ok(_) => Gap::NoPeripherals,
     }
 }
 
@@ -169,11 +266,54 @@ mod tests {
         i.device_dir = Some(d.clone());
         assert!(matches!(release(&i, Arch::Armv7), Gap::NoUid(Missing::NoFile(_))));
         std::fs::write(d.join(crate::darwin::webdevice::files::SEP_UID), [9; 32]).unwrap();
-        // Every input there: the core itself is what is missing.
+        // Every input there: the platform is what is missing.
         let g = release(&i, Arch::Armv7);
-        assert!(matches!(g, Gap::NoTranslator(Arch::Armv7)), "{g}");
-        assert!(g.to_string().contains("AArch32"));
-        assert!(release(&i, Arch::Aarch64).to_string().contains("AArch64"));
+        assert!(matches!(g, Gap::NoPlatform(_)), "{g}");
+        assert!(g.to_string().contains("AArch32 front end") && g.to_string().contains("ROM"), "{g}");
+        assert!(matches!(release(&i, Arch::Aarch64), Gap::NoA64SystemModel));
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    fn loaded() -> Loaded {
+        let d = tmp("boot");
+        std::fs::write(d.join(crate::darwin::webdevice::files::SEP_UID), [7; 32]).unwrap();
+        let uid = SepUid::load(&d).unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+        Loaded {
+            sepos: SepOsImage { path: PathBuf::from("sepos"), bytes: vec![0xaa; 64] },
+            seprom: vec![0xfe, 0xff, 0xff, 0xea],
+            uid,
+            arch: Arch::Armv7,
+        }
+    }
+
+    fn armv7() -> gex_a32::Config {
+        let mut features = gex_a32::Features::BASE;
+        features.mp = true;
+        gex_a32::Config { features, imp: gex_a32::ImpDef::default() }
+    }
+
+    #[test]
+    fn a_platform_sets_the_core_up_and_the_peripherals_are_the_next_gap() {
+        let p = Platform { rom_pa: 0, sram: (0x1000_0000, 0x1_0000), tz0: (0x8000_0000, 0xd3_8000), sepos_pa: 0x8000_4000, config: armv7() };
+        let b = boot(&loaded(), &p).expect("set up");
+        assert_eq!(b.regions.len(), 3);
+        assert_eq!(b.regions[0].init, vec![0xfe, 0xff, 0xff, 0xea]);
+        assert!(!b.regions[0].writable);
+        assert_eq!(&b.regions[2].init[0x4000..], &[0xaa; 64][..]);
+        // A sepOS placed outside TZ0 is refused by name.
+        let bad = Platform { sepos_pa: 0x7000_0000, ..p };
+        assert!(matches!(boot(&loaded(), &bad), Err(Gap::NoPlatform(_))));
+    }
+
+    #[test]
+    fn a_configuration_the_model_does_not_implement_is_named() {
+        let mut c = armv7();
+        c.features.security = true;
+        let p = Platform { rom_pa: 0, sram: (0x1000_0000, 0x1_0000), tz0: (0x8000_0000, 0xd3_8000), sepos_pa: 0x8000_0000, config: c };
+        match boot(&loaded(), &p) {
+            Err(Gap::CoreModel(_)) => {}
+            other => panic!("{:?}", other.err()),
+        }
     }
 }

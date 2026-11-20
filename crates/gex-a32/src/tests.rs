@@ -1423,3 +1423,48 @@ fn vmrs_vmsr_special_registers() {
     assert_eq!(c.sys(&mut r, &mut m, pc | KEY_USER, sys::VMRS, 0b1000, 0), Err(Stop::Resume));
     assert_eq!(c.mode(), UND);
 }
+
+#[test]
+fn vfp_short_vectors() {
+    // MVFR0.Short vectors = 1: the hardware executes vector operations.
+    let mut i = imp();
+    i.mvfr0 = Some(0x1111_0222);
+    let (mut c, mut r, mut m) = new_core_with(features(), i);
+    fp_enable(&mut c, &mut r, &mut m, 0x00f0_0000, true);
+    let pc = key(0x3000, false, 0);
+    let s = |r: &mut R, n: usize, v: f32| {
+        let d = &mut r.d[n / 2];
+        let sh = 32 * (n % 2);
+        *d = (*d & !(0xffff_ffff << sh)) | (v.to_bits() as u64) << sh;
+    };
+    let g = |r: &R, n: usize| f32::from_bits((r.d[n / 2] >> (32 * (n % 2))) as u32);
+    for k in 0..8 {
+        s(&mut r, 16 + k, k as f32);
+        s(&mut r, 24 + k, 10.0 * k as f32);
+    }
+    s(&mut r, 0, 100.0);
+    // Len 3, stride 2 (FPSCR.Len = 2, Stride = 0b11): VADD.F32 S8, S22, S24
+    // reads S22, S16 (wrapped round the bank), S18 and S24, S26, S28.
+    r.fpscr = 2 << 16 | 3 << 20;
+    // VADD.F32 S8, S22, S24: cond 1110 11100 D 11 Vn Vd 1010 N 0 M 0 Vm.
+    let vadd = |d: u32, n: u32, m: u32| 0xee30_0a00 | (d & 1) << 22 | (d >> 1) << 12 | (n >> 1) << 16 | (n & 1) << 7 | (m & 1) << 5 | m >> 1;
+    assert_eq!(c.sys(&mut r, &mut m, pc, sys::FP, vadd(8, 22, 24) as u64, 0), Ok(0));
+    assert_eq!([g(&r, 8), g(&r, 10), g(&r, 12)], [6.0 + 0.0, 0.0 + 20.0, 2.0 + 40.0]);
+    // A scalar second operand (S0) is used for every element.
+    assert_eq!(c.sys(&mut r, &mut m, pc, sys::FP, vadd(8, 16, 0) as u64, 0), Ok(0));
+    assert_eq!([g(&r, 8), g(&r, 10), g(&r, 12)], [100.0, 102.0, 104.0]);
+    // A scalar destination bank: one scalar operation.
+    s(&mut r, 2, -1.0);
+    assert_eq!(c.sys(&mut r, &mut m, pc, sys::FP, vadd(2, 16, 24) as u64, 0), Ok(0));
+    assert_eq!([g(&r, 2), g(&r, 4)], [0.0, 0.0]);
+    // Len 5 with stride 2: UNPREDICTABLE (Table D11-1).
+    r.fpscr = 4 << 16 | 3 << 20;
+    assert!(matches!(c.sys(&mut r, &mut m, pc, sys::FP, vadd(8, 16, 24) as u64, 0), Err(Stop::Unpredictable(_))));
+    // Without short vector hardware: a bounce, the Undefined Instruction
+    // exception.
+    let (mut c, mut r, mut m) = new_core();
+    fp_enable(&mut c, &mut r, &mut m, 0x00f0_0000, true);
+    r.fpscr = 1 << 16;
+    assert_eq!(c.sys(&mut r, &mut m, pc, sys::FP, vadd(8, 16, 24) as u64, 0), Err(Stop::Resume));
+    assert_eq!(c.mode(), UND);
+}

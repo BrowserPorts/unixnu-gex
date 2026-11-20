@@ -28,8 +28,13 @@ pub use gex_isa_a32::Features;
 
 mod cp;
 mod exc;
+mod fpu;
 mod psr;
 mod vmsa;
+
+pub use fpu::soft;
+
+
 
 #[cfg(test)]
 mod tests;
@@ -52,6 +57,16 @@ pub trait Regs {
     /// `CPSR<19:16>`.
     fn ge(&self) -> u8;
     fn set_ge(&mut self, ge: u8);
+    /// `_D[n]`, `n` in 0..=31: the extension register file (A2.6.1).
+    fn d(&self, n: u8) -> u64;
+    fn set_d(&mut self, n: u8, v: u64);
+    /// The FPSCR (B4.1.58).
+    fn fpscr(&self) -> u32;
+    fn set_fpscr(&mut self, v: u32);
+    /// Record which Floating-point and Advanced SIMD checks pass
+    /// (`gex_abi::a32::FPEN`, the [`gex_abi::a32::fpen`] bits) for
+    /// translated code.
+    fn set_fpen(&mut self, v: u64);
 }
 
 /// The core's physical address space.
@@ -146,6 +161,15 @@ pub struct ImpDef {
     /// implemented as read/write bits.
     pub cpacr_asedis: Option<bool>,
     pub cpacr_d32dis: Option<bool>,
+    /// B4.1.59, B4.1.108, B4.1.109: FPSID, MVFR0 and MVFR1. The model reads
+    /// the Floating-point implementation from MVFR0 and MVFR1 where they
+    /// record a choice: short vectors (MVFR0<27:24>), the square root and
+    /// divide operations (MVFR0<23:20>, <19:16>), and requires what it
+    /// implements of the rest (all rounding modes, no exception trapping,
+    /// full denormal and NaN arithmetic).
+    pub fpsid: Option<u32>,
+    pub mvfr0: Option<u32>,
+    pub mvfr1: Option<u32>,
     /// B1.13.5: a trivial Jazelle implementation's JOSCR is read/write with
     /// no effect (`true`) or RAZ/WI (`false`).
     pub joscr_rw: Option<bool>,
@@ -243,8 +267,8 @@ pub(crate) struct Sysregs {
     pub teecr: u32,
     pub teehbr: u32,
     pub joscr: u32,
-    /// FPEXC (B4.1.57): only EN matters to the model, which executes no
-    /// Floating-point instruction (EN resets to 0 and nothing sets it).
+    /// FPEXC (B4.1.57): EN, and EX, which is always 0 (the model has no
+    /// subarchitecture state).
     pub fpexc: u32,
 }
 
@@ -316,13 +340,23 @@ impl Core {
     /// The Reset exception (B1.9.1): SCTLR and the CPSR to their reset
     /// values, the PC to the reset vector.
     pub fn reset(&mut self, regs: &mut dyn Regs) -> Result<(), Stop> {
-        self.take_reset(regs)
+        let r = self.take_reset(regs);
+        regs.set_fpen(self.fpen());
+        r
     }
 
     /// An `A32Sys` operation (`gex_abi::a32::sys`) by the instruction whose
     /// key is `pc`: `Ok` with its result, translated code going on; `Err`
     /// otherwise.
     pub fn sys(&mut self, regs: &mut dyn Regs, mem: &mut dyn PhysMem, pc: u64, op: i32, a: u64, b: u64) -> Result<u64, Stop> {
+        let r = self.sys_op(regs, mem, pc, op, a, b);
+        // The CPACR or FPEXC may have changed: translated code's view of
+        // the Floating-point and Advanced SIMD checks follows.
+        regs.set_fpen(self.fpen());
+        r
+    }
+
+    fn sys_op(&mut self, regs: &mut dyn Regs, mem: &mut dyn PhysMem, pc: u64, op: i32, a: u64, b: u64) -> Result<u64, Stop> {
         use abi::sys::*;
         match op {
             NOP => Ok(0),
@@ -372,6 +406,9 @@ impl Core {
                 unpred(format!("{what}: {b:#x} at {:#x}", abi::key_addr(pc)))
             }
             UNIMPLEMENTED => self.unimplemented(regs, pc, a as i64, b as u32),
+            FP => self.fp_exec(regs, pc, a as u32),
+            VMRS => self.vmrs(regs, pc, a as u8).map(u64::from),
+            VMSR => self.vmsr(regs, pc, a as u8, b as u32).map(|_| 0),
             _ => unimpl(format!("A32Sys operation {op}")),
         }
     }

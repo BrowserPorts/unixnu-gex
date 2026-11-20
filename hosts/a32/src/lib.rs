@@ -135,6 +135,23 @@ impl Regs for CtxRegs {
     fn set_ge(&mut self, ge: u8) {
         self.set_u64_at(ctx::x(abi::GE), (ge & 15) as u64);
     }
+    fn d(&self, n: u8) -> u64 {
+        assert!(n < 32);
+        self.u64_at(ctx::v(n / 2) + 8 * (n as usize % 2))
+    }
+    fn set_d(&mut self, n: u8, v: u64) {
+        assert!(n < 32);
+        self.set_u64_at(ctx::v(n / 2) + 8 * (n as usize % 2), v);
+    }
+    fn fpscr(&self) -> u32 {
+        self.u64_at(ctx::x(abi::FPSCR)) as u32
+    }
+    fn set_fpscr(&mut self, v: u32) {
+        self.set_u64_at(ctx::x(abi::FPSCR), v as u64);
+    }
+    fn set_fpen(&mut self, v: u64) {
+        self.set_u64_at(ctx::x(abi::FPEN), v);
+    }
 }
 
 /// How a run ended.
@@ -332,6 +349,15 @@ impl Machine {
             leave(&mut c, Leave::Miss(pc as u64))
         })?;
         l.func_wrap(m, im::BREAKPOINT, |mut c: Caller<'_, State>, _ctx: i32, pc: i64, code: i32| -> wasmtime::Result<()> {
+            if (abi::BRK_FP_CHECK - 3..=abi::BRK_FP_CHECK).contains(&code) {
+                let st = c.data_mut();
+                let why = match st.core.fp_check_failed(&mut st.regs, pc as u64, code) {
+                    Err(Stop::Resume) => Leave::Resume,
+                    Err(s) => Leave::Exit(Exit::Stopped(s)),
+                    Ok(()) => Leave::Fail(format!("the Floating-point check at {pc:#x} returned")),
+                };
+                return leave(&mut c, why);
+            }
             let why = if code == abi::BRK_UNPREDICTABLE_PC {
                 Leave::Exit(Exit::Stopped(Stop::Unpredictable(format!(
                     "the instruction at key {pc:#x} writes the PC with an address that is UNPREDICTABLE (A2.3.2 BXWritePC bits 1:0 = 0b10, or a PC load from an unaligned address)"

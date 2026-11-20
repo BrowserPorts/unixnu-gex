@@ -484,8 +484,19 @@ pub fn add_trap_pc(pc: u64) {
     }
 }
 
+/// Whether several blocks can start in one dispatch slot, so that each
+/// checks it is the one dispatch was asked for (`ctx::LAST_TARGET`): an
+/// x86-64 guest's (instructions start on any byte), and an AArch32 core's,
+/// whose Thumb blocks start on any halfword and whose keys carry the
+/// instruction set.
+fn shared_slots(cx: &Context<'_>) -> bool {
+    gex_abi::DISPATCH_SHIFT > gex_abi::INST_ALIGN_SHIFT || cx.a32_sys != u32::MAX
+}
+
 fn is_trap_pc(pc: u64) -> bool {
-    trap_pc() == pc || TRAP_PCS.iter().any(|s| s.load(std::sync::atomic::Ordering::Relaxed) == pc)
+    // 0 is the unset value of every source (and `add_trap_pc` claims slots
+    // by it), not a trap at address 0, where an AArch32 core's vectors are.
+    pc != 0 && (trap_pc() == pc || TRAP_PCS.iter().any(|s| s.load(std::sync::atomic::Ordering::Relaxed) == pc))
 }
 
 /// `GEX_TRACE_BLOCKS`: plant a trace point at every block entry, so the host
@@ -559,7 +570,7 @@ pub fn compile_with_relocs(block: &Block, cx: &Context<'_>) -> (Vec<u8>, Vec<u32
     // own start, which for a neighbour's branch is the wrong address: a call
     // to a JIT trampoline at E ran a stale block for E+2 there, mid-
     // instruction (crashes in Mono's JIT trampolines).
-    if gex_abi::DISPATCH_SHIFT > gex_abi::INST_ALIGN_SHIFT {
+    if shared_slots(cx) {
         e.emit_target_check(block.start);
     }
     if let Some(bases) = cx.page_bases.filter(|_| page_check()) {
@@ -618,7 +629,7 @@ pub fn compile(block: &Block, cx: &Context<'_>) -> Vec<u8> {
     // own start, which for a neighbour's branch is the wrong address: a call
     // to a JIT trampoline at E ran a stale block for E+2 there, mid-
     // instruction (crashes in Mono's JIT trampolines).
-    if gex_abi::DISPATCH_SHIFT > gex_abi::INST_ALIGN_SHIFT {
+    if shared_slots(cx) {
         e.emit_target_check(block.start);
     }
     if let Some(bases) = cx.page_bases.filter(|_| page_check()) {
@@ -5625,7 +5636,7 @@ impl<'a> Emitter<'a> {
             if let Some(&func) = self.cx.blocks.get(&target) {
                 // The callee checks `LAST_TARGET` against its own address
                 // (x86-64), so a direct jump has to record it as a dispatch would.
-                if gex_abi::DISPATCH_SHIFT > gex_abi::INST_ALIGN_SHIFT {
+                if shared_slots(self.cx) {
                     self.ctx_base();
                     self.f.i64_const(target as i64);
                     self.f.store(0x37, 3, ctx::LAST_TARGET as u32);
@@ -5897,7 +5908,7 @@ impl<'a> Emitter<'a> {
         self.store_pc(start);
         self.f.i64_const(start as i64);
         self.f.local_set(self.scratch_i64);
-        if gex_abi::DISPATCH_SHIFT > gex_abi::INST_ALIGN_SHIFT {
+        if shared_slots(self.cx) {
             self.ctx_base();
             self.f.local_get(self.scratch_i64);
             self.f.store(0x37, 3, ctx::LAST_TARGET as u32);

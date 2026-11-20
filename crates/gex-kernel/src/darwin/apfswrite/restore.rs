@@ -1274,10 +1274,17 @@ const TICKET: [u8; 2] = [0x30, 0x00];
 /// 0x1a2e28 writes minimal lengths), then
 /// `AMAuthInstallApImg4StitchRestoreInfoWithAMAI` (0x186b5c) adds an IM4R
 /// for a TSS response's `<entry>-TBM` or, by `kObjectDefaultIM4RTagMap`
-/// (0x465af0), `snid` to SepStage1, SEP and RestoreSEP when the device
-/// gave a SEP nonce slot ID and `anid` to LLB when it gave an AP one:
-/// whether the J120's restore gives slot IDs is not traced.
-pub const HOST_IMG4_STAND_IN: &str = "the restore host's Image4 files (KernelCacheFile, DeviceTreeFile, NorImageData's iBoot, SystemImageRootHashFile, SystemImageCanonicalMetadataFile, SEPImageData, FUDImageData): stitched as the host Mac's AMAuthInstall stitches an entry with no Img4PayloadType (MobileDevice 1860.49.2 AMAuthInstallApImg4StitchData: IMG4 { \"IMG4\", the IPSW's IM4P, [0] the AP ticket } in minimal DER), with no IM4R: AMAuthInstallApImg4StitchRestoreInfoWithAMAI adds one for a TSS -TBM entry (none in the web device's response) or, by kObjectDefaultIM4RTagMap, snid to SEPImageData when the device reports a SEP nonce slot ID (SEPNonceSlotID), which the J120's restore was not traced to report or not (measure the files beside /private/preboot/<nsih>/System/Library/Caches/apticket.der on the device)";
+/// (0x465af0), `snid` to SepStage1, SEP and RestoreSEP when its
+/// AMAuthInstall has a SEP nonce slot ID (`__AMAuthInstallApImg4CopySEPNonceSlotID`
+/// 0x187fd4, its parameters' +0x38) and `anid` to LLB when it has an AP
+/// one. The restore's AMAuthInstall is made in recovery mode
+/// (`_AMRecoveryModeDeviceConfigureAuthInstall` 0x1483f0, kept for restore
+/// mode, which makes one without slot IDs when none was), whose parameters
+/// have `SepNonceSlotID` (2, with `ApNonceSlotID` 0) only when the build
+/// identity's `Info.RequiresNonceSlot` is true, and `ApNonceSlotID` from
+/// iBoot's `anid` variable: the J120's 21H461 identities have no
+/// `RequiresNonceSlot`, so its SEP image has no IM4R.
+pub const HOST_IMG4_STAND_IN: &str = "the restore host's Image4 files (KernelCacheFile, DeviceTreeFile, NorImageData's iBoot, SystemImageRootHashFile, SystemImageCanonicalMetadataFile, SEPImageData, FUDImageData): stitched as the host Mac's AMAuthInstall stitches an entry with no Img4PayloadType (MobileDevice 1860.49.2 AMAuthInstallApImg4StitchData: IMG4 { \"IMG4\", the IPSW's IM4P, [0] the AP ticket } in minimal DER), with no IM4R: AMAuthInstallApImg4StitchRestoreInfoWithAMAI adds one for a TSS -TBM entry (none in the web device's response), and its snid for SEPImageData needs a SEP nonce slot ID, which that host gives the restore only for a build identity with Info.RequiresNonceSlot (none of the J120's); the restore host's own MobileDevice is not measured (measure the files beside /private/preboot/<nsih>/System/Library/Caches/apticket.der on the device)";
 
 /// What the host answers that decides which of the list's files exist:
 /// install_device_tree runs only for a RestoreProtocolVersion of 15 or more

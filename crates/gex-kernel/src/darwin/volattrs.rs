@@ -253,7 +253,11 @@ struct Slot {
     read: OnceLock<Result<Volume, String>>,
 }
 
-/// The boot payload's specification of `vol`, read when first looked in.
+/// The boot payload's specification of `vol`, read now, as the system
+/// boots: the device has these attributes in its volume's inodes, so the
+/// specification's reading is the boot's work, not that of the first
+/// call to look in it (whose thread's processor time it would be). A
+/// specification that does not read is each lookup's error.
 pub fn set(vol: Vol, spec: Vec<u8>) -> Result<(), String> {
     let slot = vol.slot();
     let mut g = slot.spec.lock().unwrap_or_else(|e| e.into_inner());
@@ -261,7 +265,22 @@ pub fn set(vol: Vol, spec: Vec<u8>) -> Result<(), String> {
         return Err(format!("the attributes of {} are set already", vol.name()));
     }
     *g = Some(spec);
+    drop(g);
+    read(vol, slot);
     Ok(())
+}
+
+/// What `vol`'s specification read as, read the first time it is asked
+/// for: at boot when the payload has one, else at the first lookup, which
+/// finds none.
+fn read(vol: Vol, slot: &'static Slot) -> &'static Result<Volume, String> {
+    slot.read.get_or_init(|| {
+        let spec = slot.spec.lock().unwrap_or_else(|e| e.into_inner()).take();
+        match spec {
+            Some(s) => parse(&s).map_err(|e| format!("the boot payload's {}: {e}", vol.file())),
+            None => Err(format!("the owners, modes and flags of {} (the boot payload's {})", vol.name(), vol.file())),
+        }
+    })
 }
 
 /// The attributes of file `path` of `vol` (its path below the volume's
@@ -269,15 +288,7 @@ pub fn set(vol: Vol, spec: Vec<u8>) -> Result<(), String> {
 /// none: no specification was booted with, it does not read, or the volume
 /// has no such file.
 pub fn lookup(vol: Vol, path: &str) -> Result<Attrs, String> {
-    let slot = vol.slot();
-    let v = slot.read.get_or_init(|| {
-        let spec = slot.spec.lock().unwrap_or_else(|e| e.into_inner()).take();
-        match spec {
-            Some(s) => parse(&s).map_err(|e| format!("the boot payload's {}: {e}", vol.file())),
-            None => Err(format!("the owners, modes and flags of {} (the boot payload's {})", vol.name(), vol.file())),
-        }
-    });
-    let v = v.as_ref().map_err(Clone::clone)?;
+    let v = read(vol, vol.slot()).as_ref().map_err(Clone::clone)?;
     v.lookup(path).ok_or_else(|| format!("{path}, which {} does not have", vol.name()))
 }
 

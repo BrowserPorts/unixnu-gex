@@ -217,8 +217,12 @@ pub fn release(inputs: &Inputs, arch: Arch) -> Gap {
 mod tests {
     use super::*;
 
+    /// A directory of the caller's own: tests run in parallel and `loaded`
+    /// is called by several of them, so the tag alone is not unique.
     fn tmp(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("gex-sep-core-{tag}-{}", std::process::id()));
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!("gex-sep-core-{tag}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d

@@ -32,6 +32,8 @@ mod fpu;
 mod psr;
 mod vmsa;
 
+pub use fpu::soft;
+
 
 
 #[cfg(test)]

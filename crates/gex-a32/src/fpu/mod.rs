@@ -9,8 +9,12 @@
 //! Floating-point or Advanced SIMD instruction, and traps to
 //! [`Core::fp_check_failed`] where a check it needs does not pass.
 
+pub mod soft;
+mod vfp;
+
 use crate::{abi, need, unimpl, unpred, Core, Regs, Stop};
-use gex_isa_a32::VfpVersion;
+use gex_isa_a32::fp::FpInst;
+use gex_isa_a32::{ItState, Op, VfpVersion};
 
 /// FPEXC.EN, FPEXC.EX (B4.1.57).
 pub(crate) const FPEXC_EN: u32 = 1 << 30;
@@ -37,7 +41,50 @@ pub(crate) mod fpscr {
     pub const CUMULATIVE: u32 = 1 << 7 | 0x1f;
 }
 
+/// What the model requires of, and reads from, MVFR0 and MVFR1.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct FpImp {
+    /// MVFR0.Short vectors: the hardware executes VFP short vectors
+    /// (Appendix D11); otherwise a VFP vector operation is a bounce to
+    /// support code, the Undefined Instruction exception.
+    pub short_vectors: bool,
+    /// MVFR0.Square root, MVFR0.Divide: VSQRT and VDIV are in hardware.
+    pub sqrt: bool,
+    pub divide: bool,
+}
+
 impl Core {
+    /// The Floating-point implementation MVFR0 and MVFR1 describe. The
+    /// model implements every rounding mode, untrapped exception handling
+    /// only (VFPv3 and VFPv4, not the U variants), full denormal arithmetic
+    /// and NaN propagation in hardware; a configuration that says otherwise
+    /// is refused.
+    pub(crate) fn fp_imp(&self) -> Result<FpImp, Stop> {
+        let mvfr0 = need(self.config.imp.mvfr0, "MVFR0 (B4.1.108)")?;
+        let mvfr1 = need(self.config.imp.mvfr1, "MVFR1 (B4.1.109)")?;
+        let f = &self.config.features;
+        let field = |v: u32, at: u32| (v >> at) & 0xf;
+        if f.vfp.is_some() {
+            if field(mvfr0, 28) != 1 {
+                return unimpl("MVFR0.VFP rounding modes = 0: only Round to Nearest in hardware (the other modes bounce to support code)");
+            }
+            if field(mvfr0, 12) != 0 {
+                return unimpl("MVFR0.VFP exception trapping: VFPv3U/VFPv4U trapped floating-point exceptions");
+            }
+            if field(mvfr0, 8) != 2 || field(mvfr0, 4) != 2 {
+                return Err(Stop::ImpDef(format!("MVFR0 {mvfr0:#x}: VFPv3/VFPv4 single- and double-precision (0b0010) for a core with the Floating-point Extension")));
+            }
+            if field(mvfr1, 0) != 1 || field(mvfr1, 4) != 1 {
+                return unimpl("MVFR1.FtZ mode or D_NaN mode = 0: hardware without denormal arithmetic or NaN propagation");
+            }
+        }
+        let regs = if f.d32 { 2 } else { 1 };
+        if field(mvfr0, 0) != regs {
+            return Err(Stop::ImpDef(format!("MVFR0 {mvfr0:#x}: A_SIMD registers must be {regs} for this core's register bank")));
+        }
+        Ok(FpImp { short_vectors: field(mvfr0, 24) == 1, sqrt: field(mvfr0, 20) == 1, divide: field(mvfr0, 16) == 1 })
+    }
+
     fn has_vfp_or_simd(&self) -> bool {
         self.config.features.vfp.is_some() || self.config.features.simd
     }
@@ -230,7 +277,27 @@ impl Core {
     }
 
     /// `FP`: a Floating-point or Advanced SIMD data-processing instruction.
-    pub(crate) fn fp_exec(&mut self, _regs: &mut dyn Regs, pc: u64, raw: u32) -> Result<u64, Stop> {
-        unimpl(format!("Floating-point/Advanced SIMD data processing {raw:#010x} at {:#x}", abi::key_addr(pc)))
+    /// The instruction is decoded again from its encoding, as the lifter
+    /// decoded it; its enable checks have passed and its condition holds.
+    pub(crate) fn fp_exec(&mut self, regs: &mut dyn Regs, pc: u64, raw: u32) -> Result<u64, Stop> {
+        let at = abi::key_addr(pc);
+        let f = &self.config.features;
+        let inst = if abi::key_thumb(pc) {
+            gex_isa_a32::decode_thumb((raw >> 16) as u16, raw as u16, ItState(abi::key_it(pc)), f)
+        } else {
+            gex_isa_a32::decode_arm(raw, f)
+        };
+        if let Some(why) = inst.unpredictable {
+            return unpred(format!("{why} at {at:#x}"));
+        }
+        let Op::Fp(i) = inst.op else {
+            return unimpl(format!("A32Sys FP of {raw:#010x} at {at:#x}, which is not a Floating-point or Advanced SIMD instruction"));
+        };
+        let imp = self.fp_imp()?;
+        match i {
+            FpInst::Vfp3 { .. } | FpInst::Vfp2 { .. } | FpInst::Vcmp { .. } | FpInst::VmovImm { .. } => self.vfp_dp(regs, pc, &imp, &i)?,
+            _ => return unimpl(format!("Floating-point/Advanced SIMD data processing {raw:#010x} ({i:?}) at {at:#x}")),
+        }
+        Ok(0)
     }
 }

@@ -321,7 +321,16 @@ impl<'a> Lifter<'a> {
 
     /// A data-processing instruction, executed by the host where its
     /// condition passes.
-    fn fp_data_processing(&mut self, _i: &FpInst) -> Flow {
-        self.unimplemented(abi::unimpl::FP)
+    fn fp_data_processing(&mut self, i: &FpInst) -> Flow {
+        use FpInst::*;
+        match i {
+            Vfp3 { .. } | Vfp2 { .. } | Vcmp { .. } | VmovImm { .. } => {
+                let a = self.c64(self.raw as u64);
+                let z = self.c64(0);
+                self.sys(abi::sys::FP, a, z);
+                Flow::Next
+            }
+            _ => self.unimplemented(abi::unimpl::FP),
+        }
     }
 }

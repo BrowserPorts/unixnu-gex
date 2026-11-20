@@ -198,3 +198,8 @@ fn short_descriptor_translation() {
 fn fp_registers_and_system_registers() {
     same("fpregs");
 }
+
+#[test]
+fn vfp_arithmetic() {
+    same("vfp");
+}

@@ -1,15 +1,21 @@
 //! The web device's tools (`gex_kernel::darwin::webdevice`):
 //!
 //! ```text
-//!   gexc darwin-web-device init <dir>   make a web device: its root, manifest key, identity, UID, nonce slot
-//!   gexc darwin-web-device show <dir>   its identity and current cryptex1 boot nonce hash
+//!   gexc darwin-web-device init <dir>   make a web device: its root, manifest key, identity, UIDs, NVRAM
+//!   gexc darwin-web-device show <dir>   its identity and the cryptex1 boot nonce hash its next boot holds
 //!   gexc darwin-web-device sep <dir>    add the Secure Enclave's UID to a device made without one
-//!   gexc darwin-web-device roll <dir>   roll its cryptex1 boot nonce (its tickets go stale)
+//!   gexc darwin-web-device migrate <dir>  move the cryptex1 boot slot of a device made before its
+//!                                       NVRAM held its nonce magazine into its NVRAM
 //!   gexc darwin-web-device apkey <dir>  add the AP manifest key to a device made without one
 //!   gexc darwin-web-device apticket <dir>  sign its AP ticket for its AP nonce (making the
 //!                                       nonce's generator in its NVRAM when it has none)
 //!   gexc darwin-web-ticket <dir>        sign its Cryptex1 ticket for its current nonce
 //! ```
+//!
+//! The device's cryptex1 boot nonce is its AppleImage4's, in its NVRAM's
+//! nonce magazine (`gex_kernel::darwin::noncemag`): a new device has none
+//! until its restore (`gexc darwin-disk0`) rolls one and has its Cryptex1
+//! ticket signed for it.
 //!
 //! `init`, `apticket` and `darwin-web-ticket` read the IPSW's build
 //! identity of the device (GEX_DARWIN_RESTORE). The directory holds the device's secrets,
@@ -19,7 +25,7 @@
 //! host's (`getrandom`), as the kernel's random source gives AppleImage4's.
 
 use anyhow::{anyhow, bail, Context, Result};
-use gex_kernel::darwin::image4::{self, nonce, Outcome};
+use gex_kernel::darwin::image4::{self, Outcome};
 use gex_kernel::darwin::plist::{self, Value};
 use gex_kernel::darwin::sep::secrets::SepUid;
 use gex_kernel::darwin::webdevice::{self, files, Identity, Signer, WebDevice};
@@ -135,13 +141,22 @@ fn build_identity(chip: Option<(u32, u32)>) -> Result<(PathBuf, Value)> {
 }
 
 /// The web device of directory `dir`, as a run has it: its root's
-/// certificate, identity, cryptex1 boot slot and the path of its ticket.
+/// certificate, identity, the path of its ticket, its AP ticket and its
+/// NVRAM. A device that keeps its cryptex1 boot slot in a file of its own
+/// is refused: its NVRAM is where its AppleImage4 reads the slot.
 pub(crate) fn load(dir: &Path) -> Result<WebDevice> {
+    if dir.join(files::CRYPTEX1_BOOT_SLOT).exists() {
+        bail!("{} keeps its cryptex1 boot slot in {}, which its NVRAM's nonce magazine now holds: gexc darwin-web-device migrate {}", dir.display(), files::CRYPTEX1_BOOT_SLOT, dir.display());
+    }
+    load_files(dir)
+}
+
+fn load_files(dir: &Path) -> Result<WebDevice> {
     let ticket = dir.join(files::CRYPTEX1_TICKET);
     let ticket = ticket.exists().then(|| ticket.to_string_lossy().into_owned());
     let ap_ticket = read_optional(dir, files::AP_TICKET)?;
     let nvram = read_optional(dir, files::NVRAM)?;
-    webdevice::of_files(read(dir, files::ROOT_CERT)?, &read(dir, files::IDENTITY)?, &read(dir, files::CRYPTEX1_BOOT_SLOT)?, ticket, ap_ticket, nvram.as_deref()).map_err(|e| anyhow!("{}: {e}", dir.display()))
+    webdevice::of_files(read(dir, files::ROOT_CERT)?, &read(dir, files::IDENTITY)?, ticket, ap_ticket, nvram.as_deref()).map_err(|e| anyhow!("{}: {e}", dir.display()))
 }
 
 fn read_optional(dir: &Path, name: &str) -> Result<Option<Vec<u8>>> {
@@ -179,20 +194,12 @@ fn init(dir: &Path) -> Result<()> {
     }
     let identity = Identity::for_build(&build, ecid).map_err(|e| anyhow!("{e}"))?;
     let ap_leaf = webdevice::certificate(&webdevice::ap_manifest_key_spec(serial(), &from, &to, ap_manifest.public_key(), &root.public_key(), &identity, webdevice::AP_CERTIFICATE_EPOCH), &root).map_err(|e| anyhow!("the AP manifest key's certificate: {e}"))?;
-    // The magazine's cryptex1 boot slot: version 0, a nonce from the random
-    // source as the kext's roll takes one, no flags, no proposal.
-    let slot = nonce::Slot {
-        flags: 0,
-        nonce: random::<{ nonce::CRYPTEX1_BOOT_NONCE_LENGTH }>(),
-        proposal: [0; 16],
-    };
     let key_der = |k: &Key| k.0.to_pkcs1_der().map(|d| d.as_bytes().to_vec()).map_err(|e| anyhow!("encoding a key: {e}"));
     write_new(&dir.join(files::ROOT_KEY), &key_der(&root)?, 0o600)?;
     write_new(&dir.join(files::MANIFEST_KEY), &key_der(&manifest)?, 0o600)?;
     write_new(&dir.join(files::AP_MANIFEST_KEY), &key_der(&ap_manifest)?, 0o600)?;
     write_new(&dir.join(files::UID), &random::<32>(), 0o600)?;
     write_new(&dir.join(files::SEP_UID), &random::<32>(), 0o600)?;
-    write_new(&dir.join(files::CRYPTEX1_BOOT_SLOT), &slot.to_bytes(), 0o600)?;
     write_new(&dir.join(files::ROOT_CERT), &root_cert, 0o644)?;
     write_new(&dir.join(files::MANIFEST_CERT), &leaf, 0o644)?;
     write_new(&dir.join(files::AP_MANIFEST_CERT), &ap_leaf, 0o644)?;
@@ -221,7 +228,10 @@ fn show(dir: &Path) -> Result<()> {
         "ProductionMode {} SecurityMode {} EffectiveProductionStatusAp {} EffectiveSecurityModeAp {}",
         i.production, i.security, i.effective_production, i.effective_security
     );
-    println!("cryptex1 boot nonce hash {}", hex(&nonce_hash(&w)?));
+    match nonce_hash(&w) {
+        Ok(h) => println!("cryptex1 boot nonce hash {} (its next boot's)", hex(&h)),
+        Err(e) => println!("cryptex1 boot nonce hash none: {e}"),
+    }
     match SepUid::load(dir) {
         Ok(_) => println!("SEP UID present"),
         Err(e) => println!("SEP UID absent: {e}"),
@@ -349,11 +359,20 @@ fn sign_ap(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn roll(dir: &Path) -> Result<()> {
+/// Move the cryptex1 boot slot of a device made before its NVRAM held its
+/// nonce magazine into its NVRAM ([`webdevice::migrated_nvram`]), then
+/// remove the slot's file. Its next boot holds the same nonce, so the
+/// tickets signed for it stay good.
+fn migrate(dir: &Path) -> Result<()> {
     let path = dir.join(files::CRYPTEX1_BOOT_SLOT);
-    let slot = nonce::Slot::parse(&read(dir, files::CRYPTEX1_BOOT_SLOT)?).map_err(|e| anyhow!("{}: not a nonce slot (errno {e})", path.display()))?;
-    let rolled = slot.rolled(random::<{ nonce::CRYPTEX1_BOOT_NONCE_LENGTH }>()).map_err(|e| anyhow!("{e}"))?;
-    replace(&path, &rolled.to_bytes(), 0o600)?;
+    let slot = read(dir, files::CRYPTEX1_BOOT_SLOT)?;
+    let w = load_files(dir)?;
+    let nvram_path = dir.join(files::NVRAM);
+    let image = read(dir, files::NVRAM)?;
+    let out = webdevice::migrated_nvram(&w, &image, &slot).map_err(|e| anyhow!("{}: {e}", dir.display()))?;
+    replace(&nvram_path, &out, 0o644)?;
+    std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+    println!("cryptex1 boot slot moved from {} into {}", path.display(), nvram_path.display());
     show(dir)
 }
 
@@ -369,7 +388,7 @@ const CRYPTEX1_PAYLOADS: [(&str, &[u8; 4]); 4] = [("Cryptex1,SystemVolume", b"cs
 /// own. Then checked as the device's AppleImage4 will check it: each
 /// Image4 payload the ticket has an object for, read from `ipsw` (the
 /// extracted IPSW) at the identity's paths, must authenticate on the
-/// device `w`.
+/// device `w` once its cryptex1 boot nonce is the one of hash `cnch`.
 pub(crate) fn signed_cryptex1_ticket(dir: &Path, w: &WebDevice, build: &Value, cnch: &[u8], ipsw: &Path) -> Result<Vec<u8>> {
     let manifest = Key(RsaPrivateKey::from_pkcs1_der(&read(dir, files::MANIFEST_KEY)?).map_err(|e| anyhow!("{}: {e}", dir.join(files::MANIFEST_KEY).display()))?);
     let leaf = read(dir, files::MANIFEST_CERT)?;
@@ -383,7 +402,7 @@ pub(crate) fn signed_cryptex1_ticket(dir: &Path, w: &WebDevice, build: &Value, c
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("the build identity has no {key} path"))?;
         let payload = std::fs::read(ipsw.join(path)).with_context(|| format!("reading {}", ipsw.join(path).display()))?;
-        match image4::execute(image4::fourcc(code), &payload, &ticket, &webdevice::DeviceEnv(w)) {
+        match image4::execute(image4::fourcc(code), &payload, &ticket, &webdevice::ProposedEnv(w, cnch)) {
             Outcome::Authenticated(_) => {}
             other => bail!("the signed ticket does not authenticate {key} on this device: {other:?}"),
         }
@@ -391,8 +410,8 @@ pub(crate) fn signed_cryptex1_ticket(dir: &Path, w: &WebDevice, build: &Value, c
     Ok(ticket)
 }
 
-/// Sign the device's Cryptex1 ticket for its current nonce, checked as its
-/// AppleImage4 will check it ([`signed_cryptex1_ticket`]).
+/// Sign the device's Cryptex1 ticket for the nonce its next boot holds,
+/// checked as its AppleImage4 will check it ([`signed_cryptex1_ticket`]).
 fn sign(dir: &Path) -> Result<()> {
     let w = load(dir)?;
     let (restore, build) = build_identity(Some((w.identity.chip, w.identity.board)))?;
@@ -403,17 +422,17 @@ fn sign(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `gexc darwin-web-device init|show|roll|sep <dir>`.
+/// `gexc darwin-web-device init|show|migrate|nvram|sep|apkey|apticket <dir>`.
 pub fn cmd_device(args: &[String]) -> Result<ExitCode> {
     match args {
         [op, dir] if op == "init" => init(Path::new(dir))?,
         [op, dir] if op == "show" => show(Path::new(dir))?,
-        [op, dir] if op == "roll" => roll(Path::new(dir))?,
+        [op, dir] if op == "migrate" => migrate(Path::new(dir))?,
         [op, dir] if op == "nvram" => nvram(Path::new(dir))?,
         [op, dir] if op == "sep" => add_sep_uid(Path::new(dir))?,
         [op, dir] if op == "apkey" => add_ap_key(Path::new(dir))?,
         [op, dir] if op == "apticket" => sign_ap(Path::new(dir))?,
-        _ => bail!("usage: gexc darwin-web-device init|show|roll|nvram|sep|apkey|apticket <dir>"),
+        _ => bail!("usage: gexc darwin-web-device init|show|migrate|nvram|sep|apkey|apticket <dir>"),
     }
     Ok(ExitCode::SUCCESS)
 }

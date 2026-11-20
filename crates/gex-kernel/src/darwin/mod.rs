@@ -103,6 +103,7 @@ pub mod mig;
 pub mod mman;
 pub mod mk_timer;
 pub mod mwl;
+pub mod noncemag;
 pub mod nvram;
 pub mod persona;
 pub mod pipe;
@@ -191,9 +192,11 @@ pub fn boot(trust_cache: Option<&[u8]>, sandbox: SandboxProfiles, device_tree: O
     let mut chosen = match (&cryptex1.ticket, &cryptex1.web_device) {
         (preboot::Ticket::WebDevice, Some(w)) => {
             webdevice::set(w.clone())?;
-            let mut c = w.identity.chosen();
-            c.extend(w.boot_chosen()?);
-            c
+            // Its identity, what its boot adds for its AP ticket and nonce,
+            // and the boot command iBoot's `fsboot` adds (0x1800b0b2c →
+            // 0x1800ccc44, 0x1800f07b8), by which AppleImage4 chooses its
+            // i/o strategy.
+            w.next_boot_chosen()?
         }
         (preboot::Ticket::WebDevice, None) => return Err("the Cryptex1 ticket is the web device's (GEX_DARWIN_CRYPTEX1_TICKET=web-device), but no web device is configured (GEX_DARWIN_WEB_DEVICE)".into()),
         (_, Some(_)) => return Err("a web device is configured (GEX_DARWIN_WEB_DEVICE), but the Cryptex1 ticket is not its own (GEX_DARWIN_CRYPTEX1_TICKET=web-device)".into()),
@@ -216,6 +219,10 @@ pub fn boot(trust_cache: Option<&[u8]>, sandbox: SandboxProfiles, device_tree: O
                     let mut probe = iokit::parse(t)?;
                     iokit::fill_chosen(&mut probe, &chosen)?;
                     nvram::boot(&nvram::chosen_of(&probe), src.medium)?;
+                    // AppleImage4's boot over the NVRAM (its nonce
+                    // magazine read and rolled) and its service's start
+                    // (the magazine written as its strategy allows).
+                    noncemag::start(&probe)?;
                 }
                 None => nvram::absent(nvram::NO_IMAGE.into()),
             }

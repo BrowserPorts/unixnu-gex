@@ -9184,10 +9184,12 @@ fn darwin_nvram_source(path: &std::path::Path, device: bool) -> Result<gex_kerne
 }
 
 /// The web device of directory `dir`: what it has of its own, its root's
-/// certificate, identity and cryptex1 boot nonce slot, the Cryptex1
-/// ticket and the AP ticket its manifest keys signed for it, when there
-/// are, and the AP nonce generator its NVRAM holds (its private keys and
-/// UID are the tools', which this does not read).
+/// certificate and identity, the Cryptex1 ticket and the AP ticket its
+/// manifest keys signed for it, when there are, and its NVRAM, which holds
+/// its AP nonce generator and its nonce magazine (its private keys and
+/// UID are the tools', which this does not read). A device that keeps its
+/// cryptex1 boot slot in a file of its own is refused: its boot reads the
+/// slot from its NVRAM.
 fn darwin_web_device(dir: &std::path::Path) -> Result<gex_kernel::darwin::webdevice::WebDevice> {
     use gex_kernel::darwin::webdevice::{files, of_files};
     let read = |name: &str| std::fs::read(dir.join(name)).map_err(|e| anyhow!("the web device's {}: {e}", dir.join(name).display()));
@@ -9200,11 +9202,13 @@ fn darwin_web_device(dir: &std::path::Path) -> Result<gex_kernel::darwin::webdev
     };
     let root = read(files::ROOT_CERT)?;
     let identity = read(files::IDENTITY)?;
-    let slot = read(files::CRYPTEX1_BOOT_SLOT)?;
+    if dir.join(files::CRYPTEX1_BOOT_SLOT).exists() {
+        return Err(anyhow!("{} keeps its cryptex1 boot slot in {}, which its NVRAM's nonce magazine now holds: gexc darwin-web-device migrate {}", dir.display(), files::CRYPTEX1_BOOT_SLOT, dir.display()));
+    }
     let ticket = dir.join(files::CRYPTEX1_TICKET);
     let ticket = ticket.exists().then(|| ticket.to_string_lossy().into_owned());
     let ap_ticket = optional(files::AP_TICKET)?;
     let nvram = optional(files::NVRAM)?;
-    of_files(root, &identity, &slot, ticket, ap_ticket, nvram.as_deref()).map_err(|e| anyhow!("{}: {e}", dir.display()))
+    of_files(root, &identity, ticket, ap_ticket, nvram.as_deref()).map_err(|e| anyhow!("{}: {e}", dir.display()))
 }
 

@@ -26,12 +26,13 @@
 //!   the IPSW's build identity, in production and secure mode. The web
 //!   device's boot puts them in `/chosen` as iBoot does
 //!   ([`Identity::chosen`]).
-//! - The nonces. The web device keeps the cryptex1 boot slot of its nonce
-//!   magazine ([`super::image4::nonce::Slot`], AppleImage4's 37-byte slot
-//!   data), whose hash AppleImage4 makes as it does on the J120
-//!   ([`super::image4::nonce::cryptex1_boot_hash`]): SHA-384 of the
-//!   16-byte nonce, truncated to 32 bytes. Its nonces come from the
-//!   kernel's random source, as the kext's roll takes them; nothing in
+//! - The nonces. The web device's NVRAM holds its AppleImage4's nonce
+//!   magazine as the J120's does ([`super::noncemag`]): the slots, the
+//!   cryptex1 boot one's hash made as on the J120
+//!   ([`super::image4::nonce::cryptex1_boot_hash`]: SHA-384 of the 16-byte
+//!   nonce, truncated to 32 bytes). Its nonces come from the kernel's
+//!   random source, as the kext's roll and preroll take them; its restore
+//!   rolls the cryptex1 boot nonce before TSS signs its ticket; nothing in
 //!   the kext entangles them unless the slot or `/defaults` asks, and the
 //!   web device's do not.
 //! - The UID: a 32-byte secret of the web device's, made with it, which
@@ -53,7 +54,7 @@
 //! The secrets (the two private keys, the UID) live per installation
 //! outside every repository, and only the tools that make and sign read
 //! them; a run reads what the device has: the root's certificate, the
-//! identity, the nonce slot and the ticket ([`WebDevice`]). The SEP's UID
+//! identity, its NVRAM and the tickets ([`WebDevice`]). The SEP's UID
 //! is read by the run's SEP core, as the fuse is read by the engine that
 //! holds it, and by no other code.
 
@@ -578,7 +579,7 @@ pub fn ap_manifest_key_spec(serial: [u8; 20], not_before: &str, not_after: &str,
 /// the hash a TSS request's `ApNonce` and the AP ticket's `BNCH` carry.
 pub mod apnonce {
     use super::super::nvram;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     /// The variable (`AppleMobileApNonce::start`, 0xfffffff006581618: its
     /// symbol; IODTNVRAM keeps it as a string, for the kernel only).
@@ -621,24 +622,6 @@ pub mod apnonce {
         u64::from_str_radix(s, 16).map_err(|e| format!("invalid nonce {s:?}: {e}"))
     }
 
-    /// The bank as the device's NVRAM namespace holds it.
-    struct Mem(Mutex<Vec<u8>>);
-
-    impl nvram::Medium for Mem {
-        fn read(&self, len: usize) -> Result<Vec<u8>, String> {
-            let b = self.0.lock().unwrap();
-            b.get(..len).map(<[u8]>::to_vec).ok_or_else(|| format!("{len} bytes asked of a {}-byte namespace", b.len()))
-        }
-        fn write(&self, bytes: &[u8]) -> Result<(), String> {
-            let mut b = self.0.lock().unwrap();
-            if bytes.len() > b.len() {
-                return Err(format!("{} bytes written to a {}-byte namespace", bytes.len(), b.len()));
-            }
-            b[..bytes.len()].copy_from_slice(bytes);
-            Ok(())
-        }
-    }
-
     /// The clock the save's forced sync reads, which it does not rate
     /// limit.
     struct Start;
@@ -649,20 +632,8 @@ pub mod apnonce {
         }
     }
 
-    fn started(image: &[u8]) -> Result<(nvram::Nvram, Arc<Mem>), String> {
-        let mut chosen = nvram::Chosen::default();
-        for (k, v) in nvram::chosen_for(image) {
-            match k {
-                "nvram-bank-size" => chosen.bank_size = Some(v),
-                "nvram-bank-count" => chosen.bank_count = Some(v),
-                "nvram-current-bank" => chosen.current_bank = Some(v),
-                _ => chosen.proxy_data = Some(v),
-            }
-        }
-        let mut nv = nvram::Nvram::start(&chosen).map_err(|p| format!("IODTNVRAM's start panics: {}", p.0))?;
-        let medium = Arc::new(Mem(Mutex::new(image.to_vec())));
-        nv.register_controller(medium.clone())?;
-        Ok((nv, medium))
+    fn started(image: &[u8]) -> Result<(nvram::Nvram, Arc<nvram::MemMedium>), String> {
+        nvram::over_image(image)
     }
 
     /// The generator the NVRAM image `image` holds, read as the kernel's
@@ -880,7 +851,10 @@ pub mod files {
     /// fuses of the two engines are. The sepOS derives every key it keeps
     /// from it ([`super::sep::secrets`]).
     pub const SEP_UID: &str = "sep-uid.bin";
-    /// The cryptex1 boot slot of its nonce magazine.
+    /// Where a device made before its NVRAM held its nonce magazine kept
+    /// the magazine's cryptex1 boot slot (AppleImage4's 37 bytes); `gexc
+    /// darwin-web-device migrate` moves it into the NVRAM
+    /// ([`super::noncemag`]) and removes the file.
     pub const CRYPTEX1_BOOT_SLOT: &str = "nonce-cryptex1-boot.slot";
     /// Its Cryptex1 ticket, which its Preboot volume holds as
     /// `cryptex1/current/apticket.<target>.<ECID>.im4m`.
@@ -903,8 +877,10 @@ pub struct WebDevice {
     /// The root certificate its AppleImage4 trusts.
     pub root: Vec<u8>,
     pub identity: Identity,
-    /// Its cryptex1 boot nonce slot.
-    pub slot: nonce::Slot,
+    /// The cryptex1 boot slot its AppleImage4 will hold after its next boot
+    /// ([`super::noncemag::next_boot_cryptex1_slot`] of its NVRAM), or why
+    /// none is known.
+    pub slot: Result<nonce::Slot, String>,
     /// Its Cryptex1 ticket's host path, when one is signed.
     pub ticket: Option<String>,
     /// Its AP ticket, when one is signed.
@@ -925,25 +901,48 @@ pub fn get() -> Option<&'static WebDevice> {
     WEB.get()
 }
 
-/// The web device's current cryptex1 boot nonce hash, as its AppleImage4
-/// makes it from its slot; `entangle_nonce` is `/defaults`'
+/// The web device's cryptex1 boot nonce hash after its next boot, as its
+/// AppleImage4 makes it from its slot; `entangle_nonce` is `/defaults`'
 /// `entangle-nonce`.
 pub fn nonce_hash(w: &WebDevice, entangle_nonce: bool) -> Result<Vec<u8>, Fail> {
-    nonce::cryptex1_boot_hash(&w.slot, entangle_nonce)
+    let slot = w.slot.as_ref().map_err(|why| Fail::Unmodelled(why.clone()))?;
+    nonce::cryptex1_boot_hash(slot, entangle_nonce)
+}
+
+/// The `/chosen` of the web device's boot as AppleImage4 reads it for its
+/// nonce magazine: its identity, what its boot adds for its AP ticket and
+/// nonce ([`WebDevice::boot_chosen`]) and iBoot's `fsboot` boot command.
+struct BootChosen(Vec<(&'static str, Vec<u8>)>);
+
+impl super::noncemag::Tree for BootChosen {
+    fn prop(&self, node: &str, name: &str) -> Option<Vec<u8>> {
+        (node == "/chosen").then(|| self.0.iter().find(|(n, _)| *n == name).map(|(_, v)| v.clone())).flatten()
+    }
 }
 
 /// The web device from its directory's files as the host read them: its
-/// root's certificate, its identity, its cryptex1 boot slot, the path of
-/// its Cryptex1 ticket when it has one, its AP ticket when it has one and
-/// its NVRAM image when it has one (its AP nonce generator read from it).
-pub fn of_files(root: Vec<u8>, identity: &[u8], slot: &[u8], ticket: Option<String>, ap_ticket: Option<Vec<u8>>, nvram: Option<&[u8]>) -> Result<WebDevice, String> {
+/// root's certificate, its identity, the path of its Cryptex1 ticket when
+/// it has one, its AP ticket when it has one and its NVRAM image when it
+/// has one (its AP nonce generator read from it, and the cryptex1 boot
+/// slot its next boot will hold).
+pub fn of_files(root: Vec<u8>, identity: &[u8], ticket: Option<String>, ap_ticket: Option<Vec<u8>>, nvram: Option<&[u8]>) -> Result<WebDevice, String> {
     let identity = Identity::of_plist(&super::plist::parse(identity).map_err(|e| format!("the web device's {}: {e}", files::IDENTITY))?)?;
-    let slot = nonce::Slot::parse(slot).map_err(|e| format!("the web device's {}: not a nonce slot AppleImage4 takes (errno {e})", files::CRYPTEX1_BOOT_SLOT))?;
     let boot_nonce = match nvram {
         Some(image) => apnonce::read(image).map_err(|e| format!("the web device's {}: {e}", files::NVRAM))?,
         None => None,
     };
-    Ok(WebDevice { root, identity, slot, ticket, ap_ticket, boot_nonce })
+    let mut w = WebDevice { root, identity, slot: Err(String::new()), ticket, ap_ticket, boot_nonce };
+    w.slot = match nvram {
+        None => Err(format!("the web device has no NVRAM ({}), which holds its nonce magazine", files::NVRAM)),
+        Some(image) => w.next_boot_chosen().and_then(|c| {
+            super::noncemag::next_boot_cryptex1_slot(image, &BootChosen(c)).map_err(|e| match e {
+                Fail::Unmodelled(w) => w,
+                Fail::Panic(p) => format!("its kernel panics at AppleImage4's boot: {p}"),
+                Fail::Code(c) => format!("errno {c}"),
+            })
+        }),
+    };
+    Ok(w)
 }
 
 impl WebDevice {
@@ -969,6 +968,16 @@ impl WebDevice {
             return Err("the AP ticket was signed for another AP nonce than the one the web device's NVRAM generator gives (the generator changed since)".into());
         }
         Ok(())
+    }
+
+    /// Its boot's `/chosen` beyond the device tree's: its identity, what its
+    /// boot adds ([`WebDevice::boot_chosen`]) and the boot command of
+    /// iBoot's `fsboot`, which boots it ([`super::noncemag::boot_command`]).
+    pub fn next_boot_chosen(&self) -> Result<Vec<(&'static str, Vec<u8>)>, String> {
+        let mut c = self.identity.chosen();
+        c.extend(self.boot_chosen()?);
+        c.push(("boot-command", super::noncemag::boot_command::FSBOOT.to_le_bytes().to_vec()));
+        Ok(c)
     }
 
     /// What its boot puts in `/chosen` beyond its identity
@@ -1036,6 +1045,69 @@ impl super::image4::Environment for DeviceEnv<'_> {
 
     fn cryptex1_boot_nonce_hash(&self, _domain: u32) -> Result<Vec<u8>, Fail> {
         nonce_hash(self.0, false)
+    }
+
+    fn anchor(&self) -> Result<Vec<u8>, String> {
+        Ok(self.0.root.clone())
+    }
+}
+
+/// The NVRAM namespace `image` of a web device that kept its cryptex1
+/// boot slot in a file of its own ([`files::CRYPTEX1_BOOT_SLOT`], the
+/// slot's 37 bytes `slot`), with that slot in its nonce magazine as
+/// AppleImage4 leaves it after a boot under the device's AP ticket
+/// ([`super::noncemag`]): the slot at its key and the magazine data with
+/// the boot manifest hash, set by the kernel's task through IODTNVRAM,
+/// then a forced sync. Its next boot holds the slot's nonce; the other
+/// slots are what that boot makes of slots it cannot read. A namespace
+/// that holds a magazine already is refused.
+pub fn migrated_nvram(w: &WebDevice, image: &[u8], slot: &[u8]) -> Result<Vec<u8>, String> {
+    use super::noncemag::{self, Storage};
+    let old = nonce::Slot::parse(slot).map_err(|e| format!("{}: not a nonce slot AppleImage4 takes (errno {e})", files::CRYPTEX1_BOOT_SLOT))?;
+    let Some(t) = &w.ap_ticket else { return Err(format!("the web device has no AP ticket ({}): its boot's boot-manifest-hash, which the magazine keeps, is its hash", files::AP_TICKET)) };
+    w.check_ap_ticket()?;
+    let (mut nv, medium) = super::nvram::over_image(image)?;
+    struct Start;
+    impl super::nvram::Clock for Start {
+        fn uptime_secs(&self) -> i64 {
+            0
+        }
+    }
+    let mut st = noncemag::NvramStorage { nv: &mut nv, clock: &Start };
+    for key in [noncemag::magazine_key(), noncemag::slot_key(noncemag::CRYPTEX1_BOOT)] {
+        if st.read(&key, 0x80)? != Err(2) {
+            return Err(format!("the NVRAM holds {key} already: its nonce magazine is there"));
+        }
+    }
+    for (key, data) in [(noncemag::slot_key(noncemag::CRYPTEX1_BOOT), old.to_bytes().to_vec()), (noncemag::magazine_key(), noncemag::MagazineData::to_bytes(&boot_manifest_hash(t)).to_vec())] {
+        let r = st.write(&key, Some(&data))?;
+        if r != 0 {
+            return Err(format!("IODTNVRAM refuses {key}: errno {r}"));
+        }
+    }
+    st.sync(3)?;
+    let out = medium.bytes();
+    let moved = of_files(w.root.clone(), &super::plist::to_xml(&w.identity.to_plist()), w.ticket.clone(), w.ap_ticket.clone(), Some(&out))?;
+    let had = nonce::cryptex1_boot_hash(&old, false).map_err(|e| format!("the slot's nonce hash: {e:?}"))?;
+    match nonce_hash(&moved, false) {
+        Ok(h) if h == had => Ok(out),
+        other => Err(format!("the migrated NVRAM's next boot does not hold the slot's nonce: {other:?}")),
+    }
+}
+
+/// The web device as its AppleImage4 will see it once the nonce whose
+/// hash is the second field is its cryptex1 boot nonce: how a ticket
+/// signed for a nonce its restore proposed is checked before the restore
+/// writes it.
+pub struct ProposedEnv<'a>(pub &'a WebDevice, pub &'a [u8]);
+
+impl super::image4::Environment for ProposedEnv<'_> {
+    fn chosen(&self, name: &str, size: usize) -> Result<Option<Vec<u8>>, i32> {
+        DeviceEnv(self.0).chosen(name, size)
+    }
+
+    fn cryptex1_boot_nonce_hash(&self, _domain: u32) -> Result<Vec<u8>, Fail> {
+        Ok(self.1.to_vec())
     }
 
     fn anchor(&self) -> Result<Vec<u8>, String> {
@@ -1170,7 +1242,7 @@ mod tests {
         WebDevice {
             root: root_cert(&keys().root),
             identity,
-            slot: nonce::Slot { flags: 0, nonce: [7; 16], proposal: [0; 16] },
+            slot: Ok(nonce::Slot { flags: 0, nonce: [7; 16], proposal: [0; 16] }),
             ticket: None,
             ap_ticket: None,
             boot_nonce: None,
@@ -1302,13 +1374,14 @@ mod tests {
         }
         // The nonce rolled since the ticket was signed: ESTALE; a spent
         // nonce: the slot's ESTALE.
+        let slot = *w.slot.as_ref().unwrap();
         let rolled = WebDevice {
-            slot: w.slot.rolled([9; 16]).unwrap(),
+            slot: Ok(nonce::Slot { nonce: [9; 16], ..slot }),
             ..w.clone()
         };
         assert_eq!(cssy(&t, &rolled), Outcome::Status(e::ESTALE));
         let spent = WebDevice {
-            slot: nonce::Slot { flags: nonce::flag::SPENT, ..w.slot },
+            slot: Ok(nonce::Slot { flags: nonce::flag::SPENT, ..slot }),
             ..w.clone()
         };
         assert_eq!(cssy(&t, &spent), Outcome::Status(e::ESTALE));
@@ -1408,10 +1481,16 @@ mod tests {
         assert!(matches!(nonce::cryptex1_boot_hash(&nonce::Slot { flags: nonce::flag::ENTANGLE, ..slot }, false), Err(Fail::Unmodelled(_))));
         assert!(matches!(nonce::cryptex1_boot_hash(&slot, true), Err(Fail::Unmodelled(_))));
         assert!(matches!(nonce::cryptex1_boot_hash(&nonce::Slot { flags: nonce::flag::UNAVAILABLE, ..slot }, false), Err(Fail::Unmodelled(_))));
-        // A roll: a new nonce, the flags cleared as the kext clears them.
-        let r = nonce::Slot { flags: 0x40 | 0x2 | 0x1, ..slot }.rolled([1; 16]).unwrap();
+        // A roll at a spent nonce's level: a new nonce, the flags cleared
+        // as the kext clears them.
+        let mut r = nonce::Slot { flags: 0x40 | 0x2 | 0x1, ..slot };
+        let d = super::super::noncemag::DOMAINS[super::super::noncemag::CRYPTEX1_BOOT];
+        assert!(super::super::noncemag::roll(&mut r, &d, 0, &mut |b: &mut [u8]| {
+            b.fill(1);
+            Ok(())
+        })
+        .unwrap());
         assert_eq!((r.flags, r.nonce), (0, [1; 16]));
-        assert!(nonce::Slot { flags: nonce::flag::PROPOSAL, ..slot }.rolled([1; 16]).is_err());
     }
 
     #[test]
@@ -1720,6 +1799,28 @@ mod tests {
         // No ticket: only the generator.
         let bare = WebDevice { ap_ticket: None, ..mine };
         assert_eq!(bare.boot_chosen().unwrap(), vec![("boot-nonce", g.to_le_bytes().to_vec())]);
+    }
+
+    /// A slot kept in its own file moved into the NVRAM's nonce magazine:
+    /// the next boot holds its nonce; a new device's NVRAM holds none (its
+    /// first boot draws one); a namespace with a magazine is refused.
+    #[test]
+    fn the_nonce_slot_moves_into_the_nvram() {
+        let w = device();
+        let g = 0x5555_aaaa_1234_9876u64;
+        let leaf = ap_leaf_cert(&keys().root, &w.identity);
+        let t = ap_ticket(&w.identity, &ap_build(), &apnonce::hash(g), AP_CERTIFICATE_EPOCH, &[4; 20], &keys().manifest, &leaf).unwrap();
+        let image = apnonce::saved(&super::super::nvram::factory_image(), g).unwrap();
+        let identity = super::super::plist::to_xml(&w.identity.to_plist());
+        let fresh = of_files(w.root.clone(), &identity, None, Some(t.clone()), Some(&image)).unwrap();
+        assert!(fresh.slot.as_ref().unwrap_err().contains("random source"), "{:?}", fresh.slot);
+        let slot = nonce::Slot { flags: 0, nonce: [0x3c; 16], proposal: [0; 16] };
+        let moved = migrated_nvram(&fresh, &image, &slot.to_bytes()).unwrap();
+        let after = of_files(w.root.clone(), &identity, None, Some(t), Some(&moved)).unwrap();
+        assert_eq!(after.slot, Ok(slot));
+        assert_eq!(nonce_hash(&after, false).unwrap(), nonce::cryptex1_boot_hash(&slot, false).unwrap());
+        assert!(migrated_nvram(&after, &moved, &slot.to_bytes()).unwrap_err().contains("already"));
+        assert!(migrated_nvram(&WebDevice { ap_ticket: None, ..after }, &image, &slot.to_bytes()).is_err());
     }
 
     /// The IPSW's build identity (GEX_DARWIN_RESTORE): the AP ticket has an

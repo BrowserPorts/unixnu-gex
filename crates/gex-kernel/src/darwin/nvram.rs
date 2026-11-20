@@ -1822,6 +1822,50 @@ pub fn chosen_for(image: &[u8]) -> Vec<(&'static str, Vec<u8>)> {
     ]
 }
 
+/// A namespace held in memory, as a tool or a test has an image.
+pub struct MemMedium(pub std::sync::Mutex<Vec<u8>>);
+
+impl Medium for MemMedium {
+    fn read(&self, len: usize) -> Result<Vec<u8>, String> {
+        let b = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        b.get(..len).map(<[u8]>::to_vec).ok_or_else(|| format!("{len} bytes asked of a {}-byte namespace", b.len()))
+    }
+    fn write(&self, bytes: &[u8]) -> Result<(), String> {
+        let mut b = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if bytes.len() > b.len() {
+            return Err(format!("{} bytes written to a {}-byte namespace", bytes.len(), b.len()));
+        }
+        b[..bytes.len()].copy_from_slice(bytes);
+        Ok(())
+    }
+}
+
+impl MemMedium {
+    /// The namespace's bytes.
+    pub fn bytes(&self) -> Vec<u8> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+/// IODTNVRAM started over the namespace `image` as the web device's boot
+/// hands it over ([`chosen_for`]), its controller writing to a copy in
+/// memory.
+pub fn over_image(image: &[u8]) -> Result<(Nvram, Arc<MemMedium>), String> {
+    let mut chosen = Chosen::default();
+    for (k, v) in chosen_for(image) {
+        match k {
+            "nvram-bank-size" => chosen.bank_size = Some(v),
+            "nvram-bank-count" => chosen.bank_count = Some(v),
+            "nvram-current-bank" => chosen.current_bank = Some(v),
+            _ => chosen.proxy_data = Some(v),
+        }
+    }
+    let mut nv = Nvram::start(&chosen).map_err(|p| format!("IODTNVRAM's start panics: {}", p.0))?;
+    let medium = Arc::new(MemMedium(std::sync::Mutex::new(image.to_vec())));
+    nv.register_controller(medium.clone())?;
+    Ok((nv, medium))
+}
+
 /// Every entitlement `verifyPermission` may ask a task for.
 pub fn entitlements_asked() -> Vec<&'static str> {
     let mut v = vec![ent::WRITE_ACCESS, ent::READ_ACCESS, ent::SYSTEM_ALLOW, ent::SYSTEM_INTERNAL_ALLOW, ent::SYSTEM_HIDDEN_ALLOW];

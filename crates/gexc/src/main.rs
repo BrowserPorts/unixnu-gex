@@ -230,17 +230,18 @@ usage:
                                    ticket; its AP ticket is the restore's) or
                                    the device's ticket file (its AP ticket
                                    GEX_DARWIN_AP_TICKET's, when given)
-  gexc darwin-web-device init|show|roll|nvram|sep|apkey|apticket <dir>
+  gexc darwin-web-device init|show|migrate|nvram|sep|apkey|apticket <dir>
                                    make the web device (its root, manifest
-                                   keys, identity, UIDs, nonce slot and
-                                   factory NVRAM), show it, roll its cryptex1
-                                   boot nonce, or give one made before its
-                                   NVRAM its factory NVRAM, or add the Secure
-                                   Enclave's UID or the AP manifest key to one
-                                   made without, or sign its AP ticket for its
-                                   AP nonce (GEX_DARWIN_RESTORE)
-  gexc darwin-web-ticket <dir>     sign the web device's Cryptex1 ticket for its
-                                   current nonce (GEX_DARWIN_RESTORE)
+                                   keys, identity, UIDs and factory NVRAM),
+                                   show it, move the cryptex1 boot slot of
+                                   one made before its NVRAM held its nonce
+                                   magazine into its NVRAM, or give one made
+                                   before its NVRAM its factory NVRAM, or add
+                                   the Secure Enclave's UID or the AP manifest
+                                   key to one made without, or sign its AP
+                                   ticket for its AP nonce (GEX_DARWIN_RESTORE)
+  gexc darwin-web-ticket <dir>     sign the web device's Cryptex1 ticket for the
+                                   nonce its next boot holds (GEX_DARWIN_RESTORE)
   gexc webmetal-info               the WebGPU implementation the Darwin
                                    personality's GPU runs on (the `webmetal`
                                    build), or why there is none

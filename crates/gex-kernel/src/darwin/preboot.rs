@@ -143,17 +143,18 @@ pub fn set_sources(s: Sources) -> Result<(), String> {
 
 /// The device's current cryptex1 boot nonce hash, which the Cryptex1
 /// ticket's `cnch` must be: AppleImage4 makes it from the cryptex1 boot
-/// nonce domain's nonce in the device's NVRAM (`nonce-seeds`), entangled
-/// with the device's UID key when the device asks for it, so only the
-/// device has it and the owner supplies it (GEX_DARWIN_CRYPTEX1_NONCE_HASH):
-/// while the device has not rolled the nonce since the restore, it is the
-/// device's ticket's `cnch`.
+/// slot of the nonce magazine in the device's NVRAM
+/// ([`super::noncemag`]), entangled with the device's UID key when the
+/// device asks for it. A run given the device's NVRAM reads the magazine
+/// as the kext does; without it the owner supplies the hash
+/// (GEX_DARWIN_CRYPTEX1_NONCE_HASH): while the device has not rolled the
+/// nonce since the restore, it is the device's ticket's `cnch`.
 pub fn cryptex1_boot_nonce_hash() -> Result<Vec<u8>, String> {
     if super::webdevice::get().is_some() {
         return Err("the measured cryptex1 boot nonce hash of a device of Apple's: the web device makes its own".to_string());
     }
     let Some(hex) = sources().nonce_hash.as_deref() else {
-        return Err("the device's cryptex1 boot nonce hash (its AppleImage4's hash of the cryptex1 boot nonce in its NVRAM nonce-seeds, entangled with its UID key when asked: a measured input, GEX_DARWIN_CRYPTEX1_NONCE_HASH, is not configured)".to_string());
+        return Err("the device's cryptex1 boot nonce hash (its AppleImage4's hash of the cryptex1 boot nonce in its NVRAM's nonce magazine, entangled with its UID key when asked: neither the device's NVRAM (GEX_DARWIN_NVRAM) nor a measured hash (GEX_DARWIN_CRYPTEX1_NONCE_HASH) is given)".to_string());
     };
     let hex = hex.trim();
     if hex.is_empty() || hex.len() % 2 != 0 || hex.len() > 128 {

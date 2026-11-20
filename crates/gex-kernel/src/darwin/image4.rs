@@ -38,10 +38,10 @@
 //!
 //! The cryptex1 boot nonce's hash is the device's
 //! ([`Environment::cryptex1_boot_nonce_hash`]): the nonce of the cryptex1
-//! boot slot of its nonce magazine (NVRAM `nonce-seeds`), hashed as
-//! [`nonce`] does. A device of Apple's has it in its NVRAM, where only
-//! the device reads it, so for one the hash is a measured input; the web
-//! device ([`super::webdevice`]) keeps its slot itself.
+//! boot slot of its nonce magazine ([`super::noncemag`], kept in its
+//! NVRAM), hashed as [`nonce`] does. With the device's NVRAM modelled it
+//! is the magazine's as AppleImage4 booted it; a device of Apple's run
+//! without its NVRAM has it as a measured input.
 
 use sha2::{Digest, Sha384};
 
@@ -1464,7 +1464,7 @@ pub fn execute(fourcc: u32, payload: &[u8], manifest: &[u8], env: &dyn Environme
 }
 
 /// AppleImage4's nonce slots (one per nonce domain in its nonce magazine,
-/// NVRAM `nonce-seeds`) and the hash the BOOT anti-replay policy
+/// [`super::noncemag`]) and the hash the BOOT anti-replay policy
 /// (0xfffffff005a96474) makes of the cryptex1 boot slot's nonce.
 ///
 /// A slot's data (parsed at 0xfffffff005a9a254, written at
@@ -1546,19 +1546,6 @@ pub mod nonce {
             b
         }
 
-        /// The roll (0xfffffff005a9a5dc) of a slot with no proposal: a new
-        /// nonce of the domain's length from the kernel's random source
-        /// (runtime +0xd8, `read_random`), `random` here, and the flags
-        /// 0x40, 0x23 and (from the old 0x2) 0x8 cleared. (With a proposal
-        /// the proposal becomes the nonce; that path and the level the
-        /// caller passes are not modelled.)
-        pub fn rolled(&self, random: [u8; CRYPTEX1_BOOT_NONCE_LENGTH]) -> Result<Slot, String> {
-            if self.flags & flag::PROPOSAL != 0 {
-                return Err("rolling a nonce slot that holds a proposal (0xfffffff005a9a5dc's proposal path)".into());
-            }
-            let clear = flag::ENTANGLE | 0x23 | ((self.flags << 2) & 0x8);
-            Ok(Slot { flags: self.flags & !clear, nonce: random, proposal: self.proposal })
-        }
     }
 
     /// The cryptex1 boot nonce hash of `slot`, as the BOOT policy makes it:

@@ -292,9 +292,9 @@ pub fn chosen_stand_in() -> &'static str {
 }
 
 /// The `/chosen` values the web device's boot does not fill in yet.
-pub const WEB_DEVICE_CHOSEN_STAND_IN: &str = "the /chosen values iBoot fills in beyond the web device's identity, its AP ticket's boot-manifest-hash, its NVRAM's boot-nonce and the AP ticket's manifest properties the 21H461 readers name in /chosen/manifest-properties (love, BNCH, ECID) (stand-in: the IPSW device tree's, die-id, unique-device-id and random-seed zero, no esdm-fuses; in manifest-properties the ticket's other properties (BORD, CEPO, CHIP, CPRO, CSEC, SDOM, srvn, prtp, sdkp, tagt, tatp) not published and the Unused*Property placeholders left as they are, and manifest-object-properties left with its placeholders: iBoot (encrypted in the IPSW) is what decides them, and no 21H461 binary reads them; boot-manifest-hash and boot-nonce zero when the web device has no AP ticket or generator)";
+pub const WEB_DEVICE_CHOSEN_STAND_IN: &str = "the /chosen values iBoot fills in beyond the web device's identity, its AP ticket's boot-manifest-hash, its NVRAM's boot-nonce, fsboot's boot-command (1) and the AP ticket's manifest properties the 21H461 readers name in /chosen/manifest-properties (love, BNCH, ECID) (stand-in: the IPSW device tree's, die-id, unique-device-id and random-seed zero, no esdm-fuses; in manifest-properties the ticket's other properties (BORD, CEPO, CHIP, CPRO, CSEC, SDOM, srvn, prtp, sdkp, tagt, tatp) not published and the Unused*Property placeholders left as they are, and manifest-object-properties left with its placeholders: iBoot (encrypted in the IPSW) is what decides them, and no 21H461 binary reads them; boot-manifest-hash and boot-nonce zero when the web device has no AP ticket or generator)";
 
-pub const CHOSEN_STAND_IN: &str = "the /chosen values iBoot fills in (stand-in: the IPSW device tree's, chip-id, board-id, unique-chip-id, certificate-production-status, certificate-security-mode, effective-production-status-ap and effective-security-mode-ap zero, and no security-domain, chip-epoch, esdm-fuses or manifest-properties love: an ignition blob, a Cryptex1 ticket name of ECID 0 and the platform UUID (gethostuuid, IOPlatformUUID) of ECID 0 and chip 0; measure IODeviceTree:/chosen on the device, `ioreg -p IODeviceTree -n chosen -l`)";
+pub const CHOSEN_STAND_IN: &str = "the /chosen values iBoot fills in (stand-in: the IPSW device tree's, chip-id, board-id, unique-chip-id, certificate-production-status, certificate-security-mode, effective-production-status-ap and effective-security-mode-ap zero, and no security-domain, chip-epoch, esdm-fuses, boot-command (iBoot's fsboot adds 1; without it AppleImage4's nonce magazine takes its preserve strategy) or manifest-properties love: an ignition blob, a Cryptex1 ticket name of ECID 0 and the platform UUID (gethostuuid, IOPlatformUUID) of ECID 0 and chip 0; measure IODeviceTree:/chosen on the device, `ioreg -p IODeviceTree -n chosen -l`)";
 
 /// The chip environment AppleImage4 evaluates against: this device tree's
 /// `/chosen`, as its runtime reads it ([`read`]), the device's cryptex1
@@ -308,11 +308,15 @@ impl super::image4::Environment for Device<'_> {
         read(self.tree, CHOSEN, name, size)
     }
 
-    /// The web device's hash of its own slot, as its AppleImage4 makes it;
-    /// a device of Apple's, the measured one.
+    /// The hash of the cryptex1 boot slot of the nonce magazine AppleImage4
+    /// booted over the device's NVRAM; with no NVRAM, a device of Apple's
+    /// has the measured one, and the web device none.
     fn cryptex1_boot_nonce_hash(&self, _domain: u32) -> Result<Vec<u8>, super::image4::Fail> {
+        if let Some(h) = super::noncemag::running_cryptex1_boot_hash() {
+            return h;
+        }
         match super::webdevice::get() {
-            Some(w) => super::webdevice::nonce_hash(w, dt_prop(self.tree, "IODeviceTree:/defaults", "entangle-nonce").is_some()),
+            Some(_) => Err(super::image4::Fail::Unmodelled("the web device's cryptex1 boot nonce: its nonce magazine is in its NVRAM, which its boot was not given (its nvram.bin)".into())),
             None => super::preboot::cryptex1_boot_nonce_hash().map_err(super::image4::Fail::Unmodelled),
         }
     }

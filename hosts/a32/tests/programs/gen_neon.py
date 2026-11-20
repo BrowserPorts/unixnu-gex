@@ -1,7 +1,7 @@
 # The Advanced SIMD data-processing test programs: every instruction of a
 # class, in each of its element types, over a table of operand sets; each
 # destination and the FPSCR after it recorded.
-# `python3 gen_neon.py int neon_int.s`.
+# `python3 gen_neon.py int neon_int.s`, `python3 gen_neon.py perm neon_perm.s`.
 import sys
 
 def rng(seed):
@@ -130,7 +130,46 @@ def int_ops():
         A(imm)
     return ops
 
-CLASSES = {'int': (int_ops, 'integer and polynomial')}
+def perm_ops():
+    ops = []
+    A = ops.append
+    for k in range(16):
+        A(f'vext.8 q10, q8, q9, #{k}')
+    for k in range(8):
+        A(f'vext.8 d20, d16, d19, #{k}')
+    A('vext.16 q10, q9, q8, #3')
+    A('vext.32 d20, d17, d18, #1')
+    for n in range(1, 5):
+        regs = ', '.join(f'd{18 + j}' for j in range(n))
+        A(f'vtbl.8 d20, {{{regs}}}, d16')
+        A(f'vtbx.8 d20, {{{regs}}}, d16')
+        A(f'vtbx.8 d21, {{{regs}}}, d17')
+    for k in range(8):
+        A(f'vdup.8 q10, d16[{k}]')
+    for k in range(4):
+        A(f'vdup.16 d20, d17[{k}]')
+    for k in range(2):
+        A(f'vdup.32 q10, d19[{k}]')
+    for r in ['q10, q9', 'd20, d18']:
+        A(f'vrev16.8 {r}')
+        for e in [8, 16]:
+            A(f'vrev32.{e} {r}')
+        for e in [8, 16, 32]:
+            A(f'vrev64.{e} {r}')
+    # Both registers change: q12 (a copy of q9) is the second.
+    A('vswp q10, q12')
+    A('vswp d20, d25')
+    for e in [8, 16, 32]:
+        A(f'vtrn.{e} q10, q12')
+        A(f'vtrn.{e} d20, d24')
+        A(f'vuzp.{e} q10, q12')
+        A(f'vzip.{e} q10, q12')
+    for e in [8, 16]:
+        A(f'vuzp.{e} d20, d24')
+        A(f'vzip.{e} d20, d24')
+    return ops
+
+CLASSES = {'int': (int_ops, 'integer and polynomial'), 'perm': (perm_ops, 'permute')}
 
 kind, path = sys.argv[1], sys.argv[2]
 ops_fn, what = CLASSES[kind]
@@ -181,11 +220,16 @@ for d in ['d16', 'd17', 'd18', 'd19', 'd22', 'd23', 'd6', 'd7']:
     P(f'  vmov {d}, r0, r1')
 for op in ops:
     P('  vmov q10, q11')
+    if kind == 'perm':
+        P('  vmov q12, q9')
     P('  vmsr fpscr, r8')
     P(f'  {op}')
     P('  vmrs r9, fpscr')
     P('  outd 20')
     P('  outd 21')
+    if kind == 'perm':
+        P('  outd 24')
+        P('  outd 25')
     P('  out r9')
 P('  cmp r4, r5')
 P('  bhs 2f')

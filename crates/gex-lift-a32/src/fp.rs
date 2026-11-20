@@ -34,13 +34,14 @@ fn is_advsimd(i: &FpInst) -> bool {
     }
 }
 
-/// An Advanced SIMD integer or polynomial data-processing instruction.
+/// An Advanced SIMD integer, polynomial or permute data-processing
+/// instruction.
 fn is_simd_int(i: &FpInst) -> bool {
     use gex_isa_a32::fp::Simd2Op::*;
     match i {
         FpInst::Simd3 { dt, .. } | FpInst::Simd3Scalar { dt, .. } => *dt != Dt::F32,
-        FpInst::Simd2 { op, dt, .. } => !matches!(op, Vrev16 | Vrev32 | Vrev64 | Vswp | Vtrn | Vuzp | Vzip | Vrecpe | Vrsqrte) && *dt != Dt::F32,
-        FpInst::SimdShift { .. } | FpInst::SimdImm { .. } => true,
+        FpInst::Simd2 { op, dt, .. } => !matches!(op, Vrecpe | Vrsqrte) && *dt != Dt::F32,
+        FpInst::SimdShift { .. } | FpInst::SimdImm { .. } | FpInst::Vext { .. } | FpInst::Vtbl { .. } | FpInst::VdupScalar { .. } => true,
         _ => false,
     }
 }

@@ -11,6 +11,7 @@
 
 mod simd;
 mod simd_int;
+mod simd_perm;
 pub mod soft;
 mod vfp;
 
@@ -304,6 +305,7 @@ impl Core {
                     regs.set_fpscr(regs.fpscr() | fpscr::QC);
                 }
             }
+            _ if simd_class(&i) == Some(SimdClass::Permute) => simd_perm::exec(regs, at, &i)?,
             _ => return unimpl(format!("Floating-point/Advanced SIMD data processing {raw:#010x} ({i:?}) at {at:#x}")),
         }
         Ok(0)

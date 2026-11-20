@@ -213,3 +213,8 @@ fn vfp_conversions() {
 fn neon_integer() {
     same("neon_int");
 }
+
+#[test]
+fn neon_permutes() {
+    same("neon_perm");
+}

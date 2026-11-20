@@ -223,3 +223,8 @@ fn neon_permutes() {
 fn neon_floating_point() {
     same("neon_fp");
 }
+
+#[test]
+fn fp_loads_and_stores() {
+    same("fpldst");
+}

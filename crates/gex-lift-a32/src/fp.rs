@@ -9,7 +9,8 @@
 //! needs is clear; the trap is taken only where the condition passes.
 //!
 //! Transfers between the ARM core and the extension registers, VMRS of the
-//! FPSCR, and the loads and stores are lifted here. The data-processing
+//! FPSCR, and the loads and stores (every access through `A32Mem`) are
+//! lifted here. The data-processing
 //! instructions are executed by the host's software implementation of
 //! their pseudocode (`A32Sys` `FP`, `gex_a32::Core`): the FPSCR's rounding
 //! modes, flush-to-zero, default NaN and cumulative exception flags, and
@@ -18,8 +19,9 @@
 
 use crate::{Flow, Lifter};
 use gex_abi::a32 as abi;
-use gex_ir::{BinOp, CmpOp, Expr, GuestReg, Stmt, Ty, Value};
-use gex_isa_a32::fp::{Dt, FpInst, Simd2Op, VReg};
+use gex_ir::{BinOp, CmpOp, Expr, GuestReg, MemSz, Order, Stmt, Ty, Value};
+use gex_isa_a32::fp::{Dt, FpInst, LdStForm, Simd2Op, VReg};
+use gex_isa_a32::Reg;
 
 /// Whether `i` is an Advanced SIMD instruction (`CheckAdvSIMDEnabled()`, or
 /// `CheckAdvSIMDOrVFPEnabled(TRUE, TRUE)`) rather than a Floating-point one
@@ -301,7 +303,11 @@ impl<'a> Lifter<'a> {
                 self.set_dreg(d, v);
                 Flow::Next
             }
-            Vldm { .. } | Vldr { .. } | SimdLdSt { .. } => self.unimplemented(abi::unimpl::FP),
+            Vldr { load, d, rn, add, imm } => self.vldr(load, d, rn, add, imm),
+            Vldm { load, d, regs, rn, add, wback, fmx } => self.vldm(load, d, regs, rn, add, wback, fmx),
+            SimdLdSt { load, form, count, esize, d, inc, regs, index, align, rn, wback, rm } => {
+                self.simd_ldst(load, form, count, esize, d, inc, regs, index, align, rn, wback, rm)
+            }
             _ => self.fp_data_processing(),
         }
     }
@@ -325,6 +331,180 @@ impl<'a> Lifter<'a> {
         let a = self.c64(self.raw as u64);
         let z = self.c64(0);
         self.sys(abi::sys::FP, a, z);
+        Flow::Next
+    }
+
+    // -- extension register loads and stores (A7.6, A7.7) ----------------------
+
+    /// A8.8.334 VLDR, A8.8.414 VSTR.
+    fn vldr(&mut self, load: bool, d: VReg, rn: Reg, add: bool, imm: u32) -> Flow {
+        let base = self.r_base(rn);
+        let k = self.c32(imm);
+        let addr = self.bin(if add { BinOp::Add } else { BinOp::Sub }, base, k);
+        match d {
+            // MemA[address, 4].
+            VReg::S(s) => {
+                let host = self.mem(addr, abi::mem::access(2, !load, false, 2));
+                if load {
+                    let v = self.b.def(Expr::Load { addr: host, offset: 0, sz: MemSz::B4, signed: false, ty: Ty::I32, order: Order::Relaxed });
+                    self.set_sreg(s, v);
+                } else {
+                    let v = self.sreg(s);
+                    self.b.stmt(Stmt::Store { addr: host, offset: 0, val: v, sz: MemSz::B4, order: Order::Relaxed });
+                }
+            }
+            // Two word accesses, MemA[address, 4] and MemA[address+4, 4]:
+            // one translation of the eight bytes, word aligned.
+            VReg::D(dn) => {
+                let host = self.mem(addr, abi::mem::access(3, !load, false, 2));
+                self.dword(load, host, dn);
+            }
+            VReg::Q(_) => unreachable!("VLDR of a Q register"),
+        }
+        Flow::Next
+    }
+
+    /// Load or store `D<dn>` at `host` as two little-endian words.
+    fn dword(&mut self, load: bool, host: Value, dn: u8) {
+        for w in 0..2u32 {
+            if load {
+                let v = self.b.def(Expr::Load { addr: host, offset: 4 * w as i64, sz: MemSz::B4, signed: false, ty: Ty::I32, order: Order::Relaxed });
+                self.set_d_elem(dn, w, 32, v);
+            } else {
+                let v = self.d_elem(dn, w, 32, false);
+                self.b.stmt(Stmt::Store { addr: host, offset: 4 * w as i64, val: v, sz: MemSz::B4, order: Order::Relaxed });
+            }
+        }
+    }
+
+    /// A8.8.333 VLDM, A8.8.413 VSTM, A8.8.368 VPOP, A8.8.369 VPUSH. Every
+    /// access is translated first, so an abort leaves the registers as they
+    /// were.
+    #[allow(clippy::too_many_arguments)]
+    fn vldm(&mut self, load: bool, d: VReg, regs: u8, rn: Reg, add: bool, wback: bool, fmx: bool) -> Flow {
+        let (first, size) = match d {
+            VReg::S(s) => (s, 4u32),
+            VReg::D(n) => (n, 8),
+            VReg::Q(_) => unreachable!("VLDM of Q registers"),
+        };
+        let imm32 = size * regs as u32 + if fmx { 4 } else { 0 };
+        let base = self.r(rn);
+        let start = if add {
+            base
+        } else {
+            let k = self.c32(imm32);
+            self.bin(BinOp::Sub, base, k)
+        };
+        let access = abi::mem::access(if size == 4 { 2 } else { 3 }, !load, false, 2);
+        let mut hosts = Vec::with_capacity(regs as usize);
+        for r in 0..regs as u32 {
+            let off = self.c32(size * r);
+            let va = self.bin(BinOp::Add, start, off);
+            hosts.push(self.mem(va, access));
+        }
+        for (r, host) in hosts.into_iter().enumerate() {
+            let reg = first + r as u8;
+            if size == 4 {
+                if load {
+                    let v = self.b.def(Expr::Load { addr: host, offset: 0, sz: MemSz::B4, signed: false, ty: Ty::I32, order: Order::Relaxed });
+                    self.set_sreg(reg, v);
+                } else {
+                    let v = self.sreg(reg);
+                    self.b.stmt(Stmt::Store { addr: host, offset: 0, val: v, sz: MemSz::B4, order: Order::Relaxed });
+                }
+            } else {
+                self.dword(load, host, reg);
+            }
+        }
+        if wback {
+            let k = self.c32(imm32);
+            let nb = self.bin(if add { BinOp::Add } else { BinOp::Sub }, base, k);
+            self.w(rn, nb);
+        }
+        Flow::Next
+    }
+
+    /// A8.8.321-A8.8.332 VLD1-VLD4, A8.8.405-A8.8.412 VST1-VST4. The
+    /// alignment check of the base address is the first access's; each
+    /// element is a `MemU[]` access of its size (a 64-bit element's two words
+    /// one translation, which SCTLR.A requires 8-byte aligned).
+    #[allow(clippy::too_many_arguments)]
+    fn simd_ldst(&mut self, load: bool, form: LdStForm, count: u8, esize: u8, d: u8, inc: u8, regs: u8, index: u8, align: u16, rn: Reg, wback: bool, rm: Option<Reg>) -> Flow {
+        let esize = esize as u32;
+        let ebytes = esize / 8;
+        let elements = 64 / esize;
+        // (register, element or None for all lanes) of each access, in
+        // address order.
+        let mut slots: Vec<(u8, Option<u32>)> = Vec::new();
+        match form {
+            LdStForm::Multiple => {
+                for r in 0..regs {
+                    for e in 0..elements {
+                        for k in 0..count {
+                            slots.push((d + k * inc + r, Some(e)));
+                        }
+                    }
+                }
+            }
+            LdStForm::Lane => {
+                for k in 0..count {
+                    slots.push((d + k * inc, Some(index as u32)));
+                }
+            }
+            LdStForm::AllLanes => {
+                for k in 0..count {
+                    slots.push((d + k * inc, None));
+                }
+            }
+        }
+        let total = ebytes * slots.len() as u32;
+        let base = self.r(rn);
+        let size_log2 = ebytes.trailing_zeros();
+        let align_log2 = (align as u32).trailing_zeros();
+        let mut hosts = Vec::with_capacity(slots.len());
+        for k in 0..slots.len() as u32 {
+            let off = self.c32(k * ebytes);
+            let va = self.bin(BinOp::Add, base, off);
+            let al = if k == 0 { align_log2 } else { 0 };
+            hosts.push(self.mem(va, abi::mem::access(size_log2, !load, false, al)));
+        }
+        let sz = match ebytes {
+            1 => MemSz::B1,
+            2 => MemSz::B2,
+            4 => MemSz::B4,
+            _ => MemSz::B8,
+        };
+        let ty = if ebytes == 8 { Ty::I64 } else { Ty::I32 };
+        for (&(reg, e), &host) in slots.iter().zip(hosts.iter()) {
+            if load {
+                let v = self.b.def(Expr::Load { addr: host, offset: 0, sz, signed: false, ty, order: Order::Relaxed });
+                match e {
+                    Some(e) => self.set_d_elem(reg, e, esize, v),
+                    None => {
+                        // Replicate(MemU[address, ebytes], elements), into
+                        // `regs` registers for VLD1 (to all lanes).
+                        let splat = self.b.def(Expr::VSplat { a: v, lane_bytes: ebytes });
+                        let lo = self.b.def(Expr::VExtract { a: splat, lane: 0, lane_bytes: 8, signed: false, ty: Ty::I64 });
+                        let n = if count == 1 { regs } else { 1 };
+                        for r in 0..n {
+                            self.set_dreg(reg + r, lo);
+                        }
+                    }
+                }
+            } else {
+                let e = e.expect("no store to all lanes");
+                let v = self.d_elem(reg, e, esize, false);
+                self.b.stmt(Stmt::Store { addr: host, offset: 0, val: v, sz, order: Order::Relaxed });
+            }
+        }
+        if wback {
+            let inc = match rm {
+                Some(m) => self.r(m),
+                None => self.c32(total),
+            };
+            let nb = self.bin(BinOp::Add, base, inc);
+            self.w(rn, nb);
+        }
         Flow::Next
     }
 }

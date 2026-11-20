@@ -1,5 +1,6 @@
 //! The SEP's mailbox block shared by the AP's driver and the SEP core: the
-//! [`Akf`] registers behind one lock, and what each side waits for.
+//! [`Akf`] registers behind one lock, the interrupt controller's enables
+//! for the block's lines, and what each side waits for.
 
 use super::akf::{Akf, Fault, Sink};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -17,6 +18,12 @@ pub struct Run {
 struct State {
     akf: Akf,
     run: Run,
+    /// The interrupt controller's per-source enables for the block's
+    /// interrupt indexes (bit `i`: index `i`). `IOInterruptEventSource`'s
+    /// `enable()` and `disable()` reach the provider's `enableInterrupt` and
+    /// `disableInterrupt`, the AIC's mask: delivery takes no lock of the
+    /// driver's, so the mask lives here, beside the lines it gates.
+    sources: u32,
     /// Set when the machine is going away: waiters return.
     closed: bool,
 }
@@ -95,6 +102,24 @@ impl Hw {
         self.lock().akf.irq(index)
     }
 
+    /// Enable or disable interrupt index `index` at the interrupt
+    /// controller. Enabling a line that is asserted delivers it: its
+    /// waiter is woken.
+    pub fn set_source(&self, index: u32, enabled: bool) {
+        let mut s = self.lock();
+        if enabled {
+            s.sources |= 1 << index;
+        } else {
+            s.sources &= !(1 << index);
+        }
+        drop(s);
+        self.changed.notify_all();
+    }
+
+    pub fn source_enabled(&self, index: u32) -> bool {
+        self.lock().sources & 1 << index != 0
+    }
+
     /// Release every waiter for good: the machine ends.
     pub fn close(&self) {
         self.lock().closed = true;
@@ -108,10 +133,21 @@ impl Hw {
     /// Wait until `ready` holds of the registers, for at most `timeout`.
     /// False when it timed out or the machine closed.
     pub fn wait_until(&self, timeout: Duration, mut ready: impl FnMut(&Akf, &Run) -> bool) -> bool {
+        self.wait_state(timeout, |s| ready(&s.akf, &s.run))
+    }
+
+    /// Wait until interrupt `index` is delivered (its line asserted and its
+    /// source enabled), for at most `timeout`. False when it timed out or
+    /// the machine closed.
+    pub fn wait_interrupt(&self, index: u32, timeout: Duration) -> bool {
+        self.wait_state(timeout, |s| s.akf.irq(index) && s.sources & 1 << index != 0)
+    }
+
+    fn wait_state(&self, timeout: Duration, mut ready: impl FnMut(&State) -> bool) -> bool {
         let deadline = Instant::now() + timeout;
         let mut s = self.lock();
         loop {
-            if ready(&s.akf, &s.run) {
+            if ready(&s) {
                 return true;
             }
             if s.closed {
@@ -153,6 +189,24 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         hw.close();
         assert!(!t.join().unwrap());
+    }
+
+    #[test]
+    fn an_interrupt_is_delivered_only_while_its_source_is_enabled() {
+        let hw = Hw::new();
+        hw.write32(reg::MAILBOX_SET, 0x1111).unwrap();
+        hw.write32(reg::OUTBOX_CTRL, 1).unwrap();
+        hw.core_push(1).unwrap();
+        assert!(hw.irq(2) && !hw.source_enabled(2));
+        assert!(!hw.wait_interrupt(2, Duration::from_millis(10)), "the line is asserted, its source is masked");
+        // Enabling the source of an asserted line delivers it to the waiter.
+        let h = Arc::clone(&hw);
+        let t = std::thread::spawn(move || h.wait_interrupt(2, Duration::from_secs(30)));
+        std::thread::sleep(Duration::from_millis(20));
+        hw.set_source(2, true);
+        assert!(t.join().unwrap());
+        hw.set_source(2, false);
+        assert!(!hw.source_enabled(2));
     }
 
     #[test]

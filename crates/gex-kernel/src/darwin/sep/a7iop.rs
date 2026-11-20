@@ -75,15 +75,15 @@ struct State {
     running: bool,
     /// The doorbell action, set once (`setDoorbellAction` with index 0).
     action: Option<Doorbell>,
-    /// Interrupt index 1's and 2's sources (`IOFilterInterruptEventSource`s)
-    /// enabled at the interrupt controller.
-    src1: bool,
-    src2: bool,
     /// The A2I slots the driver believes free (`credits`).
     credits: u32,
 }
 
-/// The driver.
+/// The driver. Its lock stands for `_akfLock` and the inbox and outbox
+/// locks; interrupt index 1's and 2's sources (`IOFilterInterruptEventSource`s)
+/// are enabled at the interrupt controller ([`Hw::set_source`]), which the
+/// outbox interrupt's delivery reads without taking this lock (the filter,
+/// `_outboxHandler` K 0xfffffff005b1309c, takes none: it calls the action).
 pub struct A7iop {
     hw: Arc<Hw>,
     st: Mutex<State>,
@@ -138,8 +138,8 @@ impl A7iop {
         hw.write32(reg::MAILBOX_CLR_MIRROR, 1)?;
         hw.write32(reg::MAILBOX_CLR, 0x1000)?;
         hw.write32(reg::MAILBOX_CLR_MIRROR, 0x1000)?;
-        s.src2 = true;
-        s.src1 = false;
+        hw.set_source(2, true);
+        hw.set_source(1, false);
         let c = hw.read32(reg::OUTBOX_CTRL)?;
         hw.write32(reg::OUTBOX_CTRL, c & !ctrl::OUTBOX_ENABLE | ctrl::OUTBOX_ENABLE)?;
         // _setCPURun(1): CPU_CTRL's run bit.
@@ -155,8 +155,8 @@ impl A7iop {
         let hw = &self.hw;
         let c = hw.read32(reg::OUTBOX_CTRL)?;
         hw.write32(reg::OUTBOX_CTRL, c & !ctrl::OUTBOX_ENABLE)?;
-        s.src1 = false;
-        s.src2 = false;
+        hw.set_source(1, false);
+        hw.set_source(2, false);
         let c = hw.read32(reg::CPU_CTRL)?;
         hw.write32(reg::CPU_CTRL, c & !akf::CPU_RUN)?;
         s.running = false;
@@ -187,7 +187,8 @@ impl A7iop {
                     self.hw.write64(reg::A2I, m.0)?;
                     return Ok(());
                 }
-                s.src1 = true;
+                // The inbox source enabled (K 0xfffffff005b1333c) for the wait.
+                self.hw.set_source(1, true);
             }
             let period = Duration::from_nanos(1_000_000_000 / u64::from(POST_RETRY_FREQ));
             if !self.hw.wait_until(period, |a, _| a.a2i_len() == 0) {
@@ -216,8 +217,7 @@ impl A7iop {
         std::thread::Builder::new()
             .name("AppleA7IOP outbox".into())
             .spawn(move || loop {
-                let enabled = |me: &A7iop| me.st().src2;
-                let ready = me.hw.wait_until(Duration::from_millis(50), |a, _| a.irq(2) && enabled(&me));
+                let ready = me.hw.wait_interrupt(2, Duration::from_millis(50));
                 if me.hw.is_closed() {
                     return;
                 }
@@ -261,12 +261,14 @@ mod tests {
         let (d, hw) = driver();
         d.start_cpu().unwrap();
         assert!(hw.irq(1) && !hw.irq(2), "the inbox is empty, the outbox is too");
+        assert!(hw.source_enabled(2) && !hw.source_enabled(1), "the outbox source enabled, the inbox source disabled");
         assert_eq!(hw.read32(reg::OUTBOX_CTRL).unwrap() & ctrl::OUTBOX_ENABLE, 1);
         assert_eq!(hw.run().running, true);
         hw.core_push(1).unwrap();
         assert!(hw.irq(2));
         d.stop_cpu().unwrap();
         assert!(!hw.irq(2) && !d.running() && !hw.run().running);
+        assert!(!hw.source_enabled(1) && !hw.source_enabled(2));
     }
 
     #[test]

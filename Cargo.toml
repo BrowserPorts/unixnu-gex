@@ -37,6 +37,7 @@ members = [
     "hosts/browser",
     "hosts/hostwl",
     "hosts/native",
+    "hosts/a32",
 ]
 # WebMetal and AirWgsl are pinned submodules with workspaces (and manifests)
 # of their own; gexc builds them as dependencies (its `webmetal` feature).

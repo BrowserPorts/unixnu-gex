@@ -1,0 +1,18 @@
+[package]
+name = "gex-a32-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Runs an AArch32 (ARMv7-A) core's code through gex's tier-1 emitter on wasmtime, with the gex-a32 system model"
+
+[dependencies]
+gex-abi.workspace = true
+gex-a32.workspace = true
+gex-emit.workspace = true
+gex-ir.workspace = true
+gex-isa-a32.workspace = true
+gex-lift-a32.workspace = true
+gex-mem.workspace = true
+gex-native = { workspace = true, features = ["compile"] }
+anyhow = "1"
+wasmtime = { version = "49", default-features = false, features = ["runtime", "std", "threads", "gc", "gc-null", "anyhow"] }

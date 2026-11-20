@@ -708,6 +708,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "gex-a32-host"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "gex-a32",
+ "gex-abi",
+ "gex-emit",
+ "gex-ir",
+ "gex-isa-a32",
+ "gex-lift-a32",
+ "gex-mem",
+ "gex-native",
+ "wasmtime",
+]
+
+[[package]]
 name = "gex-abi"
 version = "0.0.1"
 

@@ -10,6 +10,7 @@ members = [
     "crates/gex-isa-x86",
     "crates/gex-isa-a32",
     "crates/gex-lift-a32",
+    "crates/gex-a32",
     "crates/gex-ir",
     "crates/gex-f80",
     "crates/gex-lift",
@@ -65,6 +66,7 @@ gex-isa = { path = "crates/gex-isa" }
 gex-isa-x86 = { path = "crates/gex-isa-x86" }
 gex-isa-a32 = { path = "crates/gex-isa-a32" }
 gex-lift-a32 = { path = "crates/gex-lift-a32" }
+gex-a32 = { path = "crates/gex-a32" }
 gex-ir = { path = "crates/gex-ir" }
 gex-dylink = { path = "crates/gex-dylink" }
 gex-f80 = { path = "crates/gex-f80" }

@@ -1,0 +1,10 @@
+[package]
+name = "gex-a32"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The system-level model of an AArch32 (ARMv7-A) core for gex: modes, PSRs, exceptions, CP15, the VMSA"
+
+[dependencies]
+gex-abi.workspace = true
+gex-isa-a32.workspace = true

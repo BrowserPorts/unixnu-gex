@@ -700,6 +700,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "gex-a32"
+version = "0.0.1"
+dependencies = [
+ "gex-abi",
+ "gex-isa-a32",
+]
+
+[[package]]
 name = "gex-abi"
 version = "0.0.1"
 

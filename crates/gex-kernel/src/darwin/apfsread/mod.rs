@@ -46,7 +46,7 @@ pub mod fs;
 pub mod lzbitmap;
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Where a container's bytes are read from.
 pub trait Medium: Send + Sync {
@@ -244,21 +244,53 @@ impl NxSuperblock {
     }
 }
 
+/// A block of metadata as the cache holds it, and what its checks found:
+/// its object checksum, and its hash where a parent keeps one, each worked
+/// out the first time it is asked for. The bytes never change while the
+/// block is cached, so neither does either answer (as a node authapfs
+/// verified on its read from the medium stays verified in the buffer
+/// cache); a block read again after it was dropped is checked again.
+pub(crate) struct Block {
+    pub(crate) bytes: Arc<[u8]>,
+    checksum: OnceLock<bool>,
+    hash: OnceLock<(HashType, Vec<u8>)>,
+}
+
+impl Block {
+    fn new(bytes: Arc<[u8]>) -> Block {
+        Block { bytes, checksum: OnceLock::new(), hash: OnceLock::new() }
+    }
+
+    /// Whether its object checksum is right ([`checksum_ok`]).
+    pub(crate) fn checksum_ok(&self) -> bool {
+        *self.checksum.get_or_init(|| checksum_ok(&self.bytes))
+    }
+
+    /// Whether its `t` digest is `want`.
+    pub(crate) fn hash_is(&self, t: HashType, want: &[u8]) -> bool {
+        let (kind, d) = self.hash.get_or_init(|| (t, t.digest(&self.bytes)));
+        if *kind == t {
+            return d == want;
+        }
+        t.digest(&self.bytes) == want
+    }
+}
+
 /// Recently read B-tree nodes and objects, by physical address: a bounded
 /// number, the oldest dropped first.
 struct BlockCache {
     cap: usize,
-    inner: Mutex<(HashMap<u64, Arc<[u8]>>, VecDeque<u64>)>,
+    inner: Mutex<(HashMap<u64, Arc<Block>>, VecDeque<u64>)>,
 }
 
 impl BlockCache {
     fn new(cap: usize) -> BlockCache {
         BlockCache { cap, inner: Mutex::new((HashMap::new(), VecDeque::new())) }
     }
-    fn get(&self, at: u64) -> Option<Arc<[u8]>> {
+    fn get(&self, at: u64) -> Option<Arc<Block>> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).0.get(&at).cloned()
     }
-    fn put(&self, at: u64, b: Arc<[u8]>) {
+    fn put(&self, at: u64, b: Arc<Block>) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if g.0.insert(at, b).is_none() {
             g.1.push_back(at);
@@ -424,10 +456,15 @@ impl Container {
 
     /// A metadata block, from the cache or the medium.
     pub(crate) fn block(&self, paddr: u64) -> Result<Arc<[u8]>> {
+        Ok(Arc::clone(&self.cached(paddr)?.bytes))
+    }
+
+    /// A metadata block as the cache holds it, with its checks' answers.
+    pub(crate) fn cached(&self, paddr: u64) -> Result<Arc<Block>> {
         if let Some(b) = self.cache.get(paddr) {
             return Ok(b);
         }
-        let b: Arc<[u8]> = self.read_raw(paddr)?.into();
+        let b = Arc::new(Block::new(self.read_raw(paddr)?.into()));
         self.cache.put(paddr, Arc::clone(&b));
         Ok(b)
     }
@@ -435,12 +472,12 @@ impl Container {
     /// A physical object of kind `kind` at `paddr`, its header and checksum
     /// checked (its identifier is its address).
     pub(crate) fn physical(&self, paddr: u64, kind: u32) -> Result<Arc<[u8]>> {
-        let b = self.block(paddr)?;
-        let h = ObjHeader::parse(&b)?;
-        if h.kind() != kind || h.otype & otype::STORAGETYPE_MASK != otype::PHYSICAL || h.oid != paddr || !checksum_ok(&b) {
+        let blk = self.cached(paddr)?;
+        let h = ObjHeader::parse(&blk.bytes)?;
+        if h.kind() != kind || h.otype & otype::STORAGETYPE_MASK != otype::PHYSICAL || h.oid != paddr || !blk.checksum_ok() {
             return malformed(format!("block {paddr:#x} is not a valid physical object of type {kind:#x} (header {h:?})"));
         }
-        Ok(b)
+        Ok(Arc::clone(&blk.bytes))
     }
 
     /// The container's object map.
@@ -867,6 +904,32 @@ mod tests {
         assert!(HashType::of(0).is_err());
         assert!(HashType::of(5).is_err());
         assert_eq!(HashType::Sha256.digest(b"abc")[..4], [0xba, 0x78, 0x16, 0xbf]);
+    }
+
+    #[test]
+    fn a_cached_block_answers_its_checks_alike_every_time() {
+        let mut b = vec![0u8; 4096];
+        for (i, x) in b.iter_mut().enumerate().skip(8) {
+            *x = (i * 5 + 1) as u8;
+        }
+        let c = fletcher64(&b);
+        b[..8].copy_from_slice(&c.to_le_bytes());
+        let good = Block::new(b.clone().into());
+        b[200] ^= 1;
+        let bad = Block::new(b.into());
+        for _ in 0..2 {
+            assert!(good.checksum_ok());
+            assert!(!bad.checksum_ok());
+        }
+        let want = HashType::Sha256.digest(&good.bytes);
+        let other = HashType::Sha384.digest(&good.bytes);
+        for _ in 0..2 {
+            assert!(good.hash_is(HashType::Sha256, &want));
+            assert!(!good.hash_is(HashType::Sha256, &other[..32]));
+            assert!(!bad.hash_is(HashType::Sha256, &want));
+            // Another algorithm than the one kept is worked out anew.
+            assert!(good.hash_is(HashType::Sha384, &other));
+        }
     }
 
     /// The SystemOS cryptex of 21H461: a raw container of 4 KiB blocks,

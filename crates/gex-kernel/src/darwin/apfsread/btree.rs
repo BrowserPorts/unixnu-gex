@@ -259,13 +259,13 @@ impl Tree {
                 return Ok(node);
             }
         };
-        let bytes = c.block(paddr)?;
+        let blk = c.cached(paddr)?;
         if let (Some(t), Some(want)) = (self.hash_type, hash) {
-            if t.digest(&bytes) != want {
+            if !blk.hash_is(t, want) {
                 return Err(Error::Integrity(format!("the B-tree node {oid:#x} (block {paddr:#x}) does not have the hash its parent keeps")));
             }
         }
-        let node = Node::parse(bytes)?;
+        let node = Node::parse(Arc::clone(&blk.bytes))?;
         if node.flags & node_flags::NOHEADER != 0 {
             if node.bytes[..32].iter().any(|&b| b != 0) {
                 return malformed(format!("the B-tree node {oid:#x} with BTNODE_NOHEADER and a header"));
@@ -276,7 +276,7 @@ impl Tree {
         } else {
             let h = ObjHeader::parse(&node.bytes)?;
             let kind = if node.flags & node_flags::ROOT != 0 { otype::BTREE } else { otype::BTREE_NODE };
-            if h.kind() != kind || h.oid != oid || h.subtype != self.subtype || !super::checksum_ok(&node.bytes) {
+            if h.kind() != kind || h.oid != oid || h.subtype != self.subtype || !blk.checksum_ok() {
                 return malformed(format!("the B-tree node {oid:#x} (block {paddr:#x}, header {h:?})"));
             }
         }

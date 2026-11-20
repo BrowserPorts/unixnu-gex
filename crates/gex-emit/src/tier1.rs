@@ -175,6 +175,10 @@ pub struct Context<'a> {
     pub x87: u32,
     /// Import index of `gex.mx`.
     pub mx: u32,
+    /// Import indices of `gex.a32_sys` and `gex.a32_mem`, which only a
+    /// module of an AArch32 core's code imports (`u32::MAX` elsewhere).
+    pub a32_sys: u32,
+    pub a32_mem: u32,
     /// Import index of `gex.sysreg_write`.
     pub sysreg_write: u32,
     /// Import index of `gex.cache_op`.
@@ -5254,6 +5258,11 @@ impl<'a> Emitter<'a> {
             HostFunc::Safepoint => self.cx.safepoint,
             HostFunc::Fma => self.cx.fma,
             HostFunc::Crypto => self.cx.crypto,
+            HostFunc::A32Sys | HostFunc::A32Mem => {
+                let i = if func == HostFunc::A32Sys { self.cx.a32_sys } else { self.cx.a32_mem };
+                assert!(i != u32::MAX, "{func:?} in a module not built for an AArch32 core");
+                i
+            }
         }
     }
 

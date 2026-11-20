@@ -959,6 +959,18 @@ pub enum HostFunc {
     /// spilled to guest memory and its result written back there
     /// (`gex_abi::crypto`). Writes memory, not guest registers.
     Crypto,
+    /// An AArch32 system-level operation (`gex_abi::a32::sys`): `(pc, op,
+    /// a, b) -> i64`, `pc` the instruction's key. The host's model of the
+    /// core does what the architecture does outside the register file and
+    /// the flags (modes and their banked registers, the PSRs, exceptions,
+    /// the coprocessor registers) and may rewrite any register, the PC
+    /// included. Only a module built for an AArch32 core imports it.
+    A32Sys,
+    /// An AArch32 data access's translation (`gex_abi::a32::mem`): `(pc,
+    /// va, access) -> i64`, the host address of the access to `va`, or the
+    /// host takes the Data Abort the translation or its checks raise and
+    /// does not return. Only a module built for an AArch32 core imports it.
+    A32Mem,
 }
 
 impl HostFunc {
@@ -972,6 +984,8 @@ impl HostFunc {
                 | HostFunc::Breakpoint
                 | HostFunc::SysRegWrite
                 | HostFunc::Safepoint
+                | HostFunc::A32Sys
+                | HostFunc::A32Mem
         )
     }
 }

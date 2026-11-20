@@ -635,6 +635,11 @@ pub const fn dispatch_miss_entry(entry: u32) -> i32 {
     DISPATCH_MISS_ENTRY - entry as i32
 }
 
+/// The export name of an AArch32 module's block at `key` (`gex_abi::a32::key`).
+pub fn a32_export(key: u64) -> String {
+    format!("a32_{key:x}")
+}
+
 pub struct ModuleBuilder {
     m: Module,
     text_base: u64,
@@ -669,6 +674,8 @@ pub struct ModuleBuilder {
 
     /// Blocks to export by name, for a shared-linkage module.
     exports_by_addr: Vec<(u64, u32)>,
+    /// A module of an AArch32 core's code ([`Self::new_a32`]).
+    a32: bool,
     /// Profiling instrumentation (`crate::profile`), when it was on as this
     /// module was started: the helper functions and the region-base global.
     /// `None` leaves the module exactly as it would be without profiling.
@@ -710,6 +717,8 @@ struct Imports {
     crypto: u32,
     x87: u32,
     mx: u32,
+    a32_sys: u32,
+    a32_mem: u32,
 }
 
 impl ModuleBuilder {
@@ -759,6 +768,26 @@ impl ModuleBuilder {
         linkage: Linkage,
         page_table: PageTable,
         shared_memory: bool,
+    ) -> ModuleBuilder {
+        Self::build(text_base, text_size, linkage, page_table, shared_memory, false)
+    }
+
+    /// A module of an AArch32 core's code (`gex_abi::a32`): it imports
+    /// `a32_sys` and `a32_mem` as well, and exports every block as
+    /// [`a32_export`] names it, for the host that runs the core to enter
+    /// at any key: a key with an IT state, or one beyond the dispatch
+    /// directory's reach, has no dispatch slot.
+    pub fn new_a32(text_base: u64, text_size: u64) -> ModuleBuilder {
+        Self::build(text_base, text_size, Linkage::Own, PageTable::new(), true, true)
+    }
+
+    fn build(
+        text_base: u64,
+        text_size: u64,
+        linkage: Linkage,
+        page_table: PageTable,
+        shared_memory: bool,
+        a32: bool,
     ) -> ModuleBuilder {
         assert_eq!(
             text_base % gex_abi::INST_ALIGN,
@@ -825,6 +854,18 @@ impl ModuleBuilder {
             crypto: m.import_func(im, imports::CRYPTO, t_crypto),
             x87: m.import_func(im, imports::X87, t_x87),
             mx: t_mx.map_or(u32::MAX, |t| m.import_func(im, imports::MX, t)),
+            a32_sys: if a32 {
+                let t = m.func_type(FuncType::new(vec![p, ValType::I64, ValType::I32, ValType::I64, ValType::I64], vec![ValType::I64]));
+                m.import_func(im, imports::A32_SYS, t)
+            } else {
+                u32::MAX
+            },
+            a32_mem: if a32 {
+                let t = m.func_type(FuncType::new(vec![p, ValType::I64, ValType::I64, ValType::I32], vec![ValType::I64]));
+                m.import_func(im, imports::A32_MEM, t)
+            } else {
+                u32::MAX
+            },
         };
 
         // The memory is the host's and shared, so every guest thread acts on
@@ -896,6 +937,7 @@ impl ModuleBuilder {
             data: Vec::new(),
             linkage,
             exports_by_addr: Vec::new(),
+            a32,
             demand_fill: false,
             profile: None,
             dense_global,
@@ -987,16 +1029,25 @@ impl ModuleBuilder {
     /// Add a translated block, reserving its index if necessary.
     pub fn add_block(&mut self, block: Block) {
         let f = self.reserve(block.start);
-        self.page_base(block.start);
-        // A block that runs on into the next page depends on that page's
-        // bytes too: give it a base, so retiring it (the bytes there
-        // rewritten) is something the block's entry check sees.
-        let last = block.end.max(block.start + 1) - 1;
-        if dispatch_page(last) != dispatch_page(block.start) {
-            self.page_base(last);
+        // An AArch32 key past the directory's reach (an address at or above
+        // its end, or one with an IT state) has no slot: its block is
+        // entered by its export or a direct jump only.
+        let slotted = !self.a32 || dispatch_page(block.end.max(block.start + 1) - 1) < gex_abi::dispatch_max_pages();
+        if slotted {
+            self.page_base(block.start);
+            // A block that runs on into the next page depends on that page's
+            // bytes too: give it a base, so retiring it (the bytes there
+            // rewritten) is something the block's entry check sees.
+            let last = block.end.max(block.start + 1) - 1;
+            if dispatch_page(last) != dispatch_page(block.start) {
+                self.page_base(last);
+            }
         }
         if self.linkage == Linkage::Shared {
             self.exports_by_addr.push((block.start, f));
+        }
+        if self.a32 {
+            self.m.export(&a32_export(block.start), ExportKind::Func, f);
         }
         self.pending.push((block, f));
     }
@@ -1067,6 +1118,8 @@ impl ModuleBuilder {
                 crypto: self.imports.crypto,
                 x87: self.imports.x87,
                 mx: self.imports.mx,
+                a32_sys: self.imports.a32_sys,
+                a32_mem: self.imports.a32_mem,
                 block_ty: self.block_ty,
                 entry_ty: self.entry_ty,
                 blocks: &self.blocks,

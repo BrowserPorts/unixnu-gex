@@ -1338,6 +1338,7 @@ impl<'a> Emitter<'a> {
             HostFunc::Safepoint => "gex_safepoint",
             HostFunc::Fma => "gex_fma",
             HostFunc::Crypto => "gex_crypto",
+            HostFunc::A32Sys | HostFunc::A32Mem => bail!("{func:?}: an AArch32 core's code is not compiled by the function tier"),
         };
         let want = match func {
             HostFunc::Syscall | HostFunc::Safepoint => 1,
@@ -1345,6 +1346,7 @@ impl<'a> Emitter<'a> {
             HostFunc::SysRegWrite | HostFunc::CacheOp => 3,
             HostFunc::Fma => 4,
             HostFunc::Crypto => 2,
+            HostFunc::A32Sys | HostFunc::A32Mem => unreachable!(),
         };
         if args.len() != want {
             bail!("{func:?} with {} arguments, the import takes {want}", args.len());

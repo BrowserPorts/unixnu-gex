@@ -1007,6 +1007,194 @@ pub const fn ctx_addr(slot: u32) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// AArch32 cores
+// ---------------------------------------------------------------------------
+
+/// An AArch32 (ARMv7-A) core run at the system level (the SEP's): where its
+/// state lives in the thread context, how a block is keyed, and the two
+/// host imports its translated code calls ([`imports::A32_SYS`],
+/// [`imports::A32_MEM`]). The rest of the core (the banked registers, the
+/// SPSRs, the rest of the CPSR, the coprocessor registers, the memory
+/// system) is the host's model of it.
+pub mod a32 {
+    /// `R0`-`R14` of the current mode are `ctx::x(0..=14)`, each a 32-bit
+    /// value zero-extended; N, Z, C and V are the flag bytes. `ctx::x(Q)`
+    /// holds the CPSR's Q flag (0 or 1) and `ctx::x(GE)` its GE bits
+    /// (`CPSR<19:16>`, 0..=15).
+    pub const Q: u8 = 16;
+    pub const GE: u8 = 17;
+    /// `ctx::x(SINK)` holds the host address of a 16-byte slot outside
+    /// every guest access's reach, set by the host: what an access whose
+    /// condition failed is given ([`mem::SKIP`]), and where a
+    /// store-exclusive that fails its monitor check stores.
+    pub const SINK: u8 = 18;
+    /// The code a `Stmt::Trap` of an AArch32 block raises (through the
+    /// `breakpoint` import) for a run-time UNPREDICTABLE case its lifter
+    /// checks: the PC an interworking write gives with bits 1:0 = 0b10
+    /// (A2.3.2 `BXWritePC`), or a load to the PC from an address that is
+    /// not word aligned. The host fails loudly.
+    pub const BRK_UNPREDICTABLE_PC: i32 = -64;
+
+    /// A block's key, and what `ctx::PC` holds: the instruction's address,
+    /// bit 0 set in the Thumb state (an ARM instruction is word aligned and
+    /// a Thumb one halfword aligned, so the bit is free, and it is the
+    /// interworking branches' own convention), and the ITSTATE it starts
+    /// in at bits 32..40, zero outside an IT block.
+    pub const fn key(addr: u32, thumb: bool, it: u8) -> u64 {
+        (it as u64) << 32 | (addr & !1) as u64 | thumb as u64
+    }
+
+    pub const fn key_addr(key: u64) -> u32 {
+        key as u32 & !1
+    }
+
+    pub const fn key_thumb(key: u64) -> bool {
+        key & 1 != 0
+    }
+
+    pub const fn key_it(key: u64) -> u8 {
+        (key >> 32) as u8
+    }
+
+    /// The operations of [`super::imports::A32_SYS`]: `(pc, op, a, b) ->
+    /// i64`, `pc` the key of the instruction (its IT state included).
+    pub mod sys {
+        /// The instruction's condition failed: nothing.
+        pub const NOP: i32 = 0;
+        /// MRC: `a` is [`cp`]; returns the value.
+        pub const MRC: i32 = 1;
+        /// MCR: `a` is [`cp`], `b` the value.
+        pub const MCR: i32 = 2;
+        /// MRRC: `a` is [`cp`] (opc2 and CRn 0); returns `Rt2:Rt`.
+        pub const MRRC: i32 = 3;
+        /// MCRR: `a` as MRRC, `b` is `Rt2:Rt`.
+        pub const MCRR: i32 = 4;
+        /// MRS: `a` 0 for the CPSR, 1 for the SPSR; returns the value.
+        pub const MRS: i32 = 5;
+        /// MSR: `a` is the field mask (bits 3:0) and 0x10 for the SPSR;
+        /// `b` the value.
+        pub const MSR: i32 = 6;
+        /// MRS (Banked register): `a` is R:SYSm; returns the value.
+        pub const MRS_BANKED: i32 = 7;
+        /// MSR (Banked register): `a` is R:SYSm, `b` the value.
+        pub const MSR_BANKED: i32 = 8;
+        /// CPS: `a` is imod (1:0), A (2), I (3), F (4), changemode (5) and
+        /// the mode (12:8).
+        pub const CPS: i32 = 9;
+        /// SETEND: `a` 1 for big-endian.
+        pub const SETEND: i32 = 10;
+        /// SRS: `a` is the mode (4:0), the addressing mode (9:8, `Amode`'s
+        /// order IA IB DA DB) and writeback (10).
+        pub const SRS: i32 = 11;
+        /// RFE: `a` is Rn (3:0), the addressing mode (9:8) and writeback (10).
+        pub const RFE: i32 = 12;
+        /// An exception return by a data-processing instruction writing the
+        /// PC with S (SUBS PC, LR and related): `b` is the result.
+        pub const ALU_RETURN: i32 = 13;
+        /// LDM (exception return): `b` is the word loaded for the PC.
+        pub const LDM_RETURN: i32 = 14;
+        /// The User mode's `R<a>` (8..=14), for LDM/STM (user registers).
+        pub const USER_READ: i32 = 15;
+        pub const USER_WRITE: i32 = 16;
+        /// Take exception `a` ([`exc`]) at this instruction, `b` its
+        /// syndrome (the immediate of SVC, SMC, HVC, BKPT).
+        pub const EXCEPTION: i32 = 17;
+        /// WFI, WFE, SEV.
+        pub const WFI: i32 = 18;
+        pub const WFE: i32 = 19;
+        pub const SEV: i32 = 20;
+        /// An UNPREDICTABLE encoding was reached: `a` the encoding, `b` its
+        /// length in bytes. Fails loudly: the architecture gives it no one
+        /// behaviour.
+        pub const UNPREDICTABLE: i32 = 21;
+        /// Something gex does not implement was reached ([`unimpl`] in `a`,
+        /// the encoding in `b`). Fails loudly.
+        pub const UNIMPLEMENTED: i32 = 22;
+        /// An UNDEFINED encoding whose condition failed (B1.9, Conditional
+        /// execution of undefined instructions): IMPLEMENTATION DEFINED
+        /// whether it is a NOP or the Undefined Instruction exception.
+        pub const UNDEF_COND_FAILED: i32 = 23;
+        /// ERET (the Virtualization Extensions).
+        pub const ERET: i32 = 24;
+        /// ISB: a context synchronization event.
+        pub const ISB: i32 = 25;
+        /// A runtime UNPREDICTABLE case the lifter checked: `a` names it
+        /// ([`unpred`]), `b` the value.
+        pub const UNPREDICTABLE_VALUE: i32 = 26;
+
+        /// A coprocessor register operand: coproc (19:16), opc1 (14:12),
+        /// CRn (11:8), CRm (7:4), opc2 (2:0).
+        pub const fn cp(coproc: u8, opc1: u8, crn: u8, crm: u8, opc2: u8) -> i64 {
+            ((coproc as i64 & 15) << 16)
+                | ((opc1 as i64 & 7) << 12)
+                | ((crn as i64 & 15) << 8)
+                | ((crm as i64 & 15) << 4)
+                | (opc2 as i64 & 7)
+        }
+    }
+
+    /// The exceptions of [`sys::EXCEPTION`] (B1.8).
+    pub mod exc {
+        pub const UNDEFINED: i64 = 1;
+        pub const SVC: i64 = 2;
+        pub const PREFETCH_ABORT: i64 = 3;
+        pub const DATA_ABORT: i64 = 4;
+        pub const IRQ: i64 = 5;
+        pub const FIQ: i64 = 6;
+        pub const SMC: i64 = 7;
+        pub const HVC: i64 = 8;
+        /// BKPT: a debug event, taken as a Prefetch Abort (B1.9.7, C4.1).
+        pub const BKPT: i64 = 9;
+        /// The instruction could not be fetched: a Prefetch Abort at it.
+        pub const FETCH: i64 = 10;
+    }
+
+    /// What [`sys::UNIMPLEMENTED`] names.
+    pub mod unimpl {
+        /// A Floating-point or Advanced SIMD instruction's execution.
+        pub const FP: i64 = 1;
+        /// ThumbEE.
+        pub const THUMBEE: i64 = 2;
+        /// The CP14 debug communications channel (LDC/STC to
+        /// DBGDTRTXint/DBGDTRRXint).
+        pub const DEBUG_DTR: i64 = 3;
+    }
+
+    /// What [`sys::UNPREDICTABLE_VALUE`] names.
+    pub mod unpred {
+        /// BXWritePC to an address with bits 1:0 = 0b10 (A2.3.2).
+        pub const BX_ARM_MISALIGNED: i64 = 1;
+        /// A PC value written by an instruction whose result must be word
+        /// aligned in the ARM state (e.g. LDR PC with bits 1:0 = 0b10).
+        pub const PC_MISALIGNED: i64 = 2;
+    }
+
+    /// The access word of [`super::imports::A32_MEM`]: `(pc, va, access)
+    /// -> host address`.
+    pub mod mem {
+        /// log2 of the access size, bits 1:0.
+        pub const SIZE_MASK: i32 = 3;
+        pub const WRITE: i32 = 1 << 2;
+        /// An unprivileged access (LDRT and the like): checked as PL0's.
+        pub const UNPRIV: i32 = 1 << 3;
+        /// log2 of the alignment the instruction requires whatever SCTLR.A
+        /// says (LDM, LDRD, the exclusives, SWP), bits 6:4; 0 for none.
+        pub const ALIGN_SHIFT: u32 = 4;
+        /// The condition failed: no access; the answer is the sink slot.
+        pub const SKIP: i32 = 1 << 7;
+        /// An exclusive access (LDREX, STREX).
+        pub const EXCL: i32 = 1 << 8;
+
+        pub const fn access(size_log2: u32, write: bool, unpriv: bool, align_log2: u32) -> i32 {
+            (size_log2 as i32 & 3)
+                | if write { WRITE } else { 0 }
+                | if unpriv { UNPRIV } else { 0 }
+                | ((align_log2 as i32 & 7) << ALIGN_SHIFT)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Host import surface
 // ---------------------------------------------------------------------------
 
@@ -1147,6 +1335,16 @@ pub mod imports {
     /// `code` is `gex_f80::sse`'s, the operands and the result raw bits
     /// (a single's or an `i32`'s zero-extended).
     pub const MX: &str = "mx";
+
+    /// An AArch32 core's system-level operation (`gex_ir::HostFunc::A32Sys`,
+    /// [`crate::a32::sys`]). Signature `(ctx: i32, pc: i64, op: i32, a: i64,
+    /// b: i64) -> i64`. Imported only by a module of an AArch32 core's code.
+    pub const A32_SYS: &str = "a32_sys";
+
+    /// An AArch32 core's data access translation (`gex_ir::HostFunc::A32Mem`,
+    /// [`crate::a32::mem`]). Signature `(ctx: i32, pc: i64, va: i64, access:
+    /// i32) -> i64`. Imported only by a module of an AArch32 core's code.
+    pub const A32_MEM: &str = "a32_mem";
 
     /// Safepoint poll taken when the interrupt flag is set.
     /// Signature `(ctx: i32, pc: i64) -> ()`.

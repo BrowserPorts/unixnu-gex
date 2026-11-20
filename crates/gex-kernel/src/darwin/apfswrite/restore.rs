@@ -244,8 +244,8 @@ pub fn build_disk0_hooked(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() 
     let device = os.and_then(|o| o.device.as_ref());
     let ap_ticket = device.and_then(|d| d.ap_ticket.as_deref());
     let p = nsih(ap_ticket);
-    let sep = os.and_then(|o| o.boot.as_ref()).zip(device);
-    concurrent_steps(&mut nx, Volumes { system, xart, hardware, preboot, update }, host.as_deref(), &p, sep, now, &mut missing)?;
+    let fw = os.and_then(|o| o.boot.as_ref()).zip(device);
+    concurrent_steps(&mut nx, Volumes { system, xart, hardware, preboot, update }, host.as_deref(), &p, fw, now, &mut missing)?;
     match os {
         Some(os) => {
             // asr's image file written into System (restore_apfs_image_async,
@@ -483,9 +483,10 @@ fn create_directory(nx: &mut Nx<'_>, vol: usize, path: &str, mode: u16, uid: u32
 /// firmware it writes into the Preboot directory is not written.
 pub const UPDATE_SEP_MISSING: &str = "update_device_firmware's update_iBoot (the first entry of _ramrod_update_device_firmware's list, RE@0x100050394): update_sep's <Preboot Root>/usr/standalone/firmware/sep-firmware.img4 (RE@0x10005140c: the host's SEPImageData, the erase identity's SEP IM4P stitched to the AP ticket, written in st_blksize writes), not written: the restore has no AP ticket (RootTicketData) or the IPSW directory no Firmware/all_flash/sep-firmware.j120.RELEASE.im4p";
 
-/// The restore step install_fud is, as a disk0 image's missing steps name
-/// it: its firmware is not written.
-pub const INSTALL_FUD_MISSING: &str = "install_fud's firmware on Preboot (<nsih>/usr/standalone/firmware/FUD and the host's personalized images in it, AOP, AVE and StaticTrustCache for the erase identity)";
+/// update_device_firmware's install_fud (the third entry of its list,
+/// after update_iBoot and update_ean), as a disk0 image's missing steps
+/// name it when the restore cannot run it ([`install_fud`]).
+pub const INSTALL_FUD_MISSING: &str = "update_device_firmware's install_fud (the third entry of _ramrod_update_device_firmware's list, RE@0x100051cd4): <Preboot Root>/usr/standalone/firmware/FUD and the host's FUDImageData written into it as <entry>.img4 (the erase identity's IsFUDFirmware components the device keeps, AVE, AOP and StaticTrustCache, each its IM4P stitched to the AP ticket), not written: the restore has no AP ticket (RootTicketData) or the IPSW directory lacks one of those IM4Ps (Firmware/ave/AppleAVE2FW_H9.im4p, Firmware/AOP/aopfw-ipad7aop.RELEASE.im4p, Firmware/044-76040-038.dmg.trustcache)";
 
 /// The name of the Preboot volume's directory for a device with no AP
 /// ticket given ([`nsih`]).
@@ -509,7 +510,7 @@ pub(crate) fn nsih(ticket: Option<&[u8]>) -> String {
 /// The main thread's steps between restore_asr and await_asr_and_retry
 /// (drafts/s21/re-ops.md sections 3 and 4) as they reach the container.
 #[allow(clippy::too_many_arguments)]
-fn concurrent_steps(nx: &mut Nx<'_>, v: Volumes, host: Option<&str>, p: &str, sep: Option<(&BootObjects, &Device)>, now: &mut dyn FnMut() -> u64, missing: &mut Missing) -> Result<(), String> {
+fn concurrent_steps(nx: &mut Nx<'_>, v: Volumes, host: Option<&str>, p: &str, fw: Option<(&BootObjects, &Device)>, now: &mut dyn FnMut() -> u64, missing: &mut Missing) -> Result<(), String> {
     // init_gigalocker (0x1000176e8 → 0x1000296c8): xART mounted read-write
     // at /mnt7 (`mount_apfs -R`; the `.fseventsd/.ramdisk-boot-done` open
     // after it fails at its lookup), then `seputil --gigalocker-init`,
@@ -559,13 +560,135 @@ fn concurrent_steps(nx: &mut Nx<'_>, v: Volumes, host: Option<&str>, p: &str, se
     // update_device_firmware (0x10001827c → 0x100032980): its list
     // (0x100050034) starts with update_iBoot, whose boot firmware goes to
     // the boot storage and whose update_sep writes the SEP's firmware into
-    // the Preboot directory, then install_fud.
-    match sep {
+    // the Preboot directory, then update_ean (the EAN storage, outside the
+    // container), then install_fud.
+    match fw {
         Some((boot, device)) if device.ap_ticket.is_some() && boot.sep.is_some() => update_sep(nx, v.preboot, p, boot, device, now)?,
         _ => missing.push(UPDATE_SEP_MISSING.into()),
     }
-    missing.push(INSTALL_FUD_MISSING.into());
+    let fud = match fw {
+        Some((boot, device)) if device.ap_ticket.is_some() => install_fud(nx, v.preboot, p, boot, device, now)?,
+        _ => false,
+    };
+    if !fud {
+        missing.push(INSTALL_FUD_MISSING.into());
+    }
     Ok(())
+}
+
+/// What the host sends for install_fud's request
+/// (`RESTORED_DATA_TYPE_FUD_DATA` with `FUDImageList`, RE@0x10002f514; the
+/// host's `_handleDataRequestMessage`, MobileDevice 1860.49.2 0x12cb00):
+/// `AMAuthInstallBundleCopyPersonalizedFUDFirmwareURLs` (0x28655c →
+/// `AMAuthInstallBundleCopyPersonalizedURLsMatchingType` 0x286278) walks
+/// the personalized bundle's receipt `Manifest` and keeps each entry whose
+/// `Info` has `IsFUDFirmware` true (and that `AMAuthInstallBundleSetEntryEnabled`
+/// has not turned off, which only a restore's optional-firmware option
+/// does), the list being that dictionary's keys; each name's
+/// `FUDImageData` is the file `_AMAuthInstallBundlePopulatePersonalizedBundle`
+/// (0x18e6e0) stitched for it, `AMAuthInstallApImg4StitchTicketData`
+/// (0x273810 → 0x2735a0: the IPSW's file as it is when the entry has no
+/// `Img4PayloadType`, then the AP ticket; [`img4`]). The device puts each
+/// in a dictionary of its own in the list's order, which install_fud walks
+/// with `CFDictionaryGetKeysAndValues`.
+///
+/// The order that walk takes is CoreFoundation's: these names' hashes
+/// collide (AOP, Ap,SystemVolumeCanonicalMetadata and StaticTrustCache in
+/// a table of six), so the device's order follows the host's list, whose
+/// own follows the receipt's. Measured with the 21H461 root's
+/// CoreFoundation under gex and the host Mac's (the same hashes and
+/// orders): for every insertion order of a receipt of 12 to 37 of the
+/// erase identity's entries holding these six, built as the host builds
+/// it or deep-copied, the device walks AVE before AOP before
+/// StaticTrustCache (drafts/s36/probe cfdorder, cfchain). A receipt has
+/// every component the AP ticket personalizes (26 for this identity).
+const FUD_ENTRIES: [&str; 6] = ["AOP", "AVE", "Ap,SystemVolumeCanonicalMetadata", "RestoreTrustCache", "StaticTrustCache", "SystemVolume"];
+
+/// The order install_fud writes [`FUD_ENTRIES`]' files in: those of them it
+/// keeps, as the device's dictionary gives them.
+const FUD_WRITE_ORDER: [&str; 3] = ["AVE", "AOP", "StaticTrustCache"];
+
+/// install_fud's override table (RE@0x1002682e8, three entries): MacEFI
+/// installed under `/usr/standalone/firmware/MacEFI/`, the canonical
+/// metadata and the root hash ("NA") not installed.
+const FUD_OVERRIDES: [(&str, &str); 3] = [("MacEFI", "/usr/standalone/firmware/MacEFI/"), ("Ap,SystemVolumeCanonicalMetadata", "NA"), ("SystemVolume", "NA")];
+
+/// install_fud (RE@0x100051cd4): the host's FUD images (`copy_fud_data`,
+/// RE@0x10002f514, the list then each name's data; its check of
+/// `<Preboot Root>/usr/standalone/firmware/FUD/<name>.img4` already on the
+/// volume only reads), then `<Preboot Root>/usr/standalone/firmware/FUD`
+/// made (`_ramrod_create_directory_with_class` 0x100047828: 0755, root's,
+/// class -1, as [`create_directory`]) and each image whose name does not
+/// start with "Restore" and whose override is not "NA" written as
+/// `FUD/<name>.img4` by `_ramrod_write_data_to_file_with_class`
+/// (0x100047ab0: `open_dprotected_np(O_WRONLY | O_CREAT | O_TRUNC, class
+/// -1, 0644)`, which with PROTECTION_CLASS_DEFAULT is open(2)
+/// (openat_dprotected_internal, xnu vfs_syscalls.c:5034), one `write` of
+/// the whole image, `close`), in the device dictionary's order
+/// ([`FUD_WRITE_ORDER`]); no `Ap,ExclaveOSVolume` here. A host answer with
+/// no images writes nothing and makes no directory. False, with nothing
+/// written, when the IPSW directory lacks an image's IM4P (the step is
+/// then listed missing, [`INSTALL_FUD_MISSING`]).
+fn install_fud(nx: &mut Nx<'_>, pb: usize, p: &str, boot: &BootObjects, device: &Device, now: &mut dyn FnMut() -> u64) -> Result<bool, String> {
+    use super::super::plist::Value;
+    use sha2::Digest;
+    let Some(ticket) = device.ap_ticket.as_deref() else {
+        return Err("not implemented: install_fud with no AP ticket for the host to personalize the FUD images with (RootTicketData)".into());
+    };
+    let manifest = super::super::plist::parse(&boot.manifest).map_err(|e| format!("BuildManifest.plist: {e}"))?;
+    let identity = super::super::preboot::erase_identity(&manifest, "j120ap")?;
+    let Some(Value::Dict(components)) = identity.get("Manifest") else { return Err("the build identity has no Manifest".into()) };
+    let mut fud: Vec<&str> = Vec::new();
+    for (key, c) in components {
+        let info = c.get("Info").ok_or_else(|| format!("the build identity's {key} has no Info"))?;
+        match info.get("IsFUDFirmware") {
+            Some(Value::Bool(true)) => fud.push(key),
+            Some(Value::Bool(false)) | None => {}
+            Some(_) => return Err(format!("the build identity's {key} IsFUDFirmware is not a boolean")),
+        }
+    }
+    if fud.is_empty() {
+        return Ok(true);
+    }
+    let mut sorted = fud.clone();
+    sorted.sort_unstable();
+    if sorted != FUD_ENTRIES {
+        return Err(format!("not implemented: install_fud's order for the FUD entries {fud:?} (the device dictionary's order is measured for {FUD_ENTRIES:?} only)"));
+    }
+    let mut images: Vec<(&str, Vec<u8>)> = Vec::new();
+    for &name in &FUD_WRITE_ORDER {
+        if name.starts_with("Restore") || FUD_OVERRIDES.iter().any(|&(n, _)| n == name) {
+            return Err(format!("install_fud's write order names {name}, which it does not install"));
+        }
+        let c = components.iter().find(|(k, _)| k == name).map(|(_, c)| c).ok_or_else(|| format!("the build identity has no {name}"))?;
+        let info = c.get("Info").ok_or_else(|| format!("the build identity's {name} has no Info"))?;
+        if info.get("Personalize") != Some(&Value::Bool(true)) {
+            return Err(format!("not implemented: install_fud's image of {name}, which the build identity does not personalize (the host's receipt holds it only when TSS answers for it)"));
+        }
+        if info.get("Img4PayloadType").is_some() {
+            return Err(format!("not implemented: install_fud's image of {name}, whose IM4P the host recreates with its Img4PayloadType"));
+        }
+        let path = info.get("Path").and_then(Value::as_str).ok_or_else(|| format!("the build identity's {name} has no Info.Path"))?;
+        let im4p = match std::fs::read(boot.dir.join(path)) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(format!("install_fud: the IPSW directory's {path}: {e}")),
+        };
+        let digest = c.get("Digest").and_then(Value::as_data).ok_or_else(|| format!("the build identity's {name} has no Digest"))?;
+        if sha2::Sha384::digest(&im4p).as_slice() != digest {
+            return Err(format!("install_fud: {path} is not the build identity's {name} (its SHA-384 is not the Digest)"));
+        }
+        images.push((name, img4(&im4p, ticket)));
+    }
+    let dir = create_directory(nx, pb, &format!("{p}/usr/standalone/firmware/FUD"), 0o755, 0, 0, now)?;
+    for (name, image) in images {
+        let file = format!("{name}.img4");
+        if fsops::lookup(nx, pb, dir, &file)?.is_some() {
+            return Err(format!("not implemented: install_fud's O_TRUNC of an existing FUD/{file}"));
+        }
+        fsops::write_new_file(nx, pb, dir, &file, 0o644, &image, &cluster_pushes, now)?;
+    }
+    Ok(true)
 }
 
 /// `st_blksize` of a file on the Preboot volume, which write_data_to_fd's
@@ -1139,11 +1262,18 @@ pub const TICKET_STAND_IN: &str = "the AP ticket (the host's RootTicketData from
 const TICKET: [u8; 2] = [0x30, 0x00];
 
 /// What stands in when the AP ticket is the device's: the host's Image4
-/// files are stitched as the ramdisk's libauthinstall stitches
-/// (`AMAuthInstallApImg4Stitch` 0x97d8: `IMG4 { "IMG4", the IM4P, [0] the
-/// ticket }` in minimal DER, an IM4R only for a TSS response's `-TBM`
-/// entry), the host's own copy of AMAuthInstall not measured.
-pub const HOST_IMG4_STAND_IN: &str = "the restore host's Image4 files (KernelCacheFile, DeviceTreeFile, NorImageData's iBoot, SystemImageRootHashFile, SystemImageCanonicalMetadataFile, SEPImageData): stitched as the restore ramdisk's libauthinstall stitches (AMAuthInstallApImg4Stitch: IMG4 { \"IMG4\", the IPSW's IM4P, [0] the AP ticket } in minimal DER, no IM4R without a TSS -TBM entry), the host's own AMAuthInstall not measured (measure the files beside /private/preboot/<nsih>/System/Library/Caches/apticket.der on the device)";
+/// files. The host Mac's AMAuthInstall (MobileDevice 1860.49.2) stitches an
+/// entry with no `Img4PayloadType` as [`img4`] does
+/// (`AMAuthInstallApImg4StitchData` 0x2735a0 → `_AMAuthInstallApImg4StitchToURL`
+/// 0x1867fc: `Img4EncodeImg4Header`, the IA5 "IMG4", the IPSW's file,
+/// `Img4EncodeManifestHeader`, the ticket; `__DEREncoderEncodeHeader`
+/// 0x1a2e28 writes minimal lengths), then
+/// `AMAuthInstallApImg4StitchRestoreInfoWithAMAI` (0x186b5c) adds an IM4R
+/// for a TSS response's `<entry>-TBM` or, by `kObjectDefaultIM4RTagMap`
+/// (0x465af0), `snid` to SepStage1, SEP and RestoreSEP when the device
+/// gave a SEP nonce slot ID and `anid` to LLB when it gave an AP one:
+/// whether the J120's restore gives slot IDs is not traced.
+pub const HOST_IMG4_STAND_IN: &str = "the restore host's Image4 files (KernelCacheFile, DeviceTreeFile, NorImageData's iBoot, SystemImageRootHashFile, SystemImageCanonicalMetadataFile, SEPImageData, FUDImageData): stitched as the host Mac's AMAuthInstall stitches an entry with no Img4PayloadType (MobileDevice 1860.49.2 AMAuthInstallApImg4StitchData: IMG4 { \"IMG4\", the IPSW's IM4P, [0] the AP ticket } in minimal DER), with no IM4R: AMAuthInstallApImg4StitchRestoreInfoWithAMAI adds one for a TSS -TBM entry (none in the web device's response) or, by kObjectDefaultIM4RTagMap, snid to SEPImageData when the device reports a SEP nonce slot ID (SEPNonceSlotID), which the J120's restore was not traced to report or not (measure the files beside /private/preboot/<nsih>/System/Library/Caches/apticket.der on the device)";
 
 /// What the host answers that decides which of the list's files exist:
 /// install_device_tree runs only for a RestoreProtocolVersion of 15 or more
@@ -2941,6 +3071,124 @@ mod tests {
         let (ty, _) = super::super::seal::img4_payload(&got).unwrap();
         assert_eq!(ty, b"sepi");
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// install_fud on a Preboot volume as update_sep leaves it:
+    /// `<nsih>/usr/standalone/firmware/FUD` made 0755 by root, then
+    /// AVE.img4, AOP.img4 and StaticTrustCache.img4 in that order (their
+    /// inode numbers rising), each 0644 root's, the IMG4 of the IPSW's IM4P
+    /// and the AP ticket; the Restore entry, the canonical metadata and the
+    /// root hash not installed. Nothing is written when the IPSW directory
+    /// lacks an image, an identity with no FUD entries makes no directory,
+    /// and a set of entries whose order is not measured, an entry the host
+    /// would retype and a file already there are refused.
+    #[test]
+    fn install_fud_writes_the_personalized_fud_images() {
+        use super::super::super::plist::{self, Value};
+        use crate::darwin::apfsread::Container;
+        use crate::darwin::image4::enc;
+        use sha2::Digest;
+        let im4p = |ty: &[u8; 4], n: u32| enc::seq(&[enc::ia5(b"IM4P"), enc::ia5(ty), enc::ia5(b"test"), enc::octets(&(0..n).map(|i| (i * 7 + u32::from(ty[0])) as u8).collect::<Vec<u8>>())]);
+        // The six IsFUDFirmware components, with the files of the three
+        // written (one larger than a cluster map), and one that is not FUD.
+        let files: Vec<(&str, &str, Vec<u8>)> = vec![
+            ("AVE", "Firmware/ave/AppleAVE2FW_H9.im4p", im4p(b"avef", 70_000)),
+            ("AOP", "Firmware/AOP/aopfw-ipad7aop.RELEASE.im4p", im4p(b"aopf", 9_000)),
+            ("StaticTrustCache", "Firmware/044-76040-038.dmg.trustcache", im4p(b"trst", 3_000)),
+        ];
+        let comp = |path: &str, digest: Vec<u8>, fud: bool, extra: Option<(&str, Value)>| {
+            let mut info = vec![("IsFUDFirmware".into(), Value::Bool(fud)), ("Path".into(), Value::String(path.into())), ("Personalize".into(), Value::Bool(true))];
+            info.extend(extra.map(|(k, v)| (k.to_string(), v)));
+            Value::Dict(vec![("Digest".into(), Value::Data(digest)), ("Info".into(), Value::Dict(info))])
+        };
+        let manifest = |set: &[&str], retype: Option<&str>| {
+            let mut m: Vec<(String, Value)> = Vec::new();
+            for &name in set {
+                let (path, digest) = match files.iter().find(|f| f.0 == name) {
+                    Some((_, p, b)) => (p.to_string(), sha2::Sha384::digest(b).to_vec()),
+                    None => (format!("Firmware/{name}"), vec![0; 48]),
+                };
+                let extra = (retype == Some(name)).then(|| ("Img4PayloadType", Value::String("xxxx".into())));
+                m.push((name.to_string(), comp(&path, digest, true, extra)));
+            }
+            m.push(("iBoot".into(), comp("Firmware/all_flash/iBoot.j120.RELEASE.im4p", vec![0; 48], false, None)));
+            let identity = Value::Dict(vec![
+                ("Info".into(), Value::Dict(vec![("DeviceClass".into(), Value::String("j120ap".into())), ("Variant".into(), Value::String(crate::darwin::preboot::cryptex1::ERASE_VARIANT.into()))])),
+                ("Manifest".into(), Value::Dict(m)),
+            ]);
+            plist::to_xml(&Value::Dict(vec![("BuildIdentities".into(), Value::Array(vec![identity]))]))
+        };
+        let ipsw = std::env::temp_dir().join(format!("gex-fud-ipsw-{}", std::process::id()));
+        for (_, path, bytes) in &files {
+            let f = ipsw.join(path);
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, bytes).unwrap();
+        }
+        let empty = std::env::temp_dir().join(format!("gex-fud-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&empty).unwrap();
+        let boot = |set: &[&str], retype: Option<&str>, dir: &std::path::Path| BootObjects { kernelcache: vec![], devicetree: vec![], iboot: vec![], root_hash: vec![], sep: None, manifest: manifest(set, retype), dir: dir.to_path_buf() };
+        let ticket: Vec<u8> = enc::seq(&[enc::ia5(b"IM4M"), enc::int(0), vec![0x31, 0x00]]);
+        let device = Device { nvram: None, tree: web_device_tree(), cryptex1_ticket: vec![], ap_ticket: Some(ticket.clone()), ap_anchor: Err("not used".into()) };
+        let p = nsih(Some(&ticket));
+
+        let blocks = 15_625_000u64;
+        let tmp = std::env::temp_dir().join(format!("gex-fud-{}", std::process::id()));
+        let f = std::fs::OpenOptions::new().create(true).truncate(true).read(true).write(true).open(&tmp).unwrap();
+        f.set_len(blocks * 4096).unwrap();
+        let sink = std::sync::Arc::new(super::super::HostFile(f, blocks * 4096));
+        let uuid = *b"gex-install-fud!";
+        let fm = container::format(&*sink, 4096, blocks, uuid).unwrap();
+        let mut nx = Nx::formatted(&*sink, &fm, uuid, Mode::Kernel).unwrap();
+        nx.mount_rw().unwrap();
+        let mut t = 1_700_000_000_000_000_000u64;
+        let mut now = || {
+            t += 1000;
+            t
+        };
+        let kv = key_os_version(RESTORE_BUILD).unwrap();
+        let times = VolumeTimes { formatted: now(), root: now(), private: now(), modified: now() };
+        let o = nx.create_volume(&NewVolume { name: "Preboot".into(), role: storage::role::PREBOOT, encrypted: false, e_apfs: true, times, uid: 0, gid: 0, key_os_version: kv, size_bytes: None }).unwrap();
+        nx.commit().unwrap();
+        let vol = nx.fs_oid.iter().position(|&x| x == o).unwrap();
+        fsops::mount_rw(&mut nx, vol, &mut now).unwrap();
+        let fw = create_directory(&mut nx, vol, &format!("{p}/usr/standalone/firmware"), 0o755, 0, 0, &mut now).unwrap();
+        // Refusals and the cases that write nothing.
+        assert!(install_fud(&mut nx, vol, &p, &boot(&["AOP", "AVE"], None, &ipsw), &device, &mut now).unwrap_err().contains("order"));
+        assert!(install_fud(&mut nx, vol, &p, &boot(&FUD_ENTRIES, Some("AOP"), &ipsw), &device, &mut now).unwrap_err().contains("Img4PayloadType"));
+        assert!(install_fud(&mut nx, vol, &p, &boot(&[], None, &ipsw), &device, &mut now).unwrap());
+        assert!(!install_fud(&mut nx, vol, &p, &boot(&FUD_ENTRIES, None, &empty), &device, &mut now).unwrap());
+        assert_eq!(fsops::lookup(&mut nx, vol, fw, "FUD").unwrap(), None);
+        install_fud(&mut nx, vol, &p, &boot(&FUD_ENTRIES, None, &ipsw), &device, &mut now).unwrap();
+        assert!(install_fud(&mut nx, vol, &p, &boot(&FUD_ENTRIES, None, &ipsw), &device, &mut now).unwrap_err().contains("O_TRUNC"));
+        fsops::unmount(&mut nx, vol, false, &mut now).unwrap();
+        nx.unmount().unwrap();
+        drop(nx);
+        let c = std::sync::Arc::new(Container::open(sink.clone()).unwrap());
+        let v = c.volume(vol).unwrap().unwrap();
+        let mut d = 2;
+        for comp in format!("{p}/usr/standalone/firmware/FUD").split('/') {
+            d = v.lookup(d, comp).unwrap().unwrap().file_id;
+        }
+        let dir = v.inode(d).unwrap().unwrap();
+        assert_eq!((dir.mode & 0o7777, dir.owner, dir.group), (0o755, 0, 0));
+        let mut last = d;
+        for (name, _, bytes) in &files {
+            let e = v.lookup(d, &format!("{name}.img4")).unwrap().unwrap_or_else(|| panic!("no {name}.img4"));
+            assert!(e.file_id > last, "{name}.img4 written after the one before it");
+            last = e.file_id;
+            let ino = v.inode(e.file_id).unwrap().unwrap();
+            let want = img4(bytes, &ticket);
+            assert_eq!((ino.mode & 0o7777, ino.owner, ino.group, v.file_size(&ino).unwrap()), (0o644, 0, 0, want.len() as u64), "{name}");
+            let mut got = vec![0u8; want.len()];
+            v.read_file(&ino, 0, &mut got).unwrap();
+            assert_eq!(got, want, "{name}");
+        }
+        for name in ["RestoreTrustCache", "Ap,SystemVolumeCanonicalMetadata", "SystemVolume"] {
+            assert_eq!(v.lookup(d, &format!("{name}.img4")).unwrap().map(|e| e.name), None, "{name} is not installed");
+        }
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_dir_all(&ipsw);
+        let _ = std::fs::remove_dir_all(&empty);
     }
 
     /// `seputil --gigalocker-init` in the restore names the file by the

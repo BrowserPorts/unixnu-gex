@@ -104,9 +104,7 @@ rm -f "$OUT.p32"
 
 # The `.m64` name a 64-bit memory's page loads (runtime.js, run-node.mjs):
 # the same module, since it serves both flavours.
-if [ -n "$ARCH_FEATURES" ]; then
-    cp page/public/gex/gex_kernel$INFIX.wasm page/public/gex/gex_kernel$INFIX.m64.wasm
-fi
+cp page/public/gex/gex_kernel$INFIX.wasm page/public/gex/gex_kernel$INFIX.m64.wasm
 
 node page/build-inputs.mjs stamp page/public/gex "gex_kernel$INFIX=$INPUTS_KEY"
 

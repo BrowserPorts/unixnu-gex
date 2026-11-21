@@ -234,11 +234,13 @@ $GEXC seed -o page/public/gex/seed$INFIX.wasm --no-shared-memory >/dev/null
 $GEXC seed -o page/public/gex/seed$INFIX.shared.wasm >/dev/null
 echo "  seed: rebuilt from this emitter"
 
-# `GEX_MEM64=1`: also the wasm64 shim for a 64-bit guest memory, x86-64
-# guests only. Same source, target wasm64-unknown-unknown (nightly, build-std),
-# shared memory only; its memory is a memory64 of LIMIT64 (16 GiB). The
-# layout below 4 GiB is the wasm32 one. Artefacts get `.m64` after the arch.
-if [ -n "${GEX_MEM64:-}" ] && [ -n "$ARCH_FEAT" ]; then
+# `GEX_MEM64=1`: also the wasm64 shim for a 64-bit guest memory, for either
+# guest: an x86-64 program that asks for one, and an AArch64 Darwin process,
+# whose images live above 4 GiB. Same source, target wasm64-unknown-unknown
+# (nightly, build-std), shared memory only; its memory is a memory64 of
+# LIMIT64 (16 GiB). The layout below 4 GiB is the wasm32 one. Artefacts get
+# `.m64` after the arch.
+if [ -n "${GEX_MEM64:-}" ]; then
     M64OUT=target/wine64$TSUF/wasm64-unknown-unknown/release/gex_browser.wasm
     LINK64=$(echo "$LINK" | sed "s/--max-memory=$GUEST_BYTES/--max-memory=$((16 << 30))/")
     if RUSTFLAGS="$LINK64 \

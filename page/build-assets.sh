@@ -28,7 +28,8 @@ mkdir -p "$PUB/gex" "$PUB/rootfs" "$WORK"
 # -- the runtime -----------------------------------------------------------
 
 echo "building the shim..."
-"$ROOT/hosts/browser/build.sh" >/dev/null
+# With the wasm64 one for a 64-bit memory, which a Darwin process runs in.
+GEX_MEM64=1 "$ROOT/hosts/browser/build.sh" >/dev/null
 cp "$ROOT/target/wasm32-unknown-unknown/release/gex_browser.wasm" "$PUB/gex/"
 
 # Do the shim and the glue agree, in both directions -- every export the page

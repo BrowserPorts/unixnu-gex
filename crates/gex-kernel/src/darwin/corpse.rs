@@ -235,7 +235,7 @@ pub fn get_ref(f: u16, who: (&str, i32)) -> Result<(), u64> {
 /// it: on the host's standard error. (`os_log`'s own reader, `/dev/oslog`,
 /// is not modelled, and says so when opened.)
 pub fn kernel_log(line: String) {
-    eprintln!("{line}");
+    crate::darwin_say!("{line}");
 }
 
 /// `task_crashinfo_release_ref`.
@@ -1098,7 +1098,7 @@ impl crate::syscalls::Kernel {
     /// sender ends the corpse.
     fn darwin_corpse_delivered(&mut self, kr: u64) {
         if kr != KERN_SUCCESS {
-            eprintln!("Failed to send exception EXC_CORPSE_NOTIFY. error code: {} for pid {}", kr as i32, self.pid);
+            crate::darwin_say!("Failed to send exception EXC_CORPSE_NOTIFY. error code: {} for pid {}", kr as i32, self.pid);
         }
         if let Some(port) = self.dtask.corpse.as_mut().and_then(|c| c.port.take()) {
             self.ipc().release_send(port);

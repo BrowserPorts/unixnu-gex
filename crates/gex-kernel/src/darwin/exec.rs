@@ -521,7 +521,7 @@ impl Kernel {
         self.dtask.p_name.set(name);
         if let Err(why) = self.darwin_exec_csflags(lr.sig, lr.csflags) {
             if self.trace {
-                eprintln!("[gex:{}] AMFI: killing {}: {why}", self.pid, l.exe_path);
+                crate::darwin_say!("[gex:{}] AMFI: killing {}: {why}", self.pid, l.exe_path);
             }
             return Err(Errno::EPERM);
         }
@@ -532,7 +532,7 @@ impl Kernel {
         let vnode = self.vfs.canonical(&self.vfs.absolute(pending.script.as_deref().unwrap_or(l.exe_path)));
         if let Err(super::sandboxes::Kill(why)) = self.darwin_sb_label_update_execve(&super::sandboxes::Exec { path: &vnode, spawnattrs: pending.spawnattrs.as_deref(), marked: pending.marked }) {
             if self.trace {
-                eprintln!("[gex:{}] Sandbox: hook..execve() killing {}[pid={}, uid={}]: {why}", self.pid, vnode, self.pid, self.creds.uid());
+                crate::darwin_say!("[gex:{}] Sandbox: hook..execve() killing {}[pid={}, uid={}]: {why}", self.pid, vnode, self.pid, self.creds.uid());
             }
             return Err(Errno::EPERM);
         }
@@ -574,7 +574,7 @@ impl Kernel {
         // mpo_proc_notify_exec_complete.
         if let Err(why) = self.darwin_sb_exec_complete() {
             if self.trace {
-                eprintln!("[gex:{}] Sandbox: killing {}: {why}", self.pid, l.exe_path);
+                crate::darwin_say!("[gex:{}] Sandbox: killing {}: {why}", self.pid, l.exe_path);
             }
             return Err(Errno::EPERM);
         }

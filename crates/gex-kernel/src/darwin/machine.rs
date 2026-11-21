@@ -174,10 +174,8 @@ pub fn end(e: Event) -> ! {
         match HOOK.get() {
             Some(h) => h(&e),
             None => {
-                use std::io::Write;
-                let mut err = std::io::stderr().lock();
-                let _ = err.write_all(&e.console());
-                let _ = writeln!(err, "[gex] the machine ended ({:?} by pid {}, {:?}) with no host to take it", e.kind, e.pid, e.cause);
+                super::report::write(&e.console());
+                crate::darwin_say!("[gex] the machine ended ({:?} by pid {}, {:?}) with no host to take it", e.kind, e.pid, e.cause);
             }
         }
     }

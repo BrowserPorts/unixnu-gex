@@ -342,7 +342,7 @@ impl Kernel {
     pub(crate) fn darwin_authorize(&mut self, cred: &Cred, vp: &Node, dvp: Option<&Node>, action: u32) -> Result<(), Errno> {
         let r = self.darwin_authorize_check(cred, vp, dvp, action);
         if self.trace && r.is_err() {
-            eprintln!("[gex:{}] vnode_authorize of {action:#x} by {}:{} refused: {:?} ({:?} {:?})", self.pid, cred.uid, cred.gid(), r, vp.vtype, vp.attrs);
+            crate::darwin_say!("[gex:{}] vnode_authorize of {action:#x} by {}:{} refused: {:?} ({:?} {:?})", self.pid, cred.uid, cred.gid(), r, vp.vtype, vp.attrs);
         }
         match r {
             Ok(()) => Ok(()),

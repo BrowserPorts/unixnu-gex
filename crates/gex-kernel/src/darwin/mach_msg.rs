@@ -1674,7 +1674,7 @@ impl Kernel {
     fn darwin_guard_exception(&mut self, name: u32, g: Guard, portguard: u64) {
         const MAX_FATAL: u32 = 1 << 7;
         if (g as u32) <= MAX_FATAL {
-            eprintln!("[gex:{}] EXC_GUARD (GUARD_TYPE_MACH_PORT, flavor {:#x}, name {name:#x}, guard {portguard:#x}): the task is killed", self.pid, g as u32);
+            crate::darwin_say!("[gex:{}] EXC_GUARD (GUARD_TYPE_MACH_PORT, flavor {:#x}, name {name:#x}, guard {portguard:#x}): the task is killed", self.pid, g as u32);
             self.dtask.guard_kill = true;
         }
     }

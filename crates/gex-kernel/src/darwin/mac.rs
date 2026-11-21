@@ -904,7 +904,7 @@ impl Kernel {
         // the object it names.
         if flags & 0x0100_0084 != 0 && !a.quiet && self.trace {
             let object = a.string.as_deref().map(|s| format!(" {}", String::from_utf8_lossy(s))).unwrap_or_default();
-            eprintln!("[gex:{}] Sandbox: {}({}) {}({errno}) {}{object}", self.pid, self.exe_path, self.pid, if errno != 0 { "deny" } else { "allow" }, OPERATION_NAMES.get(op).copied().unwrap_or("?"));
+            crate::darwin_say!("[gex:{}] Sandbox: {}({}) {}({errno}) {}{object}", self.pid, self.exe_path, self.pid, if errno != 0 { "deny" } else { "allow" }, OPERATION_NAMES.get(op).copied().unwrap_or("?"));
         }
         (errno, flags, fx)
     }

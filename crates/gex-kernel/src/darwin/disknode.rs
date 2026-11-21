@@ -51,7 +51,7 @@ pub fn install(sink: Arc<dyn Sink>, missing: Vec<String>) -> Result<(), String> 
     }
     DISK.set(Disk { sink, missing }).map_err(|_| "a disk0 image is installed already".to_string())?;
     // The stand-in the kernel's container takes at run time, once.
-    eprintln!("[gex] Darwin: the disk0 image served with a stand-in: {VNODE_STAND_IN}");
+    crate::darwin_say!("[gex] Darwin: the disk0 image served with a stand-in: {VNODE_STAND_IN}");
     Ok(())
 }
 

@@ -453,7 +453,7 @@ impl Kernel {
                     Err(AddError::Invalid) => return Err(super::errno::EBADEXEC),
                     Err(AddError::Policy(why, _)) => {
                         if self.trace {
-                            eprintln!("[gex:{}] validation of code signature failed through MACF policy: {why}", self.pid);
+                            crate::darwin_say!("[gex:{}] validation of code signature failed through MACF policy: {why}", self.pid);
                         }
                         return Err(Errno::EPERM);
                     }
@@ -549,7 +549,7 @@ impl Kernel {
             Err(AddError::Invalid) => Err(super::errno::EBADEXEC),
             Err(AddError::Policy(why, _)) => {
                 if self.trace {
-                    eprintln!("[gex:{}] {path}: validation of code signature failed through MACF policy: {why}", self.pid);
+                    crate::darwin_say!("[gex:{}] {path}: validation of code signature failed through MACF policy: {why}", self.pid);
                 }
                 Err(super::errno::EBADEXEC)
             }

@@ -114,6 +114,7 @@ pub mod psem;
 pub mod psynch;
 pub mod reason;
 pub mod reboot;
+pub mod report;
 pub mod rlimit;
 pub mod rusage;
 pub mod sandbox;
@@ -207,9 +208,9 @@ pub fn boot(trust_cache: Option<&[u8]>, sandbox: SandboxProfiles, device_tree: O
     if let Some(src) = &nvram {
         chosen.extend(src.chosen()?);
         if let Some(gaps) = src.unmeasured() {
-            eprintln!("[gex] Darwin: {gaps}");
+            crate::darwin_say!("[gex] Darwin: {gaps}");
         }
-        eprintln!("[gex] Darwin: {NVRAM_WRITERS_UNMODELLED}");
+        crate::darwin_say!("[gex] Darwin: {NVRAM_WRITERS_UNMODELLED}");
     }
     match device_tree {
         Some(t) => {
@@ -237,7 +238,7 @@ pub fn boot(trust_cache: Option<&[u8]>, sandbox: SandboxProfiles, device_tree: O
     pagecache::set_on();
     // The device facts that stand in until measured, once at start.
     if let Some(gaps) = storage::unmeasured() {
-        eprintln!("[gex] Darwin: {gaps}");
+        crate::darwin_say!("[gex] Darwin: {gaps}");
     }
     for (vol, spec) in volume_attrs {
         volattrs::set(vol, spec)?;
@@ -749,7 +750,7 @@ impl crate::syscalls::Kernel {
     /// SIGSYS when the call returns ([`Self::darwin_strict_stop`]).
     pub fn darwin_unimplemented(&mut self, what: String) {
         if self.dtask.said.insert(what.clone()) || self.trace {
-            eprintln!("[gex:{}] Darwin: not implemented: {what}", self.pid);
+            crate::darwin_say!("[gex:{}] Darwin: not implemented: {what}", self.pid);
         }
         if self.dtask.strict && self.dtask.stop.is_none() {
             self.dtask.stop = Some(what);

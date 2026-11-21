@@ -1173,6 +1173,6 @@ mod tests {
         let sha = |p: &str| hex(&sha2::Sha256::digest(file(&a, p).unwrap()));
         assert_eq!(sha("digest.db"), "cbf2bc5a688a2c712b52ae50c854469d40f7c66abb4f8acd57b0ded842435e19");
         assert_eq!(sha("mtree.txt"), "2a59ded00e7ecb973eb293a35585cd824bb656affedc5a433ff4a6ff85326eb6");
-        eprintln!("044-76040-038.dmg.mtree: decoded in {decoded:?}, read in {:?}", t.elapsed());
+        crate::darwin_say!("044-76040-038.dmg.mtree: decoded in {decoded:?}, read in {:?}", t.elapsed());
     }
 }

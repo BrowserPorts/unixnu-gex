@@ -1948,7 +1948,7 @@ mod platform {
                 Outcome::Unported(w) => *unported.entry(w).or_insert(0) += 1,
             }
         }
-        eprintln!("decided {decided}, unported {unported:?}");
+        crate::darwin_say!("decided {decided}, unported {unported:?}");
     }
 
     /// A real builtin collection (`GEX_SANDBOX_BUILTIN`, the kernelcache's
@@ -1969,7 +1969,7 @@ mod platform {
                     Outcome::Unported(w) => format!("{op}:?{w}"),
                 })
                 .collect();
-            eprintln!("{name} {:#x} {}", p.flags, out.join(" "));
+            crate::darwin_say!("{name} {:#x} {}", p.flags, out.join(" "));
         }
     }
 }

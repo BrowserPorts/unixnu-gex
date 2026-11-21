@@ -1623,6 +1623,6 @@ mod tests {
             }
             n += 1;
         }
-        eprintln!("{n} streams: {by_fast} by libcompression's decoder, {by_strict} by liblzma's alone, {refused} refused");
+        crate::darwin_say!("{n} streams: {by_fast} by libcompression's decoder, {by_strict} by liblzma's alone, {refused} refused");
     }
 }

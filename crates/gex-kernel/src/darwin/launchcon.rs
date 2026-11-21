@@ -1384,7 +1384,7 @@ impl crate::syscalls::Kernel {
     fn darwin_lc_log(&self, log: &[String]) {
         if self.trace {
             for l in log {
-                eprintln!("[gex:{}] {l}", self.pid);
+                crate::darwin_say!("[gex:{}] {l}", self.pid);
             }
         }
     }

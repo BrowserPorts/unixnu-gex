@@ -665,7 +665,7 @@ impl Kernel {
         }
         if self.trace {
             let how = if suspended { ", suspended" } else { "" };
-            eprintln!("[gex:{}] bsdthread_create(func {func:#x}, stack {stack:#x}) = thread {} (port {port:#x}){how}", self.pid, req.tid);
+            crate::darwin_say!("[gex:{}] bsdthread_create(func {func:#x}, stack {stack:#x}) = thread {} (port {port:#x}){how}", self.pid, req.tid);
         }
         use super::sched::RunState;
         if suspended {

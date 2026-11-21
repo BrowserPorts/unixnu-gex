@@ -91,7 +91,7 @@ impl Kernel {
         if super::kobject::DEVELOPER_MODE {
             self.darwin_unimplemented("a synchronous EXC_GUARD for a descriptor under Developer Mode (task_exception_notify)".into());
         }
-        eprintln!("[gex:{}] EXC_GUARD (GUARD_TYPE_FD, code {code:#x}, guard {subcode:#x}): the task is killed", self.pid);
+        crate::darwin_say!("[gex:{}] EXC_GUARD (GUARD_TYPE_FD, code {code:#x}, guard {subcode:#x}): the task is killed", self.pid);
         let th = self.dtask.threads.map.entry(self.tid).or_default();
         th.uu_exception = EXC_GUARD;
         th.uu_code = code as i64;

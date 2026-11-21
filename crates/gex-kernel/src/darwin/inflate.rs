@@ -521,7 +521,7 @@ mod tests {
             }
             n += 1;
         }
-        eprintln!("{n} streams: {accepted} decoded to bytes; {undefined} reading unset memory, of which the host's scratch changed {host_undefined}");
+        crate::darwin_say!("{n} streams: {accepted} decoded to bytes; {undefined} reading unset memory, of which the host's scratch changed {host_undefined}");
     }
 
     #[test]

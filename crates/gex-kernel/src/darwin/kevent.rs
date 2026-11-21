@@ -633,7 +633,7 @@ impl Kernel {
             return;
         }
         if m.write_u64(tsd + offset, R2K_WORKLOOP_PENDING_EVENTS).is_err() {
-            eprintln!("[gex:{}] pid {} (tid:{tid}): copyout of return_to_kernel ast flags failed with ast_addr = {}", self.pid, self.pid, tsd + offset);
+            crate::darwin_say!("[gex:{}] pid {} (tid:{tid}): copyout of return_to_kernel ast flags failed with ast_addr = {}", self.pid, self.pid, tsd + offset);
         }
     }
 

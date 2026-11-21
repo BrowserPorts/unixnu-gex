@@ -814,7 +814,7 @@ impl Kernel {
             let pio = self.path_io();
             let raw = m.read_cstr(path, 4096)?;
             if self.trace {
-                eprintln!("[gex:{}] getattrlist {:?} {:x?} options {options:#x} size {size}", self.pid, String::from_utf8_lossy(&raw), alist.set);
+                crate::darwin_say!("[gex:{}] getattrlist {:?} {:x?} options {options:#x} size {size}", self.pid, String::from_utf8_lossy(&raw), alist.set);
             }
             if raw.len() >= al::MAXPATHLEN {
                 return Err(Errno::ENAMETOOLONG);

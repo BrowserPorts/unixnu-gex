@@ -11,7 +11,6 @@
 //! `disableConsoleOutput` (`gc_pause`), so there nothing shows what the
 //! console was given; no call can see the difference.
 
-use std::io::Write;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use super::ptmx::{makedev, PTC_MAJOR, PTSD_MAJOR};
@@ -238,9 +237,7 @@ pub fn console_write(s: &[u8]) {
         }
         out.push(c);
     }
-    let mut e = std::io::stderr().lock();
-    let _ = e.write_all(&out);
-    let _ = e.flush();
+    super::report::write(&out);
 }
 
 #[cfg(test)]

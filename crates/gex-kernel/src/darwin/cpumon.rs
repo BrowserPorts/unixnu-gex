@@ -338,7 +338,7 @@ impl Kernel {
                     interval = MAX_CPUMON_INTERVAL;
                 }
                 if warn {
-                    eprintln!("process {}[{}] denied attempt to escape CPU monitor (missing required entitlement).", self.darwin_p_name_str(), self.pid);
+                    crate::darwin_say!("process {}[{}] denied attempt to escape CPU monitor (missing required entitlement).", self.darwin_p_name_str(), self.pid);
                 }
                 self.dtask.cpuusage.perthr_percentage = percentage;
                 self.dtask.cpuusage.perthr_interval = interval;
@@ -527,16 +527,16 @@ impl Kernel {
         let thread_id = self.thread_signals.get(tid).map_or(0, |t| t.darwin_id());
         let name = self.darwin_p_name_str();
         let tv = |ns: u64| format!("{}.{:06}", ns / NSEC_PER_SEC, ns % NSEC_PER_SEC / 1000);
-        eprintln!("process {name}[{}] thread {thread_id} caught burning CPU! It used more than {percentage}% CPU over {interval_sec} seconds", self.pid);
-        eprintln!("  (actual recent usage: {usage_percent}% over ~{} seconds)", (last_refill_ns + NSEC_PER_SEC / 2) / NSEC_PER_SEC);
-        eprintln!("  Thread lifetime cpu usage {}s, ({} user, {} sys)", tv(user + sys), tv(user), tv(sys));
-        eprintln!("  Ledger balance: {}; mabs credit: {}; mabs debit: {}", l.balance(), l.credit, l.debit);
-        eprintln!("  mabs limit: {}; mabs period: {} ns; last refill: {last_refill_ns} ns{}.", l.limit, interval_ns, if fatal { " [fatal violation]" } else { "" });
+        crate::darwin_say!("process {name}[{}] thread {thread_id} caught burning CPU! It used more than {percentage}% CPU over {interval_sec} seconds", self.pid);
+        crate::darwin_say!("  (actual recent usage: {usage_percent}% over ~{} seconds)", (last_refill_ns + NSEC_PER_SEC / 2) / NSEC_PER_SEC);
+        crate::darwin_say!("  Thread lifetime cpu usage {}s, ({} user, {} sys)", tv(user + sys), tv(user), tv(sys));
+        crate::darwin_say!("  Ledger balance: {}; mabs credit: {}; mabs debit: {}", l.balance(), l.credit, l.debit);
+        crate::darwin_say!("  mabs limit: {}; mabs period: {} ns; last refill: {last_refill_ns} ns{}.", l.limit, interval_ns, if fatal { " [fatal violation]" } else { "" });
         // send_resource_violation: host_get_special_port's
         // HOST_RESOURCE_NOTIFY_PORT, which no task here can have set
         // (host_set_special_port), so the send has no destination.
         const MACH_SEND_INVALID_DEST: u32 = 0x1000_0003;
-        eprintln!("send_resource_violation(CPU usage, ...): error {MACH_SEND_INVALID_DEST:#x}");
+        crate::darwin_say!("send_resource_violation(CPU usage, ...): error {MACH_SEND_INVALID_DEST:#x}");
         // exception_triage(EXC_RESOURCE, code): with no handler but the
         // kernel's, nothing (EXC_RESOURCE is no signal).
         if self.darwin_exc_handled(super::exception::EXC_RESOURCE) {

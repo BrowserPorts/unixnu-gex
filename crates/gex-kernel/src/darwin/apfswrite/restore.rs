@@ -3567,7 +3567,7 @@ mod tests {
                 .map_err(|e| e.to_string())?;
             assert!(copy.success());
             let run = std::process::Command::new(&tool).args(["-d"]).arg(&cp).args(["-s", "1", "-n", super::super::asr::IMAGE_NAME, "-f"]).output().map_err(|e| e.to_string())?;
-            eprintln!("{}", String::from_utf8_lossy(&run.stderr));
+            crate::darwin_say!("{}", String::from_utf8_lossy(&run.stderr));
             assert!(run.status.success(), "apfs_invert failed");
             // The binary's clock readings, from its volume superblock.
             use crate::darwin::apfsread::Medium as _;
@@ -3668,7 +3668,7 @@ mod tests {
             copy_container(&dp, &cp, base, psize);
             let run = std::process::Command::new(&tool).arg("-R").arg(&pp).arg("-I").arg(&rh).arg("-P").arg("-u").arg(&dbp).args(["-d", "-v"]).arg(&cp).output().map_err(|e| e.to_string())?;
             let log = String::from_utf8_lossy(&run.stderr);
-            eprintln!("{}", log.lines().filter(|l| !l.contains("skipping extended attribute file extent")).collect::<Vec<_>>().join("\n"));
+            crate::darwin_say!("{}", log.lines().filter(|l| !l.contains("skipping extended attribute file extent")).collect::<Vec<_>>().join("\n"));
             assert!(run.status.success(), "apfs_sealvolume failed");
             // The binary's clock readings, from its volume superblock.
             let ctr = super::super::HostFile(std::fs::File::open(&cp).unwrap(), psize);
@@ -3720,7 +3720,7 @@ mod tests {
                 // -M: the container keybag is KEYS_STAND_IN's plaintext.
                 let dev = std::process::Command::new(&fsck).args(["-n", "-W", "-s", "-M"]).arg(&cp2).output().unwrap();
                 let host = std::process::Command::new("/sbin/fsck_apfs").args(["-n", "-s", "-M"]).arg(&cp2).output().unwrap();
-                eprintln!("snapshot xid {n}\n{}{}", String::from_utf8_lossy(&dev.stdout), String::from_utf8_lossy(&host.stdout));
+                crate::darwin_say!("snapshot xid {n}\n{}{}", String::from_utf8_lossy(&dev.stdout), String::from_utf8_lossy(&host.stdout));
                 ff.borrow_mut().push((dev.status.success(), String::from_utf8_lossy(&dev.stdout).into_owned() + &String::from_utf8_lossy(&dev.stderr)));
                 ff.borrow_mut().push((host.status.success(), String::from_utf8_lossy(&host.stdout).into_owned() + &String::from_utf8_lossy(&host.stderr)));
             }
@@ -3817,7 +3817,7 @@ mod tests {
             d2.0.sync_all().map_err(|e| e.to_string())?;
             copy_container(&dp, &cp, base, psize);
             let run = std::process::Command::new(&tool).args(["-A", "-D", "-U", "0", "-G", "0", "-v", "Vtmp"]).arg(&cp).output().map_err(|e| e.to_string())?;
-            eprintln!("{}", String::from_utf8_lossy(&run.stderr));
+            crate::darwin_say!("{}", String::from_utf8_lossy(&run.stderr));
             assert!(run.status.success(), "newfs_apfs -A failed");
             // The tool's clock readings, from the volume it made.
             let c = std::sync::Arc::new(Container::open(std::sync::Arc::new(super::super::HostFile(std::fs::File::open(&cp).unwrap(), psize))).unwrap());
@@ -4697,7 +4697,7 @@ mod tests {
             let trees = run(&["-n", "-s"], "/sbin/fsck_apfs", &view);
             let _ = std::fs::remove_file(&view);
             let out = String::from_utf8_lossy(&trees.stdout).to_string() + &String::from_utf8_lossy(&trees.stderr);
-            eprintln!("{tag}: view fsck (orphans {orphans:x?}):\n{out}");
+            crate::darwin_say!("{tag}: view fsck (orphans {orphans:x?}):\n{out}");
             assert!(dev.status.success(), "{tag}: device fsck -M: {}{}", String::from_utf8_lossy(&dev.stdout), String::from_utf8_lossy(&dev.stderr));
             assert!(host.status.success(), "{tag}: host fsck -M: {}{}", String::from_utf8_lossy(&host.stdout), String::from_utf8_lossy(&host.stderr));
             assert!(!out.contains("skipping the fsroot tree"), "{tag}: {out}");
@@ -4917,7 +4917,7 @@ mod tests {
         let _ = std::fs::remove_file(&view);
         let _ = std::fs::remove_file(&path);
         let out = String::from_utf8_lossy(&trees.stdout).to_string() + &String::from_utf8_lossy(&trees.stderr);
-        eprintln!("view fsck (orphans {orphans:x?}):\n{out}");
+        crate::darwin_say!("view fsck (orphans {orphans:x?}):\n{out}");
         assert!(dev.status.success(), "device fsck -M: {}{}", String::from_utf8_lossy(&dev.stdout), String::from_utf8_lossy(&dev.stderr));
         assert!(host.status.success(), "host fsck -M: {}{}", String::from_utf8_lossy(&host.stdout), String::from_utf8_lossy(&host.stderr));
         assert!(!out.contains("skipping the fsroot tree"), "{out}");
@@ -4942,7 +4942,7 @@ mod tests {
         let trees = std::process::Command::new("/sbin/fsck_apfs").args(["-n", "-s"]).arg(&view).output().unwrap();
         let _ = std::fs::remove_file(&view);
         let out = String::from_utf8_lossy(&trees.stdout).to_string() + &String::from_utf8_lossy(&trees.stderr);
-        eprintln!("view fsck (orphans {orphans:x?}):\n{out}");
+        crate::darwin_say!("view fsck (orphans {orphans:x?}):\n{out}");
         assert!(!out.contains("skipping the fsroot tree"), "{out}");
         let bad: Vec<&str> = out.lines().filter(|l| (l.contains("error") || l.contains("warning")) && !view_says(l, &unnamed)).collect();
         assert!(bad.is_empty(), "{out}");
@@ -5097,7 +5097,7 @@ mod tests {
             let trees = run(&["-n", "-s"], "/sbin/fsck_apfs", &view);
             let _ = std::fs::remove_file(&view);
             let out = String::from_utf8_lossy(&trees.stdout).to_string() + &String::from_utf8_lossy(&trees.stderr);
-            eprintln!("{tag}: view fsck (orphans {orphans:x?}):\n{out}");
+            crate::darwin_say!("{tag}: view fsck (orphans {orphans:x?}):\n{out}");
             assert!(dev.status.success(), "{tag}: device fsck -M: {}{}", String::from_utf8_lossy(&dev.stdout), String::from_utf8_lossy(&dev.stderr));
             assert!(host.status.success(), "{tag}: host fsck -M: {}{}", String::from_utf8_lossy(&host.stdout), String::from_utf8_lossy(&host.stderr));
             assert!(!out.contains("skipping the fsroot tree"), "{tag}: {out}");

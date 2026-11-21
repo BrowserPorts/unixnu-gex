@@ -734,7 +734,7 @@ impl Kernel {
         let ustate = user_state(self.creds.uid());
         if s.container_expected && s.container.is_none() && ustate.is_none() {
             if self.trace {
-                eprintln!("[gex:{}] Sandbox: missing user state for uid {}", self.pid, self.creds.uid());
+                crate::darwin_say!("[gex:{}] Sandbox: missing user state for uid {}", self.pid, self.creds.uid());
             }
             return;
         }
@@ -781,7 +781,7 @@ impl Kernel {
         }
         if self.trace {
             let name = if sb.protoboxed() { "(apply-protobox)".into() } else { String::from_utf8_lossy(sb.profile.name()).into_owned() };
-            eprintln!("[gex:{}] Sandbox: {}[{}] ==> {name}", self.pid, ex.path, self.pid);
+            crate::darwin_say!("[gex:{}] Sandbox: {}[{}] ==> {name}", self.pid, ex.path, self.pid);
         }
         // Filtered when its profile says, unless translated (never on iOS),
         // or when the platform profile says (its flags are 0).
@@ -888,7 +888,7 @@ impl Kernel {
         self.dtask.filter_msg = sb.profile.flags() & 0x1000 != 0;
         self.darwin_sb_apply_masks(Some(&sb));
         if self.trace {
-            eprintln!("[gex:{}] Sandbox apply: {}[{}] {}", self.pid, self.exe_path, self.pid, String::from_utf8_lossy(sb.profile.name()));
+            crate::darwin_say!("[gex:{}] Sandbox apply: {}[{}] {}", self.pid, self.exe_path, self.pid, String::from_utf8_lossy(sb.profile.name()));
         }
         Ok(())
     }
@@ -914,7 +914,7 @@ impl Kernel {
     /// to the kernel's log.
     pub(crate) fn darwin_sb_report(&self, what: &str) {
         if self.trace {
-            eprintln!("[gex:{}] Sandbox: {}({}) deny(1) {what}", self.pid, self.exe_path, self.pid);
+            crate::darwin_say!("[gex:{}] Sandbox: {}({}) deny(1) {what}", self.pid, self.exe_path, self.pid);
         }
     }
 }

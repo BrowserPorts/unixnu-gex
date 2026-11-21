@@ -256,7 +256,7 @@ impl Kernel {
                 let (argv, envp) = (lossy(img.strings.args()), lossy(img.strings.envs()));
                 let path = img.path.clone();
                 if self.trace {
-                    eprintln!("[gex:{}] darwin execve({path:?}, {} args)", self.pid, argv.len());
+                    crate::darwin_say!("[gex:{}] darwin execve({path:?}, {} args)", self.pid, argv.len());
                 }
                 self.dtask.exec_sandbox = Some(img.sandbox.clone());
                 self.dtask.exec_launch = img.launch.clone();

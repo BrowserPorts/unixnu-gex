@@ -521,7 +521,7 @@ mod tests {
                 r.0 += 1;
                 r.1 += n as u64;
             }
-            eprintln!("{img}: decmpfs types {seen:?}; read (files, bytes) {read:?}");
+            crate::darwin_say!("{img}: decmpfs types {seen:?}; read (files, bytes) {read:?}");
         }
     }
 }

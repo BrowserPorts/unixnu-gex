@@ -1179,7 +1179,7 @@ fn log(k: &mut Kernel, a: &mut MethodArgs) -> i32 {
         return ret::BAD_ARGUMENT;
     }
     let n = b.iter().position(|&c| c == 0).unwrap().min(512);
-    eprint!("{}", String::from_utf8_lossy(&b[..n]));
+    crate::darwin::report::write(String::from_utf8_lossy(&b[..n]).as_bytes());
     let _ = k;
     ret::SUCCESS
 }

@@ -576,7 +576,7 @@ mod tests {
                 assert_eq!(got, Entry { hash_type: e[20], flags: e[21], category: Some(e[22]) });
                 assert_eq!(got.hash_type, 2, "{file}: SHA-256 cdhashes");
             }
-            eprintln!("{file}: {n} entries, uuid {:02x?}", m.uuid);
+            crate::darwin_say!("{file}: {n} entries, uuid {:02x?}", m.uuid);
         }
     }
 

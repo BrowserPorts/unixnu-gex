@@ -18,16 +18,11 @@ use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use gex_kernel::darwin::machine::{Cause, Event, Kind, Panic};
+use gex_kernel::darwin::machine::{Event, Kind, Panic};
 
-/// gexc's status when the system halts (`halt_all_cpus(FALSE)`).
-pub const HALT_STATUS: u8 = 200;
-/// gexc's status when the system restarts (`halt_all_cpus(TRUE)`): the
-/// device's iBoot would boot it again.
-pub const RESTART_STATUS: u8 = 201;
-/// gexc's status when the system panics: the device would write its
-/// paniclog and reset, iBoot booting it again.
-pub const PANIC_STATUS: u8 = 202;
+/// gexc's status when the system halts, restarts or panics
+/// (`gex_kernel::darwin::machine`'s, which every host's run ends with).
+pub use gex_kernel::darwin::machine::{HALT_STATUS, PANIC_STATUS, RESTART_STATUS};
 
 /// The machine's end, as the native host takes it: the console's text (a
 /// panic's paniclog line), gex's account of the event, and the run's end
@@ -35,19 +30,10 @@ pub const PANIC_STATUS: u8 = 202;
 /// the hardware stops every CPU.
 fn machine_end(e: &Event) {
     use std::io::Write;
-    let (what, status) = match &e.kind {
-        Kind::Halt => ("halted", HALT_STATUS),
-        Kind::Restart => ("restarted", RESTART_STATUS),
-        Kind::Panic(_) => ("panicked", PANIC_STATUS),
-    };
-    let cause = match e.cause {
-        Cause::Reboot { howto } => format!("reboot(2) howto {howto:#x}"),
-        Cause::HostReboot { options } => format!("host_reboot options {options:#x}"),
-        Cause::CriticalExit => "proc_prepareexit's critical exit".to_string(),
-    };
+    let status = e.status();
     let mut err = std::io::stderr().lock();
     let _ = err.write_all(&e.console());
-    let _ = writeln!(err, "[gex] the system {what}: {cause}, by pid {} ({}); gexc exits {status}", e.pid, e.name);
+    let _ = writeln!(err, "[gex] {}; gexc exits {status}", e.account());
     if let Kind::Panic(p) = &e.kind {
         let _ = writeln!(err, "[gex] panic options {:#x}; not modelled: {}", p.options, Panic::UNMODELLED);
     }

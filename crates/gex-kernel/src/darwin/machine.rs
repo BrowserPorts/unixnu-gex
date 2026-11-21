@@ -130,6 +130,16 @@ pub struct Event {
     pub name: String,
 }
 
+/// The status a host's run ends with when the system halts
+/// (`halt_all_cpus(FALSE)`).
+pub const HALT_STATUS: u8 = 200;
+/// The status a host's run ends with when the system restarts
+/// (`halt_all_cpus(TRUE)`): the device's iBoot would boot it again.
+pub const RESTART_STATUS: u8 = 201;
+/// The status a host's run ends with when the system panics: the device
+/// would write its paniclog and reset, iBoot booting it again.
+pub const PANIC_STATUS: u8 = 202;
+
 impl Event {
     /// What the console shows of it: the paniclog's first line for a
     /// panic; nothing for a halt or a restart (see the module's notes).
@@ -138,6 +148,32 @@ impl Event {
             Kind::Panic(p) => p.line(),
             Kind::Halt | Kind::Restart => Vec::new(),
         }
+    }
+
+    /// The run's status for it: [`HALT_STATUS`], [`RESTART_STATUS`] or
+    /// [`PANIC_STATUS`].
+    pub fn status(&self) -> u8 {
+        match &self.kind {
+            Kind::Halt => HALT_STATUS,
+            Kind::Restart => RESTART_STATUS,
+            Kind::Panic(_) => PANIC_STATUS,
+        }
+    }
+
+    /// gex's account of it for a host's report: what the system did, the
+    /// call that did it and whose call it was.
+    pub fn account(&self) -> String {
+        let what = match &self.kind {
+            Kind::Halt => "halted",
+            Kind::Restart => "restarted",
+            Kind::Panic(_) => "panicked",
+        };
+        let cause = match self.cause {
+            Cause::Reboot { howto } => format!("reboot(2) howto {howto:#x}"),
+            Cause::HostReboot { options } => format!("host_reboot options {options:#x}"),
+            Cause::CriticalExit => "proc_prepareexit's critical exit".to_string(),
+        };
+        format!("the system {what}: {cause}, by pid {} ({})", self.pid, self.name)
     }
 }
 
@@ -198,5 +234,17 @@ mod tests {
     fn a_halt_or_restart_prints_nothing() {
         let e = Event { kind: Kind::Restart, cause: Cause::Reboot { howto: 0x400 }, pid: 1, name: "launchd".into() };
         assert!(e.console().is_empty());
+    }
+
+    #[test]
+    fn an_end_is_accounted_for_with_its_status() {
+        let e = Event { kind: Kind::Halt, cause: Cause::HostReboot { options: 0x8 }, pid: 3, name: "rebootcall".into() };
+        assert_eq!(e.account(), "the system halted: host_reboot options 0x8, by pid 3 (rebootcall)");
+        assert_eq!(e.status(), HALT_STATUS);
+        let e = Event { kind: Kind::Restart, cause: Cause::Reboot { howto: 0 }, pid: 1, name: "launchd".into() };
+        assert_eq!((e.account().as_str(), e.status()), ("the system restarted: reboot(2) howto 0x0, by pid 1 (launchd)", RESTART_STATUS));
+        let p = Panic { cpu: 0, caller: caller::CRITICAL_EXIT, options: 0, message: Vec::new() };
+        let e = Event { kind: Kind::Panic(p), cause: Cause::CriticalExit, pid: 1, name: "launchd".into() };
+        assert_eq!((e.account().as_str(), e.status()), ("the system panicked: proc_prepareexit's critical exit, by pid 1 (launchd)", PANIC_STATUS));
     }
 }

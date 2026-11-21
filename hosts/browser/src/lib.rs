@@ -4328,6 +4328,15 @@ fn install_panic_hook() {
             debug: |s| trace_line(&format!("[gex] {s}")),
             say: |s| warn_line(&format!("[gex-info] {s}")),
         });
+        // The Darwin kernel's clocks: the page's, as the Linux side reads
+        // it (`host_now_ns`, the Worker's clock origin and its performance
+        // clock), for the counter and every deadline and for the calendar.
+        gex_kernel::darwin::time::set_clock(gex_kernel::darwin::time::Clock { monotonic: darwin_clock, realtime: darwin_clock });
+        // What it says (its reports, the console's output, the machine's
+        // end), on the process's stderr as the memory map's notes are.
+        gex_kernel::darwin::report::set_sink(|b| unsafe { write(2, b.as_ptr() as usize, b.len() as u32) });
+        // And the machine's end ([`darwin_machine_end`]).
+        gex_kernel::darwin::machine::set_hook(darwin_machine_end);
         std::panic::set_hook(Box::new(|info| {
             // Set while this hook runs: a panic inside it is not reported
             // through it (std aborts at once, its line on a stderr that
@@ -6145,6 +6154,9 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     // at INTERP_BASE == BRK_TOP, so a break there could never grow and every
     // dynamic program's malloc fell back to mmap -- a different path through
     // libc than the same program takes natively.
+    // The host's clocks and sinks first: a new kernel reads the Darwin
+    // clock (its task's start).
+    install_panic_hook();
     let mut kernel = Kernel::new(gex_abi::ctx_addr(0), program.exe.brk, String::new());
     // A 32-bit (i386) program: i386 ABI in the kernel, compatibility-mode
     // decoding in the translator.
@@ -11710,6 +11722,9 @@ fn child_host(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls: i64, brk: i64) -> 
     // With the parent's break, not zero: the heap's bytes came over in the
     // image, and a kernel that thinks it empty hands the next `malloc` an
     // address in the low region where the register contexts are.
+    // The host's clocks and sinks first: a new kernel reads the Darwin
+    // clock (its task's start).
+    install_panic_hook();
     let mut kernel = Kernel::new(ctx_addr, brk as u64, String::new());
     // Who this process is: `Kernel::new` defaults to uid 1000, so a child that
     // did not copy `IDENTITY` here is not root and every forked `dpkg` refuses.
@@ -11842,6 +11857,46 @@ fn exit_process(code: i32) -> i32 {
     set_resume_none();
     set_resume_ctx_none();
     2
+}
+
+/// The Darwin kernel's clock (`gex_kernel::darwin::time`): the page's, in
+/// ns since the epoch.
+fn darwin_clock() -> std::time::Duration {
+    std::time::Duration::from_nanos(host_now_ns())
+}
+
+/// The machine's end (`gex_kernel::darwin::machine`), as this host takes
+/// it: the console's text and gex's account of the event on the process's
+/// stderr, then every process of the system stopped with the event's
+/// status (`ProcTable::request_halt`: each exits at its next entry to the
+/// kernel, and a waiter as its wait ends), as the hardware stops every
+/// CPU. The calling thread's process ends here with that status, inside
+/// the call that ended the machine, which never returns.
+fn darwin_machine_end(e: &gex_kernel::darwin::machine::Event) {
+    use gex_kernel::darwin::machine::{Kind, Panic};
+    let status = i32::from(e.status());
+    gex_kernel::darwin::report::write(&e.console());
+    gex_kernel::darwin_say!("[gex] {}; every process exits {status}", e.account());
+    if let Kind::Panic(p) = &e.kind {
+        gex_kernel::darwin_say!("[gex] panic options {:#x}; not modelled: {}", p.options, Panic::UNMODELLED);
+    }
+    if let Some(home) = sigs::home() {
+        home.procs().request_halt(status);
+    }
+    exit_process(status);
+    // The call's way back to JS: its kernel lock and GL deferral, which its
+    // return would have ended, ended here; every other thread of the
+    // process finds it exited when it next takes the lock.
+    #[cfg(feature = "shared-memory")]
+    if DEPTH.with(|d| d.replace(0)) > 0 {
+        jit_give();
+        KLOCK.store(0, std::sync::atomic::Ordering::Release);
+        gex_kernel::sync::rank_give(gex_kernel::sync::rank::KERNEL);
+        // SAFETY: the address of a `static AtomicU32` in the shared memory.
+        unsafe { warch::memory_atomic_notify(KLOCK.as_ptr() as *mut i32, u32::MAX) };
+    }
+    gl::DEFER.with(|d| d.set(false));
+    trap();
 }
 
 /// This process's memory is a forked copy of its parent's (`gex_adopt_child`):

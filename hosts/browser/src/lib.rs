@@ -8930,7 +8930,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
         }
         let outcome = h.kernel.syscall(&mut gm, pc as u64);
         if h.kernel.darwin {
-            darwin::unstarted_threads(&mut h.kernel);
+            darwin::start_spawns(&mut h.kernel);
             // What its pipe watch looks at, told to its thread-call Worker.
             darwin::after_call(&h.kernel);
         }
@@ -9062,6 +9062,11 @@ fn syscall_entry(ctx: i32, pc: i64) {
             }
             SyscallOutcome::ThreadExit => {
                 h.threads[cur()].run().waiting = Waiting::Exited;
+                // A Darwin thread's end, as its host thread's (the native
+                // host's `run_guest_thread`).
+                if h.kernel.darwin {
+                    gex_kernel::darwin::workq::thread_ended(kstate.tid);
+                }
                 end_if_all_exited();
                 // Nowhere to resume this thread. A resume left from before
                 // (a call-out's return, `cgen::returned`, which a call-out
@@ -9351,6 +9356,12 @@ fn syscall_entry(ctx: i32, pc: i64) {
     // Libraries some of whose exports a provider serves (glibc's mem*):
     // JS binds them before the guest goes on, as the
     // native host does after the same syscall.
+    // Threads a Darwin call made for after it (`darwin::start_spawns`),
+    // their Workers started now, however the call goes on.
+    if darwin::spawned() {
+        // SAFETY: a host import without arguments; nothing here holds a lock.
+        unsafe { cgen::thread_start() };
+    }
     let stop = if crate::cgen::elfprov::maps(&mapped) && stop == 0 {
         set_resume(pc as u64 + gex_abi::SYSCALL_INST_BYTES);
         set_resume_ctx(my_ctx());
@@ -11295,7 +11306,29 @@ const STAGING: u64 = u64::MAX;
 /// Whether a thread is staged for the host (`gex_thread_pending` to claim):
 /// a look, for the shim to call the host's start only then.
 pub(crate) fn thread_staged() -> bool {
-    THREAD[0].load(std::sync::atomic::Ordering::Acquire) != 0
+    THREAD[0].load(std::sync::atomic::Ordering::Acquire) != 0 || !LATER.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+}
+
+/// Threads a call made for the host to start after it, beyond the one
+/// `THREAD` holds (a Darwin call's `take_spawns`, which may be several):
+/// tid, context address, entry pc, claimed in order once `THREAD` is free
+/// ([`gex_thread_pending`]).
+static LATER: std::sync::Mutex<std::collections::VecDeque<(i32, u64, u64)>> = std::sync::Mutex::new(std::collections::VecDeque::new());
+
+/// A thread the kernel made for the host to start once the call that made
+/// it returns (`Kernel::take_spawns`): in the thread table as running
+/// elsewhere, as `clone`'s is ([`thread_made`]), and queued for a Worker.
+pub(crate) fn thread_later(tid: i32, ctx_addr: u64) {
+    let start = guest().read_u64(ctx_addr + ctx::PC as u64).unwrap_or(0);
+    sigs::proc_home().table().push(tid, ctx_addr, ThreadCell::new(Run::new(start, Waiting::Elsewhere)));
+    with_jit_only(|j| {
+        if !j.ever_threaded {
+            backfill_registry(j);
+            j.ever_threaded = true;
+            regview::set_threaded(true);
+        }
+    });
+    LATER.lock().unwrap_or_else(|e| e.into_inner()).push_back((tid, ctx_addr, start));
 }
 
 // A thread is a Worker. There is no second shape.
@@ -11406,7 +11439,10 @@ pub extern "C" fn gex_thread_pending() -> i32 {
     loop {
         let tid = THREAD[0].load(std::sync::atomic::Ordering::Acquire);
         if tid == 0 {
-            return 0;
+            // The threads queued after a call, one at a time.
+            let Some((tid, ctx, pc)) = LATER.lock().unwrap_or_else(|e| e.into_inner()).pop_front() else { return 0 };
+            CLAIMED_THREAD.with(|c| c.set((ctx, pc)));
+            return tid;
         }
         // Being staged: a moment.
         if tid == STAGING {
@@ -11477,6 +11513,10 @@ pub extern "C" fn gex_adopt_thread(tid: i32) -> i64 {
     table[i].run().waiting = Waiting::Runnable;
     CURRENT.with(|c| c.set(i));
     bind_free(i);
+    // A Darwin thread's first entry is its kernel's (`darwin::adopted`).
+    if darwin_process() {
+        return darwin::adopted(i).map_or(0, |pc| pc as i64);
+    }
     let pc = table[i].run().pc;
     pc as i64
 }

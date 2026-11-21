@@ -618,12 +618,11 @@ pub(crate) fn spawn_refused(k: &mut gex_kernel::syscalls::Kernel, m: &mut GuestM
     let _ = gex_kernel::darwin::set_result(m, k.ctx_addr, gex_kernel::Errno::ENOSYS.as_return());
 }
 
-/// The Darwin calls that make a process or a thread the page does not
-/// start yet, refused before the kernel takes them, so that nothing of
-/// the child is made: `fork` and `vfork` (a forked Darwin process's memory
-/// and task, `darwin_fork_plan`'s inheritance) and `bsdthread_create` (a
-/// Darwin thread's Worker and its first entry). Reported, and the call
-/// fails with ENOSYS; false for any other call.
+/// The Darwin calls that make a process the page does not start yet,
+/// refused before the kernel takes them, so that nothing of the child is
+/// made: `fork` and `vfork` (a forked Darwin process's memory and task,
+/// `darwin_fork_plan`'s inheritance). Reported, and the call fails with
+/// ENOSYS; false for any other call.
 pub(crate) fn refused(k: &mut gex_kernel::syscalls::Kernel, m: &mut GuestMem<'_>) -> bool {
     use gex_kernel::darwin;
     let raw = m.read_u64(k.ctx_addr + darwin::NR_SLOT as u64).unwrap_or(!0);
@@ -633,20 +632,95 @@ pub(crate) fn refused(k: &mut gex_kernel::syscalls::Kernel, m: &mut GuestMem<'_>
     let what = match darwin::bsd_syscode(m, k.ctx_addr, raw) {
         2 => "fork",
         66 => "vfork",
-        360 => "bsdthread_create",
         _ => return false,
     };
-    k.darwin_unimplemented(format!("{what}: the page starts no other Worker of a Darwin process (a forked child's, a thread's) yet; the call fails with ENOSYS"));
+    k.darwin_unimplemented(format!("{what}: the page starts no forked child of a Darwin process yet; the call fails with ENOSYS"));
     let _ = darwin::set_result(m, k.ctx_addr, gex_kernel::Errno::ENOSYS.as_return());
     true
 }
 
-/// The threads a Darwin call made for the host to start (a workqueue's, a
-/// resumed one's: `Kernel::take_spawns`), which the page does not start
-/// yet: reported, as they never run.
-pub(crate) fn unstarted_threads(k: &mut gex_kernel::syscalls::Kernel) {
-    let n = k.take_spawns().len();
-    if n != 0 {
-        k.darwin_unimplemented(format!("the threads a call made for the host to start ({n}: a workqueue's or a resumed thread's): the page starts no other Worker of a Darwin process yet, so they never run"));
+thread_local! {
+    /// The call this Worker just made queued threads for the host to start
+    /// ([`start_spawns`]).
+    static SPAWNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The threads a Darwin call made for the host to start once it returns (a
+/// workqueue's, a thread resumed after it was made suspended:
+/// `Kernel::take_spawns`), each queued for a Worker of its own, as the
+/// native host starts a host thread for each after every call.
+pub(crate) fn start_spawns(k: &mut gex_kernel::syscalls::Kernel) {
+    let reqs = k.take_spawns();
+    if reqs.is_empty() {
+        return;
     }
+    for r in reqs {
+        thread_later(r.tid, r.ctx_addr);
+    }
+    SPAWNED.with(|c| c.set(true));
+}
+
+/// Whether the call just made queued threads ([`start_spawns`]): the host
+/// starts their Workers once the kernel lock is let go.
+pub(crate) fn spawned() -> bool {
+    SPAWNED.with(|c| c.replace(false))
+}
+
+/// A Darwin thread's first entry, in its own Worker before it runs a guest
+/// instruction (`gex_adopt_thread`), as the native host's
+/// `run_guest_thread` makes it: the thread noted as started on this Worker
+/// (`workq::thread_started`), then the kernel's own first entry for a
+/// thread that has one (a workqueue thread, made parked:
+/// `Kernel::darwin_thread_entry`), which leaves the context set for where
+/// the guest begins. Thread `i`'s entry pc, or `None` when it does not run
+/// (it, or its process, has ended).
+pub(crate) fn adopted(i: usize) -> Option<u64> {
+    use gex_kernel::SyscallOutcome;
+    let out = with_exec_lock(|h| {
+        let ks = h.threads[i].kstate();
+        gex_kernel::darwin::workq::thread_started(ks.tid);
+        h.kernel.enter_thread(&ks);
+        let mut gm = guest();
+        let mut out = h.kernel.darwin_thread_entry(&mut gm);
+        // A wait the page does not park (`unparked`, as a call's): reported,
+        // and the thread does not start.
+        if let Some(SyscallOutcome::Blocking(op)) = &out {
+            let what = format!("{op:?}");
+            let what = what.split(['{', '(', ' ']).next().unwrap_or("?").to_string();
+            h.kernel.darwin_unimplemented(format!("a new workqueue thread's first wait ({what}): the page's waits do not end a Darwin wait as its kernel does (finish_blocking); the thread does not start"));
+            out = Some(SyscallOutcome::ThreadExit);
+        }
+        start_spawns(&mut h.kernel);
+        match out {
+            None | Some(SyscallOutcome::Continue) => {}
+            Some(SyscallOutcome::Resume(pc)) => {
+                let _ = gm.write_u64(ks.ctx_addr + ctx::PC as u64, pc);
+            }
+            Some(SyscallOutcome::ThreadExit) => {
+                h.threads[i].run().waiting = Waiting::Exited;
+                gex_kernel::darwin::workq::thread_ended(ks.tid);
+                end_if_all_exited();
+                return None;
+            }
+            Some(SyscallOutcome::Exit(code)) => {
+                task_end(&mut h.kernel);
+                exit_process(code);
+                return None;
+            }
+            Some(SyscallOutcome::Killed { signal, .. }) => {
+                task_end(&mut h.kernel);
+                killed(signal as i32, 0);
+                return None;
+            }
+            Some(other) => panic!("gex: Darwin thread {}: its first kernel entry's outcome {other:?}, which a thread's start does not have", ks.tid),
+        }
+        let pc = gm.read_u64(ks.ctx_addr + ctx::PC as u64).unwrap_or(0);
+        h.threads[i].run().pc = pc;
+        Some(pc)
+    });
+    if spawned() {
+        // SAFETY: a host import without arguments; nothing here holds a lock.
+        unsafe { cgen::thread_start() };
+    }
+    out
 }

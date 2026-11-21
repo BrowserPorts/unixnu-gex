@@ -2770,8 +2770,9 @@ extern "C" {
     /// placed, the function table's log, the bindings, a staged program.
     fn cgen_serve();
     /// Start the thread the call staged (`#startThread`), after
-    /// `entry_call`: called only when one is staged.
-    fn thread_start();
+    /// `entry_call`, or a Darwin call's (`darwin::start_spawns`): called
+    /// only when one is staged.
+    pub(crate) fn thread_start();
     /// Call the guest fault hook `idx` (`void(int ctx, unsigned code,
     /// address, unsigned kind)`) here, its C frames below the guest's stack
     /// pointer `sp`: 1; 0 when this build cannot (the fault is staged then).

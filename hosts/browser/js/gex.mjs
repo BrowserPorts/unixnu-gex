@@ -4384,8 +4384,8 @@ export class Gex {
    * are already shared. All that crosses is which thread-table entry to run.
    */
   async #drainThread() {
-    const thread = this.#takeThread();
-    if (thread) await this.#postThread(thread);
+    // Every one staged: a Darwin call can make several (`take_spawns`).
+    for (let thread; (thread = this.#takeThread());) await this.#postThread(thread);
   }
 
   /**
@@ -4404,13 +4404,17 @@ export class Gex {
       threadNotStarted(who, err);
       try { this.#shim?.exports?.gex_worker_promise_done?.(); } catch {}
     };
-    try {
-      thread = this.#takeThread();
-    } catch (err) {
-      lost(err);
-      return;
+    // Every one staged: a Darwin call can make several (`take_spawns`).
+    for (;;) {
+      try {
+        thread = this.#takeThread();
+      } catch (err) {
+        lost(err);
+        return;
+      }
+      if (!thread) return;
+      this.#postThread(thread).catch(lost);
     }
-    if (thread) this.#postThread(thread).catch(lost);
   }
 
   /** The thread `clone` left for the host, claimed: null with none. */

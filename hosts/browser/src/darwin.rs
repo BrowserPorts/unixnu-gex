@@ -510,6 +510,102 @@ pub extern "C" fn gex_darwin_thread_calls() -> u32 {
     1
 }
 
+/// How a Darwin thread's way back to user space ended ([`to_user`]).
+pub(crate) enum ToUser {
+    /// It runs on where it was.
+    Run,
+    /// A handler frame was set up while it was held, or its registers were
+    /// set while it was in the kernel: it goes on at this pc.
+    Resume(u64),
+    /// Its process ended while it was held, or a signal it took ends it
+    /// (the status, `exit_process`'s; its task already ended).
+    Exit(Option<i32>),
+}
+
+/// `thread_apc_ast` for this Worker's Darwin thread on its way back to user
+/// space (after a call, at a safepoint, after its wait, at its start), as
+/// the native host's `darwin_return_to_user` makes it: while its task is
+/// held (stopped) or the thread suspended it waits, the signals posted
+/// meanwhile acted on as they come, and an abort lets it take its signals
+/// before it asks again (`Kernel::darwin_hold`). It waits on its wait slot,
+/// on its process's queue (a signal, its end) and for 20 ms at most, as the
+/// native host waits on its descriptors' changes.
+pub(crate) fn to_user() -> ToUser {
+    use gex_kernel::darwin::jobctl::Hold;
+    use gex_kernel::signal::Delivery;
+    let slot = waitq::slot();
+    let mut queued = false;
+    let mut resume = None;
+    let out = loop {
+        let seq = unsafe { k_ws_seq(slot) };
+        let held = with_exec_lock(|h| {
+            let i = cur();
+            let ks = h.threads[i].kstate();
+            h.kernel.enter_thread(&ks);
+            let mut gm = guest();
+            let held = h.kernel.darwin_hold(&mut gm, ks.tid);
+            // Held or let go, the replies waiting for it to be off its
+            // processor are sent (`darwin_set_offcpu`): their receivers'
+            // wakes.
+            woken(&mut h.kernel);
+            match held {
+                Hold::Deliver => {
+                    let d = h.kernel.deliver_pending(&mut gm);
+                    woken(&mut h.kernel);
+                    if let Delivery::Terminate { .. } = d {
+                        task_end(&mut h.kernel);
+                    }
+                    Err(d)
+                }
+                held => Ok(held),
+            }
+        });
+        match held {
+            Ok(Hold::Run) => break resume.map_or(ToUser::Run, ToUser::Resume),
+            Ok(Hold::Resume(pc)) => break ToUser::Resume(resume.unwrap_or(pc)),
+            Err(Delivery::None) => continue,
+            Err(Delivery::Resume(t)) => {
+                resume = Some(t);
+                continue;
+            }
+            Err(Delivery::Terminate { signal, .. }) => break ToUser::Exit(Some(-(signal as i32))),
+            Ok(Hold::Park) | Ok(Hold::Deliver) => {}
+        }
+        // The process ending in another thread lets it go, to end too.
+        if exited() {
+            break ToUser::Exit(None);
+        }
+        if !queued && unsafe { k_present() } != 0 {
+            unsafe { k_wq_add(waitq::proc_queue(), slot as u32) };
+            queued = true;
+        }
+        unsafe { k_ws_park(slot, seq, HOLD_LOOK.as_nanos() as i64) };
+    };
+    if queued {
+        unsafe { k_wq_del(waitq::proc_queue(), slot as u32) };
+    }
+    out
+}
+
+/// How often a held thread asks again with nothing having told it, as the
+/// native host's does.
+const HOLD_LOOK: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// [`to_user`] for this Worker's thread, which is to go on at `pc`: where
+/// it goes on, or `None` when it does not (its process has ended, here or
+/// in another thread).
+pub(crate) fn to_user_at(pc: u64) -> Option<u64> {
+    match to_user() {
+        ToUser::Run => Some(pc),
+        ToUser::Resume(t) => Some(t),
+        ToUser::Exit(Some(code)) => {
+            exit_here(code, Some(pc));
+            None
+        }
+        ToUser::Exit(None) => None,
+    }
+}
+
 /// A fault a Darwin thread takes at `pc`, the kernel's to raise
 /// (`raise` makes it: `raise_fault`, `darwin_access_fault`), with the
 /// kernel lock: its handler's frame or the access made again, the target
@@ -550,11 +646,12 @@ pub(crate) fn fault_and_leave(ctx_addr: u64, pc: u64, raise: impl FnOnce(&mut ge
     trap()
 }
 
-/// The signals pending for a Darwin thread at a safepoint, taken as its
-/// kernel takes them on the way back to user space (`deliver_pending`,
-/// `bsd_ast`): with the kernel lock, as a Darwin frame; never the lock-free
-/// Linux delivery (`sigs::deliver`).
-pub(crate) fn safepoint_signals(ctx_addr: u64, pc: u64) {
+/// A Darwin thread at a safepoint, as the native host's safepoint takes
+/// one: the signals pending for it, taken as its kernel takes them on the
+/// way back to user space (`deliver_pending`, `bsd_ast`), with the kernel
+/// lock, as a Darwin frame (never the lock-free Linux delivery,
+/// `sigs::deliver`); with none, its hold ([`to_user`]).
+pub(crate) fn safepoint(ctx_addr: u64, pc: u64) {
     use gex_kernel::signal::Delivery;
     let d = with_exec_lock(|h| {
         let mut gm = guest();
@@ -564,6 +661,22 @@ pub(crate) fn safepoint_signals(ctx_addr: u64, pc: u64) {
         }
         d
     });
+    let d = match d {
+        Delivery::None => match to_user() {
+            ToUser::Run => return,
+            ToUser::Resume(t) => Delivery::Resume(t),
+            ToUser::Exit(Some(code)) => {
+                exit_here(code, Some(pc));
+                trap();
+            }
+            ToUser::Exit(None) => {
+                set_resume_none();
+                set_resume_ctx_none();
+                trap();
+            }
+        },
+        d => d,
+    };
     match d {
         Delivery::None => {}
         Delivery::Resume(target) => {
@@ -834,16 +947,18 @@ pub(crate) fn adopted(i: usize) -> Option<u64> {
         unsafe { cgen::thread_start() };
     }
     match out {
-        Some(Some(pc)) => Some(pc),
+        // Made while its task is held, it waits first (thread_create's
+        // thread_hold).
+        Some(Some(pc)) => to_user_at(pc),
         // Its first wait, in this Worker until it ends (as `wasm32_wait`
-        // waits a call's out in place).
+        // waits a call's out in place), then its way to user space.
         Some(None) => loop {
             let _now = NowScope::open();
             if schedule() == 1 {
                 let pc = resume();
                 set_resume_none();
                 set_resume_ctx_none();
-                return pc;
+                return pc.and_then(to_user_at);
             }
             if exited() || SCHED_OVER.with(|c| c.replace(false)) {
                 return None;

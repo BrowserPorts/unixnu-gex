@@ -8094,7 +8094,25 @@ pub extern "C" fn gex_wake() -> i32 {
         trace_line(&format!("[gex] woken {n} times, threads:{census}\n"));
     }
     set_paused_to(0);
-    schedule()
+    let picked = schedule();
+    // A Darwin thread whose wait ended here, on its way back to user space
+    // (`darwin::to_user`).
+    if picked == 1 && darwin_process() {
+        let here = my_ctx();
+        if let Some(at) = resume().filter(|_| resume_ctx().unwrap_or(here) == here) {
+            match darwin::to_user_at(at) {
+                Some(t) => set_resume(t),
+                None => {
+                    if !exited() {
+                        set_resume_none();
+                        set_resume_ctx_none();
+                    }
+                    return 2;
+                }
+            }
+        }
+    }
+    picked
 }
 
 /// Hand the guest its standard input, from `len` bytes at `ptr` in the shim's
@@ -9495,6 +9513,32 @@ fn syscall_entry(ctx: i32, pc: i64) {
         };
         trace_line(&format!("[gex]   t{i} = {}{split}{clk}\n", x0 as i64));
     }
+    // A Darwin thread on its way back to user space after its call (or its
+    // wait, ended here): held while its task is stopped (`darwin::to_user`).
+    let stop = if darwin_process() && (stop == 0 || stop == 1) && !exited() {
+        let here = my_ctx();
+        let at = if stop == 0 { Some(pc as u64 + gex_abi::SYSCALL_INST_BYTES) } else { resume().filter(|_| resume_ctx().unwrap_or(here) == here) };
+        match at {
+            Some(at) => match darwin::to_user_at(at) {
+                Some(t) if t == at => stop,
+                Some(t) => {
+                    set_resume(t);
+                    set_resume_ctx(here);
+                    1
+                }
+                None => {
+                    if !exited() {
+                        set_resume_none();
+                        set_resume_ctx_none();
+                    }
+                    2
+                }
+            },
+            None => stop,
+        }
+    } else {
+        stop
+    };
     // A call to make again (`finish_wait`: a priority-inheritance lock still
     // held, a stream another thread got to first, an `accept` or `recvmsg`
     // whose wait is over) from a provider or a wasm32 program: it has no
@@ -17138,10 +17182,11 @@ fn safepoint(ctx: i32, pc: i64) {
     // shared word, dispositions and timers, and the inbox other processes
     // fill, collected when anyone has sent anything since this Worker last
     // looked.
-    if SAFEPOINT_SIGNALS && darwin_process() && sigs::ready() {
+    if darwin_process() {
+        // A Darwin thread's, every safepoint: its signals and its hold.
         let ctx_addr = ctx as u32 as u64;
         let _ = guest().write_u64(ctx_addr + ctx::PC as u64, pc as u64);
-        darwin::safepoint_signals(ctx_addr, pc as u64);
+        darwin::safepoint(ctx_addr, pc as u64);
     } else if SAFEPOINT_SIGNALS && sigs::ready() {
         let ctx_addr = ctx as u32 as u64;
         let mut gm = guest();

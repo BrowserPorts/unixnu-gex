@@ -519,7 +519,12 @@ impl Kernel {
         let Some(l) = self.dtask.threads.map.get(&tid).and_then(|t| t.cpu_ledger) else { return };
         let (percentage, interval_ns) = ((abs_to_ns(l.limit as u64) * 100 / abs_to_ns(l.period)) as u8, abs_to_ns(l.period));
         let interval_sec = (interval_ns / NSEC_PER_SEC) as u32;
-        let (user, sys) = self.thread_signals.get(tid).and_then(|t| t.cpu.times()).unwrap_or((0, 0));
+        // thread_read_times: its lifetime usage, read from the host's
+        // clocks (which the ledger's charge above read too).
+        let Some((user, sys)) = self.thread_signals.get(tid).and_then(|t| t.cpu.times()) else {
+            self.darwin_unimplemented("the CPU usage monitor's violation report on a host without per-thread clocks".into());
+            return;
+        };
         let now = super::mach::absolute_time();
         let balance_ns = abs_to_ns(l.balance().max(0) as u64);
         let last_refill_ns = abs_to_ns(now.saturating_sub(l.last_refill));

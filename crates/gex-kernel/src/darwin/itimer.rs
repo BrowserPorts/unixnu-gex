@@ -4,8 +4,8 @@
 //! uptime (`microuptime`).
 //!
 //! The virtual and profiling timers count down the task's user time, and
-//! its user and system time, as `bsd_ast` charges them; this kernel does
-//! not divide a thread's time so, and arming one fails loudly.
+//! its user and system time, as `bsd_ast` charges them from the host's
+//! per-thread clocks; on a host without them, arming one fails loudly.
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -73,6 +73,12 @@ impl Kernel {
             return Err(Errno::EINVAL);
         }
         let v = self.darwin_itimer_now(which);
+        // A virtual or profiling timer running down the threads' time,
+        // which the host has no clocks to read.
+        if which != ITIMER_REAL && v.value != 0 && super::workq::host_clocks().is_none() {
+            self.darwin_unimplemented("a virtual timer on a host without per-thread clocks".into());
+            return Err(Errno::ENOSYS);
+        }
         write_itimerval(m, itv, v)?;
         Ok(0)
     }
@@ -111,6 +117,12 @@ impl Kernel {
         let value = itimerfix(sec(16), usec(24));
         let interval = itimerfix(sec(0), usec(8));
         let (Ok(value), Ok(interval)) = (value, interval) else { return Err(Errno::EINVAL) };
+        // A virtual or profiling timer counts down the threads' time, read
+        // from the host's clocks: without them it would never run down.
+        if which != ITIMER_REAL && value != 0 && super::workq::host_clocks().is_none() {
+            self.darwin_unimplemented("a virtual timer on a host without per-thread clocks".into());
+            return Err(Errno::ENOSYS);
+        }
         let v = Itimerval { interval, value };
         if which == ITIMER_REAL {
             if let Some(key) = self.dtask.realtimer.call.take() {
@@ -304,7 +316,10 @@ impl Kernel {
             return 0;
         }
         let tid = self.tid;
-        let Some((user, total)) = self.darwin_thread_abs(tid) else { return 0 };
+        let Some((user, total)) = self.darwin_thread_abs(tid) else {
+            self.darwin_unimplemented("a virtual timer on a host without per-thread clocks".into());
+            return 0;
+        };
         let i = match which {
             vt::USER => 0,
             vt::PROF => 1,

@@ -253,6 +253,9 @@ impl Sched {
     /// scheduler does not have the thread.
     pub fn cpu_usage(&self, tid: i32, total: u64) -> Result<Option<i32>, &'static str> {
         self.check()?;
+        // Every update of the usage reads the thread's time from the
+        // host's clocks.
+        crate::darwin::workq::host_clocks().ok_or("the threads' usage (sched_usage): no per-thread clocks on the host")?;
         let mut s = self.lock();
         let tick = s.tick as u32;
         let Some(t) = s.threads.get_mut(&tid) else { return Ok(None) };

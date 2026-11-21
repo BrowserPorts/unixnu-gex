@@ -355,6 +355,13 @@ impl crate::syscalls::Kernel {
                 }
             },
             RUSAGE_CHILDREN => {
+                // The reaped children's times are their threads' (each
+                // thread's at its end, and those live at the child's), all
+                // read from the host's clocks.
+                if crate::darwin::workq::host_clocks().is_none() {
+                    self.darwin_unimplemented("getrusage(RUSAGE_CHILDREN)'s times on a host without per-thread clocks".into());
+                    return Err(crate::Errno::ENOSYS);
+                }
                 let (user, sys) = self.procs.children_cpu(self.pid);
                 [user, sys].map(|ns| (ns / 1_000_000_000, (ns % 1_000_000_000 / 1000) as u32))
             }

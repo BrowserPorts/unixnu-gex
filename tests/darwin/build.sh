@@ -16,7 +16,7 @@ cc() {
     xcrun -sdk iphoneos clang -target "$TARGET" "$@"
 }
 
-for p in hello-static bsd-carry commpage exclusive-pair aes tcall bsdthr waits hold cpuclk; do
+for p in hello-static bsd-carry commpage exclusive-pair aes tcall bsdthr waits hold cpuclk pipewr; do
     cc -O2 -ffreestanding -fno-stack-protector -nostdlib -static \
         -Wl,-e,_start -o "$OUT/$p" "$HERE/src/$p.c"
 done
@@ -114,7 +114,7 @@ xcrun -sdk iphoneos clang -target arm64e-apple-ios17.0 -O2 -o "$OUT/hello-arm64e
 for f in "$OUT"/*; do
     [ -f "$f" ] || continue
     case "$(basename "$f")" in
-    hello-static | bsd-carry | commpage | exclusive-pair | aes | tcall | bsdthr | waits | hold) codesign -s - -f "$f" 2>/dev/null ;;
+    hello-static | bsd-carry | commpage | exclusive-pair | aes | tcall | bsdthr | waits | hold | cpuclk | pipewr) codesign -s - -f "$f" 2>/dev/null ;;
     *) codesign -s - -f --entitlements "$HERE/src/default.entitlements" "$f" 2>/dev/null ;;
     esac
 done

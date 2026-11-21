@@ -5770,9 +5770,12 @@ impl NetIo<'_> {
         // A stream pair in the global kernel when there is one: its ends are
         // often for two processes (Wine makes one per new process, keeps an
         // end and hands the other to the child), and with a Worker per
-        // process a local pair cannot cross a fork.
+        // process a local pair cannot cross a fork. Not a Darwin process's:
+        // its directions are kept as XNU keeps them (`xnu_pair`), which the
+        // global kernel's are not, and the page makes no other Darwin
+        // process for an end to go to (its pipes are its own too).
         const SOCK_STREAM: u64 = 1;
-        if let (Some(r), SOCK_STREAM) = (self.unix_remote, ty & 0xf) {
+        if let (Some(r), SOCK_STREAM, false) = (self.unix_remote, ty & 0xf, io.darwin) {
             let mut ids = [0u8; 8];
             let me = io.cred();
             let rc = (r.pair)(ids.as_mut_ptr() as crate::PAddr, me.pid, me.uid, me.gid);

@@ -3823,6 +3823,10 @@ struct Owed {
     /// A Darwin wait (`Kernel::darwin_block`'s): its end is its kernel's
     /// (`finish_blocking`), with the kernel lock (`darwin::finished`).
     darwin: bool,
+    /// A parked Darwin write's bytes put in since it parked
+    /// (`darwin::stream_round`), what the call's answer adds to what it put
+    /// in before.
+    darwin_written: usize,
 }
 
 impl Run {
@@ -9210,16 +9214,23 @@ fn syscall_entry(ctx: i32, pc: i64) {
                 // kernel (`finish_wait`). A call the kernel would redo once
                 // its wait is over is made again instead.
                 let k = &mut h.kernel;
-                // The kernel's own finish for a wait it parked; here the call
-                // is made again instead (`finish_parked`).
-                k.retry_sigwait = None;
-                let owed = Owed {
-                    restore_sigmask: k.restore_sigmask.take(),
-                    write_blocked: std::mem::take(&mut k.write_blocked),
-                    reissue: k.retry_accept.take().is_some()
-                        | k.retry_recvmsg.take().is_some()
-                        | k.retry_transfer.take().is_some(),
-                    darwin: k.darwin,
+                // A Darwin call's wait is ended by its kernel, which redoes
+                // or finishes the call from what it kept (`finish_blocking`,
+                // `darwin::finished`): nothing taken from it.
+                let owed = if k.darwin {
+                    Owed { darwin: true, ..Owed::default() }
+                } else {
+                    // The kernel's own finish for a wait it parked; here the
+                    // call is made again instead (`finish_parked`).
+                    k.retry_sigwait = None;
+                    Owed {
+                        restore_sigmask: k.restore_sigmask.take(),
+                        write_blocked: std::mem::take(&mut k.write_blocked),
+                        reissue: k.retry_accept.take().is_some()
+                            | k.retry_recvmsg.take().is_some()
+                            | k.retry_transfer.take().is_some(),
+                        ..Owed::default()
+                    }
                 };
                 {
                     let mut r = h.threads[cur()].run();
@@ -14919,7 +14930,7 @@ fn park_free(op: gex_kernel::BlockOp, restore_sigmask: Option<u64>, pc: u64) -> 
         r.pc = pc + gex_abi::SYSCALL_INST_BYTES;
         r.waiting = r.park_as(waiting);
         r.blocked_on = Some(op);
-        r.owed = Owed { restore_sigmask, write_blocked, reissue, darwin: false };
+        r.owed = Owed { restore_sigmask, write_blocked, reissue, ..Owed::default() };
     }
     waitq::begin_turn();
     // The compositor first, as the locked turn pumps it (`schedule`): this is
@@ -15286,7 +15297,7 @@ fn finish_wait(r: &mut Run, i: usize, ctx_addr: u64, tid: i32, timed_out: bool, 
     };
     // A Darwin wait: ended by its kernel, as the native host ends it.
     if owed.darwin {
-        return darwin::finished(r, i, ctx_addr, tid, timed_out, by_signal);
+        return darwin::finished(r, i, ctx_addr, tid, op, owed, timed_out, by_signal);
     }
     // A priority-inheritance lock's wait is over, however it ends: no
     // longer counted as waiting (`sys_futex`).
@@ -15458,9 +15469,9 @@ fn finish_parked(
                 r => r,
             }
         }
-        // A Darwin process's waits never park here (`darwin::unparked`).
+        // A Darwin write's wait is its kernel's to end (`darwin::finished`).
         gex_kernel::BlockOp::WriteStream { xnu: Some(_), .. } | gex_kernel::BlockOp::WriteWait { .. } => {
-            unreachable!("a Darwin write's wait parked in the page, which ends Darwin waits at the call (darwin::unparked)")
+            unreachable!("a Darwin write's wait finished as a Linux one's; its kernel ends it (darwin::finished)")
         }
         gex_kernel::BlockOp::WriteStream { handle, buf, len, gathered, xnu: None } => {
             // One turn's worth; the scheduler brings the thread back while

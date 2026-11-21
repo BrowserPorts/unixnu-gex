@@ -720,18 +720,133 @@ pub(crate) fn safepoint(ctx_addr: u64, pc: u64) {
 /// Whether a Darwin call's wait is one the page parks: a thread's sleep on
 /// its own wait word (`Kernel::darwin_block`'s, a futex wait on its
 /// context's `WAIT`), which every Darwin wait queue's waiter makes (kevent,
-/// psynch, ulock, mach_msg, select and poll among them), its end the
-/// kernel's ([`finished`]).
+/// psynch, ulock, mach_msg, select and poll among them); a read of a pipe
+/// or a socket with nothing in it (`ReadStream`), or an `accept` or a
+/// Darwin unix stream socket's receive (`AcceptWait`, the call finished or
+/// made again once there is something); a Darwin pipe's or stream
+/// socket's write that sleeps for room to put the rest in (`WriteStream`
+/// with its `fp_writev` accounting); and a send that waits for room before
+/// its first byte (`WriteWait`, the call made again). Each one's end is the
+/// kernel's ([`finished`]). A write to another stream (`WriteStream` with
+/// no `xnu`: one the global kernel holds, whose bytes the native host
+/// reads from the caller as the wait begins) is not parked.
 pub(crate) fn parks(op: &gex_kernel::BlockOp) -> bool {
-    matches!(op, gex_kernel::BlockOp::FutexWait { .. })
+    use gex_kernel::BlockOp;
+    matches!(op, BlockOp::FutexWait { .. } | BlockOp::ReadStream { .. } | BlockOp::AcceptWait { .. } | BlockOp::WriteStream { xnu: Some(_), .. } | BlockOp::WriteWait { .. })
+}
+
+/// Whether Darwin call wait `op` is a stream's ([`stream_round`]).
+fn on_stream(op: &gex_kernel::BlockOp) -> bool {
+    use gex_kernel::BlockOp;
+    matches!(op, BlockOp::ReadStream { .. } | BlockOp::AcceptWait { .. } | BlockOp::WriteStream { .. } | BlockOp::WriteWait { .. })
+}
+
+/// The page's park of Darwin call wait `op` ([`parks`]). A write whose
+/// descriptor has room, but not what the write needs (a write of at most
+/// `PIPE_BUF` goes in whole, a send needs room for its control), looks
+/// again after a millisecond, as the native host's loop does.
+fn waiting_of(op: &gex_kernel::BlockOp) -> Waiting {
+    use gex_kernel::BlockOp;
+    match op {
+        BlockOp::FutexWait { table, uaddr, deadline, parked, val } => Waiting::Futex {
+            val: *val,
+            wake_gen: unsafe { k_futex_gen(*uaddr) },
+            parked: parked.clone().unwrap_or_else(|| table.park(*uaddr)),
+            deadline: deadline.map(|d| turn_now() + d.as_nanos() as u64),
+        },
+        BlockOp::ReadStream { handle, .. } => Waiting::Read(Arc::clone(handle)),
+        BlockOp::AcceptWait { socket } => Waiting::Accept(Arc::clone(socket)),
+        BlockOp::WriteStream { handle, .. } | BlockOp::WriteWait { handle, .. } => {
+            if handle.poll_writable() {
+                Waiting::Sleep(turn_now() + 1_000_000)
+            } else {
+                Waiting::Write(Arc::clone(handle))
+            }
+        }
+        other => unreachable!("a Darwin wait the page parks is a futex wait or a stream's, not {other:?}"),
+    }
+}
+
+/// One look at a Darwin call's wait on a stream, as the native host's
+/// `perform_block` loop makes it with what the stream holds now: `None`
+/// while it still waits, else what the wait gives the kernel's
+/// `finish_blocking`. Where the native loop gives up its turn, a signal
+/// pending for the thread ends the wait with EINTR (its `interrupted`).
+/// A read (`ReadStream`): what there is, into the caller's buffer (a
+/// `readv`'s scattered). An `accept`'s or a receive's wait (`AcceptWait`):
+/// over once the socket is readable, the call then finished or made again.
+/// A Darwin pipe's or stream socket's rest (`WriteStream`, `written` of it
+/// put in since it parked): as much as there is room for, by the whole
+/// write's rules (`write_part`); all of it in, the bytes from before it
+/// parked and since; EPIPE, whatever went before (`fp_writev`); with no
+/// room and a signal pending, what went in, or EINTR if nothing did;
+/// another error, what went in since it parked, or the error if nothing
+/// did. A send's wait for room before its first byte
+/// (`WriteWait`): over once the socket would take `resid` bytes and `clen`
+/// of control (`send_ready`), the call then made again.
+fn stream_round(k: &mut gex_kernel::syscalls::Kernel, gm: &mut GuestMem<'_>, tid: i32, op: &gex_kernel::BlockOp, written: &mut usize) -> Option<Result<u64, gex_kernel::Errno>> {
+    use gex_kernel::{BlockOp, Errno};
+    let turn = |k: &mut gex_kernel::syscalls::Kernel| k.signal_pending_for(tid).then_some(Err(Errno::EINTR));
+    match op {
+        BlockOp::ReadStream { handle, buf, len, vectors } => {
+            if handle.poll_readable() {
+                let mut tmp = vec![0u8; *len];
+                // Another reader of the same stream took it: wait again.
+                let n = match handle.read_at(0, &mut tmp) {
+                    Err(Errno::EAGAIN) => return turn(k),
+                    Err(e) => return Some(Err(e)),
+                    Ok(n) => n,
+                };
+                let put = match vectors {
+                    Some(v) => gex_kernel::syscalls::scatter(gm, v, &tmp[..n as usize]),
+                    None => gm.write(*buf, &tmp[..n as usize]),
+                };
+                return Some(put.map(|()| n));
+            }
+            turn(k)
+        }
+        BlockOp::WriteStream { handle, gathered: Some(data), xnu: Some((orig, before)), .. } => loop {
+            let done = *written;
+            if done == data.len() {
+                return Some(Ok(before + done as u64));
+            }
+            if !handle.write_ready(data.len() - done, *orig) {
+                if k.signal_pending_for(tid) {
+                    let total = before + done as u64;
+                    return Some(if total > 0 { Ok(total) } else { Err(Errno::EINTR) });
+                }
+                return None;
+            }
+            match handle.write_part(&data[done..], *orig) {
+                Err(Errno::EPIPE) => return Some(Err(Errno::EPIPE)),
+                Ok(0) | Err(Errno::EAGAIN) => return None,
+                Ok(n) => *written += n as usize,
+                Err(_) if done > 0 => return Some(Ok(before + done as u64)),
+                Err(e) => return Some(Err(e)),
+            }
+        },
+        BlockOp::AcceptWait { socket } => {
+            if socket.poll_readable() {
+                return Some(Ok(0));
+            }
+            turn(k)
+        }
+        BlockOp::WriteWait { handle, resid, clen } => {
+            if handle.send_ready(*resid, *clen) {
+                return Some(Ok(0));
+            }
+            turn(k)
+        }
+        other => unreachable!("a Darwin stream wait is a read, a receive's, a gathered Darwin write or a send's, not {other:?}"),
+    }
 }
 
 /// A Darwin call that parked on what the page does not park
-/// (`SyscallOutcome::Blocking` other than [`parks`]'): a Darwin pipe's or
-/// socket's write (its whole size and what it already wrote, `fp_writev`'s
-/// rules) or a Darwin `wait4` (stops and continues), which the page's Linux
-/// waits do not finish as the kernel does. Reported, and the call ended
-/// through the kernel with ENOSYS; the outcome is the call's.
+/// (`SyscallOutcome::Blocking` other than [`parks`]'): a Darwin `wait4`
+/// (stops and continues), `sigsuspend`, a `connect` that waits, or a write
+/// to a stream the global kernel holds, among others, which the page's
+/// Linux waits do not finish as the kernel does. Reported, and the call
+/// ended through the kernel with ENOSYS; the outcome is the call's.
 pub(crate) fn unparked(k: &mut gex_kernel::syscalls::Kernel, m: &mut GuestMem<'_>, op: &gex_kernel::BlockOp) -> gex_kernel::SyscallOutcome {
     let what = format!("{op:?}");
     let what = what.split(['{', '(', ' ']).next().unwrap_or("?");
@@ -764,20 +879,29 @@ pub(crate) fn spawn_refused(k: &mut gex_kernel::syscalls::Kernel, m: &mut GuestM
 }
 
 /// A Darwin wait's end, in the Worker of thread `i` whose wait it was
-/// (`finish_wait`, `r` its run state, locked): as the native host ends one
-/// (`perform_block`, then `Kernel::finish_blocking` with the kernel locked):
-/// the wait's own result, `ETIMEDOUT` at its deadline, `EINTR` when a
-/// signal is pending for the thread (`signal_pending_for`, as the native
-/// host's `interrupted`), else a wake; the kernel then writes the call's
-/// answer, delivers a signal, or sleeps the thread again.
-pub(crate) fn finished(r: &mut Run, i: usize, ctx_addr: u64, tid: i32, timed_out: bool, by_signal: bool) -> Done {
+/// (`finish_wait`, `r` its run state, locked, `op` its wait and `owed` what
+/// its call owes): as the native host ends one (`perform_block`, then
+/// `Kernel::finish_blocking` with the kernel locked): the wait's own
+/// result, `ETIMEDOUT` at its deadline, `EINTR` when a signal is pending for
+/// the thread (`signal_pending_for`, as the native host's `interrupted`),
+/// else a wake; a stream's, what its round gives ([`stream_round`]), or
+/// the call parked again while it still waits. The kernel then writes the
+/// call's answer, delivers a signal, or sleeps the thread again.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finished(r: &mut Run, i: usize, ctx_addr: u64, tid: i32, op: gex_kernel::BlockOp, mut owed: Owed, timed_out: bool, by_signal: bool) -> Done {
     use gex_kernel::{Errno, SyscallOutcome};
     let pc = r.pc;
+    let stream = on_stream(&op);
     let out = with_exec_lock(|h| {
         let ks = h.threads[i].kstate();
         h.kernel.enter_thread(&ks);
         let mut gm = guest();
-        let res = if timed_out {
+        let res = if stream {
+            match stream_round(&mut h.kernel, &mut gm, tid, &op, &mut owed.darwin_written) {
+                Some(res) => res,
+                None => return None,
+            }
+        } else if timed_out {
             Err(Errno::ETIMEDOUT)
         } else if by_signal && h.kernel.signal_pending_for(tid) {
             Err(Errno::EINTR)
@@ -800,12 +924,20 @@ pub(crate) fn finished(r: &mut Run, i: usize, ctx_addr: u64, tid: i32, timed_out
         if matches!(out, SyscallOutcome::ThreadExit) {
             thread_ended(tid);
         }
-        out
+        Some(out)
     });
     if spawned() {
         // SAFETY: a host import without arguments; nothing here holds a lock.
         unsafe { cgen::thread_start() };
     }
+    // A stream's wait that goes on: parked again on the same wait, with
+    // what a write has put in so far.
+    let Some(out) = out else {
+        r.waiting = r.park_as(waiting_of(&op));
+        r.blocked_on = Some(op);
+        r.owed = owed;
+        return Done::Parked;
+    };
     match out {
         // On after the call; a thread parked at its first entry (`pc` 0,
         // `adopted`) where its context now says.
@@ -813,14 +945,7 @@ pub(crate) fn finished(r: &mut Run, i: usize, ctx_addr: u64, tid: i32, timed_out
         SyscallOutcome::Continue => Done::At(ctx_addr, pc),
         SyscallOutcome::Resume(target) => Done::At(ctx_addr, target),
         SyscallOutcome::Blocking(op) => {
-            let gex_kernel::BlockOp::FutexWait { table, uaddr, deadline, parked, val } = &op else { unreachable!("a Darwin wait the page parks is a futex wait") };
-            let waiting = Waiting::Futex {
-                val: *val,
-                wake_gen: unsafe { k_futex_gen(*uaddr) },
-                parked: parked.clone().unwrap_or_else(|| table.park(*uaddr)),
-                deadline: deadline.map(|d| turn_now() + d.as_nanos() as u64),
-            };
-            r.waiting = r.park_as(waiting);
+            r.waiting = r.park_as(waiting_of(&op));
             r.blocked_on = Some(op);
             r.owed = Owed { darwin: true, ..Owed::default() };
             Done::Parked

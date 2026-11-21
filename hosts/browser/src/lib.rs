@@ -3820,6 +3820,9 @@ struct Owed {
     /// The call is made again once its wait is over (an `accept`, a
     /// `recvmsg`, a transfer), from its instruction, rather than finished.
     reissue: bool,
+    /// A Darwin wait (`Kernel::darwin_block`'s): its end is its kernel's
+    /// (`finish_blocking`), with the kernel lock (`darwin::finished`).
+    darwin: bool,
 }
 
 impl Run {
@@ -8992,7 +8995,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
         // A Darwin call's wait, which the page does not park
         // (`darwin::unparked`).
         let outcome = match outcome {
-            SyscallOutcome::Blocking(op) if h.kernel.darwin => darwin::unparked(&mut h.kernel, &mut gm, &op),
+            SyscallOutcome::Blocking(op) if h.kernel.darwin && !darwin::parks(&op) => darwin::unparked(&mut h.kernel, &mut gm, &op),
             o => o,
         };
         let outcome = match outcome {
@@ -9198,6 +9201,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
                     reissue: k.retry_accept.take().is_some()
                         | k.retry_recvmsg.take().is_some()
                         | k.retry_transfer.take().is_some(),
+                    darwin: k.darwin,
                 };
                 {
                     let mut r = h.threads[cur()].run();
@@ -14644,6 +14648,18 @@ fn finish_mine(signalled: bool) -> i32 {
             exit_here(code, Some(ctx_pc()));
             2
         }
+        // Waiting again: the next turn registers the new wait.
+        Done::Parked => {
+            set_paused_to(2);
+            2
+        }
+        Done::Gone => {
+            end_if_all_exited();
+            set_resume_none();
+            set_resume_ctx_none();
+            SCHED_OVER.with(|c| c.set(true));
+            2
+        }
     }
 }
 
@@ -14859,7 +14875,7 @@ fn park_free(op: gex_kernel::BlockOp, restore_sigmask: Option<u64>, pc: u64) -> 
         r.pc = pc + gex_abi::SYSCALL_INST_BYTES;
         r.waiting = r.park_as(waiting);
         r.blocked_on = Some(op);
-        r.owed = Owed { restore_sigmask, write_blocked, reissue };
+        r.owed = Owed { restore_sigmask, write_blocked, reissue, darwin: false };
     }
     waitq::begin_turn();
     // The compositor first, as the locked turn pumps it (`schedule`): this is
@@ -14895,6 +14911,15 @@ fn pick_mine(run: &Arc<ThreadCell>) -> Pick {
                     drop(r);
                     exit_here(code, Some(ctx_pc()));
                     Pick::Resumed(None)
+                }
+                // Waiting again: looked at afresh.
+                Done::Parked => continue,
+                Done::Gone => {
+                    drop(r);
+                    end_if_all_exited();
+                    set_resume_none();
+                    set_resume_ctx_none();
+                    Pick::Over
                 }
             };
         }
@@ -15171,11 +15196,18 @@ fn exit_here(code: i32, killed_at: Option<u64>) -> i32 {
 }
 
 /// How a parked call ended for its thread.
-enum Done {
+pub(crate) enum Done {
     /// It runs on, at this context and pc.
     At(u64, u64),
     /// A signal ends the process, with this status (`exit_process`'s).
     Ends(i32),
+    /// A Darwin wait that its kernel sleeps again (`finish_blocking`'s
+    /// `Blocking`): the thread is parked anew, its run state says on what.
+    Parked,
+    /// The thread ended in its wait's end (a Darwin thread's `ThreadExit`):
+    /// marked exited, its process's end looked at once its run state is
+    /// let go (`end_if_all_exited`).
+    Gone,
 }
 
 /// Finish the call thread `i` parked in, its wait over (`timed_out`,
@@ -15208,6 +15240,10 @@ fn finish_wait(r: &mut Run, i: usize, ctx_addr: u64, tid: i32, timed_out: bool, 
         }
         return Done::At(ctx_addr, pc);
     };
+    // A Darwin wait: ended by its kernel, as the native host ends it.
+    if owed.darwin {
+        return darwin::finished(r, i, ctx_addr, tid, timed_out, by_signal);
+    }
     // A priority-inheritance lock's wait is over, however it ends: no
     // longer counted as waiting (`sys_futex`).
     if let gex_kernel::BlockOp::FutexLockPi { table, uaddr, .. } = &op {

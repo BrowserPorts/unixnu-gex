@@ -467,6 +467,9 @@ pub extern "C" fn gex_darwin_thread_calls() -> u32 {
                     return None;
                 }
                 let next = h.kernel.darwin_thread_calls(&mut guest());
+                // The threads they woke (a kevent's, a Mach message's
+                // receiver), in their Workers.
+                self::woken(&mut h.kernel);
                 WATCHED.store(watch_print(&h.kernel), Ordering::Release);
                 Some((next, h.kernel.darwin_pipe_watch_queues()))
             });
@@ -580,13 +583,21 @@ pub(crate) fn safepoint_signals(ctx_addr: u64, pc: u64) {
     }
 }
 
-/// A Darwin call that parked (`SyscallOutcome::Blocking`): the page parks
-/// a thread with its Linux waits, which do not end a Darwin wait as its
-/// kernel does (`Kernel::finish_blocking`: the Darwin result, the thread's
-/// wait state, a wait that sleeps again), nor finish a Darwin pipe's or
-/// socket's write (its whole size and what it already wrote) or a Darwin
-/// `wait4` (stops and continues). Reported, and the call ended through
-/// the kernel with ENOSYS; the outcome is the call's.
+/// Whether a Darwin call's wait is one the page parks: a thread's sleep on
+/// its own wait word (`Kernel::darwin_block`'s, a futex wait on its
+/// context's `WAIT`), which every Darwin wait queue's waiter makes (kevent,
+/// psynch, ulock, mach_msg, select and poll among them), its end the
+/// kernel's ([`finished`]).
+pub(crate) fn parks(op: &gex_kernel::BlockOp) -> bool {
+    matches!(op, gex_kernel::BlockOp::FutexWait { .. })
+}
+
+/// A Darwin call that parked on what the page does not park
+/// (`SyscallOutcome::Blocking` other than [`parks`]'): a Darwin pipe's or
+/// socket's write (its whole size and what it already wrote, `fp_writev`'s
+/// rules) or a Darwin `wait4` (stops and continues), which the page's Linux
+/// waits do not finish as the kernel does. Reported, and the call ended
+/// through the kernel with ENOSYS; the outcome is the call's.
 pub(crate) fn unparked(k: &mut gex_kernel::syscalls::Kernel, m: &mut GuestMem<'_>, op: &gex_kernel::BlockOp) -> gex_kernel::SyscallOutcome {
     let what = format!("{op:?}");
     let what = what.split(['{', '(', ' ']).next().unwrap_or("?");
@@ -616,6 +627,89 @@ pub(crate) fn spawn_refused(k: &mut gex_kernel::syscalls::Kernel, m: &mut GuestM
     }
     k.darwin_unimplemented("posix_spawn's child: a second Darwin process of the system, whose Darwin state is this process's Worker's in the page; the call fails with ENOSYS".into());
     let _ = gex_kernel::darwin::set_result(m, k.ctx_addr, gex_kernel::Errno::ENOSYS.as_return());
+}
+
+/// A Darwin wait's end, in the Worker of thread `i` whose wait it was
+/// (`finish_wait`, `r` its run state, locked): as the native host ends one
+/// (`perform_block`, then `Kernel::finish_blocking` with the kernel locked):
+/// the wait's own result, `ETIMEDOUT` at its deadline, `EINTR` when a
+/// signal is pending for the thread (`signal_pending_for`, as the native
+/// host's `interrupted`), else a wake; the kernel then writes the call's
+/// answer, delivers a signal, or sleeps the thread again.
+pub(crate) fn finished(r: &mut Run, i: usize, ctx_addr: u64, tid: i32, timed_out: bool, by_signal: bool) -> Done {
+    use gex_kernel::{Errno, SyscallOutcome};
+    let pc = r.pc;
+    let out = with_exec_lock(|h| {
+        let ks = h.threads[i].kstate();
+        h.kernel.enter_thread(&ks);
+        let mut gm = guest();
+        let res = if timed_out {
+            Err(Errno::ETIMEDOUT)
+        } else if by_signal && h.kernel.signal_pending_for(tid) {
+            Err(Errno::EINTR)
+        } else {
+            Ok(0)
+        };
+        let mut out = h.kernel.finish_blocking(&mut gm, res);
+        // A wait it goes on to that the page does not park, as at a call.
+        if let SyscallOutcome::Blocking(op) = &out {
+            if !parks(op) {
+                let op = op.clone();
+                out = unparked(&mut h.kernel, &mut gm, &op);
+            }
+        }
+        woken(&mut h.kernel);
+        start_spawns(&mut h.kernel);
+        if matches!(out, SyscallOutcome::Exit(_) | SyscallOutcome::Killed { .. }) {
+            task_end(&mut h.kernel);
+        }
+        if matches!(out, SyscallOutcome::ThreadExit) {
+            gex_kernel::darwin::workq::thread_ended(tid);
+        }
+        out
+    });
+    if spawned() {
+        // SAFETY: a host import without arguments; nothing here holds a lock.
+        unsafe { cgen::thread_start() };
+    }
+    match out {
+        // On after the call; a thread parked at its first entry (`pc` 0,
+        // `adopted`) where its context now says.
+        SyscallOutcome::Continue if pc == 0 => Done::At(ctx_addr, guest().read_u64(ctx_addr + ctx::PC as u64).unwrap_or(0)),
+        SyscallOutcome::Continue => Done::At(ctx_addr, pc),
+        SyscallOutcome::Resume(target) => Done::At(ctx_addr, target),
+        SyscallOutcome::Blocking(op) => {
+            let gex_kernel::BlockOp::FutexWait { table, uaddr, deadline, parked, val } = &op else { unreachable!("a Darwin wait the page parks is a futex wait") };
+            let waiting = Waiting::Futex {
+                val: *val,
+                wake_gen: unsafe { k_futex_gen(*uaddr) },
+                parked: parked.clone().unwrap_or_else(|| table.park(*uaddr)),
+                deadline: deadline.map(|d| turn_now() + d.as_nanos() as u64),
+            };
+            r.waiting = r.park_as(waiting);
+            r.blocked_on = Some(op);
+            r.owed = Owed { darwin: true, ..Owed::default() };
+            Done::Parked
+        }
+        SyscallOutcome::Exit(code) => Done::Ends(code),
+        SyscallOutcome::Killed { signal, .. } => Done::Ends(-(signal as i32)),
+        SyscallOutcome::ThreadExit => {
+            r.waiting = Waiting::Exited;
+            Done::Gone
+        }
+        other => panic!("gex: Darwin thread {tid}: its wait ended in {other:?}, which a wait's end does not have"),
+    }
+}
+
+/// The futexes a Darwin kernel entry woke (a waiter's wait word,
+/// `darwin_wake`), told to the global kernel, so a thread parked on one in
+/// another Worker sees the wake, as every call's are (`syscall_entry`).
+pub(crate) fn woken(k: &mut gex_kernel::syscalls::Kernel) {
+    if unsafe { k_present() } != 0 {
+        for addr in k.futexes.take_woken() {
+            unsafe { k_futex_wake(addr) };
+        }
+    }
 }
 
 /// The Darwin calls that make a process the page does not start yet,
@@ -672,8 +766,10 @@ pub(crate) fn spawned() -> bool {
 /// (`workq::thread_started`), then the kernel's own first entry for a
 /// thread that has one (a workqueue thread, made parked:
 /// `Kernel::darwin_thread_entry`), which leaves the context set for where
-/// the guest begins. Thread `i`'s entry pc, or `None` when it does not run
-/// (it, or its process, has ended).
+/// the guest begins. Its waits (`darwin_thread_entry`'s `perform_block`
+/// natively) park this Worker as a call's do, and end as [`finished`]
+/// ends them. Thread `i`'s entry pc, or `None` when it does not run (it,
+/// or its process, has ended).
 pub(crate) fn adopted(i: usize) -> Option<u64> {
     use gex_kernel::SyscallOutcome;
     let out = with_exec_lock(|h| {
@@ -682,24 +778,39 @@ pub(crate) fn adopted(i: usize) -> Option<u64> {
         h.kernel.enter_thread(&ks);
         let mut gm = guest();
         let mut out = h.kernel.darwin_thread_entry(&mut gm);
-        // A wait the page does not park (`unparked`, as a call's): reported,
-        // and the thread does not start.
         if let Some(SyscallOutcome::Blocking(op)) = &out {
-            let what = format!("{op:?}");
-            let what = what.split(['{', '(', ' ']).next().unwrap_or("?").to_string();
-            h.kernel.darwin_unimplemented(format!("a new workqueue thread's first wait ({what}): the page's waits do not end a Darwin wait as its kernel does (finish_blocking); the thread does not start"));
-            out = Some(SyscallOutcome::ThreadExit);
+            if !parks(op) {
+                let op = op.clone();
+                out = Some(unparked(&mut h.kernel, &mut gm, &op));
+            }
         }
+        woken(&mut h.kernel);
         start_spawns(&mut h.kernel);
         match out {
             None | Some(SyscallOutcome::Continue) => {}
             Some(SyscallOutcome::Resume(pc)) => {
                 let _ = gm.write_u64(ks.ctx_addr + ctx::PC as u64, pc);
             }
+            Some(SyscallOutcome::Blocking(op)) => {
+                // Parked from the start: the context's pc is where it goes
+                // once its wait ends (`finished`).
+                let gex_kernel::BlockOp::FutexWait { table, uaddr, deadline, parked, val } = &op else { unreachable!("a Darwin wait the page parks is a futex wait") };
+                let waiting = Waiting::Futex {
+                    val: *val,
+                    wake_gen: unsafe { k_futex_gen(*uaddr) },
+                    parked: parked.clone().unwrap_or_else(|| table.park(*uaddr)),
+                    deadline: deadline.map(|d| turn_now() + d.as_nanos() as u64),
+                };
+                let mut r = h.threads[i].run();
+                r.pc = 0;
+                r.waiting = r.park_as(waiting);
+                r.blocked_on = Some(op);
+                r.owed = Owed { darwin: true, ..Owed::default() };
+                return Some(None);
+            }
             Some(SyscallOutcome::ThreadExit) => {
                 h.threads[i].run().waiting = Waiting::Exited;
                 gex_kernel::darwin::workq::thread_ended(ks.tid);
-                end_if_all_exited();
                 return None;
             }
             Some(SyscallOutcome::Exit(code)) => {
@@ -716,11 +827,32 @@ pub(crate) fn adopted(i: usize) -> Option<u64> {
         }
         let pc = gm.read_u64(ks.ctx_addr + ctx::PC as u64).unwrap_or(0);
         h.threads[i].run().pc = pc;
-        Some(pc)
+        Some(Some(pc))
     });
     if spawned() {
         // SAFETY: a host import without arguments; nothing here holds a lock.
         unsafe { cgen::thread_start() };
     }
-    out
+    match out {
+        Some(Some(pc)) => Some(pc),
+        // Its first wait, in this Worker until it ends (as `wasm32_wait`
+        // waits a call's out in place).
+        Some(None) => loop {
+            let _now = NowScope::open();
+            if schedule() == 1 {
+                let pc = resume();
+                set_resume_none();
+                set_resume_ctx_none();
+                return pc;
+            }
+            if exited() || SCHED_OVER.with(|c| c.replace(false)) {
+                return None;
+            }
+            gex_park(0);
+        },
+        None => {
+            end_if_all_exited();
+            None
+        }
+    }
 }

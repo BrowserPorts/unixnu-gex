@@ -303,8 +303,16 @@ WebMetal's own builds choose it: `WEBGPU_NATIVE` is `dawn` or
 `wgpu-native`, and `WEBGPU_NATIVE_DIR` its install root (with
 `include/webgpu/webgpu.h` and `lib/`).
 
+The data both take from the A10X's system software is not in their
+repositories; you supply it from your own device, as their READMEs
+describe, and the build fails, naming what is missing, without it:
+`WEBMETAL_PROFILE` (the device profile), `WEBMETAL_AGX_TEXTURE_FORMATS`
+(the A10X driver's texture format table, in its Rust form) and
+`AIRWGSL_INTRINSICS` (AirWgsl's intrinsic table).
+
 ```sh
 git submodule update --init third_party/WebMetal third_party/AirWgsl
+WEBMETAL_PROFILE=<profile.toml> WEBMETAL_AGX_TEXTURE_FORMATS=<formats.rs> AIRWGSL_INTRINSICS=<intrinsics.toml> \
 WEBGPU_NATIVE=dawn WEBGPU_NATIVE_DIR=<dawn> cargo build --release -p gexc --features webmetal
 target/release/gexc webmetal-info
 ```
@@ -322,7 +330,8 @@ makes on its executor, its IOSurface table and its presentation sink. The
 display is a canvas the same Worker draws the framebuffer's frames on.
 `hosts/metal/tests/check_page.py` checks it in a browser from where a
 process's kernel stands (it needs `wasm-bindgen` at the version WebMetal
-pins).
+pins, the same three inputs, and `WEBMETAL_REFERENCE`, a run of WebMetal's
+reference harness on real Metal that its reference cases compare with).
 
 ### The Darwin test programs
 
@@ -537,7 +546,7 @@ exits 1 when any fails. It builds the programs first when
 | `GEX_DARWIN_ROOT` | the root for the dynamic programs, which run from its `/var/tmp`. Without it they are skipped, or fail when named |
 | `GEX_DARWIN_RESTORE` | the restore source (gexc's, above), whose OS cryptex image holds the shared cache the dynamic programs map. Without it they are skipped, or fail when named |
 | `GEX_DARWIN_BOOT` | the device's boot payload. Its trust cache, with the test programs' cdhashes added, goes to `tests/darwin/bin/boot/TrustCache`, with its `DeviceTree` and Sandbox blobs beside it, and gexc boots from there. Without it, the trust cache holds the test programs only |
-| `GEX_DARWIN_WEBMETAL` | WebMetal's plugin bundle, as UniXNU's `scripts/build-web-metal-plugin.py` builds it (`<out>/ios/AGXMetalA10.bundle`), which `metal` loads. Without it `metal` is skipped, or fails when named |
+| `GEX_DARWIN_WEBMETAL` | WebMetal's plugin bundle, as UniXNU's `scripts/build-web-metal-plugin.py` builds it (`<out>/ios/AGXMetalA10.bundle`) from the WebMetal commit `third_party/WebMetal` pins (the executor refuses a plugin whose wire protocol differs), which `metal` loads. Without it `metal` is skipped, or fails when named |
 
 `GEX_DARWIN_STRICT=1` reaches gexc from the environment as well. The
 runner discards each program's stderr, so run a failing program directly

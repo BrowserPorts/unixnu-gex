@@ -12,7 +12,8 @@
 //!   GPU Worker's own pipeline service (AirWgsl): requests, command
 //!   buffers committed from guest memory, completion through the queue's
 //!   doorbell and FetchEvents, results written into guest memory, compared
-//!   with the reference outputs exactly;
+//!   exactly with the reference outputs of the run `WEBMETAL_REFERENCE`
+//!   names;
 //! - a blit fill and copy, and accesses the mapping table refuses (an
 //!   unmapped stream, a read-only destination);
 //! - an IOSurface handed to the GPU, read by a blit, written by a blit and
@@ -327,9 +328,10 @@ mod task {
         [x, y, z, 0].iter().flat_map(|v| v.to_le_bytes()).collect()
     }
 
-    /// The hex bytes of `data` record `name` of a reference case's file.
+    /// The hex bytes of `data` record `name` of a reference case's file, in the release variant of the reference
+    /// run (`WEBMETAL_REFERENCE`, served by tests/check_page.py).
     fn golden(case: &str, name: &str) -> Vec<u8> {
-        let path = format!("/__webmetal/tests/reference/goldens/apple-m4-macos-27.0.1-26a434/release/{case}.json");
+        let path = format!("/__reference_run/release/{case}.json");
         let text = String::from_utf8(fetch_bytes(&path).unwrap_or_else(|| panic!("{path} is not served"))).unwrap();
         let key = format!("\"name\":\"{name}\"");
         let line = text.lines().find(|l| l.contains(&key) && l.contains("\"kind\":\"data\"")).unwrap_or_else(|| panic!("{case}: no {name}"));

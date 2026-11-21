@@ -98,7 +98,7 @@ debug = 1
 [patch.crates-io]
 wasmtime = { path = "third_party/wasmtime-49.0.2" }
 
-# WebMetal's executor takes AirWgsl at a commit of its public repository;
-# the submodule is that commit.
-[patch."https://github.com/MovByte/AirWgsl"]
+# WebMetal's executor takes AirWgsl from its public repository; the
+# submodule takes its place, so that gexc builds with the AirWgsl pinned here.
+[patch."https://github.com/BrowserPorts/AirWgsl"]
 airwgsl = { path = "third_party/AirWgsl" }

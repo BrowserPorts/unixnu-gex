@@ -3,18 +3,23 @@
 
 Builds hosts/metal for wasm32 (the GPU Worker's module and examples/check_task.rs), runs wasm-bindgen on both,
 serves tests/page cross-origin isolated (SharedArrayBuffer) from 127.0.0.1 with the ring's script
-(hosts/browser/js), WebMetal's reference outputs and the reference shader library, and opens it in a browser. The
+(hosts/browser/js), a run of WebMetal's reference harness and the reference shader library, and opens it in a browser. The
 page starts the GPU Worker with the display's canvas and a process memory, and runs the checks from a Worker that
 stands where that process's kernel stands. Each check's result is printed; the exit status is 0 when every check
 passed, 1 when one did not, 2 when the run could not complete.
 
 Usage: check_page.py [--browser chrome|chrome-headless|firefox|safari|PATH] [--build DIR] [--no-build] [--reference-build DIR]
-                     [--out RESULTS] [--timeout SECONDS]
+                     [--reference RUN] [--out RESULTS] [--timeout SECONDS]
 
 Browsers: chrome, in a window of a fresh profile (chrome-headless: headless, which Chrome 157 on the reference Mac
 does not keep running past about 30 s); firefox, in a window of a fresh profile (Firefox gives a headless page no WebGPU
 adapter); safari, through `open -a Safari`. --reference-build names a build of WebMetal's
 `tests/reference/build.py --platform ios`; without it the script makes one (Xcode's Metal toolchain).
+
+What real Metal recorded is not part of WebMetal's repository: --reference (by default $WEBMETAL_REFERENCE) names a run of
+its reference harness on real Metal (`wmref run --out RUN`, with run.json and the release variant's records), which the
+reference cases are compared with. The run stops when it is missing. Building hosts/metal needs the inputs WebMetal's
+host and AirWgsl take (WEBMETAL_PROFILE, WEBMETAL_AGX_TEXTURE_FORMATS, AIRWGSL_INTRINSICS), from the environment.
 """
 
 import argparse
@@ -66,9 +71,19 @@ def reference(args, out):
     return dest
 
 
-def serve(out, reference_dir, state):
+def reference_run(args):
+    if not args.reference:
+        sys.exit("no reference run: give --reference or set WEBMETAL_REFERENCE to a run of WebMetal's reference harness")
+    run = os.path.abspath(args.reference)
+    for name in ("run.json", "release"):
+        if not os.path.exists(os.path.join(run, name)):
+            sys.exit("%s (the reference run) has no %s" % (run, name))
+    return run
+
+
+def serve(out, reference_dir, run_dir, state):
     roots = {"js": JS, "pkg": os.path.join(out, "pkg"), "pkg-task": os.path.join(out, "pkg-task"),
-             "__webmetal": WEBMETAL, "__reference": reference_dir}
+             "__reference": reference_dir, "__reference_run": run_dir}
 
     class Handler(http.server.SimpleHTTPRequestHandler):
         def __init__(self, *a, **kw):
@@ -162,16 +177,19 @@ def main():
     ap.add_argument("--build", help="build into this directory and keep it")
     ap.add_argument("--no-build", action="store_true")
     ap.add_argument("--reference-build")
+    ap.add_argument("--reference", default=os.environ.get("WEBMETAL_REFERENCE"),
+                    help="a run of WebMetal's reference harness on real Metal (default: $WEBMETAL_REFERENCE)")
     ap.add_argument("--out", help="write the results here (JSON)")
     ap.add_argument("--timeout", type=float, default=600)
     args = ap.parse_args()
+    run_dir = reference_run(args)
     out = args.build or tempfile.mkdtemp(prefix="gex-metal-page-")
     os.makedirs(out, exist_ok=True)
     if not args.no_build:
         build(args, out)
     reference_dir = reference(args, out)
     state = {"results": [], "environment": None, "done": None, "event": threading.Event()}
-    httpd = serve(out, reference_dir, state)
+    httpd = serve(out, reference_dir, run_dir, state)
     url = "http://127.0.0.1:%d/index.html" % httpd.server_address[1]
     profile = tempfile.mkdtemp(prefix="gex-metal-page-profile-")
     print("%s: %s" % (args.browser, url), flush=True)

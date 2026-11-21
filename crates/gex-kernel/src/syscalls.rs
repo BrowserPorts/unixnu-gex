@@ -11411,6 +11411,7 @@ impl Kernel {
         if self.darwin {
             self.darwin_flush_perms(m);
             self.signals.thread().cpu.leave(matches!(out, SyscallOutcome::Blocking(_)));
+            self.darwin_thread_calls_unrun();
         }
         out
     }
@@ -11465,7 +11466,7 @@ impl Kernel {
             }
             self.darwin_take_notes();
             if let Some(what) = self.darwin_strict_stop() {
-                eprintln!("[gex:{}] GEX_DARWIN_STRICT: stopping at pc {pc:#x}: {what}", self.pid);
+                crate::darwin_say!("[gex:{}] GEX_DARWIN_STRICT: stopping at pc {pc:#x}: {what}", self.pid);
                 return SyscallOutcome::Killed { signal: crate::signal::sig::SIGSYS as u32, core: false };
             }
         }
@@ -11543,7 +11544,7 @@ impl Kernel {
                 if self.trace {
                     let kr = m.read_u64(self.ctx_addr + ctx::x(0) as u64).unwrap_or(0);
                     let how = if matches!(out, SyscallOutcome::Blocking(_)) { "blocks".to_string() } else { format!("{kr:#x}") };
-                    eprintln!("[gex:{}] pc=0x{pc:x} mach {t}({:#x}, {:#x}, {:#x}) = {how}", self.pid, a[0], a[1], a[2]);
+                    crate::darwin_say!("[gex:{}] pc=0x{pc:x} mach {t}({:#x}, {:#x}, {:#x}) = {how}", self.pid, a[0], a[1], a[2]);
                     self.strace_stack(m);
                 }
                 return out;
@@ -11555,7 +11556,7 @@ impl Kernel {
                 // taken: an error skips the call.
                 if let Err(e) = self.darwin_syscall_filter(crate::darwin::bsd_syscode(m, self.ctx_addr, raw)) {
                     if self.trace {
-                        eprintln!("[gex:{}] pc=0x{pc:x} darwin syscall {} refused by its filter", self.pid, crate::darwin::bsd_syscode(m, self.ctx_addr, raw));
+                        crate::darwin_say!("[gex:{}] pc=0x{pc:x} darwin syscall {} refused by its filter", self.pid, crate::darwin::bsd_syscode(m, self.ctx_addr, raw));
                     }
                     let _ = crate::darwin::set_result(m, self.ctx_addr, e.as_return());
                     return SyscallOutcome::Continue;
@@ -11611,7 +11612,7 @@ impl Kernel {
             // before the call does anything they would refuse.
             if let Some(e) = self.darwin_sb_file_call(m, raw, &a) {
                 if self.trace {
-                    eprintln!("[gex:{}] pc=0x{pc:x} darwin {} refused by Sandbox: {e:?}", self.pid, crate::darwin::sysno::name(raw).unwrap_or("?"));
+                    crate::darwin_say!("[gex:{}] pc=0x{pc:x} darwin {} refused by Sandbox: {e:?}", self.pid, crate::darwin::sysno::name(raw).unwrap_or("?"));
                 }
                 let _ = crate::darwin::set_result(m, self.ctx_addr, e.as_return());
                 return SyscallOutcome::Continue;
@@ -11623,13 +11624,13 @@ impl Kernel {
             }
             if let Some(out) = self.darwin_psynch_call(m, raw, &a) {
                 if self.trace {
-                    eprintln!("[gex:{}] pc=0x{pc:x} darwin {}({:#x}, {:#x}, {:#x}) -> {}", self.pid, crate::darwin::sysno::name(raw).unwrap_or("?"), a[0], a[1], a[2], if matches!(out, SyscallOutcome::Blocking(_)) { "blocks" } else { "done" });
+                    crate::darwin_say!("[gex:{}] pc=0x{pc:x} darwin {}({:#x}, {:#x}, {:#x}) -> {}", self.pid, crate::darwin::sysno::name(raw).unwrap_or("?"), a[0], a[1], a[2], if matches!(out, SyscallOutcome::Blocking(_)) { "blocks" } else { "done" });
                 }
                 return out;
             }
             if let Some(out) = self.darwin_thread_call(m, raw, &a) {
                 if self.trace {
-                    eprintln!("[gex:{}] pc=0x{pc:x} darwin {}({:#x}, {:#x}, {:#x}) -> {}", self.pid, crate::darwin::sysno::name(raw).unwrap_or("?"), a[0], a[1], a[2], if matches!(out, SyscallOutcome::Blocking(_)) { "blocks" } else { "done" });
+                    crate::darwin_say!("[gex:{}] pc=0x{pc:x} darwin {}({:#x}, {:#x}, {:#x}) -> {}", self.pid, crate::darwin::sysno::name(raw).unwrap_or("?"), a[0], a[1], a[2], if matches!(out, SyscallOutcome::Blocking(_)) { "blocks" } else { "done" });
                 }
                 return out;
             }
@@ -11639,7 +11640,7 @@ impl Kernel {
             };
             if let Some(ret) = ret {
                 if self.trace {
-                    eprintln!("[gex:{}] pc=0x{pc:x} darwin {}({:#x}, {:#x}, {:#x}) = {}", self.pid, crate::darwin::sysno::name(raw).unwrap_or("?"), a[0], a[1], a[2], ret as i64);
+                    crate::darwin_say!("[gex:{}] pc=0x{pc:x} darwin {}({:#x}, {:#x}, {:#x}) = {}", self.pid, crate::darwin::sysno::name(raw).unwrap_or("?"), a[0], a[1], a[2], ret as i64);
                     self.strace_stack(m);
                 }
                 let _ = crate::darwin::set_result(m, self.ctx_addr, ret);

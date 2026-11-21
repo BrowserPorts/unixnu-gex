@@ -84,6 +84,24 @@ pub struct Timers {
     armed: BTreeMap<(Instant, u64), Action>,
     next: u64,
     bell: Arc<Bell>,
+    /// A call armed while the host runs none ([`set_host_runs_thread_calls`]),
+    /// to be reported ([`Kernel::darwin_thread_calls_unrun`]).
+    unrun: Option<Action>,
+}
+
+/// Whether the host runs every Darwin process's thread calls: a thread (or
+/// Worker) that fires them at their deadlines and looks at the pipes with
+/// knotes on them ([`Kernel::darwin_thread_calls`]).
+static HOST_RUNS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The host runs the thread calls: without it, a call armed would never
+/// fire, and is reported instead.
+pub fn set_host_runs_thread_calls() {
+    HOST_RUNS.store(true, std::sync::atomic::Ordering::Release);
+}
+
+fn host_runs() -> bool {
+    HOST_RUNS.load(std::sync::atomic::Ordering::Acquire)
 }
 
 impl Drop for Timers {
@@ -98,6 +116,9 @@ impl Timers {
         self.next += 1;
         let key = (at, self.next);
         self.armed.insert(key, action);
+        if !host_runs() && self.unrun.is_none() {
+            self.unrun = Some(action);
+        }
         if self.armed.keys().next() == Some(&key) {
             self.bell.ring();
         }
@@ -116,6 +137,21 @@ impl Timers {
 }
 
 impl Kernel {
+    /// What the host does not run of the thread calls, reported: a call
+    /// armed, which would never fire, and knotes on pipes or sockets another
+    /// process changes, which would never be looked at again.
+    pub(crate) fn darwin_thread_calls_unrun(&mut self) {
+        if host_runs() {
+            return;
+        }
+        if let Some(a) = self.dtask.timers.unrun.take() {
+            self.darwin_unimplemented(format!("a thread call armed ({a:?}): this host runs no thread calls for the process, so it never fires"));
+        }
+        if self.darwin_pipe_watch().load(std::sync::atomic::Ordering::Acquire) != 0 {
+            self.darwin_unimplemented("a knote on a pipe or socket another process changes: this host runs no thread calls for the process, so it is not looked at again".into());
+        }
+    }
+
     /// The thread calls that are due, run; when the next one is.
     pub fn darwin_thread_calls(&mut self, m: &mut GuestMem<'_>) -> Option<Instant> {
         // The thread-call thread is runnable while it runs them.

@@ -1060,6 +1060,9 @@ fn run_program_with(
     // (corpse::hold at each task's end, corpse::exited once the end is
     // published).
     gex_kernel::darwin::corpse::set_host_keeps_corpses();
+    // And it runs each Darwin process's thread calls on a thread of its
+    // own (start_darwin_thread_calls).
+    gex_kernel::darwin::timer::set_host_runs_thread_calls();
     // It makes a Darwin task's corpse forks too, on the task's thread-call
     // thread (make_corpse_forks).
     gex_kernel::darwin::corpsefork::set_host_forks_corpses();

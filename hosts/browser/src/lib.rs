@@ -8924,11 +8924,18 @@ fn syscall_entry(ctx: i32, pc: i64) {
         let a2 = gm.read_u64(kstate.ctx_addr + ctx::x(2) as u64).unwrap_or(0);
         let slot = sys_note(nr, a0, a1);
         // A Darwin thread's call: its commpage brought up to date, a
-        // quantum on (`darwin::tick`).
+        // quantum on (`darwin::tick`); a call that would make a process or
+        // a thread the page does not start, refused (`darwin::refused`).
         if h.kernel.darwin {
             darwin::tick();
+            if darwin::refused(&mut h.kernel, &mut gm) {
+                return 0;
+            }
         }
         let outcome = h.kernel.syscall(&mut gm, pc as u64);
+        if h.kernel.darwin {
+            darwin::unstarted_threads(&mut h.kernel);
+        }
         // The page finishes its own waits (`finish_wait`, which asks the op
         // for its restart class): the kernel's note for `finish_blocking`,
         // left, would follow the thread through every switch.
@@ -8984,6 +8991,12 @@ fn syscall_entry(ctx: i32, pc: i64) {
         // An exec that asked for a 64-bit memory of a program that has a
         // memory64 twin beside it (`<path>.m64`, 64-bit Wine's loader in a twin dist):
         // the twin runs (vfork.rs `exec_route`).
+        // A Darwin call's wait, which the page does not park
+        // (`darwin::unparked`).
+        let outcome = match outcome {
+            SyscallOutcome::Blocking(op) if h.kernel.darwin => darwin::unparked(&mut h.kernel, &mut gm, &op),
+            o => o,
+        };
         let outcome = match outcome {
             SyscallOutcome::Exec { path, argv, envp } => {
                 vfork::exec_relaunch(h, &argv);
@@ -9044,8 +9057,11 @@ fn syscall_entry(ctx: i32, pc: i64) {
                 killed(signal as i32, at)
             }
             SyscallOutcome::SpawnThread { ctx_addr, tid } => thread_made(tid, ctx_addr, pc as u64),
-            // Darwin processes do not run here yet; nothing makes one.
-            SyscallOutcome::DarwinSpawn { .. } => panic!("gex: a Darwin posix_spawn in the browser, which runs no Darwin process"),
+            // A Darwin posix_spawn's child: not run here yet, said.
+            SyscallOutcome::DarwinSpawn { .. } => {
+                darwin::spawn_refused(&mut h.kernel, &mut gm);
+                0
+            }
             SyscallOutcome::ThreadExit => {
                 h.threads[cur()].run().waiting = Waiting::Exited;
                 end_if_all_exited();
@@ -15324,11 +15340,10 @@ fn finish_parked(
                 r => r,
             }
         }
-        // A Darwin pipe's or socket's parked write (its whole size and what
-        // it already wrote), and a Darwin socket's wait to send, are
-        // finished by the native host only: the page runs no Darwin process
-        // yet.
-        gex_kernel::BlockOp::WriteStream { xnu: Some(_), .. } | gex_kernel::BlockOp::WriteWait { .. } => Err(Errno::ENOSYS),
+        // A Darwin process's waits never park here (`darwin::unparked`).
+        gex_kernel::BlockOp::WriteStream { xnu: Some(_), .. } | gex_kernel::BlockOp::WriteWait { .. } => {
+            unreachable!("a Darwin write's wait parked in the page, which ends Darwin waits at the call (darwin::unparked)")
+        }
         gex_kernel::BlockOp::WriteStream { handle, buf, len, gathered, xnu: None } => {
             // One turn's worth; the scheduler brings the thread back while
             // anything is left, because the descriptor stays unwritable until
@@ -15387,10 +15402,10 @@ fn finish_parked(
             waitid,
             jobs,
         } => {
-            // Only a Darwin wait asks for stops and continues, and the page
-            // runs no Darwin process.
+            // Only a Darwin wait asks for stops and continues, and a Darwin
+            // process's waits never park here (`darwin::unparked`).
             if jobs.is_some() {
-                panic!("a Darwin wait in the page, which has no Darwin personality");
+                unreachable!("a Darwin wait4 parked in the page, which ends Darwin waits at the call (darwin::unparked)");
             }
             let nowait = waitid.is_some_and(|w| w.nowait);
             // A shared table already holds the status in the form `wait4`

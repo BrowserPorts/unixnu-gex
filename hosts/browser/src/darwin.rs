@@ -387,3 +387,74 @@ pub(crate) fn safepoint_signals(ctx_addr: u64, pc: u64) {
         }
     }
 }
+
+/// A Darwin call that parked (`SyscallOutcome::Blocking`): the page parks
+/// a thread with its Linux waits, which do not end a Darwin wait as its
+/// kernel does (`Kernel::finish_blocking`: the Darwin result, the thread's
+/// wait state, a wait that sleeps again), nor finish a Darwin pipe's or
+/// socket's write (its whole size and what it already wrote) or a Darwin
+/// `wait4` (stops and continues). Reported, and the call ended through
+/// the kernel with ENOSYS; the outcome is the call's.
+pub(crate) fn unparked(k: &mut gex_kernel::syscalls::Kernel, m: &mut GuestMem<'_>, op: &gex_kernel::BlockOp) -> gex_kernel::SyscallOutcome {
+    let what = format!("{op:?}");
+    let what = what.split(['{', '(', ' ']).next().unwrap_or("?");
+    k.darwin_unimplemented(format!("a Darwin call's wait ({what}): the page's waits do not end a Darwin wait as its kernel does (finish_blocking); the call fails with ENOSYS"));
+    match k.finish_blocking(m, Err(gex_kernel::Errno::ENOSYS)) {
+        // A wait that would sleep again is not parked either: its call
+        // fails as it is.
+        gex_kernel::SyscallOutcome::Blocking(_) => {
+            let _ = gex_kernel::darwin::set_result(m, k.ctx_addr, gex_kernel::Errno::ENOSYS.as_return());
+            gex_kernel::SyscallOutcome::Continue
+        }
+        out => out,
+    }
+}
+
+/// A Darwin `posix_spawn`'s child (`Kernel::darwin_spawned`): a second
+/// Darwin process of this Worker's system, whose state is this process's
+/// shim's, until it is the global kernel's. Reported, the child let go
+/// (its task ended, its descriptors closed, its pid reaped) and the call
+/// failed with ENOSYS.
+pub(crate) fn spawn_refused(k: &mut gex_kernel::syscalls::Kernel, m: &mut GuestMem<'_>) {
+    if let Some(mut child) = k.darwin_spawned.take() {
+        let pid = child.pid;
+        child.darwin_task_terminate();
+        child.close_all_fds();
+        k.procs.reap(pid);
+    }
+    k.darwin_unimplemented("posix_spawn's child: a second Darwin process of the system, whose Darwin state is this process's Worker's in the page; the call fails with ENOSYS".into());
+    let _ = gex_kernel::darwin::set_result(m, k.ctx_addr, gex_kernel::Errno::ENOSYS.as_return());
+}
+
+/// The Darwin calls that make a process or a thread the page does not
+/// start yet, refused before the kernel takes them, so that nothing of
+/// the child is made: `fork` and `vfork` (a forked Darwin process's memory
+/// and task, `darwin_fork_plan`'s inheritance) and `bsdthread_create` (a
+/// Darwin thread's Worker and its first entry). Reported, and the call
+/// fails with ENOSYS; false for any other call.
+pub(crate) fn refused(k: &mut gex_kernel::syscalls::Kernel, m: &mut GuestMem<'_>) -> bool {
+    use gex_kernel::darwin;
+    let raw = m.read_u64(k.ctx_addr + darwin::NR_SLOT as u64).unwrap_or(!0);
+    if darwin::mach_trap_number(raw).is_some() || raw as u32 as u64 == darwin::PLATFORM {
+        return false;
+    }
+    let what = match darwin::bsd_syscode(m, k.ctx_addr, raw) {
+        2 => "fork",
+        66 => "vfork",
+        360 => "bsdthread_create",
+        _ => return false,
+    };
+    k.darwin_unimplemented(format!("{what}: the page starts no other Worker of a Darwin process (a forked child's, a thread's) yet; the call fails with ENOSYS"));
+    let _ = darwin::set_result(m, k.ctx_addr, gex_kernel::Errno::ENOSYS.as_return());
+    true
+}
+
+/// The threads a Darwin call made for the host to start (a workqueue's, a
+/// resumed one's: `Kernel::take_spawns`), which the page does not start
+/// yet: reported, as they never run.
+pub(crate) fn unstarted_threads(k: &mut gex_kernel::syscalls::Kernel) {
+    let n = k.take_spawns().len();
+    if n != 0 {
+        k.darwin_unimplemented(format!("the threads a call made for the host to start ({n}: a workqueue's or a resumed thread's): the page starts no other Worker of a Darwin process yet, so they never run"));
+    }
+}

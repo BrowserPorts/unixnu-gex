@@ -9086,7 +9086,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
                 // A Darwin thread's end, as its host thread's (the native
                 // host's `run_guest_thread`).
                 if h.kernel.darwin {
-                    gex_kernel::darwin::workq::thread_ended(kstate.tid);
+                    darwin::thread_ended(kstate.tid);
                 }
                 end_if_all_exited();
                 // Nowhere to resume this thread. A resume left from before

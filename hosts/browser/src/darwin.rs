@@ -293,7 +293,28 @@ pub(crate) fn task_end(k: &mut gex_kernel::syscalls::Kernel) {
     if k.darwin {
         k.darwin_task_terminate();
         k.close_all_fds();
+        // Every thread still on a Worker of its own ends with it, as each
+        // native host thread notes its end however its thread ended
+        // (`run_guest_thread`'s guard).
+        let left = std::mem::take(&mut *on_workers());
+        for tid in left {
+            gex_kernel::darwin::workq::thread_ended(tid);
+        }
     }
+}
+
+/// The threads started on Workers of their own ([`adopted`]) that have not
+/// ended: what [`task_end`] ends with the process.
+fn on_workers() -> std::sync::MutexGuard<'static, Vec<i32>> {
+    static ON: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+    ON.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Darwin thread `tid` has ended (`workq::thread_ended`), its Worker no
+/// longer its.
+pub(crate) fn thread_ended(tid: i32) {
+    on_workers().retain(|&t| t != tid);
+    gex_kernel::darwin::workq::thread_ended(tid);
 }
 
 /// The process's thread calls (`gex_kernel::darwin::timer`), run as the
@@ -777,7 +798,7 @@ pub(crate) fn finished(r: &mut Run, i: usize, ctx_addr: u64, tid: i32, timed_out
             task_end(&mut h.kernel);
         }
         if matches!(out, SyscallOutcome::ThreadExit) {
-            gex_kernel::darwin::workq::thread_ended(tid);
+            thread_ended(tid);
         }
         out
     });
@@ -888,6 +909,7 @@ pub(crate) fn adopted(i: usize) -> Option<u64> {
     let out = with_exec_lock(|h| {
         let ks = h.threads[i].kstate();
         gex_kernel::darwin::workq::thread_started(ks.tid);
+        on_workers().push(ks.tid);
         h.kernel.enter_thread(&ks);
         let mut gm = guest();
         let mut out = h.kernel.darwin_thread_entry(&mut gm);
@@ -923,7 +945,7 @@ pub(crate) fn adopted(i: usize) -> Option<u64> {
             }
             Some(SyscallOutcome::ThreadExit) => {
                 h.threads[i].run().waiting = Waiting::Exited;
-                gex_kernel::darwin::workq::thread_ended(ks.tid);
+                thread_ended(ks.tid);
                 return None;
             }
             Some(SyscallOutcome::Exit(code)) => {

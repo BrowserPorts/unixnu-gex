@@ -165,17 +165,15 @@ fn asb_targets() -> [u64; 4] {
 /// A running thread's quantum: `DEFAULT_PREEMPTION_RATE`, 100 a second.
 pub const QUANTUM: std::time::Duration = std::time::Duration::from_millis(10);
 
-fn word(mem: &[u8], o: usize) -> u64 {
-    let at = placements()[1] as usize + o;
-    u64::from_le_bytes(mem[at..at + 8].try_into().unwrap())
+fn word(m: &crate::GuestMem<'_>, o: usize) -> u64 {
+    m.read_u64(placements()[1] + o as u64).expect("the commpage's read-write page")
 }
 
 /// A word of the read-write page, in one aligned store: the guest reads
 /// this memory as it runs (see the guest memory's own notes on races), and
 /// a torn field is one a program could then see.
-fn set_word(mem: &mut [u8], o: usize, v: u64) {
-    let at = placements()[1] as usize + o;
-    mem[at..at + 8].copy_from_slice(&v.to_le_bytes());
+fn set_word(m: &mut crate::GuestMem<'_>, o: usize, v: u64) {
+    m.write_u64(placements()[1] + o as u64, v).expect("the commpage's read-write page");
 }
 
 /// The kernel's SMR generation (`cpu_quiescent_advance`), the same for
@@ -211,15 +209,16 @@ pub fn set_atm_diagnostic_config(v: u32) {
     ATM_DIAGNOSTIC_CONFIG.store(v, Ordering::Relaxed);
 }
 
-pub fn tick(mem: &mut [u8], abstime: u64) {
-    set_word(mem, off::DYLD_FLAGS, DYLD_FLAGS.load(Ordering::Relaxed));
-    let at = placements()[1] as usize + off::ATM_DIAGNOSTIC_CONFIG;
-    mem[at..at + 4].copy_from_slice(&ATM_DIAGNOSTIC_CONFIG.load(Ordering::Relaxed).to_le_bytes());
-    if word(mem, off::APPROX_TIME) < abstime {
-        set_word(mem, off::APPROX_TIME, abstime);
+pub fn tick(m: &mut crate::GuestMem<'_>, abstime: u64) {
+    let mut k = m.kernel();
+    set_word(&mut k, off::DYLD_FLAGS, DYLD_FLAGS.load(Ordering::Relaxed));
+    let at = placements()[1] + off::ATM_DIAGNOSTIC_CONFIG as u64;
+    k.write(at, &ATM_DIAGNOSTIC_CONFIG.load(Ordering::Relaxed).to_le_bytes()).expect("the commpage's read-write page");
+    if word(&k, off::APPROX_TIME) < abstime {
+        set_word(&mut k, off::APPROX_TIME, abstime);
     }
     let gen = QUIESCE_GEN.fetch_add(1, Ordering::Relaxed) + 1;
-    set_word(mem, off::CPU_QUIESCENT_COUNTER, gen);
+    set_word(&mut k, off::CPU_QUIESCENT_COUNTER, gen);
 }
 
 /// `commpage_set_timestamp`: the calendar time `(sec, frac)` at absolute

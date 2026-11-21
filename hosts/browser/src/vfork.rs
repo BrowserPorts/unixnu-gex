@@ -845,6 +845,11 @@ pub extern "C" fn gex_adopted_exec(ptr: u32, len: u32) -> u64 {
         } else {
             path
         };
+        // A Darwin Worker's program (`gex_set_darwin`): started as gexc
+        // starts one, its failure said and its process ended there.
+        if crate::darwin_process() {
+            return crate::darwin::exec(h, &path, &argv, &envp);
+        }
         let entry = do_exec(h, &path, &argv, &envp);
         if entry == 0 {
             warn_line(&format!("gex: {path}: the program could not be loaded\n"));

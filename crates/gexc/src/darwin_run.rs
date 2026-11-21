@@ -52,14 +52,14 @@ pub fn run(mut ra: RunArgs, bytes: &[u8]) -> Result<ExitCode> {
         None => ra.path.clone(),
     };
     // dyld, from the Darwin root.
-    let read = |p: &str| -> Result<Vec<u8>> {
+    let read = |p: &str| -> std::result::Result<Vec<u8>, String> {
         let Some(root) = &root else {
-            bail!("{} is a dynamic Darwin program (it names {p}); give the Darwin root with --sysroot", ra.path);
+            return Err(format!("{} is a dynamic Darwin program (it names {p}); give the Darwin root with --sysroot", ra.path));
         };
         let host = root.join(p.trim_start_matches('/'));
-        std::fs::read(&host).with_context(|| format!("reading {}", host.display()))
+        std::fs::read(&host).map_err(|e| format!("reading {}: {e}", host.display()))
     };
-    let img = gex_native::darwin_image::load(bytes, &ra.path, &read)?;
+    let img = gex_kernel::darwin::image::load(bytes, &ra.path, &read).map_err(anyhow::Error::msg)?;
     ra.opts.darwin_platform = img.platform;
     ra.opts.darwin_code_signature = img.code_signature;
     ra.opts.darwin_stacksize = img.stacksize;

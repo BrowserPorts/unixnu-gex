@@ -837,6 +837,8 @@ async function handle(msg) {
   if (msg.stateful) Gex.stateful = msg.stateful;
   if (msg.fjitLibs) Gex.fjitLibs = msg.fjitLibs;
   if (msg.identities) Gex.identities = msg.identities;
+  // The Darwin boot payload (System's `darwin`), in shared memory.
+  if (msg.darwin) Gex.darwin = msg.darwin;
   if (msg.testBreakStackGuard) globalThis.GEX_TEST_BREAK_STACK_GUARD = 1;
   if (msg.testUd2Entry) globalThis.GEX_TEST_UD2_ENTRY = 1;
   if (msg.fillTime) globalThis.GEX_FILL_TIME = 1;

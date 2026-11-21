@@ -1925,6 +1925,10 @@ export class Gex {
   static fjitLibs = '';
   /** `base:key:identity:path;...` (cgen.rs `gex_cgen_identities`). */
   static identities = '';
+  /** The Darwin boot payload, `{ boot: { name: Uint8Array }, strict }`
+   *  (page/runtime System's `darwin`): what a Darwin process's system boots
+   *  from (shim darwin.rs `gex_darwin_boot_file`). */
+  static darwin = null;
   static #whySlot = 0;
 
   /** A DataView of the memory, rebuilt as `#bytes` is: for `#hookStack`,
@@ -3893,8 +3897,28 @@ export class Gex {
     // A program the page started (host.mjs `spawnExec`): the shim settles its
     // memory flavour and environment as an execve would.
     if (child.page) e.gex_page_program?.();
+    // A Darwin program's: the system it boots, from the page's payload.
+    if (this.#darwin) {
+      for (const [name, bytes] of Object.entries(Gex.darwin?.boot ?? {})) this.#putDarwinBootFile(name, bytes);
+      e.gex_darwin_set_strict(Gex.darwin?.strict ? 1 : 0);
+    }
     if (SP_CODE && single.on) return this.#putBytesP(child.exec, e.gex_adopted_exec);
     return this.#putBytes(child.exec, e.gex_adopted_exec);
+  }
+
+  /** One of the Darwin boot payload's files, to the shim
+   *  (`gex_darwin_boot_file`): its name and bytes in the shim's heap. */
+  #putDarwinBootFile(name, bytes) {
+    const e = this.#shim.exports;
+    const n = new TextEncoder().encode(name);
+    const np = e.gex_alloc(Math.max(1, n.length)) >>> 0;
+    const bp = e.gex_alloc(Math.max(1, bytes.length)) >>> 0;
+    const mem = this.#bytes();
+    mem.set(n, np);
+    mem.set(bytes, bp);
+    e.gex_darwin_boot_file(np, n.length, bp, bytes.length);
+    e.gex_free?.(np, Math.max(1, n.length));
+    e.gex_free?.(bp, Math.max(1, bytes.length));
   }
 
   /** `#putBytes` for the single-thread build: `f` on a JSPI stack of its own

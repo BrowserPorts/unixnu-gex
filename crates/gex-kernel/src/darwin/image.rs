@@ -2,9 +2,8 @@
 //! the executable at its random slide, dyld right after it by a slide of its
 //! own when it names one, and what the kernel takes from them (the
 //! platform, the signature, `LC_MAIN`'s stack size, dyld's image list). For
-//! `gexc run`'s first program and for an `execve` alike.
+//! a host's first program and for an `execve` alike, on every host.
 
-use anyhow::{bail, Context, Result};
 use gex_ld::Program;
 
 /// What loading found.
@@ -32,11 +31,12 @@ pub struct DarwinImage {
 }
 
 /// Load the Mach-O executable `bytes` (one slice), with its dyld read by
-/// `read` (a guest path), at the slides `load_machfile` draws.
-pub fn load(bytes: &[u8], name: &str, read: &dyn Fn(&str) -> Result<Vec<u8>>) -> Result<DarwinImage> {
-    use gex_kernel::darwin::exec;
+/// `read` (a guest path), at the slides `load_machfile` draws. An error
+/// says what could not be loaded and why.
+pub fn load(bytes: &[u8], name: &str, read: &dyn Fn(&str) -> Result<Vec<u8>, String>) -> Result<DarwinImage, String> {
+    use super::exec;
     let slides = exec::Slides::draw();
-    let (m, exe) = gex_ld::macho::load(bytes, slides.main).with_context(|| format!("loading {name}"))?;
+    let (m, exe) = gex_ld::macho::load(bytes, slides.main).map_err(|e| format!("loading {name}: {e}"))?;
     // load_main and load_unixthread: the stack slides down by the image's
     // slide (none for an image that is not position independent).
     let user_stack = exec::user_stack(exe.bias);
@@ -53,13 +53,13 @@ pub fn load(bytes: &[u8], name: &str, read: &dyn Fn(&str) -> Result<Vec<u8>>) ->
     let interp = match &m.dylinker {
         None => None,
         Some(dyld) => {
-            let dbytes = read(dyld).with_context(|| format!("{name} names {dyld}"))?;
+            let dbytes = read(dyld).map_err(|e| format!("{name} names {dyld}: {e}"))?;
             if !gex_ld::macho::is_macho(&dbytes) {
-                bail!("{dyld} is not a Mach-O file");
+                return Err(format!("{dyld} is not a Mach-O file"));
             }
-            let dm = gex_ld::macho::parse(&dbytes).with_context(|| format!("loading {dyld}"))?;
+            let dm = gex_ld::macho::parse(&dbytes).map_err(|e| format!("loading {dyld}: {e}"))?;
             let slide = gex_ld::macho::dylinker_slide(&dm, slides.dyld, gex_ld::macho::max_vm_addr(&exe));
-            let (dm, di) = gex_ld::macho::load_parsed(dm, &dbytes, slide).with_context(|| format!("loading {dyld}"))?;
+            let (dm, di) = gex_ld::macho::load_parsed(dm, &dbytes, slide).map_err(|e| format!("loading {dyld}: {e}"))?;
             if let Some(s) = dm.section("__DATA_DIRTY", "__all_image_info").or_else(|| dm.section("__DATA", "__all_image_info")) {
                 dyld_infos = s.addr.wrapping_add(di.bias);
                 dyld_infos_size = s.size;

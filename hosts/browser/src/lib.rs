@@ -52,6 +52,7 @@ mod sigs;
 mod vfork;
 mod usage;
 mod winspace;
+mod darwin;
 
 use std::sync::{Arc, Mutex};
 
@@ -8922,6 +8923,11 @@ fn syscall_entry(ctx: i32, pc: i64) {
         let a1 = gm.read_u64(kstate.ctx_addr + ctx::x(1) as u64).unwrap_or(0);
         let a2 = gm.read_u64(kstate.ctx_addr + ctx::x(2) as u64).unwrap_or(0);
         let slot = sys_note(nr, a0, a1);
+        // A Darwin thread's call: its commpage brought up to date, a
+        // quantum on (`darwin::tick`).
+        if h.kernel.darwin {
+            darwin::tick();
+        }
         let outcome = h.kernel.syscall(&mut gm, pc as u64);
         // The page finishes its own waits (`finish_wait`, which asks the op
         // for its restart class): the kernel's note for `finish_blocking`,
@@ -9020,7 +9026,12 @@ fn syscall_entry(ctx: i32, pc: i64) {
                 set_resume(target);
                 1
             }
-            SyscallOutcome::Exit(code) => exit_process(code),
+            SyscallOutcome::Exit(code) => {
+                // A Darwin process's task ends with it (`proc_exit`), its
+                // descriptors closed, before its end is published.
+                darwin::task_end(&mut h.kernel);
+                exit_process(code)
+            }
             // A signal with no handler kills the *process*, not the run.
             // Setting the run's exit here is what ended `apt update`: apt
             // stops its http method with `kill(pid, SIGINT)` -- ordinary
@@ -9029,6 +9040,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
             // Negative for "died of a signal"; see `exit_process`.
             SyscallOutcome::Killed { signal, .. } => {
                 let at = gm.read_u64(kstate.ctx_addr + ctx::PC as u64).unwrap_or(0);
+                darwin::task_end(&mut h.kernel);
                 killed(signal as i32, at)
             }
             SyscallOutcome::SpawnThread { ctx_addr, tid } => thread_made(tid, ctx_addr, pc as u64),
@@ -16883,6 +16895,11 @@ fn safepoint(ctx: i32, pc: i64) {
     if thread_gone() {
         stop_gone();
         trap();
+    }
+    // A Darwin thread running: its commpage brought up to date, a quantum
+    // on (`darwin::tick`).
+    if darwin_process() {
+        darwin::tick();
     }
     // Rearm: translated code counts a word down to zero and calls here; leaving
     // it at zero makes every later back-edge call out.

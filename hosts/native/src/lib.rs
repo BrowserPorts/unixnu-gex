@@ -19,7 +19,6 @@ pub mod libprov;
 pub(crate) mod elfprov;
 pub mod aot_share;
 pub mod darwin_frames;
-pub mod darwin_image;
 pub mod gl;
 pub mod profile;
 pub mod pe_units;
@@ -3159,7 +3158,7 @@ fn start_darwin_thread_calls(kernel: std::sync::Weak<Mutex<Kernel>>, memory: gex
         let (kernel, memory) = (kernel.clone(), memory.clone());
         let _ = std::thread::Builder::new().name("gex-darwin-tick".into()).spawn(move || {
             while kernel.strong_count() != 0 {
-                gex_kernel::darwin::commpage::tick(memory.bytes(), gex_kernel::darwin::mach::absolute_time());
+                gex_kernel::darwin::commpage::tick(&mut GuestMem::new(memory.bytes()), gex_kernel::darwin::mach::absolute_time());
                 std::thread::sleep(gex_kernel::darwin::commpage::QUANTUM);
             }
         });
@@ -4515,13 +4514,13 @@ fn darwin_killed(why: String) -> Result<(Exit, Stats)> {
 
 /// The activated image's file read, its slice loaded with dyld, and its
 /// signature checked as `load_code_signature` checks it.
-fn load_darwin_image(kernel: &Kernel, img: &gex_kernel::darwin::execve::Image) -> std::result::Result<crate::darwin_image::DarwinImage, String> {
+fn load_darwin_image(kernel: &Kernel, img: &gex_kernel::darwin::execve::Image) -> std::result::Result<gex_kernel::darwin::image::DarwinImage, String> {
     let Some(bytes) = kernel.read_file(&img.path) else { return Err(format!("cannot read {}", img.path)) };
     let Some(slice) = bytes.get(img.arch_offset as usize..(img.arch_offset + img.arch_size) as usize) else {
         return Err(format!("{}'s slice is past its end", img.path));
     };
-    let read = |p: &str| kernel.read_file(p).ok_or_else(|| anyhow!("cannot read {p}"));
-    let loaded = crate::darwin_image::load(slice, &img.path, &read).map_err(|e| format!("{e:#}"))?;
+    let read = |p: &str| kernel.read_file(p).ok_or_else(|| format!("cannot read {p}"));
+    let loaded = gex_kernel::darwin::image::load(slice, &img.path, &read)?;
     if let Some(cs) = &loaded.code_signature {
         gex_kernel::darwin::codesign::validate_csblob(cs).map_err(|_| format!("{}'s code signature is not valid", img.path))?;
     }
@@ -4540,7 +4539,7 @@ fn switch_to_darwin_image(kernel: &mut Kernel, img: &gex_kernel::darwin::execve:
 
 /// What `darwin_start` is told of a loaded image: its header's address,
 /// dyld, its stack size and signature.
-fn darwin_loaded<'a>(img: &'a gex_kernel::darwin::execve::Image, loaded: &'a crate::darwin_image::DarwinImage) -> gex_kernel::darwin::exec::Loaded<'a> {
+fn darwin_loaded<'a>(img: &'a gex_kernel::darwin::execve::Image, loaded: &'a gex_kernel::darwin::image::DarwinImage) -> gex_kernel::darwin::exec::Loaded<'a> {
     gex_kernel::darwin::exec::Loaded {
         mach_header: loaded.program.exe.segments.iter().map(|s| s.vaddr).min().unwrap_or(0),
         dylinker: loaded.dylinker.as_deref().filter(|_| loaded.program.interp.is_some()),
@@ -4557,7 +4556,7 @@ fn darwin_loaded<'a>(img: &'a gex_kernel::darwin::execve::Image, loaded: &'a cra
 #[allow(clippy::too_many_arguments)]
 fn run_darwin_image(
     img: Box<gex_kernel::darwin::execve::Image>,
-    loaded: crate::darwin_image::DarwinImage,
+    loaded: gex_kernel::darwin::image::DarwinImage,
     argv: Vec<String>,
     envp: Vec<String>,
     opts: &RunOptions,

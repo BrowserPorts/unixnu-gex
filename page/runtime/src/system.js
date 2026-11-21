@@ -64,6 +64,10 @@ let made = false;
 /** The guest architectures a page may name (`arch`), as `describe()` says them. */
 const ARCHES = { x86: 'x86', aarch64: 'aarch64' };
 
+/** The boot payload's files a Darwin program's system reads (`darwin`), as
+ *  gexc reads them from GEX_DARWIN_BOOT (hosts/native/src/lib.rs). */
+const DARWIN_BOOT = ['TrustCache', 'sandbox_profile.bin', 'sandbox_builtin.bin', 'sandbox_protobox.bin', 'DeviceTree', 'img4_anchor.der', 'SystemVolume.attrs'];
+
 /** ELF's machine numbers, as the guest's programs are built for them. */
 const EM = { 62: 'x86', 183: 'aarch64' };
 
@@ -192,14 +196,29 @@ export class System extends EventTarget {
    * directory under Node: GEX_XCACHE_DIR); a string names the cache, kept
    * apart from other names' on the same page. `debug`: the runtime's switches,
    * `{name: value}` as gex's test pages take `?name=value`; unstable, for
-   * debugging only.
+   * debugging only. `darwin`: what a Darwin program the system runs boots
+   * on, `{ boot, strict }`: `boot` the boot payload's files by name
+   * (`TrustCache`, `sandbox_profile.bin`, `sandbox_builtin.bin`,
+   * `sandbox_protobox.bin`, `DeviceTree`, `img4_anchor.der`,
+   * `SystemVolume.attrs`; bytes, a Blob or a URL each, a file left out is
+   * absent), as gexc takes them from GEX_DARWIN_BOOT; `strict` stops a
+   * Darwin process at anything gex reports it does not do, as
+   * GEX_DARWIN_STRICT=1 does.
    */
-  constructor({ baseUrl, units, xcache = false, arch, debug = {} } = {}) {
+  constructor({ baseUrl, units, xcache = false, arch, darwin, debug = {} } = {}) {
     super();
     for (const k of Object.keys(arguments[0] ?? {})) {
-      if (!['baseUrl', 'units', 'xcache', 'arch', 'debug'].includes(k)) throw new TypeError(`System: no option ${k}`);
+      if (!['baseUrl', 'units', 'xcache', 'arch', 'darwin', 'debug'].includes(k)) throw new TypeError(`System: no option ${k}`);
     }
     if (arch !== undefined && !ARCHES[arch]) throw new TypeError(`System: arch is one of ${Object.keys(ARCHES).join(', ')}`);
+    if (darwin !== undefined) {
+      if (typeof darwin !== 'object' || darwin === null) throw new TypeError('System: darwin is { boot, strict }');
+      for (const k of Object.keys(darwin)) if (!['boot', 'strict'].includes(k)) throw new TypeError(`System: darwin has no option ${k}`);
+      if (darwin.boot !== undefined && (typeof darwin.boot !== 'object' || darwin.boot === null)) throw new TypeError('System: darwin.boot is the boot payload\'s files, { name: bytes }');
+      for (const name of Object.keys(darwin.boot ?? {})) {
+        if (!DARWIN_BOOT.includes(name)) throw new TypeError(`System: darwin.boot has no file ${name} (${DARWIN_BOOT.join(', ')})`);
+      }
+    }
     // The page runtime keeps its state in the page's globals.
     if (made) throw new Error('System: a page runs one system; this page already made one');
     made = true;
@@ -211,6 +230,7 @@ export class System extends EventTarget {
       units: u && { url: new URL(String(u.url).replace(/\/*$/, ''), globalThis.location?.href).href, require: !!u.require },
       xcache: typeof xcache === 'string' && xcache ? xcache : !!xcache,
       arch: arch === undefined ? undefined : ARCHES[arch],
+      darwin: darwin && { boot: { ...darwin.boot }, strict: !!darwin.strict },
       debug: { ...debug },
     };
     // The page's mounts and host calls: over shared memory, or in the
@@ -456,12 +476,16 @@ export class System extends EventTarget {
     // shared memory, no Cache Storage), each Worker reads for itself.
     const lazyCache = await this.#lazyOwner(rt, kernel, opts.layers, stops);
     this.#mark('lazy owner');
+    // The Darwin boot payload, each file once in shared memory that every
+    // Worker is given without a copy; the Workers of a Darwin process boot
+    // its system from it (shim `gex_darwin_boot_file`).
+    const darwin = await this.#darwinPayload();
     const host = await rt.makeProcessHost({
       // Every Worker gets the page-fs channel's control buffer: a mount made
       // after boot reaches the programs already running, and each reaches
       // /dev/gex-host. Every Worker reaches the network through the page;
       // which network is the page's to set, any time (net.js).
-      uid: 0, ...this.#preset.host,
+      uid: 0, ...this.#preset.host, darwin,
       kernel, pageFs: this.#pageFs.control, restBundle: this.#restBundle, lazyCache, glChannel: dev.glChannel, wlChannel: dev.wlChannel, netChannel, network: this.#net,
     }, {
       onOutput: (fd, text) => this.#say(text),
@@ -502,6 +526,21 @@ export class System extends EventTarget {
     return this.#begin();
   }
 
+  /** The `darwin` option's payload, read, each file in a SharedArrayBuffer:
+   *  `{ boot: { name: Uint8Array }, strict }`, or null without the option. */
+  async #darwinPayload() {
+    const d = this.#opts.darwin;
+    if (!d) return null;
+    const boot = {};
+    for (const [name, src] of Object.entries(d.boot)) {
+      const b = await bytesOf(src, `darwin.boot.${name}`);
+      const shared = new Uint8Array(new SharedArrayBuffer(b.length));
+      shared.set(b);
+      boot[name] = shared;
+    }
+    return { boot, strict: d.strict };
+  }
+
   /** Boot's end, in either build: the init, if any, and what waited for
    *  the system to run. */
   async #begin() {
@@ -536,6 +575,8 @@ export class System extends EventTarget {
    *  reaches by message; the rest of boot as the default build's. Windows
    *  and GL are not in it yet. */
   async #bootSingle(rt, arch, opts) {
+    // A Darwin process runs in a 64-bit memory, which this build has not.
+    if (this.#opts.darwin) throw new Error('darwin: Darwin programs run in a 64-bit memory, which the single-thread build does not have');
     // The page's parts: here, before the system Worker starts, they say
     // what it must make for them (`single.wl`: a canvas's compositor), and
     // once it runs they attach their page halves (`attach`).

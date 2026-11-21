@@ -586,7 +586,7 @@ export async function makeProcessHost({
   kernel, closure = null, lateUnits = null, heartbeat = defaultHeartbeat(), fill = null, lazyCache = null, pageFs = null,
   restBundle = false, identities = null, providerSources = null, stateful = null, recompileObjects = defaultRecompile(),
   closureBuildNumbered = false, link = defaultLink(), uid, preModules = null, glChannel = null, wlChannel = null,
-  netChannel = null, network = null, winsize,
+  netChannel = null, network = null, winsize, darwin = null,
 }, on) {
   const { shimBytes, seedBytes } = await loadRuntime();
   const makeGuestWorker = await guestWorkerFactory();
@@ -629,6 +629,9 @@ export async function makeProcessHost({
     pageFs: pageFs || undefined,
     restBundle: restBundle || undefined,
     identities: identities || undefined,
+    // The Darwin boot payload (page/runtime System's `darwin`), in shared
+    // memory: what a Darwin process's Worker boots its system from.
+    darwin: darwin || undefined,
     // The closure's libraries, in `extra` so a forked child gets them too: a
     // child adopts its parent's dispatch directory but its own tables start
     // empty, so it must instantiate the modules itself for the directory to

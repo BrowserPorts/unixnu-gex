@@ -72,11 +72,13 @@ void start(void) {
         status |= 1;
     } else {
         struct kevent64_s ch = {1, EVFILT_TIMER, EV_ADD | EV_ONESHOT, 0, 30, 0, {0, 0}};
+        // Before the call: the kernel takes the deadline from its own
+        // reading of the clock in the call, which this one precedes.
+        unsigned long armed = ticks();
         struct ret r = bsd(SYS_kevent64, kq.x0, (long)&ch, 1, 0, 0, KEVENT_FLAG_IMMEDIATE, 0);
         if (r.carry || r.x0 != 0) {
             status |= 2;
         }
-        unsigned long armed = ticks();
         struct kevent64_s ev = {0};
         for (;;) {
             r = bsd(SYS_kevent64, kq.x0, 0, 0, (long)&ev, 1, KEVENT_FLAG_IMMEDIATE, 0);

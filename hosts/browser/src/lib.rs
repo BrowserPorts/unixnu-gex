@@ -9563,7 +9563,8 @@ fn clock_syscall(ctx: i32) -> bool {
     let abi = CLOCK_ABI.load(Acquire);
     // Before the process is loaded there is no guest to make a call; once it
     // has exited, the full path ends the thread.
-    if abi == 0 || exited() {
+    // (A Darwin process's clock calls are its kernel's: no Linux ABI.)
+    if abi == 0 || exited() || darwin_process() {
         return false;
     }
     let mut gm = guest();
@@ -14612,6 +14613,11 @@ fn free_syscall(ctx: i32, pc: i64, mapped: &mut Vec<gex_kernel::CodeMap>, compat
     if slot_nr == SNAP_SYSCALL && SNAP_PENDING.0.borrow().1 != 0 {
         return None;
     }
+    // A Darwin process's calls are its kernel's, whose numbers are not in
+    // the registers the Linux ABI names: never this class.
+    if darwin_process() {
+        return None;
+    }
     let call = gex_kernel::syscalls::free_class_of(&gm, regs, compat)?;
     // Its process has exited under it (as the full call): the thread goes,
     // without the call.
@@ -16146,6 +16152,13 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
         set_exit(128 + 11);
         trap();
     }
+    // A Darwin program's brk: sleh's handle_breakpoint, EXC_BREAKPOINT
+    // through exception triage to the signal it means (SIGTRAP), its
+    // handler run, or the process's end with its report.
+    if darwin_process() {
+        let pc = pc as u64;
+        darwin::fault_and_leave(my_ctx(), pc, |k, gm| k.raise_fault(gm, gex_kernel::signal::sig::SIGTRAP as u32, pc, pc));
+    }
     // A bare `brk` is almost always glibc's `abort()` (the trap it ends on when
     // `raise(SIGABRT)` returns) or a compiler `__builtin_trap`. Name where it
     // was reached from and walk the stack a little, so a crash with no printed
@@ -16191,7 +16204,10 @@ pub extern "C" fn gex_sysreg_read(_ctx: i32, _pc: i64, reg: i32) -> i64 {
     match reg {
         // CNTVCT_EL0, at the frequency the lifter tells the guest CNTFRQ is,
         // so the guest's own arithmetic on it comes out exact; less the time
-        // a restored session spent saved, as the monotonic clocks.
+        // a restored session spent saved, as the monotonic clocks. A Darwin
+        // process's is its kernel's counter (`mach_absolute_time`, 24 MHz,
+        // `gex_abi::DARWIN_CNTFRQ`).
+        -3 if gex_abi::commpage_fold() => gex_kernel::darwin::mach::absolute_time() as i64,
         -3 => host_now_ns().wrapping_sub(gex_kernel::monotonic_held()) as i64,
         // MIDR_EL1: a plausible Cortex-A72, the same one the native host
         // claims to be.
@@ -16557,6 +16573,15 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
     let _pc = fault_pc(_pc);
     if op == gex_abi::cache_op::LOW_ACCESS {
         low_access("a locked access", addr as u64, _ctx, _pc as u64);
+    }
+    // A Darwin process's access its page does not allow (its protection
+    // table, `gex_abi::PERM_TABLE64`): the fault raised at the instruction,
+    // whose state the context holds; its handler runs next, the access is
+    // made again (a page entered), or the process ends.
+    if op == gex_abi::cache_op::PERM_READ || op == gex_abi::cache_op::PERM_WRITE {
+        let write = op == gex_abi::cache_op::PERM_WRITE;
+        let pc = _pc as u64;
+        darwin::fault_and_leave(_ctx as u32 as u64, pc, |k, gm| k.darwin_access_fault(gm, pc, addr as u64, write).0);
     }
     if op == gex_abi::cache_op::SPLIT_LOCK {
         let gm = guest();
@@ -17029,7 +17054,11 @@ fn safepoint(ctx: i32, pc: i64) {
     // shared word, dispositions and timers, and the inbox other processes
     // fill, collected when anyone has sent anything since this Worker last
     // looked.
-    if SAFEPOINT_SIGNALS && sigs::ready() {
+    if SAFEPOINT_SIGNALS && darwin_process() && sigs::ready() {
+        let ctx_addr = ctx as u32 as u64;
+        let _ = guest().write_u64(ctx_addr + ctx::PC as u64, pc as u64);
+        darwin::safepoint_signals(ctx_addr, pc as u64);
+    } else if SAFEPOINT_SIGNALS && sigs::ready() {
         let ctx_addr = ctx as u32 as u64;
         let mut gm = guest();
         // The context pc must be exact before a handler frame is built on
@@ -18833,6 +18862,15 @@ pub extern "C" fn gex_guest_trap(ctx_addr: u32, signo: u32) -> u32 {
     if WASM32.load(std::sync::atomic::Ordering::Acquire) {
         trace_line(&format!("gex: wasm32 program trapped at pc={pc:#x} (signal {signo})\n"));
         exit_here(-(signo as i32), Some(pc));
+        return 1;
+    }
+    // A Darwin process's: the kernel's fault, with its exception triage
+    // and its Darwin frame.
+    if darwin_process() {
+        if let Some(target) = darwin::fault(c, pc, |k, gm| k.raise_fault(gm, signo, pc, 0)) {
+            set_resume(target);
+            set_resume_ctx(c);
+        }
         return 1;
     }
     match sigs::fault(&mut gm, c, signo, pc, 0) {

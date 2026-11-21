@@ -314,3 +314,76 @@ pub(crate) fn tick() {
         commpage::tick(&mut guest(), now);
     }
 }
+
+/// A fault a Darwin thread takes at `pc`, the kernel's to raise
+/// (`raise` makes it: `raise_fault`, `darwin_access_fault`), with the
+/// kernel lock: its handler's frame or the access made again, the target
+/// returned; or its process's end of the signal, its task with it (`None`:
+/// the process has ended).
+pub(crate) fn fault(ctx_addr: u64, pc: u64, raise: impl FnOnce(&mut gex_kernel::syscalls::Kernel, &mut GuestMem<'_>) -> gex_kernel::signal::Delivery) -> Option<u64> {
+    use gex_kernel::signal::Delivery;
+    let d = with_exec_lock(|h| {
+        let mut gm = guest();
+        let d = raise(&mut h.kernel, &mut gm);
+        if let Delivery::Terminate { .. } = d {
+            task_end(&mut h.kernel);
+        }
+        d
+    });
+    match d {
+        Delivery::Resume(target) => {
+            if let Some(run) = MY_RUN.with(|r| r.borrow().clone()) {
+                run.lock().unwrap_or_else(|e| e.into_inner()).pc = target;
+            }
+            Some(target)
+        }
+        Delivery::Terminate { signal, .. } => {
+            exit_here(-(signal as i32), Some(pc));
+            None
+        }
+        // Raised and delivered: the thread goes on where its context says.
+        Delivery::None => Some(guest().read_u64(ctx_addr + ctx::PC as u64).unwrap_or(pc)),
+    }
+}
+
+/// [`fault`], and the thread's way back to JS: at the target, or its end.
+pub(crate) fn fault_and_leave(ctx_addr: u64, pc: u64, raise: impl FnOnce(&mut gex_kernel::syscalls::Kernel, &mut GuestMem<'_>) -> gex_kernel::signal::Delivery) -> ! {
+    if let Some(target) = fault(ctx_addr, pc, raise) {
+        set_resume(target);
+        set_resume_ctx(ctx_addr);
+    }
+    trap()
+}
+
+/// The signals pending for a Darwin thread at a safepoint, taken as its
+/// kernel takes them on the way back to user space (`deliver_pending`,
+/// `bsd_ast`): with the kernel lock, as a Darwin frame; never the lock-free
+/// Linux delivery (`sigs::deliver`).
+pub(crate) fn safepoint_signals(ctx_addr: u64, pc: u64) {
+    use gex_kernel::signal::Delivery;
+    let d = with_exec_lock(|h| {
+        let mut gm = guest();
+        let d = h.kernel.deliver_pending(&mut gm);
+        if let Delivery::Terminate { .. } = d {
+            task_end(&mut h.kernel);
+        }
+        d
+    });
+    match d {
+        Delivery::None => {}
+        Delivery::Resume(target) => {
+            if let Some(run) = MY_RUN.with(|c| c.borrow().clone()) {
+                let mut r = run.lock().unwrap_or_else(|e| e.into_inner());
+                r.pc = target;
+                r.waiting = Waiting::Runnable;
+            }
+            set_resume(target);
+            set_resume_ctx(ctx_addr);
+            trap();
+        }
+        Delivery::Terminate { signal, .. } => {
+            exit_here(-(signal as i32), Some(pc));
+            trap();
+        }
+    }
+}

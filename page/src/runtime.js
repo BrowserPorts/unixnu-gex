@@ -64,8 +64,8 @@ export function elfMachine() {
   return guestArch() === 'x86' ? 0x3e : 0xb7;
 }
 // `?mem64=1` (globalThis.GEX_MEM64): a 64-bit guest memory -- the wasm64
-// shim and seed and the kernel that reaches a process's memory with i64 (`.m64`, x86 only).
-const m64Infix = () => (globalThis.GEX_MEM64 && guestArch() === 'x86' ? '.m64' : '');
+// shim and seed and the kernel that reaches a process's memory with i64 (`.m64`).
+const m64Infix = () => (globalThis.GEX_MEM64 ? '.m64' : '');
 const SHIM_URL = () => assetUrl(`/gex/gex_browser${archInfix()}${m64Infix()}.shared.wasm`);
 const SEED_URL = () => assetUrl(`/gex/seed${archInfix()}${m64Infix()}.shared.wasm`);
 const KERNEL_URL = () => assetUrl(`/gex/gex_kernel${archInfix()}${m64Infix()}.wasm`);
@@ -605,14 +605,15 @@ export async function makeProcessHost({
   // needs it (host.mjs `#other`: 64-bit Wine's wineserver, a wasm32 module).
   // Otherwise, with the global kernel, the 64-bit memory's runtime, for a
   // program an exec asks one for (its GEX_MEM64=1, or its
-  // image's user.gex.mem64 record); the page itself stays 32-bit. Fetched
-  // only then, so a page that never asks loads nothing more.
+  // image's user.gex.mem64 record) or that needs one (an AArch64 page's
+  // Darwin program, shim vfork.rs `exec_darwin`); the page itself stays
+  // 32-bit. Fetched only then, so a page that never asks loads nothing more.
   other: m64Infix() ? async () => ({
     shim: await otherBytes(assetUrl(`/gex/gex_browser${archInfix()}.shared.wasm`)),
     guest: await otherBytes(assetUrl(`/gex/seed${archInfix()}.shared.wasm`)),
     // the one kernel module serves both flavours (gex-kmem)
     kernel: kernel.module,
-  }) : kernel && guestArch() === 'x86' ? async () => ({
+  }) : kernel ? async () => ({
     shim: await otherBytes(assetUrl(`/gex/gex_browser${archInfix()}.m64.shared.wasm`)),
     guest: await otherBytes(assetUrl(`/gex/seed${archInfix()}.m64.shared.wasm`)),
     kernel: kernel.module,

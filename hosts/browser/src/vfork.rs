@@ -87,6 +87,10 @@ thread_local! {
     /// The staged exec's program's image span and header flags when it is a
     /// native wasm one.
     static EXEC_WASM: Cell<Option<(u64, u64, u32)>> = const { Cell::new(None) };
+    /// The staged exec is a Darwin program the page started
+    /// ([`gex_adopted_exec`]): it goes on in a Worker made a Darwin one
+    /// (`gex_set_darwin`) before anything of it runs.
+    static EXEC_DARWIN: Cell<bool> = const { Cell::new(false) };
     /// The vfork children suspended here while one of theirs runs, the
     /// innermost last.
     static STACK: RefCell<Vec<Frame>> = const { RefCell::new(Vec::new()) };
@@ -373,7 +377,9 @@ pub(crate) fn stage_exec_parts(h: &mut Host, path: &str, argv: &[String], envp: 
     // The capabilities the new program starts with (`Creds::exec`).
     h.kernel.creds.exec();
     let state = state_bytes(&h.kernel, true);
-    let mem64 = if page_flavours() & 2 != 0 { exec_target(h, path) as i32 } else { -1 };
+    // A Darwin program's Worker is a 64-bit memory's, whatever the page's.
+    let darwin = EXEC_DARWIN.with(|c| c.get());
+    let mem64 = if darwin { 1 } else if page_flavours() & 2 != 0 { exec_target(h, path) as i32 } else { -1 };
     EXEC_MEM64.with(|c| c.set(mem64));
     let wasm = exec_wasm_image(h, path);
     EXEC_WASM.with(|c| c.set(wasm));
@@ -632,6 +638,23 @@ pub extern "C" fn gex_vfork_exec_mem64() -> i32 {
     EXEC_MEM64.with(|c| c.get())
 }
 
+/// Whether the staged exec is a Darwin program's (`EXEC_DARWIN`): 1 when
+/// its Worker must be made a Darwin one (`gex_set_darwin`).
+#[no_mangle]
+pub extern "C" fn gex_vfork_exec_darwin() -> i32 {
+    EXEC_DARWIN.with(|c| c.get()) as i32
+}
+
+/// Whether the file at `path` (relative to the caller's cwd) is a Darwin
+/// program: a 64-bit arm64 Mach-O (`MH_MAGIC_64`), which `gexc run` runs on
+/// the Darwin personality (crates/gexc/src/main.rs). A fat file is not one
+/// here, as it is not to `gexc run`.
+fn exec_darwin(h: &Host, path: &str) -> bool {
+    let path = if path.starts_with('/') { path.to_string() } else { format!("{}/{path}", h.kernel.caller_cwd().trim_end_matches('/')) };
+    let mut head = [0u8; 4];
+    crate::sigs::proc_home().read_file_at(&path, 0, &mut head) == Some(4) && gex_ld::macho::is_macho(&head)
+}
+
 /// Why the child's run ended: 0 (it exited, or crashed), 2 an exec staged,
 /// 3 a call it may not make here.
 #[no_mangle]
@@ -782,6 +805,30 @@ pub extern "C" fn gex_adopted_exec(ptr: u32, len: u32) -> u64 {
         // (`exec_away`). Without this a program the page started ran in
         // the page's flavour whatever it needed, unless its Wine loader
         // happened to exec itself again (starting the server).
+        // A Darwin program the page started, as `gexc run` starts one: in a
+        // 64-bit memory (its images live above 4 GiB), in a Worker made a
+        // Darwin one before anything of it runs (`gex_set_darwin`): this
+        // one, when it is, else a new one, as an exec to the other memory
+        // flavour goes (`exec_away`). (An `execve` of one from a Linux
+        // process is the Linux personality's, which has no Mach-O loader.)
+        if page_program && exec_darwin(h, &path) && !crate::darwin_process() {
+            h.kernel.exec_mem64 = h.kernel.exec_flavour(&path, &argv, &mut envp);
+            if h.kernel.exec_mem64 == Some(false) {
+                warn_line(&format!("gex: {path}: a 32-bit memory was asked for (GEX_MEM64=0), and a Darwin program's images are above 4 GiB\n"));
+                exit_process(127);
+                return 0;
+            }
+            h.kernel.exec_mem64 = Some(true);
+            if !page_runs_mem64() || (!gex_abi::mem64() && unsafe { crate::other_runtime() } < 0) {
+                warn_line(&format!("gex: {path}: a Darwin program runs in a 64-bit memory, which this page does not run\n"));
+                exit_process(127);
+                return 0;
+            }
+            EXEC_DARWIN.with(|c| c.set(true));
+            crate::exec_away(h, &path, &argv, &envp);
+            EXEC_DARWIN.with(|c| c.set(false));
+            return 0;
+        }
         let path = if page_program {
             h.kernel.exec_mem64 = h.kernel.exec_flavour(&path, &argv, &mut envp);
             let path = exec_route(h, &path).unwrap_or(path);

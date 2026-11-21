@@ -93,7 +93,13 @@ const MEDIA = {
 // program spends its calls), beside the test programs (wine/units.mjs).
 const UNIT_DLLS = ['ntdll.dll', 'kernelbase.dll', 'kernel32.dll', 'msvcrt.dll', 'ucrtbase.dll'];
 
-export const outputs = { busybox: ['bb.tar.zst', 'rt-side.so'], slim: ['slim'], package: ['pkg', 'pkg-no-m64'], 'gl-probes': ['gl-probes.json'], wine64: ['wine64.tar', 'wine64-lazy.json', 'wine64'], 'win-progs': ['win-progs.tar'], 'win-media': ['win-media.tar'], 'wine64-units': ['wine64-units'], kde: ['kde'], 'wine-site': ['wine-site'], mem64: ['mem64-pick.x86', 'mem64-miss.x86', 'mem64-retry.x86', 'no-m64'], 'mesa-cold': ['mesa-cold'], 'native-progs': ['mount-tmpfs.x86', 'mount-tmpfs.a64', 'truncate-path.x86', 'truncate-path.a64'] };
+export const outputs = { busybox: ['bb.tar.zst', 'rt-side.so'], slim: ['slim'], package: ['pkg', 'pkg-no-m64'], 'gl-probes': ['gl-probes.json'], wine64: ['wine64.tar', 'wine64-lazy.json', 'wine64'], 'win-progs': ['win-progs.tar'], 'win-media': ['win-media.tar'], 'wine64-units': ['wine64-units'], kde: ['kde'], 'wine-site': ['wine-site'], mem64: ['mem64-pick.x86', 'mem64-miss.x86', 'mem64-retry.x86', 'no-m64'], 'mesa-cold': ['mesa-cold'], 'native-progs': ['mount-tmpfs.x86', 'mount-tmpfs.a64', 'truncate-path.x86', 'truncate-path.a64'], 'darwin-static': ['darwin-static.json', 'darwin-static'] };
+
+/** The `darwin-static` image's programs (tests/darwin/bin, as
+ *  tests/darwin/build.sh builds them), and the boot payload's files
+ *  tests/darwin/run.sh boots them with, where the payload has them. */
+const DARWIN_STATIC = ['hello-static', 'bsd-carry'];
+const DARWIN_BOOT = ['DeviceTree', 'sandbox_profile.bin', 'sandbox_builtin.bin', 'sandbox_protobox.bin', 'img4_anchor.der', 'SystemVolume.attrs'];
 
 export const images = {
   // Mesa's cold part (page/mesa-cold): for each of the mt and st builds'
@@ -196,6 +202,53 @@ export const images = {
         writeFileSync(keyFile, key);
       }
     }
+    return null;
+  },
+
+  // `darwin-static`: Darwin programs with no dyld (tests/darwin/bin's
+  // DARWIN_STATIC; tests/darwin/build.sh) in darwin-static/, and the boot
+  // payload they run on in darwin-static/boot/, made as tests/darwin/run.sh
+  // makes it from GEX_DARWIN_BOOT (the device's payload): its trust cache
+  // bundle with the programs' cdhashes added (tools/darwin-trust-cache.py),
+  // and its DeviceTree, Sandbox profiles, AppleImage4 anchor and system
+  // volume attributes as they are. That payload is Apple's: it is read from
+  // the owner's at test time and kept only in the work directory. And
+  // darwin-static.json: the payload's file names, and each program's
+  // output, status and Darwin reports under this arch's gexc (GEXC_A64,
+  // GEXC, then target/release) on that payload, strict
+  // (GEX_DARWIN_STRICT=1), which the page's run must match.
+  async 'darwin-static'(work) {
+    const boot = process.env.GEX_DARWIN_BOOT;
+    if (!boot) return 'GEX_DARWIN_BOOT: the device\'s boot payload (its TrustCache bundle, Sandbox profiles, ...)';
+    if (!existsSync(join(boot, 'TrustCache'))) return `no TrustCache in ${boot} (GEX_DARWIN_BOOT)`;
+    const bin = join(ROOT, 'tests/darwin/bin');
+    for (const p of DARWIN_STATIC) if (!existsSync(join(bin, p))) return `no tests/darwin/bin/${p} (tests/darwin/build.sh)`;
+    const gexc = process.env.GEXC_A64 || process.env.GEXC || join(ROOT, 'target/release/gexc');
+    if (!existsSync(gexc)) return `no gexc at ${gexc} (GEXC_A64)`;
+    const out = join(work, 'darwin-static');
+    rmSync(out, { recursive: true, force: true });
+    mkdirSync(join(out, 'boot'), { recursive: true });
+    for (const p of DARWIN_STATIC) copyFileSync(join(bin, p), join(out, p));
+    const tc = spawnSync('python3', ['-I', join(ROOT, 'tools/darwin-trust-cache.py'), '-o', join(out, 'boot/TrustCache'), '--bundle', join(boot, 'TrustCache'), ...DARWIN_STATIC.map((p) => join(out, p))], { encoding: 'utf8' });
+    if (tc.status !== 0) throw new Error(`tools/darwin-trust-cache.py: ${(tc.stderr || tc.stdout).trim()}`);
+    const files = ['TrustCache'];
+    for (const f of DARWIN_BOOT) {
+      if (!existsSync(join(boot, f))) continue;
+      copyFileSync(join(boot, f), join(out, 'boot', f));
+      files.push(f);
+    }
+    // The page's run has no more of the system than the payload: none of
+    // the caller's other Darwin settings (a disk image, a web device).
+    const darwinFree = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('GEX_DARWIN_')));
+    const native = {};
+    for (const p of DARWIN_STATIC) {
+      const r = spawnSync(gexc, ['run', join(out, p)], { encoding: 'utf8', timeout: 300000, env: { ...darwinFree, GEX_DARWIN_BOOT: join(out, 'boot'), GEX_DARWIN_STRICT: '1' } });
+      if (r.error || r.status === null) throw new Error(`gexc run ${p}: ${r.error?.message ?? `signal ${r.signal}`}`);
+      // And what its kernel reported (`[gex] Darwin: ...`, gexc's stderr),
+      // which the page's system says on its console.
+      native[p] = { stdout: r.stdout, status: r.status, reports: r.stderr.split('\n').filter((l) => l.startsWith('[gex] Darwin: ')) };
+    }
+    writeFileSync(join(work, 'darwin-static.json'), JSON.stringify({ boot: files, native }));
     return null;
   },
 

@@ -144,6 +144,15 @@ if (o.prepare) process.exit(missing.size ? 1 : 0);
 }
 
 // -- the browser -------------------------------------------------------------
+/** The browser's exit while the run still wanted it (`startChrome`):
+ *  `{ code, signal }` once it has, and a promise of it. Headless Chrome on
+ *  macOS has been seen to end by itself, status 0, a minute or so into a
+ *  run: a job it takes with it is retried once on a browser started again
+ *  (`runJob`), and its result says the browser ended, not the test. */
+let browserGone = null;
+let browserExit = new Promise(() => {});
+let restarting = null;
+
 let server = null;
 let chrome = null;
 let cdp = null;
@@ -166,6 +175,7 @@ for (const [queue, width] of [[jobs.filter((j) => !lone(j)), Math.max(1, Number(
   }));
 }
 cdp?.close();
+if (chrome) chrome.killedByRunner = true;
 chrome?.kill();
 await server?.close();
 if (!o.work) rmSync(WORK, { recursive: true, force: true });
@@ -184,8 +194,18 @@ async function runJob({ test, host, arch }) {
   const say = (line) => {
     if (o.verbose || /^FAIL/.test(line)) process.stderr.write(`${test.name} ${host} ${arch}: ${line}\n`);
   };
-  const r = await (host === 'browser' ? runPage : runNode)(test, ARCHES[arch], say, (o.single && test.meta.singleTimeout || test.meta.timeout) * 1000);
-  return { ...out, ...r, ms: Date.now() - t0 };
+  const run = () => (host === 'browser' ? runPage : runNode)(test, ARCHES[arch], say, (o.single && test.meta.singleTimeout || test.meta.timeout) * 1000);
+  let r = await run();
+  // The browser ended by itself under the job (not the test's doing): the
+  // job once more on a browser started again; a second such end is the
+  // run's failure, said as the browser's.
+  if (r.browserExited) {
+    log(`${test.name} ${host} ${arch}: the browser exited by itself during it; once more on a new browser`);
+    await restartChrome();
+    r = await run();
+  }
+  const { browserExited, ...rest } = r;
+  return { ...out, ...rest, ms: Date.now() - t0 };
 }
 
 // -- node ----------------------------------------------------------------------
@@ -363,6 +383,12 @@ async function startBrowser() {
   });
   await server.listen();
   log(`vite on ${PORT}, work ${WORK}`);
+  return { server, ...(await startChrome()) };
+}
+
+/** Chromium, headless, its debugging port at vite's port + 1. */
+async function startChrome() {
+  const PORT = Number(o.port);
   const profile = join(WORK, 'profile');
   rmSync(profile, { recursive: true, force: true });
   const chrome = spawn(chromePath(), [
@@ -373,6 +399,13 @@ async function startBrowser() {
     ...(gpu ? [hostAngle, '--ignore-gpu-blocklist'] : ['--use-angle=swiftshader']),
     '--disable-gpu-sandbox', '--no-sandbox', 'about:blank',
   ], { stdio: ['ignore', 'ignore', o.verbose ? 'inherit' : 'ignore'] });
+  browserGone = null;
+  browserExit = new Promise((resolve) => chrome.once('exit', (code, signal) => {
+    if (chrome.killedByRunner) return;
+    browserGone = { code, signal };
+    log(`the browser exited by itself (${signal ? `signal ${signal}` : `status ${code}`})`);
+    resolve(browserGone);
+  }));
   let ws = null;
   // A minute: a loaded machine starts it slowly.
   for (let i = 0; i < 600 && !ws; i++) {
@@ -383,7 +416,18 @@ async function startBrowser() {
     chrome.kill('SIGKILL');
     throw new Error('chromium did not come up');
   }
-  return { server, chrome, cdp: await Cdp.connect(ws) };
+  return { chrome, cdp: await Cdp.connect(ws) };
+}
+
+/** A browser in place of one that exited by itself, started once however
+ *  many jobs ask. */
+function restartChrome() {
+  restarting ??= (async () => {
+    cdp?.close();
+    ({ chrome, cdp } = await startChrome());
+    log('the browser is started again');
+  })().finally(() => { restarting = null; });
+  return restarting;
 }
 
 /** The test in a page of its own (a fresh browser context, so its storage
@@ -452,6 +496,12 @@ async function runPage(test, arch, say, timeout) {
     return path;
   };
   const poll = 'JSON.stringify(globalThis.__t ? (({ done, lines, asks, res, result, skip }) => ({ done, lines, asks, res, result, skip }))(globalThis.__t) : null)';
+  // The browser's own end, not the page's: told apart (`runJob`).
+  let exited = false;
+  browserExit.then((g) => {
+    exited = true;
+    died(`the browser exited by itself (${g.signal ? `signal ${g.signal}` : `status ${g.code}`}), not the test`);
+  });
   while (Date.now() - t0 < timeout && !crashed) {
     await sleep(sent ? 50 : 250);
     const r = await Promise.race([
@@ -493,7 +543,7 @@ async function runPage(test, arch, say, timeout) {
   if (!v?.done) {
     const what = crashed ?? `timed out after ${timeout / 1000} s`;
     say(`FAIL ${what}`);
-    return { result: 'FAIL', ...res, fail: [...res.fail, what] };
+    return { result: 'FAIL', ...res, fail: [...res.fail, what], ...(exited && { browserExited: true }) };
   }
   return { result: v.result, skip: v.skip, ...res };
 }

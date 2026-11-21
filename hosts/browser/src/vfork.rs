@@ -690,6 +690,7 @@ pub extern "C" fn gex_vfork_exec_len(i: u32) -> u32 {
 #[no_mangle]
 pub extern "C" fn gex_vfork_exec_done() {
     EXEC_PARTS.with(|p| *p.borrow_mut() = Default::default());
+    EXEC_DARWIN.with(|c| c.set(false));
 }
 
 /// The child is done: the Worker back to the parent's process (or to the
@@ -824,9 +825,10 @@ pub extern "C" fn gex_adopted_exec(ptr: u32, len: u32) -> u64 {
                 exit_process(127);
                 return 0;
             }
+            // Kept with the staged parts until the page has read them
+            // (`gex_vfork_exec_done`).
             EXEC_DARWIN.with(|c| c.set(true));
             crate::exec_away(h, &path, &argv, &envp);
-            EXEC_DARWIN.with(|c| c.set(false));
             return 0;
         }
         let path = if page_program {

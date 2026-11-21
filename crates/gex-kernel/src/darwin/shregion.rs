@@ -869,6 +869,20 @@ impl Space for TaskSpace<'_, '_, '_> {
     }
 }
 
+/// A kept slid copy (`h`, `len` bytes) mapped at `start` where the host
+/// can map a file; false where it cannot, and the slid bytes are written.
+#[cfg(unix)]
+fn map_kept(m: &mut GuestMem<'_>, start: u64, len: u64, h: &std::fs::File) -> bool {
+    use std::os::fd::AsRawFd;
+    m.map_file(start, len, h.as_raw_fd(), 0).unwrap_or(false)
+}
+
+/// [`map_kept`] on a target with no host descriptors (the browser's wasm).
+#[cfg(not(unix))]
+fn map_kept(_m: &mut GuestMem<'_>, _start: u64, _len: u64, _h: &std::fs::File) -> bool {
+    false
+}
+
 /// A region's entry put in a task's memory, and in its memory map with the
 /// entry's protections. Its pages are the region's (`vm_map_enter` of the
 /// shared region's submap, its contents the shared region pager's), not a
@@ -876,7 +890,6 @@ impl Space for TaskSpace<'_, '_, '_> {
 /// memory, whatever the task's own protections of it are, as at a mapping
 /// call the region's pages are read-only to the task.
 fn install(mm: &crate::mem::Mm, m: &mut GuestMem<'_>, c: &Contents, mp: &Mapping) -> Result<(), String> {
-    use std::os::fd::AsRawFd;
     let mut k = m.kernel();
     let m = &mut k;
     let (start, len) = (mp.address, mp.size);
@@ -907,7 +920,7 @@ fn install(mm: &crate::mem::Mm, m: &mut GuestMem<'_>, c: &Contents, mp: &Mapping
                 Some(info) => {
                     let key = slid_name(c, f, *offset, len, info);
                     let kept = key.as_ref().and_then(|p| std::fs::File::open(p).ok()).filter(|h| h.metadata().is_ok_and(|md| md.len() == len));
-                    let mapped = kept.is_some_and(|h| m.map_file(start, len, h.as_raw_fd(), 0).unwrap_or(false));
+                    let mapped = kept.is_some_and(|h| map_kept(m, start, len, &h));
                     if !mapped {
                         let mut b = vec![0u8; len as usize];
                         read_full(f.handle.as_ref(), *offset, &mut b);

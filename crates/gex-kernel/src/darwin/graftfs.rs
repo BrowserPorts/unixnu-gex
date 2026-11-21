@@ -739,6 +739,7 @@ impl FileHandle for GraftHandle {
     fn metadata(&self) -> Result<Metadata, Errno> {
         self.fs.metadata_of(&self.current()?)
     }
+    #[cfg(unix)]
     fn host_fd(&self) -> Option<i32> {
         use std::os::fd::AsRawFd;
         self.host_file().map(|f| f.as_raw_fd())

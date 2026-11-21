@@ -1915,6 +1915,7 @@ impl Clock for Uptime {
 }
 
 /// A host file holding the NVRAM namespace.
+#[cfg(unix)]
 impl Medium for super::apfswrite::HostFile {
     fn read(&self, len: usize) -> Result<Vec<u8>, String> {
         use super::apfsread::Medium as _;

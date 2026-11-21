@@ -1469,8 +1469,15 @@ impl fsops::Bytes for IpswFile {
     fn len(&self) -> u64 {
         self.1
     }
+    #[cfg(unix)]
     fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<(), String> {
         std::os::unix::fs::FileExt::read_exact_at(&self.0, buf, off).map_err(|e| e.to_string())
+    }
+    /// No host file is ever opened where the target has none (the
+    /// browser's wasm), so none is read.
+    #[cfg(not(unix))]
+    fn read_at(&self, _off: u64, _buf: &mut [u8]) -> Result<(), String> {
+        unreachable!("an IPSW file read on a target with no host files")
     }
 }
 

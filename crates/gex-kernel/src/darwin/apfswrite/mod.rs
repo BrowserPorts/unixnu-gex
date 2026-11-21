@@ -37,6 +37,7 @@ pub trait Sink: Medium {
 /// A host file as a sink.
 pub struct HostFile(pub std::fs::File, pub u64);
 
+#[cfg(unix)]
 impl Medium for HostFile {
     fn size(&self) -> u64 {
         self.1
@@ -47,6 +48,7 @@ impl Medium for HostFile {
     }
 }
 
+#[cfg(unix)]
 impl Sink for HostFile {
     fn write_at(&self, off: u64, buf: &[u8]) -> Result<(), String> {
         use std::os::unix::fs::FileExt;

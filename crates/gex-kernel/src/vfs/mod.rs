@@ -1002,10 +1002,18 @@ pub fn size_did_change(id: (u64, u64, u64), size: u64) {
 }
 
 /// [`FileHandle::host_id`] of a host file's metadata.
+#[cfg(unix)]
 pub fn host_id_of(md: &std::fs::Metadata) -> (u64, u64, u64) {
     use std::os::unix::fs::MetadataExt;
     let birth = md.created().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos() as u64);
     (md.dev(), md.ino(), birth)
+}
+
+/// [`host_id_of`] where the target has no host files (the browser's wasm):
+/// no host file is ever opened there, so no metadata of one reaches this.
+#[cfg(not(unix))]
+pub fn host_id_of(_md: &std::fs::Metadata) -> (u64, u64, u64) {
+    unreachable!("a host file's metadata on a target with no host files")
 }
 
 static SYNC_ALL: std::sync::OnceLock<fn() -> Result<(), Errno>> = std::sync::OnceLock::new();

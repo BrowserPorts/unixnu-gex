@@ -632,6 +632,7 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
             // The browser does not run Darwin processes yet.
             darwin: false,
             stat_ino32: false,
+            stat_scrub: false,
             pid: home.pid,
             creds: &home.creds,
             procs: &home.procs,

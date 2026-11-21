@@ -258,6 +258,9 @@ if [ -n "${GEX_MEM64:-}" ]; then
         echo "hosts/browser: the wasm64 shim and gex_kernel$INFIX.m64.wasm disagree (GEX_MEM64=1 hosts/kernel/build.sh)"; exit 1
     fi
     $GEXC seed --mem64 -o page/public/gex/seed$INFIX.m64.shared.wasm >/dev/null
+    # And an AArch64 Darwin process's, made with its translator switches
+    # (`gexc seed --darwin`): its `enter` reads its tables where they are.
+    [ -n "$ARCH_FEAT" ] || $GEXC seed --mem64 --darwin -o page/public/gex/seed.m64.darwin.shared.wasm >/dev/null
     echo "hosts/browser: $(stat -c%s "$M64OUT") bytes (wasm64, memory64), seed$INFIX.m64.shared.wasm"
 fi
 

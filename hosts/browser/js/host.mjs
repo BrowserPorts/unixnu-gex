@@ -689,12 +689,15 @@ export class ProcessHost {
     // The other memory flavour's `{ shim, guest, kernel }` (`#other`), or
     // an async function that fetches it.
     other = null,
+    // An async function that fetches a Darwin process's seed (`#darwinOf`).
+    darwinSeed = null,
     // `(url) => Promise<WebAssembly.Module>`: how a unit `prefetchUnit` names
     // is fetched and compiled, when not with fetch and WebAssembly.compile
     // here (a compressed one, decoded elsewhere).
     unitModule = null,
   }) {
     this.#other = other;
+    this.#darwinSeed = darwinSeed;
     if (typeof other === 'function' && typeof SharedArrayBuffer === 'function') this.#otherGate = new Int32Array(new SharedArrayBuffer(4));
     this.#unitModule = unitModule;
     this.#makeWorker = makeWorker;
@@ -724,6 +727,12 @@ export class ProcessHost {
     return this.#shimCompiling;
   }
 
+  /** The processes that run a Darwin program (an exec record's `darwin`),
+   *  whose Workers start on the Darwin seed (`#runtimeFor`). */
+  #darwinOf = new Set();
+  #darwinSeed = null;
+  #darwinGuest = null;
+
   /** Whether process `pid` (or a thread's `pid:tid`) has a 64-bit memory. */
   #mem64(pid) {
     const f = this.#flavourOf.get(Number(String(pid).split(':')[0]));
@@ -746,17 +755,29 @@ export class ProcessHost {
    *  mem64 }`, the shim compiled. */
   async #runtimeFor(pid) {
     const mem64 = this.#mem64(pid);
+    // A Darwin process's Workers run its seed, made with its switches.
+    const darwin = this.#darwinOf.has(Number(String(pid).split(':')[0]));
     if (!this.#foreign(pid)) {
-      return { shim: await this.#shimModule(), guest: this.#guest, kernel: this.#kernel ?? undefined, mem64 };
+      return { shim: await this.#shimModule(), guest: darwin ? await this.#darwinGuestFor(pid) : this.#guest, kernel: this.#kernel ?? undefined, mem64 };
     }
     const o = await this.#loadOther();
     if (!o) throw new Error(`process ${pid} needs a ${mem64 ? '64' : '32'}-bit memory, which this page does not run`);
     return {
       shim: await this.#otherShim,
-      guest: o.guest,
+      guest: darwin ? await this.#darwinGuestFor(pid) : o.guest,
       kernel: this.#kernel ? { ...this.#kernel, module: o.kernel } : undefined,
       mem64,
     };
+  }
+
+  /** A Darwin process's seed (`gexc seed --darwin`), fetched once. */
+  async #darwinGuestFor(pid) {
+    if (!this.#darwinSeed) throw new Error(`process ${pid} runs a Darwin program, and this page has no Darwin seed (AArch64, with the global kernel)`);
+    this.#darwinGuest ??= this.#darwinSeed().catch((e) => {
+      this.#darwinGuest = null;
+      throw e;
+    });
+    return this.#darwinGuest;
   }
 
   /** The other flavour's runtime, its shim compiled: fetched on first use
@@ -855,6 +876,7 @@ export class ProcessHost {
    */
   spawnExec({ pid, exec, fds, cwd = '/', wasmImage = null, opts = {} }) {
     this.#flavourOf.delete(pid);
+    this.#darwinOf.delete(pid);
     const child = {
       pid,
       // Its first thread's registers, at the first context
@@ -1970,6 +1992,8 @@ export class ProcessHost {
         const child = m.child;
         if (child.mem64 !== undefined && child.mem64 !== !!this.#extra?.mem64) this.#flavourOf.set(Number(pid), child.mem64);
         else this.#flavourOf.delete(Number(pid));
+        if (child.darwin) this.#darwinOf.add(Number(pid));
+        else this.#darwinOf.delete(Number(pid));
         this.#releaseNow(pid, w);
         this.#spawn(pid, { kind: 'adopt', child }).then(resolve, reject);
         break;

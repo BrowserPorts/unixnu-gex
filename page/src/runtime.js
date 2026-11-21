@@ -618,6 +618,10 @@ export async function makeProcessHost({
     guest: await otherBytes(assetUrl(`/gex/seed${archInfix()}.m64.shared.wasm`)),
     kernel: kernel.module,
   }) : null,
+  // An AArch64 Darwin process's seed (`gexc seed --darwin`, its `enter`
+  // reading its tables where they are), fetched for the page's first Darwin
+  // program.
+  darwinSeed: kernel && guestArch() === 'aarch64' ? () => otherBytes(assetUrl('/gex/seed.m64.darwin.shared.wasm')) : null,
   extra: {
     // The switches every page takes (hosts/browser/js/options.mjs).
     ...startOptions('extra'),

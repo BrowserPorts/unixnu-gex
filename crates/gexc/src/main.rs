@@ -931,6 +931,15 @@ fn cmd_seed(args: &[String]) -> Result<()> {
             "--no-shared-memory" => shared_memory = false,
             // The seed for the wasm64 (memory64) browser shim.
             "--mem64" => gex_abi::set_mem_flavor(gex_abi::MemFlavor::M64),
+            // A Darwin process's (the browser's Darwin Worker): made with
+            // its translator switches, as darwin_run sets them, so that its
+            // `enter` reads the process's tables where they are
+            // (gex_abi::tables64).
+            "--darwin" => {
+                gex_abi::set_commpage_fold(true);
+                gex_ir::pass::set_forward_reg_consts(true);
+                gex_ir::pass::set_fold_through_memory(false);
+            }
             other => bail!("unexpected argument {other}"),
         }
         i += 1;

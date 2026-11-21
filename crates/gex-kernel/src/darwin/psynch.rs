@@ -16,7 +16,8 @@ use crate::syscalls::{Kernel, SyscallOutcome};
 use crate::GuestMem;
 use gex_abi::ctx;
 use std::collections::{HashMap, VecDeque};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use crate::darwin::time::Instant;
 
 // Sequence words (`synch_internal.h`).
 const PTHRW_COUNT_SHIFT: u32 = 8;

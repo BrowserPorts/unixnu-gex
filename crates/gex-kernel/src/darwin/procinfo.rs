@@ -184,7 +184,7 @@ const MAXCOMLEN: usize = 16;
 
 /// The wall clock now, as `microtime` gives it.
 pub fn microtime() -> (u64, u64) {
-    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let d = crate::darwin::time::realtime().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     (d.as_secs(), u64::from(d.subsec_micros()))
 }
 

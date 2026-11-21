@@ -25,7 +25,8 @@ use crate::syscalls::{Kernel, SpawnRequest, SyscallOutcome};
 use crate::GuestMem;
 use gex_abi::ctx;
 use std::collections::{HashMap, VecDeque};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use crate::darwin::time::Instant;
 
 /// Thread QoS classes (`thread_qos_t`).
 pub mod qos {

@@ -894,7 +894,7 @@ impl Kernel {
         self.darwin_lock_outcome(m, r)
     }
 
-    fn darwin_lock_outcome(&mut self, m: &mut GuestMem<'_>, r: Result<Option<(Cont, Option<std::time::Instant>)>, Errno>) -> SyscallOutcome {
+    fn darwin_lock_outcome(&mut self, m: &mut GuestMem<'_>, r: Result<Option<(Cont, Option<crate::darwin::time::Instant>)>, Errno>) -> SyscallOutcome {
         match r {
             Ok(None) => {
                 let _ = super::set_result(m, self.ctx_addr, 0);
@@ -908,7 +908,7 @@ impl Kernel {
         }
     }
 
-    fn darwin_fcntl_lock_inner(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<Option<(Cont, Option<std::time::Instant>)>, Errno> {
+    fn darwin_fcntl_lock_inner(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<Option<(Cont, Option<crate::darwin::time::Instant>)>, Errno> {
         let (fd, c, argp) = (a[0] as i32, a[1], a[2]);
         let file = self.fds.get(fd)?;
         let Target::Lockf(v) = (match self.darwin_lock_target(&file) {
@@ -1011,7 +1011,7 @@ impl Kernel {
         self.darwin_lock_outcome(m, r)
     }
 
-    fn darwin_flock_inner(&mut self, fd: i32, how: u64) -> Result<Option<(Cont, Option<std::time::Instant>)>, Errno> {
+    fn darwin_flock_inner(&mut self, fd: i32, how: u64) -> Result<Option<(Cont, Option<crate::darwin::time::Instant>)>, Errno> {
         let file = self.fds.get(fd)?;
         let target = match self.darwin_lock_target(&file) {
             Target::NotVnode => return Err(Errno::EOPNOTSUPP),
@@ -1037,7 +1037,7 @@ impl Kernel {
     }
 
     /// A flock lock (`flock`, or `open`'s O_EXLOCK and O_SHLOCK).
-    fn darwin_flock_set(&mut self, file: &Arc<OpenFile>, v: Vnode, ty: i16, wait: u32, open_fd: Option<i32>) -> Result<Option<(Cont, Option<std::time::Instant>)>, Errno> {
+    fn darwin_flock_set(&mut self, file: &Arc<OpenFile>, v: Vnode, ty: i16, wait: u32, open_fd: Option<i32>) -> Result<Option<(Cont, Option<crate::darwin::time::Instant>)>, Errno> {
         let fg = Arc::as_ptr(file) as usize;
         let mut fl = Flock { whence: SEEK_SET, ty, ..Default::default() };
         if ty == F_UNLCK {

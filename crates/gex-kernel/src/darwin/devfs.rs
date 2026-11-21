@@ -234,7 +234,7 @@ const LAZY_UPDATE_SECONDS: i64 = 1;
 
 /// `microtime`: seconds and microseconds.
 fn microtime() -> (i64, u32) {
-    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let d = crate::darwin::time::realtime().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     (d.as_secs() as i64, d.subsec_micros())
 }
 

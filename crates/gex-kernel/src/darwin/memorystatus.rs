@@ -1218,7 +1218,7 @@ impl crate::syscalls::Kernel {
     }
 
     /// The idle demotion call, when it is due; when it is next.
-    pub(crate) fn darwin_jetsam_tick(&mut self) -> Option<std::time::Instant> {
+    pub(crate) fn darwin_jetsam_tick(&mut self) -> Option<crate::darwin::time::Instant> {
         let now = super::mach::absolute_time();
         let deadline = self.procs.jetsam().demotion_deadline;
         if deadline != 0 && now >= deadline {

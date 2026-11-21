@@ -26,7 +26,8 @@
 //! keeps them, [`set_slid_dir`]), what the shared region pager would page in.
 
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use crate::darwin::time::Instant;
 
 use crate::errno::Errno;
 use crate::syscalls::Kernel;

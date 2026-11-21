@@ -9,7 +9,8 @@
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use crate::darwin::time::Instant;
 
 use super::ctty::{self, Pgrp, Session, TtyVnode};
 use super::km::{self, CONSOLE_MAJOR};
@@ -2275,7 +2276,7 @@ mod tests {
         let token = cell.lock().enqueue_sync(&req, Arc::clone(&w));
         cell.lock().revoke_end(r.sent);
         reclaim(r.v.0, Some(&cell));
-        assert!(w.wait(Some(std::time::Instant::now())), "the reclaim wakes it");
+        assert!(w.wait(Some(crate::darwin::time::Instant::now())), "the reclaim wakes it");
         cell.lock().unsleep(token);
         assert!(matches!(io_get(&cell, &t, &o), Entry::Dead), "then it finds the vnode dead");
     }

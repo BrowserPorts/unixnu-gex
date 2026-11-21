@@ -26,7 +26,8 @@
 use crate::page_state as ps;
 use crate::syscalls::Kernel;
 use crate::GuestMem;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use crate::darwin::time::Instant;
 
 /// How often a task measures its footprint.
 pub const SAMPLE: Duration = Duration::from_millis(100);

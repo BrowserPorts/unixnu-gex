@@ -17,7 +17,8 @@ use crate::syscalls::{nr, Kernel, SyscallOutcome};
 use crate::GuestMem;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use crate::darwin::time::Instant;
 
 /// CONFIG_AIO_MAX, CONFIG_AIO_PROCESS_MAX (`config/MASTER`'s `xsmall`, which
 /// MASTER.arm64.iPhoneOS's KERNEL_BASE names) and AIO_LISTIO_MAX.

@@ -10,7 +10,7 @@ use crate::syscalls::Kernel;
 use crate::GuestMem;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Instant;
+use crate::darwin::time::Instant;
 
 /// What a thread call does when it fires.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

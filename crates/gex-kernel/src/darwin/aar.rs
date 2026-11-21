@@ -1163,7 +1163,7 @@ mod tests {
         let (kind, data) = im4p_payload(&im4p).unwrap();
         assert_eq!(kind, b"msys");
         assert!(data.starts_with(b"pbze"));
-        let t = std::time::Instant::now();
+        let t = crate::darwin::time::Instant::now();
         let a = mtree_payload(&im4p).unwrap();
         let decoded = t.elapsed();
         assert_eq!(a.len(), 99_085_424);

@@ -1313,14 +1313,14 @@ mod tests {
         assert_eq!(master_read(&cell), b"out");
         let w = Arc::new(tty::SyncWake::default());
         let token = cell.lock().enqueue_sync(&req, Arc::clone(&w));
-        assert!(w.wait(Some(std::time::Instant::now())), "the wakeup before the queueing is the sleeper's");
+        assert!(w.wait(Some(crate::darwin::time::Instant::now())), "the wakeup before the queueing is the sleeper's");
         cell.lock().unsleep(token);
         assert_eq!(cell.lock().ttywait(Some((req, Woke::Awakened))), Io::Done(Ok(())));
         // A sleep decided after the wakeup waits for the next one.
         let req = cell.lock().sleep_req(Chan::OComplete, 0, false);
         let w = Arc::new(tty::SyncWake::default());
         let token = cell.lock().enqueue_sync(&req, Arc::clone(&w));
-        assert!(!w.wait(Some(std::time::Instant::now())));
+        assert!(!w.wait(Some(crate::darwin::time::Instant::now())));
         cell.lock().unsleep(token);
         let mut cs = PtsClose::default();
         ptsclose(&cell, makedev(PTSD_MAJOR, minor), 0, false, &mut env, &mut cs, None);

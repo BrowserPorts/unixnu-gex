@@ -143,7 +143,7 @@ pub struct Waiting {
     end: usize,
     count: u64,
     old_signal_count: u64,
-    deadline: Option<std::time::Instant>,
+    deadline: Option<crate::darwin::time::Instant>,
     state: Arc<AtomicU8>,
 }
 

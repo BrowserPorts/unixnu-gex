@@ -803,7 +803,7 @@ fn darwin_gettimeofday(m: &mut GuestMem<'_>, tp: u64, tzp: u64, abs: u64) -> Res
         // clock_gettimeofday_and_absolute_time: the moment it read, which
         // the commpage's fast path extrapolates from for the next second.
         let tbr = super::mach::absolute_time();
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        let now = crate::darwin::time::realtime().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
         let frac = (u128::from(now.subsec_nanos()) << 64) / 1_000_000_000;
         super::commpage::set_timestamp(m, tbr, now.as_secs(), frac as u64);
         let mut tv = [0u8; 16];

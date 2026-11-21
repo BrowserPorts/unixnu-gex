@@ -405,7 +405,7 @@ impl Kernel {
                 let deadline_ns = (kev.data as u64).checked_mul(multiplier).ok_or(Errno::ERANGE)?;
                 // A calendar deadline: what is left of it from now, on
                 // the absolute (or continuous) clock.
-                let now_ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+                let now_ns = crate::darwin::time::realtime().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
                 if now_ns < deadline_ns {
                     now + ns_to_abs(deadline_ns - now_ns)
                 } else {

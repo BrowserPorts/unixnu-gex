@@ -508,7 +508,7 @@ impl Kernel {
         };
         *SD_LOG.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&file));
         let _ = file.handle.truncate(0);
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let now = crate::darwin::time::realtime().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
         self.darwin_sd_log(format!("Process shutdown log.  Current time is {now} (in seconds).\n\n").as_bytes());
         Ok(())
     }

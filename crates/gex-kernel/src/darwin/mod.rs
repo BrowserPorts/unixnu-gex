@@ -146,6 +146,7 @@ pub mod taskpolicy;
 pub mod threadpolicy;
 pub mod threadstate;
 pub mod thread;
+pub mod time;
 pub mod timer;
 pub mod triage;
 pub mod kcdata;
@@ -303,7 +304,7 @@ pub struct Task {
     pub timers: timer::Timers,
     /// The framebuffer's thread call for the next vertical blank, while
     /// armed ([`iomfb::swap`]).
-    pub iomfb_call: Option<(std::time::Instant, u64)>,
+    pub iomfb_call: Option<(crate::darwin::time::Instant, u64)>,
     /// Threads made by a call (resumed, or the workqueue's) for the host to
     /// start after it ([`crate::syscalls::Kernel::take_spawns`]).
     pub spawns: Vec<crate::syscalls::SpawnRequest>,
@@ -509,7 +510,7 @@ pub struct Task {
     pub rpc_reply: std::collections::HashMap<i32, ipc::ObjId>,
     pub rpc_replies: std::collections::HashMap<i32, Box<ipc::msg::Kmsg>>,
     /// When its footprint is next measured ([`footprint::SAMPLE`]).
-    pub footprint_due: Option<std::time::Instant>,
+    pub footprint_due: Option<crate::darwin::time::Instant>,
     /// A release of its pages is under way, the footprint's record held
     /// ([`footprint::Release`]).
     pub footprint_releasing: bool,

@@ -12,7 +12,8 @@ use super::wait::{Wait, WaitResult};
 use crate::errno::Errno;
 use crate::syscalls::{nr, Kernel, SyscallOutcome};
 use crate::GuestMem;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use crate::darwin::time::Instant;
 
 /// `kern_return_t`s and `mach_msg_return_t`s the traps return beyond
 /// [`kr`].
@@ -102,7 +103,7 @@ pub const TIMEBASE: (u32, u32) = (125, 3);
 /// time then.
 fn origin() -> (Instant, std::time::SystemTime) {
     static START: std::sync::OnceLock<(Instant, std::time::SystemTime)> = std::sync::OnceLock::new();
-    *START.get_or_init(|| (Instant::now(), std::time::SystemTime::now()))
+    *START.get_or_init(|| (Instant::now(), crate::darwin::time::realtime()))
 }
 
 fn time_origin() -> Instant {

@@ -23,7 +23,7 @@ use crate::GuestMem;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use crate::darwin::time::Instant;
 
 pub type KqId = u64;
 pub type KnId = u64;

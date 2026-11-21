@@ -12,7 +12,7 @@ use super::timer::Action;
 use crate::syscalls::Kernel;
 use crate::GuestMem;
 use std::collections::HashMap;
-use std::time::Instant;
+use crate::darwin::time::Instant;
 
 /// `sizeof(mk_timer_expire_msg_t)`: a header and three unused `uint64_t`s.
 const EXPIRE_MSG_SIZE: u32 = 24 + 24;

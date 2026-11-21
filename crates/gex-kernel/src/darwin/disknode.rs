@@ -221,7 +221,7 @@ fn kernel_op<R>(f: impl FnOnce(&mut super::apfswrite::tx::Nx<'static>) -> Result
 /// The kernel's clock as APFS reads it (`nanotime`): nanoseconds since
 /// 1970.
 fn nanotime() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+    crate::darwin::time::realtime().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
 }
 
 /// A writing mount of the volume in slot `index` (`apfs_vfsop_mount`):
@@ -473,7 +473,7 @@ fn request(d: &Disk, m: Media, at: u64, io: Io<'_>) -> Result<(), Errno> {
     if m == Media::Container {
         stats::scheme_transfer(len, write);
     }
-    let start = std::time::Instant::now();
+    let start = crate::darwin::time::Instant::now();
     let r = match io {
         Io::Read(b) => d.sink.read_at(at, b),
         Io::Write(b) => d.sink.write_at(at, b),

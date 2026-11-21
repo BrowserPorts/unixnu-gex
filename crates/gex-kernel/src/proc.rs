@@ -2172,13 +2172,13 @@ impl ProcTable {
         if t.shutdown_exitcount == 0 {
             return 0;
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        let deadline = crate::darwin::time::Instant::now() + std::time::Duration::from_secs(secs);
         let woken = t.shutdown_wakeups;
         let error = loop {
             if t.shutdown_wakeups != woken {
                 break 0;
             }
-            let now = std::time::Instant::now();
+            let now = crate::darwin::time::Instant::now();
             if now >= deadline {
                 break EWOULDBLOCK;
             }
@@ -2952,7 +2952,7 @@ mod tests {
         t.rebootscan(|p| Some(p.pid == c && p.shutdownstate == 0), |pid| {
             t.shutdown_mark(pid, 1, true);
         });
-        let started = std::time::Instant::now();
+        let started = crate::darwin::time::Instant::now();
         assert_eq!(t.shutdown_wait(1, 1), 35);
         assert!(started.elapsed() >= std::time::Duration::from_secs(1));
         // Its count's flag is gone: its end drops nothing.

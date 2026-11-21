@@ -447,7 +447,7 @@ pub struct SyncWake {
 
 impl SyncWake {
     /// Wait until woken (true) or `until` passes (false).
-    pub fn wait(&self, until: Option<std::time::Instant>) -> bool {
+    pub fn wait(&self, until: Option<crate::darwin::time::Instant>) -> bool {
         let mut g = self.woken.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             if *g {
@@ -456,7 +456,7 @@ impl SyncWake {
             match until {
                 None => g = self.cv.wait(g).unwrap_or_else(|e| e.into_inner()),
                 Some(t) => {
-                    let now = std::time::Instant::now();
+                    let now = crate::darwin::time::Instant::now();
                     if now >= t {
                         return false;
                     }

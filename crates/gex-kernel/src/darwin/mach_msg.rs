@@ -9,7 +9,8 @@ use super::ipc::{kr, ty, Guard, ObjId, Receiver};
 use super::wait::{Wait, WaitResult};
 use crate::syscalls::{Kernel, SyscallOutcome};
 use crate::GuestMem;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use crate::darwin::time::Instant;
 
 /// `sizeof(mach_msg_user_header_t)`, `sizeof(mach_msg_user_base_t)`.
 const HEADER: u32 = 24;

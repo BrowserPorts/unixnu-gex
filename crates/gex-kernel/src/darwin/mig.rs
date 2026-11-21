@@ -1064,7 +1064,7 @@ pub fn serve(k: &mut Kernel, obj: &Kobject, req: &Kmsg) -> Reply {
             let (secs, nsecs) = if *id == 0 {
                 super::mach::system_nanotime()
             } else {
-                let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+                let t = crate::darwin::time::realtime().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
                 (t.as_secs(), t.subsec_nanos())
             };
             let mut o = (secs as u32).to_le_bytes().to_vec();

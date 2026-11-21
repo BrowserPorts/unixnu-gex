@@ -183,7 +183,7 @@ impl Kernel {
     /// is due. The sockets are counted in the pipe watch while there are
     /// any, so a change another process makes to one of their connections
     /// (which may arm a timer here) wakes the thread calls.
-    pub(crate) fn darwin_tcp_timers(&mut self) -> Option<std::time::Instant> {
+    pub(crate) fn darwin_tcp_timers(&mut self) -> Option<crate::darwin::time::Instant> {
         let gen = self.fds.generation();
         if self.dtask.tcp_socks_gen != Some(gen) {
             self.dtask.tcp_socks = self
@@ -205,9 +205,12 @@ impl Kernel {
                 }
             }
         }
-        let mut next: Option<std::time::Instant> = None;
+        let mut next: Option<crate::darwin::time::Instant> = None;
         for w in &self.dtask.tcp_socks {
             if let Some(d) = w.upgrade().and_then(|s| s.tcp_deadline()) {
+                // The TCP loop's deadline is on the system clock: the same
+                // distance away on the kernel's.
+                let d = crate::darwin::time::Instant::now() + d.saturating_duration_since(std::time::Instant::now());
                 next = Some(next.map_or(d, |n| n.min(d)));
             }
         }

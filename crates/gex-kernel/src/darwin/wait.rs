@@ -14,7 +14,8 @@ use crate::errno::Errno;
 use crate::syscalls::{BlockOp, Kernel, SyscallOutcome};
 use crate::GuestMem;
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use crate::darwin::time::Instant;
 
 /// XNU's `wait_result_t`: why a wait ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

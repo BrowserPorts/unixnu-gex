@@ -4,7 +4,8 @@
 
 use super::akf::{Akf, Fault, Sink};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use crate::darwin::time::Instant;
 
 /// Whether the SEP core is released (CPU_CTRL's run bit), and how many
 /// times it has been: a core that is released again starts over.

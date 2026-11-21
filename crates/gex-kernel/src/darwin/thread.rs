@@ -11,7 +11,8 @@ use crate::syscalls::{Kernel, SpawnRequest, SyscallOutcome};
 use crate::GuestMem;
 use gex_abi::ctx;
 use std::collections::{HashMap, VecDeque};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use crate::darwin::time::Instant;
 
 /// `PTHREAD_START_*`: `bsdthread_create`'s flags (`kern_support.c`).
 mod start {

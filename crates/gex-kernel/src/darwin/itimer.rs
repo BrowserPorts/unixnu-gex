@@ -8,7 +8,8 @@
 //! not divide a thread's time so, and arming one fails loudly.
 
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use crate::darwin::time::Instant;
 
 use crate::errno::Errno;
 use crate::syscalls::Kernel;

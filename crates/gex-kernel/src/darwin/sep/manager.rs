@@ -26,7 +26,8 @@ use super::mem::SepMem;
 use super::shm::{self, SharedMemory};
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use crate::darwin::time::Instant;
 
 /// IOReturn codes the manager returns.
 pub mod io {

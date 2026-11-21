@@ -11,7 +11,8 @@ use crate::errno::Errno;
 use crate::syscalls::{Kernel, SyscallOutcome};
 use crate::GuestMem;
 use std::collections::{HashMap, VecDeque};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use crate::darwin::time::Instant;
 
 /// `SYNC_POLICY_REVERSED`, `SYNC_POLICY_USER_MASK`.
 const SYNC_POLICY_REVERSED: i32 = 0x2;
@@ -379,7 +380,7 @@ impl Kernel {
             let (then_sec, then_nsec) = if relative {
                 (sec as u32 as i64, nsec as i32 as i64)
             } else {
-                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+                let now = crate::darwin::time::realtime().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
                 let (ns, nn) = (now.as_secs() as i64, i64::from(now.subsec_nanos()));
                 if if ns == sec { nn > nsec } else { ns > sec } {
                     (0, 0)

@@ -9,6 +9,13 @@
 
 #[cfg(feature = "shared-memory")]
 pub(crate) use imp::*;
+
+/// A ceiling on the shim's heap, below a Darwin process's tables
+/// (`gex_abi::tables64`, inside its page zero): the heap and the Worker
+/// stacks never reach them, whatever else raised the ceiling.
+fn darwin_capped(ceiling: u64) -> u64 {
+    if gex_abi::mem64() && gex_abi::commpage_fold() { ceiling.min(gex_abi::DARWIN_DISPATCH_DIR64) } else { ceiling }
+}
 #[cfg(not(feature = "shared-memory"))]
 pub(crate) use stub::*;
 
@@ -21,7 +28,7 @@ mod stub {
     static ARENA_CEILING: AtomicU64 = AtomicU64::new(gex_abi::MMAP_TOP);
 
     pub(crate) fn arena_ceiling() -> u64 {
-        ARENA_CEILING.load(Ordering::Relaxed)
+        super::darwin_capped(ARENA_CEILING.load(Ordering::Relaxed))
     }
 
     pub(crate) fn raise_native_ceiling() {
@@ -95,7 +102,7 @@ mod imp {
     static ARENA_CEILING: AtomicU64 = AtomicU64::new(gex_abi::MMAP_TOP);
 
     pub(crate) fn arena_ceiling() -> u64 {
-        ARENA_CEILING.load(Ordering::Relaxed)
+        super::darwin_capped(ARENA_CEILING.load(Ordering::Relaxed))
     }
 
     /// A process that translates nothing (no placement window) names no

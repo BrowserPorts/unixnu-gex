@@ -262,7 +262,15 @@ pub fn claim_fixed(heap_base: u64) {
     }
     claim(Kind::Reserved, 0, 0, gex_abi::RESERVED_END, "page zero, contexts, runtime words");
     claim(Kind::Reserved, 0, gex_abi::DISPATCH_DIR, gex_abi::DISPATCH_DIR_END, "dispatch directory");
-    if gex_abi::mem64() {
+    if gex_abi::mem64() && gex_abi::commpage_fold() {
+        // A Darwin process (its runner folds the commpage): its tables
+        // inside its 4 GiB page zero, which its code never reaches, and
+        // everything from the page zero's end to the memory's its own (the
+        // shared region crosses 8 GiB; the commpage's alias is at the top).
+        let (lo, hi) = gex_abi::tables64();
+        claim(Kind::Reserved, 0, lo, hi, "Darwin M64 dispatch directory, patched pages, page protections");
+        claim(Kind::Guest, 0, gex_abi::DARWIN_GUEST_FLOOR, gex_abi::LIMIT64, "Darwin address space above its page zero");
+    } else if gex_abi::mem64() {
         claim(Kind::Reserved, 0, gex_abi::DISPATCH_DIR64, gex_abi::HIGH_TABLES_END, "M64 dispatch directory, patched pages");
         claim(Kind::Guest, 0, gex_abi::IMAGE_ZONE64, gex_abi::DISPATCH_DIR64, "M64 high arena below the tables");
     }

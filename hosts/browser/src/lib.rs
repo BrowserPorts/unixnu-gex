@@ -3339,6 +3339,12 @@ fn arena_back(start: u64, end: u64) -> Option<u64> {
     if gex_abi::mem64() && start >= gex_abi::IMAGE_ZONE64 && end <= gex_abi::DISPATCH_DIR64 {
         return grow_memory_to(end).then_some(start);
     }
+    // A Darwin process's address space, everything above its page zero
+    // (claimed whole as the guest's, `memmap::claim_fixed`): the memory
+    // grown over it, as above.
+    if gex_abi::mem64() && gex_abi::commpage_fold() && start >= gex_abi::DARWIN_GUEST_FLOOR && end <= gex_abi::LIMIT64 {
+        return grow_memory_to(end).then_some(start);
+    }
     if end > gex_abi::HIGH_ARENA_BASE && gex_abi::mem64() {
         if !grow_memory_to(end) {
             return None;
@@ -5120,7 +5126,7 @@ fn slot_span_locked(i: usize) -> Option<u64> {
     // An M64 memory's dense directory is read by every
     // dispatch, so the memory covers it from the start (V8 commits
     // lazily: untouched pages of it cost nothing).
-    if gex_abi::mem64() && !grow_memory_to(gex_abi::HIGH_TABLES_END) {
+    if gex_abi::mem64() && !grow_memory_to(gex_abi::tables64().1) {
         return None;
     }
     Some(base)
@@ -10681,13 +10687,19 @@ pub(crate) fn wine64_top_m64() -> u64 {
 /// `gex.space_top()`: this process's top in 64 KiB units, which 64-bit
 /// Wine's ntdll takes as the end of its space instead of probing; 0 in a
 /// 32-bit memory.
-/// `[gex_abi::DISPATCH_DIR64, gex_abi::HIGH_TABLES_END)` in MiB (the low
-/// half the start, the high half the end), for the page's host, which
+/// This process's M64 tables (`gex_abi::tables64`: a Darwin process's at
+/// `DARWIN_DISPATCH_DIR64`, every other's at `DISPATCH_DIR64`) in MiB (the
+/// low half the start, the high half the end), for the page's host, which
 /// reads an M64 memory's directory and copies its tables on a fork.
 #[no_mangle]
 pub extern "C" fn gex_m64_tables() -> u32 {
     const _: () = assert!(gex_abi::HIGH_TABLES_END >> 20 <= 0xffff && gex_abi::DISPATCH_DIR64 % (1 << 20) == 0 && gex_abi::HIGH_TABLES_END % (1 << 20) == 0);
-    ((gex_abi::HIGH_TABLES_END >> 20) << 16 | gex_abi::DISPATCH_DIR64 >> 20) as u32
+    const _: () = assert!(gex_abi::DARWIN_TABLES_END >> 20 <= 0xffff && gex_abi::DARWIN_DISPATCH_DIR64 % (1 << 20) == 0 && gex_abi::DARWIN_TABLES_END % (1 << 20) == 0);
+    // The shim's heap stays below a Darwin process's tables
+    // (`winspace::arena_ceiling`), and every Linux process's below them too.
+    const _: () = assert!(gex_abi::MMAP_TOP <= gex_abi::DARWIN_DISPATCH_DIR64);
+    let (lo, hi) = gex_abi::tables64();
+    ((hi >> 20) << 16 | lo >> 20) as u32
 }
 
 #[no_mangle]

@@ -8923,18 +8923,16 @@ fn syscall_entry(ctx: i32, pc: i64) {
         let a1 = gm.read_u64(kstate.ctx_addr + ctx::x(1) as u64).unwrap_or(0);
         let a2 = gm.read_u64(kstate.ctx_addr + ctx::x(2) as u64).unwrap_or(0);
         let slot = sys_note(nr, a0, a1);
-        // A Darwin thread's call: its commpage brought up to date, a
-        // quantum on (`darwin::tick`); a call that would make a process or
-        // a thread the page does not start, refused (`darwin::refused`).
-        if h.kernel.darwin {
-            darwin::tick();
-            if darwin::refused(&mut h.kernel, &mut gm) {
-                return 0;
-            }
+        // A Darwin thread's call that would make a process or a thread the
+        // page does not start, refused (`darwin::refused`).
+        if h.kernel.darwin && darwin::refused(&mut h.kernel, &mut gm) {
+            return 0;
         }
         let outcome = h.kernel.syscall(&mut gm, pc as u64);
         if h.kernel.darwin {
             darwin::unstarted_threads(&mut h.kernel);
+            // What its pipe watch looks at, told to its thread-call Worker.
+            darwin::after_call(&h.kernel);
         }
         // The page finishes its own waits (`finish_wait`, which asks the op
         // for its restart class): the kernel's note for `finish_blocking`,
@@ -16935,11 +16933,6 @@ fn safepoint(ctx: i32, pc: i64) {
     if thread_gone() {
         stop_gone();
         trap();
-    }
-    // A Darwin thread running: its commpage brought up to date, a quantum
-    // on (`darwin::tick`).
-    if darwin_process() {
-        darwin::tick();
     }
     // Rearm: translated code counts a word down to zero and calls here; leaving
     // it at zero makes every later back-edge call out.

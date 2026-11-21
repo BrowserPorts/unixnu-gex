@@ -1449,6 +1449,11 @@ class ProviderThrow extends Error {
   }
 }
 
+/** How long a Darwin program's exec waits for its thread calls' Worker to
+ *  come up (`Gex#darwinCalls`): a Worker's start, with its shim's
+ *  instantiation, under a loaded page. */
+const DARWIN_CALLS_UP_MS = 60000;
+
 /** posix_spawn children run in their parent's Worker, narrated
  *  (GEX_VFORK_TRACE, `?vforktrace=1`): to the console, or appended to the
  *  file it names under Node (a Worker's console output is lost when the run
@@ -3236,7 +3241,7 @@ export class Gex {
    * atomic-guarded `__wasm_init_memory`, so the first instance initialises the
    * data and later ones leave it alone. A plain memory would wipe the kernel.
    */
-  async attach(shimWasm, guestWasm, { devices = true } = {}) {
+  async attach(shimWasm, guestWasm, { devices = true, code = true } = {}) {
     const _at = (s) => { if (globalThis.GEX_ATTACH_TRACE) console.error(`[attach] ${s}`); };
     _at('start');
     if (this.#preattached) {
@@ -3272,12 +3277,65 @@ export class Gex {
     // A thread joins its process's numbering; a forked child decides once its
     // kernel exists (`adoptProcess`).
     this.#dense = !!e.gex_dense_on?.() && !!this.#guest.exports.blocks;
+    // A Worker that runs no guest code (a Darwin process's thread calls,
+    // `darwinThreadCalls`) installs none of the process's.
+    if (!code) return;
     this.#entriesInit();
     this.#offerToFill(this.#guest);
     _at('offerToFill done, catchUp');
     // Everything the process translated before this thread existed.
     await this.#catchUp();
     _at('attach catchUp done');
+  }
+
+  /**
+   * A Darwin process's thread calls (the shim's `gex_darwin_thread_calls`),
+   * run in this Worker until the process ends or execs: a Worker of the
+   * process's own, on its memory and kernel, as the native host runs them
+   * on a thread of the process's (`start_darwin_thread_calls`). It runs no
+   * guest code, so none is installed.
+   */
+  async darwinThreadCalls(shimWasm, guestWasm) {
+    this.#promise = false;
+    await this.attach(shimWasm, guestWasm, { devices: false, code: false });
+    // The memory as it is now, which another Worker may have grown.
+    try {
+      this.#memory.grow(0);
+    } catch {
+      this.#memory.grow(0n);
+    }
+    if (!this.#shim.exports.gex_darwin_thread_calls()) {
+      throw new Error('a Darwin process\'s thread-call Worker, and its process has no thread calls for it to run');
+    }
+  }
+
+  /**
+   * The thread-call Worker of the Darwin process this Worker has just
+   * exec'd (`#adoptExec`), started and waited for: the program's first
+   * instruction comes after it is up, as the native host starts the
+   * process's thread-call thread before its program runs.
+   */
+  async #darwinCalls(pid) {
+    const e = this.#shim.exports;
+    this.#programStore(true);
+    await this.#env.spawnThread({
+      darwinCalls: true,
+      tid: 0,
+      ctx: 0,
+      pc: 0n,
+      memory: this.#memory,
+      moduleStore: this.#moduleStore ?? undefined,
+      compat: 0,
+      procOpts: this.#opts,
+      execGen: e.gex_exec_gen?.() ?? 0,
+    });
+    const t0 = performance.now();
+    while (!e.gex_darwin_calls_up() && !e.gex_exited?.()) {
+      if (performance.now() - t0 > DARWIN_CALLS_UP_MS) {
+        throw new Error(`pid ${pid}: its Darwin thread calls' Worker was not up after ${DARWIN_CALLS_UP_MS / 1000} s`);
+      }
+      await new Promise((r) => setTimeout(r, 1));
+    }
   }
 
   /**
@@ -3901,9 +3959,15 @@ export class Gex {
     if (this.#darwin) {
       for (const [name, bytes] of Object.entries(Gex.darwin?.boot ?? {})) this.#putDarwinBootFile(name, bytes);
       e.gex_darwin_set_strict(Gex.darwin?.strict ? 1 : 0);
+      // Its thread calls run on a Worker of the process's own when the
+      // page can start one (`#darwinCalls`); the shim reports them as
+      // never run otherwise.
+      if (isShared(this.#memory.buffer) && !(SP_CODE && single.on) && typeof this.#env.spawnThread === 'function') e.gex_darwin_runs_thread_calls();
     }
     if (SP_CODE && single.on) return this.#putBytesP(child.exec, e.gex_adopted_exec);
-    return this.#putBytes(child.exec, e.gex_adopted_exec);
+    const entry = this.#putBytes(child.exec, e.gex_adopted_exec);
+    if (this.#darwin && e.gex_darwin_calls_take()) await this.#darwinCalls(child.pid);
+    return entry;
   }
 
   /** One of the Darwin boot payload's files, to the shim

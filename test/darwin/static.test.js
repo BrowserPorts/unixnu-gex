@@ -1,14 +1,17 @@
-// Darwin programs with no dyld on the page (tests/darwin/src/hello-static.c
-// and bsd-carry.c): each runs in a 64-bit memory of its own, on the boot
-// payload tests/darwin/run.sh boots them with (the `darwin-static` image),
-// and must print what it prints under gexc and end with the same status.
+// Darwin programs with no dyld on the page (tests/darwin/src/hello-static.c,
+// bsd-carry.c and tcall.c): each runs in a 64-bit memory of its own, on the
+// boot payload tests/darwin/run.sh boots them with (the `darwin-static`
+// image), and must print what it prints under gexc and end with the same
+// status. tcall's timer is fired by its process's thread calls, and its
+// commpage kept up to date every quantum, on the Worker the page starts for
+// them.
 import { System } from '../../page/runtime/src/index.js';
 import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
 
 export const meta = { hosts: ['browser'], arches: ['a64'], images: ['darwin-static'], timeout: 300 };
 
 /** What tests/darwin/run.sh expects of each (its `check`). */
-const WANT = { 'hello-static': ['hello from darwin\n', 0], 'bsd-carry': ['carry ok\n', 0] };
+const WANT = { 'hello-static': ['hello from darwin\n', 0], 'bsd-carry': ['carry ok\n', 0], tcall: ['tcall ok\n', 0] };
 
 export default async function (t) {
   const { eq, timeout } = t;

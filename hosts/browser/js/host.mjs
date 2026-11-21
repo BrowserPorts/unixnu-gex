@@ -1999,6 +1999,12 @@ export class ProcessHost {
         break;
       }
       case 'thread': {
+        // A Darwin process's thread calls' Worker (`Gex#darwinCalls`): no
+        // guest thread, so no spare and no count of the process's threads.
+        if (m.thread.darwinCalls) {
+          this.#threadWorker(pid, `${pid}:calls`, { kind: 'thread', ...m.thread, park: false });
+          break;
+        }
         // A thread of a running process: same memory, same kernel, its own
         // Worker. Nothing waits for it.
         this.#threads++;

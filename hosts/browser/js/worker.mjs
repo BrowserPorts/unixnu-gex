@@ -1142,6 +1142,15 @@ async function handle(msg) {
     let gone = false;
     // A thread's: how many `execve`s its process had made when it came up.
     let execGen = 0;
+    // A Darwin process's thread calls' Worker (`Gex#darwinCalls`): it runs
+    // them until the process ends, and ends as a thread does.
+    if (msg.kind === 'thread' && msg.darwinCalls) {
+      await gex.darwinThreadCalls(msg.shim, msg.guest);
+      gex.close?.();
+      gex.releaseWorker?.();
+      port.post({ kind: 'exit', status: 0, guestMillis: 0 });
+      return;
+    }
     if (msg.kind === 'thread') {
       const _t = (s) => { if (globalThis.GEX_ATTACH_TRACE) console.error(`[thr ${msg.tid}] ${s}`); };
       _t(`adopt start pc=0x${(msg.pc??0n).toString(16)} ctx=0x${(msg.ctx??0n).toString(16)}`);

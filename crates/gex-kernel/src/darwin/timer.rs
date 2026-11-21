@@ -45,11 +45,18 @@ impl Bell {
     pub fn ring(&self) {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).0 += 1;
         self.cv.notify_all();
+        rung();
     }
 
     fn close(&self) {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).1 = true;
         self.cv.notify_all();
+        rung();
+    }
+
+    /// Whether the process is gone (the bell closed).
+    pub fn closed(&self) -> bool {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).1
     }
 
     /// Sleep until `until`, or until a ring after `seen`; false once the
@@ -74,6 +81,23 @@ impl Bell {
                 }
             }
         }
+    }
+}
+
+/// How a host whose thread-call runner sleeps on something other than the
+/// bell's condition variable is told of a ring ([`set_ring_hook`]).
+static RING_HOOK: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Call `hook` after every ring of a bell, and its close: for a runner
+/// that sleeps on a wait of the host's own (the page's Worker parks on its
+/// wait slot) and must wake as [`Bell::wait`] would.
+pub fn set_ring_hook(hook: fn()) {
+    let _ = RING_HOOK.set(hook);
+}
+
+fn rung() {
+    if let Some(hook) = RING_HOOK.get() {
+        hook();
     }
 }
 
@@ -251,5 +275,36 @@ impl Kernel {
     /// The bell the host's thread-call thread sleeps on.
     pub fn darwin_timer_bell(&self) -> Arc<Bell> {
         self.dtask.timers.bell()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static RUNG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn note_ring() {
+        RUNG.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// A ring, and a bell's close when its timers go, reach the host's
+    /// hook as they reach a sleeper on the bell.
+    #[test]
+    fn ring_hook_hears_rings_and_close() {
+        set_ring_hook(note_ring);
+        let mut timers = Timers::default();
+        let bell = timers.bell();
+        let before = RUNG.load(std::sync::atomic::Ordering::SeqCst);
+        let seen = bell.generation();
+        timers.arm(Instant::now() + std::time::Duration::from_secs(60), Action::RealTimer);
+        assert_ne!(bell.generation(), seen);
+        assert!(RUNG.load(std::sync::atomic::Ordering::SeqCst) > before);
+        let before = RUNG.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(!bell.closed());
+        drop(timers);
+        assert!(bell.closed());
+        assert!(RUNG.load(std::sync::atomic::Ordering::SeqCst) > before);
+        assert!(!bell.wait(bell.generation(), None));
     }
 }

@@ -1662,6 +1662,34 @@ impl Kernel {
         std::sync::Arc::clone(&self.dtask.kevents.pipe_watch)
     }
 
+    /// The wait queues ([`crate::vfs::FileHandle::wait_queue`]) of what the
+    /// pipe watch looks at, for a host whose descriptors tell their waiters
+    /// of a change through those queues rather than all at once (the
+    /// page's): the descriptors of the knotes on pipes, sockets and
+    /// terminals, and the process's TCP sockets ([`Self::darwin_tcp_timers`]).
+    /// And whether any of them has no queue, so that only a look on a timer
+    /// finds it changed (as the knotes counted above bit 32 of
+    /// [`Self::darwin_pipe_watch`]).
+    pub fn darwin_pipe_watch_queues(&self) -> (Vec<u32>, bool) {
+        let mut queues = Vec::new();
+        let mut unqueued = false;
+        let kev = &self.dtask.kevents;
+        let handles = kev
+            .pipe_klist
+            .iter()
+            .filter_map(|n| kev.knotes.get(n)?.fp.as_ref().map(|fp| std::sync::Arc::clone(&fp.handle)))
+            .chain(self.dtask.tcp_socks.iter().filter_map(|w| w.upgrade().map(|s| s as std::sync::Arc<dyn crate::vfs::FileHandle>)));
+        for h in handles {
+            match h.wait_queue() {
+                0 => unqueued = true,
+                q => queues.push(q),
+            }
+        }
+        queues.sort_unstable();
+        queues.dedup();
+        (queues, unqueued)
+    }
+
     /// `vn_kqfilter` of a terminal device's vnode: EVFILT_VNODE as any
     /// vnode's; EVFILT_READ and EVFILT_WRITE through `spec_kqfilter`, to a
     /// replica's (`ptsd_kqfilter`) or a primary's (`ptmx_kqfilter`) own

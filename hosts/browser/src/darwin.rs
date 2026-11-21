@@ -172,6 +172,8 @@ fn start(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> Result<u
     k.darwin_dyld_infos_size = img.dyld_infos_size;
     k.darwin_dyld_final = false;
     k.dtask.strict = STRICT.load(std::sync::atomic::Ordering::Relaxed);
+    // Its thread calls, before anything can arm one.
+    calls_init(k);
     k.dtask.platform = img.platform;
     // Exec'd as XNU execs its first process: the next pidversion, and the
     // task_uniqueid load_init_program's clones and exec leave it.
@@ -239,8 +241,8 @@ fn start(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> Result<u
         }
         h.kernel.mem.lock().insert(lo, hi, prot::READ, "[commpage]");
     }
-    // Brought up to date at once, as the native host's tick thread does.
-    tick();
+    // Brought up to date every quantum by the process's thread-call
+    // Worker, from before its first instruction.
     // Its main stack, the kernel's to lay out (`create_unix_stack`, the
     // `apple[]` strings, `exec_copyout_strings`).
     let header = img.program.exe.segments.iter().map(|s| s.vaddr).min().unwrap_or(0);
@@ -279,6 +281,8 @@ fn start(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> Result<u
     h.threads.reset(h.kernel.pid, ctx_addr, ThreadCell::new(Run::new(entry, Waiting::Runnable)));
     set_current(h, 0);
     darwin::workq::thread_started(h.kernel.tid);
+    // Its thread-call Worker, which the page starts now.
+    let _ = CALLS.compare_exchange(CALLS_CAN, CALLS_WANTED, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire);
     Ok(entry)
 }
 
@@ -292,27 +296,215 @@ pub(crate) fn task_end(k: &mut gex_kernel::syscalls::Kernel) {
     }
 }
 
-/// When the commpage was last brought up to date ([`tick`]), in absolute
-/// time; 0 for never.
-static TICKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The process's thread calls (`gex_kernel::darwin::timer`), run as the
+/// native host runs them (hosts/native/src/lib.rs
+/// `start_darwin_thread_calls`): on a Worker of their own, which sleeps
+/// until the earliest armed deadline, a ring of the bell (an earlier one
+/// armed), or a change to a pipe or socket with a knote on it, and fires
+/// what is due with the kernel locked; and which brings the commpage up to
+/// date every quantum (`commpage::tick`), as XNU does at a running
+/// thread's quantum's end. The Worker parks on its wait slot (`waitq`),
+/// which is on the process's queue (its end), a queue of its own that the
+/// bell's rings notify ([`CALLS_Q`]), and the queues of the descriptors the
+/// pipe watch looks at.
+static CALLS_Q: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// The commpage's per-quantum update (`commpage::tick`: its approximate
-/// time, quiescent counter and flags), which the native host makes on a
-/// thread of its own every quantum: here as a Darwin thread runs, at its
-/// calls and its safepoints, once a quantum has passed since the last, as
-/// XNU makes it at a running thread's quantum's end.
-pub(crate) fn tick() {
+/// The thread-call Worker's state: [`CALLS_NONE`] until the page says it
+/// can start one, then wanted, taken by the page, and up.
+static CALLS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(CALLS_NONE);
+const CALLS_NONE: u32 = 0;
+const CALLS_CAN: u32 = 1;
+const CALLS_WANTED: u32 = 2;
+const CALLS_TAKEN: u32 = 3;
+const CALLS_UP: u32 = 4;
+
+/// What the pipe watch's registration was made for ([`watch_print`]): a
+/// call that changes it tells the Worker ([`after_call`]).
+static WATCHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// A call changed what the pipe watch looks at since the Worker last
+/// registered for it.
+static REWATCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Before a Darwin program's exec: the page starts its process's thread-call
+/// Worker (`#adoptExec`). Only with the global kernel, whose wait slots and
+/// queues the Worker sleeps on.
+#[no_mangle]
+pub extern "C" fn gex_darwin_runs_thread_calls() {
+    if unsafe { k_present() } != 0 {
+        let _ = CALLS.compare_exchange(CALLS_NONE, CALLS_CAN, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire);
+    }
+}
+
+/// After a Darwin program's exec: 1 when the page is to start its
+/// thread-call Worker now (once).
+#[no_mangle]
+pub extern "C" fn gex_darwin_calls_take() -> u32 {
     use std::sync::atomic::Ordering;
-    use gex_kernel::darwin::{commpage, mach};
-    let now = mach::absolute_time();
-    let last = TICKED.load(Ordering::Relaxed);
-    let quantum = commpage::QUANTUM.as_nanos() as u64 * u64::from(mach::TIMEBASE.1) / u64::from(mach::TIMEBASE.0);
-    if last != 0 && now < last.saturating_add(quantum) {
+    u32::from(CALLS.compare_exchange(CALLS_WANTED, CALLS_TAKEN, Ordering::AcqRel, Ordering::Acquire).is_ok())
+}
+
+/// Whether the thread-call Worker is up: the program's first instruction
+/// waits for it, as the native host starts its threads before it.
+#[no_mangle]
+pub extern "C" fn gex_darwin_calls_up() -> u32 {
+    u32::from(CALLS.load(std::sync::atomic::Ordering::Acquire) == CALLS_UP)
+}
+
+/// The bell's rings, told to the thread-call Worker.
+fn rung() {
+    let q = CALLS_Q.load(std::sync::atomic::Ordering::Acquire);
+    if q != 0 {
+        unsafe { k_wq_notify(q) };
+    }
+}
+
+/// At a Darwin program's exec, before anything is armed: the thread calls
+/// are the page's to run when it can start their Worker, and reported as
+/// never run otherwise (`darwin_thread_calls_unrun`), as is the commpage's
+/// quantum update, which nothing else makes.
+fn calls_init(k: &mut gex_kernel::syscalls::Kernel) {
+    use std::sync::atomic::Ordering;
+    if CALLS.load(Ordering::Acquire) != CALLS_CAN {
+        k.darwin_unimplemented("the thread calls and the commpage's quantum update: the page runs no Worker for them here (no global kernel, or no Worker of a process's own), so a call armed never fires and the commpage's approximate time stays where the exec left it".into());
         return;
     }
-    if TICKED.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
-        commpage::tick(&mut guest(), now);
+    if CALLS_Q.load(Ordering::Acquire) == 0 {
+        CALLS_Q.store(unsafe { k_wq_new() }, Ordering::Release);
     }
+    gex_kernel::darwin::timer::set_ring_hook(rung);
+    gex_kernel::darwin::timer::set_host_runs_thread_calls();
+}
+
+/// What the pipe watch looks at, in a word: its knotes and the process's
+/// TCP sockets, by identity.
+fn watch_print(k: &gex_kernel::syscalls::Kernel) -> u64 {
+    let kev = &k.dtask.kevents;
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix = |v: u64| h = (h ^ v).wrapping_mul(0x0100_0000_01b3);
+    mix(kev.pipe_klist.len() as u64);
+    for n in &kev.pipe_klist {
+        mix(*n);
+    }
+    mix(k.dtask.tcp_socks.len() as u64);
+    for w in &k.dtask.tcp_socks {
+        mix(w.as_ptr() as *const u8 as usize as u64);
+    }
+    h
+}
+
+/// After a Darwin call: a change to what the pipe watch looks at is told
+/// to the thread-call Worker, which registers its slot for it afresh.
+pub(crate) fn after_call(k: &gex_kernel::syscalls::Kernel) {
+    use std::sync::atomic::Ordering;
+    let q = CALLS_Q.load(Ordering::Acquire);
+    if q == 0 || CALLS.load(Ordering::Acquire) < CALLS_WANTED {
+        return;
+    }
+    if watch_print(k) != WATCHED.load(Ordering::Acquire) {
+        REWATCH.store(true, Ordering::Release);
+        unsafe { k_wq_notify(q) };
+    }
+}
+
+/// How often a knote whose descriptor no event announces is looked at, as
+/// the native host's pipe watch does.
+const POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// The thread-call Worker's run (`gex_darwin_thread_calls`, from the
+/// Worker the page started for it): until the process ends or execs.
+/// 0 when there is nothing to run.
+#[no_mangle]
+pub extern "C" fn gex_darwin_thread_calls() -> u32 {
+    use gex_kernel::darwin::{commpage, mach, time::Instant};
+    use std::sync::atomic::Ordering;
+    let q = CALLS_Q.load(Ordering::Acquire);
+    if q == 0 || CALLS.load(Ordering::Acquire) != CALLS_TAKEN || unsafe { k_present() } == 0 {
+        return 0;
+    }
+    let gen = EXEC_GEN.load(Ordering::Acquire);
+    let slot = waitq::slot();
+    let proc_q = waitq::proc_queue();
+    unsafe {
+        k_wq_add(q, slot as u32);
+        k_wq_add(proc_q, slot as u32);
+    }
+    let (bell, pipes) = with_exec_lock(|h| (h.kernel.darwin_timer_bell(), h.kernel.darwin_pipe_watch()));
+    // The descriptors' queues the slot is on.
+    let mut watched: Vec<u32> = Vec::new();
+    let mut unqueued = false;
+    let mut next_tick = Instant::now();
+    let mut next_call: Option<Instant> = None;
+    let mut next_poll: Option<Instant> = None;
+    let mut seen: Option<u64> = None;
+    let mut woken = false;
+    loop {
+        let seq = unsafe { k_ws_seq(slot) };
+        if exited() || EXEC_GEN.load(Ordering::Acquire) != gen || bell.closed() {
+            break;
+        }
+        // The commpage, every quantum (the native host's tick thread).
+        let now = Instant::now();
+        if now >= next_tick {
+            commpage::tick(&mut guest(), mach::absolute_time());
+            next_tick = Instant::now() + commpage::QUANTUM;
+        }
+        // The pipe watch: a pipe or socket with a knote changed (its queue
+        // notified the slot), or one no event announces is due a look; or
+        // what it looks at changed.
+        let count = pipes.load(Ordering::Acquire);
+        let polled = count >> 32 != 0 || unqueued;
+        let poll_due = polled && next_poll.map_or(true, |t| Instant::now() >= t);
+        let piped = count > 0 && (woken || poll_due);
+        let rewatch = REWATCH.swap(false, Ordering::AcqRel);
+        // The thread calls: the bell rang, or the earliest is due.
+        let rang = seen != Some(bell.generation());
+        let due = next_call.is_some_and(|t| Instant::now() >= t);
+        if rang || due || piped || rewatch {
+            seen = Some(bell.generation());
+            woken = false;
+            let out = with_exec_lock(|h| {
+                if exited() {
+                    return None;
+                }
+                let next = h.kernel.darwin_thread_calls(&mut guest());
+                WATCHED.store(watch_print(&h.kernel), Ordering::Release);
+                Some((next, h.kernel.darwin_pipe_watch_queues()))
+            });
+            let Some((next, (queues, none))) = out else { break };
+            next_call = next;
+            unqueued = none;
+            for &old in watched.iter().filter(|o| !queues.contains(o)) {
+                unsafe { k_wq_del(old, slot as u32) };
+            }
+            for &new in queues.iter().filter(|n| !watched.contains(n)) {
+                unsafe { k_wq_add(new, slot as u32) };
+                // A change made before the slot was on its queue is looked
+                // for at once.
+                woken = true;
+            }
+            watched = queues;
+            if poll_due || next_poll.is_none() {
+                next_poll = Some(Instant::now() + POLL);
+            }
+            // The program's first instruction waits for this.
+            let _ = CALLS.compare_exchange(CALLS_TAKEN, CALLS_UP, Ordering::AcqRel, Ordering::Acquire);
+        }
+        // Asleep until the next of these, or a notify.
+        let now = Instant::now();
+        let polled = pipes.load(Ordering::Acquire) >> 32 != 0 || unqueued;
+        let until = [Some(next_tick), next_call, if polled { next_poll } else { None }].into_iter().flatten().min().expect("the next tick");
+        let ns = if until > now { (until - now).as_nanos().min(i64::MAX as u128) as i64 } else { 0 };
+        // On the word as it was sampled before the look above: a ring, a
+        // change or a notify since then ends the sleep at once.
+        let r = unsafe { k_ws_park(slot, seq, ns) };
+        // 0: notified, 1: notified before it slept; 2: its time.
+        woken |= r != 2;
+    }
+    let slot = slot as u32;
+    for q2 in watched.into_iter().chain([q, proc_q]) {
+        unsafe { k_wq_del(q2, slot) };
+    }
+    1
 }
 
 /// A fault a Darwin thread takes at `pc`, the kernel's to raise

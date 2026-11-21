@@ -85,8 +85,10 @@ void start(void) {
                 break;
             }
             if (r.x0 == 1) {
-                // Fired once, not before its deadline.
-                if (ev.ident != 1 || ev.filter != EVFILT_TIMER || ev.data != 1) {
+                // Fired, not before its deadline: its data the intervals
+                // gone by when it was read (filt_timerprocess), one or
+                // more as the poll comes late.
+                if (ev.ident != 1 || ev.filter != EVFILT_TIMER || ev.data < 1) {
                     status |= 8;
                 }
                 if (ticks() - armed < 30 * TICKS_PER_MS) {

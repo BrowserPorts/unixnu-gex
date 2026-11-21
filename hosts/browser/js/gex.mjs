@@ -1029,11 +1029,13 @@ const LOW_END = DISPATCH_DIR + 0x80000 * 4;
 // An M64 memory's dense directory, one word per page of all 16 GiB, and its
 // patched-page bits (gex_abi::DISPATCH_DIR64 .. HIGH_TABLES_END), as the
 // shim names them (`gex_m64_tables`, MiB), read at its first instantiation.
+// Read again whenever the process's layout may have changed: a Darwin
+// process's are elsewhere (`gex_set_darwin`, gex_abi::tables64).
 let DISPATCH_DIR64 = 0;
 let HIGH_TABLES_END = 0;
 const noteM64Tables = (e) => {
   const t = e.gex_m64_tables?.();
-  if (t === undefined || DISPATCH_DIR64) return;
+  if (t === undefined) return;
   DISPATCH_DIR64 = (t & 0xffff) * 2 ** 20;
   HIGH_TABLES_END = (t >>> 16) * 2 ** 20;
 };
@@ -1575,6 +1577,9 @@ export class Gex {
   /** A 32-bit Wine process's Windows address-space line: a forked child's from its
    *  parent, -1 for a fresh process to split at once (see `#workerStack`). */
   #windowsSpace = 0;
+  /** This process runs a Darwin program (its exec record's `darwin`):
+   *  `gex_set_darwin` before anything is translated or claimed. */
+  #darwin = false;
   /** A 64-bit Wine program being loaded into a 64-bit memory: the split. */
   #wine64Split = false;
   /** A process that runs no translated code (a native wasm program, a fork
@@ -1786,6 +1791,14 @@ export class Gex {
       if (globalThis.GEX_NULL_GUARD) this.#shim.exports.gex_set_null_guard?.(1);
       // `?mxcsr=1` before anything is translated: SSE under MXCSR (gex_ir::mxcsr_exact).
       if (globalThis.GEX_MXCSR) this.#shim.exports.gex_set_mxcsr_exact?.(1);
+      // A Darwin process (its exec record's `darwin`): its translator
+      // switches before anything is translated, and its layout (its tables
+      // inside its page zero) before the first claim below.
+      if (this.#darwin) {
+        if (!this.#shim.exports.gex_set_darwin) throw new Error('a Darwin program, and this runtime\'s shim runs none (no gex_set_darwin)');
+        this.#shim.exports.gex_set_darwin();
+        noteM64Tables(this.#shim.exports);
+      }
       // `?pinregion=BYTES`: a project's libraries' region above the placement
       // window, before the first claim of arena (gex_abi::set_pin_region).
       if (globalThis.GEX_PIN_REGION) this.#shim.exports.gex_set_pin_region?.(BigInt(globalThis.GEX_PIN_REGION));
@@ -3841,6 +3854,7 @@ export class Gex {
   async #adoptExec(shimWasm, guestWasm, child, opts) {
     this.#windowsSpace = 0;
     this.#noPlace = child.wasmImage ?? null;
+    this.#darwin = !!child.darwin;
     const pooled = this.#preattached;
     await this.attach(shimWasm, guestWasm);
     // Whether the exec started on the runtime its Worker made in the pool

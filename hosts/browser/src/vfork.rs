@@ -755,6 +755,11 @@ pub extern "C" fn gex_adopted_exec(ptr: u32, len: u32) -> u64 {
     // This Worker's memory is new (host.mjs gives an exec child no recycled
     // one), so the exec need not clear what no program wrote.
     EXEC_FRESH.with(|c| c.set(true));
+    // A Darwin process's instruction count, now that its function tiers'
+    // switches are set and before anything of it is translated.
+    if crate::darwin_process() {
+        crate::darwin_count_instructions();
+    }
     // A fresh Worker's process, its own until the program runs.
     crate::with_own_host(|h| {
         // A script names its interpreter (`#!`), as `execve` reads it: a

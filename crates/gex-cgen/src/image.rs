@@ -113,6 +113,15 @@ fn unit_inputs() -> String {
     // SSE under MXCSR (`gex_ir::mxcsr_exact`), a per-program opt-in, the
     // same way: the units with it and without it never mix.
     let base = if gex_ir::mxcsr_exact() { format!("{base}:mxcsr") } else { base };
+    // A Darwin process's translator switches (its runner's, gexc's
+    // darwin_run.rs): its commpage folded and its addresses wrapped,
+    // register constants forwarded, no load folded through memory, and its
+    // instructions counted. Named only when on, so no other unit's key
+    // changes.
+    let base = if gex_abi::commpage_fold() { format!("{base}:commpage") } else { base };
+    let base = if gex_ir::pass::forward_reg_consts() { format!("{base}:regconsts") } else { base };
+    let base = if !gex_ir::pass::fold_through_memory() { format!("{base}:nomemfold") } else { base };
+    let base = if gex_abi::count_instructions() { format!("{base}:insncount") } else { base };
     // So is the guest memory: a wasm64 unit is a different
     // module. Nothing is added for wasm32, whose keys stay as they were.
     if gex_abi::mem64() {

@@ -13276,6 +13276,56 @@ fn flavour_salt(h: &mut impl std::hash::Hasher) {
     if gex_ir::mxcsr_exact() {
         h.write_u8(8);
     }
+    // A Darwin process's switches (`gex_set_darwin`): its commpage folded
+    // and its addresses wrapped, register constants forwarded, no load
+    // folded through memory, and its retired instructions counted.
+    if gex_abi::commpage_fold() {
+        h.write_u8(4);
+    }
+    if gex_ir::pass::forward_reg_consts() {
+        h.write_u8(5);
+    }
+    if !gex_ir::pass::fold_through_memory() {
+        h.write_u8(6);
+    }
+    if gex_abi::count_instructions() {
+        h.write_u8(7);
+    }
+}
+
+/// This Worker's process is a Darwin one (its exec record's `darwin`,
+/// vfork.rs `exec_darwin`): its translator switches, as gexc's Darwin
+/// runner sets them (crates/gexc/src/darwin_run.rs), before anything is
+/// translated and before this Worker's first claim of memory, whose layout
+/// they decide (`memmap::claim_fixed`, `gex_abi::tables64`). Its commpage
+/// is folded to its alias at the top of the memory, and every address it
+/// computes wrapped to the memory, which needs the addresses its code
+/// builds in registers seen as the constants they are; dyld rebases and
+/// binds its data after its code is translated, so no load is folded to
+/// what memory held at translation. Whether its retired instructions are
+/// counted is decided at its exec ([`darwin_count_instructions`]), when the
+/// function tiers' switches are known. A process-wide setting: the
+/// process's memory holds it, for every Worker of it.
+#[no_mangle]
+pub extern "C" fn gex_set_darwin() {
+    gex_abi::set_commpage_fold(true);
+    gex_ir::pass::set_forward_reg_consts(true);
+    gex_ir::pass::set_fold_through_memory(false);
+}
+
+/// Whether this Worker's process is a Darwin one ([`gex_set_darwin`]).
+pub(crate) fn darwin_process() -> bool {
+    gex_abi::mem64() && gex_abi::commpage_fold()
+}
+
+/// A Darwin process's instruction count (`gex_abi::set_count_instructions`),
+/// set at its exec, before its first translation: each thread's retired
+/// instructions counted in its context by tier-1 code, for the kernel's
+/// `ri_instructions`; the function tiers do not count, so where they run
+/// (units, the function JIT) the count is off and the kernel reports the
+/// field as not kept, as gexc's runner decides.
+pub(crate) fn darwin_count_instructions() {
+    gex_abi::set_count_instructions(!(cgen::on() || fjit::on()));
 }
 
 /// Whether the object covering this page has been translated whole.

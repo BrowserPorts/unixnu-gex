@@ -46,6 +46,19 @@ pub mod op {
     /// its number and the caller's candidate (an instant and a calendar
     /// time, 12 bytes each: seconds, nanoseconds); the answer the origin.
     pub const ORIGIN: u32 = 2;
+    /// The trust caches ([`super::super::trustcache`]): the boot's static
+    /// one set (the request its module, none for no module; the answer 1
+    /// when it is the one the system has), a query (the query's type and
+    /// the cdhash; the entry found), whether the runtime has a UUID, a
+    /// module loaded (its type and module; 0 loaded, 1 a duplicate, 2
+    /// failed and why), and a boot cryptex type's loaded mark asked for
+    /// and set.
+    pub const TC_SET_STATIC: u32 = 16;
+    pub const TC_QUERY: u32 = 17;
+    pub const TC_HAS_UUID: u32 = 18;
+    pub const TC_LOAD: u32 = 19;
+    pub const TC_BOOT_LOADED: u32 = 20;
+    pub const TC_MARK_LOADED: u32 = 21;
 }
 
 /// The system's identifiers each new process, task or thread takes the next
@@ -138,11 +151,20 @@ static ORIGINS: [OnceLock<Moment>; 2] = [OnceLock::new(), OnceLock::new()];
 
 /// One call through `r`, whose answer must be `out`'s length: a channel
 /// that fails is a broken system, which goes no further.
-fn call(r: Remote, op: u32, req: &[u8], out: &mut [u8]) {
+pub(crate) fn call(r: Remote, op: u32, req: &[u8], out: &mut [u8]) {
     let n = (r.call)(op, req, out);
     if n != out.len() as i64 {
         panic!("gex: the global kernel answered the Darwin system's call {op} with {n} (wanted {} bytes)", out.len());
     }
+}
+
+/// [`call`] with an answer of any length up to `out`'s: its length.
+pub(crate) fn call_upto(r: Remote, op: u32, req: &[u8], out: &mut [u8]) -> usize {
+    let n = (r.call)(op, req, out);
+    if n < 0 || n > out.len() as i64 {
+        panic!("gex: the global kernel answered the Darwin system's call {op} with {n} (wanted at most {} bytes)", out.len());
+    }
+    n as usize
 }
 
 /// The next of counter `c`: the global kernel's, where it holds the
@@ -176,7 +198,10 @@ pub fn serve(op: u32, req: &[u8], out: &mut [u8]) -> i64 {
             out[..24].copy_from_slice(&moment_bytes(got));
             24
         }
-        _ => -ENOSYS,
+        _ => match super::trustcache::serve(op, req, out) {
+            Some(n) => n,
+            None => -ENOSYS,
+        },
     }
 }
 

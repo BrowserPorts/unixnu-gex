@@ -10,6 +10,8 @@
 
 use std::sync::OnceLock;
 
+use super::share::{self, Remote};
+
 /// A trust cache entry as a query finds it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Entry {
@@ -71,6 +73,16 @@ impl Module {
             return Err(Error::Truncated);
         }
         Ok(Module { version, uuid: b[4..20].try_into().unwrap(), entries: b[HEADER..end].to_vec() })
+    }
+
+    /// The module as [`Module::load`] reads it: its header and entries.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut b = Vec::with_capacity(HEADER + self.entries.len());
+        b.extend_from_slice(&self.version.to_le_bytes());
+        b.extend_from_slice(&self.uuid);
+        b.extend_from_slice(&(self.count() as u32).to_le_bytes());
+        b.extend_from_slice(&self.entries);
+        b
     }
 
     fn entry(&self, i: usize) -> &[u8] {
@@ -147,9 +159,31 @@ pub fn load_bundle(b: &[u8]) -> Result<Module, Error> {
 /// no bundle ("no external trust caches found").
 static STATIC: OnceLock<Option<Module>> = OnceLock::new();
 
-/// Set the boot's static trust cache, once.
-pub fn set_static(m: Option<Module>) {
-    let _ = STATIC.set(m);
+/// Set the boot's static trust cache, once: the system boots once. Where
+/// the global kernel holds the system's state ([`share`]), a process of the
+/// page that boots after the first finds the system's set, and booting with
+/// another is an error.
+pub fn set_static(m: Option<Module>) -> Result<(), String> {
+    let same = match share::remote() {
+        Some(r) => set_static_through(r, m.as_ref()),
+        None => set_static_here(m),
+    };
+    if same {
+        Ok(())
+    } else {
+        Err("its static trust cache differs from the one the system booted with".into())
+    }
+}
+
+/// Whether the static trust cache is `m`, set now if it was not.
+fn set_static_here(m: Option<Module>) -> bool {
+    STATIC.get_or_init(|| m.clone()) == &m
+}
+
+fn set_static_through(r: Remote, m: Option<&Module>) -> bool {
+    let mut o = [0u8; 1];
+    share::call(r, share::op::TC_SET_STATIC, &m.map_or_else(Vec::new, Module::to_bytes), &mut o);
+    o[0] != 0
 }
 
 /// The trust caches loaded since boot, the last loaded first (the
@@ -161,6 +195,17 @@ static LOADED: std::sync::Mutex<Vec<Module>> = std::sync::Mutex::new(Vec::new())
 /// `checkRuntimeForUUID` (0x...bbb84, 0x...bbf48): whether the static trust
 /// cache or a loaded one has UUID `uuid`.
 pub fn runtime_has_uuid(uuid: &[u8; 16]) -> bool {
+    match share::remote() {
+        Some(r) => {
+            let mut o = [0u8; 1];
+            share::call(r, share::op::TC_HAS_UUID, uuid, &mut o);
+            o[0] != 0
+        }
+        None => runtime_has_uuid_here(uuid),
+    }
+}
+
+fn runtime_has_uuid_here(uuid: &[u8; 16]) -> bool {
     STATIC.get().and_then(Option::as_ref).is_some_and(|m| &m.uuid == uuid) || LOADED.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|m| &m.uuid == uuid)
 }
 
@@ -279,11 +324,29 @@ fn boot_flag(ty: u8) -> Option<&'static std::sync::atomic::AtomicBool> {
 /// `load_trust_cache_with_type` (kern_trustcache.c 841-846): a boot
 /// cryptex type loaded already.
 pub fn boot_type_loaded(ty: u8) -> bool {
+    match share::remote() {
+        Some(r) => {
+            let mut o = [0u8; 1];
+            share::call(r, share::op::TC_BOOT_LOADED, &[ty], &mut o);
+            o[0] != 0
+        }
+        None => boot_type_loaded_here(ty),
+    }
+}
+
+fn boot_type_loaded_here(ty: u8) -> bool {
     boot_flag(ty).is_some_and(|f| f.load(std::sync::atomic::Ordering::Acquire))
 }
 
 /// `load_trust_cache_with_type` after a load of type `ty` (869-877).
 pub fn mark_loaded(ty: u8) {
+    match share::remote() {
+        Some(r) => share::call(r, share::op::TC_MARK_LOADED, &[ty], &mut []),
+        None => mark_loaded_here(ty),
+    }
+}
+
+fn mark_loaded_here(ty: u8) {
     if let Some(f) = boot_flag(ty) {
         f.store(true, std::sync::atomic::Ordering::Release);
     }
@@ -308,6 +371,14 @@ pub enum LoadError {
 /// cache added to the runtime ([`add`]).
 pub fn load_module(ty: u8, authenticated: Result<Vec<u8>, i32>) -> Result<(), LoadError> {
     let data = authenticated.map_err(|e| LoadError::Failed(format!("the Image4 evaluation failed with {e}")))?;
+    match share::remote() {
+        Some(r) => load_through(r, ty, &data),
+        None => load_here(ty, data),
+    }
+}
+
+/// [`load_module`]'s steps past the evaluation, on the system's runtime.
+fn load_here(ty: u8, data: Vec<u8>) -> Result<(), LoadError> {
     if data.is_empty() {
         return Err(LoadError::Failed("an empty module".into()));
     }
@@ -349,6 +420,24 @@ pub fn is_duplicate_img4(b: &[u8]) -> Result<bool, String> {
     Ok(Module::load(data).is_ok_and(|m| runtime_has_uuid(&m.uuid)))
 }
 
+fn load_through(r: Remote, ty: u8, data: &[u8]) -> Result<(), LoadError> {
+    let mut req = Vec::with_capacity(1 + data.len());
+    req.push(ty);
+    req.extend_from_slice(data);
+    let mut o = [0u8; LOAD_ANSWER];
+    let n = share::call_upto(r, share::op::TC_LOAD, &req, &mut o);
+    match &o[..n] {
+        [0] => Ok(()),
+        [1] => Err(LoadError::Duplicate),
+        [2, why @ ..] => Err(LoadError::Failed(String::from_utf8_lossy(why).into_owned())),
+        _ => panic!("gex: the global kernel's answer to a trust cache load: {:?}", &o[..n]),
+    }
+}
+
+/// The longest answer to a load through the global kernel: its outcome and
+/// why it failed (a few words; a longer one is the channel's error).
+const LOAD_ANSWER: usize = 512;
+
 /// A trust cache query's type (libTrustCache's `TCQueryType_t`, as AMFI
 /// uses it: its platform test, 0x...ab3e10, asks 1 and then, where loaded
 /// caches count, 2).
@@ -362,10 +451,115 @@ pub enum Query {
 
 /// `query_trust_cache` of one type: its entry for `cdhash`.
 pub fn query(q: Query, cdhash: &[u8; 20]) -> Option<Entry> {
+    match share::remote() {
+        Some(r) => query_through(r, q, cdhash),
+        None => query_here(q, cdhash),
+    }
+}
+
+fn query_here(q: Query, cdhash: &[u8; 20]) -> Option<Entry> {
     match q {
         Query::Static => STATIC.get().and_then(Option::as_ref).and_then(|m| m.lookup(cdhash)),
         Query::Loadable => LOADED.lock().unwrap_or_else(|e| e.into_inner()).iter().find_map(|m| m.lookup(cdhash)),
     }
+}
+
+impl Query {
+    /// Its `TCQueryType_t`.
+    fn number(self) -> u8 {
+        match self {
+            Query::Static => 1,
+            Query::Loadable => 2,
+        }
+    }
+
+    fn of(n: u8) -> Option<Query> {
+        match n {
+            1 => Some(Query::Static),
+            2 => Some(Query::Loadable),
+            _ => None,
+        }
+    }
+}
+
+/// An entry found, or none, as 5 bytes: found, hash type, flags, whether
+/// there is a category, the category.
+fn entry_bytes(e: Option<Entry>) -> [u8; 5] {
+    match e {
+        None => [0; 5],
+        Some(e) => [1, e.hash_type, e.flags, u8::from(e.category.is_some()), e.category.unwrap_or(0)],
+    }
+}
+
+fn entry_of(b: [u8; 5]) -> Option<Entry> {
+    (b[0] != 0).then(|| Entry { hash_type: b[1], flags: b[2], category: (b[3] != 0).then_some(b[4]) })
+}
+
+fn query_through(r: Remote, q: Query, cdhash: &[u8; 20]) -> Option<Entry> {
+    let mut req = [0u8; 21];
+    req[0] = q.number();
+    req[1..].copy_from_slice(cdhash);
+    let mut o = [0u8; 5];
+    share::call(r, share::op::TC_QUERY, &req, &mut o);
+    entry_of(o)
+}
+
+/// A trust cache call the global kernel's channel carried ([`share::serve`]),
+/// answered on this kernel's runtime: `None` for a call that is not one of
+/// these.
+pub(crate) fn serve(op: u32, req: &[u8], out: &mut [u8]) -> Option<i64> {
+    const EINVAL: i64 = 22;
+    const E2BIG: i64 = 7;
+    let answer = |out: &mut [u8], b: &[u8]| -> i64 {
+        if b.len() > out.len() {
+            return -E2BIG;
+        }
+        out[..b.len()].copy_from_slice(b);
+        b.len() as i64
+    };
+    Some(match op {
+        share::op::TC_SET_STATIC => {
+            let m = if req.is_empty() {
+                None
+            } else {
+                match Module::load(req) {
+                    Ok(m) => Some(m),
+                    Err(_) => return Some(-EINVAL),
+                }
+            };
+            answer(out, &[u8::from(set_static_here(m))])
+        }
+        share::op::TC_QUERY => {
+            let (Some(q), Ok(h)) = (req.first().and_then(|&n| Query::of(n)), <[u8; 20]>::try_from(req.get(1..).unwrap_or(&[]))) else { return Some(-EINVAL) };
+            answer(out, &entry_bytes(query_here(q, &h)))
+        }
+        share::op::TC_HAS_UUID => {
+            let Ok(u) = <[u8; 16]>::try_from(req) else { return Some(-EINVAL) };
+            answer(out, &[u8::from(runtime_has_uuid_here(&u))])
+        }
+        share::op::TC_LOAD => {
+            let Some((&ty, data)) = req.split_first() else { return Some(-EINVAL) };
+            match load_here(ty, data.to_vec()) {
+                Ok(()) => answer(out, &[0]),
+                Err(LoadError::Duplicate) => answer(out, &[1]),
+                Err(LoadError::Failed(why)) => {
+                    let mut b = vec![2];
+                    b.extend_from_slice(why.as_bytes());
+                    answer(out, &b)
+                }
+            }
+        }
+        share::op::TC_BOOT_LOADED => {
+            let [ty] = req else { return Some(-EINVAL) };
+            answer(out, &[u8::from(boot_type_loaded_here(*ty))])
+        }
+        share::op::TC_MARK_LOADED => {
+            let [ty] = req else { return Some(-EINVAL) };
+            mark_loaded_here(*ty);
+            0
+        }
+        _ => return None,
+    })
 }
 
 /// AMFI's platform test (`0x...ab3e10`): a query of the static trust cache,
@@ -578,6 +772,38 @@ mod tests {
             }
             crate::darwin_say!("{file}: {n} entries, uuid {:02x?}", m.uuid);
         }
+    }
+
+    /// Each call through the global kernel's channel answers as the
+    /// serving kernel's runtime does: the boot's static cache set once and
+    /// then only matched, queries, a load and its duplicate, a boot type's
+    /// mark.
+    #[test]
+    fn the_runtime_through_the_channel_is_the_serving_kernels() {
+        let r = Remote { call: share::serve };
+        let h = [0x5c; 20];
+        let st = Module::load(&module_of([0x5c; 16], &[h])).unwrap();
+        assert_eq!(Module::load(&st.to_bytes()), Ok(st.clone()));
+        assert!(set_static_through(r, Some(&st)));
+        assert!(set_static_through(r, Some(&st)));
+        assert!(!set_static_through(r, None));
+        assert_eq!(query_through(r, Query::Static, &h), query_here(Query::Static, &h));
+        assert!(query_through(r, Query::Static, &h).is_some());
+        assert_eq!(query_through(r, Query::Loadable, &[0x5d; 20]), None);
+        let mut o = [0u8; 1];
+        share::call(r, share::op::TC_HAS_UUID, &[0x5c; 16], &mut o);
+        assert_eq!(o, [1]);
+        let l = module_of([0x5e; 16], &[[0x5e; 20]]);
+        assert_eq!(load_through(r, 0x0d, &l), Ok(()));
+        assert_eq!(query_through(r, Query::Loadable, &[0x5e; 20]).map(|e| e.flags), Some(0));
+        assert_eq!(load_through(r, 0x0d, &l), Err(LoadError::Duplicate));
+        assert!(matches!(load_through(r, 0x0d, &[]), Err(LoadError::Failed(w)) if w == "an empty module"));
+        let mut b = [0u8; 1];
+        share::call(r, share::op::TC_BOOT_LOADED, &[0x0f], &mut b);
+        assert_eq!(b, [0]);
+        share::call(r, share::op::TC_MARK_LOADED, &[0x0f], &mut []);
+        assert_eq!(serve(share::op::TC_QUERY, &[3; 21], &mut [0; 5]), Some(-22));
+        assert_eq!(serve(1, &[], &mut []), None);
     }
 
     #[test]

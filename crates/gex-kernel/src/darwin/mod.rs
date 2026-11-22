@@ -250,7 +250,7 @@ pub fn boot(trust_cache: Option<&[u8]>, sandbox: SandboxProfiles, device_tree: O
         Some(b) => Some(trustcache::load_bundle(b).map_err(|e| format!("failed to load static trust cache module: 0 ({e:?})"))?),
         None => None,
     };
-    trustcache::set_static(m);
+    trustcache::set_static(m)?;
     // devfs's terminal nodes: ptmx, its replicas, tty.
     crate::vfs::devfs::set_darwin_ttys();
     mac::set_platform_profile(sandbox.platform)?;

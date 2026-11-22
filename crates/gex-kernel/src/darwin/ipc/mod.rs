@@ -11,6 +11,7 @@ pub mod msg;
 pub mod port;
 pub mod right;
 pub mod space;
+pub mod wire;
 
 use crate::errno::Errno;
 use crate::syscalls::{Kernel, SyscallOutcome};

@@ -470,3 +470,37 @@ mod tests {
         assert_eq!(s.names().count(), 0);
     }
 }
+
+impl Space {
+    /// The space as bytes ([`super::wire`]).
+    pub fn put(&self, p: &mut super::wire::Put) {
+        p.len(self.table.len());
+        for e in &self.table {
+            p.u32(e.bits);
+            p.opt(e.object, super::wire::Put::u64);
+            p.u32(e.next);
+            p.u32(e.request);
+        }
+        p.u64(self.size);
+        p.u32(self.hashed);
+        p.len(self.rev.len());
+        for (&o, &n) in super::wire::sorted(&self.rev) {
+            p.u64(o);
+            p.u32(n);
+        }
+        p.u32(self.free);
+        p.u64(self.rng);
+        p.bool(self.active);
+    }
+
+    /// The space [`Space::put`] made.
+    pub fn get(g: &mut super::wire::Get<'_>) -> Result<Space, super::wire::Bad> {
+        let n = g.len()?;
+        let table = (0..n).map(|_| Ok(Entry { bits: g.u32()?, object: g.opt(super::wire::Get::u64)?, next: g.u32()?, request: g.u32()? })).collect::<Result<Vec<_>, super::wire::Bad>>()?;
+        let size = g.u64()?;
+        let hashed = g.u32()?;
+        let n = g.len()?;
+        let rev = (0..n).map(|_| Ok((g.u64()?, g.u32()?))).collect::<Result<_, super::wire::Bad>>()?;
+        Ok(Space { table, size, hashed, rev, free: g.u32()?, rng: g.u64()?, active: g.bool()? })
+    }
+}

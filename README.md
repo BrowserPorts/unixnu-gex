@@ -26,7 +26,10 @@ Wine.
 Darwin programs run under gex's native host, `gexc`, which runs the
 translated program on wasmtime. A boot runs launchd through its early boot
 tasks and stops at the Secure Enclave. It does not reach a user interface.
-The browser host (`hosts/browser`) does not start Darwin processes yet.
+The browser host (`hosts/browser`) runs static Darwin programs, ones that
+need no dyld, each in a process of its own: their threads, waits, pipes and
+sockets work there as they do natively. Dynamic programs, `posix_spawn` and
+`fork` are refused there, loudly, for now.
 
 ## What it adds
 

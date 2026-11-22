@@ -1,7 +1,7 @@
 //! The SEP's mailbox hardware: the AKF block behind `/arm-io/sep`'s first
 //! `reg` entry, as AppleA7IOPV2 (the driver `iop,s8000` matches) programs it
-//! (the registers: `drafts/sep/01-a7iop-mailbox.md`, each read from the
-//! kernelcache's AppleA7IOP and AKFWrap-v2 kexts).
+//! (the registers each read from the kernelcache's AppleA7IOP and
+//! AKFWrap-v2 kexts).
 //!
 //! Two FIFOs of 64-bit messages connect the AP and the SEP core: A2I (the
 //! AP's 8-byte store to `0x4010` pushes) and I2A (its 8-byte load from

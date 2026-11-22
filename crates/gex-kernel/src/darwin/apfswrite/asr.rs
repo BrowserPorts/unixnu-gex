@@ -138,7 +138,7 @@ mod tests {
     }
 
     /// The IPSW's system image (GEX_TEST_UDIF): three instructions, 5,506
-    /// writes (re-asr-write.md A.3, A.5).
+    /// writes.
     #[test]
     fn the_system_image_writes() {
         let Ok(path) = std::env::var("GEX_TEST_UDIF") else { return };

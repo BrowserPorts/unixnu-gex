@@ -404,8 +404,8 @@ mod tests {
     use super::*;
 
     /// gexc's container before asr's writes and the placements the device
-    /// library's own spaceman_alloc made for them (re-dataalloc.md §7: a
-    /// clone of the container, the binary's function called in process).
+    /// library's own spaceman_alloc made for them (a clone of the
+    /// container, the binary's function called in process).
     fn restore_container() -> (Fxc, Clip) {
         let mut f = Fxc::new(15_624_989);
         for (s, l) in [(29_412, 15_351_439), (15_380_857, 2), (15_380_865, 2), (15_380_873, 2), (15_380_900, 244_089)] {

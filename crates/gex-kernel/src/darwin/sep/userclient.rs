@@ -1,6 +1,6 @@
 //! AppleSEPUserClient: the dispatch table of 84 selectors at K
 //! 0xfffffff006eb6950 (24-byte `IOExternalMethodDispatch` entries) and the
-//! selectors the data-protection boot reaches (`drafts/sep/04-userclient-idp.md`).
+//! selectors the data-protection boot reaches.
 //!
 //! `init_data_protection` opens the client with type 0 (the type is
 //! ignored), asks the xART gigalocker to initialise (selector 44, which

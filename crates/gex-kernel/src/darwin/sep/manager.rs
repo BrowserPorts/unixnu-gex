@@ -2,8 +2,7 @@
 //! the doorbell that routes the SEP's messages, the control and discovery
 //! endpoints, the SEP ROM's boot protocol (`AppleSEPBooter`) and the load of
 //! the sepOS (`AppleSEPFirmware`), ported from the 21H461 kernelcache
-//! (`drafts/sep/02-transport.md`, `03-boot-handshake.md`, `04-userclient-idp.md`;
-//! `K` is a kernelcache vm address in AppleSEPManager).
+//! (`K` is a kernelcache vm address in AppleSEPManager).
 //!
 //! Everything below the mailbox is the SEP's: no reply the SEP ROM or the
 //! sepOS would give is made here. A request nothing answers waits as the
@@ -824,9 +823,8 @@ mod tests {
 
     /// A SEP's side of the mailbox, for the tests only: a thread that takes
     /// each message the AP posts and answers with what a script says. The
-    /// script is the test's statement of what the real SEP ROM and sepOS say
-    /// (03-boot-handshake.md section 11); the manager never makes these
-    /// replies itself.
+    /// script is the test's statement of what the real SEP ROM and sepOS
+    /// say; the manager never makes these replies itself.
     struct Peer {
         hw: Arc<Hw>,
         seen: Arc<Mutex<Vec<Message>>>,
@@ -1021,8 +1019,8 @@ mod tests {
         finish(&m, &hw, door);
     }
 
-    /// The SEP ROM as 03-boot-handshake.md section 11 has it for the kernel-load flow:
-    /// status 1, BootTz0 accepted, status 2, Boot accepted.
+    /// The SEP ROM in the kernel-load flow: status 1, BootTz0 accepted,
+    /// status 2, Boot accepted.
     fn rom_script_two_phase() -> impl Fn(Message) -> Vec<Message> + Send + 'static {
         let tz0 = Arc::new(AtomicBool::new(false));
         move |msg| {

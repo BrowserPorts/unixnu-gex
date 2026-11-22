@@ -1,8 +1,7 @@
 //! `apfs_sealvolume -R /mnt5/mtree_remap.xml -I /mnt5/root_hash -u
 //! /mnt5/manifest_and_db/digest.db -d -v <System>`, the erase restore's
 //! seal of the System volume (the ramdisk's binary, APFS 2236.140.6;
-//! addresses S: are its own; drafts' re-seal.md and re-seal-snap.md the
-//! transcription), on the container the kernel handed over:
+//! addresses S: are its own), on the container the kernel handed over:
 //!
 //! - the library's `nx_mount` (its reaper finding nothing: the kernel's ran
 //!   to its end), the volume's `apfs_mount` (no write: its clone epoch is

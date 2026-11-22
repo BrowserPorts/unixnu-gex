@@ -103,11 +103,10 @@ pub struct OsImage {
     pub device: Option<Device>,
 }
 
-/// What the restore host sends seal_system_volume
-/// (drafts/s27/re-seal-snap.md 3.1): SystemImageCanonicalMetadataFile and
-/// SystemImageRootHashFile, the IPSW's `Firmware/044-76040-038.dmg.mtree`
-/// and `.root_hash` (the latter as the host's Image4 file of it,
-/// TICKET_STAND_IN).
+/// What the restore host sends seal_system_volume:
+/// SystemImageCanonicalMetadataFile and SystemImageRootHashFile, the IPSW's
+/// `Firmware/044-76040-038.dmg.mtree` and `.root_hash` (the latter as the
+/// host's Image4 file of it, TICKET_STAND_IN).
 pub struct SealFiles {
     /// The `.mtree` IM4P: an Apple Archive of `digest.db` and `mtree.txt`.
     pub mtree: Vec<u8>,
@@ -239,9 +238,9 @@ pub fn build_disk0_hooked(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() 
     }
     // 5. restore_asr starts asr on its own queue (0x10003f4f4) and the main
     // thread goes on with the steps up to await_asr_and_retry, which waits
-    // for it (drafts/s21/re-ops.md): nothing orders the two, so the order
-    // here is RUN_STAND_IN's. The asr thread's mount of System
-    // (mount_partition(0), `mount_apfs -R`) comes first.
+    // for it: nothing orders the two, so the order here is RUN_STAND_IN's.
+    // The asr thread's mount of System (mount_partition(0),
+    // `mount_apfs -R`) comes first.
     fsops::mount_rw(&mut nx, system, now)?;
     let host = host_uuid(os)?;
     let device = os.and_then(|o| o.device.as_ref());
@@ -289,8 +288,8 @@ pub fn build_disk0_hooked(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() 
         // 6. create_protected_filesystems (0x10002a54c): class D's key
         // obliterated (effaceable storage only), then Data made encrypted
         // (`newfs_apfs -A -D -o role=d -v Data -P`: the kernel's
-        // volumeCreate with the container keybag's entries,
-        // drafts/s16/re-protected.md; keys and ciphertext KEYS_STAND_IN).
+        // volumeCreate with the container keybag's entries; keys and
+        // ciphertext KEYS_STAND_IN).
         // Each is mounted read-write as it is made (0x10002a698 →
         // mount_partition, `mount_apfs -R`): Data's mount starts its pfkur
         // and fixup threads, whose writes reach the kernel before User's
@@ -341,7 +340,7 @@ pub fn build_disk0_hooked(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() 
         match &os.seal {
             Some(files) => {
                 // The main list after check_mounted's block and the NVRAM
-                // steps (drafts/s27/re-seal-snap.md 0).
+                // steps.
                 populate_preboot_volume(&mut nx, v, &p, now)?;
                 missing.extend(nx.vnode_missing.drain(..));
                 // set_boot_command writes NVRAM only; set_autoboot_delay
@@ -374,8 +373,7 @@ pub fn build_disk0_hooked(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() 
                         create_system_snapshot(&mut nx, v, &p, now)?;
                         // prepare_data_split, convert_eds_volumes,
                         // split_data_volume and commit_temporary_checkpoint
-                        // log and return on an erase restore
-                        // (re-seal-snap.md 5).
+                        // log and return on an erase restore.
                         migrate_user_fsevents(&mut nx, v, data, user, now)?;
                         unmount_filesystems(&mut nx, v, data, user, now)?;
                     }
@@ -403,7 +401,7 @@ pub fn build_disk0_hooked(disk: std::sync::Arc<dyn Sink>, now: &mut dyn FnMut() 
     // block-0 write has the newest mounting version are not traced.
     // Times the kernel still holds in memory: the next rewrite of their
     // inodes (for Data's /keybags, aks_bootstrap_fs's class change in
-    // fixup_var, drafts/s26/re-aks-data.md 1) is not reached.
+    // fixup_var) is not reached.
     let mut slots: Vec<usize> = nx.jobj_times.keys().map(|k| k.0).collect();
     slots.dedup();
     for v in slots {
@@ -511,8 +509,8 @@ pub(crate) fn nsih(ticket: Option<&[u8]>) -> String {
     }
 }
 
-/// The main thread's steps between restore_asr and await_asr_and_retry
-/// (drafts/s21/re-ops.md sections 3 and 4) as they reach the container.
+/// The main thread's steps between restore_asr and await_asr_and_retry as
+/// they reach the container.
 #[allow(clippy::too_many_arguments)]
 fn concurrent_steps(nx: &mut Nx<'_>, v: Volumes, host: Option<&str>, p: &str, fw: Option<(&BootObjects, &Device)>, now: &mut dyn FnMut() -> u64, missing: &mut Missing) -> Result<(), String> {
     // init_gigalocker (0x1000176e8 → 0x1000296c8): xART mounted read-write
@@ -604,8 +602,8 @@ fn concurrent_steps(nx: &mut Nx<'_>, v: Volumes, host: Option<&str>, p: &str, fw
 /// orders): for every insertion order of a receipt of 12 to 37 of the
 /// erase identity's entries holding these six, built as the host builds
 /// it or deep-copied, the device walks AVE before AOP before
-/// StaticTrustCache (drafts/s36/probe cfdorder, cfchain). A receipt has
-/// every component the AP ticket personalizes (26 for this identity).
+/// StaticTrustCache. A receipt has every component the AP ticket
+/// personalizes (26 for this identity).
 const FUD_ENTRIES: [&str; 6] = ["AOP", "AVE", "Ap,SystemVolumeCanonicalMetadata", "RestoreTrustCache", "StaticTrustCache", "SystemVolume"];
 
 /// The order install_fud writes [`FUD_ENTRIES`]' files in: those of them it
@@ -767,10 +765,10 @@ fn blksize_writes(n: u64, blksize: u64) -> Vec<u64> {
 }
 
 /// What stands in for `/mnt2/keybags/usersession.kb`: UserManagementLayout
-/// writes its user manifest with NSPropertyListSerialization (binary,
-/// drafts/s21/re-data.md 2.1), two of its values fresh random UUIDs, the
-/// order CFBinaryPList takes the dictionaries' keys in and the user
-/// dictionary's fields after `userFromManifestDictionary:` not traced.
+/// writes its user manifest with NSPropertyListSerialization (binary),
+/// two of its values fresh random UUIDs, the order CFBinaryPList takes the
+/// dictionaries' keys in and the user dictionary's fields after
+/// `userFromManifestDictionary:` not traced.
 pub const USERSESSION_STAND_IN: &str = "the bytes of Data's /keybags/usersession.kb (UserManagementLayout's binary user manifest: two random UUIDs per device run, CFBinaryPList's key order and the user dictionary's serialized fields not traced: re-data UNSETTLED-4) (stand-in: a binary property list of the manifest's and the user's listed keys in sorted order, objects uniqued, the UUIDs 00000000-0000-4000-8000-0000000001F5 and ...1F6)";
 
 /// A binary property list (`bplist00`) of `v`: the objects in the order
@@ -875,8 +873,7 @@ fn bplist(v: &super::super::plist::Value) -> Vec<u8> {
 }
 
 /// USERSESSION_STAND_IN's bytes: the user manifest UserManagementLayout's
-/// `saveManifest:toPath:` writes for the primary user (drafts/s21/re-data.md
-/// 2.1's tables).
+/// `saveManifest:toPath:` writes for the primary user.
 fn usersession_kb() -> Vec<u8> {
     use super::super::plist::Value;
     let s = |x: &str| Value::String(x.into());
@@ -916,14 +913,13 @@ fn usersession_kb() -> Vec<u8> {
     ]))
 }
 
-/// configure_data_volumes (0x10002a098; drafts/s21/re-data.md 2) on Data
-/// (`data`) and User (`user`), when System's image has
-/// /System/Library/Templates/User: UserManagementLayout's primary user on
-/// Data (2.1, drafts/s23/re-uml-data.md), the AKS identity calls (Secure
-/// Enclave only), the user protection of Data's VEK (2.3) and
-/// AKSVolumeMap's cookie on User (2.5), each with its checkpoint, the
-/// template's copy onto User and aks_bootstrap_user_fs (2.4). The rename
-/// leaves /keybags' times in the kernel's memory (`nx.jobj_times`).
+/// configure_data_volumes (0x10002a098) on Data (`data`) and User
+/// (`user`), when System's image has /System/Library/Templates/User:
+/// UserManagementLayout's primary user on Data, the AKS identity calls
+/// (Secure Enclave only), the user protection of Data's VEK and
+/// AKSVolumeMap's cookie on User, each with its checkpoint, the template's
+/// copy onto User and aks_bootstrap_user_fs. The rename leaves /keybags'
+/// times in the kernel's memory (`nx.jobj_times`).
 fn configure_data_volumes(nx: &mut Nx<'_>, system: usize, data: usize, user: usize, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     let mut t = ROOT_INO;
     for n in ["System", "Library", "Templates", "User"] {
@@ -963,12 +959,11 @@ const MOBILE: u32 = 501;
 /// copyfile(".../Templates/User/", "/mnt10", COPYFILE_ALL |
 /// COPYFILE_RECURSIVE | COPYFILE_NOFOLLOW) by libcopyfile 196.120.5 with
 /// UserManagementLayout's handler (lchown to 501:501 at every FINISH),
-/// from the template directory `tmpl` on System onto User's root
-/// (drafts/s23/re-user-copy.md 1.5 and 5): fts in the source's directory
-/// order, each directory made and closed over by the cleanup pass, empty
-/// files truncated, compressed ones copied by their decmpfs attribute and
-/// UF_COMPRESSED; the source's modes, times and flags applied as
-/// COPYFILE_STAT does.
+/// from the template directory `tmpl` on System onto User's root: fts in
+/// the source's directory order, each directory made and closed over by the
+/// cleanup pass, empty files truncated, compressed ones copied by their
+/// decmpfs attribute and UF_COMPRESSED; the source's modes, times and flags
+/// applied as COPYFILE_STAT does.
 fn user_template_copy(nx: &mut Nx<'_>, system: usize, tmpl: u64, user: usize, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     use fsops::SetAttr;
     let ids = |u: u32, g: u32| SetAttr { uid: Some(u), gid: Some(g), ..Default::default() };
@@ -1063,10 +1058,10 @@ fn user_template_copy(nx: &mut Nx<'_>, system: usize, tmpl: u64, user: usize, no
     cleanup(nx, user, ROOT_INO, rmode, rmtime, ratime, now)
 }
 
-/// AppleKeyStore's map for a user's volume (AKS 0x30f60, 72 entries;
-/// drafts/s14/restored/aks_bootstrap_map.txt): path, flags (1: set the
-/// class on a directory, 2 and 4 kept for its other users, 8: skipped),
-/// mode, class. The entries with flags 0x0a are left out: skipped.
+/// AppleKeyStore's map for a user's volume (AKS 0x30f60, 72 entries):
+/// path, flags (1: set the class on a directory, 2 and 4 kept for its other
+/// users, 8: skipped), mode, class. The entries with flags 0x0a are left
+/// out: skipped.
 const USER_MAP: [(&str, u32, u16, u32); 46] = [
     ("", 0x00, 0o711, 0),
     ("/.ssh", 0x05, 0o700, 4),
@@ -1117,12 +1112,11 @@ const USER_MAP: [(&str, u32, u16, u32); 46] = [
 ];
 
 /// aks_bootstrap_user_fs("/mnt10", 0, 501, 501) (AKS 0x13a28 →
-/// aks_bootstrap_fs_with_map AKS 0x13634; drafts/s21/re-data.md 2.4,
-/// drafts/s23/re-user-copy.md 3): with no /.bootstrapped, each map entry
-/// in order: a missing path made by mkpath_np with the entry's mode (its
-/// parent exists: one mkdir; a mode of 01000 or more would be chmodded:
-/// none is) and chowned to 501:501; then a directory whose entry has
-/// flag 1 given the entry's class when it has another; existing paths
+/// aks_bootstrap_fs_with_map AKS 0x13634): with no /.bootstrapped, each map
+/// entry in order: a missing path made by mkpath_np with the entry's mode
+/// (its parent exists: one mkdir; a mode of 01000 or more would be
+/// chmodded: none is) and chowned to 501:501; then a directory whose entry
+/// has flag 1 given the entry's class when it has another; existing paths
 /// keep their mode and owner. Then /.bootstrapped made (open O_CREAT,
 /// 0644) and closed.
 fn aks_bootstrap_user_fs(nx: &mut Nx<'_>, user: usize, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
@@ -1203,9 +1197,10 @@ pub const GIGALOCKER_STAND_IN: &str = "the records the Secure Enclave writes int
 /// preallocates 6 MiB (`F_PREALLOCATE` {F_ALLOCATEALL, F_PEOFPOSMODE, 0,
 /// 0x600000}, the size already a multiple of the volume's block and the
 /// page size), grows the file to it and closes it, whose fsync zero-fills
-/// the range in the cluster layer's block maps (drafts/s27/re-zerofill.md:
-/// /mnt7's I/O attributes come from its volume node as /mnt9's do); then the Secure Enclave call (selector 0x2c) opens the file
-/// and its raw device (no file-system write: GIGALOCKER_STAND_IN).
+/// the range in the cluster layer's block maps (/mnt7's I/O attributes
+/// come from its volume node as /mnt9's do); then the Secure Enclave call
+/// (selector 0x2c) opens the file and its raw device (no file-system write:
+/// GIGALOCKER_STAND_IN).
 fn gigalocker_init(nx: &mut Nx<'_>, xart: usize, host: &str, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     const SIZE: u64 = 0x60_0000;
     let u = crate::darwin::platform::uuid_parse(host).ok_or_else(|| format!("the platform UUID {host:?} is not a UUID"))?;
@@ -1224,8 +1219,8 @@ fn gigalocker_init(nx: &mut Nx<'_>, xart: usize, host: &str, now: &mut dyn FnMut
 }
 
 /// The IPSW's boot objects the host personalizes for install_kernel_cache's
-/// list (drafts/s23/re-kernelcache.md 3): the IM4P payloads as the IPSW has
-/// them (their SHA-384 the erase identity's digests).
+/// list: the IM4P payloads as the IPSW has them (their SHA-384 the erase
+/// identity's digests).
 pub struct BootObjects {
     /// `kernelcache.release.ipad7`.
     pub kernelcache: Vec<u8>,
@@ -1421,8 +1416,7 @@ fn personalize_splat_ticket(device: &Device, nvram: Option<&mut RestoreNvram>) -
 }
 
 /// What install_splat takes from the restore host and the device's own
-/// randomness that only a device run has (drafts/s27/re-splat.md
-/// UNSETTLED 1, 4, 5, 9, 12).
+/// randomness that only a device run has.
 pub const SPLAT_STAND_IN: &str = "what install_splat's Cryptex1 on Preboot takes from the restore host and the run (drafts/s27/re-splat.md): the host's SourceBootObjectV4 message sizes, which make the write(2) calls (stand-in: idevicerestore's 8192-byte FileData chunks), the time the transfer takes, which decides when the kernel's grow-ahead starts on os.dmg and app.dmg (stand-in: the model's clock), the build identity the host sends back and CoreFoundation's XML of it (stand-in: the IPSW's erase identity, written by this model's plist writer) and Foundation's temporary name for the Cryptex1 ticket (stand-in .dat.nosync0000.AAAAAA); measure /private/preboot/cryptex1/current on the device: its files' extents and BuildManifest.plist's bytes";
 
 /// The host's FileData message size ([`SPLAT_STAND_IN`]).
@@ -1433,10 +1427,10 @@ const SPLAT_HOST_CHUNK: u64 = 8192;
 const SPLAT_TICKET_TEMP: &str = ".dat.nosync0000.AAAAAA";
 
 /// The `write(2)` calls stdio makes of a file `fopen(dest, "wb")` gets in
-/// `chunk`-byte `fwrite`s, then `fclose` (drafts/s27/re-splat.md 1.5):
-/// the buffer is `st_blksize`, 4096 here; an `fwrite` into an empty
-/// buffer of at least its size writes the whole buffers of it at once and
-/// keeps the rest; `fclose` writes what is kept.
+/// `chunk`-byte `fwrite`s, then `fclose`: the buffer is `st_blksize`, 4096
+/// here; an `fwrite` into an empty buffer of at least its size writes the
+/// whole buffers of it at once and keeps the rest; `fclose` writes what is
+/// kept.
 fn stdio_writes(size: u64, chunk: u64) -> Result<Vec<u64>, String> {
     const BUF: u64 = 4096;
     let mut out = Vec::new();
@@ -1533,21 +1527,19 @@ fn splat_stream_matches(src: &dyn fsops::Bytes, expected: &[u8]) -> Result<Optio
     })
 }
 
-/// install_splat (0x10003af24; drafts/s27/re-splat.md), with Preboot
-/// mounted read-write at /mnt9 and System at /mnt1, for `device`: the
-/// build identity's Cryptex1 components (none: nothing), then
-/// ramrod_splat_install (0x10006419c): cryptex1/current made by
-/// NSFileManager's mkpath_np (mkdirat 0777 under umask 0, so no chmod);
-/// each component of the table (0x100268528) present in the identity
-/// `fopen(dest, "wb")` (0666) and written in the host's chunks through
-/// stdio, checked against the digest the device's Cryptex1 ticket has for
-/// its object;
-/// RestoreVersion.plist and SystemVersion.plist copyfile'd from System
-/// (COPYFILE_ALL, no state); BuildManifest.plist by -[NSDictionary
-/// writeToFile:atomically:NO] (one write, fsync); the Cryptex1 ticket
-/// written atomically through a temporary file (write, fsync, rename). No
-/// LocalPolicy: J120's chip 0x8011 is in the restore's list of chips
-/// without one (0x10027e8d8).
+/// install_splat (0x10003af24), with Preboot mounted read-write at /mnt9
+/// and System at /mnt1, for `device`: the build identity's Cryptex1
+/// components (none: nothing), then ramrod_splat_install (0x10006419c):
+/// cryptex1/current made by NSFileManager's mkpath_np (mkdirat 0777 under
+/// umask 0, so no chmod); each component of the table (0x100268528) present
+/// in the identity `fopen(dest, "wb")` (0666) and written in the host's
+/// chunks through stdio, checked against the digest the device's Cryptex1
+/// ticket has for its object; RestoreVersion.plist and SystemVersion.plist
+/// copyfile'd from System (COPYFILE_ALL, no state); BuildManifest.plist by
+/// -[NSDictionary writeToFile:atomically:NO] (one write, fsync); the
+/// Cryptex1 ticket written atomically through a temporary file (write,
+/// fsync, rename). No LocalPolicy: J120's chip 0x8011 is in the restore's
+/// list of chips without one (0x10027e8d8).
 fn install_splat(nx: &mut Nx<'_>, v: Volumes, boot: &BootObjects, device: &Device, nvram: Option<&mut RestoreNvram>, now: &mut dyn FnMut() -> u64) -> Result<bool, String> {
     use super::super::plist::Value;
     use super::super::preboot;
@@ -1648,9 +1640,8 @@ fn install_splat(nx: &mut Nx<'_>, v: Volumes, boot: &BootObjects, device: &Devic
         }
     }
     // BuildManifest.plist: open(0x601, 0666), write, fsync, close. The
-    // fsync (apfs_fsync_internal, no commit: drafts/s27/re-txdata.md 4)
-    // pushes the data and removes PREV_FSIZE as the close's would; the
-    // close then finds nothing to do.
+    // fsync (apfs_fsync_internal, no commit) pushes the data and removes
+    // PREV_FSIZE as the close's would; the close then finds nothing to do.
     let xml = preboot::restore_manifest(identity);
     fsops::write_new_file(nx, pb, cur, preboot::cryptex1::MANIFEST, 0o666, &xml, &cluster_pushes, now)?;
     // The ticket: a temporary file (open 0xa02, 0666), write, fsync, the
@@ -1663,14 +1654,13 @@ fn install_splat(nx: &mut Nx<'_>, v: Volumes, boot: &BootObjects, device: &Devic
     Ok(roll_missing)
 }
 
-/// install_kernel_cache's nested list (0x100018620; drafts/s23/
-/// re-kernelcache.md 1, 2), run after install_splat with Preboot and
-/// Hardware mounted read-write: the kernel cache, device tree, iBoot and
-/// root hash, each a new file under the Preboot directory of the ticket's
-/// hash written by one `write` and closed ([`fsops::write_new_file`]), then
-/// write_ticket's AP ticket there, its symbolic link in the firmware
-/// directory and its copy on Hardware. The /mnt1 `stat`s and the
-/// `access`es only read.
+/// install_kernel_cache's nested list (0x100018620), run after
+/// install_splat with Preboot and Hardware mounted read-write: the kernel
+/// cache, device tree, iBoot and root hash, each a new file under the
+/// Preboot directory of the ticket's hash written by one `write` and closed
+/// ([`fsops::write_new_file`]), then write_ticket's AP ticket there, its
+/// symbolic link in the firmware directory and its copy on Hardware. The
+/// /mnt1 `stat`s and the `access`es only read.
 fn install_kernel_cache(nx: &mut Nx<'_>, v: Volumes, boot: &BootObjects, device: &Device, pushes: &dyn Fn(u64) -> Result<fsops::Pushes, String>, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     let ticket = device.ap_ticket.as_deref().unwrap_or(&TICKET);
     let p = nsih(device.ap_ticket.as_deref());
@@ -1704,13 +1694,13 @@ fn install_kernel_cache(nx: &mut Nx<'_>, v: Volumes, boot: &BootObjects, device:
 /// volumes that only the device answers.
 pub const CLUSTER_STAND_IN: &str = "how the cluster layer pushes the gigalocker file's close-time zero fill and install_kernel_cache's large files (drafts/s26/re-cluster.md, drafts/s27/re-zerofill.md): the main namespace's limit table index (the byte at its object's +0x1f0) that sets IOMaximumByteCountWrite, and the controller's IOMinimumSaturationByteCount, throttling and any syncer push, which only move the pushes in time (stand-in: the table's type-1 limits, 1 MiB, so 1 MiB clusters and block maps: six for the 6 MiB fill, the first adding a PREV_FSIZE field of 0x100000 the close's fsync removes; the write-behind leaving its last four clusters to the close, the pushes ordered by offset; measure the kernelcache's file extents on the device's Preboot and the xART volume's last_mod_time against the gigalocker file's times)";
 
-/// A disk0 volume's cluster size C and block-map length M
-/// (drafts/s26/re-cluster.md): the mount's I/O attributes from the volume
-/// node's limits (vfs_init_io_attributes X 0xfffffff0073742f4: Wc the
-/// byte count, or the block count's bytes when fewer, 64 MiB with
-/// neither; the segment count, else Wc / 16 KiB, at most 0xffff), C =
-/// cluster_max_io_size (X 0xfffffff00735ee9c: min(segments, 4096) pages or
-/// Wc, a 16 KiB multiple, at least 1 MiB) and M (Wc to a 16 KiB multiple).
+/// A disk0 volume's cluster size C and block-map length M: the mount's I/O
+/// attributes from the volume node's limits (vfs_init_io_attributes X
+/// 0xfffffff0073742f4: Wc the byte count, or the block count's bytes when
+/// fewer, 64 MiB with neither; the segment count, else Wc / 16 KiB, at most
+/// 0xffff), C = cluster_max_io_size (X 0xfffffff00735ee9c:
+/// min(segments, 4096) pages or Wc, a 16 KiB multiple, at least 1 MiB) and
+/// M (Wc to a 16 KiB multiple).
 fn cluster_sizes() -> (u64, u64) {
     const PAGE: u64 = 16 << 10;
     let (wc, sc) = io_attributes(crate::darwin::storagestack::disk0_write_limits());
@@ -1757,19 +1747,18 @@ fn f_iosize() -> u64 {
 }
 
 /// The pushes of one `write(2)` of `n` bytes from offset 0 into a new file
-/// on a disk0 volume (drafts/s26/re-cluster.md): the mount's I/O
-/// attributes from the volume node's limits (vfs_init_io_attributes X
-/// 0xfffffff0073742f4: Wc the byte count, or the block count's bytes when
-/// fewer, 64 MiB with neither; the segment count, else Wc / 16 KiB, at
-/// most 0xffff), the cluster size C = cluster_max_io_size (X
-/// 0xfffffff00735ee9c: min(segments, 4096) pages or Wc, a 16 KiB multiple,
-/// at least 1 MiB) and the block-map length M (Wc to a 16 KiB multiple);
-/// cluster_write_copy files the data in clusters of C up to the 16 KiB
-/// page end, each pushed as block maps of at most M; with MAX_CLUSTERS 4,
-/// the write-behind pushes the lowest cluster each time a fifth is added,
-/// so all but the last four go during the write and the close's push takes
-/// those in order. Block maps are clipped at the file's hole end (round_up
-/// to the volume's block), where APFS stops allocating.
+/// on a disk0 volume: the mount's I/O attributes from the volume node's
+/// limits (vfs_init_io_attributes X 0xfffffff0073742f4: Wc the byte count,
+/// or the block count's bytes when fewer, 64 MiB with neither; the segment
+/// count, else Wc / 16 KiB, at most 0xffff), the cluster size C =
+/// cluster_max_io_size (X 0xfffffff00735ee9c: min(segments, 4096) pages or
+/// Wc, a 16 KiB multiple, at least 1 MiB) and the block-map length M (Wc to
+/// a 16 KiB multiple); cluster_write_copy files the data in clusters of C
+/// up to the 16 KiB page end, each pushed as block maps of at most M; with
+/// MAX_CLUSTERS 4, the write-behind pushes the lowest cluster each time a
+/// fifth is added, so all but the last four go during the write and the
+/// close's push takes those in order. Block maps are clipped at the file's
+/// hole end (round_up to the volume's block), where APFS stops allocating.
 fn cluster_pushes(n: u64) -> Result<fsops::Pushes, String> {
     const PAGE: u64 = 16 << 10;
     const MAX_CLUSTERS: usize = 4;
@@ -1799,12 +1788,11 @@ fn cluster_pushes(n: u64) -> Result<fsops::Pushes, String> {
 }
 
 /// AppleKeyStore's map for the system data volume (AKS 0x308d0, 35
-/// entries; drafts/s14/restored/aks_bootstrap_map.txt): path, flags (1:
-/// set the class on a directory, 8: skipped), mode, owner and group as the
-/// ramdisk's /etc/master.passwd and /etc/group name them (root and wheel
-/// 0, daemon 1, _securityd 64, _wireless 25, _networkd 24, mobile 501;
-/// drafts/s26/re-aks-data.md 2.5), class. The flags-0x0a entries are left
-/// out: skipped.
+/// entries): path, flags (1: set the class on a directory, 8: skipped),
+/// mode, owner and group as the ramdisk's /etc/master.passwd and /etc/group
+/// name them (root and wheel 0, daemon 1, _securityd 64, _wireless 25,
+/// _networkd 24, mobile 501), class. The flags-0x0a entries are left out:
+/// skipped.
 const SYSTEM_MAP: [(&str, u32, u16, u32, u32, u32); 27] = [
     ("/keybags", 0x01, 0o700, 0, 0, 4),
     ("/logs", 0x01, 0o755, 0, 0, 4),
@@ -1835,11 +1823,11 @@ const SYSTEM_MAP: [(&str, u32, u16, u32, u32, u32); 27] = [
     ("/Managed Preferences/mobile", 0x01, 0o755, 501, 501, 4),
 ];
 
-/// fixup_var's `aks_bootstrap_fs("/mnt2", 1)` (AKS 0x13b1c; drafts/s26/
-/// re-aks-data.md 2-4), after `MKBKeyBagCreateSystem`, which writes nothing
-/// with enhanced APFS: with no /root/.bootstrapped, each system map entry in
-/// order (the mobile map is skipped with enhanced APFS): a missing path made
-/// by mkpath_np (missing intermediates by mkdir 0777 with no owner or class
+/// fixup_var's `aks_bootstrap_fs("/mnt2", 1)` (AKS 0x13b1c), after
+/// `MKBKeyBagCreateSystem`, which writes nothing with enhanced APFS: with
+/// no /root/.bootstrapped, each system map entry in order (the mobile map
+/// is skipped with enhanced APFS): a missing path made by mkpath_np
+/// (missing intermediates by mkdir 0777 with no owner or class
 /// change, then the entry's mkdir with its mode masked to 0777), chmod to the
 /// entry's mode when it is 0x200 or more, chown to its owner and group; then
 /// a directory whose entry has flag 1 given the entry's class when its
@@ -1891,20 +1879,18 @@ fn aks_bootstrap_fs(nx: &mut Nx<'_>, data: usize, now: &mut dyn FnMut() -> u64) 
 }
 
 /// What fixup_var's copy of /private/var onto Data takes from the device
-/// run and from what is not traced (drafts/s27/re-bomcopy.md UNSETTLED,
-/// drafts/s27/re-datawrite.md UNSETTLED).
+/// run and from what is not traced.
 pub const BOM_STAND_IN: &str = "what fixup_var's BOM copy of /private/var onto Data takes from the run (drafts/s27/re-bomcopy.md, re-datawrite.md): mktemp's random temporary names, which decide where their directory records sit until the rename (stand-in .BC.T_AAAAAA for files, .BC.D_AAAAAA for the link), the kernel's readdir order of a System directory whose files the copy unlinks as it goes (stand-in: key order, resumed after the last entry read), listxattr's order and its hiding of com.apple.fs.symlink (stand-in: the attribute records' key order, the link's target attribute not listed), when the change times the renames of the copied plain files leave in memory are written (a sync pass or the vnode's reclaim: listed as pending), and for the files written in several 128 KiB writes the cluster layer's sizes and pushes (as CLUSTER_STAND_IN's) and whether a second passes between a file's creation and an append, which starts grow-ahead (stand-in: the clock of the machine building the image); measure /private/var on a restored device, and a kdebug trace of the copy";
 
 /// BOM's temporary names ([`BOM_STAND_IN`]).
 const BOM_FILE_TEMP: &str = ".BC.T_AAAAAA";
 const BOM_LINK_TEMP: &str = ".BC.D_AAAAAA";
 
-/// fixup_var's copy of /mnt1/private/var onto /mnt2 (Bom's legacy engine,
-/// drafts/s27/re-bomcopy.md 0.1, 2; drafts/s27/re-datawrite.md 0) with
-/// restored's handler unlinking each copied regular file under a moved
-/// tree from System (drafts/s18/re-unlink-order.md), then removefile of
-/// the moved trees. The walk takes System's directories in readdir order
-/// onto Data's root, which is never changed itself:
+/// fixup_var's copy of /mnt1/private/var onto /mnt2 (Bom's legacy engine)
+/// with restored's handler unlinking each copied regular file under a moved
+/// tree from System, then removefile of the moved trees. The walk takes
+/// System's directories in readdir order onto Data's root, which is never
+/// changed itself:
 /// - a directory not on Data (only one under a directory BOM found there
 ///   is looked for): mkdir 0777 (its parent's group), lchown, chmod to its
 ///   mode, its contents, then setattrlist of its modification and access
@@ -2111,9 +2097,8 @@ pub enum NvramValue {
 
 /// A change restored makes to the NVRAM variables (`IODeviceTree:/options`,
 /// IODTNVRAM) through IORegistryEntrySetCFProperty on its NVRAM queue
-/// (RE@0x100062818; drafts/s27/re-mountpoints.md 0.2, 5.5): a variable
-/// deleted (`IONVRAM-DELETE-PROPERTY` = its name; one that is not there is
-/// no error) or set.
+/// (RE@0x100062818): a variable deleted (`IONVRAM-DELETE-PROPERTY` = its
+/// name; one that is not there is no error) or set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NvramOp {
     Delete(&'static str),
@@ -2139,12 +2124,12 @@ fn set_filesystem_permissions(o: &RestoreOptions, nv: &mut Vec<NvramOp>) {
 }
 
 /// The NVRAM changes of the steps from check_mounted's
-/// create_partition_mountpoints to set_tdm (drafts/s27/re-mountpoints.md
-/// 0.2, 2.2, 4, 5), in order: set_filesystem_permissions'; none from
-/// create_production_ucrt (its UCRT fetch is compiled out, RE@0x1000266f0
-/// returns NULL, so it makes no call at all); set_one_time_boot_command's
-/// (RE@0x100039ebc: one-time-boot-command deleted, or set to "checkerboard"
-/// with `SetFieldDiagnosticsBoot`); none from set_nvram_variables (a no-op,
+/// create_partition_mountpoints to set_tdm, in order:
+/// set_filesystem_permissions'; none from create_production_ucrt (its UCRT
+/// fetch is compiled out, RE@0x1000266f0 returns NULL, so it makes no call
+/// at all); set_one_time_boot_command's (RE@0x100039ebc:
+/// one-time-boot-command deleted, or set to "checkerboard" with
+/// `SetFieldDiagnosticsBoot`); none from set_nvram_variables (a no-op,
 /// RE@0x100039f30); persistent_boot_args' (RE@0x100039e14: after the host
 /// answers its message 0x19, boot-args set to "": the CFData attempt is
 /// refused by the kernel, boot-args being a string variable, and the
@@ -2385,8 +2370,8 @@ const VOLUME_TABLE: [(&str, &str); 10] = [
 /// Baseband Data entry: with `UpdateBaseband` RE@0x10004af6c needs an
 /// IOService "baseband" (not Leda) or "AppleConvergedIPCLedaBBControl",
 /// without it RE@0x1000456ac needs `/filesystems/fstab/baseband-vol`; J120's
-/// device tree has none of them (drafts/s14/restored/dt.txt: no baseband
-/// node, fstab xart, system, preboot, data, update, hardware).
+/// device tree has none of them (no baseband node; fstab xart, system,
+/// preboot, data, update, hardware).
 const J120_BASEBAND: bool = false;
 
 /// The object `path` names below volume `vol`'s root, if any (repeated
@@ -2402,9 +2387,8 @@ fn resolve(nx: &mut Nx<'_>, vol: usize, path: &str) -> Result<Option<u64>, Strin
     Ok(Some(dir))
 }
 
-/// create_partition_mountpoints (RE@0x10003a070; drafts/s27/
-/// re-mountpoints.md 2.3), after its block's set_filesystem_permissions
-/// (NVRAM changes only, re-mountpoints.md 2.2): for the volume table's
+/// create_partition_mountpoints (RE@0x10003a070), after its block's
+/// set_filesystem_permissions (NVRAM changes only): for the volume table's
 /// xART, Logs (with a `LogPartitionSize`), Hardware, Scratch and Update
 /// entries (Baseband Data only with a baseband; System, Data, User and
 /// Preboot skipped), the mount
@@ -2415,9 +2399,8 @@ fn resolve(nx: &mut Nx<'_>, vol: usize, path: &str) -> Result<Option<u64>, Strin
 /// UF_IMMUTABLE whether it was there or not, a failure of either logged and
 /// not fatal. After fixup_var only /internal is missing on the erase
 /// restore: one directory made by mkdir 0755, chmod's fast path, chown 0:0,
-/// chmod 0777 and chflags 0x20002 (re-mountpoints.md 0.1). The ramdisk's
-/// securelevel is not known (re-mountpoints.md UNSETTLED 5): a flags change
-/// whose answer needs it is refused.
+/// chmod 0777 and chflags 0x20002. The ramdisk's securelevel is not
+/// known: a flags change whose answer needs it is refused.
 pub fn create_partition_mountpoints(nx: &mut Nx<'_>, system: usize, data: usize, o: &RestoreOptions, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     use fsops::bsd_flags::{SF_APPEND, SF_IMMUTABLE, UF_APPEND, UF_IMMUTABLE};
     for (i, (name, path)) in VOLUME_TABLE.iter().enumerate() {
@@ -2587,23 +2570,23 @@ fn copyfile_data(nx: &mut Nx<'_>, vol: usize, f: u64, data: &[u8], now: &mut dyn
 }
 
 /// The copy of one System item at `src` to Preboot's `parent`/`name`
-/// (copytree's per-item copyfile calls, drafts/s27/re-populate.md 4.2,
-/// copyfile-196.120.5 copytree l.700-970, copyfile l.1224-1420): a
-/// directory's pre-order copy (an existing one given its own owner, group
-/// and mode by chmodx_np, then its owner and group and mode back by the
-/// epilogue's fchown and fchmod; a new one made by mkdir with the source's
-/// mode and S_IRWXU), its children in the order getattrlistbulk returns
-/// them (the directory's records in key order, [`fsops::read_dir`]), its
-/// cleanup (chmodx_np of its own settings, fchmod to the source's mode,
-/// then copyfile_stat: fsetattrlist of the source's modification and access
-/// times, fchown, fchmod, FSIOC_CAS_BSDFLAGS); a regular file not at the
-/// destination created (O_EXCL, the source's mode with S_IWUSR), its data
-/// ([`copyfile_data`]), fchmodx_np of the source's owner, group and mode,
-/// copyfile_stat's calls, and the close's push and PREV_FSIZE removal
-/// ([`fsops::close_pushed`]); a file at the destination skipped by the
-/// status callback (RE@0x100057120 "already exists"), a symbolic link too
-/// ("skipping symlink"). Extended attributes and ACLs on either side and
-/// other file types are not implemented.
+/// (copytree's per-item copyfile calls, copyfile-196.120.5 copytree
+/// l.700-970, copyfile l.1224-1420): a directory's pre-order copy (an
+/// existing one given its own owner, group and mode by chmodx_np, then its
+/// owner and group and mode back by the epilogue's fchown and fchmod; a new
+/// one made by mkdir with the source's mode and S_IRWXU), its children in
+/// the order getattrlistbulk returns them (the directory's records in key
+/// order, [`fsops::read_dir`]), its cleanup (chmodx_np of its own settings,
+/// fchmod to the source's mode, then copyfile_stat: fsetattrlist of the
+/// source's modification and access times, fchown, fchmod,
+/// FSIOC_CAS_BSDFLAGS); a regular file not at the destination created
+/// (O_EXCL, the source's mode with S_IWUSR), its data ([`copyfile_data`]),
+/// fchmodx_np of the source's owner, group and mode, copyfile_stat's calls,
+/// and the close's push and PREV_FSIZE removal ([`fsops::close_pushed`]); a
+/// file at the destination skipped by the status callback (RE@0x100057120
+/// "already exists"), a symbolic link too ("skipping symlink"). Extended
+/// attributes and ACLs on either side and other file types are not
+/// implemented.
 #[allow(clippy::too_many_arguments)]
 fn populate_item(nx: &mut Nx<'_>, sys: usize, pb: usize, src: u64, parent: u64, name: &str, rel: &str, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     use fsops::SetAttr;
@@ -2689,9 +2672,8 @@ mod preboot_flags {
 }
 
 /// populate_preboot_volume (RE@0x10001948c → RE@0x100030be8 →
-/// `_ramrod_populate_preboot_volume` RE@0x100057208; drafts/s27/
-/// re-populate.md, drafts/s31 notes), the last step of the install, with
-/// System at /mnt1:
+/// `_ramrod_populate_preboot_volume` RE@0x100057208), the last step of the
+/// install, with System at /mnt1:
 /// - force_unmount_partition(9, 0): Preboot's `unmount("/mnt9", 0)`, not
 ///   forced, when it is mounted; then `mount_apfs -R` mounts it again (its
 ///   `.fseventsd/.ramdisk-boot-done` open fails at its lookup);
@@ -2764,15 +2746,13 @@ fn populate_preboot_volume(nx: &mut Nx<'_>, v: Volumes, p: &str, now: &mut dyn F
     fsops::unmount(nx, pb, false, now)
 }
 
-/// The NVRAM changes of set_boot_command and set_autoboot_delay
-/// (drafts/s27/re-seal-snap.md 0.2, 1, 2), which gex's missing NVRAM store
-/// cannot take.
+/// The NVRAM changes of set_boot_command and set_autoboot_delay, which
+/// gex's missing NVRAM store cannot take.
 const NVRAM_AUTOBOOT_MISSING: &str = "set_boot_command's and set_autoboot_delay's NVRAM changes (IODeviceTree:/options): boot-command deleted when it holds \"upgrade\" (reset_boot_command_if_in_values, RE@0x100033d98), then, after set_autoboot_delay's sync(2), auto-boot set to \"true\" and bootdelay to \"0\" (AutoBootDelay's default 0, RE@0x100033ed4) with IONVRAM-FORCESYNCNOW-PROPERTY: gex has no NVRAM variable store for them";
 
-/// set_autoboot_delay (RE@0x100019524 → RE@0x100033eb0; drafts/s27/
-/// re-seal-snap.md 2): with AutoBootDelay at its default 0, `sync()`
-/// (RE@0x100033ef8, [`fsops::sync`]) before its NVRAM writes
-/// ([`NVRAM_AUTOBOOT_MISSING`]).
+/// set_autoboot_delay (RE@0x100019524 → RE@0x100033eb0): with AutoBootDelay
+/// at its default 0, `sync()` (RE@0x100033ef8, [`fsops::sync`]) before its
+/// NVRAM writes ([`NVRAM_AUTOBOOT_MISSING`]).
 fn set_autoboot_delay(nx: &mut Nx<'_>, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     fsops::sync(nx, now)
 }
@@ -2808,14 +2788,13 @@ fn trusted_payload(device: &Device, code: &[u8; 4], img4: &[u8], what: &str) -> 
     }
 }
 
-/// seal_system_volume (RE@0x10003ab6c; drafts/s27/re-seal-snap.md 3): the
-/// canonical metadata unarchived on the ramdisk's /mnt5 (tmpfs) and
-/// `mtree -m` reading /mnt1 (the mounts set MNT_NOATIME: no write);
-/// unmount_filesystems_everything without Update (RE@0x10002ecb8: from
-/// the volume table's last slot down, each mounted volume forced:
-/// Preboot, Hardware, User, Data, xART after `seputil
-/// --gigalocker-shutdown` (a Secure Enclave call only), System), then
-/// Update's `unmount("/mnt4", 0)`; the container handed to
+/// seal_system_volume (RE@0x10003ab6c): the canonical metadata unarchived
+/// on the ramdisk's /mnt5 (tmpfs) and `mtree -m` reading /mnt1 (the mounts
+/// set MNT_NOATIME: no write); unmount_filesystems_everything without
+/// Update (RE@0x10002ecb8: from the volume table's last slot down, each
+/// mounted volume forced: Preboot, Hardware, User, Data, xART after
+/// `seputil --gigalocker-shutdown` (a Secure Enclave call only), System),
+/// then Update's `unmount("/mnt4", 0)`; the container handed to
 /// apfs_sealvolume (RUN_STAND_IN, as for apfs_invert); the seal
 /// ([`super::sealvolume::seal_volume`]); then `mount_partition(0, ro)`,
 /// the kernel's next mount of the container (its reaper idle, System
@@ -2888,13 +2867,13 @@ fn arv_snapshot_name(img4_file: &[u8]) -> Result<String, String> {
     Ok(format!("com.apple.os.update-{}", p[0x10..0x10 + n].iter().map(|b| format!("{b:02X}")).collect::<String>()))
 }
 
-/// create_system_snapshot (RE@0x100039ab4; drafts/s27/re-seal-snap.md 4):
-/// preboot_path's `mount_partition(9, rw)` and its /mnt9/<nsih>; the root
-/// hash Image4 file install_root_hash wrote there read; the update
-/// snapshot's name made of it (the name the device tree's
-/// `root-snapshot-name` gives the booted kernel, [`storage::ROOT_SNAPSHOT`]);
-/// `fs_snapshot_create` on /mnt1 ([`super::snapshot::fs_snapshot_create`]).
-/// With that name, no `mount_partition(0, 0)` and no `fs_snapshot_root`.
+/// create_system_snapshot (RE@0x100039ab4): preboot_path's
+/// `mount_partition(9, rw)` and its /mnt9/<nsih>; the root hash Image4 file
+/// install_root_hash wrote there read; the update snapshot's name made of
+/// it (the name the device tree's `root-snapshot-name` gives the booted
+/// kernel, [`storage::ROOT_SNAPSHOT`]); `fs_snapshot_create` on /mnt1
+/// ([`super::snapshot::fs_snapshot_create`]). With that name, no
+/// `mount_partition(0, 0)` and no `fs_snapshot_root`.
 fn create_system_snapshot(nx: &mut Nx<'_>, v: Volumes, dir: &str, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     fsops::mount_rw(nx, v.preboot, now)?;
     resolve(nx, v.preboot, dir)?.ok_or_else(|| format!("no /mnt9/{dir}"))?;
@@ -2910,12 +2889,11 @@ fn create_system_snapshot(nx: &mut Nx<'_>, v: Volumes, dir: &str, now: &mut dyn 
     }
 }
 
-/// migrate_user_fsevents (RE@0x10003c044; re-seal-snap.md 5): with
-/// `e-apfs` the data volume is split, so xART (`seputil
-/// --gigalocker-init` only stats it and calls the Secure Enclave), Data
-/// and User are mounted read-write (`mount_apfs -R`; the
-/// `.ramdisk-boot-done` opens fail at their lookups); neither User's nor
-/// Data's root has `.fseventsd`, so nothing is migrated.
+/// migrate_user_fsevents (RE@0x10003c044): with `e-apfs` the data volume is
+/// split, so xART (`seputil --gigalocker-init` only stats it and calls the
+/// Secure Enclave), Data and User are mounted read-write (`mount_apfs -R`;
+/// the `.ramdisk-boot-done` opens fail at their lookups); neither User's
+/// nor Data's root has `.fseventsd`, so nothing is migrated.
 fn migrate_user_fsevents(nx: &mut Nx<'_>, v: Volumes, data: usize, user: usize, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     for vol in [v.xart, data, user] {
         fsops::mount_rw(nx, vol, now)?;
@@ -3613,12 +3591,12 @@ mod tests {
 
     /// apfs_sealvolume against the device's own binary
     /// (GEX_TEST_SEALVOLUME: the host-runnable copy that takes a container
-    /// file, drafts/s18/bin/sv_file.mac; with GEX_TEST_UDIF, GEX_TEST_MTREE,
-    /// GEX_TEST_ROOT_HASH and GEX_TEST_SCRATCH): the container as the
-    /// restore hands it to apfs_sealvolume, sealed by the binary on a copy
-    /// and by the port, block for block (the port given the binary's two
-    /// clock readings; `-P` gives the binary the root hash's IM4P, whose
-    /// payload the device's Image4 file carries).
+    /// file; with GEX_TEST_UDIF, GEX_TEST_MTREE, GEX_TEST_ROOT_HASH and
+    /// GEX_TEST_SCRATCH): the container as the restore hands it to
+    /// apfs_sealvolume, sealed by the binary on a copy and by the port,
+    /// block for block (the port given the binary's two clock readings;
+    /// `-P` gives the binary the root hash's IM4P, whose payload the
+    /// device's Image4 file carries).
     #[test]
     fn seal_matches_the_device_binary() {
         use crate::darwin::apfsread::Container;
@@ -3639,7 +3617,7 @@ mod tests {
         let db_path = dir.join(format!("gex-seal-digest-{pid}.db"));
         let plist_path = dir.join(format!("gex-seal-remap-{pid}.plist"));
         std::fs::write(&db_path, crate::darwin::aar::file(&archive, "digest.db").unwrap()).unwrap();
-        // The remap dictionary mtree -m writes (drafts/s18/exp/remap.plist).
+        // The remap dictionary mtree -m writes.
         let t = "1777576853000000000";
         let keys = ["ACCESS", "BIRTH", "CHANGE", "DATEADDED", "MODIFICATION"].iter().map(|k| format!("\t<key>{k}</key>\n\t<integer>{t}</integer>\n")).collect::<String>();
         std::fs::write(&plist_path, format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n{keys}</dict>\n</plist>\n")).unwrap();
@@ -3917,8 +3895,8 @@ mod tests {
     /// Data allocations of every size against the device library's
     /// `spaceman_alloc` (GEX_TEST_NEWFS_A: the host-runnable user-space
     /// `newfs_apfs -A`; GEX_TEST_DA_HOOK: the hook that calls the
-    /// library's own allocator at its first allocation, drafts/s18/da;
-    /// with GEX_TEST_SCRATCH): on disk0's container as asr finds it, each
+    /// library's own allocator at its first allocation; with
+    /// GEX_TEST_SCRATCH): on disk0's container as asr finds it, each
     /// allocation's blocks and the roving pointer after it, then every
     /// allocation zone's chunk, ring and index. The sequence fills the
     /// 4- and 1-block zones' chunks (the 1-block zone's is its chunk-info
@@ -4013,14 +3991,13 @@ mod tests {
 
     /// The encrypted Data and User volumes after the invert (GEX_TEST_UDIF,
     /// GEX_TEST_SCRATCH, GEX_TEST_FSCK): Data's superblock as the kernel's
-    /// volumeCreate and read-write mount leave it (drafts/s16/re-protected.md
-    /// 2.1, drafts/s21/re-data.md 1) with fixup_var's directories and copy
-    /// counted, the copy's objects by type, /internal, the pfkur thread's temporary inode,
-    /// User's epoch, the container keybag's four entries; the device's and
-    /// the host's fsck_apfs with -M (their keybag read needs the device's
-    /// crypto I/O, drafts/s21/re-data.md 4), and the host's on a copy
-    /// presenting the encrypted volumes as unencrypted, which checks their
-    /// trees.
+    /// volumeCreate and read-write mount leave it with fixup_var's
+    /// directories and copy counted, the copy's objects by type, /internal,
+    /// the pfkur thread's temporary inode, User's epoch, the container
+    /// keybag's four entries; the device's and the host's fsck_apfs with -M
+    /// (their keybag read needs the device's crypto I/O), and the host's on
+    /// a copy presenting the encrypted volumes as unencrypted, which checks
+    /// their trees.
     #[test]
     fn data_volume_is_made_as_the_kernel_makes_it() {
         use crate::darwin::apfsread::{Container, Medium, Omap};
@@ -4063,11 +4040,10 @@ mod tests {
         // /keybags (0x11), usersession.kb (0x12) and the overprovisioning
         // file (0x13: one contiguous unwritten extent of 156,250 blocks,
         // trimmed when the device answers DK_FEATURE_UNMAP); then fixup_var:
-        // aks_bootstrap_fs' 27 directories and /root/.bootstrapped
-        // (drafts/s26/re-aks-data.md), BOM's copy of the image's /private/var
-        // (drafts/s27/re-bomcopy.md 0.1: 6,719 directories, 530 plain and
-        // 3,723 compressed files, 2,041 of these with a resource-fork stream
-        // named by an object identifier of its own, one link), then
+        // aks_bootstrap_fs' 27 directories and /root/.bootstrapped, BOM's
+        // copy of the image's /private/var (6,719 directories, 530 plain
+        // and 3,723 compressed files, 2,041 of these with a resource-fork
+        // stream named by an object identifier of its own, one link), then
         // create_partition_mountpoints' /internal.
         let (files, links, forks) = (2 + 1 + 530 + 3_723, 1, 2_041);
         let next = 0x14 + 27 + 1 + 6_719 + 530 + 3_723 + links + forks + 1;
@@ -4076,8 +4052,8 @@ mod tests {
         assert_eq!((u32::from_le_bytes(pfkur[24..28].try_into().unwrap()), u32::from_le_bytes(pfkur[28..32].try_into().unwrap())), (0x4000_0002, 0x20));
         let usb = c.read_raw(com.lookup(&c, c.nx.fs_oid[6], c.xid()).unwrap().unwrap().paddr).unwrap();
         assert_eq!((q(&usb, 0x38), q(&usb, 0x108), q(&usb, 0xb0), q(&usb, 0x3d8), u16::from_le_bytes([usb[0x3c4], usb[0x3c5]])), (0x388, 0, 0x48, 0x10, 2));
-        // The template copy and the AKS bootstrap (drafts/s23/re-user-copy.md
-        // 4): 18 + 34 directories, 4 files.
+        // The template copy and the AKS bootstrap: 18 + 34 directories, 4
+        // files.
         assert_eq!((q(&usb, 0xb8), q(&usb, 0xc0)), (4, 52));
         assert_ne!(q(&usb, 0x448), 0);
         // The volume's object map and file-system tree, read raw (the reader
@@ -4176,10 +4152,10 @@ mod tests {
         assert!(bad.is_empty(), "{out}");
         assert_eq!(out.lines().filter(|l| l.starts_with("warning: overallocation detected")).count(), orphans.len(), "{out}");
         assert!(out.contains("appears to be OK") && out.contains(&format!("{:x}+1", kb)), "{out}");
-        // User's tree through the view (drafts/s23/re-user-copy.md 4), its
-        // expanded-records and unwritten-extents flags cleared for gex's
-        // reader, which refuses them (User has no extents, and the records
-        // read here are laid out alike).
+        // User's tree through the view, its expanded-records and
+        // unwritten-extents flags cleared for gex's reader, which refuses
+        // them (User has no extents, and the records read here are laid out
+        // alike).
         {
             use std::os::unix::fs::FileExt;
             let c = open();
@@ -4465,9 +4441,8 @@ mod tests {
             || unnamed.iter().any(|o| l.contains(&format!("orphan omap mapping found for oid {o}")) || l.contains(&format!("orphan omap mapping (oid {o} ")))
     }
 
-    /// The NVRAM changes of the steps after fixup_var
-    /// (drafts/s27/re-mountpoints.md 0.2): with restored's defaults, and with
-    /// the options that change them.
+    /// The NVRAM changes of the steps after fixup_var: with restored's
+    /// defaults, and with the options that change them.
     #[test]
     fn nvram_changes_follow_the_restore_options() {
         use NvramOp::{Attempt, Delete, Set};
@@ -4582,16 +4557,16 @@ mod tests {
     }
 
     /// check_mounted's create_partition_mountpoints on a container of its
-    /// own (GEX_TEST_FSCK, GEX_TEST_SCRATCH; drafts/s27/re-mountpoints.md 0.1,
-    /// 3): System's /private/xarts and Data's /hardware and
-    /// /MobileSoftwareUpdate already there (the image's, the BOM copy's and
-    /// aks_bootstrap_fs'), so only /internal is made: mkdir 0755, chmod's
-    /// fast path (a clock reading, nothing written), chown 0:0, chmod 0777,
-    /// chflags SF_IMMUTABLE | UF_IMMUTABLE, ten clock readings in all;
-    /// nothing on System. Then chflags' own refusals (each before any
-    /// transaction), its masks and its write of unchanged flags; the
-    /// device's and the host's fsck_apfs -M and the host's on the
-    /// unencrypted view, mounted and after the unmounts.
+    /// own (GEX_TEST_FSCK, GEX_TEST_SCRATCH): System's /private/xarts and
+    /// Data's /hardware and /MobileSoftwareUpdate already there (the
+    /// image's, the BOM copy's and aks_bootstrap_fs'), so only /internal is
+    /// made: mkdir 0755, chmod's fast path (a clock reading, nothing
+    /// written), chown 0:0, chmod 0777, chflags SF_IMMUTABLE |
+    /// UF_IMMUTABLE, ten clock readings in all; nothing on System. Then
+    /// chflags' own refusals (each before any transaction), its masks and
+    /// its write of unchanged flags; the device's and the host's fsck_apfs
+    /// -M and the host's on the unencrypted view, mounted and after the
+    /// unmounts.
     #[test]
     fn partition_mountpoints_make_only_internal() {
         use fsops::bsd_flags::*;
@@ -4716,17 +4691,17 @@ mod tests {
     }
 
     /// fixup_var's copy of a small /private/var on System onto Data, with the
-    /// moved tree's removal (GEX_TEST_FSCK, GEX_TEST_SCRATCH; drafts/s27/
-    /// re-bomcopy.md, re-datawrite.md): a directory Data has left as it is
-    /// and walked into; new directories with the source's owners, modes and
-    /// times; plain files of class 3 (the volume's key: identifier 4, each
-    /// extent its own block as tweak) written once or in three appends, a
-    /// class-4 file (a per-file key, its record referenced per extent) of
-    /// two blocks, an empty file; a compressed file with its decmpfs header
-    /// and one with a resource fork stream; a symbolic link; the plain
-    /// files' rename times held in memory; the moved tree's file unlinked
-    /// and its directories removed from System. Then the device's and the
-    /// host's fsck_apfs -M and the host's on the unencrypted view.
+    /// moved tree's removal (GEX_TEST_FSCK, GEX_TEST_SCRATCH): a directory
+    /// Data has left as it is and walked into; new directories with the
+    /// source's owners, modes and times; plain files of class 3 (the
+    /// volume's key: identifier 4, each extent its own block as tweak)
+    /// written once or in three appends, a class-4 file (a per-file key,
+    /// its record referenced per extent) of two blocks, an empty file; a
+    /// compressed file with its decmpfs header and one with a resource fork
+    /// stream; a symbolic link; the plain files' rename times held in
+    /// memory; the moved tree's file unlinked and its directories removed
+    /// from System. Then the device's and the host's fsck_apfs -M and the
+    /// host's on the unencrypted view.
     #[test]
     fn var_copy_makes_data_as_the_kernel_makes_it() {
         let (Ok(dir), Ok(fsck)) = (std::env::var("GEX_TEST_SCRATCH"), std::env::var("GEX_TEST_FSCK")) else { return };
@@ -4959,7 +4934,7 @@ mod tests {
     /// Data's read-write mount and unmount on a container of its own
     /// (GEX_TEST_FSCK: the device's host-runnable fsck_apfs; scratch in
     /// GEX_TEST_SCRATCH): the clone epoch, the pfkur thread's temporary
-    /// inode (drafts/s23: alloc_tmp_ino_helper's parameters) and the fixup
+    /// inode (alloc_tmp_ino_helper's parameters) and the fixup
     /// thread's transaction at the mount, User's epoch only, the inode gone
     /// at Data's unmount; the device's and the host's fsck_apfs -M, and the
     /// host's on the unencrypted view, after each.
@@ -4999,9 +4974,9 @@ mod tests {
         assert!(!nx.pfkur_tmp.contains_key(&2));
         let sb = nx.vol_sb_read(2).unwrap().0.to_vec();
         assert_eq!((q(&sb, 0xb0), q(&sb, 0x3d8)), (0x10, 0x10));
-        // UserManagementLayout's manifest on Data (drafts/s23/re-uml-data.md):
-        // /keybags with the subdirectory count, the class-D file with its
-        // per-file key record, the fsync, the rename, F_BARRIERFSYNC's commit.
+        // UserManagementLayout's manifest on Data: /keybags with the
+        // subdirectory count, the class-D file with its per-file key
+        // record, the fsync, the rename, F_BARRIERFSYNC's commit.
         let keybags = fsops::mkdir(&mut nx, 1, 2, "keybags", 0o700, 0, 0, &mut now).unwrap().unwrap();
         let ino = fsops::create_protected(&mut nx, 1, keybags, "usersession.kb.writing", 0o644, 0, 4, &mut now).unwrap();
         let kb = usersession_kb();
@@ -5038,9 +5013,8 @@ mod tests {
         assert_eq!(nx.xid, xid + 2, "the payload's checkpoint");
         sink.0.sync_all().unwrap();
         assert_eq!(keybag_entries(&path, blocks * 4096), vec![(du.clone(), 2, 0x28), (du, 10, 0x28), (uu.clone(), 2, 0x28), (uu.clone(), 0xd, 0x28), (uu, 0xf8, 0x28)]);
-        // reserve_overprov_space on Data (drafts/s21/re-overprov.md 4): the
-        // file, its one contiguous unwritten extent of 156,250 blocks, the
-        // commit, the trim's flag.
+        // reserve_overprov_space on Data: the file, its one contiguous
+        // unwritten extent of 156,250 blocks, the commit, the trim's flag.
         let xid = nx.xid;
         let ino = fsops::reserve_overprov_space(&mut nx, 1, 64_000_000_000, true, &mut now).unwrap();
         assert_eq!(nx.xid, xid + 1, "F_FULLFSYNC's checkpoint");
@@ -5053,10 +5027,10 @@ mod tests {
         assert_eq!((q(&fext[0], 0), q(&fext[0], 16)), (0x0300_0000_2625_a000, q(&fext[0], 8)));
         let sb = nx.vol_sb_read(1).unwrap().0.to_vec();
         assert_eq!((q(&sb, 0xb8), q(&sb, 0xe0)), (2, 156_251));
-        // fixup_var's aks_bootstrap_fs("/mnt2") (drafts/s26/re-aks-data.md): its
-        // first entry, /keybags, written from its in-memory object with the
-        // rename's times and class D; then the map's directories, owners,
-        // modes and classes, and /root/.bootstrapped taking /root's class.
+        // fixup_var's aks_bootstrap_fs("/mnt2"): its first entry, /keybags,
+        // written from its in-memory object with the rename's times and
+        // class D; then the map's directories, owners, modes and classes,
+        // and /root/.bootstrapped taking /root's class.
         let before = fsops::inode(&mut nx, 1, keybags).unwrap();
         let sb0 = nx.vol_sb_read(1).unwrap().0.to_vec();
         aks_bootstrap_fs(&mut nx, 1, &mut now).unwrap();
@@ -5128,7 +5102,7 @@ mod tests {
 
     #[test]
     fn cluster_pushes_follow_the_cluster_layer() {
-        // drafts/s26/re-cluster.md 2's table for 1 MiB clusters and maps.
+        // The limit table's 1 MiB clusters and maps (CLUSTER_STAND_IN's).
         let p = cluster_pushes(16_243_000).unwrap();
         let mut want: Vec<(u64, u64)> = (0..15).map(|k| (k << 20, 1 << 20)).collect();
         want.push((15_728_640, 516_096));
@@ -5203,13 +5177,12 @@ mod tests {
         assert!(host.status.success(), "host fsck: {}{}", String::from_utf8_lossy(&host.stdout), String::from_utf8_lossy(&host.stderr));
     }
 
-    /// The gigalocker file's close-time zero fill (drafts/s27/re-zerofill.md)
-    /// on a fresh xART-role volume: with 1 MiB block maps the first adds a
-    /// PREV_FSIZE field and the close's fsync removes it, two file-system
-    /// transactions (two clock readings, the last the volume's last
-    /// modification); one 6 MiB block map changes nothing; the inode and
-    /// records end as the truncate left them, the blocks zeroed; the
-    /// device's and the host's fsck.
+    /// The gigalocker file's close-time zero fill on a fresh xART-role
+    /// volume: with 1 MiB block maps the first adds a PREV_FSIZE field and
+    /// the close's fsync removes it, two file-system transactions (two
+    /// clock readings, the last the volume's last modification); one 6 MiB
+    /// block map changes nothing; the inode and records end as the truncate
+    /// left them, the blocks zeroed; the device's and the host's fsck.
     #[test]
     fn gigalocker_zero_fill_follows_its_block_maps() {
         let (Ok(dir), Ok(fsck)) = (std::env::var("GEX_TEST_SCRATCH"), std::env::var("GEX_TEST_FSCK")) else { return };
@@ -5274,13 +5247,12 @@ mod tests {
         assert!(stdio_writes(3 * 5000, 5000).is_err(), "a partly filled buffer before the next fwrite");
     }
 
-    /// install_splat's kernel paths on a fresh Preboot-role volume
-    /// (drafts/s27/re-splat.md 4): a file appended to in 8 KiB writes with no
-    /// grow-ahead (the clock barely moving) and one whose clock passes a
-    /// second after its creation (grow-ahead's hole left past the pushed
-    /// end), the copyfile of a small plain file into its preallocation, a
-    /// rename and the close's time write; the records and the device's and
-    /// host's fsck.
+    /// install_splat's kernel paths on a fresh Preboot-role volume: a file
+    /// appended to in 8 KiB writes with no grow-ahead (the clock barely
+    /// moving) and one whose clock passes a second after its creation
+    /// (grow-ahead's hole left past the pushed end), the copyfile of a
+    /// small plain file into its preallocation, a rename and the close's
+    /// time write; the records and the device's and host's fsck.
     #[test]
     fn splat_streams_are_checked_by_their_digests_length() {
         use sha2::Digest;

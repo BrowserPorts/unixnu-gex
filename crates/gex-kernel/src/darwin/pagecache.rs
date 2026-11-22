@@ -39,22 +39,21 @@
 //!
 //! The same pages give a task's disk I/O (`task_io_stats`: what
 //! `spec_strategy` sees its threads issue) and its logical writes (the
-//! `logical_writes` ledger). Per 21H461's AppleAPFS (notes in the
-//! handoff's Step 24): a file's data reads and writes all reach
-//! `spec_strategy` through `apfs_vnop_strategy`'s `buf_strategy` on the
-//! device vnode, in the thread that issues them: the pager's cluster at a
-//! fault (`cluster_pagein`), `read`'s misses, prefetch and read-ahead
-//! (`apfs_vnop_read`'s `cluster_read` with the call's flags), `write`'s
-//! reads of partial pages and its pushes (`apfs_vnop_write`'s
-//! `cluster_write`: `IO_SYNC` for `O_SYNC` and `O_DSYNC`, else the
-//! write-behind), `fsync`'s `cluster_push_err(IO_SYNC)` (`F_FULLFSYNC`
-//! and `F_BARRIERFSYNC` too: their transaction is the flusher thread's,
-//! kernel_task's), the last writer's close (`apfs_vnop_close`'s
-//! `VNOP_FSYNC(MNT_NOWAIT)`), and msync's pageouts (`cluster_pageout`).
-//! The pageout thread's and the syncer's writes are kernel_task's, as an
-//! aio worker's I/O is. Logical writes are XNU's alone but for
-//! AppleAPFS's `obj_dirty`: `cluster_write_copy`'s copies, a vnode page's
-//! first store fault, and the dirty pages a truncation or an
+//! `logical_writes` ledger). Per 21H461's AppleAPFS: a file's data reads
+//! and writes all reach `spec_strategy` through `apfs_vnop_strategy`'s
+//! `buf_strategy` on the device vnode, in the thread that issues them: the
+//! pager's cluster at a fault (`cluster_pagein`), `read`'s misses, prefetch
+//! and read-ahead (`apfs_vnop_read`'s `cluster_read` with the call's
+//! flags), `write`'s reads of partial pages and its pushes
+//! (`apfs_vnop_write`'s `cluster_write`: `IO_SYNC` for `O_SYNC` and
+//! `O_DSYNC`, else the write-behind), `fsync`'s `cluster_push_err(IO_SYNC)`
+//! (`F_FULLFSYNC` and `F_BARRIERFSYNC` too: their transaction is the
+//! flusher thread's, kernel_task's), the last writer's close
+//! (`apfs_vnop_close`'s `VNOP_FSYNC(MNT_NOWAIT)`), and msync's pageouts
+//! (`cluster_pageout`). The pageout thread's and the syncer's writes are
+//! kernel_task's, as an aio worker's I/O is. Logical writes are XNU's alone
+//! but for AppleAPFS's `obj_dirty`: `cluster_write_copy`'s copies, a vnode
+//! page's first store fault, and the dirty pages a truncation or an
 //! invalidation discards (a debit).
 
 use super::ubc::FileKey;

@@ -1,10 +1,10 @@
 //! The memory the AP and the SEP both address: the web device's carve-outs
 //! for the sepOS, the shared buffer and the endpoints' buffers.
 //!
-//! The SEP has no IOMapper on the J120 (`drafts/sep/01-a7iop-mailbox.md`
-//! section 6: the `sep` node has no `iommu-parent` and `/arm-io` has no
-//! `dart-sep`), so every address the AP gives it is a physical address: the
-//! firmware's (`AppleSEPFirmware::_mapMemoryToSEP`), the shared memory's
+//! The SEP has no IOMapper on the J120 (the `sep` node has no
+//! `iommu-parent` and `/arm-io` has no `dart-sep`), so every address the AP
+//! gives it is a physical address: the firmware's
+//! (`AppleSEPFirmware::_mapMemoryToSEP`), the shared memory's
 //! (`IOSlaveMemoryBuffer::initWithOptions`: the slave address is
 //! `getPhysicalAddress()`), the endpoints' OOL buffers'. gex has no AP DRAM
 //! to point at, so the carve-outs are the web device's own: this pool hands

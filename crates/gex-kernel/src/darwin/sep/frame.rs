@@ -1,6 +1,5 @@
 //! The mailbox message and the endpoint numbers and opcodes AppleSEPManager
-//! uses (`drafts/sep/02-transport.md` and `03-boot-handshake.md`, read from
-//! the kernelcache's AppleSEPManager).
+//! uses (read from the kernelcache's AppleSEPManager).
 //!
 //! A message is one 64-bit little-endian word: byte 0 the endpoint, byte 1
 //! the tag, byte 2 the opcode, byte 3 the parameter (a reply's status on the
@@ -68,9 +67,8 @@ pub mod ep {
     pub const BOOTSTRAP: u8 = 0xff;
 }
 
-/// Control endpoint (EP0) opcodes: the AP's requests, with their layouts in
-/// 02-transport.md section 4.2, and the sepOS's unsolicited messages
-/// (tag 0), section 4.1.
+/// Control endpoint (EP0) opcodes: the AP's requests and the sepOS's
+/// unsolicited messages (tag 0).
 pub mod control {
     pub const PING: u8 = 0x00;
     pub const SET_OOL_IN_ADDRESS: u8 = 0x02;
@@ -99,7 +97,7 @@ pub mod discovery {
     pub const ADVERTISE_OOLS: u8 = 1;
 }
 
-/// The SEP ROM's protocol on `ep::BOOTSTRAP` (03-boot-handshake.md section 3).
+/// The SEP ROM's protocol on `ep::BOOTSTRAP`.
 pub mod rom {
     // AP to SEPROM.
     pub const STATUS: u8 = 0x02;

@@ -5,8 +5,8 @@
 //! The SEP core is a 32-bit ARMv7 core on the J120: the kernel registers
 //! its core dumps as `CPU_TYPE_ARM`, `CPU_SUBTYPE_ARM_V7` unless the `sep`
 //! node has an `aarch64` property, which it does not
-//! (`drafts/sep/07-sep-core.md`, K 0xfffffff0063d88d8). A core runs only
-//! when every input is the owner's real one:
+//! (K 0xfffffff0063d88d8). A core runs only when every input is the owner's
+//! real one:
 //!
 //! 1. the decrypted sepOS payload (`GEX_DARWIN_SEPOS`): the AP sends it to
 //!    the SEP ROM, which decrypts it with the SEP's GID key and verifies
@@ -142,8 +142,8 @@ pub struct Platform {
 }
 
 /// The SEP's platform, as far as the evidence gives it. The AP's binaries
-/// say only that the core is ARMv7 with 4 KiB pages (07-sep-core.md §1);
-/// everything [`Platform`] holds is in the SEP ROM and the sepOS.
+/// say only that the core is ARMv7 with 4 KiB pages; everything
+/// [`Platform`] holds is in the SEP ROM and the sepOS.
 pub fn platform() -> Result<Platform, Gap> {
     Err(Gap::NoPlatform(vec![
         "the physical addresses of the ROM, the SRAM and TZ0",

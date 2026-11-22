@@ -1,9 +1,9 @@
 //! AppleA7IOPV2, the driver `iop,s8000` matches for the SEP, as the
 //! manager uses it: a doorbell action, start and stop of the core, and the
-//! two mailbox calls (`drafts/sep/01-a7iop-mailbox.md`, sections 3 to 5;
-//! K 0xfffffff005b126fc `startCPUWithOptions`, K 0xfffffff005b128cc
-//! `stopCPU`, K 0xfffffff005b133b0 `postMailbox`, K 0xfffffff005b131a0
-//! `getMailbox`, and the V2 register accessors from K 0xfffffff006c2ed94).
+//! two mailbox calls (K 0xfffffff005b126fc `startCPUWithOptions`,
+//! K 0xfffffff005b128cc `stopCPU`, K 0xfffffff005b133b0 `postMailbox`,
+//! K 0xfffffff005b131a0 `getMailbox`, and the V2 register accessors from
+//! K 0xfffffff006c2ed94).
 //!
 //! The device-tree properties that change its behaviour are absent on the
 //! J120's `sep` node (`ignore-mailboxes`, `cpu-ctrl-filtered`,

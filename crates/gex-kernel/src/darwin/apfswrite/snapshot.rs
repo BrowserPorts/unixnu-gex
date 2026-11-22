@@ -1,9 +1,8 @@
 //! The kernel's snapshot of a volume (`fs_snapshot_create`, XNU
 //! `snapshot_create` → `vn_create` in the snapshot directory →
 //! `apfs_snap_vnop_create` K 0x6666d94 → `clone_fs` K 0x66691c0; the APFS
-//! kext 2236.140.6, drafts' re-seal-snap.md 4 the transcription), as
-//! create_system_snapshot makes the System volume's update snapshot: one
-//! transaction, committed and waited for:
+//! kext 2236.140.6), as create_system_snapshot makes the System volume's
+//! update snapshot: one transaction, committed and waited for:
 //!
 //! - a physical copy of the volume superblock (the snapshot's), its object
 //!   map, snapshot tree, extent-reference tree and revert fields cleared;
@@ -67,7 +66,7 @@ pub fn fs_snapshot_create(nx: &mut Nx<'_>, vol: usize, name: &str, now: &mut dyn
     let sealed = u64a(sb, 0x38) & 0x20 != 0;
     // A sealed volume: the caller's create-sealed-snapshot entitlement
     // (K 0x6668f94) lets it on; a read-only mount of a sealed volume is
-    // allowed (re-seal-snap.md 4.3).
+    // allowed.
     if !sealed {
         return Err("not implemented: a snapshot of a volume that is not sealed (the read-only mount's refusal, K 0x66812b4)".into());
     }

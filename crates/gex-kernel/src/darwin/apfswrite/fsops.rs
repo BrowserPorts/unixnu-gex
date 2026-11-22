@@ -86,8 +86,7 @@ fn fs_tx_enter(nx: &mut Nx<'_>, vol: usize) -> Result<(), String> {
 /// change's transaction; on a volume of a role that keeps document
 /// identifiers (no role, User, Data, Enterprise), +0x428's 0x10 too; then
 /// `tx_leave(nx, xid, 0)`, whose close rule ([`Nx::close_due`], checked at
-/// every leave: drafts/s27/re-txdata.md 0.2) commits the transaction when
-/// this was its last holder.
+/// every leave) commits the transaction when this was its last holder.
 fn fs_tx_leave(nx: &mut Nx<'_>, vol: usize, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     fs_tx_mark(nx, vol, now)?;
     if nx.close_due(0)? {
@@ -179,9 +178,9 @@ fn doc_id_cleanup(nx: &mut Nx<'_>, vol: usize) -> Result<(), String> {
 /// and the one write of `set_cloneinfo_id_epoch` (K 0x6716184: a volume
 /// never given a clone epoch, or changed since its last unmount's entry,
 /// gets its next object identifier as the epoch); then the threads the
-/// mount's tail starts (K 0x66c8030..0x66c8074, drafts/s21/re-data.md
-/// 1.3), which write only on a volume they run on: the pfkur thread's
-/// temporary inode ([`pfkur_resume`]) and the fixup thread's transaction
+/// mount's tail starts (K 0x66c8030..0x66c8074), which write only on a
+/// volume they run on: the pfkur thread's temporary inode
+/// ([`pfkur_resume`]) and the fixup thread's transaction
 /// ([`volume_fixup`]), in that order (RUN_STAND_IN: the two threads are not
 /// ordered). The purgatory cleaner finds no deleted snapshot, the
 /// encryption-rolling resume returns on a ramdisk boot, and the keybag
@@ -433,11 +432,10 @@ fn create_obj_in(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str, mode: u16
     // A directory on Data, or a directory or file on User: the only
     // document-identifier upkeep of mkdir and create is the tombstone
     // inheritance (K 0x66a3a38), which needs a tombstone the restore's
-    // threads do not hold (drafts/s23/re-uml-data.md 1.3), and on User
-    // their inode and directory records go to the file-system tree, not
-    // the secondary one (K 0x66ed1bc; drafts/s23/re-user-copy.md 2.1). A
+    // threads do not hold, and on User their inode and directory records
+    // go to the file-system tree, not the secondary one (K 0x66ed1bc). A
     // symbolic link calls fs_obj_create_name_checked directly, without
-    // fs_obj_create_do's tombstone step (drafts/s27/re-datawrite.md 6).
+    // fs_obj_create_do's tombstone step.
     let doc_ok = {
         let (sb, _) = nx.vol_sb_read(vol)?;
         match u16::from_le_bytes([sb[SB_ROLE], sb[SB_ROLE + 1]]) {
@@ -520,15 +518,13 @@ fn create_obj_in(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str, mode: u16
     }
     // On a volume with its own key (crypto mode 1) a file takes the
     // default class C like an unencrypted one's and a directory its
-    // parent's, with no PROT_CLASS_EXPLICIT (drafts/s23/re-user-copy.md
-    // 2.2, 2.3).
+    // parent's, with no PROT_CLASS_EXPLICIT.
     // A file on a VEK volume takes its parent's class when that is a
     // valid file class (cp_is_valid_class(1, c): 1 to 7) other than 0, with
     // PROT_CLASS_EXPLICIT by the directory rule above (K 0x66a36c0..
-    // 0x66a3858; drafts/s26/re-aks-data.md 3.6); under a parent of no valid
-    // file class (0) it takes the volume's default (fs + 0x350: 3, as on an
-    // unencrypted volume) with no PROT_CLASS_EXPLICIT (drafts/s27/
-    // re-bomcopy.md 4.1).
+    // 0x66a3858); under a parent of no valid file class (0) it takes the
+    // volume's default (fs + 0x350: 3, as on an unencrypted volume) with no
+    // PROT_CLASS_EXPLICIT.
     let vek_file_class = encrypted && !dir && !link && crypto == 3 && (1..=7).contains(&parent_prot);
     if vek_file_class && (1u32 << parent_prot) & 0x97 != 0 {
         extra |= 0x8;
@@ -798,11 +794,11 @@ pub fn dstream_size(v: &[u8]) -> Result<u64, String> {
     Ok(dstream_of(v)?.map_or(0, |d| d.size))
 }
 
-/// How a stream's data is encrypted (drafts/s27/re-datawrite.md 0, 2): not
-/// at all (an unencrypted volume); with the volume's key (identifier 4,
-/// each data extent's crypto field its own first block, flagged
-/// FEXT_CRYPTO_ID_IS_TWEAK); or with a per-file key (identifier the
-/// stream's, a crypto-state record referenced by each data-extent record).
+/// How a stream's data is encrypted: not at all (an unencrypted volume);
+/// with the volume's key (identifier 4, each data extent's crypto field its
+/// own first block, flagged FEXT_CRYPTO_ID_IS_TWEAK); or with a per-file
+/// key (identifier the stream's, a crypto-state record referenced by each
+/// data-extent record).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Crypt {
     None,
@@ -906,9 +902,8 @@ fn class4_crypto_state(nx: &mut Nx<'_>, vol: usize) -> Result<Vec<u8>, String> {
 
 /// The volume checks of a data write on volume `vol`: on Data (no
 /// secondary tree) its names only, the write paths there having no
-/// document-identifier step (traced for [`write_new_protected`],
-/// drafts/s23/re-uml-data.md 3, and unchanged by the crypto kind,
-/// drafts/s27/re-datawrite.md 0); elsewhere [`check_volume`]'s.
+/// document-identifier step (traced for [`write_new_protected`], and
+/// unchanged by the crypto kind); elsewhere [`check_volume`]'s.
 fn check_write_volume(nx: &mut Nx<'_>, vol: usize) -> Result<(), String> {
     let (sb, _) = nx.vol_sb_read(vol)?;
     if u16::from_le_bytes([sb[SB_ROLE], sb[SB_ROLE + 1]]) == 0x40 && u64a(sb, SB_INCOMPAT) & 0x100 == 0 {
@@ -1207,7 +1202,7 @@ pub fn preallocate(nx: &mut Nx<'_>, vol: usize, ino: u64, len: u64, now: &mut dy
     let mut x = xfields(&v)?;
     x.push((INO_EXT_TYPE_DSTREAM, XF_SYSTEM_FIELD, vec![0u8; 0x28]));
     put_rec(nx, vol, &(oid | J_DSTREAM_ID << 60).to_le_bytes(), &1u32.to_le_bytes())?;
-    // The quota check (re-alloc.md section 3) with what the volume holds.
+    // The quota check with what the volume holds.
     {
         let sb = nx.vol_sb(vol)?;
         let quota = u64a(sb, 0x50);
@@ -1244,16 +1239,16 @@ pub fn preallocate(nx: &mut Nx<'_>, vol: usize, ino: u64, len: u64, now: &mut dy
     Ok(blocks * bs)
 }
 
-/// `restored_external`'s reserve_overprov_space (RE 0x10002e5bc,
-/// drafts/s21/re-overprov.md) on the Data volume `vol` of a disk of
-/// `disk_bytes` (the whole disk's DKIOCGETBLOCKSIZE times
-/// DKIOCGETBLOCKCOUNT), whose container device answers DK_FEATURE_UNMAP as
-/// `unmap`: `/.overprovisioning_file` made with `open_dprotected_np(O_RDWR
-/// | O_CREAT | O_EXCL, class 6, 0600)` (stored as class C on a VEK volume),
-/// `F_PREALLOCATE` {CONTIG | ALL | PERSIST, F_PEOFPOSMODE} of 1 GiB, or a
-/// hundredth of the disk when it is no more than 0x1900000063 bytes,
-/// `ftruncate` to it, `F_FULLFSYNC`, `F_TRIM_ACTIVE_FILE` over it, then
-/// the closes (nothing written). Its inode number.
+/// `restored_external`'s reserve_overprov_space (RE 0x10002e5bc) on the
+/// Data volume `vol` of a disk of `disk_bytes` (the whole disk's
+/// DKIOCGETBLOCKSIZE times DKIOCGETBLOCKCOUNT), whose container device
+/// answers DK_FEATURE_UNMAP as `unmap`: `/.overprovisioning_file` made with
+/// `open_dprotected_np(O_RDWR | O_CREAT | O_EXCL, class 6, 0600)` (stored
+/// as class C on a VEK volume), `F_PREALLOCATE` {CONTIG | ALL | PERSIST,
+/// F_PEOFPOSMODE} of 1 GiB, or a hundredth of the disk when it is no more
+/// than 0x1900000063 bytes, `ftruncate` to it, `F_FULLFSYNC`,
+/// `F_TRIM_ACTIVE_FILE` over it, then the closes (nothing written). Its
+/// inode number.
 pub fn reserve_overprov_space(nx: &mut Nx<'_>, vol: usize, disk_bytes: u64, unmap: bool, now: &mut dyn FnMut() -> u64) -> Result<u64, String> {
     const NAME: &str = ".overprovisioning_file";
     let size = if disk_bytes as i64 > 0x19_0000_0063 { 0x4000_0000 } else { (disk_bytes as i64 / 100) as u64 };
@@ -1278,16 +1273,14 @@ pub fn reserve_overprov_space(nx: &mut Nx<'_>, vol: usize, disk_bytes: u64, unma
 /// `open_dprotected_np(O_CREAT, class, 0, mode)` of a regular file
 /// `name` in directory `parent` of an encrypted volume with a VEK, by
 /// root under umask 0 (apfs_vnop_create K 0x668c3f8): setup_prot_class
-/// with an explicit class (K 0x66a3670, drafts/s21/re-overprov.md 1.1),
-/// which on a VEK volume stores class 6 as class C without
-/// PROT_CLASS_EXPLICIT and needs no per-file key (K 0x66f44b0 takes the
-/// VEK); the Secure Enclave's lock-state answer for the class
-/// (K 0x669caec, device-only) must allow it, as the restore's success
+/// with an explicit class (K 0x66a3670), which on a VEK volume stores class
+/// 6 as class C without PROT_CLASS_EXPLICIT and needs no per-file key (K
+/// 0x66f44b0 takes the VEK); the Secure Enclave's lock-state answer for the
+/// class (K 0x669caec, device-only) must allow it, as the restore's success
 /// says it does; then the create as [`create`] makes it, the group the
 /// parent's. Class 4 stays class D with PROT_CLASS_EXPLICIT (internal
-/// 0x8; drafts/s23/re-uml-data.md 2.1): its per-file key comes with its
-/// data stream. Only classes 4 and 6 on a volume with a VEK are
-/// implemented. The new inode's number.
+/// 0x8): its per-file key comes with its data stream. Only classes 4 and 6
+/// on a volume with a VEK are implemented. The new inode's number.
 pub fn create_protected(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str, mode: u16, uid: u32, class: u32, now: &mut dyn FnMut() -> u64) -> Result<u64, String> {
     check_names(nx, vol)?;
     let (sb, _) = nx.vol_sb_read(vol)?;
@@ -1340,15 +1333,15 @@ pub fn create_protected(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str, mo
 /// on an empty regular file of a VEK volume with unwritten extents
 /// (incompat 0x80) by a process entitled to `allocate_contig`
 /// (apfs_vnop_allocate K 0x669a348 with VNOP flags 0x1f →
-/// preallocate_inline K 0x669cef0 with 0xe5; drafts/s21/re-overprov.md
-/// 2.2-2.4): in one file-system transaction the data stream made (its
-/// default crypto identifier 4, the VEK's, K 0x66f44b0), then alloc_space
-/// (K 0x6707764): the free-space floor, one contiguous non-partial data
-/// allocation, the volume's counts, one unwritten file extent whose crypto
-/// field is its physical block (FEXT_CRYPTO_ID_IS_TWEAK | unwritten, K
-/// 0x6700a08), its block references; the stream's allocated size, the
-/// inode's PERSIST flag 0x8000000, its modification and change times from
-/// one clock reading. The bytes allocated, or ENOSPC.
+/// preallocate_inline K 0x669cef0 with 0xe5): in one file-system
+/// transaction the data stream made (its default crypto identifier 4, the
+/// VEK's, K 0x66f44b0), then alloc_space (K 0x6707764): the free-space
+/// floor, one contiguous non-partial data allocation, the volume's counts,
+/// one unwritten file extent whose crypto field is its physical block
+/// (FEXT_CRYPTO_ID_IS_TWEAK | unwritten, K 0x6700a08), its block
+/// references; the stream's allocated size, the inode's PERSIST flag
+/// 0x8000000, its modification and change times from one clock reading. The
+/// bytes allocated, or ENOSPC.
 fn preallocate_contig_persist(nx: &mut Nx<'_>, vol: usize, ino: u64, len: u64, now: &mut dyn FnMut() -> u64) -> Result<Result<u64, i32>, String> {
     const INODE_PREALLOCATED_PERSIST: u64 = 0x800_0000;
     const FEXT_CRYPTO_ID_IS_TWEAK: u64 = 1;
@@ -1446,19 +1439,18 @@ pub struct PendingWrite {
 
 /// The first `write(2)` of `data` (under one block) at offset 0 into an
 /// empty class-D file with PROT_CLASS_EXPLICIT on a VEK volume
-/// (apfs_vnop_write K 0x6691308, prepare_write_and_lock K 0x66a4024;
-/// drafts/s23/re-uml-data.md 3): in one file-system transaction the data
-/// stream made (its identifier the inode's) with the per-file key's
-/// crypto-state record (K 0x66f441c's per-file path: the crypto identifier
-/// is the stream's; K 0x6734154 fills the record with AppleKeyStore's
-/// blobs, PER_FILE_KEY_STAND_IN; K 0x66f4e3c inserts it), its
-/// `j_dstream_id`, one block from the allocation zone (alloc_space flags
-/// 8) whose file extent counts the record a second reference (K
-/// 0x66f8ad8), the block references, then the stream's size and allocated
-/// size, a PREV_FSIZE field of the old size 0, the write generation and
-/// the inode. The modification and change times (one more reading) and the
-/// bytes written stay in memory until the `fsync` ([`fsync_pending`]); the
-/// data reaches the block then.
+/// (apfs_vnop_write K 0x6691308, prepare_write_and_lock K 0x66a4024): in
+/// one file-system transaction the data stream made (its identifier the
+/// inode's) with the per-file key's crypto-state record (K 0x66f441c's
+/// per-file path: the crypto identifier is the stream's; K 0x6734154 fills
+/// the record with AppleKeyStore's blobs, PER_FILE_KEY_STAND_IN; K
+/// 0x66f4e3c inserts it), its `j_dstream_id`, one block from the allocation
+/// zone (alloc_space flags 8) whose file extent counts the record a second
+/// reference (K 0x66f8ad8), the block references, then the stream's size
+/// and allocated size, a PREV_FSIZE field of the old size 0, the write
+/// generation and the inode. The modification and change times (one more
+/// reading) and the bytes written stay in memory until the `fsync`
+/// ([`fsync_pending`]); the data reaches the block then.
 pub fn write_new_protected(nx: &mut Nx<'_>, vol: usize, ino: u64, data: &[u8], now: &mut dyn FnMut() -> u64) -> Result<PendingWrite, String> {
     let bs = nx.l.bs;
     if data.is_empty() || data.len() as u64 >= bs {
@@ -1515,12 +1507,11 @@ pub fn write_new_protected(nx: &mut Nx<'_>, vol: usize, ino: u64, data: &[u8], n
 }
 
 /// `fsync(2)` after [`write_new_protected`] (apfs_vnop_fsync K 0x669176c →
-/// apfs_fsync_internal K 0x66a12e4; drafts/s23/re-uml-data.md 4): the
-/// data block written (the bytes, then zeros to the block's end: the
-/// plaintext the per-file key encrypts, KEYS_STAND_IN), then the
-/// PREV_FSIZE field removed in a file-system transaction (K 0x6766d4c)
-/// whose inode write carries the pending modification and change times
-/// and the bytes written. No commit.
+/// apfs_fsync_internal K 0x66a12e4): the data block written (the bytes,
+/// then zeros to the block's end: the plaintext the per-file key encrypts,
+/// KEYS_STAND_IN), then the PREV_FSIZE field removed in a file-system
+/// transaction (K 0x6766d4c) whose inode write carries the pending
+/// modification and change times and the bytes written. No commit.
 pub fn fsync_pending(nx: &mut Nx<'_>, vol: usize, w: &PendingWrite, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     let bs = nx.l.bs as usize;
     let mut b = w.data.clone();
@@ -1554,13 +1545,13 @@ pub struct RenameTimes {
 
 /// `rename(2)` of regular file or symbolic link `ino` (one link) from `from` to `to` in
 /// directory `dir`, no file named `to` there (apfs_vnop_renamex K
-/// 0x6692440 with no flags; drafts/s23/re-uml-data.md 5.1): in one
-/// file-system transaction the old record removed and the new one
-/// inserted (its date added and flags the old one's), the inode's
-/// name field and the directory's write generation rewritten, no time
-/// changed; after it the file's change time and the directory's times
-/// are read into memory only (returned; the directory's are also kept in
-/// `nx.jobj_times`, for its next rewrite or a sync pass to write).
+/// 0x6692440 with no flags): in one file-system transaction the old record
+/// removed and the new one inserted (its date added and flags the old
+/// one's), the inode's name field and the directory's write generation
+/// rewritten, no time changed; after it the file's change time and the
+/// directory's times are read into memory only (returned; the directory's
+/// are also kept in `nx.jobj_times`, for its next rewrite or a sync pass to
+/// write).
 pub fn rename_in_dir(nx: &mut Nx<'_>, vol: usize, dir: u64, from: &str, to: &str, ino: u64, now: &mut dyn FnMut() -> u64) -> Result<RenameTimes, String> {
     check_names(nx, vol)?;
     let (sb, _) = nx.vol_sb_read(vol)?;
@@ -1581,8 +1572,7 @@ pub fn rename_in_dir(nx: &mut Nx<'_>, vol: usize, dir: u64, from: &str, to: &str
         return Err("not implemented: a rename onto an existing name".into());
     }
     let f = get_rec(nx, vol, &inode_key(ino))?.ok_or("the file has no inode")?;
-    // A symbolic link's records change as a regular file's (drafts/s27/
-    // re-datawrite.md 7.1).
+    // A symbolic link's records change as a regular file's.
     let fmt = u16::from_le_bytes([f[INO_MODE], f[INO_MODE + 1]]) & S_IFMT;
     if (fmt != S_IFREG && fmt != S_IFLNK) || u32::from_le_bytes(f[INO_NCHILDREN..INO_NCHILDREN + 4].try_into().unwrap()) != 1 || u32::from_le_bytes(f[0x44..0x48].try_into().unwrap()) & 0x40 != 0 {
         return Err("not implemented: renaming other than a regular file or symbolic link of one link and no UF_TRACKED".into());
@@ -1617,9 +1607,9 @@ pub fn rename_in_dir(nx: &mut Nx<'_>, vol: usize, dir: u64, from: &str, to: &str
 }
 
 /// The in-memory times of a file written by apfs_fsync_internal (K
-/// 0x66a1878, when the jobj's times-dirty bit is set with no data to push:
-/// drafts/s27/re-txdata.md 4): one file-system transaction (type 4, count
-/// 1), `times` its modification and change times, the inode rewritten.
+/// 0x66a1878, when the jobj's times-dirty bit is set with no data to
+/// push): one file-system transaction (type 4, count 1), `times` its
+/// modification and change times, the inode rewritten.
 pub fn write_times(nx: &mut Nx<'_>, vol: usize, ino: u64, times: (u64, u64), now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     fs_tx_enter(nx, vol)?;
     let mut v = get_rec(nx, vol, &inode_key(ino))?.ok_or("the file has no inode")?;
@@ -1658,23 +1648,22 @@ fn trim_active_file(nx: &mut Nx<'_>, vol: usize, ino: u64, now: &mut dyn FnMut()
     fs_tx_leave(nx, vol, now)
 }
 
-/// The close of a file whose size was grown into its preallocation
-/// (drafts/s27/re-zerofill.md): VNOP_CLOSE's `VNOP_FSYNC(MNT_NOWAIT)` (K
-/// 0x6690bb4) → apfs_flush_allocated_unwritten_ranges (K 0x66a1a98):
-/// `cluster_write(vp, NULL, size, size, 0, 0, 0xb80)` zero-fills the
-/// file's unwritten range [0, size) in clusters of `c` bytes, each pushed
-/// as block maps of at most `m` bytes, stopping at the extents' ends, all
-/// in file order (the write-behind pushes the lowest cluster at the fifth
-/// and sixth, the flush's push the rest). Each block map takes the
-/// extent's no-copy-on-write path (K 0x6708ce4: no transaction, no
-/// change) and trims the range from its front; fs_update_prev_fsize (K
-/// 0x670ad18) then records the start of what is left as a PREV_FSIZE
-/// field when the inode has none or a larger one: so the first block map,
-/// when others follow, adds PREV_FSIZE = its end in its own file-system
-/// transaction (K 0x670add0), and the fsync, after the flush, removes it
-/// in another (K 0x66a17f0 → K 0x6766d4c); the inode's size, times and
-/// write generation are not touched. The zeros reach the blocks with the
-/// pushes.
+/// The close of a file whose size was grown into its preallocation:
+/// VNOP_CLOSE's `VNOP_FSYNC(MNT_NOWAIT)` (K 0x6690bb4) →
+/// apfs_flush_allocated_unwritten_ranges (K 0x66a1a98): `cluster_write(vp,
+/// NULL, size, size, 0, 0, 0xb80)` zero-fills the file's unwritten range
+/// [0, size) in clusters of `c` bytes, each pushed as block maps of at most
+/// `m` bytes, stopping at the extents' ends, all in file order (the
+/// write-behind pushes the lowest cluster at the fifth and sixth, the
+/// flush's push the rest). Each block map takes the extent's
+/// no-copy-on-write path (K 0x6708ce4: no transaction, no change) and trims
+/// the range from its front; fs_update_prev_fsize (K 0x670ad18) then
+/// records the start of what is left as a PREV_FSIZE field when the inode
+/// has none or a larger one: so the first block map, when others follow,
+/// adds PREV_FSIZE = its end in its own file-system transaction (K
+/// 0x670add0), and the fsync, after the flush, removes it in another (K
+/// 0x66a17f0 → K 0x6766d4c); the inode's size, times and write generation
+/// are not touched. The zeros reach the blocks with the pushes.
 pub fn close_after_grow(nx: &mut Nx<'_>, vol: usize, ino: u64, c: u64, m: u64, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     const PAGE: u64 = 16 << 10;
     let bs = nx.l.bs;
@@ -1750,8 +1739,7 @@ pub struct Pushes {
 }
 
 /// `open(O_WRONLY | O_CREAT | O_TRUNC)` of a new file `name` in `parent`,
-/// one `write` of all of `data` at offset 0, and `close` (drafts/s21/
-/// re-gigalocker.md D, drafts/s23/re-kernelcache.md 4): the file made as
+/// one `write` of all of `data` at offset 0, and `close`: the file made as
 /// [`create`] makes it by root, with its parent's group (O_TRUNC does
 /// nothing to a file the open made), then [`write_first`]. The file's
 /// inode number.
@@ -1766,12 +1754,10 @@ pub fn write_new_file(nx: &mut Nx<'_>, vol: usize, parent: u64, name: &str, mode
 }
 
 /// One `write` of all of `data` at offset 0 into the new, empty regular
-/// file `ino`, and `close` (drafts/s21/re-gigalocker.md D, drafts/s23/
-/// re-kernelcache.md 4, drafts/s27/re-datawrite.md 0.1). The write's
-/// transaction (prepare_write_and_lock K 0x66a4024) makes the data stream
-/// (on a VEK volume with its crypto identifier, [`Crypt`]: a per-file key's
-/// crypto-state record first) and takes one of two paths
-/// (K 0x66a4410..0x66a4478):
+/// file `ino`, and `close`. The write's transaction (prepare_write_and_lock
+/// K 0x66a4024) makes the data stream (on a VEK volume with its crypto
+/// identifier, [`Crypt`]: a per-file key's crypto-state record first) and
+/// takes one of two paths (K 0x66a4410..0x66a4478):
 /// - direct, for a length not a block multiple and under 0x20000: the
 ///   blocks allocated at once (alloc_space flags 8: requests for what is
 ///   left until the space manager has granted it all), each piece counted,
@@ -1802,7 +1788,7 @@ pub fn write_first(nx: &mut Nx<'_>, vol: usize, ino: u64, data: &[u8], pushes: &
         // A volume with unwritten extents (incompat 0x80, Data's) takes the
         // same paths: neither path asks alloc_space for an unwritten extent,
         // and the deferred path's hole is made with flags 0
-        // (K 0x6707ed0..0x6707f5c; drafts/s27/re-datawrite.md 1, 3).
+        // (K 0x6707ed0..0x6707f5c).
         let sb = nx.vol_sb(vol)?;
         // The volume's low-space state (fs + 0x3ac, set below the
         // thresholds at fs + 0x3b0..0x3bc) can force the direct path; its
@@ -1816,11 +1802,11 @@ pub fn write_first(nx: &mut Nx<'_>, vol: usize, ino: u64, data: &[u8], pushes: &
     if u16::from_le_bytes([v[INO_MODE], v[INO_MODE + 1]]) & S_IFMT != S_IFREG {
         return Err("not implemented: a first write into other than an empty regular file".into());
     }
-    // A stream the file already has, emptied by a truncate (drafts/
-    // s27/re-populate.md 6.2): size and allocated size 0, no extent; the
-    // write takes the deferred path (the direct one is chosen only where the
-    // inode has no stream, or by the low-space state) and makes neither the
-    // stream's reference record nor its field.
+    // A stream the file already has, emptied by a truncate: size and
+    // allocated size 0, no extent; the write takes the deferred path (the
+    // direct one is chosen only where the inode has no stream, or by the
+    // low-space state) and makes neither the stream's reference record nor
+    // its field.
     let existing = dstream_of(&v)?;
     let mut written0 = 0u64;
     if let Some(d) = &existing {
@@ -1941,14 +1927,14 @@ pub fn write_first(nx: &mut Nx<'_>, vol: usize, ino: u64, data: &[u8], pushes: &
 
 
 /// `write(2)` of `data` at offset 0 into a new file whose blocks
-/// [`preallocate`] already gave it (drafts/s27/re-splat.md 4.6): the write
-/// ends within the allocated size, over a data extent, so no allocation
-/// and no range (prepare_write_and_lock K 0x66a4024): one file-system
-/// transaction with the size, a PREV_FSIZE field of the old size 0 and
-/// the write generation, the inode rewritten; the write's end then reads
-/// the clock for the modification and change times and counts the bytes,
-/// in memory: they are returned, for the inode's next write. The data
-/// reaches the blocks at the close's push ([`close_pushed`]).
+/// [`preallocate`] already gave it: the write ends within the allocated
+/// size, over a data extent, so no allocation and no range
+/// (prepare_write_and_lock K 0x66a4024): one file-system transaction with
+/// the size, a PREV_FSIZE field of the old size 0 and the write generation,
+/// the inode rewritten; the write's end then reads the clock for the
+/// modification and change times and counts the bytes, in memory: they are
+/// returned, for the inode's next write. The data reaches the blocks at the
+/// close's push ([`close_pushed`]).
 pub fn write_into_preallocation(nx: &mut Nx<'_>, vol: usize, ino: u64, data: &[u8], now: &mut dyn FnMut() -> u64) -> Result<(u64, u64), String> {
     let v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
     if dstream_of(&v)?.is_some_and(|d| d.size != 0) {
@@ -1958,21 +1944,21 @@ pub fn write_into_preallocation(nx: &mut Nx<'_>, vol: usize, ino: u64, data: &[u
 }
 
 /// `write(2)` of `n` bytes at the end of a regular file whose allocated
-/// size already holds them (drafts/s27/re-populate.md 5.2; prepare_write_
-/// and_lock K 0x66a4024): no allocation, and every block of the range in a
-/// data extent, so no intention range or reservation (the range scan's
-/// fs_map_file_offset_ext lookups only read); as the write extends the
-/// file, one file-system transaction (K 0x66a5248, type 4): the size, a
-/// PREV_FSIZE field of the old size when the inode has none (one it has of
-/// at most the old size is kept, K 0x66a5a70..0x66a5aa0), the write
-/// generation (K 0x66a5ae8), the inode rewritten from its in-memory object
-/// (K 0x66a5b0c), which carries `held`, the times and byte count the
-/// file's previous write's end left there (none for the stream's first
-/// write: its record's own). The write's end then reads the clock for the
-/// modification and change times and adds `n` to the bytes written, in
-/// memory (K 0x66a5c80..0x66a5d7c): they are returned, for the inode's
-/// next write. The bytes reach the blocks with the cluster layer's pushes
-/// through the existing extents (no transaction; [`close_pushed`]).
+/// size already holds them (prepare_write_and_lock K 0x66a4024): no
+/// allocation, and every block of the range in a data extent, so no
+/// intention range or reservation (the range scan's fs_map_file_offset_ext
+/// lookups only read); as the write extends the file, one file-system
+/// transaction (K 0x66a5248, type 4): the size, a PREV_FSIZE field of the
+/// old size when the inode has none (one it has of at most the old size is
+/// kept, K 0x66a5a70..0x66a5aa0), the write generation (K 0x66a5ae8), the
+/// inode rewritten from its in-memory object (K 0x66a5b0c), which carries
+/// `held`, the times and byte count the file's previous write's end left
+/// there (none for the stream's first write: its record's own). The write's
+/// end then reads the clock for the modification and change times and adds
+/// `n` to the bytes written, in memory (K 0x66a5c80..0x66a5d7c): they are
+/// returned, for the inode's next write. The bytes reach the blocks with
+/// the cluster layer's pushes through the existing extents (no transaction;
+/// [`close_pushed`]).
 pub fn extend_into_preallocation(nx: &mut Nx<'_>, vol: usize, ino: u64, n: u64, held: Option<(u64, u64)>, now: &mut dyn FnMut() -> u64) -> Result<(u64, u64), String> {
     check_volume(nx, vol)?;
     if u64a(nx.vol_sb(vol)?, SB_FS_FLAGS) & 1 == 0 {
@@ -2061,7 +2047,7 @@ pub fn truncate_equal(nx: &mut Nx<'_>, vol: usize, ino: u64, written: u64, now: 
 /// (`apfs_io_lock_exclusive` K 0x6767084 at K 0x668e628: jobj+0x190 the
 /// thread), → apfs_truncate_locked K 0x66a6bbc's fast path, for an
 /// unsealed volume and an inode neither cloned (internal 0x10) nor
-/// dataless; drafts/s31 notes):
+/// dataless:
 /// - `ino_shrink_size_tx` (K 0x669d444 → fs_tx_enter(1, 3)): a PREV_FSIZE
 ///   field of at least `new` removed (K 0x67641cc), the size, the
 ///   modification and change times from one clock reading (K 0x66f3750),
@@ -2196,10 +2182,10 @@ pub fn truncate_shrink(nx: &mut Nx<'_>, vol: usize, ino: u64, new: u64, now: &mu
 }
 
 /// The close of a file whose bytes `data` a write put within its data
-/// extents (VNOP_CLOSE → VNOP_FSYNC(MNT_NOWAIT), drafts/s27/re-splat.md
-/// 4.6): the push writes them, zeros to the block's end, through the
-/// existing extents with no transaction; then PREV_FSIZE is removed in
-/// its own transaction (K 0x6766d4c) with the inode as it stands.
+/// extents (VNOP_CLOSE → VNOP_FSYNC(MNT_NOWAIT)): the push writes them,
+/// zeros to the block's end, through the existing extents with no
+/// transaction; then PREV_FSIZE is removed in its own transaction (K
+/// 0x6766d4c) with the inode as it stands.
 pub fn close_pushed(nx: &mut Nx<'_>, vol: usize, ino: u64, data: &[u8], now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     let bs = nx.l.bs;
     let v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
@@ -2290,8 +2276,8 @@ fn grow_ahead(a: u64, e: u64, bs: u64, ro_compat: u64) -> u64 {
 
 /// A new regular file `ino` of an unencrypted volume, opened for writing
 /// and given its bytes `src` by a sequence of `write(2)` calls of the
-/// lengths `writes` from offset 0, then closed (drafts/s27/re-splat.md 4),
-/// with the cluster layer's cluster size `c` and block-map length `m`:
+/// lengths `writes` from offset 0, then closed, with the cluster layer's
+/// cluster size `c` and block-map length `m`:
 /// - the first write (a block multiple or 0x20000 bytes or more: the
 ///   deferred path, [`write_new_file`]'s) makes the data stream, its
 ///   sparse extent to the write's block end, SPARSE_BYTES, the size,
@@ -2325,8 +2311,8 @@ pub fn write_appends(nx: &mut Nx<'_>, vol: usize, ino: u64, writes: &[u64], src:
     }
     {
         let sb = nx.vol_sb(vol)?;
-        // Unwritten extents (incompat 0x80) change nothing here (drafts/s27/
-        // re-datawrite.md 1, 3: holes made and extended with flags 0).
+        // Unwritten extents (incompat 0x80) change nothing here (holes made
+        // and extended with flags 0).
         if u64a(sb, 0x50) != 0 {
             return Err("not implemented: writes on a volume with a quota (the low-space state)".into());
         }
@@ -2338,8 +2324,8 @@ pub fn write_appends(nx: &mut Nx<'_>, vol: usize, ino: u64, writes: &[u64], src:
     if u64a(&v, INO_INTERNAL_FLAGS) & 0x410 != 0 || u32::from_le_bytes(v[0x44..0x48].try_into().unwrap()) & 0x4000_0020 == 0x4000_0020 {
         return Err("not implemented: writes to a file with internal flags 0x410 (K 0x66a4410) or bsd_flags 0x40000020 (K 0x66fb37c)".into());
     }
-    // The stream's crypto (drafts/s27/re-datawrite.md 0.1): the first
-    // write makes a per-file key's record; the appends add none.
+    // The stream's crypto: the first write makes a per-file key's record;
+    // the appends add none.
     let crypt = file_crypt(nx, vol, &v)?;
     let first = writes[0];
     if first % bs != 0 && first < 0x20000 {
@@ -2586,8 +2572,7 @@ pub fn chown(nx: &mut Nx<'_>, vol: usize, ino: u64, uid: u32, gid: u32, now: &mu
 /// pfkur thread (K 0x66b0ffc at K 0x66c8988), which removes its temporary
 /// inode ([`free_tmp_ino`]), and commits (`tx_finish(0x11)` at K
 /// 0x66c8ef8, which, as the sync's, writes nothing when no transaction is
-/// open: drafts/s16/re-kext-update.md 5); then, in the next transaction,
-/// which stays open, the
+/// open); then, in the next transaction, which stays open, the
 /// kernel's `apfs_modified_by` entry (an existing one of the same name
 /// moves to the front, else the entries shift and the oldest goes), the
 /// clone transaction, and the unmount time. vflush reclaims the volume's
@@ -2659,14 +2644,13 @@ fn drop_at_risk(nx: &mut Nx<'_>, vol: usize, at: &str) {
 }
 
 /// apfs_vfsop_sync's vnode pass over slot `vol` (`vnode_iterate(mp, 0,
-/// K 0x66d1748)`, K 0x66c9d80; drafts/s27/re-txdata.md 4): the mount's
-/// vnode list from its head, the newest vnode first ([`Nx::vnode_list`]),
-/// each vnode whose inode holds only its times unwritten (`(jobj+0x98 &
-/// 0x40010) == 0x40000`) given apfs_fsync_internal's times write (K
-/// 0x66a1878): one file-system transaction (type 4, count 1) rewriting the
-/// inode with them, its own `fs_tx_leave`. The private directory's vnode
-/// (fs+0x130) is skipped. Inodes at risk of recycling ([`drop_at_risk`])
-/// are listed, not written.
+/// K 0x66d1748)`, K 0x66c9d80): the mount's vnode list from its head, the
+/// newest vnode first ([`Nx::vnode_list`]), each vnode whose inode holds
+/// only its times unwritten (`(jobj+0x98 & 0x40010) == 0x40000`) given
+/// apfs_fsync_internal's times write (K 0x66a1878): one file-system
+/// transaction (type 4, count 1) rewriting the inode with them, its own
+/// `fs_tx_leave`. The private directory's vnode (fs+0x130) is skipped.
+/// Inodes at risk of recycling ([`drop_at_risk`]) are listed, not written.
 fn vnode_pass(nx: &mut Nx<'_>, vol: usize, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     drop_at_risk(nx, vol, "this vnode pass");
     let mut pending: Vec<u64> = nx.jobj_times.keys().filter(|k| k.0 == vol).map(|k| k.1).collect();
@@ -2729,11 +2713,10 @@ pub mod waitfor {
 }
 
 /// `VFS_SYNC(mp, waitfor)` of slot `vol`, which the container holds
-/// mounted read-write: apfs_vfsop_sync (K 0x66c9d80; drafts/s27/
-/// re-txdata.md 4.1). A volume mounted read-only (`apfs + 0x354`) or a
-/// snapshot mount (`+ 0x380`) returns at once, and a mount being updated
-/// (`MNT_UPDATE`) logs and returns: the caller's, which knows the mount.
-/// Then:
+/// mounted read-write: apfs_vfsop_sync (K 0x66c9d80). A volume mounted
+/// read-only (`apfs + 0x354`) or a snapshot mount (`+ 0x380`) returns at
+/// once, and a mount being updated (`MNT_UPDATE`) logs and returns: the
+/// caller's, which knows the mount. Then:
 ///
 /// - `vnode_iterate(mp, 0, K 0x66d1748)`: each vnode but a dead one's and
 ///   the private directory's given `apfs_fsync_internal(fs, vp, waitfor)`
@@ -2856,9 +2839,9 @@ fn check_setattr_volume(nx: &mut Nx<'_>, vol: usize) -> Result<(), String> {
 }
 
 /// `setattr` of `a` on `ino` (apfs_vnop_setattr K 0x668e4a0's general
-/// path, drafts/s23/re-user-copy.md 2.4): nothing to set writes nothing; a
-/// mode alone and unchanged takes the fast path ([`chmod_same`]: the change
-/// time read into memory only); else in one file-system transaction owner and group (counted
+/// path): nothing to set writes nothing; a mode alone and unchanged takes
+/// the fast path ([`chmod_same`]: the change time read into memory only);
+/// else in one file-system transaction owner and group (counted
 /// even when unchanged), the mode bits, the access time (not counted), the
 /// modification time, the creation time lowered to the modification time
 /// when later and a time was given (K 0x668f6c4), the change time read
@@ -2923,10 +2906,9 @@ fn name_of(v: &[u8]) -> Result<String, String> {
 }
 
 /// `ftruncate(fd, 0)` of an empty regular file with no data stream
-/// (apfs_truncate_locked K 0x66a6bbc's equal-size branch; drafts/s23/
-/// re-user-copy.md 2.5): in one file-system transaction the modification
-/// and change times (one reading), the inode rewritten from its in-memory
-/// object; no data stream.
+/// (apfs_truncate_locked K 0x66a6bbc's equal-size branch): in one
+/// file-system transaction the modification and change times (one reading),
+/// the inode rewritten from its in-memory object; no data stream.
 pub fn truncate_same(nx: &mut Nx<'_>, vol: usize, ino: u64, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     check_setattr_volume(nx, vol)?;
     let v = get_rec(nx, vol, &inode_key(ino))?.ok_or_else(|| format!("no inode {ino:#x}"))?;
@@ -2943,10 +2925,10 @@ pub fn truncate_same(nx: &mut Nx<'_>, vol: usize, ino: u64, now: &mut dyn FnMut(
 }
 
 /// `fsetxattr(fd, "com.apple.decmpfs", data, XATTR_SHOWCOMPRESSION)` on a
-/// file not yet compressed (apfs_setxattr_internal K 0x6765cc4; drafts/
-/// s23/re-user-copy.md 2.6): the attribute embedded in its record
-/// (XATTR_DATA_EMBEDDED) in one file-system transaction, the file's change
-/// time read, the inode rewritten from its in-memory object.
+/// file not yet compressed (apfs_setxattr_internal K 0x6765cc4): the
+/// attribute embedded in its record (XATTR_DATA_EMBEDDED) in one
+/// file-system transaction, the file's change time read, the inode
+/// rewritten from its in-memory object.
 pub fn set_decmpfs_xattr(nx: &mut Nx<'_>, vol: usize, ino: u64, data: &[u8], now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     const NAME: &str = "com.apple.decmpfs";
     check_setattr_volume(nx, vol)?;
@@ -3091,8 +3073,7 @@ pub fn read_stream(nx: &mut Nx<'_>, vol: usize, oid: u64, size: u64) -> Result<V
 /// `setxattr(path, "com.apple.ResourceFork", data, len, pos,
 /// XATTR_NOFOLLOW)` by root on regular file `ino`, not compressed, whose
 /// fork is absent (`pos` 0) or `pos` bytes long (an append)
-/// (apfs_vnop_setxattr K 0x6699610 → K 0x665fac0 → K 0x665d844;
-/// drafts/s27/re-datawrite.md 0.2, 5):
+/// (apfs_vnop_setxattr K 0x6699610 → K 0x665fac0 → K 0x665d844):
 /// - T1, a new stream (alloc_and_set_xattr K 0x665e120 with end 0): one
 ///   file-system transaction taking the stream's identifier X from
 ///   next_obj_id, its crypto by the file's class (the volume's key, or for
@@ -3261,12 +3242,12 @@ pub fn setxattr_rsrc_fork(nx: &mut Nx<'_>, vol: usize, ino: u64, pos: u64, data:
 }
 
 /// FSIOC_CAS_BSDFLAGS from `expected` to `new` (handle_cas_bsdflags K
-/// 0x66e0088; drafts/s23/re-user-copy.md 2.7): setting UF_COMPRESSED on a
-/// file with a valid decmpfs attribute first truncates it to its (equal)
-/// size; then, the flags being `expected`, in one file-system transaction
-/// the flags set, the change time read, and for a regular file becoming
-/// compressed the decmpfs header's uncompressed size in j_inode_val +0x54
-/// with INODE_HAS_UNCOMPRESSED_SIZE (0x40000), the inode rewritten from
+/// 0x66e0088): setting UF_COMPRESSED on a file with a valid decmpfs
+/// attribute first truncates it to its (equal) size; then, the flags being
+/// `expected`, in one file-system transaction the flags set, the change
+/// time read, and for a regular file becoming compressed the decmpfs
+/// header's uncompressed size in j_inode_val +0x54 with
+/// INODE_HAS_UNCOMPRESSED_SIZE (0x40000), the inode rewritten from
 /// its in-memory object (any times it held unwritten with it).
 pub fn cas_bsdflags(nx: &mut Nx<'_>, vol: usize, ino: u64, expected: u32, new: u32, now: &mut dyn FnMut() -> u64) -> Result<(), String> {
     check_setattr_volume(nx, vol)?;
@@ -3280,7 +3261,7 @@ pub fn cas_bsdflags(nx: &mut Nx<'_>, vol: usize, ino: u64, expected: u32, new: u
         let x = get_rec(nx, vol, &k)?.ok_or("not implemented: UF_COMPRESSED on a file without a decmpfs attribute")?;
         let d = &x[4..];
         // Type 9 (the data in the header) and type 4 (in the resource fork)
-        // take the same steps (drafts/s27/re-bomcopy.md 4.5).
+        // take the same steps.
         let ty = if d.len() >= 8 { u32::from_le_bytes(d[4..8].try_into().unwrap()) } else { 0 };
         if x[0..2] != 2u16.to_le_bytes() || d.len() < 16 || &d[0..4] != b"fpmc" || (ty != 9 && ty != 4) {
             return Err("not implemented: UF_COMPRESSED with a decmpfs attribute other than an embedded type 9 or 4".into());
@@ -3310,9 +3291,8 @@ pub fn cas_bsdflags(nx: &mut Nx<'_>, vol: usize, ino: u64, expected: u32, new: u
 
 /// `setattrlist(ATTR_CMN_DATA_PROTECT_FLAGS)` of directory `ino` to class
 /// `class` (apfs_vnop_setattr K 0x668e4a0), on a volume of crypto mode 1
-/// (drafts/s23/re-user-copy.md 3) or 3 (a VEK volume: K 0x668eb64 →
-/// K 0x66a8804; drafts/s26/re-aks-data.md 1): nothing when the class is
-/// already it; else one file-system transaction setting the class and
+/// or 3 (a VEK volume: K 0x668eb64 → K 0x66a8804): nothing when the class
+/// is already it; else one file-system transaction setting the class and
 /// PROT_CLASS_EXPLICIT (0x8) with the change time read, the inode written
 /// from its in-memory object (so with any times it held, `nx.jobj_times`),
 /// then the general path's transaction with nothing counted (the inode
@@ -3392,11 +3372,11 @@ pub mod bsd_flags {
 const INO_EXT_TYPE_DOCUMENT_ID: u8 = 3;
 
 /// `chflags(path, flags)` by root of `ino`, the object the path names
-/// (xnu-10063 vfs_syscalls.c chflags → chflags1 → chflags0;
-/// drafts/s27/re-mountpoints.md 3), with `securelevel` the kernel's (`None`:
-/// not known, refused where the answer needs it):
+/// (xnu-10063 vfs_syscalls.c chflags → chflags1 → chflags0), with
+/// `securelevel` the kernel's (`None`: not known, refused where the answer
+/// needs it):
 /// - mac_vnode_check_setflags: the MAC policies taken to allow it, as for
-///   the restore's other calls (re-mountpoints.md UNSETTLED 4);
+///   the restore's other calls (not yet settled);
 /// - vnode_authattr (vfs_subr.c:10822): SF_SYNTHETIC cleared from the new
 ///   and the old flags; for root no flag change is illegal (UF_SETTABLE |
 ///   SF_SETTABLE is every bit left); a change asks KAUTH_VNODE_WRITE_SECURITY

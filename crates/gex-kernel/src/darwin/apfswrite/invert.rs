@@ -1,7 +1,7 @@
 //! `apfs_invert -d <container> -s 1 -n apfs_invert_asr_img -f`, the erase
 //! restore's turn of asr's image file into the System volume's own
 //! contents (the erase ramdisk's `apfs_invert`, APFS 2236.140.6; addresses
-//! are its own, drafts' re-invert.md the transcription):
+//! are its own):
 //!
 //! - the outer container mounted by its library (`nx_mount` 0x100032d98),
 //!   the volume (`apfs_mount` 0x10001f5fc, no snapshots allowed), the image

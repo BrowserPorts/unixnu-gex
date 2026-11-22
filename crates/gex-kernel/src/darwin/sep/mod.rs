@@ -9,9 +9,6 @@
 //! owner supplies ([`image`], [`core`]) and the web device's own UID
 //! ([`secrets`]). No reply of the SEP's is made here; what is missing
 //! fails loudly and is named.
-//!
-//! The specification of what each piece was read from is in
-//! `drafts/sep/`, kept beside the build.
 
 pub mod a7iop;
 pub mod akf;

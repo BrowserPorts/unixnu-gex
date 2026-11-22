@@ -1,6 +1,5 @@
 //! The SEP's drivers in the registry's `IOService` plane, as the
-//! kernelcache matches them over the device tree
-//! (`drafts/sep/01-a7iop-mailbox.md` section 1):
+//! kernelcache matches them over the device tree:
 //!
 //! ```text
 //!   sep                 AppleARMIODevice, a nub of /arm-io/sep

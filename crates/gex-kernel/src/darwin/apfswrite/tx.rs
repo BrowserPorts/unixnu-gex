@@ -1636,7 +1636,7 @@ impl<'a> Nx<'a> {
             Ok(x) => x,
             // A cache holding every free block found no run that long: with
             // nothing to rescan, the tier loop's next tier and the
-            // avoid-off retry (3.5) are left.
+            // avoid-off retry are left.
             Err(_) if !partial => return Err("not implemented: a non-partial data allocation the free-extent cache has no run for (the next tier and the avoid-off retry, re-alloc 3.5)".into()),
             Err(_) => return Err("not implemented: a data allocation the free-extent cache cannot place (the chunk scan and the free queues' drain)".into()),
         };
@@ -3032,15 +3032,14 @@ impl<'a> Nx<'a> {
 
     /// `APFSVolumeEnableUserProtectionWithOptions(vol, user, no data, 8)`:
     /// the container user client's selector 0x14, apfs_vek_set_protection
-    /// (K:0xfffffff006679080; drafts/s21/re-data.md 2.3): the volume's
-    /// wrapped VEK (tag 10) read and no stale proposed one (tag 0xb), the
-    /// Secure Enclave's rewrap of it for the user (KEYS_STAND_IN: the same
-    /// bytes' length), then in the open container transaction
-    /// apfs_commit_update_volume_key (K:0xfffffff00665c030): the rewrap
-    /// added as the proposed key, the Secure Enclave's commit, the VEK
-    /// entry replaced, the proposed one deleted, each a keybag rewrite;
-    /// `tx_leave(nx, xid, 5)` closes the transaction and waits for its
-    /// checkpoint.
+    /// (K:0xfffffff006679080): the volume's wrapped VEK (tag 10) read and
+    /// no stale proposed one (tag 0xb), the Secure Enclave's rewrap of it
+    /// for the user (KEYS_STAND_IN: the same bytes' length), then in the
+    /// open container transaction apfs_commit_update_volume_key
+    /// (K:0xfffffff00665c030): the rewrap added as the proposed key, the
+    /// Secure Enclave's commit, the VEK entry replaced, the proposed one
+    /// deleted, each a keybag rewrite; `tx_leave(nx, xid, 5)` closes the
+    /// transaction and waits for its checkpoint.
     pub fn vek_set_protection(&mut self, index: usize) -> Result<(), String> {
         let (sb, _) = self.vol_sb_read(index)?;
         if u64a(sb, 0x38) & 0x20 != 0 {
@@ -3065,13 +3064,12 @@ impl<'a> Nx<'a> {
     }
 
     /// `APFSVolumePayloadSet(vol, type, data)` as AKSVolumeMap makes it
-    /// (the container user client's selector 0xa, K:0xfffffff006678cfc;
-    /// drafts/s21/re-data.md 2.5) with the user's volume cookie
-    /// (KEYS_STAND_IN): an encrypted volume, a type under 8, at most 0x800
-    /// bytes; the entry of tag 0xf8 + type added by a `keybag_operation`
-    /// with no transaction of the caller's, which opens or joins the
-    /// container's and, holding one of its own, ends with `tx_leave(..., 5)`:
-    /// a checkpoint.
+    /// (the container user client's selector 0xa, K:0xfffffff006678cfc)
+    /// with the user's volume cookie (KEYS_STAND_IN): an encrypted volume,
+    /// a type under 8, at most 0x800 bytes; the entry of tag 0xf8 + type
+    /// added by a `keybag_operation` with no transaction of the caller's,
+    /// which opens or joins the container's and, holding one of its own,
+    /// ends with `tx_leave(..., 5)`: a checkpoint.
     pub fn volume_payload_set(&mut self, index: usize, ty: u16) -> Result<(), String> {
         let cookie = key_stand_in(COOKIE_LEN);
         let (sb, _) = self.vol_sb_read(index)?;
@@ -3105,8 +3103,7 @@ impl<'a> Nx<'a> {
             return Err(format!("existing file system (slot {index})"));
         }
         // Data (the shared data volume) and User: what -P changes
-        // (drafts/s16/re-protected.md section 2: K 0xfffffff006672290 with
-        // the device tree's e-apfs).
+        // (K 0xfffffff006672290 with the device tree's e-apfs).
         let shared = v.encrypted && v.role == 0x40 && v.e_apfs;
         let secondary = v.encrypted && !shared && v.role != 0x2c0 && v.e_apfs;
         if v.encrypted && !(shared || (secondary && v.role == 0x2)) {

@@ -1,7 +1,7 @@
 //! The shared memory buffer: one contiguous SEP-visible buffer with a
 //! channel table at its start (`AppleSEPSharedMemoryBuffer`,
-//! `drafts/sep/02-transport.md` section 6, K 0xfffffff0063d79c4
-//! `withChannels`, K 0xfffffff0063d0cfc `_allocateShm`).
+//! K 0xfffffff0063d79c4 `withChannels`, K 0xfffffff0063d0cfc
+//! `_allocateShm`).
 //!
 //! The table has 16-byte entries `{u32 name, u32 size, u64 offset}` (a
 //! channel's name is its four characters as a number, the first character

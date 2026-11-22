@@ -34,10 +34,10 @@ pub struct RealTimer {
     pub call: Option<(Instant, u64)>,
 }
 
-/// `microuptime`, from the first time it is asked.
+/// `microuptime`, from the first time the system asks it.
 fn microuptime() -> u64 {
     static START: OnceLock<Instant> = OnceLock::new();
-    START.get_or_init(Instant::now).elapsed().as_micros() as u64
+    START.get_or_init(|| super::share::origin(super::share::Origin::Microuptime, (Instant::now(), super::time::realtime())).0).elapsed().as_micros() as u64
 }
 
 /// The instant a microsecond of uptime falls at.

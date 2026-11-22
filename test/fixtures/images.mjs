@@ -98,7 +98,7 @@ export const outputs = { busybox: ['bb.tar.zst', 'rt-side.so'], slim: ['slim'], 
 /** The `darwin-static` image's programs (tests/darwin/bin, as
  *  tests/darwin/build.sh builds them), and the boot payload's files
  *  tests/darwin/run.sh boots them with, where the payload has them. */
-const DARWIN_STATIC = ['hello-static', 'bsd-carry', 'tcall', 'bsdthr', 'waits', 'hold', 'cpuclk', 'pipewr', 'unixname'];
+const DARWIN_STATIC = ['hello-static', 'bsd-carry', 'tcall', 'bsdthr', 'waits', 'hold', 'cpuclk', 'pipewr', 'unixname', 'sysids'];
 const DARWIN_BOOT = ['DeviceTree', 'sandbox_profile.bin', 'sandbox_builtin.bin', 'sandbox_protobox.bin', 'img4_anchor.der', 'SystemVolume.attrs'];
 
 export const images = {

@@ -667,6 +667,15 @@ pub enum Remote {
     /// ([`super::mig::later_reply`]), for the routine that waits for it in
     /// this task: its return code and scalar outputs.
     Later { token: u64, ret: i32, scalars: Vec<u64> },
+    /// A change another task's call made to this task's importance marks
+    /// and boost, which its element reaches as a mirror there
+    /// ([`super::importance::PolicyAt`]).
+    Policy(super::importance::PolicyOp),
+    /// A bill another task's call rolled up to this task's bank ledger,
+    /// which its bank context reaches by its key there
+    /// ([`super::voucher::LedgerAt`]): CPU time to it, by it, and whether
+    /// the bill held time not kept.
+    Ledger { to_me: u64, to_others: u64, unkept: bool },
 }
 
 /// How other tasks reach a task: its mailbox, and the bell of the thread

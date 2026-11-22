@@ -16,6 +16,16 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 #[derive(Debug, PartialEq, Eq)]
 pub struct Bad(pub usize, pub &'static str);
 
+/// What a process decoding the table holds of its own task: its key, and
+/// the policy and bank ledger its elements reach as cells (every other
+/// task's are in another process's memory: a mirror and a key).
+#[derive(Clone, Debug, Default)]
+pub struct OwnTask {
+    pub task: super::TaskKey,
+    pub policy: Option<super::super::importance::Policy>,
+    pub ledger: Option<std::sync::Arc<super::super::rusage::BankLedger>>,
+}
+
 /// An encoding under way.
 #[derive(Default)]
 pub struct Put(pub Vec<u8>);
@@ -106,6 +116,11 @@ impl<'a> Get<'a> {
             _ => Err(Bad(self.at - 1, "an option")),
         }
     }
+    /// What was wanted where the decoding is.
+    pub fn bad(&self, what: &'static str) -> Bad {
+        Bad(self.at, what)
+    }
+
     /// Whether every byte has been read.
     pub fn done(&self) -> bool {
         self.at == self.b.len()
@@ -695,11 +710,11 @@ pub fn get_exc(g: &mut Get<'_>) -> Result<super::super::exception::ExcActions, B
 }
 
 impl super::IpcShared {
-    /// The table as bytes, but for its links and its vouchers (which hold
-    /// what is a task's own: its mailbox and bell, its policy, its bank
-    /// ledger): its objects, spaces, queues, the kernel's objects every
-    /// task names, the host's special ports and exception actions, and its
-    /// counters.
+    /// The table as bytes, but for its links (which hold what is a task's
+    /// own: its mailbox and bell): its objects, spaces, queues, the
+    /// kernel's objects every task names, the host's special ports and
+    /// exception actions, its vouchers and importance (each task's policy
+    /// as its marks, its bank ledger as its key), and its counters.
     pub fn table_bytes(&self) -> Vec<u8> {
         let mut p = Put::default();
         put_objects(&mut p, &self.objects);
@@ -719,12 +734,14 @@ impl super::IpcShared {
             p.i32(id);
             p.u64(o);
         }
+        self.vouchers.put(&mut p);
         p.0
     }
 
-    /// The table [`Self::table_bytes`] made, with `links` and `vouchers` as
-    /// its own; bytes that are not all of one, refused.
-    pub fn of_table_bytes(b: &[u8], links: HashMap<super::TaskKey, std::sync::Arc<super::TaskLink>>, vouchers: super::super::voucher::VoucherTables) -> Result<super::IpcShared, Bad> {
+    /// The table [`Self::table_bytes`] made, with `links` as its own, for a
+    /// process whose own task `own` is; bytes that are not all of one,
+    /// refused.
+    pub fn of_table_bytes(b: &[u8], links: HashMap<super::TaskKey, std::sync::Arc<super::TaskLink>>, own: &OwnTask) -> Result<super::IpcShared, Bad> {
         let g = &mut Get::new(b);
         let objects = get_objects(g)?;
         let next_id = g.u64()?;
@@ -737,6 +754,7 @@ impl super::IpcShared {
         let host_exc = get_exc(g)?;
         let n = g.len()?;
         let host_special = (0..n).map(|_| Ok((g.i32()?, g.u64()?))).collect::<Result<_, Bad>>()?;
+        let vouchers = super::super::voucher::VoucherTables::get(g, own)?;
         if !g.done() {
             return Err(Bad(g.at, "the table's end"));
         }
@@ -792,7 +810,7 @@ mod tests {
     }
 
     fn of(b: &[u8]) -> Result<super::super::IpcShared, Bad> {
-        super::super::IpcShared::of_table_bytes(b, HashMap::new(), Default::default())
+        super::super::IpcShared::of_table_bytes(b, HashMap::new(), &OwnTask::default())
     }
 
     #[test]

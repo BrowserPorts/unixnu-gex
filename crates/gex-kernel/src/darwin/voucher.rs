@@ -10,7 +10,7 @@
 //! reference counted; index 0 is the manager's default value, and a
 //! voucher with it for a key has nothing for that key.
 
-use super::ipc::ObjId;
+use super::ipc::{ObjId, TaskKey};
 use crate::syscalls::Kernel;
 use std::collections::HashMap;
 
@@ -319,7 +319,30 @@ struct BankTask {
     to_charge: Vec<u64>,
     /// `bt_ledger`: its task's ledger, until the task lets go of the
     /// context (`bank_destroy_bank_task_ledger`).
-    ledger: Option<std::sync::Arc<super::rusage::BankLedger>>,
+    ledger: Option<LedgerAt>,
+    /// Its task's key: whose ledger it is.
+    owner: TaskKey,
+}
+
+/// A bank context's ledger as the table reaches it: the ledger, where the
+/// process holding the table is its task's own (natively every task's);
+/// else, in the page, a task of another process, whose ledger is in that
+/// process's memory: its task's key, a bill to which goes to that process
+/// ([`super::ipc::Remote::Ledger`]).
+#[derive(Clone, Debug)]
+pub enum LedgerAt {
+    Cell(std::sync::Arc<super::rusage::BankLedger>),
+    Elsewhere(TaskKey),
+}
+
+impl LedgerAt {
+    fn same(&self, o: &LedgerAt) -> bool {
+        match (self, o) {
+            (LedgerAt::Cell(a), LedgerAt::Cell(b)) => std::sync::Arc::ptr_eq(a, b),
+            (LedgerAt::Elsewhere(a), LedgerAt::Elsewhere(b)) => a == b,
+            _ => false,
+        }
+    }
 }
 
 /// `struct bank_account`: what a merchant task's work for a holder is
@@ -1152,8 +1175,9 @@ impl Kernel {
         };
         let persona_uid = persona.as_ref().map_or(super::cred::UID_NONE, |p| p.get_uid());
         // get_bank_task_context: bt_ledger is the task's ledger.
-        let ledger = Some(std::sync::Arc::clone(&self.dtask.rusage.bank.lock().unwrap_or_else(|e| e.into_inner())));
-        BankTask { refs: 1, made: 0, voucher_ref: 0, info, persona_uid, hasentitlement: self.bank_task_is_propagate_entitled(), thread_group: super::coalition::thread_group(self.pid), to_pay: Vec::new(), to_charge: Vec::new(), ledger }
+        let ledger = Some(LedgerAt::Cell(std::sync::Arc::clone(&self.dtask.rusage.bank.lock().unwrap_or_else(|e| e.into_inner()))));
+        let owner = self.ipc().task;
+        BankTask { refs: 1, made: 0, voucher_ref: 0, info, persona_uid, hasentitlement: self.bank_task_is_propagate_entitled(), thread_group: super::coalition::thread_group(self.pid), to_pay: Vec::new(), to_charge: Vec::new(), ledger, owner }
     }
 
     /// `bank_task_is_propagate_entitled`: a platform binary propagates
@@ -1270,16 +1294,26 @@ impl Kernel {
         // merchant's, unless they are the same ledger (or both gone).
         let (hl, ml) = (self.bank_task(holder).ledger.clone(), self.bank_task(merchant).ledger.clone());
         let same = match (&hl, &ml) {
-            (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+            (Some(a), Some(b)) => a.same(b),
             (None, None) => true,
             _ => false,
         };
         if !same {
             use std::sync::atomic::Ordering::AcqRel;
             for (l, me) in [(hl, true), (ml, false)] {
-                let Some(l) = l else { continue };
-                if me { l.to_me.fetch_add(bill, AcqRel) } else { l.to_others.fetch_add(bill, AcqRel) };
-                l.unkept.fetch_or(unkept, AcqRel);
+                match l {
+                    None => {}
+                    Some(LedgerAt::Cell(l)) => {
+                        if me { l.to_me.fetch_add(bill, AcqRel) } else { l.to_others.fetch_add(bill, AcqRel) };
+                        l.unkept.fetch_or(unkept, AcqRel);
+                    }
+                    // Another process's task's ledger: the bill goes to it
+                    // (none to a task that has ended).
+                    Some(LedgerAt::Elsewhere(key)) => {
+                        let (to_me, to_others) = if me { (bill, 0) } else { (0, bill) };
+                        self.ipc().remote(key, super::ipc::Remote::Ledger { to_me, to_others, unkept });
+                    }
+                }
             }
         }
         self.bank_task(holder).to_pay.retain(|&a| a != h);
@@ -1379,7 +1413,7 @@ impl Kernel {
         use super::rusage::Bills;
         let own = std::sync::Arc::clone(&s.bank.lock().unwrap_or_else(|e| e.into_inner()));
         let ctx = self.vt().bank.values().find_map(|e| match e {
-            BankElem::Task(t) if t.info.pid == pid && t.info.unique_pid == uniqueid && t.ledger.as_ref().is_some_and(|l| std::sync::Arc::ptr_eq(l, &own)) => Some((t.to_pay.clone(), t.to_charge.clone())),
+            BankElem::Task(t) if t.info.pid == pid && t.info.unique_pid == uniqueid && matches!(&t.ledger, Some(LedgerAt::Cell(l)) if std::sync::Arc::ptr_eq(l, &own)) => Some((t.to_pay.clone(), t.to_charge.clone())),
             _ => None,
         });
         let Some((to_pay, to_charge)) = ctx else { return Bills::of_ledger(&own) };
@@ -1777,3 +1811,229 @@ impl Kernel {
 
 /// `sizeof(struct proc_persona_info)`.
 const PROC_PERSONA_INFO_SIZE: u32 = 48;
+
+// -- the tables as bytes ([`super::ipc::wire`]) -------------------------------------------
+
+use super::ipc::wire::{sorted, Bad, Get, OwnTask, Put};
+
+fn put_u64s(p: &mut Put, v: &[u64]) {
+    p.len(v.len());
+    for &x in v {
+        p.u64(x);
+    }
+}
+
+fn get_u64s(g: &mut Get<'_>) -> Result<Vec<u64>, Bad> {
+    let n = g.len()?;
+    (0..n).map(|_| g.u64()).collect()
+}
+
+fn put_key_table(p: &mut Put, t: &[u32; KEY_NUM]) {
+    for &w in t {
+        p.u32(w);
+    }
+}
+
+fn get_key_table(g: &mut Get<'_>) -> Result<[u32; KEY_NUM], Bad> {
+    let mut t = [0u32; KEY_NUM];
+    for w in t.iter_mut() {
+        *w = g.u32()?;
+    }
+    Ok(t)
+}
+
+impl VoucherTables {
+    /// The tables as bytes: a bank context's ledger as its task's key.
+    pub fn put(&self, p: &mut Put) {
+        p.len(self.ivac.len());
+        for c in &self.ivac {
+            p.opt(c.as_ref(), |p, c: &Ivac| {
+                p.len(c.table.len());
+                for e in &c.table {
+                    p.u64(e.value);
+                    p.u32(e.refs);
+                    p.u32(e.made);
+                    p.bool(e.persist);
+                    p.bool(e.free);
+                    p.bool(e.releasing);
+                    p.u32(e.index);
+                    p.u32(e.next);
+                }
+                p.u32(c.init_size);
+                p.u32(c.freelist);
+            });
+        }
+        p.len(self.vouchers.len());
+        for (&id, v) in sorted(&self.vouchers) {
+            p.u64(id);
+            put_key_table(p, &v.table);
+            p.u32(v.refs);
+            p.opt(v.port, Put::u64);
+        }
+        p.len(self.by_table.len());
+        for (t, &id) in sorted(&self.by_table) {
+            put_key_table(p, t);
+            p.u64(id);
+        }
+        p.u64(self.next);
+        p.len(self.bank.len());
+        for (&h, e) in sorted(&self.bank) {
+            p.u64(h);
+            match e {
+                BankElem::Task(t) => {
+                    p.u8(0);
+                    for w in [t.refs, t.made, t.voucher_ref] {
+                        p.u32(w);
+                    }
+                    let i = &t.info;
+                    p.u64(i.unique_pid);
+                    p.i32(i.pid);
+                    for w in [i.flags, i.pidversion, i.persona_id, i.uid, i.gid] {
+                        p.u32(w);
+                    }
+                    p.bytes(&i.macho_uuid);
+                    p.u32(t.persona_uid);
+                    p.bool(t.hasentitlement);
+                    p.u64(t.thread_group);
+                    put_u64s(p, &t.to_pay);
+                    put_u64s(p, &t.to_charge);
+                    // The ledger as its task's key: a cell's is its owner's.
+                    p.opt(t.ledger.as_ref(), |p, l: &LedgerAt| {
+                        p.u64(match l {
+                            LedgerAt::Cell(_) => t.owner,
+                            LedgerAt::Elsewhere(k) => *k,
+                        })
+                    });
+                    p.u64(t.owner);
+                }
+                BankElem::Account(a) => {
+                    p.u8(1);
+                    p.u32(a.refs);
+                    p.u32(a.made);
+                    for w in [a.merchant, a.holder, a.secureoriginator, a.proximateprocess, a.thread_group] {
+                        p.u64(w);
+                    }
+                    p.u32(a.so_persona.id);
+                    p.u32(a.so_persona.uid);
+                    p.u64(a.bill);
+                    p.bool(a.bill_unkept);
+                    p.len(a.adopters.len());
+                    for &t in &a.adopters {
+                        p.i32(t);
+                    }
+                }
+            }
+        }
+        self.imp.put(p);
+        p.u64(self.next_handle);
+    }
+
+    /// The tables [`VoucherTables::put`] made: `own`'s task's bank context
+    /// has its ledger's cell, every other task's its key.
+    pub fn get(g: &mut Get<'_>, own: &OwnTask) -> Result<VoucherTables, Bad> {
+        let n = g.len()?;
+        let ivac = (0..n)
+            .map(|_| {
+                g.opt(|g| {
+                    let m = g.len()?;
+                    let table = (0..m).map(|_| Ok(Ivace { value: g.u64()?, refs: g.u32()?, made: g.u32()?, persist: g.bool()?, free: g.bool()?, releasing: g.bool()?, index: g.u32()?, next: g.u32()? })).collect::<Result<_, Bad>>()?;
+                    Ok(Ivac { table, init_size: g.u32()?, freelist: g.u32()? })
+                })
+            })
+            .collect::<Result<_, Bad>>()?;
+        let n = g.len()?;
+        let vouchers = (0..n).map(|_| Ok((g.u64()?, Voucher { table: get_key_table(g)?, refs: g.u32()?, port: g.opt(Get::u64)? }))).collect::<Result<_, Bad>>()?;
+        let n = g.len()?;
+        let by_table = (0..n).map(|_| Ok((get_key_table(g)?, g.u64()?))).collect::<Result<_, Bad>>()?;
+        let next = g.u64()?;
+        let n = g.len()?;
+        let mut bank = HashMap::new();
+        for _ in 0..n {
+            let h = g.u64()?;
+            let e = match g.u8()? {
+                0 => {
+                    let (refs, made, voucher_ref) = (g.u32()?, g.u32()?, g.u32()?);
+                    let (unique_pid, pid) = (g.u64()?, g.i32()?);
+                    let (flags, pidversion, persona_id, uid, gid) = (g.u32()?, g.u32()?, g.u32()?, g.u32()?, g.u32()?);
+                    let uuid = g.bytes()?;
+                    let macho_uuid: [u8; 16] = uuid.as_slice().try_into().map_err(|_| g.bad("a 16-byte UUID"))?;
+                    let info = ProcPersonaInfo { unique_pid, pid, flags, pidversion, persona_id, uid, gid, macho_uuid };
+                    let (persona_uid, hasentitlement, thread_group) = (g.u32()?, g.bool()?, g.u64()?);
+                    let (to_pay, to_charge) = (get_u64s(g)?, get_u64s(g)?);
+                    let ledger = g.opt(Get::u64)?.map(|k| match &own.ledger {
+                        Some(l) if k == own.task => LedgerAt::Cell(std::sync::Arc::clone(l)),
+                        _ => LedgerAt::Elsewhere(k),
+                    });
+                    BankElem::Task(BankTask { refs, made, voucher_ref, info, persona_uid, hasentitlement, thread_group, to_pay, to_charge, ledger, owner: g.u64()? })
+                }
+                1 => {
+                    let (refs, made) = (g.u32()?, g.u32()?);
+                    let (merchant, holder, secureoriginator, proximateprocess, thread_group) = (g.u64()?, g.u64()?, g.u64()?, g.u64()?, g.u64()?);
+                    let so_persona = BankPersona { id: g.u32()?, uid: g.u32()? };
+                    let (bill, bill_unkept) = (g.u64()?, g.bool()?);
+                    let m = g.len()?;
+                    let adopters = (0..m).map(|_| g.i32()).collect::<Result<_, Bad>>()?;
+                    BankElem::Account(BankAccount { refs, made, merchant, holder, secureoriginator, proximateprocess, thread_group, so_persona, bill, bill_unkept, adopters })
+                }
+                _ => return Err(g.bad("a bank element's kind")),
+            };
+            bank.insert(h, e);
+        }
+        let imp = super::importance::ImpState::get(g, own)?;
+        Ok(VoucherTables { ivac, vouchers, by_table, next, bank, imp, next_handle: g.u64()? })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn tables(ledger: &Arc<super::super::rusage::BankLedger>) -> VoucherTables {
+        let mut t = VoucherTables::default();
+        t.ivac = vec![None, Some(Ivac { table: vec![Ivace::reset(1), Ivace { value: 9, refs: 2, made: 1, persist: true, free: false, releasing: false, index: 0, next: 0 }], init_size: 2, freelist: 0 })];
+        t.vouchers.insert(3, Voucher { table: [1; KEY_NUM], refs: 1, port: Some(44) });
+        t.by_table.insert([1; KEY_NUM], 3);
+        t.next = 3;
+        let info = ProcPersonaInfo { unique_pid: 77, pid: 105, flags: 1, pidversion: 2, persona_id: 501, uid: 501, gid: 20, macho_uuid: [7; 16] };
+        t.bank.insert(0x1040, BankElem::Task(BankTask { refs: 1, made: 1, voucher_ref: 0, info, persona_uid: 501, hasentitlement: true, thread_group: 9, to_pay: vec![0x1080], to_charge: vec![], ledger: Some(LedgerAt::Cell(Arc::clone(ledger))), owner: 5 }));
+        t.bank.insert(0x1080, BankElem::Account(BankAccount { refs: 1, made: 1, merchant: 0x1040, holder: 0x1040, secureoriginator: 0x1040, proximateprocess: 0x1040, thread_group: 9, so_persona: BankPersona { id: 501, uid: 501 }, bill: 1234, bill_unkept: true, adopters: vec![8, 9] }));
+        t.next_handle = 0x1080;
+        t
+    }
+
+    fn bytes(t: &VoucherTables) -> Vec<u8> {
+        let mut p = Put::default();
+        t.put(&mut p);
+        p.0
+    }
+
+    #[test]
+    fn a_bank_context_is_its_own_processs_ledger_and_a_key_elsewhere() {
+        let ledger = Arc::new(super::super::rusage::BankLedger::default());
+        let b = bytes(&tables(&ledger));
+        let own = OwnTask { task: 5, policy: None, ledger: Some(Arc::clone(&ledger)) };
+        let mut g = Get::new(&b);
+        let mine = VoucherTables::get(&mut g, &own).expect("it decodes");
+        assert!(g.done());
+        assert!(matches!(mine.bank.get(&0x1040), Some(BankElem::Task(BankTask { ledger: Some(LedgerAt::Cell(l)), .. })) if Arc::ptr_eq(l, &ledger)));
+        assert_eq!(bytes(&mine), b);
+        let other = OwnTask { task: 6, policy: None, ledger: Some(Arc::new(super::super::rusage::BankLedger::default())) };
+        let theirs = VoucherTables::get(&mut Get::new(&b), &other).expect("it decodes");
+        assert!(matches!(theirs.bank.get(&0x1040), Some(BankElem::Task(BankTask { ledger: Some(LedgerAt::Elsewhere(5)), .. }))));
+        assert_eq!(bytes(&theirs), b);
+        for cut in [0, b.len() / 2, b.len() - 1] {
+            assert!(VoucherTables::get(&mut Get::new(&b[..cut]), &other).is_err(), "cut at {cut}");
+        }
+    }
+
+    #[test]
+    fn ledgers_are_the_same_by_cell_or_by_key() {
+        let l = Arc::new(super::super::rusage::BankLedger::default());
+        assert!(LedgerAt::Cell(Arc::clone(&l)).same(&LedgerAt::Cell(Arc::clone(&l))));
+        assert!(!LedgerAt::Cell(Arc::clone(&l)).same(&LedgerAt::Cell(Arc::new(super::super::rusage::BankLedger::default()))));
+        assert!(LedgerAt::Elsewhere(4).same(&LedgerAt::Elsewhere(4)));
+        assert!(!LedgerAt::Elsewhere(4).same(&LedgerAt::Elsewhere(5)));
+        assert!(!LedgerAt::Elsewhere(4).same(&LedgerAt::Cell(l)));
+    }
+}

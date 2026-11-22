@@ -1648,6 +1648,14 @@ impl Kernel {
                         self.darwin_answer_later(m, token, reply);
                     }
                 }
+                super::ipc::Remote::Policy(op) => self.darwin_policy_with(|p| op.apply(p)),
+                super::ipc::Remote::Ledger { to_me, to_others, unkept } => {
+                    use std::sync::atomic::Ordering::AcqRel;
+                    let l = std::sync::Arc::clone(&self.dtask.rusage.bank.lock().unwrap_or_else(|e| e.into_inner()));
+                    l.to_me.fetch_add(to_me, AcqRel);
+                    l.to_others.fetch_add(to_others, AcqRel);
+                    l.unkept.fetch_or(unkept, AcqRel);
+                }
             }
         }
         self.darwin_pending_ready(m);

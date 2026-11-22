@@ -314,6 +314,33 @@ pub(crate) fn task_end(k: &mut gex_kernel::syscalls::Kernel) {
     }
 }
 
+/// This process ends without having ended its task: gex could not run it
+/// on (its Worker trapped out, `gex_abandon`, or its frames ended with no
+/// exit, `gex_process_gone`), and it ends as a killed one. Outside a kernel
+/// call its kernel's state is whole and its task ends as a killed
+/// process's does ([`task_end`]). A trap inside one (`in_call`) cut the
+/// call off where it was: its task cannot end, which is said here and
+/// recorded for every process of the page that takes the IPC table, as
+/// what this one lost of the system's IPC state. (The table, if the call
+/// held it, the global kernel takes back at the exit as it was last given
+/// back, and records that loss too: `ipc::wire::process_exited`.)
+/// Nothing for a Linux process.
+pub(crate) fn abandoned(in_call: bool) {
+    if !darwin_process() {
+        return;
+    }
+    if !in_call {
+        with_exec_lock(|h| task_end(&mut h.kernel));
+        return;
+    }
+    let pid = my_pid();
+    let what = format!(
+        "process {pid}'s task's end (it ended inside a kernel call, where gex failed): its IPC space, the rights in it and the ports it held stay in the system's table, none destroyed and no notification sent"
+    );
+    gex_kernel::darwin_say!("[gex:{pid}] Darwin: not implemented: {what}");
+    gex_kernel::darwin::ipc::wire::note_lost(pid, &what);
+}
+
 /// The threads started on Workers of their own ([`adopted`]) that have not
 /// ended: what [`task_end`] ends with the process.
 fn on_workers() -> std::sync::MutexGuard<'static, Vec<i32>> {

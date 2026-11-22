@@ -244,6 +244,15 @@ pub fn sd_filt2(p: &ScanProc, me: i32, f: &SdFilter) -> Option<bool> {
 }
 
 impl Kernel {
+    /// The machine's end with `e`, inside this task's kernel call: the
+    /// system's IPC table given back first, with what the call has changed
+    /// of it, as a call gives it back at its end, which this one never
+    /// reaches.
+    pub(crate) fn darwin_machine_end(&mut self, e: Event) -> ! {
+        self.darwin_ipc_leave();
+        machine::end(e)
+    }
+
     fn darwin_machine_event(&self, kind: Kind, cause: Cause) -> Event {
         let n = self.dtask.p_name.0;
         let name = String::from_utf8_lossy(&n[..n.iter().position(|&c| c == 0).unwrap_or(n.len())]).into_owned();
@@ -307,7 +316,7 @@ impl Kernel {
         }
         let first = howto & (rb::PANIC | rb::QUICK) != rb::PANIC | rb::QUICK && IN_SHUTDOWN.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok();
         match begin(howto, first) {
-            Begin::Panic => machine::end(self.darwin_machine_event(Kind::Panic(panic_kernel(howto, message)), Cause::Reboot { howto })),
+            Begin::Panic => self.darwin_machine_end(self.darwin_machine_event(Kind::Panic(panic_kernel(howto, message)), Cause::Reboot { howto })),
             Begin::Busy => return Err(Errno::EBUSY),
             Begin::ForceReboot => return self.darwin_force_reboot(howto, message),
             Begin::Shutdown => {}
@@ -343,7 +352,7 @@ impl Kernel {
     fn darwin_force_reboot(&mut self, howto: u32, message: Option<&[u8]>) -> Result<u64, Errno> {
         let final_begun = howto & rb::PANIC == 0 && FINAL_STAGE.swap(true, Ordering::AcqRel);
         match finish(howto, final_begun) {
-            Finish::Panic => machine::end(self.darwin_machine_event(Kind::Panic(panic_kernel(howto, message)), Cause::Reboot { howto })),
+            Finish::Panic => self.darwin_machine_end(self.darwin_machine_event(Kind::Panic(panic_kernel(howto, message)), Cause::Reboot { howto })),
             Finish::Busy => Err(Errno::EBUSY),
             Finish::HostReboot(options) => {
                 // What strict mode stops at, before the machine's end would
@@ -352,7 +361,7 @@ impl Kernel {
                     return Err(Errno::EIO);
                 }
                 self.darwin_nvram_halt_restart();
-                machine::end(self.darwin_machine_event(host_reboot_kind(options), Cause::Reboot { howto }))
+                self.darwin_machine_end(self.darwin_machine_event(host_reboot_kind(options), Cause::Reboot { howto }))
             }
         }
     }
@@ -361,7 +370,7 @@ impl Kernel {
     /// ([`host_reboot_kind`]): the machine's end.
     pub(crate) fn darwin_host_reboot(&mut self, options: u32) -> ! {
         self.darwin_nvram_halt_restart();
-        machine::end(self.darwin_machine_event(host_reboot_kind(options), Cause::HostReboot { options }))
+        self.darwin_machine_end(self.darwin_machine_event(host_reboot_kind(options), Cause::HostReboot { options }))
     }
 
     /// Report `what`, a part of the shutdown not modelled, when a thread

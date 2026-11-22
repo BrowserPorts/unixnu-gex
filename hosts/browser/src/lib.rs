@@ -15742,10 +15742,7 @@ fn trap() -> ! {
 /// entry (`NATIVE_LEFT`, `NO_LEAVE`, the resume point). Those this shim
 /// can end itself, `trap` ends.
 fn check_scopes_at_trap() {
-    #[cfg(feature = "shared-memory")]
-    let kernel = DEPTH.with(|d| d.get()) > 0;
-    #[cfg(not(feature = "shared-memory"))]
-    let kernel = HOST.with(|h| h.try_borrow_mut().is_err());
+    let kernel = in_kernel_now();
     let defer = gl::DEFER.with(|d| d.get());
     if kernel || defer {
         warn_line(&format!(
@@ -15755,6 +15752,16 @@ fn check_scopes_at_trap() {
             LAST_SYSCALL.with(|c| c.get()) as i32,
         ));
     }
+}
+
+/// Whether this Worker is inside a kernel call: it holds the kernel lock
+/// (or, single-threaded, the host is borrowed). After a trap, whether the
+/// trap cut a kernel call off.
+fn in_kernel_now() -> bool {
+    #[cfg(feature = "shared-memory")]
+    return DEPTH.with(|d| d.get()) > 0;
+    #[cfg(not(feature = "shared-memory"))]
+    return HOST.with(|h| h.try_borrow_mut().is_err());
 }
 
 /// Which of the shim's own entry points is running, for a report that cannot
@@ -21032,6 +21039,9 @@ pub extern "C" fn gex_abandon(code: i32) {
     }
     let pid = home.pid();
     trace_line(&format!("[proc] abandon {pid}: the Worker stopped without an exit\n"));
+    // A Darwin process's task ends with it, as a killed one's, where its
+    // kernel's state allows (darwin.rs `abandoned`).
+    darwin::abandoned(in_kernel_now());
     // The descriptors, on the same terms as `exit_process`: a status alone
     // ends a `wait4` and nothing else. A parent reading a dead child's pipe
     // -- which is every `$(...)`, and every apt method -- is not waiting on
@@ -21194,6 +21204,8 @@ pub extern "C" fn gex_process_gone(status: i32) -> u32 {
         }
         return 0;
     }
+    // (its frames ended outside any kernel call)
+    darwin::abandoned(in_kernel_now());
     set_exited(true);
     waitq::wake_process();
     let pid = my_pid();

@@ -817,12 +817,13 @@ impl Ipc {
     /// key and keeps the space it has). A task that has ended has neither:
     /// its kernel reaches the ports and the other tasks' spaces, its own
     /// space is the inactive one its end left it (`is_active` false: no
-    /// name is in it and none is given out), and it takes no key.
-    pub fn check_out(&mut self, cell: &Arc<IpcCell>) {
+    /// name is in it and none is given out), and it takes no key. `call`
+    /// names the kernel call taking it, for the global kernel's record.
+    pub fn check_out(&mut self, cell: &Arc<IpcCell>, call: impl FnOnce() -> String) {
         debug_assert!(!self.held);
         // In the page the table is the global kernel's, which every
         // process of the page takes it from.
-        let mut s = if super::share::remote().is_some() { wire::take_table(&self.own_task()) } else { cell.take() };
+        let mut s = if super::share::remote().is_some() { wire::take_table(&self.own_task(), &call()) } else { cell.take() };
         self.cell.get_or_insert_with(|| Arc::clone(cell));
         self.objects = std::mem::take(&mut s.objects);
         self.next_id = s.next_id;

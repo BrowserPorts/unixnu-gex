@@ -662,10 +662,11 @@ impl crate::syscalls::Kernel {
                 // this task meanwhile is taken with it.
                 let l = std::sync::Arc::clone(&self.dtask.rusage.bank.lock().unwrap_or_else(|e| e.into_inner()));
                 self.dtask.ipc_raw.own_ledger = Some(l);
-                self.dtask.ipc_raw.check_out(&self.procs.darwin_ipc);
+                let (tid, pc) = (self.tid, self.syscall_pc);
+                self.dtask.ipc_raw.check_out(&self.procs.darwin_ipc, || format!("kernel call by thread {tid} (its last system call's pc {pc:#x})"));
                 self.darwin_mailbox_fetch();
             } else {
-                self.dtask.ipc_raw.check_out(&self.procs.darwin_ipc);
+                self.dtask.ipc_raw.check_out(&self.procs.darwin_ipc, String::new);
             }
         }
         &mut self.dtask.ipc_raw

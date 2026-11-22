@@ -113,12 +113,18 @@ pub mod op {
     pub const MAILBOX_PUT: u32 = 7;
     pub const MAILBOX_TAKE: u32 = 8;
     /// The system's IPC table ([`super::super::ipc::wire::take_table`]):
-    /// a take's request the taker's pid, its answer the table's bytes (none
-    /// before the first is given back), `-EAGAIN` while another holds it,
-    /// or the table's length (not taken) when it is longer than the room
-    /// given; a give-back's request the giver's pid and the table.
+    /// a take's request the taker's pid, how many of the table's losses it
+    /// has been told of (4 bytes) and the kernel call it takes it in; its
+    /// answer the number of losses recorded (4 bytes), the ones the taker
+    /// has not been told of (each a pid and its text), then the table's
+    /// bytes (none before the first is given back); `-EAGAIN` while another
+    /// holds it, or the answer's length (not taken) when it is longer than
+    /// the room given. A give-back's request the giver's pid and the table.
+    /// A loss's (`IPC_LOST`, [`super::super::ipc::wire::note_lost`]) the
+    /// pid of the process that ended and what it lost.
     pub const IPC_TAKE: u32 = 9;
     pub const IPC_PUT: u32 = 10;
+    pub const IPC_LOST: u32 = 11;
 }
 
 /// The boot payload every process of the page booted from: its files'

@@ -131,6 +131,7 @@ pub mod sockbuf;
 pub mod unixsock;
 pub mod sema;
 pub mod select;
+pub mod share;
 pub mod shm;
 pub mod signal;
 pub mod sockaddr;
@@ -794,11 +795,14 @@ impl crate::syscalls::Kernel {
     }
 }
 
-/// `nextpidversion`: one counter for the system, taken at each exec
-/// (`OSIncrementAtomic` returns the value before).
 /// The system's `nextuniqueid`: a new process takes the next (the kernel's
-/// own process is 0, so the first is 1).
+/// own process is 0, so the first is 1). The global kernel's where it holds
+/// the system's state ([`share`]).
 pub fn next_uniqueid() -> u64 {
+    share::next(share::Counter::Uniqueid).unwrap_or_else(local_next_uniqueid)
+}
+
+fn local_next_uniqueid() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
 }
@@ -810,6 +814,10 @@ pub fn next_uniqueid() -> u64 {
 /// child, an exec's new task in cloneproc, a corpse fork), and so do
 /// exec_handle_sugid (each image activated) and task_mark_corpse.
 pub fn next_task_uniqueid() -> u64 {
+    share::next(share::Counter::TaskUniqueid).unwrap_or_else(local_next_task_uniqueid)
+}
+
+fn local_next_task_uniqueid() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
@@ -817,11 +825,21 @@ pub fn next_task_uniqueid() -> u64 {
 /// The system's `thread_unique_id`: a new thread takes the next (the first
 /// is 101).
 pub fn next_thread_id() -> u64 {
+    share::next(share::Counter::ThreadId).unwrap_or_else(local_next_thread_id)
+}
+
+fn local_next_thread_id() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(100);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
 }
 
+/// `nextpidversion`: one counter for the system, taken at each exec
+/// (`OSIncrementAtomic` returns the value before).
 pub fn next_pidversion() -> i32 {
+    share::next(share::Counter::Pidversion).map_or_else(local_next_pidversion, |v| v as u32 as i32)
+}
+
+fn local_next_pidversion() -> i32 {
     static NEXT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }

@@ -461,6 +461,9 @@ extern "C" {
     fn k_futex_wake(addr: u64);
     fn k_futex_gen(addr: u64) -> u32;
     fn k_lock_call(req: gex_kernel::PAddr, req_len: u32, out: gex_kernel::PAddr, out_len: u32, caller: i32) -> i64;
+    /// The Darwin system's state the page's processes share
+    /// (`gex_kernel::darwin::share`): one encoded call.
+    fn k_darwin_call(op: u32, req: gex_kernel::PAddr, req_len: u32, out: gex_kernel::PAddr, out_len: u32) -> i64;
     fn k_lock_queue() -> u32;
     fn k_lock_seq() -> u64;
     fn k_spawn(ppid: i32) -> i32;
@@ -1797,6 +1800,10 @@ fn shared_dns_name(addr: u32) -> Option<String> {
 
 fn gl_call(req: &[u8], out: &mut [u8]) -> i64 {
     unsafe { k_lock_call(req.as_ptr() as gex_kernel::PAddr, req.len() as u32, out.as_mut_ptr() as gex_kernel::PAddr, out.len() as u32, my_pid()) }
+}
+
+fn dc_call(op: u32, req: &[u8], out: &mut [u8]) -> i64 {
+    unsafe { k_darwin_call(op, req.as_ptr() as gex_kernel::PAddr, req.len() as u32, out.as_mut_ptr() as gex_kernel::PAddr, out.len() as u32) }
 }
 
 fn gl_queue() -> u32 {
@@ -4351,6 +4358,12 @@ fn install_panic_hook() {
         gex_kernel::darwin::report::set_sink(|b| unsafe { write(2, b.as_ptr() as usize, b.len() as u32) });
         // And the machine's end ([`darwin_machine_end`]).
         gex_kernel::darwin::machine::set_hook(darwin_machine_end);
+        // And the Darwin system's state, which every process of the page
+        // shares: the global kernel's, from before the first kernel here
+        // takes anything of it (a new task's identifiers).
+        if unsafe { k_present() } != 0 {
+            gex_kernel::darwin::share::set_remote(gex_kernel::darwin::share::Remote { call: dc_call });
+        }
         std::panic::set_hook(Box::new(|info| {
             // Set while this hook runs: a panic inside it is not reported
             // through it (std aborts at once, its line on a stderr that

@@ -1713,6 +1713,25 @@ pub extern "C" fn k_lock_call(req: gex_kmem::PAddr, req_len: u32, out: gex_kmem:
     r
 }
 
+/// One call on the Darwin system's state, which every process of the page
+/// shares here (`gex_kernel::darwin::share`): the request `req_len` bytes
+/// at `req` in the caller's memory, the answer into `out` (at most
+/// `out_len` bytes). The answer's length, or a negated errno.
+#[no_mangle]
+pub extern "C" fn k_darwin_call(op: u32, req: gex_kmem::PAddr, req_len: u32, out: gex_kmem::PAddr, out_len: u32) -> i64 {
+    note_panics();
+    let mut b = vec![0u8; req_len as usize];
+    if req_len > 0 && !unsafe { gex_kmem::pull_checked(b.as_mut_ptr(), req, req_len) } {
+        return -14;
+    }
+    let mut o = vec![0u8; out_len as usize];
+    let r = gex_kernel::darwin::share::serve(op, &b, &mut o);
+    if r > 0 && !unsafe { gex_kmem::push_checked(out, o.as_ptr(), (r as u32).min(out_len)) } {
+        return -14;
+    }
+    r
+}
+
 /// How many shared-mapping write-backs there have been (`locks::write_seq`):
 /// one load, at the system call entry of every process that maps a file shared.
 #[no_mangle]

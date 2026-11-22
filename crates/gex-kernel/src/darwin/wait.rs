@@ -163,6 +163,10 @@ impl Kernel {
             // waiting).
             _ if own_deadline => {
                 let pidle = self.procs.sched.processors_idle(Some(tid), 0);
+                // (darwin_pidle_elsewhere's, with the slot held)
+                if self.procs.is_shared() && super::held::any_elsewhere(super::held::Kind::Process, self.pid).is_some() {
+                    self.dtask.rusage.wkups_unkept.store(true, std::sync::atomic::Ordering::Release);
+                }
                 self.dtask.rusage.interrupt_wakeup(pidle);
                 WaitResult::TimedOut
             }

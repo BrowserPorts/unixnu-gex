@@ -117,7 +117,7 @@ impl Kernel {
             let actions: Option<ExcActions> = match t.level {
                 0 => self.dtask.kports.thread_exc.get(&self.tid).copied(),
                 1 => Some(self.dtask.kports.exc),
-                _ => Some(self.ipc().host_exc),
+                _ => Some(self.darwin_host_exc("an exception's delivery")),
             };
             t.level += 1;
             let Some(actions) = actions else { continue };

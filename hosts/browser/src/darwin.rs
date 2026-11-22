@@ -135,7 +135,12 @@ fn start(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> Result<u
     let ctx_addr = h.threads[cur()].ctx_addr();
     h.kernel.next_ctx_slot.reset(ctx_slots_below(ctx_addr).max(1));
 
-    // The system boots, with the page's payload (gexc's GEX_DARWIN_BOOT).
+    // The system boots, with the page's payload (gexc's GEX_DARWIN_BOOT):
+    // the one every Darwin process of the page boots from.
+    {
+        let files = BOOT.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        darwin::share::boot_payload(&files).map_err(|e| load(format!("the boot payload: {e}")))?;
+    }
     h.kernel.darwin = true;
     let tc = boot_file("TrustCache");
     let sandbox = darwin::SandboxProfiles { platform: boot_file("sandbox_profile.bin"), builtin: boot_file("sandbox_builtin.bin"), protobox: boot_file("sandbox_protobox.bin") };
@@ -183,6 +188,9 @@ fn start(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> Result<u
     k.dtask.task_uniqueid = darwin::next_task_uniqueid();
     k.darwin_signals_init();
     k.darwin_nofile_sync();
+    // One of the page's Darwin processes from now on, and what the others
+    // changed of the state it reads from its start, reported.
+    k.darwin_page_start();
     // (No scheduler maintenance thread: the page runs none, and the
     // averages it would keep say so when asked, `Sched::check`.)
     // A system launchd has booted has its Preboot volume grafted: with

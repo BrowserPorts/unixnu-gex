@@ -422,6 +422,9 @@ impl Kernel {
     /// target's threads stop at their next look at the task's holds; the
     /// call does not wait for them as `task_wait_locked` does.
     pub(crate) fn darwin_pid_suspend(&mut self, pid: i32) -> Result<u64, Errno> {
+        if self.darwin_jetsam_elsewhere("pid_suspend") {
+            return Err(Errno::ENOSYS);
+        }
         let job = self.darwin_pid_hold_target(pid)?;
         {
             let mut j = job.lock().unwrap_or_else(|e| e.into_inner());
@@ -439,6 +442,9 @@ impl Kernel {
 
     /// `pid_resume(pid)`: `pid_suspend`'s hold released.
     pub(crate) fn darwin_pid_resume(&mut self, pid: i32) -> Result<u64, Errno> {
+        if self.darwin_jetsam_elsewhere("pid_resume") {
+            return Err(Errno::ENOSYS);
+        }
         let job = self.darwin_pid_hold_target(pid)?;
         self.procs.jetsam().on_resume(pid);
         {

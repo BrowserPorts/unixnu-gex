@@ -277,7 +277,7 @@ impl Kernel {
         const MACH_EXCEPTION_BACKTRACE_PREFERRED: i32 = 0x2000_0000;
         let thread = self.dtask.kports.thread_exc.get(&self.tid).map(|a| a[EXC_CORPSE_NOTIFY]);
         let task = Some(self.dtask.kports.exc[EXC_CORPSE_NOTIFY]);
-        let host = Some(self.ipc().host_exc[EXC_CORPSE_NOTIFY]);
+        let host = Some(self.darwin_host_exc("a lightweight corpse's notification")[EXC_CORPSE_NOTIFY]);
         let mut out = [None; 3];
         let mut any = false;
         for (i, a) in [thread, task, host].into_iter().enumerate() {

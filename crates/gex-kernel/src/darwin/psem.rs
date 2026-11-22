@@ -213,6 +213,13 @@ impl Kernel {
         if fmode & O_CREAT != 0 && value > SEM_VALUE_MAX {
             return Err(Errno::EINVAL);
         }
+        // A name another process of the page holds is in its memory: what
+        // the open would find, or make, is not this one's to answer.
+        let key = name.chars().map(|c| c as u8).collect::<Vec<u8>>();
+        if let Some(h) = super::held::elsewhere(super::held::Kind::PsemName, &key, self.pid) {
+            self.darwin_elsewhere(&format!("sem_open of the POSIX semaphore name {name:?}"), h);
+            return Err(Errno::ENOSYS);
+        }
         let found = names().get(&name).cloned();
         if fmode & (O_CREAT | O_EXCL) == O_CREAT | O_EXCL && found.is_some() {
             return Err(Errno::EEXIST);
@@ -230,16 +237,30 @@ impl Kernel {
                 gid: cred.groups.first().copied().unwrap_or(0),
                 inner: Mutex::new(Inner { count: value, usecount: 1, creator: (self.pid, self.dtask.uniqueid), ..Inner::default() }),
             });
-            let mut n = names();
-            // Another process's create between the look and now is the
-            // name it finds.
-            match n.get(&name) {
-                Some(_) if fmode & O_EXCL != 0 => return Err(Errno::EEXIST),
-                Some(other) => Arc::clone(other),
-                None => {
-                    n.insert(name.clone(), Arc::clone(&p));
+            let made = {
+                let mut n = names();
+                // Another process's create between the look and now is the
+                // name it finds.
+                match n.get(&name) {
+                    Some(_) if fmode & O_EXCL != 0 => return Err(Errno::EEXIST),
+                    Some(other) => Err(Arc::clone(other)),
+                    None => {
+                        n.insert(name.clone(), Arc::clone(&p));
+                        Ok(p)
+                    }
+                }
+            };
+            match made {
+                Ok(p) => {
+                    if let Some(h) = super::held::claim(super::held::Kind::PsemName, &key, self.pid) {
+                        // Made in another process of the page meanwhile.
+                        names().remove(&name);
+                        self.darwin_elsewhere(&format!("sem_open of the POSIX semaphore name {name:?}"), h);
+                        return Err(Errno::ENOSYS);
+                    }
                     p
                 }
+                Err(other) => other,
             }
         } else {
             let p = found.ok_or(Errno::ENOENT)?;
@@ -260,7 +281,14 @@ impl Kernel {
     /// `sem_unlink(name)`: the name goes; the semaphore lives while open.
     fn darwin_sem_unlink(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
         let name = self.darwin_psem_name(m, a[0])?;
-        let p = names().get(&name).cloned().ok_or(Errno::ENOENT)?;
+        let key = name.chars().map(|c| c as u8).collect::<Vec<u8>>();
+        let Some(p) = names().get(&name).cloned() else {
+            if let Some(h) = super::held::elsewhere(super::held::Kind::PsemName, &key, self.pid) {
+                self.darwin_elsewhere(&format!("sem_unlink of the POSIX semaphore name {name:?}"), h);
+                return Err(Errno::ENOSYS);
+            }
+            return Err(Errno::ENOENT);
+        };
         let creator = self.darwin_psem_creator(&p, true);
         self.darwin_psem_mac("ipc-posix-sem-unlink", &name, creator)?;
         // psem_access with the semaphore's own mode as the open mode.
@@ -268,6 +296,7 @@ impl Kernel {
         let mut n = names();
         if n.get(&name).is_some_and(|q| Arc::ptr_eq(q, &p)) {
             n.remove(&name);
+            super::held::let_go(super::held::Kind::PsemName, &key, self.pid);
             let mut i = p.inner();
             i.usecount -= 1;
             i.removed = i.usecount != 0;

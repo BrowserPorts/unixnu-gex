@@ -276,7 +276,22 @@ impl Kernel {
         if fmode & O_CREAT != 0 {
             self.darwin_pshm_mac(78, &name)?;
         }
+        // A name another process of the page holds is in its memory: what
+        // the open would find, or make, is not this one's to answer.
+        let key = name.chars().map(|c| c as u8).collect::<Vec<u8>>();
+        if let Some(h) = super::held::elsewhere(super::held::Kind::ShmName, &key, self.pid) {
+            self.darwin_elsewhere(&format!("shm_open of the POSIX shared memory name {name:?}"), h);
+            return Err(Errno::ENOSYS);
+        }
         let (p, made) = NAMES.open(&name, fmode, a[2] as u32 & ALLPERMS, &self.dtask.cred, self.pid)?;
+        if made {
+            if let Some(h) = super::held::claim(super::held::Kind::ShmName, &key, self.pid) {
+                // Made in another process meanwhile.
+                let _ = NAMES.unlink(&name, &self.dtask.cred);
+                self.darwin_elsewhere(&format!("shm_open of the POSIX shared memory name {name:?}"), h);
+                return Err(Errno::ENOSYS);
+            }
+        }
         // An object there: the MAC policies' say on reading it, then on
         // writing or truncating it (`fmode & (FWRITE | O_TRUNC)`), then its
         // access.
@@ -299,9 +314,18 @@ impl Kernel {
     pub(crate) fn darwin_shm_unlink(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
         let name = get_name(m, a[0]).map_err(|_| Errno::EINVAL)?;
         // The object found, then the MAC policies' say on its unlink.
-        NAMES.find(&name).ok_or(Errno::ENOENT)?;
+        let key = name.chars().map(|c| c as u8).collect::<Vec<u8>>();
+        if NAMES.find(&name).is_none() {
+            if let Some(h) = super::held::elsewhere(super::held::Kind::ShmName, &key, self.pid) {
+                self.darwin_elsewhere(&format!("shm_unlink of the POSIX shared memory name {name:?}"), h);
+                return Err(Errno::ENOSYS);
+            }
+            return Err(Errno::ENOENT);
+        }
         self.darwin_pshm_mac(80, &name)?;
-        NAMES.unlink(&name, &self.dtask.cred).map(|_| 0)
+        NAMES.unlink(&name, &self.dtask.cred)?;
+        super::held::let_go(super::held::Kind::ShmName, &key, self.pid);
+        Ok(0)
     }
 
     /// Sandbox's check of operation `op` (ipc-posix-shm-read-data 76,

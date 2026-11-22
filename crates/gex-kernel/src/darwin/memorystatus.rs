@@ -1229,6 +1229,17 @@ impl crate::syscalls::Kernel {
         (deadline != 0).then(|| super::mach::abs_to_instant(deadline))
     }
 
+    /// Whether `what` reads or changes the jetsam table where it is not the
+    /// system's: in the page each process's process table holds a copy of
+    /// its own, with no process's entry (reported, for the caller to fail).
+    pub(crate) fn darwin_jetsam_elsewhere(&mut self, what: &str) -> bool {
+        if !self.procs.is_shared() {
+            return false;
+        }
+        self.darwin_unimplemented(format!("{what}: the jetsam table, which in the page is each process's own copy with no process's entry, not the system's"));
+        true
+    }
+
     /// `proc_dirtycontrol(pid, flavor, arg)`: `proc_info`'s
     /// PROC_INFO_CALL_DIRTYCONTROL. The value is the call's return.
     pub(crate) fn darwin_dirtycontrol(&mut self, pid: i32, flavor: u32, arg: u64) -> Result<u64, Errno> {
@@ -1236,6 +1247,9 @@ impl crate::syscalls::Kernel {
         const SET: u32 = 2;
         const GET: u32 = 3;
         const CLEAR: u32 = 4;
+        if self.darwin_jetsam_elsewhere("proc_dirtycontrol") {
+            return Err(Errno::ENOSYS);
+        }
         let pcontrol = arg as u32;
         let target = self.procs.live_nice(pid);
         let jetsam_has = self.procs.jetsam().get(pid).is_some();
@@ -1275,6 +1289,9 @@ impl crate::syscalls::Kernel {
     /// value is the call's return (`*ret`).
     pub(crate) fn darwin_memorystatus_control(&mut self, m: &mut crate::GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
         let (command, pid, flags, buffer, size) = (a[0] as u32, a[1] as i32, a[2] as u32, a[3], a[4]);
+        if self.darwin_jetsam_elsewhere("memorystatus_control") {
+            return Err(Errno::ENOSYS);
+        }
         let root = self.creds.uid() == 0;
         let entitled = self.darwin_task_entitled(MEMORYSTATUS_ENTITLEMENT);
         let skip_auth = matches!(command, cmd::SET_PROCESS_IS_FREEZABLE | cmd::GET_PROCESS_IS_FREEZABLE | cmd::GET_PROCESS_IS_FROZEN);

@@ -247,6 +247,19 @@ impl Kernel {
     /// (EPERM); then `mount_common`. CONFIG_IMGSRC_ACCESS is not in a
     /// release kernel: `MNT_IMGSRC_BY_INDEX` is a flag like the others.
     pub(crate) fn darwin_mount(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
+        // The mount list every process reads, which in the page is each
+        // process's own copy.
+        if self.darwin_system_change_refused(super::held::Kind::Mounts, "mount(2), a change to the mount list") {
+            return Err(Errno::ENOSYS);
+        }
+        let r = self.darwin_mount_inner(m, a);
+        if r.is_ok() {
+            super::held::claim(super::held::Kind::Mounts, &[], self.pid);
+        }
+        r
+    }
+
+    fn darwin_mount_inner(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
         const MFSNAMELEN: usize = 15;
         const MNT_RDONLY: u64 = 0x1;
         const MNT_UNION: u64 = 0x20;

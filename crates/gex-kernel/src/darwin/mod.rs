@@ -132,6 +132,7 @@ pub mod unixsock;
 pub mod sema;
 pub mod select;
 pub mod share;
+pub mod held;
 pub mod shm;
 pub mod signal;
 pub mod sockaddr;
@@ -744,6 +745,45 @@ impl crate::syscalls::Kernel {
     pub(crate) fn darwin_take_notes(&mut self) {
         for what in NOTES.with(|n| std::mem::take(&mut *n.borrow_mut())) {
             self.darwin_unimplemented(what);
+        }
+    }
+
+    /// A use of the Darwin system's state that reaches what process `pid`
+    /// of the page (or several, [`held::SEVERAL`]) holds of a subsystem that
+    /// is each process's own copy there ([`held`]): reported as not
+    /// implemented, for the caller to fail.
+    pub(crate) fn darwin_elsewhere(&mut self, what: &str, pid: i32) {
+        let who = if pid == held::SEVERAL { "other processes of the page".to_string() } else { format!("process {pid} of the page") };
+        self.darwin_unimplemented(format!("{what}, which {who} holds: in the page each process has its own copy of it, not the system's"));
+    }
+
+    /// Whether a change to the system-wide state `kind`, which every process
+    /// reads without asking (the mount list, a freeze), is one this process
+    /// may make where the state is each process's own copy: not when
+    /// another process of the page changed it, nor while another Darwin
+    /// process of the page runs (its copy would not change). Reported as
+    /// `what`, for the caller to fail.
+    pub(crate) fn darwin_system_change_refused(&mut self, kind: held::Kind, what: &str) -> bool {
+        let pid = self.pid;
+        let Some(h) = held::elsewhere(kind, &[], pid).or_else(|| held::any_elsewhere(held::Kind::Process, pid)) else { return false };
+        self.darwin_elsewhere(what, h);
+        true
+    }
+
+    /// A Darwin process of the page has started (its exec): it is one of
+    /// the page's from now on, and what other processes changed of the
+    /// system-wide state it reads from its start is reported: the mount
+    /// list, which every path it looks up reads, and a freeze, which every
+    /// write it makes checks.
+    pub fn darwin_page_start(&mut self) {
+        let pid = self.pid;
+        held::set_me(pid);
+        held::claim(held::Kind::Process, &pid.to_le_bytes(), pid);
+        if let Some(h) = held::elsewhere(held::Kind::Mounts, &[], pid) {
+            self.darwin_elsewhere("the mount list, which another process changed (mount(2), MNT_UPDATE or a shutdown's unmounts)", h);
+        }
+        if let Some(h) = held::elsewhere(held::Kind::Freeze, &[], pid) {
+            self.darwin_elsewhere("a filesystem freeze (F_FREEZE_FS), which every write checks", h);
         }
     }
 

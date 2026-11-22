@@ -100,6 +100,8 @@ fn state<R>(f: impl FnOnce(&mut State) -> R) -> R {
 /// default spinner if none is (`vc_progress_initialize`); then
 /// `initialize_screen`. `Err` says what is not modelled that it would do.
 pub fn initialize_console(info: Option<Video>, op: u32, now: u64) -> Result<(), String> {
+    // The system's console, of which this process's is a copy in the page.
+    super::held::touch_mine(super::held::Kind::Vconsole, &[]);
     state(|s| {
         if op == op::RELEASE_SCREEN && !s.progress {
             s.progress = true;

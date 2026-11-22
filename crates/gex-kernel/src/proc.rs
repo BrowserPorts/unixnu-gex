@@ -1901,10 +1901,21 @@ impl ProcTable {
     /// not made it yet) and once it is reaped. `proc_find` finds the
     /// process only when it has not exited; `proc_find_zombref` only when
     /// it has.
+    ///
+    /// A table that is really somewhere else holds only this process's
+    /// records: another Darwin process's of the page is in that process's
+    /// memory, and the lookup is reported (as not
+    /// implemented, at the end of the call) rather than answered as if
+    /// there were no such process.
     pub fn darwin(&self, pid: i32) -> Option<(Arc<dyn std::any::Any + Send + Sync>, bool)> {
-        let t = self.lock();
-        let p = t.procs.iter().find(|p| p.pid == pid)?;
-        p.darwin.clone().map(|r| (r, p.exited))
+        let found = {
+            let t = self.lock();
+            t.procs.iter().find(|p| p.pid == pid).and_then(|p| p.darwin.clone().map(|r| (r, p.exited)))
+        };
+        if found.is_none() && self.remote.is_some() && crate::darwin::held::darwin_process(pid) {
+            crate::darwin::note_unimplemented(format!("process {pid}'s Darwin record (proc_find), which is in that process's own memory in the page, not the system's"));
+        }
+        found
     }
 
     pub fn live_nice(&self, pid: i32) -> Option<(u32, i32)> {

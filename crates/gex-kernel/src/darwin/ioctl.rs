@@ -95,7 +95,29 @@ static LO0_FLAGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::n
 /// (`rt_ifmsg`) are its callers' to report.
 pub fn if_down_all() {
     const IFF_UP: u32 = 0x1;
-    LO0_FLAGS.fetch_and(!IFF_UP, std::sync::atomic::Ordering::Relaxed);
+    lo0_flags(4, !IFF_UP);
+}
+
+/// lo0's flags after `how` with `v` (as [`super::share::value`]'s: 0 read,
+/// 1 set, 3 or, 4 and): the system's, which the global kernel holds in the
+/// page (from `loopattach`'s, as here).
+fn lo0_flags(how: u8, v: u32) -> u32 {
+    use std::sync::atomic::Ordering::Relaxed;
+    use super::share::{value, Value};
+    if value(Value::Lo0Flags, 2, u64::from(LO0_FLAGS.load(Relaxed))).is_some() {
+        return value(Value::Lo0Flags, how, u64::from(v)).map_or(0, |f| f as u32);
+    }
+    match how {
+        1 => LO0_FLAGS.store(v, Relaxed),
+        3 => {
+            LO0_FLAGS.fetch_or(v, Relaxed);
+        }
+        4 => {
+            LO0_FLAGS.fetch_and(v, Relaxed);
+        }
+        _ => {}
+    }
+    LO0_FLAGS.load(Relaxed)
 }
 
 impl Kernel {
@@ -103,7 +125,6 @@ impl Kernel {
     /// `lo_ioctl`'s SIOCSIFADDR brings up. The address itself is not kept:
     /// no call here reads an interface's addresses back.
     fn darwin_ifaddr_add(&mut self, data: &mut [u8]) -> Result<(), Errno> {
-        use std::sync::atomic::Ordering::Relaxed;
         const AF_INET: u8 = 2;
         const IFF_UP_RUNNING: u32 = 0x1 | 0x40;
         let len = data[..16].iter().position(|&c| c == 0).unwrap_or(16);
@@ -111,7 +132,7 @@ impl Kernel {
             self.darwin_unimplemented(format!("SIOCAIFADDR on {:?}, family {}", String::from_utf8_lossy(&data[..len]), data[17]));
             return Err(Errno::EOPNOTSUPP);
         }
-        LO0_FLAGS.fetch_or(IFF_UP_RUNNING, Relaxed);
+        lo0_flags(3, IFF_UP_RUNNING);
         Ok(())
     }
 
@@ -130,15 +151,14 @@ impl Kernel {
     /// `SIOCGIFFLAGS` and `SIOCSIFFLAGS` (root's, already checked) of an
     /// interface by name.
     pub(super) fn darwin_ifflags(&mut self, com: u64, data: &mut [u8]) -> Result<(), Errno> {
-        use std::sync::atomic::Ordering::Relaxed;
         const IFF_CANTCHANGE: u32 = 0x2 | 0x10 | 0x40 | 0x400 | 0x800 | 0x8000 | 0x200;
         self.darwin_ifunit(data)?;
         if com == cmd::SIOCGIFFLAGS {
-            data[16..18].copy_from_slice(&(LO0_FLAGS.load(Relaxed) as u16).to_le_bytes());
+            data[16..18].copy_from_slice(&(lo0_flags(0, 0) as u16).to_le_bytes());
         } else {
             let new = u32::from(u16::from_le_bytes([data[16], data[17]]));
-            let keep = LO0_FLAGS.load(Relaxed) & IFF_CANTCHANGE;
-            LO0_FLAGS.store(keep | (new & !IFF_CANTCHANGE & 0xffff), Relaxed);
+            let keep = lo0_flags(0, 0) & IFF_CANTCHANGE;
+            lo0_flags(1, keep | (new & !IFF_CANTCHANGE & 0xffff));
         }
         Ok(())
     }

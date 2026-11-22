@@ -298,6 +298,13 @@ impl Kernel {
     /// which it never is here; `cl_sparse_push_error` counts the sparse
     /// cluster pushes that failed with ENOSPC, and no push fails here.
     fn darwin_reboot_kernel(&mut self, howto: u32, message: Option<&[u8]>) -> Result<u64, Errno> {
+        // The shutdown state (IN_SHUTDOWN, the final stage, the shutdown
+        // log's offset) is each process's own copy in the page: a reboot
+        // another process of the page began is in its memory.
+        if let Some(h) = super::held::claim(super::held::Kind::Shutdown, &[], self.pid) {
+            self.darwin_elsewhere("reboot(2), the system's shutdown", h);
+            return Err(Errno::ENOSYS);
+        }
         let first = howto & (rb::PANIC | rb::QUICK) != rb::PANIC | rb::QUICK && IN_SHUTDOWN.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok();
         match begin(howto, first) {
             Begin::Panic => machine::end(self.darwin_machine_event(Kind::Panic(panic_kernel(howto, message)), Cause::Reboot { howto })),

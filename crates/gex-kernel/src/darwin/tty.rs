@@ -594,6 +594,8 @@ pub fn copy_constty() -> Option<Arc<TtyCell>> {
 
 /// `set_constty`.
 pub fn set_constty(tp: Option<Arc<TtyCell>>) {
+    // The console's, of which this process's is a copy in the page.
+    super::held::touch_mine(super::held::Kind::Console, &[]);
     *CONSTTY.lock().unwrap_or_else(|e| e.into_inner()) = tp;
 }
 

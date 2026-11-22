@@ -1757,6 +1757,8 @@ pub extern "C" fn k_exit(pid: i32, status: i32) {
     note_kill(pid, procs().ppid(pid), gex_kernel::signal::sig::SIGCHLD);
     // Its record locks, however it ended.
     locks().release_pid(pid, None);
+    // What it held of the Darwin system's state that ends with it.
+    gex_kernel::darwin::held::process_exited(pid);
     // What it wrote is kept before its parent hears it ended. A failure is
     // the write-back's to say: it tries again and reports it.
     let _ = gex_kernel::vfs::tmpfs::persist::exited();
@@ -1968,6 +1970,7 @@ pub extern "C" fn k_ppid(pid: i32) -> i32 {
 #[no_mangle]
 pub extern "C" fn k_reap(pid: i32) {
     procs().reap(pid);
+    gex_kernel::darwin::held::process_reaped(pid);
 }
 
 /// `getpgid`, with Linux's zero-means-the-caller rule. Negative errno on

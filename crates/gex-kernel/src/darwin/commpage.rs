@@ -153,10 +153,12 @@ fn asb_targets() -> [u64; 4] {
         0x67df_bbd1_2c4a_594e,
     ];
     static RANDIDX: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    // Drawn once for the system: the first process's draw, where the
+    // global kernel holds the system's values.
     let first = *RANDIDX.get_or_init(|| {
         let mut b = [0u8; 1];
         crate::vfs::devfs::fill_random(&mut b);
-        b[0]
+        super::share::value(super::share::Value::AsbIndex, 2, u64::from(b[0])).map_or(b[0], |v| v as u8)
     });
     let val = |i: u8| VALS[usize::from(first.wrapping_add(i)) % VALS.len()];
     [val(0), val(1) % (u64::MAX - MACH_VM_MAX_ADDRESS) + MACH_VM_MAX_ADDRESS, val(2), val(3) % VM_MIN_KERNEL_ADDRESS]
@@ -180,6 +182,12 @@ fn set_word(m: &mut crate::GuestMem<'_>, o: usize, v: u64) {
 /// every process.
 static QUIESCE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// This kernel's next SMR generation: the system's
+/// ([`super::share::Counter::Quiesce`]).
+pub(crate) fn local_next_quiesce() -> u64 {
+    QUIESCE_GEN.fetch_add(1, Ordering::Relaxed) + 1
+}
+
 /// One quantum of the scheduler's work on the commpage: the last known
 /// absolute time (`commpage_update_mach_approximate_time`), only ever
 /// forward, and the quiescent counter. A CPU running a program is outside
@@ -194,7 +202,8 @@ pub fn dyld_flags() -> u64 {
 }
 
 /// `commpage_update_dyld_flags`: every process's page has it at its next
-/// [`tick`].
+/// [`tick`]. (`kern.dyld_flags` is set by pid 1 alone, which in the page is
+/// the page kernel's own, never a Darwin process: there it is never set.)
 pub fn set_dyld_flags(v: u64) {
     DYLD_FLAGS.store(v, Ordering::Relaxed);
 }
@@ -206,6 +215,8 @@ static ATM_DIAGNOSTIC_CONFIG: std::sync::atomic::AtomicU32 = std::sync::atomic::
 /// `atm_set_diagnostic_config`'s `commpage_update_atm_diagnostic_config`:
 /// every process's page has it at its next [`tick`].
 pub fn set_atm_diagnostic_config(v: u32) {
+    // The system's, where the global kernel holds it.
+    super::share::value(super::share::Value::AtmDiagnosticConfig, 1, u64::from(v));
     ATM_DIAGNOSTIC_CONFIG.store(v, Ordering::Relaxed);
 }
 
@@ -213,11 +224,12 @@ pub fn tick(m: &mut crate::GuestMem<'_>, abstime: u64) {
     let mut k = m.kernel();
     set_word(&mut k, off::DYLD_FLAGS, DYLD_FLAGS.load(Ordering::Relaxed));
     let at = placements()[1] + off::ATM_DIAGNOSTIC_CONFIG as u64;
-    k.write(at, &ATM_DIAGNOSTIC_CONFIG.load(Ordering::Relaxed).to_le_bytes()).expect("the commpage's read-write page");
+    let atm = super::share::value(super::share::Value::AtmDiagnosticConfig, 0, 0).map_or_else(|| ATM_DIAGNOSTIC_CONFIG.load(Ordering::Relaxed), |v| v as u32);
+    k.write(at, &atm.to_le_bytes()).expect("the commpage's read-write page");
     if word(&k, off::APPROX_TIME) < abstime {
         set_word(&mut k, off::APPROX_TIME, abstime);
     }
-    let gen = QUIESCE_GEN.fetch_add(1, Ordering::Relaxed) + 1;
+    let gen = super::share::next(super::share::Counter::Quiesce).unwrap_or_else(local_next_quiesce);
     set_word(&mut k, off::CPU_QUIESCENT_COUNTER, gen);
 }
 

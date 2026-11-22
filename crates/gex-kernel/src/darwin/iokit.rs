@@ -1254,6 +1254,12 @@ static CLIENTS: std::sync::Mutex<Vec<Option<std::sync::Arc<std::sync::Mutex<User
 /// in creation order (`gIORegistryLastID`), and each user client the next.
 static NEXT_CLIENT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// This kernel's next user client serial (from 0): the system's
+/// ([`super::share::Counter::IoClient`]).
+pub(crate) fn local_next_client_serial() -> u64 {
+    NEXT_CLIENT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// `kIORegistryEntryIDPrefix`, the first registry entry id.
 pub const REGISTRY_ID_PREFIX: u64 = 0x1_0000_0000;
 
@@ -1264,7 +1270,7 @@ pub fn registry_id(i: u32) -> u64 {
 
 /// A new user client of `service`, by its number.
 pub fn client_add(service: u32, class: &'static str, creator: String, default_locking: bool, kind: Kind) -> u32 {
-    let serial = NEXT_CLIENT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let serial = super::share::next(super::share::Counter::IoClient).unwrap_or_else(local_next_client_serial);
     let id = REGISTRY_ID_PREFIX + tree().len() as u64 + serial;
     let c = UserClient { service, class, id, creator, default_locking, closed: false, kind };
     let mut t = CLIENTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -1294,6 +1300,14 @@ pub fn open_user_client(k: &mut crate::syscalls::Kernel, service: u32, ty: u32) 
     let pid = k.pid;
     let comm = k.darwin_public(pid).map(|(p, _)| String::from_utf8_lossy(&p.comm).into_owned()).unwrap_or_default();
     let creator = format!("pid {pid}, {comm}");
+    // The service's state (IOSurfaceRoot's surfaces and ids, the
+    // framebuffer's display, the accelerator's connections) is each
+    // process's own copy in the page: a service another process of the
+    // page opened is in its memory.
+    if let Some(h) = super::held::claim(super::held::Kind::IoService, &service.to_le_bytes(), pid) {
+        k.darwin_elsewhere(&format!("the IOKit service {} (a user client of it)", name(t, service)), h);
+        return Err(ret::UNSUPPORTED);
+    }
     let (class, kind, default_locking) = match n.class {
         // IOService::newUserClient by the container's IOUserClientClass
         // (its personality's), for any type; the apfs kext does not depend

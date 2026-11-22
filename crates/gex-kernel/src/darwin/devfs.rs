@@ -196,6 +196,12 @@ static NEXT_INO: AtomicU64 = AtomicU64::new(0);
 /// devnode takes a number, then `devfs_propogate`'s copy in the mount's
 /// plane the next, which is the one seen.
 pub fn later_ino() -> u64 {
+    super::share::next(super::share::Counter::DevIno).unwrap_or_else(local_later_ino)
+}
+
+/// This kernel's [`later_ino`]: the system's
+/// ([`super::share::Counter::DevIno`]).
+pub(crate) fn local_later_ino() -> u64 {
     let _ = NEXT_INO.compare_exchange(0, 2 * backing(), Ordering::AcqRel, Ordering::Acquire);
     NEXT_INO.fetch_add(2, Ordering::AcqRel) + 1
 }
@@ -293,7 +299,11 @@ impl DnTimes {
     /// time it would move is made now, with the ones put off; else it is
     /// marked for later.
     pub fn consider(&mut self, flags: u32) {
-        let now = microtime();
+        self.consider_at(flags, microtime());
+    }
+
+    /// [`Self::consider`] at `now`.
+    fn consider_at(&mut self, flags: u32, now: (i64, u32)) {
         let needed = |last: i64| now.0 > last && now.0 - last >= LAZY_UPDATE_SECONDS;
         if (self.change || flags & UPDATE_CHANGE != 0) && needed(self.ctime.0)
             || (self.access || flags & UPDATE_ACCESS != 0) && needed(self.atime.0)
@@ -311,9 +321,14 @@ impl DnTimes {
     /// `devfs_getattr`'s times: what is put off made now, and a time never
     /// set the boot's. The modification time's seconds, and all three.
     pub fn getattr(&mut self) -> (i64, Times) {
-        self.times_locked(microtime(), 0);
+        self.getattr_at(microtime(), boot_sec())
+    }
+
+    /// [`Self::getattr`] at `now`, the boot's second `boot`.
+    fn getattr_at(&mut self, now: (i64, u32), boot: i64) -> (i64, Times) {
+        self.times_locked(now, 0);
         if self.ctime.0 == 0 {
-            self.ctime = (boot_sec(), 0);
+            self.ctime = (boot, 0);
         }
         if self.mtime.0 == 0 {
             self.mtime = self.ctime;
@@ -325,29 +340,108 @@ impl DnTimes {
     }
 }
 
-/// The times of this table's nodes and of the root, by name ("" the root).
-static TIMES: Mutex<Option<HashMap<&'static str, DnTimes>>> = Mutex::new(None);
+/// The times of this table's nodes and of the root, by name ("" the root):
+/// the system's, which the global kernel holds in the page.
+static TIMES: Mutex<Option<HashMap<String, DnTimes>>> = Mutex::new(None);
 
-fn with_times<R>(name: &'static str, f: impl FnOnce(&mut DnTimes) -> R) -> R {
+fn with_times<R>(name: &str, boot: i64, f: impl FnOnce(&mut DnTimes) -> R) -> R {
     let mut g = TIMES.lock().unwrap_or_else(|e| e.into_inner());
-    f(g.get_or_insert_with(HashMap::new).entry(name).or_insert_with(DnTimes::made_at_boot))
+    f(g.get_or_insert_with(HashMap::new).entry(name.to_string()).or_insert_with(|| DnTimes::made_at(boot)))
+}
+
+/// A mark on node `name`'s times (`how` 0) or its attributes' read (1):
+/// the read's modification second and times. Where the global kernel
+/// holds the system's times, there, with this kernel's clock's readings
+/// (the global kernel reads none).
+fn times(name: &str, how: u8, flags: u32) -> Option<(i64, Times)> {
+    let (now, boot) = (microtime(), boot_sec());
+    if let Some(r) = super::share::remote() {
+        let mut req = vec![how];
+        req.extend_from_slice(&now.0.to_le_bytes());
+        req.extend_from_slice(&now.1.to_le_bytes());
+        req.extend_from_slice(&boot.to_le_bytes());
+        req.extend_from_slice(&flags.to_le_bytes());
+        req.extend_from_slice(name.as_bytes());
+        let mut o = [0u8; TIMES_ANSWER];
+        let n = super::share::call_upto(r, super::share::op::DEV_TIMES, &req, &mut o);
+        return (n == TIMES_ANSWER).then(|| times_of(&o));
+    }
+    with_times(name, boot, |t| match how {
+        0 => {
+            t.consider_at(flags, now);
+            None
+        }
+        _ => Some(t.getattr_at(now, boot)),
+    })
+}
+
+/// What a read of a node's times answers through the channel: the
+/// modification second, then its nanoseconds, the access second and
+/// nanoseconds, the change second and nanoseconds.
+const TIMES_ANSWER: usize = 36;
+
+fn times_bytes(mtime: i64, t: &Times) -> [u8; TIMES_ANSWER] {
+    let mut o = [0u8; TIMES_ANSWER];
+    o[..8].copy_from_slice(&mtime.to_le_bytes());
+    o[8..12].copy_from_slice(&t.mtime_ns.to_le_bytes());
+    o[12..20].copy_from_slice(&t.atime.to_le_bytes());
+    o[20..24].copy_from_slice(&t.atime_ns.to_le_bytes());
+    o[24..32].copy_from_slice(&t.ctime.to_le_bytes());
+    o[32..36].copy_from_slice(&t.ctime_ns.to_le_bytes());
+    o
+}
+
+fn times_of(o: &[u8; TIMES_ANSWER]) -> (i64, Times) {
+    let q = |a: usize| i64::from_le_bytes(o[a..a + 8].try_into().unwrap());
+    let w = |a: usize| u32::from_le_bytes(o[a..a + 4].try_into().unwrap());
+    (q(0), Times { mtime_ns: w(8), atime: q(12), atime_ns: w(20), ctime: q(24), ctime_ns: w(32), birth: None })
+}
+
+/// A call on the devfs times [`super::share::Remote::call`] carried,
+/// answered by this kernel, which holds the system's: none for another
+/// call.
+pub(crate) fn serve(op: u32, req: &[u8], out: &mut [u8]) -> Option<i64> {
+    const EINVAL: i64 = 22;
+    if op != super::share::op::DEV_TIMES {
+        return None;
+    }
+    let (Some(&how @ (0 | 1)), 25.., TIMES_ANSWER..) = (req.first(), req.len(), out.len()) else { return Some(-EINVAL) };
+    let now = (i64::from_le_bytes(req[1..9].try_into().unwrap()), u32::from_le_bytes(req[9..13].try_into().unwrap()));
+    let boot = i64::from_le_bytes(req[13..21].try_into().unwrap());
+    let flags = u32::from_le_bytes(req[21..25].try_into().unwrap());
+    let Ok(name) = std::str::from_utf8(&req[25..]) else { return Some(-EINVAL) };
+    Some(with_times(name, boot, |t| {
+        if how == 0 {
+            t.consider_at(flags, now);
+            0
+        } else {
+            let (mtime, times) = t.getattr_at(now, boot);
+            out[..TIMES_ANSWER].copy_from_slice(&times_bytes(mtime, &times));
+            TIMES_ANSWER as i64
+        }
+    }))
 }
 
 /// `devfsspec_read` and `devfsspec_write`'s marks on a node of this table.
 pub fn touch(n: &Node, flags: u32) {
-    with_times(n.name, |t| t.consider(flags));
+    times(n.name, 0, flags);
 }
 
 /// `devfs_readdir`'s access of the root.
 pub fn touch_root() {
-    with_times("", |t| t.consider(UPDATE_ACCESS));
+    times("", 0, UPDATE_ACCESS);
+}
+
+/// The attributes' times of node `name` ("" the root).
+fn getattr_of(name: &str) -> (i64, Times) {
+    times(name, 1, 0).expect("the devfs times' read answers")
 }
 
 /// A node's attributes (`devfs_getattr`): its device as the boot numbered
 /// it (major 0 when that is the boot's own choice, which a stat reports).
 pub fn metadata(n: &'static Node) -> Metadata {
     let dev = (n.major.unwrap_or(0) << 24) | n.minor;
-    let (mtime, times) = with_times(n.name, |t| t.getattr());
+    let (mtime, times) = getattr_of(n.name);
     Metadata {
         file_type: file_type(n),
         size: 0,
@@ -365,7 +459,7 @@ pub fn metadata(n: &'static Node) -> Metadata {
 /// name and its ".." (itself); its size `dn_len`, 8 and the name's length
 /// for each entry.
 pub fn root_metadata() -> Metadata {
-    let (mtime, times) = with_times("", |t| t.getattr());
+    let (mtime, times) = getattr_of("");
     Metadata {
         file_type: FileType::Directory,
         size: list().iter().map(|n| n.len() as u64 + 8).sum(),

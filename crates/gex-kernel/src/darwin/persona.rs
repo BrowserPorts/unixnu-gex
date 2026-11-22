@@ -242,6 +242,15 @@ impl Kernel {
     /// `persona(operation, flags, info, id, idlen, path)`.
     pub(crate) fn darwin_persona(&mut self, m: &mut GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
         let (operation, infop, idp, idlenp, path) = (a[0] as u32 as u64, a[2], a[3], a[4], a[5]);
+        // The registry another process of the page changed is in its
+        // memory: what this one's says is not the system's. (A process's
+        // own persona by its pid is its record's, PIDINFO's.)
+        if operation != op::PIDINFO {
+            if let Some(h) = super::held::elsewhere(super::held::Kind::Personas, &[], self.pid) {
+                self.darwin_elsewhere("the persona registry (persona(2))", h);
+                return Err(Errno::ENOSYS);
+            }
+        }
         match operation {
             op::ALLOC => self.kpersona_alloc(m, infop, idp, 0),
             op::PALLOC => self.kpersona_alloc(m, infop, idp, path),
@@ -331,6 +340,8 @@ impl Kernel {
         kpersona_copyout(m, &k, infop)?;
         // persona_init_end.
         r.list.insert(0, persona);
+        // The registry is this process's of the page from now on.
+        super::held::claim(super::held::Kind::Personas, &[], self.pid);
         Ok(())
     }
 
@@ -349,6 +360,7 @@ impl Kernel {
         }
         let p = r.list.remove(at);
         p.valid.store(false, Ordering::Release);
+        super::held::claim(super::held::Kind::Personas, &[], self.pid);
         Ok(())
     }
 

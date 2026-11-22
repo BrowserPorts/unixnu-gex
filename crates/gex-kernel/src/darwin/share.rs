@@ -82,7 +82,59 @@ pub mod op {
     pub const CO_TERMINATE: u32 = 45;
     pub const CO_KIND: u32 = 46;
     pub const CO_SET_NAME: u32 = 47;
+    /// The record of what each process of the page holds of the state
+    /// that is still its own copy there ([`super::super::held`]): the
+    /// request the kind, the caller's pid (4 bytes) and the key; the
+    /// answer the holder's pid (4 bytes), or for a count the total (8).
+    pub const HELD_CLAIM: u32 = 48;
+    pub const HELD_HOLDER: u32 = 49;
+    pub const HELD_LET_GO: u32 = 50;
+    pub const HELD_ANY: u32 = 51;
+    pub const HELD_TOUCH: u32 = 52;
+    pub const HELD_COUNT: u32 = 53;
+    /// One of the system's values ([`super::Value`]): the request its
+    /// number, how (0 read, 1 set, 2 set unless set before) and a value
+    /// (8 bytes); the answer the value after (8 bytes).
+    pub const VALUE: u32 = 4;
+    /// The boot payload's digest ([`super::boot_payload`]): the request
+    /// the caller's (32 bytes), the answer the system's, the first asker's.
+    pub const BOOT_PAYLOAD: u32 = 5;
+    /// The devfs nodes' times ([`super::super::devfs`]): a mark or a read
+    /// of one node's, with the caller's clock readings; a read's answer
+    /// its times.
+    pub const DEV_TIMES: u32 = 6;
 }
+
+/// The boot payload every process of the page booted from: its files'
+/// digest, the system's the first process's. Each process boots its own
+/// copy of the boot's immutable data (the device tree, the sandbox
+/// profiles, the system volume's attributes, the Image4 anchor, the trust
+/// cache), which is the system's only while it is the same payload: a
+/// process given another fails its boot. Nothing natively, where one boot
+/// is the system's.
+pub fn boot_payload(files: &[(String, Vec<u8>)]) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    let Some(r) = remote() else { return Ok(()) };
+    let mut sorted: Vec<&(String, Vec<u8>)> = files.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut h = Sha256::new();
+    for (name, bytes) in sorted {
+        h.update((name.len() as u64).to_le_bytes());
+        h.update(name.as_bytes());
+        h.update((bytes.len() as u64).to_le_bytes());
+        h.update(bytes);
+    }
+    let mine: [u8; 32] = h.finalize().into();
+    let mut o = [0u8; 32];
+    call(r, op::BOOT_PAYLOAD, &mine, &mut o);
+    if o != mine {
+        return Err("a boot payload other than the one the page's first Darwin process booted from: each process holds its own copy of the boot's immutable data, which must be the system's".into());
+    }
+    Ok(())
+}
+
+/// The boot payload's digest this kernel holds for the system.
+static BOOT_DIGEST: OnceLock<[u8; 32]> = OnceLock::new();
 
 /// The system's identifiers each new process, task or thread takes the next
 /// of ([`super::super::next_uniqueid`] and the others).
@@ -93,6 +145,13 @@ pub enum Counter {
     TaskUniqueid = 1,
     ThreadId = 2,
     Pidversion = 3,
+    /// A user client's registry entry id's serial ([`super::super::iokit`]).
+    IoClient = 4,
+    /// A devfs node made after the mount: its inode number
+    /// ([`super::super::devfs::later_ino`]).
+    DevIno = 5,
+    /// The kernel's SMR generation ([`super::super::commpage::tick`]).
+    Quiesce = 6,
 }
 
 impl Counter {
@@ -102,6 +161,9 @@ impl Counter {
             1 => Counter::TaskUniqueid,
             2 => Counter::ThreadId,
             3 => Counter::Pidversion,
+            4 => Counter::IoClient,
+            5 => Counter::DevIno,
+            6 => Counter::Quiesce,
             _ => return None,
         })
     }
@@ -113,8 +175,40 @@ impl Counter {
             Counter::TaskUniqueid => super::local_next_task_uniqueid(),
             Counter::ThreadId => super::local_next_thread_id(),
             Counter::Pidversion => super::local_next_pidversion() as u32 as u64,
+            Counter::IoClient => super::iokit::local_next_client_serial(),
+            Counter::DevIno => super::devfs::local_later_ino(),
+            Counter::Quiesce => super::commpage::local_next_quiesce(),
         }
     }
+}
+
+/// The system's values every process reads, and the ones that change
+/// them set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Value {
+    /// `atm_diagnostic_config` ([`super::super::commpage`]).
+    AtmDiagnosticConfig = 0,
+    /// The commpage's ASB targets' first random index, drawn once.
+    AsbIndex = 1,
+    /// lo0's `if_flags` ([`super::super::ioctl`]).
+    Lo0Flags = 2,
+}
+
+/// The values this kernel holds for the system's: each set or not.
+static VALUES: std::sync::Mutex<[Option<u64>; 3]> = std::sync::Mutex::new([None; 3]);
+
+/// Value `which`: the global kernel's, where it holds the system's state,
+/// after `how` (0 read, 1 set to `v`, 2 set to `v` unless set before, 3 or
+/// `v` into it, 4 and `v` into it; an or or an and of a value not set is
+/// one of 0); none elsewhere (the caller's own is the system's).
+pub(crate) fn value(which: Value, how: u8, v: u64) -> Option<u64> {
+    let r = remote()?;
+    let mut req = vec![which as u8, how];
+    req.extend_from_slice(&v.to_le_bytes());
+    let mut o = [0u8; 8];
+    call(r, op::VALUE, &req, &mut o);
+    Some(u64::from_le_bytes(o))
 }
 
 /// The system's clock origins, each taken by the first of its kernels to
@@ -239,7 +333,30 @@ pub fn serve(op: u32, req: &[u8], out: &mut [u8]) -> i64 {
             24
         }
         op::SYSTEM_STRING => super::sysctl::serve_string(req, out),
-        _ => match super::trustcache::serve(op, req, out).or_else(|| super::coalition::serve(op, req, out)) {
+        op::BOOT_PAYLOAD => {
+            let (32, 32..) = (req.len(), out.len()) else { return -EINVAL };
+            let got = BOOT_DIGEST.get_or_init(|| req.try_into().unwrap());
+            out[..32].copy_from_slice(got);
+            32
+        }
+        op::VALUE => {
+            let (Some(&which @ (0..=2)), Some(&how @ (0..=4)), 10, 8..) = (req.first(), req.get(1), req.len(), out.len()) else { return -EINVAL };
+            let v = u64::from_le_bytes(req[2..10].try_into().unwrap());
+            let mut t = VALUES.lock().unwrap_or_else(|e| e.into_inner());
+            let slot = &mut t[which as usize];
+            match how {
+                1 => *slot = Some(v),
+                2 => {
+                    slot.get_or_insert(v);
+                }
+                3 => *slot = Some(slot.unwrap_or(0) | v),
+                4 => *slot = Some(slot.unwrap_or(0) & v),
+                _ => {}
+            }
+            out[..8].copy_from_slice(&slot.unwrap_or(0).to_le_bytes());
+            8
+        }
+        _ => match super::trustcache::serve(op, req, out).or_else(|| super::coalition::serve(op, req, out)).or_else(|| super::held::serve(op, req, out)).or_else(|| super::devfs::serve(op, req, out)) {
             Some(n) => n,
             None => -ENOSYS,
         },
@@ -312,6 +429,27 @@ mod tests {
         assert_eq!(call_read(Remote { call: long_answer }, op::SYSTEM_STRING, &[0]), want);
         assert_eq!(serve(op::SYSTEM_STRING, &[2], &mut []), -22);
         assert_eq!(serve(op::SYSTEM_STRING, &[0, 1], &mut []), -22);
+    }
+
+    #[test]
+    fn a_value_is_the_serving_kernels() {
+        let r = Remote { call: through_serve };
+        let req = |how: u8, v: u64| {
+            let mut b = vec![Value::AsbIndex as u8, how];
+            b.extend_from_slice(&v.to_le_bytes());
+            b
+        };
+        let mut o = [0u8; 8];
+        // (AsbIndex: this test's alone; the first candidate stays.)
+        call(r, op::VALUE, &req(2, 7), &mut o);
+        assert_eq!(u64::from_le_bytes(o), 7);
+        call(r, op::VALUE, &req(2, 9), &mut o);
+        assert_eq!(u64::from_le_bytes(o), 7);
+        call(r, op::VALUE, &req(0, 0), &mut o);
+        assert_eq!(u64::from_le_bytes(o), 7);
+        assert_eq!(serve(op::VALUE, &[3, 0, 0, 0, 0, 0, 0, 0, 0, 0], &mut o), -22);
+        assert_eq!(serve(op::VALUE, &[0, 5, 0, 0, 0, 0, 0, 0, 0, 0], &mut o), -22);
+        assert_eq!(serve(op::VALUE, &[0, 0], &mut o), -22);
     }
 
     #[test]

@@ -59,6 +59,24 @@ pub mod op {
     pub const TC_LOAD: u32 = 19;
     pub const TC_BOOT_LOADED: u32 = 20;
     pub const TC_MARK_LOADED: u32 = 21;
+    /// The coalitions ([`super::super::coalition`]), a call for each of
+    /// its functions on the table: pids as 4 bytes, coalition ids as 8.
+    pub const CO_FORK: u32 = 32;
+    pub const CO_ADOPT_CORPSE: u32 = 33;
+    pub const CO_EXEC: u32 = 34;
+    pub const CO_MEMBERSHIP: u32 = 35;
+    pub const CO_THREAD_GROUP: u32 = 36;
+    pub const CO_PRIVILEGED: u32 = 37;
+    pub const CO_LEADER: u32 = 38;
+    pub const CO_TASK_TERMINATED: u32 = 39;
+    pub const CO_ACTIVATE: u32 = 40;
+    pub const CO_RELEASE: u32 = 41;
+    pub const CO_PLACE: u32 = 42;
+    pub const CO_LIST: u32 = 43;
+    pub const CO_CREATE: u32 = 44;
+    pub const CO_TERMINATE: u32 = 45;
+    pub const CO_KIND: u32 = 46;
+    pub const CO_SET_NAME: u32 = 47;
 }
 
 /// The system's identifiers each new process, task or thread takes the next
@@ -158,6 +176,23 @@ pub(crate) fn call(r: Remote, op: u32, req: &[u8], out: &mut [u8]) {
     }
 }
 
+/// A read whose answer may be of any length: asked again with room for the
+/// whole when the first answer says it is longer.
+pub(crate) fn call_read(r: Remote, op: u32, req: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; 4096];
+    loop {
+        let n = (r.call)(op, req, &mut out);
+        if n < 0 {
+            panic!("gex: the global kernel answered the Darwin system's call {op} with {n}");
+        }
+        if n as usize <= out.len() {
+            out.truncate(n as usize);
+            return out;
+        }
+        out = vec![0u8; n as usize];
+    }
+}
+
 /// [`call`] with an answer of any length up to `out`'s: its length.
 pub(crate) fn call_upto(r: Remote, op: u32, req: &[u8], out: &mut [u8]) -> usize {
     let n = (r.call)(op, req, out);
@@ -198,7 +233,7 @@ pub fn serve(op: u32, req: &[u8], out: &mut [u8]) -> i64 {
             out[..24].copy_from_slice(&moment_bytes(got));
             24
         }
-        _ => match super::trustcache::serve(op, req, out) {
+        _ => match super::trustcache::serve(op, req, out).or_else(|| super::coalition::serve(op, req, out)) {
             Some(n) => n,
             None => -ENOSYS,
         },

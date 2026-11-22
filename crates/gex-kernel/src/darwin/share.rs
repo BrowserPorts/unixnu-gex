@@ -46,6 +46,11 @@ pub mod op {
     /// its number and the caller's candidate (an instant and a calendar
     /// time, 12 bytes each: seconds, nanoseconds); the answer the origin.
     pub const ORIGIN: u32 = 2;
+    /// A system string's read or set (`kern.osreleasetype` 0,
+    /// `kern.hostname` 1: [`super::super::sysctl`]): the request its
+    /// number (0x80 added for a set) and a set's value; a read's answer the
+    /// value, however long.
+    pub const SYSTEM_STRING: u32 = 3;
     /// The trust caches ([`super::super::trustcache`]): the boot's static
     /// one set (the request its module, none for no module; the answer 1
     /// when it is the one the system has), a query (the query's type and
@@ -233,6 +238,7 @@ pub fn serve(op: u32, req: &[u8], out: &mut [u8]) -> i64 {
             out[..24].copy_from_slice(&moment_bytes(got));
             24
         }
+        op::SYSTEM_STRING => super::sysctl::serve_string(req, out),
         _ => match super::trustcache::serve(op, req, out).or_else(|| super::coalition::serve(op, req, out)) {
             Some(n) => n,
             None => -ENOSYS,
@@ -277,6 +283,35 @@ mod tests {
         let mut o = [0u8; 24];
         assert_eq!(serve(op::ORIGIN, &[2; 25], &mut o), -22);
         assert_eq!(serve(op::ORIGIN, &[0; 24], &mut o), -22);
+    }
+
+    /// An answer longer than the first buffer, as a read of a long system
+    /// string gives it: the whole, the second time.
+    fn long_answer(_op: u32, _req: &[u8], out: &mut [u8]) -> i64 {
+        for (i, b) in out.iter_mut().enumerate().take(5000) {
+            *b = i as u8;
+        }
+        5000
+    }
+
+    #[test]
+    fn a_system_string_through_the_channel_is_the_serving_kernels() {
+        let r = Remote { call: through_serve };
+        // Each as the serving kernel has it, and set again to what it is
+        // (other tests read them meanwhile).
+        for which in [0u8, 1] {
+            let v = call_read(r, op::SYSTEM_STRING, &[which]);
+            let mut o = vec![0u8; v.len()];
+            assert_eq!(super::super::sysctl::serve_string(&[which], &mut o), v.len() as i64);
+            assert_eq!(o, v);
+            let mut req = vec![which | 0x80];
+            req.extend_from_slice(&v);
+            call(r, op::SYSTEM_STRING, &req, &mut []);
+        }
+        let want: Vec<u8> = (0..5000).map(|i| i as u8).collect();
+        assert_eq!(call_read(Remote { call: long_answer }, op::SYSTEM_STRING, &[0]), want);
+        assert_eq!(serve(op::SYSTEM_STRING, &[2], &mut []), -22);
+        assert_eq!(serve(op::SYSTEM_STRING, &[0, 1], &mut []), -22);
     }
 
     #[test]

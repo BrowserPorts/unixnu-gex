@@ -14659,6 +14659,45 @@ fn how_ended(r: &Run, now: u64, signalled: bool) -> (bool, bool) {
     (timed_out, by_signal)
 }
 
+/// This Worker's thread's wait, if it is over (`signalled`: a signal that
+/// would do something is pending), finished ([`finish_wait`]); `None`
+/// while it still waits. A Darwin wait is ended by its kernel, so the
+/// kernel lock is taken first and the run state after it, the order of
+/// every call under the kernel lock that asks the threads' run states (a
+/// thread's end asks every one, [`end_if_all_exited`]): the run state held
+/// while the lock is waited for is a deadlock with such a call. The threads
+/// the end queued start once the lock is let go. Only the thread's own
+/// Worker makes its wait a Darwin one, so whether it is holds once the run
+/// state is let go; whether the wait is over is asked again under both.
+fn finish_if_over(run: &Arc<ThreadCell>, signalled: bool) -> Option<Done> {
+    let over = |h: Option<&mut Host>, r: &mut Run| {
+        let now = turn_now();
+        if !wait_ready(&r.waiting, &r.blocked_on, now, signalled) {
+            return None;
+        }
+        let (timed_out, by_signal) = how_ended(r, now, signalled);
+        waitq::leave();
+        IDLE_SPINS.store(0, std::sync::atomic::Ordering::Relaxed);
+        Some(finish_wait(h, r, cur(), my_ctx(), my_tid(), timed_out, by_signal))
+    };
+    {
+        let mut r = run.lock().unwrap_or_else(|e| e.into_inner());
+        if !r.owed.darwin {
+            return over(None, &mut r);
+        }
+        // Not over: the kernel is not wanted.
+        if !wait_ready(&r.waiting, &r.blocked_on, turn_now(), signalled) {
+            return None;
+        }
+    }
+    let done = with_exec_lock(|h| over(Some(h), &mut run.lock().unwrap_or_else(|e| e.into_inner())));
+    if darwin::spawned() {
+        // SAFETY: a host import without arguments; nothing here holds a lock.
+        unsafe { cgen::thread_start() };
+    }
+    done
+}
+
 /// An idle turn's wait found over ([`waitq::idle_turn`]): this Worker's
 /// thread runs again, its parked call finished here, with no kernel lock --
 /// its run state is its own (`MY_RUN`), what the call owes was taken from
@@ -14681,18 +14720,13 @@ fn finish_mine(signalled: bool) -> i32 {
         SCHED_OVER.with(|c| c.set(true));
         return 2;
     }
-    let now = turn_now();
-    if !wait_ready(&r.waiting, &r.blocked_on, now, signalled) {
+    drop(r);
+    let Some(done) = finish_if_over(&run, signalled) else {
         // What the idle turn asked was the registered copy of this same
         // wait; the next turn asks again.
         set_paused_to(2);
         return 2;
-    }
-    let (timed_out, by_signal) = how_ended(&r, now, signalled);
-    waitq::leave();
-    IDLE_SPINS.store(0, std::sync::atomic::Ordering::Relaxed);
-    let done = finish_wait(&mut r, cur(), my_ctx(), my_tid(), timed_out, by_signal);
-    drop(r);
+    };
     match done {
         Done::At(ctx_addr, pc) => {
             set_resume(pc);
@@ -14954,23 +14988,16 @@ fn park_free(op: gex_kernel::BlockOp, restore_sigmask: Option<u64>, pc: u64) -> 
 fn pick_mine(run: &Arc<ThreadCell>) -> Pick {
     loop {
         let sig = sigs::ready();
-        let mut r = run.lock().unwrap_or_else(|e| e.into_inner());
-        let now = turn_now();
-        if wait_ready(&r.waiting, &r.blocked_on, now, sig) {
-            let (timed_out, by_signal) = how_ended(&r, now, sig);
-            waitq::leave();
-            IDLE_SPINS.store(0, std::sync::atomic::Ordering::Relaxed);
-            return match finish_wait(&mut r, cur(), my_ctx(), my_tid(), timed_out, by_signal) {
+        if let Some(done) = finish_if_over(run, sig) {
+            return match done {
                 Done::At(c, pc) => Pick::Resumed(Some((c, pc))),
                 Done::Ends(code) => {
-                    drop(r);
                     exit_here(code, Some(ctx_pc()));
                     Pick::Resumed(None)
                 }
                 // Waiting again: looked at afresh.
                 Done::Parked => continue,
                 Done::Gone => {
-                    drop(r);
                     end_if_all_exited();
                     set_resume_none();
                     set_resume_ctx_none();
@@ -14978,6 +15005,7 @@ fn pick_mine(run: &Arc<ThreadCell>) -> Pick {
                 }
             };
         }
+        let r = run.lock().unwrap_or_else(|e| e.into_inner());
         // Its process ended under it (`exit_process` marks every thread).
         if matches!(r.waiting, Waiting::Exited) && !leader_waits() {
             return Pick::Over;
@@ -15269,8 +15297,9 @@ pub(crate) enum Done {
 /// `by_signal` as [`how_ended`] found them): its answer into its context
 /// (`ctx_addr`), what else the call owes ([`Owed`]), and a signal to
 /// deliver. Needs no kernel: `r` is the thread's own run state, locked, and
-/// this Worker's signal binding is the thread's.
-fn finish_wait(r: &mut Run, i: usize, ctx_addr: u64, tid: i32, timed_out: bool, by_signal: bool) -> Done {
+/// this Worker's signal binding is the thread's. A Darwin wait's end is its
+/// kernel's, `h`, locked before `r` was ([`finish_if_over`]).
+fn finish_wait(h: Option<&mut Host>, r: &mut Run, i: usize, ctx_addr: u64, tid: i32, timed_out: bool, by_signal: bool) -> Done {
     let was_futex = matches!(r.waiting, Waiting::Futex { .. });
     r.waiting = Waiting::Runnable;
     let op = r.blocked_on.take();
@@ -15297,7 +15326,8 @@ fn finish_wait(r: &mut Run, i: usize, ctx_addr: u64, tid: i32, timed_out: bool, 
     };
     // A Darwin wait: ended by its kernel, as the native host ends it.
     if owed.darwin {
-        return darwin::finished(r, i, ctx_addr, tid, op, owed, timed_out, by_signal);
+        let h = h.expect("a Darwin wait's end with the kernel locked (finish_if_over)");
+        return darwin::finished(h, r, i, ctx_addr, tid, op, owed, timed_out, by_signal);
     }
     // A priority-inheritance lock's wait is over, however it ends: no
     // longer counted as waiting (`sys_futex`).

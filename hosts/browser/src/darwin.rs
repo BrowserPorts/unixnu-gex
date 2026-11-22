@@ -879,20 +879,22 @@ pub(crate) fn spawn_refused(k: &mut gex_kernel::syscalls::Kernel, m: &mut GuestM
 }
 
 /// A Darwin wait's end, in the Worker of thread `i` whose wait it was
-/// (`finish_wait`, `r` its run state, locked, `op` its wait and `owed` what
-/// its call owes): as the native host ends one (`perform_block`, then
-/// `Kernel::finish_blocking` with the kernel locked): the wait's own
-/// result, `ETIMEDOUT` at its deadline, `EINTR` when a signal is pending for
-/// the thread (`signal_pending_for`, as the native host's `interrupted`),
-/// else a wake; a stream's, what its round gives ([`stream_round`]), or
-/// the call parked again while it still waits. The kernel then writes the
-/// call's answer, delivers a signal, or sleeps the thread again.
+/// (`finish_wait`, with `h` the kernel, locked, then `r` its run state,
+/// locked, `op` its wait and `owed` what its call owes): as the native host
+/// ends one (`perform_block`, then `Kernel::finish_blocking` with the
+/// kernel locked): the wait's own result, `ETIMEDOUT` at its deadline,
+/// `EINTR` when a signal is pending for the thread (`signal_pending_for`,
+/// as the native host's `interrupted`), else a wake; a stream's, what its
+/// round gives ([`stream_round`]), or the call parked again while it still
+/// waits. The kernel then writes the call's answer, delivers a signal, or
+/// sleeps the thread again. The threads the call queued are started by
+/// the caller once it has let the kernel go ([`spawned`]).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn finished(r: &mut Run, i: usize, ctx_addr: u64, tid: i32, op: gex_kernel::BlockOp, mut owed: Owed, timed_out: bool, by_signal: bool) -> Done {
+pub(crate) fn finished(h: &mut Host, r: &mut Run, i: usize, ctx_addr: u64, tid: i32, op: gex_kernel::BlockOp, mut owed: Owed, timed_out: bool, by_signal: bool) -> Done {
     use gex_kernel::{Errno, SyscallOutcome};
     let pc = r.pc;
     let stream = on_stream(&op);
-    let out = with_exec_lock(|h| {
+    let out = (|| {
         let ks = h.threads[i].kstate();
         h.kernel.enter_thread(&ks);
         let mut gm = guest();
@@ -925,11 +927,7 @@ pub(crate) fn finished(r: &mut Run, i: usize, ctx_addr: u64, tid: i32, op: gex_k
             thread_ended(tid);
         }
         Some(out)
-    });
-    if spawned() {
-        // SAFETY: a host import without arguments; nothing here holds a lock.
-        unsafe { cgen::thread_start() };
-    }
+    })();
     // A stream's wait that goes on: parked again on the same wait, with
     // what a write has put in so far.
     let Some(out) = out else {

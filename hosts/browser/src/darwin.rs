@@ -135,6 +135,9 @@ fn start(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> Result<u
     let ctx_addr = h.threads[cur()].ctx_addr();
     h.kernel.next_ctx_slot.reset(ctx_slots_below(ctx_addr).max(1));
 
+    // This Worker's process, which the system's state the global kernel
+    // holds (the IPC table first) knows it by.
+    gex_kernel::darwin::held::set_me(h.kernel.pid);
     // The system boots, with the page's payload (gexc's GEX_DARWIN_BOOT):
     // the one every Darwin process of the page boots from.
     {
@@ -400,6 +403,8 @@ fn calls_init(k: &mut gex_kernel::syscalls::Kernel) {
     if CALLS_Q.load(Ordering::Acquire) == 0 {
         CALLS_Q.store(unsafe { k_wq_new() }, Ordering::Release);
     }
+    // Which the other processes of the page notify to ring its bell.
+    gex_kernel::darwin::timer::set_bell_queue(CALLS_Q.load(Ordering::Acquire));
     gex_kernel::darwin::timer::set_ring_hook(rung);
     gex_kernel::darwin::timer::set_host_runs_thread_calls();
 }
@@ -485,8 +490,10 @@ pub extern "C" fn gex_darwin_thread_calls() -> u32 {
         let poll_due = polled && next_poll.map_or(true, |t| Instant::now() >= t);
         let piped = count > 0 && (woken || poll_due);
         let rewatch = REWATCH.swap(false, Ordering::AcqRel);
-        // The thread calls: the bell rang, or the earliest is due.
-        let rang = seen != Some(bell.generation());
+        // The thread calls: the bell rang (here, or another process of the
+        // page left this task something: a notify it woke for), or the
+        // earliest is due.
+        let rang = seen != Some(bell.generation()) || (woken && gex_kernel::darwin::ipc::wire::own_mail_waiting());
         let due = next_call.is_some_and(|t| Instant::now() >= t);
         if rang || due || piped || rewatch {
             seen = Some(bell.generation());

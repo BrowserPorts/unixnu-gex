@@ -872,6 +872,24 @@ pub(super) fn mailbox_put(task: super::TaskKey, pid: i32, r: &[u8]) {
     super::super::share::call(rm, super::super::share::op::MAILBOX_PUT, &req, &mut []);
 }
 
+/// This process's task's key, where its table is the global kernel's
+/// (0 before it has one).
+static OWN_KEY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// This process's task is `key` ([`super::Ipc::check_out`], in the page).
+pub(super) fn set_own_key(key: super::TaskKey) {
+    OWN_KEY.store(key, std::sync::atomic::Ordering::Release);
+}
+
+/// Whether other processes have left anything in this process's task's
+/// global mailbox (asked without taking it): for its thread-call runner,
+/// which a ring from another process wakes. False natively.
+pub fn own_mail_waiting() -> bool {
+    let key = OWN_KEY.load(std::sync::atomic::Ordering::Acquire);
+    let (Some(rm), true) = (super::super::share::remote(), key != 0) else { return false };
+    (rm.call)(super::super::share::op::MAILBOX_TAKE, &key.to_le_bytes(), &mut []) > 0
+}
+
 /// What other processes left in task `task`'s global mailbox, oldest
 /// first: none natively.
 pub fn mailbox_take(task: super::TaskKey) -> Vec<Vec<u8>> {
@@ -922,13 +940,141 @@ pub(crate) fn serve(op: u32, req: &[u8], out: &mut [u8]) -> Option<i64> {
             m.remove(&task);
             Some(p.0.len() as i64)
         }
+        o::IPC_TAKE => {
+            let 4 = req.len() else { return Some(-EINVAL) };
+            let pid = i32::from_le_bytes(req.try_into().unwrap());
+            let mut t = table();
+            if t.held.is_some() {
+                return Some(-11);
+            }
+            let n = t.bytes.as_ref().map_or(0, Vec::len);
+            if n > out.len() {
+                return Some(n as i64);
+            }
+            if let Some(b) = &t.bytes {
+                out[..n].copy_from_slice(b);
+            }
+            t.held = Some(pid);
+            Some(n as i64)
+        }
+        o::IPC_PUT => {
+            let 4.. = req.len() else { return Some(-EINVAL) };
+            let pid = i32::from_le_bytes(req[..4].try_into().unwrap());
+            let mut t = table();
+            if t.held != Some(pid) {
+                return Some(-EINVAL);
+            }
+            t.bytes = Some(req[4..].to_vec());
+            t.held = None;
+            Some(0)
+        }
         _ => None,
     }
 }
 
-/// Process `pid` of the page has exited: its tasks' mailboxes go.
-pub fn process_exited(pid: i32) {
+/// Process `pid` of the page has exited: its tasks' mailboxes go, and the
+/// IPC table, if it held it (a process ended in the middle of a kernel
+/// call: the table as it last gave it back): whether it did, for the
+/// global kernel to wake the processes waiting for it.
+pub fn process_exited(pid: i32) -> bool {
     mailboxes().retain(|_, (p, _)| *p != pid);
+    let mut t = table();
+    if t.held == Some(pid) {
+        t.held = None;
+        return true;
+    }
+    false
+}
+
+/// The system's IPC table where the global kernel holds it for the
+/// processes of the page: its bytes as last given back (none before the
+/// first), and the process holding it.
+struct Table {
+    bytes: Option<Vec<u8>>,
+    held: Option<i32>,
+}
+
+static TABLE: std::sync::Mutex<Table> = std::sync::Mutex::new(Table { bytes: None, held: None });
+
+fn table() -> std::sync::MutexGuard<'static, Table> {
+    TABLE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The wait queue a process waiting for the table parks on: the system's,
+/// made by the first process to want it.
+fn table_queue() -> u32 {
+    use super::super::share::{value, Value};
+    static Q: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *Q.get_or_init(|| {
+        if let Some(q) = value(Value::IpcQueue, 0, 0).filter(|&q| q != 0) {
+            return q as u32;
+        }
+        let mine = crate::wait::Queue::new();
+        let id = mine.id();
+        let got = value(Value::IpcQueue, 2, u64::from(id)).unwrap_or(0) as u32;
+        if got == id {
+            // The system's from now on: never freed.
+            std::mem::forget(mine);
+        }
+        got
+    })
+}
+
+/// The system's IPC table, from the global kernel, for this process
+/// (`own` its task): taken whole, the caller parked while another process
+/// holds it; a new table before any process has given one back.
+pub(super) fn take_table(own: &OwnTask) -> super::IpcShared {
+    use super::super::share::{op, remote};
+    let r = remote().expect("the page's table is the global kernel's");
+    let pid = super::super::held::me();
+    let q = table_queue();
+    let mut got: Option<Vec<u8>> = None;
+    let mut out = vec![0u8; 64 << 10];
+    let since = super::super::time::Instant::now();
+    (r.park)(q, &mut || loop {
+        let n = (r.call)(op::IPC_TAKE, &pid.to_le_bytes(), &mut out);
+        if n == -11 {
+            // Held, as the native cell's take waits; a holder that never
+            // gives it back is a broken system.
+            if since.elapsed() > std::time::Duration::from_secs(120) {
+                panic!("gex: the Darwin IPC table has been held for 120 s: a process of the page did not give it back");
+            }
+            return false;
+        }
+        if n < 0 {
+            panic!("gex: the global kernel answered the IPC table's take with {n}");
+        }
+        let n = n as usize;
+        if n > out.len() {
+            // Longer than the room: asked again with room for it.
+            out = vec![0u8; n];
+            continue;
+        }
+        got = Some(out[..n].to_vec());
+        return true;
+    });
+    let b = got.expect("taken");
+    if b.is_empty() {
+        return super::IpcShared::default();
+    }
+    match super::IpcShared::of_table_bytes(&b, own) {
+        Ok(s) => s,
+        Err(e) => panic!("gex: the global kernel's IPC table is not one ({e:?})"),
+    }
+}
+
+/// Give the system's IPC table back to the global kernel, and wake the
+/// processes waiting for it.
+pub(super) fn put_table(s: &super::IpcShared) {
+    use super::super::share::{op, remote};
+    let r = remote().expect("the page's table is the global kernel's");
+    let mut req = super::super::held::me().to_le_bytes().to_vec();
+    req.extend_from_slice(&s.table_bytes());
+    let n = (r.call)(op::IPC_PUT, &req, &mut []);
+    if n != 0 {
+        panic!("gex: the global kernel answered the IPC table's give-back with {n}");
+    }
+    crate::wait::notify(table_queue());
 }
 
 impl super::IpcShared {
@@ -1158,6 +1304,38 @@ mod tests {
         assert_eq!(serve(op::MAILBOX_TAKE, &9002u64.to_le_bytes(), &mut out), Some(0));
         assert_eq!(serve(op::MAILBOX_PUT, &[0; 12], &mut []), Some(-22));
         assert_eq!(serve(op::MAILBOX_TAKE, &[0; 7], &mut out), Some(-22));
+    }
+
+
+    #[test]
+    fn the_table_is_one_processs_at_a_time() {
+        use super::super::super::share::op;
+        // (the global kernel's table is this binary's; this test alone
+        // takes it)
+        let take = |pid: i32, out: &mut [u8]| serve(op::IPC_TAKE, &pid.to_le_bytes(), out);
+        let put = |pid: i32, b: &[u8]| {
+            let mut req = pid.to_le_bytes().to_vec();
+            req.extend_from_slice(b);
+            serve(op::IPC_PUT, &req, &mut [])
+        };
+        let mut out = [0u8; 8];
+        // Before any is given back: none, taken.
+        assert_eq!(take(31, &mut out), Some(0));
+        assert_eq!(take(32, &mut out), Some(-11));
+        // Only its holder gives it back.
+        assert_eq!(put(32, &[1, 2, 3]), Some(-22));
+        assert_eq!(put(31, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]), Some(0));
+        // Too long for the room: its length, not taken.
+        assert_eq!(take(32, &mut out), Some(10));
+        let mut room = [0u8; 16];
+        assert_eq!(take(32, &mut room), Some(10));
+        assert_eq!(&room[..10], &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        // A holder's end lets it go, as it was last given back.
+        assert!(process_exited(32));
+        assert!(!process_exited(32));
+        assert_eq!(take(33, &mut room), Some(10));
+        assert_eq!(put(33, &[]), Some(0));
+        assert_eq!(serve(op::IPC_TAKE, &[0; 3], &mut room), Some(-22));
     }
 
 }

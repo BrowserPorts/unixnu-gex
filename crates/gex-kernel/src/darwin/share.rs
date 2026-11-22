@@ -23,6 +23,9 @@ use std::sync::OnceLock;
 #[derive(Clone, Copy, Debug)]
 pub struct Remote {
     pub call: fn(op: u32, req: &[u8], out: &mut [u8]) -> i64,
+    /// Park the calling thread until `ready` says it may go on: `ready`
+    /// asked first, and again each time wait queue `queue` is notified.
+    pub park: fn(queue: u32, ready: &mut dyn FnMut() -> bool),
 }
 
 static REMOTE: OnceLock<Remote> = OnceLock::new();
@@ -109,6 +112,13 @@ pub mod op {
     /// with its length, however long.
     pub const MAILBOX_PUT: u32 = 7;
     pub const MAILBOX_TAKE: u32 = 8;
+    /// The system's IPC table ([`super::super::ipc::wire::take_table`]):
+    /// a take's request the taker's pid, its answer the table's bytes (none
+    /// before the first is given back), `-EAGAIN` while another holds it,
+    /// or the table's length (not taken) when it is longer than the room
+    /// given; a give-back's request the giver's pid and the table.
+    pub const IPC_TAKE: u32 = 9;
+    pub const IPC_PUT: u32 = 10;
 }
 
 /// The boot payload every process of the page booted from: its files'
@@ -141,6 +151,15 @@ pub fn boot_payload(files: &[(String, Vec<u8>)]) -> Result<(), String> {
 
 /// The boot payload's digest this kernel holds for the system.
 static BOOT_DIGEST: OnceLock<[u8; 32]> = OnceLock::new();
+
+/// A park for tests, whose serving kernel is in the same instance: `ready`
+/// asked until it says so.
+#[cfg(test)]
+pub(crate) fn park_by_asking(_queue: u32, ready: &mut dyn FnMut() -> bool) {
+    while !ready() {
+        std::thread::yield_now();
+    }
+}
 
 /// The system's identifiers each new process, task or thread takes the next
 /// of ([`super::super::next_uniqueid`] and the others).
@@ -199,10 +218,13 @@ pub enum Value {
     AsbIndex = 1,
     /// lo0's `if_flags` ([`super::super::ioctl`]).
     Lo0Flags = 2,
+    /// The wait queue a process waiting for the IPC table parks on
+    /// ([`super::super::ipc::wire::take_table`]).
+    IpcQueue = 3,
 }
 
 /// The values this kernel holds for the system's: each set or not.
-static VALUES: std::sync::Mutex<[Option<u64>; 3]> = std::sync::Mutex::new([None; 3]);
+static VALUES: std::sync::Mutex<[Option<u64>; 4]> = std::sync::Mutex::new([None; 4]);
 
 /// Value `which`: the global kernel's, where it holds the system's state,
 /// after `how` (0 read, 1 set to `v`, 2 set to `v` unless set before, 3 or
@@ -215,6 +237,12 @@ pub(crate) fn value(which: Value, how: u8, v: u64) -> Option<u64> {
     let mut o = [0u8; 8];
     call(r, op::VALUE, &req, &mut o);
     Some(u64::from_le_bytes(o))
+}
+
+/// Value `which` as this kernel holds it for the system (the global
+/// kernel's own read): none before it is set.
+pub fn local_value(which: Value) -> Option<u64> {
+    VALUES.lock().unwrap_or_else(|e| e.into_inner())[which as usize]
 }
 
 /// The system's clock origins, each taken by the first of its kernels to
@@ -346,7 +374,7 @@ pub fn serve(op: u32, req: &[u8], out: &mut [u8]) -> i64 {
             32
         }
         op::VALUE => {
-            let (Some(&which @ (0..=2)), Some(&how @ (0..=4)), 10, 8..) = (req.first(), req.get(1), req.len(), out.len()) else { return -EINVAL };
+            let (Some(&which @ (0..=3)), Some(&how @ (0..=4)), 10, 8..) = (req.first(), req.get(1), req.len(), out.len()) else { return -EINVAL };
             let v = u64::from_le_bytes(req[2..10].try_into().unwrap());
             let mut t = VALUES.lock().unwrap_or_else(|e| e.into_inner());
             let slot = &mut t[which as usize];
@@ -379,7 +407,7 @@ mod tests {
 
     #[test]
     fn a_counter_through_the_channel_is_the_serving_kernels() {
-        let r = Remote { call: through_serve };
+        let r = Remote { call: through_serve, park: park_by_asking };
         // The serving kernel's counters are this test binary's, which other
         // tests take from at the same time: each answer is one that kernel
         // gave, so later ones are larger.
@@ -395,7 +423,7 @@ mod tests {
 
     #[test]
     fn an_origin_is_the_first_askers() {
-        let r = Remote { call: through_serve };
+        let r = Remote { call: through_serve, park: park_by_asking };
         let t = super::super::time::Instant::of_reading(std::time::Duration::new(5 << 32, 7));
         let a = (t, std::time::UNIX_EPOCH + std::time::Duration::new(1_700_000_000, 9));
         let b = (super::super::time::Instant::of_reading(std::time::Duration::new(6 << 32, 0)), std::time::UNIX_EPOCH);
@@ -419,7 +447,7 @@ mod tests {
 
     #[test]
     fn a_system_string_through_the_channel_is_the_serving_kernels() {
-        let r = Remote { call: through_serve };
+        let r = Remote { call: through_serve, park: park_by_asking };
         // Each as the serving kernel has it, and set again to what it is
         // (other tests read them meanwhile).
         for which in [0u8, 1] {
@@ -432,14 +460,14 @@ mod tests {
             call(r, op::SYSTEM_STRING, &req, &mut []);
         }
         let want: Vec<u8> = (0..5000).map(|i| i as u8).collect();
-        assert_eq!(call_read(Remote { call: long_answer }, op::SYSTEM_STRING, &[0]), want);
+        assert_eq!(call_read(Remote { call: long_answer, park: park_by_asking }, op::SYSTEM_STRING, &[0]), want);
         assert_eq!(serve(op::SYSTEM_STRING, &[2], &mut []), -22);
         assert_eq!(serve(op::SYSTEM_STRING, &[0, 1], &mut []), -22);
     }
 
     #[test]
     fn a_value_is_the_serving_kernels() {
-        let r = Remote { call: through_serve };
+        let r = Remote { call: through_serve, park: park_by_asking };
         let req = |how: u8, v: u64| {
             let mut b = vec![Value::AsbIndex as u8, how];
             b.extend_from_slice(&v.to_le_bytes());
@@ -453,7 +481,7 @@ mod tests {
         assert_eq!(u64::from_le_bytes(o), 7);
         call(r, op::VALUE, &req(0, 0), &mut o);
         assert_eq!(u64::from_le_bytes(o), 7);
-        assert_eq!(serve(op::VALUE, &[3, 0, 0, 0, 0, 0, 0, 0, 0, 0], &mut o), -22);
+        assert_eq!(serve(op::VALUE, &[4, 0, 0, 0, 0, 0, 0, 0, 0, 0], &mut o), -22);
         assert_eq!(serve(op::VALUE, &[0, 5, 0, 0, 0, 0, 0, 0, 0, 0], &mut o), -22);
         assert_eq!(serve(op::VALUE, &[0, 0], &mut o), -22);
     }

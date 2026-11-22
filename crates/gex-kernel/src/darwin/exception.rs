@@ -46,7 +46,6 @@ const KERN_INVALID_ARGUMENT: i32 = 4;
 const KERN_FAILURE: i32 = 5;
 const KERN_NO_ACCESS: i32 = 8;
 const KERN_INVALID_RIGHT: i32 = 17;
-const KERN_NOT_SUPPORTED: i32 = 46;
 
 /// `struct exception_action`: a send right to the handler (dead when it
 /// was copied from a dead port), the message's behavior and flavor, and
@@ -332,31 +331,10 @@ impl Kernel {
         if level == Level::Host && check(self.ipc(), level, mask, new, behavior, flavor, s) == Ok(true) && self.darwin_mac_check_set_host_exception_ports(mask) != 0 {
             return Err(KERN_NO_ACCESS);
         }
-        // The host's actions another process of the page set are in its
-        // memory, and so would be every other process's reading of these.
-        if level == Level::Host {
-            if let Some(h) = super::held::elsewhere(super::held::Kind::HostExc, &[], self.pid) {
-                self.darwin_elsewhere("the host's exception ports (host_set_exception_ports)", h);
-                return Err(KERN_NOT_SUPPORTED);
-            }
-        }
         let mut actions = self.exc_actions_take(level, tid);
         let r = set_port(self.ipc(), &mut actions, level, mask, new, behavior, flavor, s, swap);
         self.exc_actions_put(level, tid, actions);
-        if level == Level::Host && r.is_ok() {
-            super::held::claim(super::held::Kind::HostExc, &[], self.pid);
-        }
         r
-    }
-
-    /// The host's exception actions (`realhost.exc_actions`), for `what`:
-    /// those another process of the page set are in its memory, which is
-    /// reported (the use goes on with this process's own).
-    pub(crate) fn darwin_host_exc(&mut self, what: &str) -> ExcActions {
-        if let Some(h) = super::held::elsewhere(super::held::Kind::HostExc, &[], self.pid) {
-            self.darwin_elsewhere(&format!("the host's exception ports ({what})"), h);
-        }
-        self.ipc().host_exc
     }
 
     /// `task_`, `thread_` or `host_get_exception_ports`.
@@ -367,12 +345,6 @@ impl Kernel {
         }
         if level == Level::Thread && !self.darwin_thread_alive(tid) {
             return Reply::err(KERN_FAILURE);
-        }
-        if level == Level::Host {
-            if let Some(h) = super::held::elsewhere(super::held::Kind::HostExc, &[], self.pid) {
-                self.darwin_elsewhere("the host's exception ports (host_get_exception_ports)", h);
-                return Reply::err(KERN_NOT_SUPPORTED);
-            }
         }
         let actions = self.exc_actions_take(level, tid);
         let entries = get(self.ipc(), &actions, mask as u32);
@@ -405,10 +377,7 @@ impl Kernel {
         let ux = self.ipc().global_port(super::ipc::Kobject::UxHandler);
         let valid = |a: &ExcActions| matches!(a[exc].port, Some(Carried::Port(p)) if p != ux);
         let tid = self.tid;
-        if self.dtask.kports.thread_exc.get(&tid).is_some_and(valid) || valid(&self.dtask.kports.exc) {
-            return true;
-        }
-        valid(&self.darwin_host_exc("an exception's handler"))
+        self.dtask.kports.thread_exc.get(&tid).is_some_and(valid) || valid(&self.dtask.kports.exc) || valid(&self.ipc().host_exc)
     }
 
     /// Whether an exception of type `exc` the task raises (a corpse's, no
@@ -416,6 +385,6 @@ impl Kernel {
     pub(crate) fn darwin_task_exc_handled(&mut self, exc: usize) -> bool {
         let ux = self.ipc().global_port(super::ipc::Kobject::UxHandler);
         let valid = |a: &ExcActions| matches!(a[exc].port, Some(Carried::Port(p)) if p != ux);
-        valid(&self.dtask.kports.exc) || valid(&self.darwin_host_exc("a task exception's handler"))
+        valid(&self.dtask.kports.exc) || valid(&self.ipc().host_exc)
     }
 }

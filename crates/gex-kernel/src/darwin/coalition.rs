@@ -1212,7 +1212,7 @@ mod tests {
     /// answers as the serving kernel's table does, at the caller's time.
     #[test]
     fn the_table_through_the_channel_is_the_serving_kernels() {
-        let r = Remote { call: share::serve };
+        let r = Remote { call: share::serve, park: super::share::park_by_asking };
         // Pids no other test uses.
         let (p, c) = (0x7100_0001, 0x7100_0002);
         fork_through(r, p, c);

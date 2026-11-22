@@ -16,7 +16,7 @@ cc() {
     xcrun -sdk iphoneos clang -target "$TARGET" "$@"
 }
 
-for p in hello-static bsd-carry commpage exclusive-pair aes tcall bsdthr waits hold cpuclk pipewr unixname sysids xproc; do
+for p in hello-static bsd-carry commpage exclusive-pair aes tcall bsdthr waits hold cpuclk pipewr unixname sysids xproc xmach; do
     cc -O2 -ffreestanding -fno-stack-protector -nostdlib -static \
         -Wl,-e,_start -o "$OUT/$p" "$HERE/src/$p.c"
 done
@@ -118,6 +118,9 @@ for f in "$OUT"/*; do
     *) codesign -s - -f --entitlements "$HERE/src/default.entitlements" "$f" 2>/dev/null ;;
     esac
 done
+# xmach sets the host's telemetry port, which a task entitled to monitor
+# launchd's events may (hostspecial's entitlements).
+codesign -s - -f --entitlements "$HERE/src/hostspecial.entitlements" "$OUT/xmach" 2>/dev/null
 # memlimit sets its own memory limit, which memorystatus allows an entitled
 # task.
 codesign -s - -f --entitlements "$HERE/src/memlimit.entitlements" "$OUT/memlimit" 2>/dev/null

@@ -37,12 +37,6 @@ pub enum Kind {
     /// The persona registry ([`super::persona`]), keyed by nothing: the
     /// process that changed it.
     Personas = 3,
-    /// A host special port (`realhost.special[id]`), keyed by its id: the
-    /// process that set it.
-    HostSpecial = 4,
-    /// The host's exception actions (`realhost.exc_actions`), keyed by
-    /// nothing: the process that set them.
-    HostExc = 5,
     /// A ptmx replica's minor ([`super::ptmx`]), while it is allocated.
     PtyUnit = 6,
     /// A BSD pty's terminal, keyed by its slot, once made (it is never
@@ -82,8 +76,6 @@ impl Kind {
             1 => Kind::ShmName,
             2 => Kind::PsemName,
             3 => Kind::Personas,
-            4 => Kind::HostSpecial,
-            5 => Kind::HostExc,
             6 => Kind::PtyUnit,
             7 => Kind::BsdPty,
             8 => Kind::Console,
@@ -136,8 +128,9 @@ fn held() -> std::sync::MutexGuard<'static, BTreeMap<(Kind, Vec<u8>), i32>> {
 /// process: its pid stays across its execs, and it makes no other).
 static ME: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
-/// This instance is process `pid` of the page ([`super::super::syscalls::Kernel::darwin_page_start`]).
-pub(crate) fn set_me(pid: i32) {
+/// This instance is process `pid` of the page: set at its Darwin exec,
+/// before its kernel takes anything of the system's state.
+pub fn set_me(pid: i32) {
     ME.store(pid, std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -310,10 +303,12 @@ pub(crate) fn serve(o: u32, req: &[u8], out: &mut [u8]) -> Option<i64> {
 /// Process `pid` of the page has exited: what it held that ends at its
 /// exit goes, and so do its counts. Called by the global kernel, which
 /// holds the record.
-pub fn process_exited(pid: i32) {
+/// Whether it held the IPC table (given up for it: the processes waiting
+/// for the table are to be woken, [`super::share::ipc_queue`]).
+pub fn process_exited(pid: i32) -> bool {
     held().retain(|(k, _), h| *h != pid || k.ends() != End::Exit);
     counts().retain(|(_, p), _| *p != pid);
-    super::ipc::wire::process_exited(pid);
+    super::ipc::wire::process_exited(pid)
 }
 
 /// Process `pid` of the page has been reaped: it is no longer one.

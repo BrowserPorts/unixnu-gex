@@ -655,11 +655,52 @@ impl crate::syscalls::Kernel {
     /// This task's IPC state, with the system's table taken for the rest
     /// of the kernel call ([`Self::darwin_ipc_leave`] gives it back).
     pub(crate) fn ipc(&mut self) -> &mut ipc::Ipc {
-        let ipc = &mut self.dtask.ipc_raw;
-        if !ipc.held {
-            ipc.check_out(&self.procs.darwin_ipc);
+        if !self.dtask.ipc_raw.held {
+            if share::remote().is_some() {
+                // The table the global kernel holds gives this task's own
+                // bank context its ledger; what other processes left for
+                // this task meanwhile is taken with it.
+                let l = std::sync::Arc::clone(&self.dtask.rusage.bank.lock().unwrap_or_else(|e| e.into_inner()));
+                self.dtask.ipc_raw.own_ledger = Some(l);
+                self.dtask.ipc_raw.check_out(&self.procs.darwin_ipc);
+                self.darwin_mailbox_fetch();
+            } else {
+                self.dtask.ipc_raw.check_out(&self.procs.darwin_ipc);
+            }
         }
-        ipc
+        &mut self.dtask.ipc_raw
+    }
+
+    /// In the page, what other processes left in this task's global
+    /// mailbox, taken with the table: its policy's and ledger's changes
+    /// made now (the table gave its own elements the policy and ledger
+    /// themselves, which those changes are owed to before any other call
+    /// reads them), the rest left in its mailbox for its thread calls.
+    fn darwin_mailbox_fetch(&mut self) {
+        let key = self.dtask.ipc_raw.task;
+        let Some(link) = self.dtask.ipc_raw.link.clone() else { return };
+        if key == 0 {
+            return;
+        }
+        let mut rest = Vec::new();
+        for b in ipc::wire::mailbox_take(key) {
+            match ipc::wire::remote_of(&b) {
+                Ok(ipc::Remote::Policy(op)) => self.darwin_policy_with(|p| op.apply(p)),
+                Ok(ipc::Remote::Ledger { to_me, to_others, unkept }) => {
+                    use std::sync::atomic::Ordering::AcqRel;
+                    let l = std::sync::Arc::clone(&self.dtask.rusage.bank.lock().unwrap_or_else(|e| e.into_inner()));
+                    l.to_me.fetch_add(to_me, AcqRel);
+                    l.to_others.fetch_add(to_others, AcqRel);
+                    l.unkept.fetch_or(unkept, AcqRel);
+                }
+                Ok(r) => rest.push(r),
+                Err(e) => panic!("gex: a remote in task {key}'s global mailbox is not one ({e:?})"),
+            }
+        }
+        if !rest.is_empty() {
+            link.mailbox.lock().unwrap_or_else(|e| e.into_inner()).extend(rest);
+            link.ring();
+        }
     }
 
     /// `ipc_task_enable`: other tasks reach this task from here on, by its
@@ -736,10 +777,20 @@ impl crate::syscalls::Kernel {
         if self.dtask.policy.is_none() {
             self.dtask.policy = self.procs.task_policy(self.pid);
         }
-        match &self.dtask.policy {
-            Some(c) => f(&mut c.lock().unwrap_or_else(|e| e.into_inner())),
-            None => f(&mut taskpolicy::TaskPolicy::default()),
+        let Some(c) = self.dtask.policy.clone() else { return f(&mut taskpolicy::TaskPolicy::default()) };
+        let (r, changed) = {
+            let mut p = c.lock().unwrap_or_else(|e| e.into_inner());
+            let before = p.imp;
+            let r = f(&mut p);
+            (r, p.imp != before)
+        };
+        // In the page the other processes read this task's importance marks
+        // from the table: taken now, it has them as they are when the call
+        // gives it back.
+        if changed && share::remote().is_some() && self.dtask.ipc_raw.link.is_some() {
+            self.ipc();
         }
+        r
     }
 
     /// The gaps [`note_unimplemented`] noted in this call, reported.

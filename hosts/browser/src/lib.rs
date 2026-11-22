@@ -1806,6 +1806,24 @@ fn dc_call(op: u32, req: &[u8], out: &mut [u8]) -> i64 {
     unsafe { k_darwin_call(op, req.as_ptr() as gex_kernel::PAddr, req.len() as u32, out.as_mut_ptr() as gex_kernel::PAddr, out.len() as u32) }
 }
 
+/// The Darwin system's park: this Worker's wait slot on global queue
+/// `queue` until `ready` says it may go on, `ready` asked again at each
+/// notify (the slot's sequence sampled before each ask, so a notify
+/// between the ask and the park ends the park at once).
+fn dc_park(queue: u32, ready: &mut dyn FnMut() -> bool) {
+    let slot = waitq::slot();
+    unsafe { k_wq_add(queue, slot as u32) };
+    loop {
+        let seq = unsafe { k_ws_seq(slot) };
+        if ready() {
+            break;
+        }
+        // (bounded, so a holder's 120 s is noticed by `ready`)
+        unsafe { k_ws_park(slot, seq, 1_000_000_000) };
+    }
+    unsafe { k_wq_del(queue, slot as u32) };
+}
+
 fn gl_queue() -> u32 {
     unsafe { k_lock_queue() }
 }
@@ -4362,7 +4380,7 @@ fn install_panic_hook() {
         // shares: the global kernel's, from before the first kernel here
         // takes anything of it (a new task's identifiers).
         if unsafe { k_present() } != 0 {
-            gex_kernel::darwin::share::set_remote(gex_kernel::darwin::share::Remote { call: dc_call });
+            gex_kernel::darwin::share::set_remote(gex_kernel::darwin::share::Remote { call: dc_call, park: dc_park });
         }
         std::panic::set_hook(Box::new(|info| {
             // Set while this hook runs: a panic inside it is not reported

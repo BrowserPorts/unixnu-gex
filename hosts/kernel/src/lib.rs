@@ -1757,8 +1757,13 @@ pub extern "C" fn k_exit(pid: i32, status: i32) {
     note_kill(pid, procs().ppid(pid), gex_kernel::signal::sig::SIGCHLD);
     // Its record locks, however it ended.
     locks().release_pid(pid, None);
-    // What it held of the Darwin system's state that ends with it.
-    gex_kernel::darwin::held::process_exited(pid);
+    // What it held of the Darwin system's state that ends with it; the IPC
+    // table, if it held it, to the processes waiting for it.
+    if gex_kernel::darwin::held::process_exited(pid) {
+        if let Some(q) = gex_kernel::darwin::share::local_value(gex_kernel::darwin::share::Value::IpcQueue) {
+            wait::k_wq_notify(q as u32);
+        }
+    }
     // What it wrote is kept before its parent hears it ended. A failure is
     // the write-back's to say: it tries again and reports it.
     let _ = gex_kernel::vfs::tmpfs::persist::exited();

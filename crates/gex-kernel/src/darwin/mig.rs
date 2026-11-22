@@ -2064,12 +2064,7 @@ fn host_get_special_port(k: &mut Kernel, obj: &Kobject, port: super::ipc::ObjId,
         HOST_PRIV_PORT => k.darwin_host_priv_port(),
         HOST_IO_MAIN_PORT => k.ipc().global_port(Kobject::IoMain),
         _ => {
-            // realhost.special: what launchd set; one another process of
-            // the page set is in its memory.
-            if let Some(h) = super::held::elsewhere(super::held::Kind::HostSpecial, &id.to_le_bytes(), k.pid) {
-                k.darwin_elsewhere(&format!("host special port {id} (host_get_special_port)"), h);
-                return Reply::err(KERN_NOT_SUPPORTED);
-            }
+            // realhost.special: what launchd set.
             match k.ipc().host_special.iter().find(|&&(w, _)| w == id).map(|&(_, p)| p) {
                 Some(p) => {
                     k.ipc().copy_send(p);
@@ -2116,12 +2111,6 @@ fn host_set_special_port(k: &mut Kernel, obj: &Kobject, _port: super::ipc::ObjId
     }
     if k.darwin_mac_check_set_host_special_port(id) != 0 {
         return Reply::err(KERN_NO_ACCESS);
-    }
-    // The port another process of the page set is in its memory, and so
-    // would be every other process's read of the one set here.
-    if let Some(h) = super::held::claim(super::held::Kind::HostSpecial, &id.to_le_bytes(), k.pid) {
-        k.darwin_elsewhere(&format!("host special port {id} (host_set_special_port)"), h);
-        return Reply::err(KERN_NOT_SUPPORTED);
     }
     let ipc = k.ipc();
     let old = ipc.host_special.iter().position(|&(w, _)| w == id).map(|i| ipc.host_special.remove(i).1);

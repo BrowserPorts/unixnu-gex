@@ -780,7 +780,7 @@ mod tests {
     /// mark.
     #[test]
     fn the_runtime_through_the_channel_is_the_serving_kernels() {
-        let r = Remote { call: share::serve };
+        let r = Remote { call: share::serve, park: super::share::park_by_asking };
         let h = [0x5c; 20];
         let st = Module::load(&module_of([0x5c; 16], &[h])).unwrap();
         assert_eq!(Module::load(&st.to_bytes()), Ok(st.clone()));

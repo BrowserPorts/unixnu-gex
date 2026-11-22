@@ -575,6 +575,9 @@ pub struct Ipc {
     /// While a thread call runs: the processes it told of something
     /// (what it woke there is not counted as an interrupt wakeup).
     pub callout_remotes: Mutex<Option<Vec<i32>>>,
+    /// This task's bank ledger, which a table taken from the global kernel
+    /// gives its own bank context ([`wire::OwnTask`]).
+    pub own_ledger: Option<Arc<super::rusage::BankLedger>>,
     /// This task's own link, kept for emptying its mailbox.
     pub link: Option<Arc<TaskLink>>,
     /// The kernel's own objects every task names alike (the host, host
@@ -780,6 +783,15 @@ impl IpcCell {
     }
 }
 
+/// The table given back: to its cell, or in the page to the global kernel.
+fn give_back(cell: &IpcCell, s: IpcShared) {
+    if super::share::remote().is_some() {
+        wire::put_table(&s);
+    } else {
+        cell.put(s);
+    }
+}
+
 /// `ipc_port_request_table_next_size(2, osize, 16)` in entries (16-byte
 /// requests).
 fn request_table_grow(ocount: usize) -> usize {
@@ -808,7 +820,9 @@ impl Ipc {
     /// name is in it and none is given out), and it takes no key.
     pub fn check_out(&mut self, cell: &Arc<IpcCell>) {
         debug_assert!(!self.held);
-        let mut s = cell.take();
+        // In the page the table is the global kernel's, which every
+        // process of the page takes it from.
+        let mut s = if super::share::remote().is_some() { wire::take_table(&self.own_task()) } else { cell.take() };
         self.cell.get_or_insert_with(|| Arc::clone(cell));
         self.objects = std::mem::take(&mut s.objects);
         self.next_id = s.next_id;
@@ -829,6 +843,9 @@ impl Ipc {
         self.host_special = std::mem::take(&mut s.host_special);
         self.vouchers = std::mem::take(&mut s.vouchers);
         self.held = true;
+        if super::share::remote().is_some() && self.task != 0 {
+            wire::set_own_key(self.task);
+        }
         if !self.globals.iter().any(|(g, _)| *g == Kobject::UxHandler) {
             self.ux_handler_setup();
         }
@@ -849,7 +866,13 @@ impl Ipc {
         }
         let s = IpcShared { objects: std::mem::take(&mut self.objects), next_id: self.next_id, timestamp: self.timestamp, spaces, next_task: self.next_task_hint, queues: std::mem::take(&mut self.queues), links: std::mem::take(&mut self.links), globals: std::mem::take(&mut self.globals), host_special: std::mem::take(&mut self.host_special), host_exc: std::mem::take(&mut self.host_exc), vouchers: std::mem::take(&mut self.vouchers) };
         self.held = false;
-        cell.put(s);
+        give_back(&cell, s);
+    }
+
+    /// What this task holds of its own, for a table taken from the global
+    /// kernel.
+    fn own_task(&self) -> wire::OwnTask {
+        wire::OwnTask { task: self.task, policy: self.link.as_ref().and_then(|l| l.policy.clone()), ledger: self.own_ledger.clone(), link: self.link.clone() }
     }
 
     /// The task has ended: its (terminated) space leaves the table, and the
@@ -867,7 +890,7 @@ impl Ipc {
         if let Some(cell) = cell {
             let spaces = std::mem::take(&mut self.others);
             let s = IpcShared { objects: std::mem::take(&mut self.objects), next_id: self.next_id, timestamp: self.timestamp, spaces, next_task: self.next_task_hint, queues: std::mem::take(&mut self.queues), links: std::mem::take(&mut self.links), globals: std::mem::take(&mut self.globals), host_special: std::mem::take(&mut self.host_special), host_exc: std::mem::take(&mut self.host_exc), vouchers: std::mem::take(&mut self.vouchers) };
-            cell.put(s);
+            give_back(&cell, s);
         }
     }
 

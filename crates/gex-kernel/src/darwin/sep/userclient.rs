@@ -281,7 +281,7 @@ fn gigalocker_init(k: &mut Kernel, a: &mut MethodArgs) -> i32 {
     // The SEP-driven xART master has not checked in (the SEP is not running), so the
     // call returns 0 and the gigalocker is opened when it does.
     if sep.mgr.endpoint_service(super::frame::name::XART_MASTER).is_some() {
-        k.darwin_unimplemented(format!("AppleSEPXART::gl_initialize({path}): the gigalocker's open, record repair and CRC (05-xart-art.md) is not ported"));
+        k.darwin_unimplemented(format!("AppleSEPXART::gl_initialize({path}): the gigalocker's open, record repair and CRC is not ported"));
         return io::UNSUPPORTED;
     }
     ret::SUCCESS

@@ -1637,7 +1637,7 @@ impl<'a> Nx<'a> {
             // A cache holding every free block found no run that long: with
             // nothing to rescan, the tier loop's next tier and the
             // avoid-off retry are left.
-            Err(_) if !partial => return Err("not implemented: a non-partial data allocation the free-extent cache has no run for (the next tier and the avoid-off retry, re-alloc 3.5)".into()),
+            Err(_) if !partial => return Err("not implemented: a non-partial data allocation the free-extent cache has no run for (the next tier and the avoid-off retry)".into()),
             Err(_) => return Err("not implemented: a data allocation the free-extent cache cannot place (the chunk scan and the free queues' drain)".into()),
         };
         if got == 0 {

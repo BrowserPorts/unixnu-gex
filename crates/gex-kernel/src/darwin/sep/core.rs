@@ -89,7 +89,7 @@ impl std::fmt::Display for Gap {
             Gap::SepRomUnreadable(p, e) => write!(f, "GEX_DARWIN_SEPROM={}: {e}", p.display()),
             Gap::NoUid(m) => write!(f, "{m}"),
             Gap::NoA64SystemModel => f.write_str("the SEP core is AArch64 (the sep node has an aarch64 property): gex's translator runs user-mode A64 and has no system-level A64 model"),
-            Gap::NoPlatform(missing) => write!(f, "the SEP core is ARMv7 and gex's AArch32 front end can run it, but the SEP's platform is not known: {} (in the SEP ROM and the sepOS; drafts/sep/07-sep-core.md)", missing.join("; ")),
+            Gap::NoPlatform(missing) => write!(f, "the SEP core is ARMv7 and gex's AArch32 front end can run it, but the SEP's platform is not known: {} (in the SEP ROM and the sepOS)", missing.join("; ")),
             Gap::CoreModel(s) => write!(f, "the SEP core's configuration is not one gex's AArch32 model implements: {s:?}"),
             Gap::NoPeripherals => f.write_str("the SEP core is set up, but its peripherals (the SEP side of the mailbox, the AES engine with the UID and GID keys, the PKA, the TRNG, the memory protection engine over TZ0, the interrupt controller, the timers) have no model: their registers are in the SEP ROM and the sepOS"),
         }

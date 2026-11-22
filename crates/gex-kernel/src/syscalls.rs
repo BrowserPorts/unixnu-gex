@@ -5862,7 +5862,13 @@ impl NetIo<'_> {
         // Bound and listening in one call: what a guest does between `bind`
         // and `listen` is local to itself, and what the far end can see is
         // only whether the name answers.
-        if let Some(r) = self.unix_remote {
+        //
+        // Not a Darwin process's: the global kernel's sockets keep Linux's
+        // rules, and a Darwin socket is kept by XNU's, as the native host
+        // keeps every one. Its name is the process's own; one another
+        // process holds is refused before this, with its report
+        // ([`NetIo::darwin_remote_name`]).
+        if let (Some(r), false) = (self.unix_remote, io.darwin) {
             let me = io.cred();
             let id = (r.bind)(name.as_ptr() as crate::PAddr, name.len() as u32, me.pid, me.uid, me.gid);
             if id < 0 {
@@ -5915,7 +5921,8 @@ impl NetIo<'_> {
         // process bound will be. A host-bound name -- the virtio-gpu socket --
         // is in *this* process's table and never in the kernel's, so the
         // local path is still tried when the kernel does not know the name.
-        if let Some(r) = self.unix_remote {
+        // Not for a Darwin process, whose sockets are its own (`unix_bind`).
+        if let (Some(r), false) = (self.unix_remote, io.darwin) {
             let me = io.cred();
             let id = (r.connect)(name.as_ptr() as crate::PAddr, name.len() as u32, me.pid, me.uid, me.gid, 0, 0);
             if id >= 0 {
@@ -5938,6 +5945,23 @@ impl NetIo<'_> {
             return Err(Self::unix_connect_lookup(io, &path));
         }
         r
+    }
+
+    /// A Darwin process's `bind` or `connect` of unix stream socket `a[0]`
+    /// to a name the global kernel holds, which another process of the
+    /// page bound: the name, else `None`. A Darwin process's unix sockets
+    /// are its own, kept by XNU's rules (`unix_bind`), which the global
+    /// kernel's are not, so a name another process holds is one it cannot
+    /// meet; the caller reports it and refuses the call.
+    pub fn darwin_remote_name(&self, io: &FdIo<'_>, m: &GuestMem<'_>, n: u64, a: [u64; 6], cwd: &str) -> Option<String> {
+        let r = self.unix_remote?;
+        if !io.darwin || !matches!(n, nr::BIND | nr::CONNECT) || io.unix_of(a[0] as i32).is_err() {
+            return None;
+        }
+        let path = io.unix_path(m, a[1], a[2]).ok()?;
+        let path = if path.starts_with('\0') { path } else { crate::vfs::normalize(&path, cwd) };
+        let name = io.ns.outer_path(&path).into_owned();
+        ((r.exists)(name.as_ptr() as crate::PAddr, name.len() as u32) > 0).then_some(name)
     }
 
     /// Why XNU's `unp_connect` refuses a name nothing is bound to: it looks
@@ -12552,7 +12576,17 @@ impl Kernel {
             nr::RECVMSG => self.sys_recvmsg(m, a[0] as i32, a[1], a[2]),
             n if is_socket_call(n) => {
                 let cwd = self.vfs.cwd.clone();
-                self.net_io().call(&self.fd_io(), m, n, a, &cwd)
+                // A Darwin process's unix socket meeting a name another
+                // process holds: not done yet, said.
+                let remote = if self.darwin { self.net_io().darwin_remote_name(&self.fd_io(), m, n, a, &cwd) } else { None };
+                match remote {
+                    Some(name) => {
+                        let what = if n == nr::BIND { "bind" } else { "connect" };
+                        self.darwin_unimplemented(format!("a unix stream socket's {what} to {name:?}, a name another process of the page holds: a Darwin process's unix sockets are its own, kept by XNU's rules, and meet no other process's yet; the call fails with ENOSYS"));
+                        Err(Errno::ENOSYS)
+                    }
+                    None => self.net_io().call(&self.fd_io(), m, n, a, &cwd),
+                }
             }
             nr::FLOCK => self.fd_io().flock(m, a[0] as i32, a[1]),
             nr::EPOLL_CTL => self.sys_epoll_ctl(m, a[0] as i32, a[1], a[2] as i32, a[3]),
@@ -17829,6 +17863,113 @@ mod tests {
         set_args(&mut m, k.ctx_addr, nr::RECVMSG, &[a, 0x21000, MSG_DONTWAIT]);
         k.syscall(&mut m, 0);
         assert_eq!(ret(&m, k.ctx_addr), -(Errno::EAGAIN.0 as i64));
+    }
+
+    /// A Darwin process's named unix stream sockets are its own, kept by
+    /// XNU's rules, as the native host keeps every one: with a global
+    /// kernel (`unix_remote`) a bind and a connect stay in the process's
+    /// table and never reach the global kernel, whose sockets keep Linux's
+    /// rules; a name the global kernel holds (another process bound it) is
+    /// refused with ENOSYS and reported, not met.
+    #[test]
+    fn darwin_unix_names_are_the_process_own() {
+        use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+        static REMOTE_CALLS: AtomicU32 = AtomicU32::new(0);
+        extern "C" fn bind(_: crate::PAddr, _: u32, _: i32, _: u32, _: u32) -> i32 {
+            REMOTE_CALLS.fetch_add(1, SeqCst);
+            -(Errno::ENOSYS.0 as i32)
+        }
+        extern "C" fn connect(_: crate::PAddr, _: u32, _: i32, _: u32, _: u32, _: u32, _: u32) -> i32 {
+            REMOTE_CALLS.fetch_add(1, SeqCst);
+            -(Errno::ENOSYS.0 as i32)
+        }
+        extern "C" fn none1(_: i32) -> i32 {
+            -(Errno::ENOSYS.0 as i32)
+        }
+        extern "C" fn none2(_: i32, _: crate::PAddr) -> i32 {
+            -(Errno::ENOSYS.0 as i32)
+        }
+        extern "C" fn none3(_: i32, _: crate::PAddr, _: u32) -> i32 {
+            -(Errno::ENOSYS.0 as i32)
+        }
+        extern "C" fn shutdown(_: i32, _: u32) -> i32 {
+            -(Errno::ENOSYS.0 as i32)
+        }
+        extern "C" fn close(_: i32) {}
+        // Another process holds /theirs (the one name of 7 bytes here).
+        extern "C" fn exists(_: crate::PAddr, len: u32) -> i32 {
+            i32::from(len == "/theirs".len() as u32)
+        }
+        extern "C" fn pair(_: crate::PAddr, _: i32, _: u32, _: u32) -> i32 {
+            -(Errno::ENOSYS.0 as i32)
+        }
+        extern "C" fn write_fds(_: i32, _: crate::PAddr, _: u32, _: crate::PAddr, _: u32) -> i32 {
+            -(Errno::ENOSYS.0 as i32)
+        }
+        extern "C" fn read_fds(_: i32, _: crate::PAddr, _: u32, _: u32, _: i32, _: i32, _: crate::PAddr, _: u32) -> i32 {
+            -(Errno::ENOSYS.0 as i32)
+        }
+        extern "C" fn queue(_: i32) -> u32 {
+            0
+        }
+        extern "C" fn rename(_: crate::PAddr, _: u32, _: crate::PAddr, _: u32) {}
+        let remote = unix::Remote {
+            bind,
+            connect,
+            peer_cred: none2,
+            peer_addr: none2,
+            accept: none1,
+            pending: none1,
+            read: none3,
+            write: none3,
+            readable: none1,
+            writable: none1,
+            available: none1,
+            close,
+            hup: none1,
+            shutdown,
+            exists,
+            pair,
+            dup: none1,
+            write_fds,
+            read_fds,
+            describe: |_| None,
+            rebuild: |_, _| None,
+            queue,
+            rename,
+        };
+        let (mut buf, mut k) = setup();
+        let mut m = GuestMem::new(&mut buf);
+        let mut fds = Vec::new();
+        for _ in 0..3 {
+            set_args(&mut m, k.ctx_addr, nr::SOCKET, &[1, 1, 0]);
+            k.syscall(&mut m, 0);
+            fds.push(ret(&m, k.ctx_addr) as u64);
+        }
+        k.unix_remote = Some(remote);
+        k.darwin = true;
+        k.dtask.strict = true;
+        // A Darwin sockaddr_un: sun_len, sun_family, the path.
+        let name = |m: &mut GuestMem<'_>, at: u64, path: &str| -> u64 {
+            let len = 2 + path.len() as u64 + 1;
+            m.write(at, &[len as u8, 1]).unwrap();
+            m.write(at + 2, path.as_bytes()).unwrap();
+            m.write(at + 2 + path.len() as u64, &[0]).unwrap();
+            len
+        };
+        let mine = name(&mut m, 0x20000, "/mine");
+        let theirs = name(&mut m, 0x20100, "/theirs");
+        let call = |k: &mut Kernel, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]| k.dispatch(m, n, a).unwrap();
+        assert_eq!(call(&mut k, &mut m, nr::BIND, [fds[0], 0x20000, mine, 0, 0, 0]), Ok(0));
+        assert_eq!(call(&mut k, &mut m, nr::LISTEN, [fds[0], 5, 0, 0, 0, 0]), Ok(0));
+        assert_eq!(call(&mut k, &mut m, nr::CONNECT, [fds[1], 0x20000, mine, 0, 0, 0]), Ok(0));
+        assert_eq!(REMOTE_CALLS.load(SeqCst), 0, "the process's own name never reaches the global kernel");
+        assert!(k.socket_names.exists("/mine"));
+        assert_eq!(call(&mut k, &mut m, nr::CONNECT, [fds[2], 0x20100, theirs, 0, 0, 0]), Err(Errno::ENOSYS));
+        assert_eq!(REMOTE_CALLS.load(SeqCst), 0);
+        assert!(k.darwin_strict_stop().is_some_and(|s| s.contains("connect to \"/theirs\", a name another process of the page holds")));
+        assert_eq!(call(&mut k, &mut m, nr::BIND, [fds[2], 0x20100, theirs, 0, 0, 0]), Err(Errno::ENOSYS));
+        assert!(k.darwin_strict_stop().is_some_and(|s| s.contains("bind to \"/theirs\"")));
     }
 
     /// A Darwin process's `msghdr` has 32-bit lengths and keeps its flags at

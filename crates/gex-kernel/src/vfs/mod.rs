@@ -287,8 +287,8 @@ pub struct Metadata {
     pub rdev: u64,
     /// `st_dev`: the host filesystem's device for a host file, so that two
     /// files are one only when device and inode both match (every macOS
-    /// volume's root is inode 2, and Wine took /Volumes/X for /). Zero for
-    /// gex's own filesystems.
+    /// volume's root is inode 2, and Wine took another volume's root for
+    /// the root directory). Zero for gex's own filesystems.
     pub dev: u64,
     /// The other times and the nanoseconds, where the filesystem keeps
     /// them (the host's). All zero: every time is `mtime`, whole seconds.

@@ -103,6 +103,12 @@ pub mod op {
     /// of one node's, with the caller's clock readings; a read's answer
     /// its times.
     pub const DEV_TIMES: u32 = 6;
+    /// A task's global mailbox ([`super::super::ipc::wire::mailbox_put`]):
+    /// the request the task's key (8 bytes), its process (4) and an encoded
+    /// remote; a take's request the key, its answer every remote left, each
+    /// with its length, however long.
+    pub const MAILBOX_PUT: u32 = 7;
+    pub const MAILBOX_TAKE: u32 = 8;
 }
 
 /// The boot payload every process of the page booted from: its files'
@@ -356,7 +362,7 @@ pub fn serve(op: u32, req: &[u8], out: &mut [u8]) -> i64 {
             out[..8].copy_from_slice(&slot.unwrap_or(0).to_le_bytes());
             8
         }
-        _ => match super::trustcache::serve(op, req, out).or_else(|| super::coalition::serve(op, req, out)).or_else(|| super::held::serve(op, req, out)).or_else(|| super::devfs::serve(op, req, out)) {
+        _ => match super::trustcache::serve(op, req, out).or_else(|| super::coalition::serve(op, req, out)).or_else(|| super::held::serve(op, req, out)).or_else(|| super::devfs::serve(op, req, out)).or_else(|| super::ipc::wire::serve(op, req, out)) {
             Some(n) => n,
             None => -ENOSYS,
         },

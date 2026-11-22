@@ -1202,7 +1202,7 @@ impl crate::syscalls::Kernel {
         }
         if fx.rescheduled {
             for l in self.ipc().links.values() {
-                l.bell.ring();
+                l.ring();
             }
         }
     }

@@ -700,6 +700,31 @@ pub struct TaskLink {
     pub codesign: Option<super::codesign::CodeSign>,
     /// Its task policy, with its importance marks.
     pub policy: Option<super::importance::Policy>,
+    /// In the page, a task of another process: how to reach it there. None
+    /// for a task of this process (natively every task).
+    pub elsewhere: Option<Elsewhere>,
+}
+
+/// A task of another process of the page, as the table reaches it: its
+/// mailbox is the global kernel's, which its process empties, and a ring
+/// of its bell notifies the wait queue that process's thread-call runner
+/// sleeps on; its importance marks are its policy's as its process last
+/// gave the table back.
+#[derive(Clone, Debug)]
+pub struct Elsewhere {
+    pub bell: u32,
+    pub marks: Option<super::taskpolicy::Importance>,
+}
+
+impl TaskLink {
+    /// Ring the bell of the thread that empties its mailbox.
+    pub fn ring(&self) {
+        match &self.elsewhere {
+            None => self.bell.ring(),
+            Some(e) if e.bell != 0 => crate::wait::notify(e.bell),
+            Some(_) => super::note_unimplemented(format!("a ring of process {}'s thread calls, which run on no Worker the other processes of the page can wake", self.pid)),
+        }
+    }
 }
 
 /// What every task shares: the ports and sets (XNU's are kernel objects,
@@ -861,11 +886,20 @@ impl Ipc {
     /// has ended.
     pub fn remote_or_back(&self, task: TaskKey, r: Remote) -> Result<(), Remote> {
         let Some(l) = self.links.get(&task) else { return Err(r) };
+        if l.elsewhere.is_some() {
+            // Another process's task: its mailbox is the global kernel's.
+            let Some(b) = wire::remote_bytes(&r) else {
+                super::note_unimplemented(format!("{r:?} for a task of process {}, which only this process's own tasks are told", l.pid));
+                return Err(r);
+            };
+            wire::mailbox_put(task, l.pid, &b);
+        } else {
+            l.mailbox.lock().unwrap_or_else(|e| e.into_inner()).push(r);
+        }
         if let Some(v) = self.callout_remotes.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             v.push(l.pid);
         }
-        l.mailbox.lock().unwrap_or_else(|e| e.into_inner()).push(r);
-        l.bell.ring();
+        l.ring();
         Ok(())
     }
 
@@ -887,7 +921,7 @@ impl Ipc {
         let link = Arc::new(link);
         self.links.insert(self.task, Arc::clone(&link));
         if ring {
-            link.bell.ring();
+            link.ring();
         }
         self.link = Some(link);
     }

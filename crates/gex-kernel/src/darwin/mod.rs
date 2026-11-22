@@ -682,6 +682,7 @@ impl crate::syscalls::Kernel {
             name_port: std::sync::Mutex::new(None),
             codesign: self.dtask.codesign.clone(),
             policy: self.dtask.policy.clone().or_else(|| self.procs.task_policy(self.pid)),
+            elsewhere: None,
         };
         self.ipc().task_enable(link);
         // The task's threads, whose time by effective QoS its policy's

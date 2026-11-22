@@ -345,7 +345,13 @@ impl Ipc {
             return None;
         }
         let link = self.links.get(&key)?;
-        let (pid, policy) = (link.pid, PolicyAt::Cell(link.policy.clone()?));
+        let policy = match (&link.policy, &link.elsewhere) {
+            (Some(p), _) => PolicyAt::Cell(Arc::clone(p)),
+            // Another process's task: its marks as its process gave them.
+            (None, Some(super::ipc::Elsewhere { marks: Some(m), .. })) => PolicyAt::Mirror(*m),
+            _ => return None,
+        };
+        let pid = link.pid;
         let imp = self.imp();
         let h = imp.alloc();
         imp.elems.insert(h, Elem::Task(ImpTask { refs: 1, made: 0, externcnt: 0, externdrop: 0, kmsgs: Vec::new(), task: Some((key, pid)), owner: key, policy, inherits: Vec::new(), assertcnt: 0, legacy_externcnt: 0, legacy_externdrop: 0, filelocks: 0, updatepolicy: false, queued: false }));
@@ -1649,7 +1655,7 @@ mod tests {
         let s = state(&policy);
         let b = bytes(&s);
         // Its own process: the cell itself.
-        let own = OwnTask { task: 5, policy: Some(Arc::clone(&policy)), ledger: None };
+        let own = OwnTask { task: 5, policy: Some(Arc::clone(&policy)), ledger: None, link: None };
         let mut g = Get::new(&b);
         let mine = ImpState::get(&mut g, &own).expect("it decodes");
         assert!(g.done());
@@ -1657,7 +1663,7 @@ mod tests {
         assert!(matches!(&t.policy, PolicyAt::Cell(c) if Arc::ptr_eq(c, &policy)));
         assert_eq!(bytes(&mine), b);
         // Another: the marks, as they were.
-        let other = OwnTask { task: 6, policy: Some(Arc::new(PolicyCell::default())), ledger: None };
+        let other = OwnTask { task: 6, policy: Some(Arc::new(PolicyCell::default())), ledger: None, link: None };
         let theirs = ImpState::get(&mut Get::new(&b), &other).expect("it decodes");
         let Some(Elem::Task(t)) = theirs.elems.get(&0x4000_0040) else { panic!("the task element") };
         assert!(matches!(t.policy, PolicyAt::Mirror(m) if m == policy.lock().unwrap().imp));

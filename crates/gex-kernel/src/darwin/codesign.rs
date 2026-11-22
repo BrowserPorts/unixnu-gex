@@ -928,3 +928,114 @@ mod tests {
         assert!(c.cdhash.is_some() && c.der.is_none() && c.cms.is_none());
     }
 }
+
+// -- a signature as bytes ([`super::ipc::wire`]) ----------------------------------------
+
+use super::ipc::wire::{Bad, Get, Put};
+
+fn put_ent(p: &mut Put, e: &Ent) {
+    match e {
+        Ent::Bool(b) => {
+            p.u8(0);
+            p.bool(*b);
+        }
+        Ent::Int(i) => {
+            p.u8(1);
+            p.u64(*i as u64);
+        }
+        Ent::String(s) => {
+            p.u8(2);
+            p.bytes(s);
+        }
+        Ent::Data(d) => {
+            p.u8(3);
+            p.bytes(d);
+        }
+        Ent::Array(v) => {
+            p.u8(4);
+            p.len(v.len());
+            for x in v {
+                put_ent(p, x);
+            }
+        }
+        Ent::Dict(v) => {
+            p.u8(5);
+            put_dict(p, v);
+        }
+    }
+}
+
+fn put_dict(p: &mut Put, v: &[(Vec<u8>, Ent)]) {
+    p.len(v.len());
+    for (k, x) in v {
+        p.bytes(k);
+        put_ent(p, x);
+    }
+}
+
+/// An entitlement's value; a nesting deeper than any signature's is not one.
+fn get_ent(g: &mut Get<'_>, depth: u32) -> Result<Ent, Bad> {
+    if depth > 64 {
+        return Err(g.bad("an entitlement nested no deeper than 64"));
+    }
+    Ok(match g.u8()? {
+        0 => Ent::Bool(g.bool()?),
+        1 => Ent::Int(g.u64()? as i64),
+        2 => Ent::String(g.bytes()?),
+        3 => Ent::Data(g.bytes()?),
+        4 => {
+            let n = g.len()?;
+            Ent::Array((0..n).map(|_| get_ent(g, depth + 1)).collect::<Result<_, _>>()?)
+        }
+        5 => Ent::Dict(get_dict(g, depth + 1)?),
+        _ => return Err(g.bad("an entitlement's kind")),
+    })
+}
+
+fn get_dict(g: &mut Get<'_>, depth: u32) -> Result<Vec<(Vec<u8>, Ent)>, Bad> {
+    let n = g.len()?;
+    (0..n).map(|_| Ok((g.bytes()?, get_ent(g, depth)?))).collect()
+}
+
+impl CodeSign {
+    /// The signature, as the kernel holds it, as bytes.
+    pub fn put(&self, p: &mut Put) {
+        p.u8(self.platform);
+        p.u32(self.cd_flags);
+        p.u32(self.cd_version);
+        p.u8(self.hash_type);
+        p.u64(self.exec_seg_flags);
+        for b in [&self.identity, &self.team_id, &self.xml, &self.der] {
+            p.opt(b.as_deref(), |p, b| p.bytes(b));
+        }
+        p.opt(self.cms, |p, n| p.u64(n as u64));
+        p.bytes(&self.blob);
+        p.opt(self.cdhash.as_ref(), |p, h| p.bytes(h));
+        p.u32(self.flags);
+        p.bool(self.platform_binary);
+        p.opt(self.trust_cache.as_ref(), |p, e: &super::trustcache::Entry| {
+            p.u8(e.hash_type);
+            p.u8(e.flags);
+            p.opt(e.category, Put::u8);
+        });
+        p.u32(self.category);
+        put_dict(p, &self.ents.0);
+    }
+
+    /// The signature [`CodeSign::put`] made.
+    pub fn get(g: &mut Get<'_>) -> Result<CodeSign, Bad> {
+        let (platform, cd_flags, cd_version, hash_type, exec_seg_flags) = (g.u8()?, g.u32()?, g.u32()?, g.u8()?, g.u64()?);
+        let (identity, team_id, xml, der) = (g.opt(Get::bytes)?, g.opt(Get::bytes)?, g.opt(Get::bytes)?, g.opt(Get::bytes)?);
+        let cms = g.opt(|g| usize::try_from(g.u64()?).map_err(|_| g.bad("a CMS blob's length")))?;
+        let blob = g.bytes()?;
+        let cdhash = g.opt(|g| {
+            let b = g.bytes()?;
+            b.as_slice().try_into().map_err(|_| g.bad("a cdhash"))
+        })?;
+        let (flags, platform_binary) = (g.u32()?, g.bool()?);
+        let trust_cache = g.opt(|g| Ok(super::trustcache::Entry { hash_type: g.u8()?, flags: g.u8()?, category: g.opt(Get::u8)? }))?;
+        let category = g.u32()?;
+        let ents = Entitlements(get_dict(g, 0)?);
+        Ok(CodeSign { platform, cd_flags, cd_version, hash_type, exec_seg_flags, identity, team_id, xml, der, cms, blob, cdhash, flags, platform_binary, trust_cache, category, ents })
+    }
+}

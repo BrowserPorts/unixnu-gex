@@ -24,6 +24,7 @@ pub struct OwnTask {
     pub task: super::TaskKey,
     pub policy: Option<super::super::importance::Policy>,
     pub ledger: Option<std::sync::Arc<super::super::rusage::BankLedger>>,
+    pub link: Option<std::sync::Arc<super::TaskLink>>,
 }
 
 /// An encoding under way.
@@ -709,6 +710,227 @@ pub fn get_exc(g: &mut Get<'_>) -> Result<super::super::exception::ExcActions, B
     Ok(a)
 }
 
+/// What another task's call leaves for a task of another process, as bytes:
+/// none for what only its own process makes (the WebMetal executor's notes,
+/// a routine's later answer), which never goes to another.
+pub fn remote_bytes(r: &super::Remote) -> Option<Vec<u8>> {
+    use super::Remote as R;
+    let mut p = Put::default();
+    match r {
+        R::Wake(t) => {
+            p.u8(0);
+            p.i32(*t);
+        }
+        R::Knote(o) => {
+            p.u8(1);
+            p.u64(*o);
+        }
+        R::PsetKnote(s, o) => {
+            p.u8(2);
+            p.u64(*s);
+            p.u64(*o);
+        }
+        R::Kobject { kmsg, options, caller } => {
+            p.u8(3);
+            put_kmsg(&mut p, kmsg);
+            p.u64(*options);
+            p.u64(*caller);
+        }
+        R::KobjectNoSenders { port, mscount } => {
+            p.u8(4);
+            p.u64(*port);
+            p.u32(*mscount);
+        }
+        R::Policy(op) => {
+            use super::super::importance::PolicyOp as O;
+            p.u8(5);
+            match op {
+                O::Boost(b) => {
+                    p.u8(0);
+                    p.bool(*b);
+                }
+                O::DonorPropagated(b) => {
+                    p.u8(1);
+                    p.bool(*b);
+                }
+                O::ResetDonor => p.u8(2),
+            }
+        }
+        R::Ledger { to_me, to_others, unkept } => {
+            p.u8(6);
+            p.u64(*to_me);
+            p.u64(*to_others);
+            p.bool(*unkept);
+        }
+        R::Accel(_) | R::Later { .. } => return None,
+    }
+    Some(p.0)
+}
+
+/// The remote [`remote_bytes`] made.
+pub fn remote_of(b: &[u8]) -> Result<super::Remote, Bad> {
+    use super::Remote as R;
+    let g = &mut Get::new(b);
+    let r = match g.u8()? {
+        0 => R::Wake(g.i32()?),
+        1 => R::Knote(g.u64()?),
+        2 => R::PsetKnote(g.u64()?, g.u64()?),
+        3 => R::Kobject { kmsg: Box::new(get_kmsg(g)?), options: g.u64()?, caller: g.u64()? },
+        4 => R::KobjectNoSenders { port: g.u64()?, mscount: g.u32()? },
+        5 => {
+            use super::super::importance::PolicyOp as O;
+            R::Policy(match g.u8()? {
+                0 => O::Boost(g.bool()?),
+                1 => O::DonorPropagated(g.bool()?),
+                2 => O::ResetDonor,
+                _ => return Err(g.bad("a policy change")),
+            })
+        }
+        6 => R::Ledger { to_me: g.u64()?, to_others: g.u64()?, unkept: g.bool()? },
+        _ => return Err(g.bad("a remote's kind")),
+    };
+    if !g.done() {
+        return Err(g.bad("the remote's end"));
+    }
+    Ok(r)
+}
+
+/// The tasks' links as bytes: each task's key, process, whether its IPC is
+/// active, its name port, its signature, its importance marks (a policy's
+/// as they are now), and the wait queue its process's thread calls sleep
+/// on (this process's own, for its own tasks).
+fn put_links(p: &mut Put, links: &HashMap<super::TaskKey, std::sync::Arc<super::TaskLink>>) {
+    p.len(links.len());
+    for (&k, l) in sorted(links) {
+        p.u64(k);
+        p.i32(l.pid);
+        p.bool(l.ipc_active.load(std::sync::atomic::Ordering::Acquire));
+        p.opt(*l.name_port.lock().unwrap_or_else(|e| e.into_inner()), Put::u64);
+        p.opt(l.codesign.as_ref(), |p, c: &super::super::codesign::CodeSign| c.put(p));
+        let (marks, bell) = match &l.elsewhere {
+            Some(e) => (e.marks, e.bell),
+            None => (l.policy.as_ref().map(|c| c.lock().unwrap_or_else(|e| e.into_inner()).imp), super::super::timer::bell_queue()),
+        };
+        p.opt(marks.as_ref(), |p, m: &super::super::taskpolicy::Importance| {
+            for b in [m.donor, m.live_donor, m.receiver, m.denap_receiver] {
+                p.bool(b);
+            }
+            p.u64(m.transitions);
+            p.bool(m.donor_propagated);
+        });
+        p.u32(bell);
+    }
+}
+
+/// The links [`put_links`] made: `own`'s task's is its own link, with the
+/// name port the table gives it; every other task's, a link to another
+/// process's task ([`super::Elsewhere`]).
+fn get_links(g: &mut Get<'_>, own: &OwnTask) -> Result<HashMap<super::TaskKey, std::sync::Arc<super::TaskLink>>, Bad> {
+    let n = g.len()?;
+    let mut out = HashMap::new();
+    for _ in 0..n {
+        let (k, pid, active) = (g.u64()?, g.i32()?, g.bool()?);
+        let name_port = g.opt(Get::u64)?;
+        let codesign = g.opt(super::super::codesign::CodeSign::get)?;
+        let marks = g.opt(|g| Ok(super::super::taskpolicy::Importance { donor: g.bool()?, live_donor: g.bool()?, receiver: g.bool()?, denap_receiver: g.bool()?, transitions: g.u64()?, donor_propagated: g.bool()? }))?;
+        let bell = g.u32()?;
+        let link = match &own.link {
+            Some(l) if k == own.task => {
+                *l.name_port.lock().unwrap_or_else(|e| e.into_inner()) = name_port;
+                std::sync::Arc::clone(l)
+            }
+            _ => std::sync::Arc::new(super::TaskLink {
+                mailbox: Default::default(),
+                bell: Default::default(),
+                pid,
+                ipc_active: std::sync::atomic::AtomicBool::new(active),
+                name_port: std::sync::Mutex::new(name_port),
+                codesign,
+                policy: None,
+                elsewhere: Some(super::Elsewhere { bell, marks }),
+            }),
+        };
+        out.insert(k, link);
+    }
+    Ok(out)
+}
+
+/// The tasks' mailboxes, where the global kernel holds them for the
+/// processes of the page: each task's process and what was left for it.
+static MAILBOXES: std::sync::Mutex<BTreeMap<super::TaskKey, (i32, Vec<Vec<u8>>)>> = std::sync::Mutex::new(BTreeMap::new());
+
+fn mailboxes() -> std::sync::MutexGuard<'static, BTreeMap<super::TaskKey, (i32, Vec<Vec<u8>>)>> {
+    MAILBOXES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Leave `r`'s bytes in the global mailbox of task `task` of process `pid`.
+pub(super) fn mailbox_put(task: super::TaskKey, pid: i32, r: &[u8]) {
+    let Some(rm) = super::super::share::remote() else { return };
+    let mut req = task.to_le_bytes().to_vec();
+    req.extend_from_slice(&pid.to_le_bytes());
+    req.extend_from_slice(r);
+    super::super::share::call(rm, super::super::share::op::MAILBOX_PUT, &req, &mut []);
+}
+
+/// What other processes left in task `task`'s global mailbox, oldest
+/// first: none natively.
+pub fn mailbox_take(task: super::TaskKey) -> Vec<Vec<u8>> {
+    let Some(rm) = super::super::share::remote() else { return Vec::new() };
+    let b = super::super::share::call_read(rm, super::super::share::op::MAILBOX_TAKE, &task.to_le_bytes());
+    let g = &mut Get::new(&b);
+    let mut out = Vec::new();
+    while !g.done() {
+        match g.bytes() {
+            Ok(r) => out.push(r),
+            Err(e) => panic!("gex: the global kernel's mailbox of task {task} is not one ({e:?})"),
+        }
+    }
+    out
+}
+
+/// A mailbox call [`super::super::share::Remote::call`] carried, answered
+/// by this kernel, which holds the mailboxes: none for another call.
+pub(crate) fn serve(op: u32, req: &[u8], out: &mut [u8]) -> Option<i64> {
+    use super::super::share::op as o;
+    const EINVAL: i64 = 22;
+    match op {
+        o::MAILBOX_PUT => {
+            let 13.. = req.len() else { return Some(-EINVAL) };
+            let task = u64::from_le_bytes(req[..8].try_into().unwrap());
+            let pid = i32::from_le_bytes(req[8..12].try_into().unwrap());
+            let mut m = mailboxes();
+            let e = m.entry(task).or_insert((pid, Vec::new()));
+            e.0 = pid;
+            e.1.push(req[12..].to_vec());
+            Some(0)
+        }
+        o::MAILBOX_TAKE => {
+            let 8 = req.len() else { return Some(-EINVAL) };
+            let task = u64::from_le_bytes(req.try_into().unwrap());
+            let mut m = mailboxes();
+            let Some((_, got)) = m.get(&task) else { return Some(0) };
+            let mut p = Put::default();
+            for r in got {
+                p.bytes(r);
+            }
+            // Too long for the room given: its length, the mailbox kept
+            // for the asking again.
+            if p.0.len() > out.len() {
+                return Some(p.0.len() as i64);
+            }
+            out[..p.0.len()].copy_from_slice(&p.0);
+            m.remove(&task);
+            Some(p.0.len() as i64)
+        }
+        _ => None,
+    }
+}
+
+/// Process `pid` of the page has exited: its tasks' mailboxes go.
+pub fn process_exited(pid: i32) {
+    mailboxes().retain(|_, (p, _)| *p != pid);
+}
+
 impl super::IpcShared {
     /// The table as bytes, but for its links (which hold what is a task's
     /// own: its mailbox and bell): its objects, spaces, queues, the
@@ -735,13 +957,14 @@ impl super::IpcShared {
             p.u64(o);
         }
         self.vouchers.put(&mut p);
+        put_links(&mut p, &self.links);
         p.0
     }
 
     /// The table [`Self::table_bytes`] made, with `links` as its own, for a
     /// process whose own task `own` is; bytes that are not all of one,
     /// refused.
-    pub fn of_table_bytes(b: &[u8], links: HashMap<super::TaskKey, std::sync::Arc<super::TaskLink>>, own: &OwnTask) -> Result<super::IpcShared, Bad> {
+    pub fn of_table_bytes(b: &[u8], own: &OwnTask) -> Result<super::IpcShared, Bad> {
         let g = &mut Get::new(b);
         let objects = get_objects(g)?;
         let next_id = g.u64()?;
@@ -755,6 +978,7 @@ impl super::IpcShared {
         let n = g.len()?;
         let host_special = (0..n).map(|_| Ok((g.i32()?, g.u64()?))).collect::<Result<_, Bad>>()?;
         let vouchers = super::super::voucher::VoucherTables::get(g, own)?;
+        let links = get_links(g, own)?;
         if !g.done() {
             return Err(Bad(g.at, "the table's end"));
         }
@@ -810,7 +1034,7 @@ mod tests {
     }
 
     fn of(b: &[u8]) -> Result<super::super::IpcShared, Bad> {
-        super::super::IpcShared::of_table_bytes(b, HashMap::new(), &OwnTask::default())
+        super::super::IpcShared::of_table_bytes(b, &OwnTask::default())
     }
 
     #[test]
@@ -848,4 +1072,92 @@ mod tests {
         long.push(0);
         assert!(of(&long).is_err());
     }
+
+    fn link(pid: i32, policy: Option<super::super::super::importance::Policy>, elsewhere: Option<super::super::Elsewhere>) -> Arc<super::super::TaskLink> {
+        Arc::new(super::super::TaskLink {
+            mailbox: Default::default(),
+            bell: Default::default(),
+            pid,
+            ipc_active: std::sync::atomic::AtomicBool::new(true),
+            name_port: std::sync::Mutex::new(None),
+            codesign: None,
+            policy,
+            elsewhere,
+        })
+    }
+
+    #[test]
+    fn a_link_is_its_own_processs_and_reaches_another_elsewhere() {
+        use super::super::super::codesign::{CodeSign, Ent, Entitlements};
+        use super::super::super::taskpolicy::{Importance, PolicyCell, TaskPolicy};
+        let mut tp = TaskPolicy::default();
+        tp.imp.mark_receiver(true);
+        let mine = link(105, Some(Arc::new(PolicyCell::new(tp))), None);
+        let ents = Entitlements(vec![(b"a".to_vec(), Ent::Bool(true)), (b"d".to_vec(), Ent::Dict(vec![(b"x".to_vec(), Ent::Array(vec![Ent::Int(-3), Ent::Data(vec![1, 2])]))]))]);
+        let cs = CodeSign { platform: 2, cd_flags: 0x2_0002, identity: Some(b"theirs".to_vec()), cdhash: Some([5; 20]), platform_binary: true, trust_cache: Some(super::super::super::trustcache::Entry { hash_type: 2, flags: 0, category: Some(1) }), ents, blob: vec![0xfa, 0xde], ..CodeSign::default() };
+        let marks = Importance { donor: true, transitions: 3, ..Importance::default() };
+        let theirs = Arc::new(super::super::TaskLink { codesign: Some(cs.clone()), ..Arc::try_unwrap(link(106, None, Some(super::super::Elsewhere { bell: 17, marks: Some(marks) }))).unwrap() });
+        *theirs.name_port.lock().unwrap() = Some(40);
+        let links: HashMap<_, _> = [(1, Arc::clone(&mine)), (2, theirs)].into_iter().collect();
+        let mut p = Put::default();
+        put_links(&mut p, &links);
+        let own = OwnTask { task: 1, link: Some(Arc::clone(&mine)), ..OwnTask::default() };
+        let mut g = Get::new(&p.0);
+        let back = get_links(&mut g, &own).expect("they decode");
+        assert!(g.done());
+        assert!(Arc::ptr_eq(&back[&1], &mine));
+        let t = &back[&2];
+        assert_eq!((t.pid, t.policy.is_none(), *t.name_port.lock().unwrap()), (106, true, Some(40)));
+        assert_eq!(t.codesign.as_ref(), Some(&cs));
+        assert!(matches!(&t.elsewhere, Some(super::super::Elsewhere { bell: 17, marks: Some(m) }) if *m == marks));
+        // The other process sees this one's task as another's, with its
+        // policy's marks.
+        let other = OwnTask { task: 2, link: None, ..OwnTask::default() };
+        let seen = get_links(&mut Get::new(&p.0), &other).expect("they decode");
+        assert!(matches!(&seen[&1].elsewhere, Some(super::super::Elsewhere { marks: Some(m), .. }) if m.receiver));
+        let mut q = Put::default();
+        put_links(&mut q, &back);
+        assert_eq!(q.0, p.0);
+    }
+
+    #[test]
+    fn a_remote_is_the_same_remote_after_its_bytes() {
+        use super::super::Remote as R;
+        use super::super::super::importance::PolicyOp;
+        let k = Kmsg { bits: 0x13, size: 24, dest: 9, reply: None, voucher: Some(3), voucher_raw: 0, id: 7, body: vec![1, 2], descs: vec![], sender: Sender::KERNEL, aux: vec![], keep_alive: false, ppriority: 0, qos_override: 0, imp: Some(4) };
+        for r in [R::Wake(12), R::Knote(5), R::PsetKnote(6, 7), R::Kobject { kmsg: Box::new(k), options: 0x200, caller: 3 }, R::KobjectNoSenders { port: 8, mscount: 2 }, R::Policy(PolicyOp::Boost(true)), R::Policy(PolicyOp::DonorPropagated(false)), R::Policy(PolicyOp::ResetDonor), R::Ledger { to_me: 5, to_others: 6, unkept: true }] {
+            let b = remote_bytes(&r).expect("it goes to another process");
+            let back = remote_of(&b).expect("it decodes");
+            assert_eq!(format!("{back:?}"), format!("{r:?}"));
+            assert!(remote_of(&b[..b.len() - 1]).is_err());
+        }
+        assert!(remote_bytes(&R::Later { token: 1, ret: 0, scalars: vec![] }).is_none());
+    }
+
+    #[test]
+    fn a_mailbox_keeps_what_was_left_until_it_is_taken() {
+        use super::super::super::share::op;
+        // (task keys of this test's own)
+        let put = |task: u64, pid: i32, r: &[u8]| {
+            let mut req = task.to_le_bytes().to_vec();
+            req.extend_from_slice(&pid.to_le_bytes());
+            req.extend_from_slice(r);
+            assert_eq!(serve(op::MAILBOX_PUT, &req, &mut []), Some(0));
+        };
+        put(9001, 77, &[1, 2, 3]);
+        put(9001, 77, &[4]);
+        let mut small = [0u8; 4];
+        assert_eq!(serve(op::MAILBOX_TAKE, &9001u64.to_le_bytes(), &mut small), Some(8 + 3 + 8 + 1));
+        let mut out = [0u8; 64];
+        assert_eq!(serve(op::MAILBOX_TAKE, &9001u64.to_le_bytes(), &mut out), Some(20));
+        let g = &mut Get::new(&out[..20]);
+        assert_eq!((g.bytes().unwrap(), g.bytes().unwrap()), (vec![1, 2, 3], vec![4]));
+        assert_eq!(serve(op::MAILBOX_TAKE, &9001u64.to_le_bytes(), &mut out), Some(0));
+        put(9002, 78, &[5]);
+        process_exited(78);
+        assert_eq!(serve(op::MAILBOX_TAKE, &9002u64.to_le_bytes(), &mut out), Some(0));
+        assert_eq!(serve(op::MAILBOX_PUT, &[0; 12], &mut []), Some(-22));
+        assert_eq!(serve(op::MAILBOX_TAKE, &[0; 7], &mut out), Some(-22));
+    }
+
 }

@@ -2012,13 +2012,13 @@ mod tests {
     fn a_bank_context_is_its_own_processs_ledger_and_a_key_elsewhere() {
         let ledger = Arc::new(super::super::rusage::BankLedger::default());
         let b = bytes(&tables(&ledger));
-        let own = OwnTask { task: 5, policy: None, ledger: Some(Arc::clone(&ledger)) };
+        let own = OwnTask { task: 5, policy: None, ledger: Some(Arc::clone(&ledger)), link: None };
         let mut g = Get::new(&b);
         let mine = VoucherTables::get(&mut g, &own).expect("it decodes");
         assert!(g.done());
         assert!(matches!(mine.bank.get(&0x1040), Some(BankElem::Task(BankTask { ledger: Some(LedgerAt::Cell(l)), .. })) if Arc::ptr_eq(l, &ledger)));
         assert_eq!(bytes(&mine), b);
-        let other = OwnTask { task: 6, policy: None, ledger: Some(Arc::new(super::super::rusage::BankLedger::default())) };
+        let other = OwnTask { task: 6, policy: None, ledger: Some(Arc::new(super::super::rusage::BankLedger::default())), link: None };
         let theirs = VoucherTables::get(&mut Get::new(&b), &other).expect("it decodes");
         assert!(matches!(theirs.bank.get(&0x1040), Some(BankElem::Task(BankTask { ledger: Some(LedgerAt::Elsewhere(5)), .. }))));
         assert_eq!(bytes(&theirs), b);

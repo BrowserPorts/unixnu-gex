@@ -95,7 +95,7 @@ impl Kernel {
                     if !self.prio_may(uid) {
                         return Err(Errno::EPERM);
                     }
-                    let r = self.procs.task_policy(pid).map_or(0, |p| p.lock().unwrap_or_else(|e| e.into_inner()).requested.role);
+                    let r = self.procs.task_policy_state(pid).map_or(0, |p| p.requested.role);
                     low = super::taskpolicy::task_role_to_darwin_role(r);
                 }
             }
@@ -108,7 +108,7 @@ impl Kernel {
                     if !root && self.creds.uid() != uid {
                         return Err(Errno::EPERM);
                     }
-                    low = i32::from(self.procs.task_policy(pid).is_some_and(|p| p.lock().unwrap_or_else(|e| e.into_inner()).game_mode));
+                    low = i32::from(self.procs.task_policy_state(pid).is_some_and(|p| p.game_mode));
                 }
             }
             _ => return Err(Errno::EINVAL),

@@ -488,7 +488,7 @@ impl Kernel {
     fn darwin_extract_other(&mut self, key: u64, start: u64, size: u64, a: &mut Remap) -> Result<Other, u64> {
         let pid = self.ipc().links.get(&key).map(|l| l.pid);
         let peer = pid.and_then(|pid| self.procs.vm(pid).ok());
-        let ents = pid.and_then(|pid| self.procs.darwin(pid)).and_then(|(r, _)| r.downcast::<super::procinfo::Public>().ok()).and_then(|p| p.vm.clone());
+        let ents = pid.and_then(|pid| self.procs.darwin(pid)).and_then(|(r, _)| r.downcast::<super::procinfo::Public>().ok()).and_then(|p| (*p.vm).clone());
         let (Some(peer), Some(ents)) = (peer, ents) else {
             // A task that is gone: its map has no entries left.
             return Err(kr::INVALID_ADDRESS);

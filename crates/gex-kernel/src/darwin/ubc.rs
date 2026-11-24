@@ -203,7 +203,7 @@ fn tasks(procs: &ProcTable) -> Vec<Task> {
         }
         let Some((r, _)) = procs.darwin(pid) else { continue };
         let Ok(p) = r.downcast::<super::procinfo::Public>() else { continue };
-        let (Some(entries), Ok(peer)) = (p.vm.clone(), procs.vm(pid)) else { continue };
+        let (Some(entries), Ok(peer)) = ((*p.vm).clone(), procs.vm(pid)) else { continue };
         out.push(Task { entries, peer, meter: Arc::clone(&p.rusage) });
     }
     out

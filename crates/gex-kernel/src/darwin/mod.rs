@@ -551,6 +551,10 @@ pub struct Task {
     /// Under strict mode, the unimplemented thing that stops the process
     /// when the call returns.
     stop: Option<String>,
+    /// In the page, the record this process last gave the global kernel
+    /// for the other processes ([`procinfo::Public::put_record`]): none
+    /// before it first publishes one.
+    pub(crate) record_sent: Option<Vec<u8>>,
 }
 
 impl Task {
@@ -774,6 +778,11 @@ impl crate::syscalls::Kernel {
             }
         }
         self.dtask.ipc_raw.check_in();
+        // What the call changed of its record, for the other processes of
+        // the page, as natively they read the one record.
+        if self.dtask.record_sent.is_some() {
+            self.darwin_record_send();
+        }
     }
 
     /// This process's task policy, as it is now.

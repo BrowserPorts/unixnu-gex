@@ -13,7 +13,10 @@
 //                     for FILE.done to exist: "xproc held".
 //   xproc peek FILE   proc_info PROC_PIDTBSDINFO of the pid in FILE, once
 //                     there (at most 20 s): "xproc peek E", E the errno
-//                     (0 when found), then makes FILE.done.
+//                     (0 when found with that pid and this program's
+//                     name, -2 or -3 when not), then kill's signal 0 to it:
+//                     "xproc peek E kill K", K the errno (0 when sent);
+//                     then makes FILE.done.
 
 #define SYS_exit 1
 #define SYS_write 4
@@ -21,6 +24,7 @@
 #define SYS_close 6
 #define SYS_read 3
 #define SYS_getpid 20
+#define SYS_kill 37
 #define SYS_access 33
 #define SYS_select 93
 #define SYS_shm_open 266
@@ -113,7 +117,11 @@ static long bsdinfo(long pid) {
     static unsigned char info[PROC_BSDINFO_SIZE];
     struct ret r = bsd(SYS_proc_info, PROC_INFO_CALL_PIDINFO, pid, PROC_PIDTBSDINFO, 0, (long)info, sizeof info);
     if (r.carry) return r.x0;
-    return r.x0 == PROC_BSDINFO_SIZE ? 0 : -1;
+    if (r.x0 != PROC_BSDINFO_SIZE) return -1;
+    // pbi_pid, and pbi_comm: this program's.
+    if (*(int *)(info + 12) != (int)pid) return -2;
+    if (!same((const char *)info + 48, "xproc")) return -3;
+    return 0;
 }
 
 static long self_test(void) {
@@ -205,6 +213,9 @@ void main_entry(long argc, char **argv) {
         } else {
             put("xproc peek ");
             num(bsdinfo(pid));
+            // And kill's look for it (signal 0: found, and may be signalled).
+            put(" kill ");
+            num(err(bsd(SYS_kill, pid, 0, 1, 0, 0, 0)));
             say();
         }
         struct ret d = bsd(SYS_open, (long)done_of(argv[2]), O_CREAT | O_WRONLY, 0644, 0, 0, 0);

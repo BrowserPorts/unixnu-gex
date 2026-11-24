@@ -1691,7 +1691,7 @@ impl ProcTable {
             })
         };
         if let Some((ppid, (mut user, mut sys), record, true)) = ended {
-            if let Some(threads) = record.and_then(|r| r.downcast::<crate::darwin::procinfo::Public>().ok()).and_then(|p| p.threads.clone()) {
+            if let Some(threads) = record.and_then(|r| r.downcast::<crate::darwin::procinfo::Public>().ok()).and_then(|p| (*p.threads).clone()) {
                 for tid in threads.tids() {
                     if let Some((u, s)) = threads.get(tid).and_then(|t| t.cpu.times()) {
                         user += u;
@@ -2052,10 +2052,33 @@ impl ProcTable {
         (t.procs.len(), t.procs.iter().filter(|p| p.persona.unwrap_or(p.uid) == uid).count())
     }
 
+    /// Whether process `pid` is on the process list, and whether as a
+    /// zombie (`proc_find`, else `pzfind`): in a table that is really
+    /// somewhere else, another Darwin process of the page's as its record
+    /// says.
+    pub fn listed(&self, pid: i32) -> Option<bool> {
+        let found = self.lock().procs.iter().find(|p| p.pid == pid).map(|p| p.zseq != 0);
+        if found.is_none() && self.remote.is_some() {
+            return crate::darwin::share::record_get(pid).map(|(_, exited)| exited);
+        }
+        found
+    }
+
     /// Every process in `proc_listpids`' order: the live ones, the latest
     /// made first, then the zombies, the latest first: (pid, ppid, pgid,
     /// zombie).
+    ///
+    /// A table that is really somewhere else holds this process's own
+    /// alone: in the page, a listing while another Darwin process of the
+    /// page is there is noted, the others' entries being the global
+    /// kernel's table's.
     pub fn listing(&self) -> Vec<(i32, i32, i32, bool)> {
+        if self.remote.is_some() {
+            let me = crate::darwin::held::me();
+            if let Some(other) = crate::darwin::held::any_elsewhere(crate::darwin::held::Kind::Process, me) {
+                crate::darwin::note_unimplemented(format!("the process list (allproc, zombproc) with process {other} of the page in it, whose entry is the global kernel's table's"));
+            }
+        }
         let t = self.lock();
         let mut live: Vec<&Proc> = t.procs.iter().filter(|p| p.zseq == 0).collect();
         live.reverse();
@@ -2088,17 +2111,30 @@ impl ProcTable {
             let t = self.lock();
             t.procs.iter().find(|p| p.pid == pid).and_then(|p| p.darwin.clone().map(|r| (r, p.exited)))
         };
-        if found.is_none() && self.remote.is_some() && crate::darwin::held::darwin_process(pid) {
-            crate::darwin::note_unimplemented(format!("process {pid}'s Darwin record (proc_find), which is in that process's own memory in the page, not the system's"));
+        if found.is_none() && self.remote.is_some() {
+            return self.record_elsewhere(pid).map(|(p, exited)| (Arc::new(p) as Arc<dyn std::any::Any + Send + Sync>, exited));
         }
         found
+    }
+
+    /// Another process of the page's record, as it last gave it to the
+    /// global kernel, and whether it has exited.
+    fn record_elsewhere(&self, pid: i32) -> Option<(crate::darwin::procinfo::Public, bool)> {
+        let (b, exited) = crate::darwin::share::record_get(pid)?;
+        match crate::darwin::procinfo::Public::of_record(pid, &b) {
+            Ok(p) => Some((p, exited)),
+            Err(e) => panic!("gex: the global kernel's record of process {pid} is not one ({e:?})"),
+        }
     }
 
     pub fn live_nice(&self, pid: i32) -> Option<(u32, i32)> {
         let t = self.lock();
         let Some(p) = t.procs.iter().find(|p| p.pid == pid) else {
             drop(t);
-            self.note_elsewhere(pid, "uid and nice value (proc_find)");
+            // Another process of the page's: as its record last had them.
+            if self.remote.is_some() {
+                return self.record_elsewhere(pid).filter(|(_, exited)| !exited).and_then(|(p, _)| p.table.map(|f| (f.uid, f.nice)));
+            }
             return None;
         };
         let live = p.child.status.lock().map(|s| s.is_none()).unwrap_or(false);
@@ -2176,6 +2212,26 @@ impl ProcTable {
     }
 
     /// `pid`'s job control state, as its waiting parent sees it.
+    /// `pid`'s job state as it is now: another process of the page's as its
+    /// record last had it.
+    pub fn job_state(&self, pid: i32) -> Option<Job> {
+        let found = self.lock().procs.iter().find(|p| p.pid == pid).map(|p| *p.child.job.lock().unwrap_or_else(|e| e.into_inner()));
+        if found.is_none() && self.remote.is_some() {
+            return self.record_elsewhere(pid).and_then(|(p, _)| p.table.map(|f| f.job));
+        }
+        found
+    }
+
+    /// `pid`'s task policy as it is now, a zombie's too: another process
+    /// of the page's as its record last had it.
+    pub fn task_policy_state(&self, pid: i32) -> Option<crate::darwin::taskpolicy::TaskPolicy> {
+        let found = self.lock().procs.iter().find(|p| p.pid == pid).map(|p| *p.child.policy.lock().unwrap_or_else(|e| e.into_inner()));
+        if found.is_none() && self.remote.is_some() {
+            return self.record_elsewhere(pid).and_then(|(p, _)| p.table.map(|f| f.policy));
+        }
+        found
+    }
+
     pub fn job(&self, pid: i32) -> Option<Arc<Mutex<Job>>> {
         let found = self.lock().procs.iter().find(|p| p.pid == pid).map(|p| Arc::clone(&p.child.job));
         if found.is_none() {
@@ -2248,8 +2304,12 @@ impl ProcTable {
     /// does not find it, and `proc_find_zombref` does until it is reaped.
     pub fn set_exited(&self, pid: i32) {
         // (in a table that is really somewhere else, the process's own
-        // record, if it holds it: [`Self::adopt_own`])
+        // record, if it holds it: [`Self::adopt_own`], and the record the
+        // other processes read)
         self.lock().mark_exited(pid);
+        if self.remote.is_some() {
+            crate::darwin::share::record_exited(pid);
+        }
     }
 
     /// `exit_with_reason`'s commitment to an exit for a signal's default

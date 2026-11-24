@@ -892,8 +892,7 @@ impl Kernel {
         }
         let procs = Arc::clone(&self.procs);
         set_importance_query(Box::new(move |pid| {
-            procs.task_policy(pid).map_or((false, false), |p| {
-                let p = p.lock().unwrap_or_else(|e| e.into_inner());
+            procs.task_policy_state(pid).map_or((false, false), |p| {
                 let i = p.imp;
                 (i.donor || (i.receiver && p.requested.boosted), i.receiver || i.denap_receiver)
             })

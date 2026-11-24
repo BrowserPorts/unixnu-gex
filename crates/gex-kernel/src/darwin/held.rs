@@ -305,6 +305,7 @@ pub(crate) fn serve(o: u32, req: &[u8], out: &mut [u8]) -> Option<i64> {
 pub fn process_exited(pid: i32) -> bool {
     held().retain(|(k, _), h| *h != pid || k.ends() != End::Exit);
     counts().retain(|(_, p), _| *p != pid);
+    super::share::record_process_exited(pid);
     let whole = super::share::whole_exited(pid);
     super::ipc::wire::process_exited(pid) || whole
 }
@@ -312,6 +313,7 @@ pub fn process_exited(pid: i32) -> bool {
 /// Process `pid` of the page has been reaped: it is no longer one.
 pub fn process_reaped(pid: i32) {
     held().retain(|(k, _), h| *h != pid || k.ends() != End::Reap);
+    super::share::record_process_reaped(pid);
 }
 
 /// Whether `pid` is a Darwin process of the page: one whose exec made it one and that has not been reaped. Never natively

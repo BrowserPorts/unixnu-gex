@@ -437,9 +437,8 @@ pub(crate) fn spawn_stage(h: &mut Host, m: &mut GuestMem<'_>, pid_addr: u64) -> 
     }
     // Its descriptors, directory and Unix state, as a vfork child's exec
     // stages them: this kernel the child's meanwhile. A hand-on the global
-    // kernel refuses even so (a handle it cannot duplicate) is said, with
-    // what the staging took for the descriptors before it, which nothing
-    // gives back.
+    // kernel refuses even so (a handle it cannot duplicate) is said, and what
+    // the staging took for the others is given back.
     std::mem::swap(&mut h.kernel, &mut *child);
     stage_fork_fds(h, pid, false);
     let fds = FORK_FDS.with(|c| std::mem::take(&mut *c.borrow_mut()));
@@ -450,9 +449,10 @@ pub(crate) fn spawn_stage(h: &mut Host, m: &mut GuestMem<'_>, pid_addr: u64) -> 
     h.kernel.fds.close_all();
     std::mem::swap(&mut h.kernel, &mut *child);
     if !refused.is_empty() {
+        give_back_staged_fds(&fds, pid);
         child.darwin_task_terminate();
         h.kernel.procs.reap(pid);
-        h.kernel.darwin_unimplemented(format!("posix_spawn's child in a Worker of its own: the global kernel would not hand on its descriptors {}; what was taken for its others ({}) is not given back; the call fails with ENOSYS", refused.join(", "), staged.len()));
+        h.kernel.darwin_unimplemented(format!("posix_spawn's child in a Worker of its own: the global kernel would not hand on its descriptors {}; the call fails with ENOSYS", refused.join(", ")));
         let _ = gex_kernel::darwin::set_result(m, h.kernel.ctx_addr, gex_kernel::Errno::ENOSYS.as_return());
         return None;
     }

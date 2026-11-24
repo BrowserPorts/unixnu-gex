@@ -10542,6 +10542,32 @@ pub extern "C" fn gex_adopt_fds(ptr: u32, len: u32) -> i32 {
     adopt_fds_text(&text.to_string())
 }
 
+/// What [`stage_fork_fds`] took from the global kernel for process
+/// `holder`'s descriptors (its `text`), given back, for a process that will
+/// not adopt them: a pipe's or terminal's end `holder` held is closed for
+/// it, and a handle held once more for it (a file's, a socket's, an
+/// inotify instance's, an internet socket's) is taken up as the process
+/// would take it and let go. A process descriptor, an epoll set's
+/// registrations and a file by its path hold nothing there.
+pub(crate) fn give_back_staged_fds(text: &str, holder: i32) {
+    use gex_kernel::fs::oflags;
+    let ns = sigs::proc_home().ns();
+    for line in text.lines() {
+        let mut parts = line.splitn(5, ' ');
+        let (Some(_fd), Some(_cloexec), Some(flags), Some(offset), Some(path)) = (parts.next(), parts.next(), parts.next().and_then(|v| v.parse::<u64>().ok()), parts.next().and_then(|v| v.parse::<u64>().ok()), parts.next()) else {
+            continue;
+        };
+        if let Some(id) = pipe_id(path) {
+            unsafe { k_pipe_close_end(id, (flags & oflags::ACCMODE != oflags::O_RDONLY) as i32, holder) };
+        } else if let Some((id, master)) = pty_ref(path) {
+            unsafe { k_pty_close_end(id, master as i32, holder) };
+        } else if path.starts_with("pidfd:") || path.starts_with("epoll:") || path.starts_with('/') {
+        } else if let Err(e) = rebuild_carried(&ns, path, flags, offset) {
+            warn_line(&format!("gex: a descriptor staged for process {holder} ({path}) could not be given back: {e}\n"));
+        }
+    }
+}
+
 /// [`gex_adopt_fds`]'s work, on `stage_fork_fds`'s text.
 fn adopt_fds_text(text: &str) -> i32 {
     ADOPTED_EPOLLS.with(|m| *m.borrow_mut() = Some(Default::default()));

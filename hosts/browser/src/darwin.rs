@@ -49,6 +49,9 @@ enum Fail {
     /// `badtoolate`): its task ended and the process killed (SIGKILL), as
     /// the native host ends it.
     Killed(String),
+    /// A spawned child that did not start: gone unseen (its pid reaped),
+    /// its spawner's call told why ([`spawned_start`]).
+    Unseen,
 }
 
 /// The exec of a Darwin program the page started, in this Darwin Worker's
@@ -69,6 +72,11 @@ pub(crate) fn exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -
             exit_process(-9);
             0
         }
+        // Its Worker ends; its pid, reaped, has no end to publish.
+        Err(Fail::Unseen) => {
+            exit_process(127);
+            0
+        }
     }
 }
 
@@ -85,20 +93,23 @@ fn start(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> Result<u
     if path == "/sbin/launchd" || h.kernel.pid == gex_kernel::proc::INIT_PID {
         return Err(load("launchd as the system's first process (pid 1, the page kernel's own here)".into()));
     }
-    let Some(bytes) = h.kernel.read_file(path) else { return Err(load("cannot read it".into())) };
-    let img = {
-        let k = &h.kernel;
-        darwin::image::load(&bytes, path, &|p: &str| k.read_file(p).ok_or_else(|| format!("cannot read {p}"))).map_err(load)?
+    // A posix_spawn's child, whose spawner's call made its task and
+    // activated its image ([`spawn_stage`]): taken up once the system has
+    // booted here ([`spawned_start`]). The run's first program is loaded
+    // now.
+    let spawned = CARRY.with(|c| c.borrow_mut().take());
+    let first = match spawned {
+        Some(_) => None,
+        None => {
+            let Some(bytes) = h.kernel.read_file(path) else { return Err(load("cannot read it".into())) };
+            let img = {
+                let k = &h.kernel;
+                darwin::image::load(&bytes, path, &|p: &str| k.read_file(p).ok_or_else(|| format!("cannot read {p}"))).map_err(load)?
+            };
+            static_only(&img).map_err(load)?;
+            Some(img)
+        }
     };
-    // dyld and the shared cache it maps: the root's, from the boot's
-    // graft of the OS cryptex on the disk's Preboot volume, which the page
-    // does not give a Darwin system yet.
-    if img.program.interp.is_some() {
-        return Err(load(format!(
-            "a dynamic Darwin program (it names {}), whose shared cache comes from the boot's graft of the OS cryptex (the disk0 image), which the page does not give its Darwin system yet",
-            img.dylinker.as_deref().unwrap_or("dyld")
-        )));
-    }
 
     // The old image's translations and the generic part of an exec, as
     // `do_exec` makes them: a fresh map that grows on demand, the
@@ -167,43 +178,55 @@ fn start(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> Result<u
     // The SEP's inputs, none of which the page gives: what needs the SEP
     // stops and names what is missing.
     darwin::sep::set_inputs(darwin::sep::core::Inputs { sepos: None, seprom: None, device_dir: None }).map_err(load)?;
-    // The process, of the user it runs as.
-    let k = &mut h.kernel;
-    let (uid, gid) = (k.creds.uid(), k.creds.gid());
-    k.dtask.cred = darwin::cred::Cred::of(uid, gid);
-    k.dtask.uniqueid = darwin::next_uniqueid();
-    k.dtask.start_now();
-    k.signals.thread().set_darwin_id(darwin::next_thread_id());
-    k.darwin_cred_tokens();
-    k.darwin_use_pages();
-    k.darwin_dyld_infos = img.dyld_infos;
-    k.darwin_dyld_infos_size = img.dyld_infos_size;
-    k.darwin_dyld_final = false;
-    k.dtask.strict = STRICT.load(std::sync::atomic::Ordering::Relaxed);
-    // Its thread calls, before anything can arm one.
-    calls_init(k);
-    k.dtask.platform = img.platform;
-    // Exec'd as XNU execs its first process: the next pidversion, and the
-    // task_uniqueid load_init_program's clones and exec leave it.
-    k.dtask.pidversion = darwin::next_pidversion();
-    let _ = darwin::next_task_uniqueid();
-    let _ = darwin::next_task_uniqueid();
-    k.dtask.task_uniqueid = darwin::next_task_uniqueid();
-    k.darwin_signals_init();
-    k.darwin_nofile_sync();
-    // One of the page's Darwin processes from now on, and what the others
-    // changed of the state it reads from its start, reported.
-    k.darwin_page_start();
-    // (No scheduler maintenance thread: the page runs none, and the
-    // averages it would keep say so when asked, `Sched::check`.)
-    // A system launchd has booted has its Preboot volume grafted: with
-    // the disk0 image only, which the page does not give yet.
-    k.darwin_boot_grafts();
-    // Its first thread is in its task's list from the start.
-    if k.sig_tid == 0 {
-        let tid = k.tid;
-        k.thread_sig(tid);
-    }
+    // A spawned child: its task, its switch to its image and its task
+    // enabled, as its spawner's call does natively.
+    let (img, spawn_exec): (darwin::image::DarwinImage, Option<Box<darwin::execve::Image>>) = match (first, spawned) {
+        (None, Some(blob)) => {
+            let (img, exec) = spawned_start(h, &blob)?;
+            (img, Some(exec))
+        }
+        (Some(img), _) => {
+            // The process, of the user it runs as.
+            let k = &mut h.kernel;
+            let (uid, gid) = (k.creds.uid(), k.creds.gid());
+            k.dtask.cred = darwin::cred::Cred::of(uid, gid);
+            k.dtask.uniqueid = darwin::next_uniqueid();
+            k.dtask.start_now();
+            k.signals.thread().set_darwin_id(darwin::next_thread_id());
+            k.darwin_cred_tokens();
+            k.darwin_use_pages();
+            k.darwin_dyld_infos = img.dyld_infos;
+            k.darwin_dyld_infos_size = img.dyld_infos_size;
+            k.darwin_dyld_final = false;
+            k.dtask.strict = STRICT.load(std::sync::atomic::Ordering::Relaxed);
+            // Its thread calls, before anything can arm one.
+            calls_init(k);
+            k.dtask.platform = img.platform;
+            // Exec'd as XNU execs its first process: the next pidversion, and the
+            // task_uniqueid load_init_program's clones and exec leave it.
+            k.dtask.pidversion = darwin::next_pidversion();
+            let _ = darwin::next_task_uniqueid();
+            let _ = darwin::next_task_uniqueid();
+            k.dtask.task_uniqueid = darwin::next_task_uniqueid();
+            k.darwin_signals_init();
+            k.darwin_nofile_sync();
+            // One of the page's Darwin processes from now on, and what the others
+            // changed of the state it reads from its start, reported.
+            k.darwin_page_start();
+            // (No scheduler maintenance thread: the page runs none, and the
+            // averages it would keep say so when asked, `Sched::check`.)
+            // A system launchd has booted has its Preboot volume grafted: with
+            // the disk0 image only, which the page does not give yet.
+            k.darwin_boot_grafts();
+            // Its first thread is in its task's list from the start.
+            if k.sig_tid == 0 {
+                let tid = k.tid;
+                k.thread_sig(tid);
+            }
+            (img, None)
+        }
+        (None, None) => unreachable!("a program loaded or a child carried"),
+    };
 
     // The image: each segment where its headers say, the memory grown to
     // it (above the page zero, `arena_back`).
@@ -257,18 +280,22 @@ fn start(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> Result<u
     // Its main stack, the kernel's to lay out (`create_unix_stack`, the
     // `apple[]` strings, `exec_copyout_strings`).
     let header = img.program.exe.segments.iter().map(|s| s.vaddr).min().unwrap_or(0);
+    let spawn_exec_placed = spawn_exec.is_some();
     let st = {
+        // A spawned child's: the strings and signature its activation made,
+        // its slice's offset, its spawn's allocator flag.
+        let exec = spawn_exec.as_deref();
         let loaded = darwin::exec::Loaded {
             mach_header: header,
             dylinker: None,
             stacksize: img.stacksize,
             exe_path: path,
-            file_start: 0,
+            file_start: exec.map_or(0, |i| i.arch_offset),
             code_signature: img.code_signature.as_deref(),
-            signature: None,
-            nano: false,
+            signature: exec.map(|i| i.load.clone()),
+            nano: exec.and_then(|i| i.spawn.as_ref()).is_some_and(|sp| sp.flags & darwin::spawn::flag::NANO_ALLOCATOR != 0),
         };
-        h.kernel.darwin_start(None, &loaded, img.user_stack).map_err(|e| Fail::Killed(format!("starting {path}: errno {}", e.0)))?
+        h.kernel.darwin_start(spawn_exec.map(|i| i.strings), &loaded, img.user_stack).map_err(|e| Fail::Killed(format!("starting {path}: errno {}", e.0)))?
     };
     if !grow_memory_to(st.alloc + st.size) {
         return Err(Fail::Killed(format!("its stack {:#x}..{:#x}: the memory will not grow to it", st.alloc, st.alloc + st.size)));
@@ -294,7 +321,250 @@ fn start(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> Result<u
     darwin::workq::thread_started(h.kernel.tid);
     // Its thread-call Worker, which the page starts now.
     let _ = CALLS.compare_exchange(CALLS_CAN, CALLS_WANTED, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire);
+    // A spawned child's memory built and its image and stack in place: its
+    // spawner's call returns (the native host's `ImagePlaced`).
+    if spawn_exec_placed {
+        darwin::share::spawn_started(h.kernel.pid, h.kernel.dtask.original_ppid, 0);
+    }
     Ok(entry)
+}
+
+/// A program the page runs has no dyld: dyld and the shared cache it maps
+/// are the root's, from the boot's graft of the OS cryptex on the disk's
+/// Preboot volume, which the page does not give a Darwin system yet.
+fn static_only(img: &gex_kernel::darwin::image::DarwinImage) -> Result<(), String> {
+    match img.program.interp {
+        Some(_) => Err(format!(
+            "a dynamic Darwin program (it names {}), whose shared cache comes from the boot's graft of the OS cryptex (the disk0 image), which the page does not give its Darwin system yet",
+            img.dylinker.as_deref().unwrap_or("dyld")
+        )),
+        None => Ok(()),
+    }
+}
+
+thread_local! {
+    /// A Darwin posix_spawn's child staged for a Worker of its own
+    /// ([`spawn_stage`]): its pid and the context its first thread takes
+    /// there, until the page has taken the staged exec
+    /// (`gex_darwin_spawn_staged`).
+    static SPAWN_STAGED: std::cell::Cell<(i32, u32)> = const { std::cell::Cell::new((0, 0)) };
+    /// This Worker's process is a posix_spawn's child: its carried task and
+    /// image ([`gex_darwin_adopt_carry`]), until its start takes them.
+    static CARRY: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Whether a spawned child is staged for the page to start
+/// (`gex_after_trap`: the run loop drains it).
+pub(crate) fn spawn_staged() -> bool {
+    SPAWN_STAGED.with(|c| c.get().0 != 0)
+}
+
+/// The staged spawned child's pid (0 for none), taken; its context then
+/// [`gex_darwin_spawn_ctx`]. Its exec's parts are vfork.rs's staged ones.
+#[no_mangle]
+pub extern "C" fn gex_darwin_spawn_staged() -> i32 {
+    let (pid, _) = SPAWN_STAGED.with(|c| c.get());
+    SPAWN_STAGED.with(|c| c.set((0, c.get().1)));
+    pid
+}
+
+/// The context the last staged spawned child's first thread takes.
+#[no_mangle]
+pub extern "C" fn gex_darwin_spawn_ctx() -> u32 {
+    SPAWN_STAGED.with(|c| c.get().1)
+}
+
+/// The page could not start the staged child's Worker: its spawner's call
+/// fails with EAGAIN, as the native host's does when it cannot make the
+/// child's thread, the child gone unseen. Its task's rights, which its
+/// Worker would have let go at its start's failure, are not: said.
+#[no_mangle]
+pub extern "C" fn gex_darwin_spawn_failed(pid: i32) {
+    let me = crate::with_own_host(|h| {
+        h.kernel.procs.reap(pid);
+        gex_kernel::darwin_say!("[gex:{pid}] Darwin: not implemented: posix_spawn's child whose Worker the page could not start: its task's rights are not let go (its start would have ended its task)");
+        h.kernel.pid
+    });
+    gex_kernel::darwin::share::spawn_started(pid, me, gex_kernel::Errno::EAGAIN.0);
+}
+
+/// This Worker's process is a posix_spawn's child: what its spawner's call
+/// made of it ([`spawn_stage`]'s fifth part), before its exec
+/// (`gex_adopted_exec`).
+#[no_mangle]
+pub extern "C" fn gex_darwin_adopt_carry(ptr: u32, len: u32) {
+    let b = shim_slice(ptr, len).to_vec();
+    CARRY.with(|c| *c.borrow_mut() = Some(b));
+}
+
+/// A Darwin `posix_spawn`'s child (`Kernel::darwin_spawned`), for a Worker
+/// of its own, as the native host's `start_darwin_spawn` starts it on a
+/// thread of its own: its task and the image its spawner's call activated
+/// ([`gex_kernel::darwin::carry`]), its thread's id, and the descriptors,
+/// directory and Unix state a vfork child's exec carries, staged for the
+/// page (`gex_darwin_spawn_staged`); this Worker's references to its
+/// descriptors closed. The wait the call parks in until the child's image
+/// is in place there or its start has failed; none when the child cannot
+/// cross whole: what it would lose is said, the child let go (its task
+/// ended, its pid reaped) and the call failed with ENOSYS.
+pub(crate) fn spawn_stage(h: &mut Host, m: &mut GuestMem<'_>, pid_addr: u64) -> Option<gex_kernel::BlockOp> {
+    use gex_kernel::darwin::carry;
+    let mut child = h.kernel.darwin_spawned.take().expect("posix_spawn's child (Kernel::darwin_spawned)");
+    let pid = child.pid;
+    let img = child.darwin_exec.take().expect("a spawned child's image");
+    let mut carried = gex_kernel::darwin::ipc::wire::Put::default();
+    let mut lost: Vec<String> = carry::put_task(&child.dtask, &mut carried).into_iter().map(|f| format!("its task's {f}")).collect();
+    carry::put_image(&img, &mut carried);
+    carried.u64(child.signals.thread().darwin_id());
+    let ctx = h.threads[cur()].ctx_addr();
+    // Its descriptors, each one the page can hand on (`carriable`), before
+    // anything of them is staged, so that a child that cannot go leaves
+    // nothing held for it.
+    for (fd, file, _) in child.fds.entries() {
+        if !carriable(&file, pid) {
+            lost.push(format!("its descriptor {fd} ({})", file.path));
+        }
+    }
+    if !lost.is_empty() {
+        child.darwin_task_terminate();
+        child.close_all_fds();
+        h.kernel.procs.reap(pid);
+        for l in lost {
+            h.kernel.darwin_unimplemented(format!("posix_spawn's child in a Worker of its own: {l} does not cross; the call fails with ENOSYS"));
+        }
+        let _ = gex_kernel::darwin::set_result(m, h.kernel.ctx_addr, gex_kernel::Errno::ENOSYS.as_return());
+        return None;
+    }
+    // Its descriptors, directory and Unix state, as a vfork child's exec
+    // stages them: this kernel the child's meanwhile. A hand-on the global
+    // kernel refuses even so (a handle it cannot duplicate) is said, with
+    // what the staging took for the descriptors before it, which nothing
+    // gives back.
+    std::mem::swap(&mut h.kernel, &mut *child);
+    stage_fork_fds(h, pid, false);
+    let fds = FORK_FDS.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    let staged: std::collections::BTreeSet<i32> = fds.lines().filter_map(|l| l.split(' ').next()?.parse().ok()).collect();
+    let refused: Vec<String> = h.kernel.fds.entries().into_iter().filter(|(fd, ..)| !staged.contains(fd)).map(|(fd, file, _)| format!("{fd} ({})", file.path)).collect();
+    let cwd = h.kernel.caller_cwd().into_bytes();
+    let state = state_bytes(&h.kernel, true);
+    h.kernel.fds.close_all();
+    std::mem::swap(&mut h.kernel, &mut *child);
+    if !refused.is_empty() {
+        child.darwin_task_terminate();
+        h.kernel.procs.reap(pid);
+        h.kernel.darwin_unimplemented(format!("posix_spawn's child in a Worker of its own: the global kernel would not hand on its descriptors {}; what was taken for its others ({}) is not given back; the call fails with ENOSYS", refused.join(", "), staged.len()));
+        let _ = gex_kernel::darwin::set_result(m, h.kernel.ctx_addr, gex_kernel::Errno::ENOSYS.as_return());
+        return None;
+    }
+    // Its exec's command line, as `gex_adopted_exec` reads it: the image's
+    // path, then its arguments and its environment, each after its count.
+    let mut cmd = Vec::new();
+    let (args, envs) = (img.strings.args(), img.strings.envs());
+    let (argc, envc) = (args.len().to_string(), envs.len().to_string());
+    for s in std::iter::once(img.path.as_bytes()).chain(std::iter::once(argc.as_bytes())).chain(args.iter().copied()).chain(std::iter::once(envc.as_bytes())).chain(envs.iter().copied()) {
+        cmd.extend_from_slice(s);
+        cmd.push(0);
+    }
+    vfork::stage_darwin_spawn([cmd, fds.into_bytes(), cwd, state, carried.0]);
+    SPAWN_STAGED.with(|c| c.set((pid, ctx as u32)));
+    Some(gex_kernel::BlockOp::SpawnStart { pid, pid_addr })
+}
+
+/// A spawned child's start in this Worker, from what its spawner's call
+/// made of it, as the native host's `start_darwin_spawn` starts one: its
+/// task and its thread's id taken up; one of the page's processes; its
+/// image loaded (`Kernel::darwin_load_image`: a load that fails is its
+/// spawner's call's error, the child ended as posix_spawn's failure ends
+/// it, `Kernel::darwin_spawn_load_failed`); then switched over to it, the image activated, the
+/// process marked exec'd, its task enabled and its NOTE_EXEC posted; then
+/// what its run's start sets (its pages, dyld's image info range, the
+/// strict switch, its platform, its signals and descriptor limit).
+fn spawned_start(h: &mut Host, blob: &[u8]) -> Result<(gex_kernel::darwin::image::DarwinImage, Box<gex_kernel::darwin::execve::Image>), Fail> {
+    use gex_kernel::darwin::{self, carry, share};
+    use gex_kernel::Errno;
+    let k = &mut h.kernel;
+    let pid = k.pid;
+    // Its spawner, whom its start's answer wakes.
+    let ppid = k.procs.ppid(pid);
+    let g = &mut darwin::ipc::wire::Get::new(blob);
+    let got = (|| Ok::<_, darwin::ipc::wire::Bad>((carry::get_task(g)?, carry::get_image(g)?, g.u64()?)))();
+    let (task, img, thread_id) = match got {
+        Ok(v) if g.done() => v,
+        other => {
+            warn_line(&format!("gex: posix_spawn's child {pid}: what its spawner's call made of it did not come whole ({:?}); its call fails with ENOSYS\n", other.err()));
+            k.close_all_fds();
+            k.procs.reap(pid);
+            share::spawn_started(pid, ppid, Errno::ENOSYS.0);
+            return Err(Fail::Unseen);
+        }
+    };
+    k.dtask = task;
+    k.signals.thread().set_darwin_id(thread_id);
+    calls_init(k);
+    k.darwin_page_start();
+    if k.sig_tid == 0 {
+        let tid = k.tid;
+        k.thread_sig(tid);
+    }
+    // load_machfile of the activated image (`darwin_load_image`): its
+    // failure is the spawner's call's error, the child ended as
+    // posix_spawn's failure ends it (`darwin_spawn_load_failed`).
+    let loaded = match k.darwin_load_image(&img) {
+        Ok(l) => l,
+        Err((e, why)) => {
+            if k.trace {
+                warn_line(&format!("[gex:{pid}] posix_spawn: {why}\n"));
+            }
+            k.darwin_spawn_load_failed();
+            share::spawn_started(pid, ppid, e.0);
+            return Err(Fail::Unseen);
+        }
+    };
+    // Natively it would run; the page has no dyld for it: said, the child
+    // let go (its task ended, its descriptors closed, its pid reaped) and
+    // its spawner's call failed with ENOSYS.
+    if let Err(why) = static_only(&loaded) {
+        warn_line(&format!("gex: posix_spawn's child {pid}: {}: {why}; its call fails with ENOSYS\n", img.path));
+        k.darwin_task_terminate();
+        k.close_all_fds();
+        k.procs.reap(pid);
+        share::spawn_started(pid, ppid, Errno::ENOSYS.0);
+        return Err(Fail::Unseen);
+    }
+    // switch_to_darwin_image, then the image activated, its signature and
+    // labels set (a policy's refusal kills the child at its start).
+    let tid = if k.sig_tid != 0 { k.sig_tid } else { k.tid };
+    k.exec_signals(tid);
+    k.exe_path = img.path.clone();
+    k.darwin_exec_switch(img.spawn.as_ref(), img.thread_id, img.setid);
+    k.dtask.platform = loaded.platform;
+    {
+        let l = darwin::exec::Loaded {
+            mach_header: loaded.program.exe.segments.iter().map(|s| s.vaddr).min().unwrap_or(0),
+            dylinker: None,
+            stacksize: loaded.stacksize,
+            exe_path: &img.path,
+            file_start: img.arch_offset,
+            code_signature: loaded.code_signature.as_deref(),
+            signature: Some(img.load.clone()),
+            nano: img.spawn.as_ref().is_some_and(|sp| sp.flags & darwin::spawn::flag::NANO_ALLOCATOR != 0),
+        };
+        k.darwin_activate(&l);
+    }
+    // exec_mach_imgact's P_EXEC; posix_spawn's ipc_task_enable and NOTE_EXEC.
+    k.procs.set_execed(pid);
+    k.darwin_task_enable();
+    gex_kernel::procnote::post(pid, gex_kernel::procnote::note::EXEC);
+    // What its run's start sets (the native host's `run_program_with`).
+    k.darwin_use_pages();
+    k.darwin_dyld_infos = loaded.dyld_infos;
+    k.darwin_dyld_infos_size = loaded.dyld_infos_size;
+    k.darwin_dyld_final = false;
+    k.dtask.strict = STRICT.load(std::sync::atomic::Ordering::Relaxed);
+    k.dtask.platform = loaded.platform;
+    k.darwin_signals_init();
+    k.darwin_nofile_sync();
+    Ok((loaded, Box::new(img)))
 }
 
 /// A Darwin process's task end, at its process's end (`proc_exit`): its
@@ -778,7 +1048,7 @@ pub(crate) fn safepoint(ctx_addr: u64, pc: u64) {
 /// reads from the caller as the wait begins) is not parked.
 pub(crate) fn parks(op: &gex_kernel::BlockOp) -> bool {
     use gex_kernel::BlockOp;
-    matches!(op, BlockOp::FutexWait { .. } | BlockOp::ReadStream { .. } | BlockOp::AcceptWait { .. } | BlockOp::WriteStream { xnu: Some(_), .. } | BlockOp::WriteWait { .. } | BlockOp::WaitChild { jobs: Some(_), .. })
+    matches!(op, BlockOp::FutexWait { .. } | BlockOp::ReadStream { .. } | BlockOp::AcceptWait { .. } | BlockOp::WriteStream { xnu: Some(_), .. } | BlockOp::WriteWait { .. } | BlockOp::WaitChild { jobs: Some(_), .. } | BlockOp::SpawnStart { .. })
 }
 
 /// Whether Darwin call wait `op` is a stream's ([`stream_round`]).
@@ -813,6 +1083,9 @@ fn waiting_of(op: &gex_kernel::BlockOp) -> Waiting {
         // else when the global kernel's table has one ([`wait_round`]).
         BlockOp::WaitChild { nohang: true, .. } => Waiting::Runnable,
         BlockOp::WaitChild { .. } => Waiting::Child,
+        // A spawned child's start in its Worker, as a child's end is waited
+        // for ([`spawn_waited`]).
+        BlockOp::SpawnStart { .. } => Waiting::Child,
         other => unreachable!("a Darwin wait the page parks is a futex wait, a stream's or a child's, not {other:?}"),
     }
 }
@@ -974,20 +1247,29 @@ pub(crate) fn unparked(k: &mut gex_kernel::syscalls::Kernel, m: &mut GuestMem<'_
     }
 }
 
-/// A Darwin `posix_spawn`'s child (`Kernel::darwin_spawned`): a second
-/// Darwin process of this Worker's system, whose state is this process's
-/// shim's, until it is the global kernel's. Reported, the child let go
-/// (its task ended, its descriptors closed, its pid reaped) and the call
-/// failed with ENOSYS.
-pub(crate) fn spawn_refused(k: &mut gex_kernel::syscalls::Kernel, m: &mut GuestMem<'_>) {
-    if let Some(mut child) = k.darwin_spawned.take() {
-        let pid = child.pid;
-        child.darwin_task_terminate();
-        child.close_all_fds();
-        k.procs.reap(pid);
+/// The end of a spawner's wait for its child's start ([`spawn_stage`]),
+/// once [`gex_kernel::darwin::share::spawn_start`] has it: the pid written
+/// where the call asked, or the start's errno its result, as the native
+/// host's `start_darwin_spawn` answers the call; `None` while it waits.
+pub(crate) fn spawn_waited(h: &mut Host, ctx_addr: u64, pc: u64, pid: i32, pid_addr: u64) -> Option<Done> {
+    use gex_kernel::darwin::share::{spawn_start, SpawnStart};
+    let halted = h.kernel.procs.halt_code().is_some();
+    let mut gm = guest();
+    match spawn_start(pid, true) {
+        SpawnStart::Pending if !halted => return None,
+        // Started, or ended before it said (`ImagePlaced` on the native
+        // host's start that ends), or a halt, which ends the spawner at its
+        // next entry: the call returns the pid.
+        SpawnStart::Result(0) | SpawnStart::Ended | SpawnStart::Pending => {
+            if pid_addr != 0 {
+                let _ = gm.write(pid_addr, &(pid as u32).to_le_bytes());
+            }
+        }
+        SpawnStart::Result(e) => {
+            let _ = gex_kernel::darwin::set_result(&mut gm, ctx_addr, gex_kernel::Errno(e).as_return());
+        }
     }
-    k.darwin_unimplemented("posix_spawn's child: a second Darwin process of the system, whose Darwin state is this process's Worker's in the page; the call fails with ENOSYS".into());
-    let _ = gex_kernel::darwin::set_result(m, k.ctx_addr, gex_kernel::Errno::ENOSYS.as_return());
+    Some(if pc == 0 { Done::At(ctx_addr, gm.read_u64(ctx_addr + ctx::PC as u64).unwrap_or(0)) } else { Done::At(ctx_addr, pc) })
 }
 
 /// A Darwin wait's end, in the Worker of thread `i` whose wait it was
@@ -1005,6 +1287,18 @@ pub(crate) fn spawn_refused(k: &mut gex_kernel::syscalls::Kernel, m: &mut GuestM
 pub(crate) fn finished(h: &mut Host, r: &mut Run, i: usize, ctx_addr: u64, tid: i32, op: gex_kernel::BlockOp, mut owed: Owed, timed_out: bool, by_signal: bool) -> Done {
     use gex_kernel::{Errno, SyscallOutcome};
     let pc = r.pc;
+    // A spawner's: its child's start is over or not, no kernel call to end.
+    if let gex_kernel::BlockOp::SpawnStart { pid, pid_addr } = op {
+        return match spawn_waited(h, ctx_addr, pc, pid, pid_addr) {
+            Some(done) => done,
+            None => {
+                r.waiting = r.park_as(waiting_of(&op));
+                r.blocked_on = Some(op);
+                r.owed = owed;
+                Done::Parked
+            }
+        };
+    }
     let stream = on_stream(&op);
     let out = (|| {
         let ks = h.threads[i].kstate();

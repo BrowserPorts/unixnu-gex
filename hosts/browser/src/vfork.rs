@@ -80,7 +80,7 @@ thread_local! {
     /// What a child that execs hands the Worker it goes on in: the command,
     /// its descriptors (as `stage_fork_fds` describes them, for this pid),
     /// its working directory and its signal state, pending signals included.
-    static EXEC_PARTS: RefCell<[Vec<u8>; 4]> = const { RefCell::new([Vec::new(), Vec::new(), Vec::new(), Vec::new()]) };
+    static EXEC_PARTS: RefCell<[Vec<u8>; 5]> = const { RefCell::new([Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()]) };
     /// The staged exec's memory (`exec_target`): 1 a 64-bit one, 0 a 32-bit
     /// one, -1 the parent's (a page that runs one flavour).
     static EXEC_MEM64: Cell<i32> = const { Cell::new(-1) };
@@ -383,8 +383,21 @@ pub(crate) fn stage_exec_parts(h: &mut Host, path: &str, argv: &[String], envp: 
     EXEC_MEM64.with(|c| c.set(mem64));
     let wasm = exec_wasm_image(h, path);
     EXEC_WASM.with(|c| c.set(wasm));
-    EXEC_PARTS.with(|p| *p.borrow_mut() = [cmd, fds, cwd, state]);
+    EXEC_PARTS.with(|p| *p.borrow_mut() = [cmd, fds, cwd, state, Vec::new()]);
     h.kernel.fds.close_all();
+}
+
+/// A Darwin posix_spawn's child's exec, for a Worker of its own
+/// (`darwin::spawn_stage`): its command line, descriptors, cwd and Unix
+/// state as [`stage_exec_parts`] stages an exec's, and what its spawner's
+/// call made of its task and image (the fifth part, which the new Worker
+/// takes before its exec, `gex_darwin_adopt_carry`), in a Darwin Worker's
+/// 64-bit memory.
+pub(crate) fn stage_darwin_spawn(parts: [Vec<u8>; 5]) {
+    EXEC_MEM64.with(|c| c.set(1));
+    EXEC_WASM.with(|c| c.set(None));
+    EXEC_DARWIN.with(|c| c.set(true));
+    EXEC_PARTS.with(|p| *p.borrow_mut() = parts);
 }
 
 /// An exec's program's image span, relative to the caller's cwd, when it is

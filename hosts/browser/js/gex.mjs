@@ -3963,6 +3963,7 @@ export class Gex {
       // page can start one (`#darwinCalls`); the shim reports them as
       // never run otherwise.
       if (isShared(this.#memory.buffer) && !(SP_CODE && single.on) && typeof this.#env.spawnThread === 'function') e.gex_darwin_runs_thread_calls();
+      if (child.darwinCarry?.length) this.#putBytes(child.darwinCarry, e.gex_darwin_adopt_carry);
     }
     if (SP_CODE && single.on) return this.#putBytesP(child.exec, e.gex_adopted_exec);
     const entry = this.#putBytes(child.exec, e.gex_adopted_exec);
@@ -4757,6 +4758,9 @@ export class Gex {
       fds: part(1),
       cwd: new TextDecoder().decode(part(2)),
       state: part(3),
+      // A Darwin posix_spawn's child's task and image, as its spawner's
+      // call made them (darwin.rs `spawn_stage`), for its start.
+      darwinCarry: part(4),
       exe: null,
       // The memory its program needs, in a 64-bit memory's page (vfork.rs
       // `exec_memory`): true or false, or undefined for the parent's.
@@ -4793,8 +4797,26 @@ export class Gex {
    *  null with none staged. No promise otherwise, since a call-out's loop
    *  asks at every trap and may never reach the event loop. */
   #drainFork() {
+    this.#drainDarwinSpawn();
     const pid = this.#shim.exports.gex_fork_pending?.();
     return pid ? this.#startFork(pid) : null;
+  }
+
+  /** A Darwin posix_spawn's child its call staged (darwin.rs
+   *  `spawn_stage`): started in a Worker of its own as an exec record, the
+   *  spawner's call parked until the child's image is in place there. A
+   *  Worker the page cannot start fails the call (`gex_darwin_spawn_failed`). */
+  #drainDarwinSpawn() {
+    const e = this.#shim.exports;
+    const pid = e.gex_darwin_spawn_staged?.();
+    if (!pid) return;
+    const r = this.#vforkExecRecord(pid, e.gex_darwin_spawn_ctx(), 0);
+    r.vforkMs = undefined;
+    e.gex_vfork_exec_done();
+    this.#env.spawnProcess(r).catch((err) => {
+      console.error(`[gex] starting pid ${pid} (a Darwin posix_spawn's child): ${err.message ?? err}`);
+      e.gex_darwin_spawn_failed(pid);
+    });
   }
 
   async #startFork(pid) {
@@ -8782,6 +8804,9 @@ export class Gex {
         // the exit: a network/futex flag can still be set, and waiting on it
         // here strands an already-dead process so its parent can never reap it.
         if (e.gex_exited?.()) return e.gex_exit_code();
+        // A Darwin posix_spawn's child its call staged before the call
+        // parked to wait for the child's start (darwin.rs `spawn_stage`).
+        this.#drainDarwinSpawn();
         // The guest gave the stack back unfinished: every thread waits on
         // something only the page can produce. Waiting happens out here because
         // a guest holding the one wasm stack is a guest nothing can reach. The

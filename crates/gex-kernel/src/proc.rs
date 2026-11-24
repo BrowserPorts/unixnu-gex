@@ -2380,6 +2380,14 @@ impl ProcTable {
 
     /// A stop's or a continue's news for `pid`'s waiting parent: its wait
     /// woken (`stop`'s `wakeup(parent)`).
+    /// Process `pid`'s waiters woken: what one of them waits for changed
+    /// outside this table (a spawned child's start in another host).
+    pub fn wake(&self, pid: i32) {
+        if let Some(p) = self.lock().procs.iter().find(|p| p.pid == pid) {
+            p.queue.notify();
+        }
+    }
+
     pub fn job_changed(&self, pid: i32) {
         let t = self.lock();
         if let Some(p) = t.procs.iter().find(|p| p.pid == pid) {

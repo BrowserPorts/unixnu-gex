@@ -295,8 +295,14 @@ fn uncarried(t: &Task) -> Vec<&'static str> {
         pending_replies, realtimer, vtimers, cpuusage, wakeups, threads, waits, ulocks, psynch, timers, iomfb_call, spawns, connect_wait, connect_waited, tcp_socks, tcp_socks_gen, tcp_watch, kcaller, read_from, child_ports, semas, mk_timers, workq, workq_wake, in_callout, callout_pidle, callout_woken, workq_creator_pending, threadreqs, next_threadreq, kevents, vmrsrcowner, fork_ids, activated, lock_wakes, ttyops, custom_stack, spawn_failed, syscall_exit, crash_notify, corpse, corpse_forks, corpse_fork_results, bt_deliveries, bt_daemon, corpse_source, fault_code, ktriage_unmodelled, rpc_reply, rpc_replies, footprint_due, footprint_releasing, sema_wake, pending_send, pending_send_buf, guard_kill, fd_guard, aio, ca_client_wi, psem_waits, eventlink_waits, image_files, no_attach, p_debugger, force_quota, stop, job_event,
     );
     // Its usage's start crosses; the rest of its usage is a new
-    // process's.
-    if differs(rusage, &super::rusage::Shared::new(rusage.start_abstime.load(Acquire))) {
+    // process's, but for its objects' owner's pid, which its publishing
+    // set (`darwin_publish`, as the child's start does again), and its
+    // meter's submaps, its map's (the shared region's it inherited), which
+    // the image switch's new map and its entry into its region make again.
+    let new_usage = super::rusage::Shared::new(rusage.start_abstime.load(Acquire));
+    new_usage.meter.owner().set_pid(rusage.meter.owner().pid());
+    *new_usage.meter.submaps.lock().unwrap_or_else(|e| e.into_inner()) = rusage.meter.submaps.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if differs(rusage, &new_usage) {
         lost.push("rusage");
     }
     // The rights ipc_task_init gave it cross; its task's own ports are

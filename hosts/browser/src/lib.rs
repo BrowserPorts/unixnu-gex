@@ -8050,6 +8050,12 @@ fn park_until_ready() {
     if unsafe { k_present() } == 0 || waitq::wants_page() != Some(false) {
         return;
     }
+    // A Darwin posix_spawn's child its call staged (`darwin::spawn_stage`):
+    // the page starts it from this Worker's run loop, which a sleep here
+    // would never reach, and the call's wait is for that child's start.
+    if darwin::spawn_staged() {
+        return;
+    }
     waitq::park();
 }
 
@@ -9047,6 +9053,15 @@ fn syscall_entry(ctx: i32, pc: i64) {
         // the twin runs (vfork.rs `exec_route`).
         // A Darwin call's wait, which the page does not park
         // (`darwin::unparked`).
+        // A Darwin posix_spawn's child, for a Worker of its own: the call
+        // waits for its start there (`darwin::spawn_stage`).
+        let outcome = match outcome {
+            SyscallOutcome::DarwinSpawn { pid_addr } => match darwin::spawn_stage(h, &mut gm, pid_addr) {
+                Some(op) => SyscallOutcome::Blocking(op),
+                None => SyscallOutcome::Continue,
+            },
+            o => o,
+        };
         let outcome = match outcome {
             SyscallOutcome::Blocking(op) if h.kernel.darwin && !darwin::parks(&op) => darwin::unparked(&mut h.kernel, &mut gm, &op),
             o => o,
@@ -9111,11 +9126,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
                 killed(signal as i32, at)
             }
             SyscallOutcome::SpawnThread { ctx_addr, tid } => thread_made(tid, ctx_addr, pc as u64),
-            // A Darwin posix_spawn's child: not run here yet, said.
-            SyscallOutcome::DarwinSpawn { .. } => {
-                darwin::spawn_refused(&mut h.kernel, &mut gm);
-                0
-            }
+            SyscallOutcome::DarwinSpawn { .. } => unreachable!("a Darwin posix_spawn's child is staged as the call's outcome is taken (darwin::spawn_stage)"),
             SyscallOutcome::ThreadExit => {
                 h.threads[cur()].run().waiting = Waiting::Exited;
                 // A Darwin thread's end, as its host thread's (the native
@@ -9217,6 +9228,9 @@ fn syscall_entry(ctx: i32, pc: i64) {
                         Waiting::Accept(Arc::clone(socket))
                     }
                     gex_kernel::BlockOp::FileLock { .. } => Waiting::Lock,
+                    // A Darwin spawner, for its child's start in its own
+                    // Worker (`darwin::spawn_stage`).
+                    gex_kernel::BlockOp::SpawnStart { .. } => Waiting::Child,
                     // `sigsuspend` waits for a signal, and only a signal: one
                     // from another process notifies this process's wait queue
                     // (the process table does), one from a thread of its own
@@ -10401,6 +10415,28 @@ fn carry_name(file: &gex_kernel::file::OpenFile, holder: i32) -> Option<String> 
         }
     }
     file.path.starts_with('/').then(|| file.path.clone())
+}
+
+/// Whether [`carry_name`] has a way to hand `file` on to process `holder`
+/// in another Worker, asked without handing it on: a pipe's or a
+/// terminal's end, a memfd, a file, socket or inotify instance of the
+/// global kernel, an epoll set, an internet socket (each of which the
+/// global kernel may still refuse to duplicate, which the hand-on says), a
+/// process descriptor of another process, or a file by its absolute path.
+pub(crate) fn carriable(file: &gex_kernel::file::OpenFile, holder: i32) -> bool {
+    if pipe_id(&file.path).is_some() || pty_ref(&file.path).is_some() {
+        return true;
+    }
+    if Arc::clone(&file.handle).as_memfd().is_some() || file.handle.remote_id().is_some() || gex_kernel::syscalls::Kernel::remote_unix_of_file(file).is_some() {
+        return true;
+    }
+    if let Some(pid) = file.handle.pidfd() {
+        return pid != holder;
+    }
+    if Arc::clone(&file.handle).as_inotify().is_some() || Arc::clone(&file.handle).as_epoll().is_some() || Arc::clone(&file.handle).as_inet_socket().is_some() {
+        return true;
+    }
+    file.path.starts_with('/')
 }
 
 /// Move a memfd's bytes into an unnamed file of the global kernel
@@ -14084,6 +14120,12 @@ fn wait_ready(waiting: &Waiting, blocked_on: &Option<gex_kernel::BlockOp>, now: 
         // waiting, and also when there are none at all -- that is `ECHILD`,
         // which is an answer and not a reason to sleep forever.
         Waiting::Child => match blocked_on {
+            // A Darwin spawner: whether its child's start in its Worker is
+            // over (a look, taking nothing), or a halt.
+            Some(gex_kernel::BlockOp::SpawnStart { pid, .. }) => {
+                sigs::home().is_some_and(|h| h.procs().halt_code().is_some())
+                    || gex_kernel::darwin::share::spawn_start(*pid, false) != gex_kernel::darwin::share::SpawnStart::Pending
+            }
             // A Darwin wait: whether the global kernel's table has an end,
             // a stop or a continue for it (a look, taking nothing), or no
             // child; a halt or a signal ends it too.
@@ -15579,6 +15621,9 @@ fn finish_parked(
         }
         // `sigsuspend` only ever ends one way, whether or not a handler ran.
         gex_kernel::BlockOp::SigSuspend { .. } => Err(Errno::EINTR),
+        // A Darwin call's wait, which the Darwin kernel ends
+        // (`darwin::finished`), never this.
+        gex_kernel::BlockOp::SpawnStart { .. } => unreachable!("a Darwin spawner's wait ends in darwin::finished"),
         // `rt_sigtimedwait`: one of its set pending is taken by the call
         // made again (with its `siginfo_t`); none, at the deadline, is
         // `EAGAIN`; none before it (another thread took it) waits again.
@@ -15919,7 +15964,8 @@ pub extern "C" fn gex_after_trap(installed: u32, wasmdll_have: u32, flags: u32) 
         || vfork::gex_vfork_ok() != -2
         || FORK.with(|f| f.get()[0]) != 0
         || THREAD[0].load(std::sync::atomic::Ordering::Acquire) != 0
-        || cgen::fault_staged();
+        || cgen::fault_staged()
+        || darwin::spawn_staged();
     if busy {
         return 0;
     }

@@ -174,6 +174,59 @@ pub mod op {
     /// pid, the status word or signal, and the end's p_xhighbits or the
     /// continue's p_contproc.
     pub const DWAIT: u32 = 62;
+    /// A spawned child's start, where another host than its spawner's
+    /// runs it (the page): its request the pid, its spawner's pid and the
+    /// result (0 started, its image in place; else the errno its spawner's
+    /// call fails with); the spawner's waiters are woken.
+    pub const SPAWN_ACK: u32 = 63;
+    /// Whether the start of spawned child `pid` is over, for its spawner's
+    /// call: the request the pid and a byte (1 take the result, 0 only
+    /// look); the answer a byte (0 not yet, 1 a result, 2 the child ended
+    /// without one) and the result.
+    pub const SPAWN_TAKE: u32 = 64;
+}
+
+/// The spawned children's start results not yet taken by their spawners
+/// (where this kernel is the global one).
+static SPAWN_ACKS: std::sync::Mutex<std::collections::BTreeMap<i32, i32>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// How a spawned child's start in another host ended, as its spawner's
+/// call takes it ([`spawn_start`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpawnStart {
+    /// Not over yet.
+    Pending,
+    /// Over: 0, its image in place, or the errno of a start that failed.
+    Result(i32),
+    /// The child ended before it said (a start that ended in its host),
+    /// which ends the spawner's wait as the native host's `ImagePlaced` does.
+    Ended,
+}
+
+/// Spawned child `pid`'s start is over in the host that runs it: `result`
+/// for its spawner's call, its spawner `ppid` woken to take it.
+pub fn spawn_started(pid: i32, ppid: i32, result: i32) {
+    let r = remote().expect("a spawned child's start through the global kernel");
+    let mut req = pid.to_le_bytes().to_vec();
+    req.extend_from_slice(&ppid.to_le_bytes());
+    req.extend_from_slice(&result.to_le_bytes());
+    call(r, op::SPAWN_ACK, &req, &mut []);
+}
+
+/// Whether spawned child `pid`'s start is over (`take`: and the result
+/// taken).
+pub fn spawn_start(pid: i32, take: bool) -> SpawnStart {
+    let r = remote().expect("a spawned child's start through the global kernel");
+    let mut req = pid.to_le_bytes().to_vec();
+    req.push(u8::from(take));
+    let mut o = [0u8; 5];
+    call(r, op::SPAWN_TAKE, &req, &mut o);
+    match o[0] {
+        0 => SpawnStart::Pending,
+        1 => SpawnStart::Result(i32::from_le_bytes(o[1..5].try_into().unwrap())),
+        2 => SpawnStart::Ended,
+        k => panic!("gex: the global kernel answered a spawned child's start with {k}"),
+    }
 }
 
 /// The system's process table, where this kernel is the global one: the
@@ -968,6 +1021,29 @@ pub fn serve(op: u32, req: &[u8], out: &mut [u8]) -> i64 {
             out[..p.0.len()].copy_from_slice(&p.0);
             p.0.len() as i64
         }
+        op::SPAWN_ACK => {
+            let (Some(p), 12) = (system_procs(), req.len()) else { return -EINVAL };
+            let w = |i: usize| i32::from_le_bytes(req[i * 4..i * 4 + 4].try_into().unwrap());
+            SPAWN_ACKS.lock().unwrap_or_else(|e| e.into_inner()).insert(w(0), w(2));
+            p.wake(w(1));
+            0
+        }
+        op::SPAWN_TAKE => {
+            let (Some(p), 5, 5..) = (system_procs(), req.len(), out.len()) else { return -EINVAL };
+            let pid = i32::from_le_bytes(req[..4].try_into().unwrap());
+            let mut acks = SPAWN_ACKS.lock().unwrap_or_else(|e| e.into_inner());
+            let got = if req[4] != 0 { acks.remove(&pid) } else { acks.get(&pid).copied() };
+            drop(acks);
+            let (k, v) = match got {
+                Some(v) => (1u8, v),
+                // Gone from the table, or ended there, with nothing said.
+                None if p.handle(pid).is_none_or(|c| c.status.lock().map_or(true, |s| s.is_some())) => (2, 0),
+                None => (0, 0),
+            };
+            out[0] = k;
+            out[1..5].copy_from_slice(&v.to_le_bytes());
+            5
+        }
         op::CHANGE_POST => {
             let 4.. = req.len() else { return -EINVAL };
             let pid = i32::from_le_bytes(req[..4].try_into().unwrap());
@@ -1201,7 +1277,7 @@ mod tests {
 
     #[test]
     fn every_call_has_a_number_of_its_own() {
-        let mut all = vec![op::NEXT, op::ORIGIN, op::SYSTEM_STRING, op::TC_SET_STATIC, op::TC_QUERY, op::TC_HAS_UUID, op::TC_LOAD, op::TC_BOOT_LOADED, op::TC_MARK_LOADED, op::CO_FORK, op::CO_ADOPT_CORPSE, op::CO_EXEC, op::CO_MEMBERSHIP, op::CO_THREAD_GROUP, op::CO_PRIVILEGED, op::CO_LEADER, op::CO_TASK_TERMINATED, op::CO_ACTIVATE, op::CO_RELEASE, op::CO_PLACE, op::CO_LIST, op::CO_CREATE, op::CO_TERMINATE, op::CO_KIND, op::CO_SET_NAME, op::HELD_CLAIM, op::HELD_HOLDER, op::HELD_LET_GO, op::HELD_ANY, op::HELD_TOUCH, op::HELD_COUNT, op::VALUE, op::BOOT_PAYLOAD, op::DEV_TIMES, op::MAILBOX_PUT, op::MAILBOX_TAKE, op::IPC_TAKE, op::IPC_PUT, op::IPC_LOST, op::WHOLE_TAKE, op::WHOLE_PUT, op::SCHED, op::PROC_SEED, op::RECORD_PUT, op::RECORD_GET, op::RECORD_EXITED];
+        let mut all = vec![op::NEXT, op::ORIGIN, op::SYSTEM_STRING, op::TC_SET_STATIC, op::TC_QUERY, op::TC_HAS_UUID, op::TC_LOAD, op::TC_BOOT_LOADED, op::TC_MARK_LOADED, op::CO_FORK, op::CO_ADOPT_CORPSE, op::CO_EXEC, op::CO_MEMBERSHIP, op::CO_THREAD_GROUP, op::CO_PRIVILEGED, op::CO_LEADER, op::CO_TASK_TERMINATED, op::CO_ACTIVATE, op::CO_RELEASE, op::CO_PLACE, op::CO_LIST, op::CO_CREATE, op::CO_TERMINATE, op::CO_KIND, op::CO_SET_NAME, op::HELD_CLAIM, op::HELD_HOLDER, op::HELD_LET_GO, op::HELD_ANY, op::HELD_TOUCH, op::HELD_COUNT, op::VALUE, op::BOOT_PAYLOAD, op::DEV_TIMES, op::MAILBOX_PUT, op::MAILBOX_TAKE, op::IPC_TAKE, op::IPC_PUT, op::IPC_LOST, op::WHOLE_TAKE, op::WHOLE_PUT, op::SCHED, op::PROC_SEED, op::RECORD_PUT, op::RECORD_GET, op::RECORD_EXITED, op::CHANGE_POST, op::CHANGE_TAKE, op::CHANGE_DONE, op::CHANGE_STATE, op::JOB_SET, op::DWAIT, op::SPAWN_ACK, op::SPAWN_TAKE];
         let n = all.len();
         all.sort_unstable();
         all.dedup();

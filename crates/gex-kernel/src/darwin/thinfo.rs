@@ -314,6 +314,9 @@ impl Kernel {
             // sigcontinue.
             BlockOp::WaitChild { .. } => Discarded,
             BlockOp::SigSuspend { .. } => Discarded,
+            // posix_spawn's own call, which XNU's activates the child's image
+            // in (exec_activate_image): no sleep, the call's stack.
+            BlockOp::SpawnStart { .. } => Kept,
             _ => Unknown("a wait of the host's whose call has not been matched to XNU's"),
         }
     }

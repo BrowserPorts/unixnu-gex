@@ -186,6 +186,13 @@ fn with_container<R>(f: impl FnOnce(&mut super::apfswrite::tx::Nx<'static>) -> R
     let d = DISK.get().ok_or("no disk0 image (GEX_DARWIN_DISK0)")?;
     let mut g = KERNEL_NX.lock().unwrap_or_else(|e| e.into_inner());
     if g.is_none() {
+        // In the page, the container's state in memory is the process's
+        // that mounted it: another's mount would be a second container
+        // writing the system's disk.
+        let me = super::held::me();
+        if let Some(h) = (me > 0).then(|| super::held::claim(super::held::Kind::Disk0Container, &[], me)).flatten() {
+            return Err(format!("the kernel's container in the disk0 image, which process {h} of the page holds: in the page each process has its own copy of it, not the system's"));
+        }
         let (base, size) = storage::partition_extent();
         let part: &'static PartMedium = Box::leak(Box::new(PartMedium(Arc::clone(&d.sink), base, size)));
         let mut nx = Nx::mounted(part, Mode::Kernel).map_err(|e| format!("the kernel's mount of the container in the disk0 image: {e}"))?;

@@ -64,6 +64,13 @@ pub enum Kind {
     /// Asynchronous I/O requests not yet returned ([`super::aio`]): a
     /// count.
     Aio = 18,
+    /// The kernel's APFS container on disk0 ([`super::disknode`]: its
+    /// object cache, space manager and open transaction), keyed by
+    /// nothing: the process that mounted it. disk0's bytes are the
+    /// system's in the page (the global kernel's device); what the
+    /// kernel holds of the container in memory is the process's, and
+    /// stays with it.
+    Disk0Container = 19,
 }
 
 impl Kind {
@@ -83,6 +90,7 @@ impl Kind {
             16 => Kind::IoService,
             17 => Kind::FileLocks,
             18 => Kind::Aio,
+            19 => Kind::Disk0Container,
             _ => return None,
         })
     }

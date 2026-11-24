@@ -175,6 +175,8 @@ export class System extends EventTarget {
    *  is bound at once. */
   #unixUp = false;
   #pageFs = null;
+  /** The Darwin system's disk0 (`#darwinDisk0`), for the kernel at boot. */
+  #disk0 = null;
   /** The init (`boot(argv, opts)`), `[argv, opts]`, and its Process once
    *  it runs. */
   #init = null;
@@ -203,7 +205,12 @@ export class System extends EventTarget {
    * `SystemVolume.attrs`; bytes, a Blob or a URL each, a file left out is
    * absent), as gexc takes them from GEX_DARWIN_BOOT; `strict` stops a
    * Darwin process at anything gex reports it does not do, as
-   * GEX_DARWIN_STRICT=1 does.
+   * GEX_DARWIN_STRICT=1 does; `disk0`, the system's disk image as gexc
+   * takes it from GEX_DARWIN_DISK0, `{ url, missing }`: `url` where the
+   * page's server has the image, which every process reads by ranges (the
+   * server must answer them), never copied; `missing` what its build
+   * reported missing (its `.missing`: the text as a string, or bytes, a
+   * Blob or a URL of it; none left out). What the system writes to it stays in the page.
    */
   constructor({ baseUrl, units, xcache = false, arch, darwin, debug = {} } = {}) {
     super();
@@ -212,8 +219,13 @@ export class System extends EventTarget {
     }
     if (arch !== undefined && !ARCHES[arch]) throw new TypeError(`System: arch is one of ${Object.keys(ARCHES).join(', ')}`);
     if (darwin !== undefined) {
-      if (typeof darwin !== 'object' || darwin === null) throw new TypeError('System: darwin is { boot, strict }');
-      for (const k of Object.keys(darwin)) if (!['boot', 'strict'].includes(k)) throw new TypeError(`System: darwin has no option ${k}`);
+      if (typeof darwin !== 'object' || darwin === null) throw new TypeError('System: darwin is { boot, strict, disk0 }');
+      for (const k of Object.keys(darwin)) if (!['boot', 'strict', 'disk0'].includes(k)) throw new TypeError(`System: darwin has no option ${k}`);
+      if (darwin.disk0 !== undefined) {
+        const d = darwin.disk0;
+        if (typeof d !== 'object' || d === null || !(typeof d.url === 'string' || d.url instanceof URL)) throw new TypeError('System: darwin.disk0 is { url, missing }, url the image\'s');
+        for (const k of Object.keys(d)) if (!['url', 'missing'].includes(k)) throw new TypeError(`System: darwin.disk0 has no option ${k}`);
+      }
       if (darwin.boot !== undefined && (typeof darwin.boot !== 'object' || darwin.boot === null)) throw new TypeError('System: darwin.boot is the boot payload\'s files, { name: bytes }');
       for (const name of Object.keys(darwin.boot ?? {})) {
         if (!DARWIN_BOOT.includes(name)) throw new TypeError(`System: darwin.boot has no file ${name} (${DARWIN_BOOT.join(', ')})`);
@@ -230,7 +242,7 @@ export class System extends EventTarget {
       units: u && { url: new URL(String(u.url).replace(/\/*$/, ''), globalThis.location?.href).href, require: !!u.require },
       xcache: typeof xcache === 'string' && xcache ? xcache : !!xcache,
       arch: arch === undefined ? undefined : ARCHES[arch],
-      darwin: darwin && { boot: { ...darwin.boot }, strict: !!darwin.strict },
+      darwin: darwin && { boot: { ...darwin.boot }, strict: !!darwin.strict, disk0: darwin.disk0 && { ...darwin.disk0 } },
       debug: { ...debug },
     };
     // The page's mounts and host calls: over shared memory, or in the
@@ -480,6 +492,7 @@ export class System extends EventTarget {
     // Worker is given without a copy; the Workers of a Darwin process boot
     // its system from it (shim `gex_darwin_boot_file`).
     const darwin = await this.#darwinPayload();
+    this.#disk0 = await this.#darwinDisk0();
     const host = await rt.makeProcessHost({
       // Every Worker gets the page-fs channel's control buffer: a mount made
       // after boot reaches the programs already running, and each reaches
@@ -539,6 +552,22 @@ export class System extends EventTarget {
       boot[name] = shared;
     }
     return { boot, strict: d.strict };
+  }
+
+  /** The `darwin` option's disk0: `{ url, size, missing }`, the URL made
+   *  absolute, its size what the server says of a range of it (a ranged
+   *  request of its first byte: a whole answer would be the image), its
+   *  missing steps as text; null without one. */
+  async #darwinDisk0() {
+    const d = this.#opts.darwin?.disk0;
+    if (!d) return null;
+    const url = new URL(String(d.url), globalThis.location?.href).href;
+    const res = await fetch(url, { headers: { Range: 'bytes=0-0' } });
+    const total = /^bytes \d+-\d+\/(\d+)$/.exec(res.headers.get('content-range') ?? '');
+    try { await res.body?.cancel(); } catch {}
+    if (res.status !== 206 || !total) throw new Error(`darwin.disk0 ${url}: the server does not answer a range of it (status ${res.status}); the image is read by ranges`);
+    const missing = d.missing === undefined ? '' : typeof d.missing === 'string' ? d.missing : new TextDecoder().decode(await bytesOf(d.missing, 'darwin.disk0.missing'));
+    return { url, size: Number(total[1]), missing };
   }
 
   /** Boot's end, in either build: the init, if any, and what waited for
@@ -675,6 +704,13 @@ export class System extends EventTarget {
     });
     // Where the files' contents go (fs.js), before any file is laid.
     await this.#store(s, k, fsi?.store?.());
+    // The Darwin system's disk0, which its processes reach through the
+    // kernel (hosts/kernel disk0.rs).
+    if (this.#disk0) {
+      const { url, size, missing } = this.#disk0;
+      const r = await k.r('k_disk0_set', { in: url }, BigInt(size), { in: missing });
+      if (r !== 0) throw new Error(`darwin.disk0 ${url}: the kernel took no image (${r})`);
+    }
     this.#mark('store');
     for (const l of layers) await (l.image ? this.#files.layImage(l) : this.#files.lay(l));
     // A bundle laid while the guest runs (kfs.js `#layEarly`): its index is

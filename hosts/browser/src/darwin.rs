@@ -178,6 +178,12 @@ fn start(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> Result<u
     // The SEP's inputs, none of which the page gives: what needs the SEP
     // stops and names what is missing.
     darwin::sep::set_inputs(darwin::sep::core::Inputs { sepos: None, seprom: None, device_dir: None }).map_err(load)?;
+    // The disk nodes' image: the page's disk0, which the global kernel
+    // serves every process (gexc's GEX_DARWIN_DISK0), with what its build
+    // reported missing.
+    if let Some((sink, missing)) = disk0() {
+        darwin::disknode::install(sink, missing).map_err(|e| load(format!("the page's disk0: {e}")))?;
+    }
     // A spawned child: its task, its switch to its image and its task
     // enabled, as its spawner's call does natively.
     let (img, spawn_exec): (darwin::image::DarwinImage, Option<Box<darwin::execve::Image>>) = match (first, spawned) {
@@ -327,6 +333,74 @@ fn start(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> Result<u
         darwin::share::spawn_started(h.kernel.pid, h.kernel.dtask.original_ppid, 0);
     }
     Ok(entry)
+}
+
+/// The system's disk0 as the global kernel serves it to every process of
+/// the page (hosts/kernel disk0.rs): its image read by ranges from the
+/// page's server, what the system writes kept over it there. A medium the
+/// disk nodes read and write as gexc's host file.
+struct PageDisk0(u64);
+
+impl gex_kernel::darwin::apfsread::Medium for PageDisk0 {
+    fn size(&self) -> u64 {
+        self.0
+    }
+    fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<(), String> {
+        for (at, part) in buf.chunks_mut(DISK0_PART).enumerate() {
+            let o = off + (at * DISK0_PART) as u64;
+            // SAFETY: `part` is this module's memory, borrowed for the call.
+            let r = unsafe { k_disk0_read(o, part.as_mut_ptr() as gex_kernel::PAddr, part.len() as u32) };
+            if r < 0 {
+                return Err(format!("disk0's read of {} bytes at {o}: errno {} (the page's ranged read of its image failed: the Worker's console says so)", part.len(), -r));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl gex_kernel::darwin::apfswrite::Sink for PageDisk0 {
+    fn write_at(&self, off: u64, buf: &[u8]) -> Result<(), String> {
+        for (at, part) in buf.chunks(DISK0_PART).enumerate() {
+            let o = off + (at * DISK0_PART) as u64;
+            // SAFETY: as `read_at`'s.
+            let r = unsafe { k_disk0_write(o, part.as_ptr() as gex_kernel::PAddr, part.len() as u32) };
+            if r < 0 {
+                return Err(format!("disk0's write of {} bytes at {o}: errno {} (a block written in part reads the rest from its image first, which failed)", part.len(), -r));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The most of disk0 one call to the global kernel moves: a buffer that
+/// size in its memory for each.
+const DISK0_PART: usize = 1 << 20;
+
+/// The page's disk0 and what its build reported missing, if the page gave
+/// one.
+fn disk0() -> Option<(std::sync::Arc<dyn gex_kernel::darwin::apfswrite::Sink>, Vec<String>)> {
+    // SAFETY: the global kernel's calls, with this module's memory.
+    if unsafe { k_present() } == 0 {
+        return None;
+    }
+    let size = unsafe { k_disk0_size() };
+    if size == 0 {
+        return None;
+    }
+    let mut out = vec![0u8; 4096];
+    loop {
+        let n = unsafe { k_disk0_missing(out.as_mut_ptr() as gex_kernel::PAddr, out.len() as u32) };
+        if n < 0 {
+            return None;
+        }
+        if n as usize <= out.len() {
+            out.truncate(n as usize);
+            break;
+        }
+        out = vec![0u8; n as usize];
+    }
+    let missing = String::from_utf8_lossy(&out).lines().filter(|l| !l.is_empty()).map(str::to_string).collect();
+    Some((std::sync::Arc::new(PageDisk0(size)), missing))
 }
 
 /// A program the page runs has no dyld: dyld and the shared cache it maps

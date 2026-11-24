@@ -715,7 +715,7 @@ impl Kernel {
     /// platform binary, entitled to DriverKit and allowed get-task (of the
     /// process `proc_find` finds by `pid`).
     pub(crate) fn darwin_third_party_debuggable_driver(&mut self, pid: i32) -> bool {
-        let driver = self.procs.task_policy(pid).is_some_and(|c| c.lock().unwrap_or_else(|e| e.into_inner()).requested.apptype == super::taskpolicy::apptype::DRIVER);
+        let driver = self.procs.task_policy_state(pid).is_some_and(|p| p.requested.apptype == super::taskpolicy::apptype::DRIVER);
         let Some(p) = self.darwin_proc_find(pid) else { return false };
         let csflags = p.csflags.load(std::sync::atomic::Ordering::Acquire);
         let sig = p.codesign.as_ref();

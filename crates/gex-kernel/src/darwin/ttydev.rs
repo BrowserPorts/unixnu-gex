@@ -828,7 +828,7 @@ impl Env for KEnv {
         // off).
         let mut pick: Option<(i32, bool, bool)> = None;
         for (pid, _, _, live) in procs.pgrp_members(pg.id) {
-            let stopped = live && procs.job(pid).is_some_and(|j| j.lock().unwrap_or_else(|e| e.into_inner()).stopped);
+            let stopped = live && procs.job_state(pid).is_some_and(|j| j.stopped);
             let (run, zomb) = (live && !stopped, !live);
             let better = match pick {
                 None => true,
@@ -866,7 +866,7 @@ impl Env for KEnv {
         }
         let public = record.downcast::<super::procinfo::Public>().ok()?;
         // p_uthlist's first: its oldest thread.
-        let Some(threads) = public.threads.clone() else { return Some(Err(())) };
+        let Some(threads) = (*public.threads).clone() else { return Some(Err(())) };
         let Some(&first) = threads.tids_in_order().first() else { return Some(Err(())) };
         // thread_info's run state; a thread that has not yet come into the
         // kernel is running.

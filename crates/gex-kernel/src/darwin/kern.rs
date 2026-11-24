@@ -1581,10 +1581,10 @@ impl Kernel {
     fn darwin_kill(&mut self, pid: i32, signum: u32, posix: bool) -> Result<u64, Errno> {
         if pid > 0 {
             // proc_find, else pzfind.
-            match self.procs.listing().into_iter().find(|e| e.0 == pid) {
+            match self.procs.listed(pid) {
                 None => return Err(Errno::ESRCH),
-                Some((_, _, _, true)) => return Ok(0),
-                Some(_) => {}
+                Some(true) => return Ok(0),
+                Some(false) => {}
             }
             if !self.darwin_cansignal(pid, signum, true) {
                 return Err(Errno::EPERM);

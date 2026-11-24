@@ -10,10 +10,18 @@
 //   xproc open NAME   opens both: "xproc open shm=E sem=E", each E the
 //                     errno (0 when it opened).
 //   xproc hold FILE   writes its pid to FILE, then waits (at most 20 s)
-//                     for FILE.done to exist: "xproc held".
+//                     for FILE.done to exist: "xproc held nice N", N its
+//                     nice value then.
+//   xproc nice FILE   sets the nice value of the pid in FILE, once there
+//                     (at most 20 s), to 7 and reads it back: "xproc nice E
+//                     N", E setpriority's errno, N getpriority's answer;
+//                     then makes FILE.done.
 //   xproc peek FILE   proc_info PROC_PIDTBSDINFO of the pid in FILE, once
 //                     there (at most 20 s): "xproc peek E", E the errno
-//                     (0 when found), then makes FILE.done.
+//                     (0 when found with that pid and this program's
+//                     name, -2 or -3 when not), then kill's signal 0 to it:
+//                     "xproc peek E kill K", K the errno (0 when sent);
+//                     then makes FILE.done.
 
 #define SYS_exit 1
 #define SYS_write 4
@@ -21,6 +29,9 @@
 #define SYS_close 6
 #define SYS_read 3
 #define SYS_getpid 20
+#define SYS_kill 37
+#define SYS_setpriority 96
+#define SYS_getpriority 100
 #define SYS_access 33
 #define SYS_select 93
 #define SYS_shm_open 266
@@ -113,7 +124,11 @@ static long bsdinfo(long pid) {
     static unsigned char info[PROC_BSDINFO_SIZE];
     struct ret r = bsd(SYS_proc_info, PROC_INFO_CALL_PIDINFO, pid, PROC_PIDTBSDINFO, 0, (long)info, sizeof info);
     if (r.carry) return r.x0;
-    return r.x0 == PROC_BSDINFO_SIZE ? 0 : -1;
+    if (r.x0 != PROC_BSDINFO_SIZE) return -1;
+    // pbi_pid, and pbi_comm: this program's.
+    if (*(int *)(info + 12) != (int)pid) return -2;
+    if (!same((const char *)info + 48, "xproc")) return -3;
+    return 0;
 }
 
 static long self_test(void) {
@@ -182,10 +197,38 @@ void main_entry(long argc, char **argv) {
                 bsd(SYS_select, 0, 0, 0, 0, (long)tv, 0);
             }
             if (!status) {
-                put("xproc held");
+                put("xproc held nice ");
+                num(bsd(SYS_getpriority, 0, 0, 0, 0, 0, 0).x0);
                 say();
             }
         }
+    } else if (argc == 3 && same(argv[1], "nice")) {
+        // The pid, once the first has written it (at most 20 s): its nice
+        // value set to 7 and read back.
+        long pid = 0;
+        for (int tries = 0; tries < 200 && pid <= 0; tries++) {
+            char buf[24];
+            struct ret f = bsd(SYS_open, (long)argv[2], O_RDONLY, 0, 0, 0, 0);
+            long n = f.carry ? -1 : bsd(SYS_read, f.x0, (long)buf, sizeof buf, 0, 0, 0).x0;
+            if (!f.carry) bsd(SYS_close, f.x0, 0, 0, 0, 0, 0);
+            for (long i = 0; i < n && buf[i] >= '0' && buf[i] <= '9'; i++) pid = pid * 10 + (buf[i] - '0');
+            if (pid <= 0) {
+                long tv[2] = {0, 100000};
+                bsd(SYS_select, 0, 0, 0, 0, (long)tv, 0);
+            }
+        }
+        if (pid <= 0) {
+            status = 1;
+        } else {
+            put("xproc nice ");
+            num(err(bsd(SYS_setpriority, 0, pid, 7, 0, 0, 0)));
+            put(" ");
+            struct ret g = bsd(SYS_getpriority, 0, pid, 0, 0, 0, 0);
+            num(g.carry ? 1000 + g.x0 : g.x0);
+            say();
+        }
+        struct ret d = bsd(SYS_open, (long)done_of(argv[2]), O_CREAT | O_WRONLY, 0644, 0, 0, 0);
+        if (d.carry) status = 3;
     } else if (argc == 3 && same(argv[1], "peek")) {
         // The pid, once the first has written it (at most 20 s).
         long pid = 0;
@@ -205,6 +248,9 @@ void main_entry(long argc, char **argv) {
         } else {
             put("xproc peek ");
             num(bsdinfo(pid));
+            // And kill's look for it (signal 0: found, and may be signalled).
+            put(" kill ");
+            num(err(bsd(SYS_kill, pid, 0, 1, 0, 0, 0)));
             say();
         }
         struct ret d = bsd(SYS_open, (long)done_of(argv[2]), O_CREAT | O_WRONLY, 0644, 0, 0, 0);

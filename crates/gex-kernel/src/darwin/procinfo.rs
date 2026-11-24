@@ -5,11 +5,61 @@
 //! parts of its `struct proc` the calls report, until the process is
 //! reaped (a zombie's is read too). A process republishes it as it changes
 //! (its credential, its image).
+//!
+//! In the page another process's record is the snapshot its process gave
+//! the global kernel ([`Public::put_record`]): what it holds as data is
+//! read as natively, and what is that process's live state ([`Part`]: its
+//! descriptors, threads, map, usage and sandbox) is in that process's
+//! memory, which a read of it reports.
 
 use crate::errno::Errno;
 use crate::syscalls::Kernel;
 use crate::GuestMem;
 use std::sync::Arc;
+
+/// What a process's record carries of its process table's entry and its
+/// task for another process of the page: the table's uid, `p_nice` and
+/// job state, the task's policy, and its open descriptors' count
+/// (`fd_nfiles`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Facts {
+    pub uid: u32,
+    pub nice: i32,
+    pub job: crate::proc::Job,
+    pub policy: super::taskpolicy::TaskPolicy,
+    pub nfiles: u32,
+}
+
+/// A live part of a process's record: the process's own, or, in a record
+/// of another process of the page, a stand-in, the part being in that
+/// process's memory; each use of a stand-in is noted (reported at the
+/// call's end) as what is not the system's.
+#[derive(Clone, Debug, Default)]
+pub struct Part<T> {
+    v: T,
+    /// Whose it is and what it is, for a stand-in.
+    elsewhere: Option<(i32, &'static str)>,
+}
+
+impl<T> Part<T> {
+    pub fn here(v: T) -> Part<T> {
+        Part { v, elsewhere: None }
+    }
+
+    fn elsewhere(v: T, pid: i32, what: &'static str) -> Part<T> {
+        Part { v, elsewhere: Some((pid, what)) }
+    }
+}
+
+impl<T> std::ops::Deref for Part<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        if let Some((pid, what)) = self.elsewhere {
+            super::note_unimplemented(format!("process {pid}'s {what}, which is in that process's own memory in the page, not the system's"));
+        }
+        &self.v
+    }
+}
 
 /// What other processes read of a Darwin process.
 #[derive(Clone, Debug, Default)]
@@ -33,9 +83,9 @@ pub struct Public {
     /// The image's path (`proc_pidpath`).
     pub path: Vec<u8>,
     /// Its descriptor table, while it lives.
-    pub fds: Option<Arc<crate::file::FdTable>>,
+    pub fds: Part<Option<Arc<crate::file::FdTable>>>,
     /// Its threads, while it lives.
-    pub threads: Option<Arc<crate::signal::ThreadSigs>>,
+    pub threads: Part<Option<Arc<crate::signal::ThreadSigs>>>,
     /// `p_pcaction`.
     pub pcaction: Arc<std::sync::atomic::AtomicU32>,
     /// `p_persona`.
@@ -47,16 +97,21 @@ pub struct Public {
     /// `p_textoff`.
     pub textoff: i64,
     /// Its credential's Sandbox label.
-    pub sandbox: super::sandboxes::Label,
+    pub sandbox: Part<super::sandboxes::Label>,
     /// `p_name`, all of it.
     pub p_name: super::reason::PName,
     /// Its signal dispositions, real timer and accounting flags.
     pub live: Arc<super::kinfo::Live>,
     /// What `proc_pid_rusage` reads of it beyond the rest.
-    pub rusage: Arc<super::rusage::Shared>,
+    pub rusage: Part<Arc<super::rusage::Shared>>,
     /// Its map's entries, while it lives, for another task's operation on
     /// its map (a file's change of size reaching its mappings).
-    pub vm: Option<Arc<crate::sync::Mutex<super::vm::Map>>>,
+    pub vm: Part<Option<Arc<crate::sync::Mutex<super::vm::Map>>>>,
+    /// What its process table and its task have of it, as its process last
+    /// published them (a record of another process of the page:
+    /// [`Public::of_record`]); none in this table's own records, whose
+    /// table and task have them.
+    pub table: Option<Facts>,
 }
 
 impl Public {
@@ -78,8 +133,8 @@ impl Public {
             cputype: 0,
             cpusubtype: 0,
             path: Vec::new(),
-            fds: None,
-            threads: None,
+            fds: Part::here(None),
+            threads: Part::here(None),
             pcaction: Default::default(),
             persona: None,
             // bsd_init's kernproc_ro_data: CS_VALID.
@@ -89,9 +144,132 @@ impl Public {
             sandbox: Default::default(),
             p_name: Default::default(),
             live: Default::default(),
-            rusage: super::rusage::Shared::new(0),
-            vm: None,
+            rusage: Part::here(super::rusage::Shared::new(0)),
+            vm: Part::here(None),
+            table: None,
         }
+    }
+}
+
+impl Public {
+    /// The record as its process publishes it for the other processes of
+    /// the page: its data, its live state's values (signal dispositions,
+    /// real timer, accounting flags, argument area, `p_pcaction`,
+    /// `p_csflags`) and its nice value; not its live parts ([`Part`]).
+    pub fn put_record(&self, table: &Facts, p: &mut super::ipc::wire::Put) {
+        use std::sync::atomic::Ordering::Acquire;
+        let c = &self.cred;
+        for v in [c.uid, c.ruid, c.svuid, c.rgid, c.svgid, c.gmuid, c.flags] {
+            p.u32(v);
+        }
+        p.len(c.groups.len());
+        for &g in &c.groups {
+            p.u32(g);
+        }
+        p.bool(self.sugid);
+        p.bytes(&self.comm);
+        p.bytes(&self.name);
+        p.u64(self.start.0);
+        p.u64(self.start.1);
+        p.bytes(&self.uuid);
+        p.u64(self.uniqueid);
+        p.u64(self.puniqueid);
+        p.i32(self.pidversion);
+        for v in [self.platform, self.cputype, self.cpusubtype] {
+            p.u32(v);
+        }
+        p.bytes(&self.path);
+        p.u32(self.pcaction.load(Acquire));
+        p.opt(self.persona.as_ref(), |p, q| q.put(p));
+        p.u32(self.csflags.load(Acquire));
+        p.opt(self.codesign.as_deref(), |p, c| c.put(p));
+        p.u64(self.textoff as u64);
+        p.bytes(&self.p_name.0);
+        let l = &self.live;
+        for v in [l.sigignore.load(Acquire), l.sigcatch.load(Acquire), l.acflag.load(Acquire), l.argc.load(Acquire), l.argslen.load(Acquire)] {
+            p.u32(v);
+        }
+        p.u64(l.user_stack.load(Acquire));
+        let (itv, rtime) = *l.realtimer.lock().unwrap_or_else(|e| e.into_inner());
+        p.u64(itv.interval);
+        p.u64(itv.value);
+        p.u64(rtime);
+        p.u32(table.uid);
+        p.i32(table.nice);
+        table.job.put(p);
+        table.policy.put_wire(p);
+        p.u32(table.nfiles);
+    }
+
+    /// Process `pid`'s record from what [`Public::put_record`] made: its
+    /// live parts stand-ins that say so when used.
+    pub fn of_record(pid: i32, b: &[u8]) -> Result<Public, super::ipc::wire::Bad> {
+        use std::sync::atomic::{AtomicU32, AtomicU64};
+        let g = &mut super::ipc::wire::Get::new(b);
+        let mut w = [0u32; 7];
+        for v in w.iter_mut() {
+            *v = g.u32()?;
+        }
+        let mut groups = Vec::new();
+        for _ in 0..g.len()? {
+            groups.push(g.u32()?);
+        }
+        let cred = super::cred::Cred { uid: w[0], ruid: w[1], svuid: w[2], groups, rgid: w[3], svgid: w[4], gmuid: w[5], flags: w[6] };
+        let sugid = g.bool()?;
+        let comm = g.bytes()?;
+        let name = g.bytes()?;
+        let start = (g.u64()?, g.u64()?);
+        let uuid: [u8; 16] = g.bytes()?.try_into().map_err(|_| g.bad("a uuid"))?;
+        let (uniqueid, puniqueid, pidversion) = (g.u64()?, g.u64()?, g.i32()?);
+        let (platform, cputype, cpusubtype) = (g.u32()?, g.u32()?, g.u32()?);
+        let path = g.bytes()?;
+        let pcaction = Arc::new(AtomicU32::new(g.u32()?));
+        let persona = g.opt(super::persona::Persona::get)?;
+        let csflags = Arc::new(AtomicU32::new(g.u32()?));
+        let codesign = g.opt(super::codesign::CodeSign::get)?.map(Arc::new);
+        let textoff = g.u64()? as i64;
+        let p_name = super::reason::PName(g.bytes()?.try_into().map_err(|_| g.bad("a p_name"))?);
+        let live = super::kinfo::Live {
+            sigignore: AtomicU32::new(g.u32()?),
+            sigcatch: AtomicU32::new(g.u32()?),
+            acflag: AtomicU32::new(g.u32()?),
+            argc: AtomicU32::new(g.u32()?),
+            argslen: AtomicU32::new(g.u32()?),
+            user_stack: AtomicU64::new(g.u64()?),
+            realtimer: std::sync::Mutex::new((super::itimer::Itimerval { interval: g.u64()?, value: g.u64()? }, g.u64()?)),
+        };
+        let table = Some(Facts { uid: g.u32()?, nice: g.i32()?, job: crate::proc::Job::get(g)?, policy: super::taskpolicy::TaskPolicy::get_wire(g)?, nfiles: g.u32()? });
+        if !g.done() {
+            return Err(g.bad("the end of a process's record"));
+        }
+        Ok(Public {
+            cred,
+            sugid,
+            comm,
+            name,
+            start,
+            uuid,
+            uniqueid,
+            puniqueid,
+            pidversion,
+            platform,
+            cputype,
+            cpusubtype,
+            path,
+            fds: Part::elsewhere(None, pid, "descriptor table"),
+            threads: Part::elsewhere(None, pid, "threads"),
+            pcaction,
+            persona,
+            csflags,
+            codesign,
+            textoff,
+            sandbox: Part::elsewhere(Default::default(), pid, "Sandbox label"),
+            p_name,
+            live: Arc::new(live),
+            rusage: Part::elsewhere(super::rusage::Shared::new(0), pid, "usage (proc_pid_rusage's ledgers and counters)"),
+            vm: Part::elsewhere(None, pid, "map"),
+            table,
+        })
     }
 }
 
@@ -318,18 +496,19 @@ impl Kernel {
             cputype: self.dtask.cputype.0,
             cpusubtype: self.dtask.cputype.1,
             path: path.to_vec(),
-            fds: Some(Arc::clone(&self.fds)),
-            threads: Some(Arc::clone(&self.thread_signals)),
+            fds: Part::here(Some(Arc::clone(&self.fds))),
+            threads: Part::here(Some(Arc::clone(&self.thread_signals))),
             pcaction: Arc::clone(&self.dtask.pcaction),
             persona: self.dtask.persona.clone(),
             csflags: Arc::clone(&self.dtask.csflags),
             codesign: self.dtask.codesign.clone().map(Arc::new),
             textoff: self.dtask.textoff,
-            sandbox: Arc::clone(&self.dtask.sandbox),
+            sandbox: Part::here(Arc::clone(&self.dtask.sandbox)),
             p_name: self.dtask.p_name,
             live: Arc::clone(&self.dtask.live),
-            rusage: Arc::clone(&self.dtask.rusage),
-            vm: Some(self.dtask.vm.shared()),
+            rusage: Part::here(Arc::clone(&self.dtask.rusage)),
+            vm: Part::here(Some(self.dtask.vm.shared())),
+            table: None,
         }
     }
 
@@ -340,6 +519,23 @@ impl Kernel {
         self.darwin_live_realtimer();
         let r: Arc<dyn std::any::Any + Send + Sync> = Arc::new(self.darwin_public_now());
         self.procs.set_darwin(self.pid, r);
+        if super::share::remote().is_some() {
+            self.darwin_record_send();
+        }
+    }
+
+    /// In the page, this process's record as it is now given to the global
+    /// kernel, where it changed since it was last.
+    pub(crate) fn darwin_record_send(&mut self) {
+        let (uid, nice) = self.procs.live_nice(self.pid).unwrap_or((self.dtask.cred.ruid, 0));
+        let job = self.procs.job_state(self.pid).unwrap_or_default();
+        let facts = Facts { uid, nice, job, policy: self.darwin_policy(), nfiles: self.fds.nfiles() as u32 };
+        let mut p = super::ipc::wire::Put::default();
+        self.darwin_public_now().put_record(&facts, &mut p);
+        if self.dtask.record_sent.as_ref() != Some(&p.0) {
+            super::share::record_put(self.pid, &p.0);
+            self.dtask.record_sent = Some(p.0);
+        }
     }
 
     /// Process `pid`'s record (this process's as it is now) and whether it
@@ -554,7 +750,7 @@ impl Kernel {
             if self.darwin_public(origin).is_none_or(|(_, zombie)| zombie) {
                 return Err(e::ESRCH);
             }
-            let tp = if origin == self.pid { Some(self.darwin_policy()) } else { self.procs.task_policy(origin).map(|c| *c.lock().unwrap_or_else(|e| e.into_inner())) };
+            let tp = if origin == self.pid { Some(self.darwin_policy()) } else { self.procs.task_policy_state(origin) };
             bg = u32::from(tp.is_some_and(|p| p.effective.darwinbg));
         }
         Ok(bg)
@@ -599,7 +795,7 @@ impl Kernel {
                     Err(x) => break 'out Err(x),
                 };
                 if flags & PROC_FLAG_APPLICATION == PROC_FLAG_APPLICATION {
-                    let tp = if pid == self.pid { Some(self.darwin_policy()) } else { self.procs.task_policy(pid).map(|c| *c.lock().unwrap_or_else(|e| e.into_inner())) };
+                    let tp = if pid == self.pid { Some(self.darwin_policy()) } else { self.procs.task_policy_state(pid) };
                     let ef = tp.map(|p| p.effective).unwrap_or_default();
                     if ef.darwinbg {
                         reason = LEADER_BACKGROUND;
@@ -733,11 +929,7 @@ impl Kernel {
         }
         let sig = self.procs.jetsam().on_terminate(pid);
         // proc_set_task_policy(TASK_POLICY_ATTRIBUTE, TASK_POLICY_TERMINATED).
-        if let Some(cell) = self.procs.task_policy(pid) {
-            let mut p = cell.lock().unwrap_or_else(|e| e.into_inner());
-            p.requested.terminated = true;
-            p.update(false);
-        }
+        self.darwin_change(pid, super::change::Change::Terminated)?;
         self.darwin_kill_post(pid, sig);
         Ok(u64::from(sig))
     }
@@ -1105,7 +1297,7 @@ impl Kernel {
         if let Some(x) = exited.then(|| self.procs.xstat(pid)).flatten() {
             return (SZOMB, x);
         }
-        match self.procs.job(pid).map(|j| *j.lock().unwrap_or_else(|e| e.into_inner())) {
+        match self.procs.job_state(pid) {
             Some(j) if j.stopped => (SSTOP, j.xstat),
             Some(j) => (SRUN, j.xstat),
             None => (SRUN, 0),
@@ -1146,7 +1338,11 @@ impl Kernel {
         b[64..64 + p.name.len().min(2 * MAXCOMLEN - 1)].copy_from_slice(&p.name[..p.name.len().min(2 * MAXCOMLEN - 1)]);
         // fd_nfiles, a live process's.
         if !zombie {
-            w(&mut b, 96, p.fds.as_ref().map_or(0, |f| f.nfiles()) as u32);
+            let n = match &p.table {
+                Some(f) => f.nfiles,
+                None => p.fds.as_ref().map_or(0, |f| f.nfiles()) as u32,
+            };
+            w(&mut b, 96, n);
         }
         let pgid = self.procs.pgid(pid, pid).unwrap_or(0);
         w(&mut b, 100, pgid as u32);
@@ -1227,8 +1423,7 @@ impl Kernel {
         const IMPORTANCE_DONOR: u32 = 0x400000;
         const SUPPRESSED: u32 = 0x800000;
         const APPLICATION: u32 = 0x1000000;
-        let Some(p) = self.procs.task_policy(pid) else { return Ok(0) };
-        let p = p.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let Some(p) = self.procs.task_policy_state(pid) else { return Ok(0) };
         let (r, ef) = (&p.requested, &p.effective);
         let mut f = 0;
         if r.ext_darwinbg {
@@ -1407,4 +1602,44 @@ pub(crate) fn uniqidentifierinfo(p: &Public) -> [u8; 56] {
     b[24..32].copy_from_slice(&p.puniqueid.to_le_bytes());
     b[32..36].copy_from_slice(&p.pidversion.to_le_bytes());
     b
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Another process of the page's record is what its process published,
+    /// and its live parts say so when used.
+    #[test]
+    fn a_record_given_to_the_global_kernel_is_read_back() {
+        let mut p = Public::kernel();
+        p.cred = crate::darwin::cred::Cred::of(501, 20);
+        p.comm = b"xproc".to_vec();
+        p.path = b"/var/tmp/xproc".to_vec();
+        p.uniqueid = 77;
+        p.pidversion = 9;
+        p.csflags.store(0x301, std::sync::atomic::Ordering::Release);
+        p.live.sigcatch.store(1 << 14, std::sync::atomic::Ordering::Release);
+        let job = crate::proc::Job { stopped: true, xstat: 17, ..Default::default() };
+        let mut policy = crate::darwin::taskpolicy::TaskPolicy::default();
+        policy.requested.ext_darwinbg = true;
+        let facts = Facts { uid: 501, nice: 4, job, policy, nfiles: 6 };
+        let mut b = crate::darwin::ipc::wire::Put::default();
+        p.put_record(&facts, &mut b);
+        let q = Public::of_record(40, &b.0).unwrap();
+        assert_eq!((q.cred.uid, q.comm.as_slice(), q.path.as_slice(), q.uniqueid, q.pidversion), (501, &b"xproc"[..], &b"/var/tmp/xproc"[..], 77, 9));
+        assert_eq!(q.csflags.load(std::sync::atomic::Ordering::Acquire), 0x301);
+        assert_eq!(q.live.sigcatch.load(std::sync::atomic::Ordering::Acquire), 1 << 14);
+        assert_eq!(q.table, Some(facts));
+        assert_eq!(q.start, p.start);
+        let mut again = crate::darwin::ipc::wire::Put::default();
+        q.put_record(&facts, &mut again);
+        assert_eq!(again.0, b.0);
+        assert!(Public::of_record(40, &b.0[..b.0.len() - 1]).is_err());
+        // Its threads are that process's: a stand-in, and the use noted.
+        crate::darwin::NOTES.with(|n| n.borrow_mut().clear());
+        assert!(q.threads.is_none());
+        let noted = crate::darwin::NOTES.with(|n| std::mem::take(&mut *n.borrow_mut()));
+        assert_eq!(noted, vec!["process 40's threads, which is in that process's own memory in the page, not the system's".to_string()]);
+    }
 }

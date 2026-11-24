@@ -138,6 +138,29 @@ pub mod op {
     /// The scheduler's state ([`super::super::sched`]): the request one of
     /// its calls and the call's arguments, the answer its result.
     pub const SCHED: u32 = 14;
+    /// A process's own record as the system's process table has it
+    /// ([`crate::proc::Seed`]): the request its pid, the answer the record,
+    /// `-ESRCH` for no such process.
+    pub const PROC_SEED: u32 = 15;
+    /// The records of the Darwin processes of the page
+    /// ([`crate::darwin::procinfo::Public::put_record`]): a put's request
+    /// the pid and the record; a get's the pid, its answer whether the
+    /// process has exited (a byte) then the record, nothing for none; an
+    /// exit's the pid.
+    pub const RECORD_PUT: u32 = 54;
+    pub const RECORD_GET: u32 = 55;
+    pub const RECORD_EXITED: u32 = 56;
+    /// A change to another process's own state ([`super::super::change`]):
+    /// a post's request the pid and the change, its answer the ticket (8
+    /// bytes), `-ESRCH` for a process that has no record or has exited; a
+    /// take's the pid, its answer each change pending (its ticket and
+    /// bytes); a done's the pid, the ticket and its errno; a state's the
+    /// pid and the ticket, its answer 0 pending, 1 and the errno done, 2
+    /// gone (the process ended first).
+    pub const CHANGE_POST: u32 = 57;
+    pub const CHANGE_TAKE: u32 = 58;
+    pub const CHANGE_DONE: u32 = 59;
+    pub const CHANGE_STATE: u32 = 60;
 }
 
 /// The system's process table, where this kernel is the global one: the
@@ -271,6 +294,163 @@ pub(crate) fn take_parked(r: Remote, what: &str, ask: &mut dyn FnMut(&mut [u8]) 
         return true;
     });
     got.expect("taken")
+}
+
+/// The Darwin processes' records the global kernel holds for the page:
+/// each one's bytes and whether it has exited, from its first publication
+/// until it is reaped.
+static RECORDS: std::sync::Mutex<std::collections::BTreeMap<i32, (Vec<u8>, bool)>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn records() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<i32, (Vec<u8>, bool)>> {
+    RECORDS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Process `pid`'s record, as it gives it to the global kernel.
+pub(crate) fn record_put(pid: i32, b: &[u8]) {
+    let Some(r) = remote() else { return };
+    let mut req = pid.to_le_bytes().to_vec();
+    req.extend_from_slice(b);
+    call(r, op::RECORD_PUT, &req, &mut []);
+}
+
+/// Process `pid` has exited (`proc_list_exited` holds of its record).
+pub(crate) fn record_exited(pid: i32) {
+    let Some(r) = remote() else { return };
+    call(r, op::RECORD_EXITED, &pid.to_le_bytes(), &mut []);
+}
+
+/// Another process of the page's record, and whether it has exited: none
+/// for no Darwin process of that pid that has published one (being made,
+/// reaped, or not a Darwin process), and none where this kernel's table is
+/// the system's.
+pub(crate) fn record_get(pid: i32) -> Option<(Vec<u8>, bool)> {
+    let r = remote()?;
+    let b = call_read(r, op::RECORD_GET, &pid.to_le_bytes());
+    let (&exited, rest) = b.split_first()?;
+    Some((rest.to_vec(), exited != 0))
+}
+
+/// The records' end with their processes: an exit marks it (and ends the
+/// changes waiting for it: whether any were), a reap drops it (the global
+/// kernel's).
+pub fn record_process_exited(pid: i32) -> bool {
+    if let Some(e) = records().get_mut(&pid) {
+        e.1 = true;
+    }
+    let mut c = changes();
+    let waiting = c.get(&pid).is_some_and(|x| !x.pending.is_empty());
+    if let Some(x) = c.get_mut(&pid) {
+        x.gone = true;
+        x.pending.clear();
+    }
+    waiting
+}
+
+/// The changes other processes of the page left for each process: the
+/// next ticket, those not yet made, the results of those made, and
+/// whether the process has ended.
+#[derive(Default)]
+struct Changes {
+    next: u64,
+    pending: Vec<(u64, Vec<u8>)>,
+    done: std::collections::BTreeMap<u64, i32>,
+    gone: bool,
+}
+
+static CHANGES: std::sync::Mutex<std::collections::BTreeMap<i32, Changes>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn changes() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<i32, Changes>> {
+    CHANGES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Leave change `b` for process `pid`: its ticket, none for a process with
+/// no live record.
+pub(crate) fn change_post(pid: i32, b: &[u8]) -> Option<u64> {
+    let r = remote()?;
+    let mut req = pid.to_le_bytes().to_vec();
+    req.extend_from_slice(b);
+    let mut o = [0u8; 8];
+    let n = (r.call)(op::CHANGE_POST, &req, &mut o);
+    match n {
+        8 => Some(u64::from_le_bytes(o)),
+        -3 => None,
+        _ => panic!("gex: the global kernel answered a change's post with {n}"),
+    }
+}
+
+/// The changes left for process `pid` (this one), each with its ticket.
+pub(crate) fn change_take(pid: i32) -> Vec<(u64, Vec<u8>)> {
+    use super::ipc::wire::Get;
+    let Some(r) = remote() else { return Vec::new() };
+    let b = call_read(r, op::CHANGE_TAKE, &pid.to_le_bytes());
+    let g = &mut Get::new(&b);
+    let mut out = Vec::new();
+    while !g.done() {
+        match (g.u64(), g.bytes()) {
+            (Ok(t), Ok(c)) => out.push((t, c)),
+            _ => panic!("gex: the global kernel's changes for process {pid} are not a list"),
+        }
+    }
+    out
+}
+
+/// Change `ticket` for process `pid` made, with errno `e` (0 for none).
+pub(crate) fn change_done(pid: i32, ticket: u64, e: i32) {
+    let Some(r) = remote() else { return };
+    let mut req = pid.to_le_bytes().to_vec();
+    req.extend_from_slice(&ticket.to_le_bytes());
+    req.extend_from_slice(&e.to_le_bytes());
+    call(r, op::CHANGE_DONE, &req, &mut []);
+}
+
+/// Wait for change `ticket` for process `pid` to be made: its errno, none
+/// when the process ended first.
+pub(crate) fn change_wait(pid: i32, ticket: u64) -> Option<i32> {
+    let r = remote().expect("a change through the global kernel");
+    let mut req = pid.to_le_bytes().to_vec();
+    req.extend_from_slice(&ticket.to_le_bytes());
+    let mut got = None;
+    let since = super::time::Instant::now();
+    (r.park)(super::ipc::wire::table_queue(), &mut || {
+        let mut o = [0u8; 5];
+        let n = (r.call)(op::CHANGE_STATE, &req, &mut o);
+        match (n, o[0]) {
+            (1.., 0) => {
+                if since.elapsed() > std::time::Duration::from_secs(120) {
+                    panic!("gex: process {pid} has not made a change asked of it in 120 s");
+                }
+                false
+            }
+            (5, 1) => {
+                got = Some(Some(i32::from_le_bytes(o[1..5].try_into().unwrap())));
+                true
+            }
+            (1.., 2) => {
+                got = Some(None);
+                true
+            }
+            _ => panic!("gex: the global kernel answered a change's state with {n}"),
+        }
+    });
+    got.expect("waited")
+}
+
+pub fn record_process_reaped(pid: i32) {
+    records().remove(&pid);
+}
+
+/// Process `pid`'s own record as the system's process table has it, for
+/// the process itself at its start: none where this kernel's table is the
+/// system's.
+pub fn proc_seed(pid: i32) -> Option<crate::proc::Seed> {
+    let r = remote()?;
+    let mut out = [0u8; 512];
+    let n = call_upto(r, op::PROC_SEED, &pid.to_le_bytes(), &mut out);
+    let g = &mut super::ipc::wire::Get::new(&out[..n]);
+    match crate::proc::Seed::get(g) {
+        Ok(s) if g.done() => Some(s),
+        got => panic!("gex: the global kernel's record of process {pid} is not one ({got:?})"),
+    }
 }
 
 /// The system's tables, other than the IPC table, that a process of the
@@ -665,6 +845,95 @@ pub fn serve(op: u32, req: &[u8], out: &mut [u8]) -> i64 {
                 Err(e) => -e,
             }
         }
+        op::CHANGE_POST => {
+            let 4.. = req.len() else { return -EINVAL };
+            let pid = i32::from_le_bytes(req[..4].try_into().unwrap());
+            if !records().get(&pid).is_some_and(|(_, exited)| !exited) {
+                return -3;
+            }
+            let mut c = changes();
+            let x = c.entry(pid).or_default();
+            x.next += 1;
+            x.gone = false;
+            let t = x.next;
+            x.pending.push((t, req[4..].to_vec()));
+            let 8.. = out.len() else { return -EINVAL };
+            out[..8].copy_from_slice(&t.to_le_bytes());
+            8
+        }
+        op::CHANGE_TAKE => {
+            let 4 = req.len() else { return -EINVAL };
+            let pid = i32::from_le_bytes(req.try_into().unwrap());
+            let mut c = changes();
+            let Some(x) = c.get_mut(&pid) else { return 0 };
+            let mut p = super::ipc::wire::Put::default();
+            for (t, b) in &x.pending {
+                p.u64(*t);
+                p.bytes(b);
+            }
+            if p.0.len() <= out.len() {
+                out[..p.0.len()].copy_from_slice(&p.0);
+                x.pending.clear();
+            }
+            p.0.len() as i64
+        }
+        op::CHANGE_DONE => {
+            let 16 = req.len() else { return -EINVAL };
+            let pid = i32::from_le_bytes(req[..4].try_into().unwrap());
+            let t = u64::from_le_bytes(req[4..12].try_into().unwrap());
+            let e = i32::from_le_bytes(req[12..16].try_into().unwrap());
+            changes().entry(pid).or_default().done.insert(t, e);
+            0
+        }
+        op::CHANGE_STATE => {
+            let (12, 5..) = (req.len(), out.len()) else { return -EINVAL };
+            let pid = i32::from_le_bytes(req[..4].try_into().unwrap());
+            let t = u64::from_le_bytes(req[4..12].try_into().unwrap());
+            let mut c = changes();
+            let Some(x) = c.get_mut(&pid) else { return -EINVAL };
+            if let Some(e) = x.done.remove(&t) {
+                out[0] = 1;
+                out[1..5].copy_from_slice(&e.to_le_bytes());
+                return 5;
+            }
+            out[0] = if x.gone { 2 } else { 0 };
+            1
+        }
+        op::RECORD_PUT => {
+            let 4.. = req.len() else { return -EINVAL };
+            let pid = i32::from_le_bytes(req[..4].try_into().unwrap());
+            let mut t = records();
+            let e = t.entry(pid).or_insert((Vec::new(), false));
+            e.0 = req[4..].to_vec();
+            0
+        }
+        op::RECORD_EXITED => {
+            let 4 = req.len() else { return -EINVAL };
+            record_process_exited(i32::from_le_bytes(req.try_into().unwrap()));
+            0
+        }
+        op::RECORD_GET => {
+            let 4 = req.len() else { return -EINVAL };
+            let t = records();
+            let Some((b, exited)) = t.get(&i32::from_le_bytes(req.try_into().unwrap())) else { return 0 };
+            let n = 1 + b.len();
+            if n <= out.len() {
+                out[0] = u8::from(*exited);
+                out[1..n].copy_from_slice(b);
+            }
+            n as i64
+        }
+        op::PROC_SEED => {
+            let (Some(p), 4) = (system_procs(), req.len()) else { return -EINVAL };
+            let Some(s) = p.seed_of(i32::from_le_bytes(req.try_into().unwrap())) else { return -3 };
+            let mut b = super::ipc::wire::Put::default();
+            s.put(&mut b);
+            if b.0.len() > out.len() {
+                return -EINVAL;
+            }
+            out[..b.0.len()].copy_from_slice(&b.0);
+            b.0.len() as i64
+        }
         op::SCHED => match system_procs() {
             Some(p) => super::sched::serve(&p.sched, req, out),
             None => -ENOSYS,
@@ -763,6 +1032,57 @@ mod tests {
         assert_eq!(serve(op::VALUE, &[4, 0, 0, 0, 0, 0, 0, 0, 0, 0], &mut o), -22);
         assert_eq!(serve(op::VALUE, &[0, 5, 0, 0, 0, 0, 0, 0, 0, 0], &mut o), -22);
         assert_eq!(serve(op::VALUE, &[0, 0], &mut o), -22);
+    }
+
+    #[test]
+    fn a_change_waits_for_its_process_and_ends_with_it() {
+        let pid: i32 = 8801;
+        let post = |b: &[u8]| {
+            let mut req = pid.to_le_bytes().to_vec();
+            req.extend_from_slice(b);
+            let mut o = [0u8; 8];
+            (serve(op::CHANGE_POST, &req, &mut o), u64::from_le_bytes(o))
+        };
+        let state = |t: u64| {
+            let mut req = pid.to_le_bytes().to_vec();
+            req.extend_from_slice(&t.to_le_bytes());
+            let mut o = [0u8; 5];
+            let n = serve(op::CHANGE_STATE, &req, &mut o);
+            (n, o)
+        };
+        // No record: no process to change.
+        assert_eq!(post(&[1]).0, -3);
+        let mut req = pid.to_le_bytes().to_vec();
+        req.extend_from_slice(&[7, 7]);
+        assert_eq!(serve(op::RECORD_PUT, &req, &mut []), 0);
+        let (n, t) = post(&[5]);
+        assert_eq!(n, 8);
+        assert_eq!(state(t), (1, [0, 0, 0, 0, 0]));
+        let mut out = [0u8; 64];
+        let n = serve(op::CHANGE_TAKE, &pid.to_le_bytes(), &mut out) as usize;
+        let g = &mut super::super::ipc::wire::Get::new(&out[..n]);
+        assert_eq!((g.u64().unwrap(), g.bytes().unwrap()), (t, vec![5]));
+        assert_eq!(serve(op::CHANGE_TAKE, &pid.to_le_bytes(), &mut out), 0);
+        let mut done = pid.to_le_bytes().to_vec();
+        done.extend_from_slice(&t.to_le_bytes());
+        done.extend_from_slice(&1i32.to_le_bytes());
+        assert_eq!(serve(op::CHANGE_DONE, &done, &mut []), 0);
+        assert_eq!(state(t), (5, [1, 1, 0, 0, 0]));
+        // One pending when the process ends: gone, and the exit says so.
+        let (_, t2) = post(&[6]);
+        assert!(record_process_exited(pid));
+        assert_eq!(state(t2), (1, [2, 0, 0, 0, 0]));
+        assert_eq!(post(&[6]).0, -3);
+        record_process_reaped(pid);
+    }
+
+    #[test]
+    fn every_call_has_a_number_of_its_own() {
+        let mut all = vec![op::NEXT, op::ORIGIN, op::SYSTEM_STRING, op::TC_SET_STATIC, op::TC_QUERY, op::TC_HAS_UUID, op::TC_LOAD, op::TC_BOOT_LOADED, op::TC_MARK_LOADED, op::CO_FORK, op::CO_ADOPT_CORPSE, op::CO_EXEC, op::CO_MEMBERSHIP, op::CO_THREAD_GROUP, op::CO_PRIVILEGED, op::CO_LEADER, op::CO_TASK_TERMINATED, op::CO_ACTIVATE, op::CO_RELEASE, op::CO_PLACE, op::CO_LIST, op::CO_CREATE, op::CO_TERMINATE, op::CO_KIND, op::CO_SET_NAME, op::HELD_CLAIM, op::HELD_HOLDER, op::HELD_LET_GO, op::HELD_ANY, op::HELD_TOUCH, op::HELD_COUNT, op::VALUE, op::BOOT_PAYLOAD, op::DEV_TIMES, op::MAILBOX_PUT, op::MAILBOX_TAKE, op::IPC_TAKE, op::IPC_PUT, op::IPC_LOST, op::WHOLE_TAKE, op::WHOLE_PUT, op::SCHED, op::PROC_SEED, op::RECORD_PUT, op::RECORD_GET, op::RECORD_EXITED];
+        let n = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), n, "two of the channel's calls share a number");
     }
 
     #[test]

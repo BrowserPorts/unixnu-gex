@@ -130,7 +130,7 @@ impl Persona {
         registry().list.iter().any(|p| p.key == self.key)
     }
 
-    fn put(&self, p: &mut super::ipc::wire::Put) {
+    pub(crate) fn put(&self, p: &mut super::ipc::wire::Put) {
         p.u64(self.key);
         p.u32(self.id);
         p.i32(self.ptype);
@@ -139,7 +139,7 @@ impl Persona {
         p.u32(self.uid);
     }
 
-    fn get(g: &mut super::ipc::wire::Get<'_>) -> Result<Persona, super::ipc::wire::Bad> {
+    pub(crate) fn get(g: &mut super::ipc::wire::Get<'_>) -> Result<Persona, super::ipc::wire::Bad> {
         Ok(Persona { key: g.u64()?, id: g.u32()?, ptype: g.i32()?, login: g.bytes()?, path: g.opt(|g| g.bytes())?, uid: g.u32()? })
     }
 }

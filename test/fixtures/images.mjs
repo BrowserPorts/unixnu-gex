@@ -98,7 +98,7 @@ export const outputs = { busybox: ['bb.tar.zst', 'rt-side.so'], slim: ['slim'], 
 /** The `darwin-static` image's programs (tests/darwin/bin, as
  *  tests/darwin/build.sh builds them), and the boot payload's files
  *  tests/darwin/run.sh boots them with, where the payload has them. */
-const DARWIN_STATIC = ['hello-static', 'bsd-carry', 'tcall', 'bsdthr', 'waits', 'hold', 'cpuclk', 'pipewr', 'unixname', 'sysids', 'xproc', 'xmach', 'xsys'];
+const DARWIN_STATIC = ['hello-static', 'bsd-carry', 'tcall', 'bsdthr', 'waits', 'hold', 'cpuclk', 'pipewr', 'unixname', 'sysids', 'xproc', 'xmach', 'xsys', 'ownrec'];
 /** The programs gexc runs as another user than its own (xmach sets a host
  *  special port, through the host privilege port root's task has; xsys's
  *  memorystatus_control is root's). */

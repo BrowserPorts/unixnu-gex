@@ -401,6 +401,16 @@ pub struct VoucherTables {
 }
 
 impl Vouchers {
+    /// The credential's ids `task_bank_init` recorded, if it has run.
+    pub fn bank_ids(&self) -> Option<(u32, u32)> {
+        self.bank_ids
+    }
+
+    /// The task's bank context, once made.
+    pub fn bank_context(&self) -> Option<u64> {
+        self.bank_context
+    }
+
     /// A forked task's: its bank context to be made with these ids.
     pub fn forked(uid: u32, gid: u32) -> Vouchers {
         Vouchers { bank_ids: Some((uid, gid)), ..Vouchers::default() }

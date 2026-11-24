@@ -341,7 +341,77 @@ pub fn combine(defer: bool, prof: Option<&sandbox::FilterMask>, pb: Option<&sand
     }))
 }
 
+impl ProfileRef {
+    fn put(self, p: &mut super::ipc::wire::Put) {
+        p.u8(match self.set {
+            Set::Builtin => 0,
+            Set::Protobox => 1,
+        });
+        p.u64(self.index as u64);
+    }
+
+    /// A profile of a collection this kernel has loaded (every process's
+    /// is the boot payload's), at an index it has.
+    fn get(g: &mut super::ipc::wire::Get<'_>) -> Result<ProfileRef, super::ipc::wire::Bad> {
+        let (set, c) = match g.u8()? {
+            0 => (Set::Builtin, &BUILTIN),
+            1 => (Set::Protobox, &PROTOBOX),
+            _ => return Err(g.bad("a profile's collection")),
+        };
+        let index = g.u64()? as usize;
+        match c.get().and_then(Option::as_ref) {
+            Some(c) if index < c.profiles.len() => Ok(ProfileRef { set, index }),
+            _ => Err(g.bad("a profile of a loaded collection")),
+        }
+    }
+}
+
 impl Sandbox {
+    /// The sandbox, in bytes, for another process of the system.
+    pub fn put(&self, p: &mut super::ipc::wire::Put) {
+        self.profile.put(p);
+        p.opt(self.protobox, |p, r| r.put(p));
+        p.bool(self.flag_3b);
+        p.bool(self.container_expected);
+        p.opt(self.container.as_deref(), |p, c| p.bytes(c));
+        p.len(self.extensions.len());
+        for e in &self.extensions {
+            // Every class an extension can have here.
+            debug_assert!(e.class == EXECUTABLE);
+            p.bytes(e.class);
+            p.bytes(&e.path);
+            p.opt(e.category.as_deref(), |p, c| p.bytes(c));
+        }
+        for m in &self.masks {
+            p.opt(m.as_ref(), |p, m| p.bytes(&sandbox::mask_bytes(m)));
+        }
+    }
+
+    /// The sandbox [`Sandbox::put`] put.
+    pub fn get(g: &mut super::ipc::wire::Get<'_>) -> Result<Sandbox, super::ipc::wire::Bad> {
+        let profile = ProfileRef::get(g)?;
+        let protobox = g.opt(ProfileRef::get)?;
+        let (flag_3b, container_expected) = (g.bool()?, g.bool()?);
+        let container = g.opt(|g| g.bytes())?;
+        let n = g.len()?;
+        let mut extensions = Vec::with_capacity(n.min(64));
+        for _ in 0..n {
+            let class = match g.bytes()? {
+                c if c == EXECUTABLE => EXECUTABLE,
+                _ => return Err(g.bad("an extension's class")),
+            };
+            extensions.push(Extension { class, path: g.bytes()?, category: g.opt(|g| g.bytes())? });
+        }
+        let mut masks: [Option<sandbox::FilterMask>; 4] = Default::default();
+        for m in masks.iter_mut() {
+            *m = g.opt(|g| {
+                let b: [u8; sandbox::MASK_BYTES] = g.bytes()?.try_into().map_err(|_| g.bad("a filter mask"))?;
+                Ok(sandbox::mask_of(b))
+            })?;
+        }
+        Ok(Sandbox { profile, protobox, flag_3b, container_expected, container, extensions, masks })
+    }
+
     /// `0x...a0f1d0`: a sandbox of `profile`. A profile with flag bit 2
     /// stacks `protobox`, or with none given, the builtin profile named
     /// `protobox` (this collection has none).

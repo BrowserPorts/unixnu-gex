@@ -58,6 +58,31 @@ impl Default for Strings {
 }
 
 impl Strings {
+    /// The area, in bytes, for another process's host.
+    pub fn put(&self, p: &mut super::ipc::wire::Put) {
+        p.bytes(&self.buf);
+        p.u64(self.strspace as u64);
+        p.u64(self.argspace as u64);
+        for v in [self.startargv, self.endargv, self.endenvv, self.argc, self.envc, self.applec] {
+            p.u64(v as u64);
+        }
+    }
+
+    /// The area [`Strings::put`] put, its offsets within its bytes.
+    pub fn get(g: &mut super::ipc::wire::Get<'_>) -> Result<Strings, super::ipc::wire::Bad> {
+        let buf = g.bytes()?;
+        let (strspace, argspace) = (g.u64()? as isize, g.u64()? as isize);
+        let mut v = [0usize; 6];
+        for x in v.iter_mut() {
+            *x = g.u64()? as usize;
+        }
+        let [startargv, endargv, endenvv, argc, envc, applec] = v;
+        if !(startargv <= endargv && endargv <= endenvv && endenvv <= buf.len()) {
+            return Err(g.bad("a string area's offsets"));
+        }
+        Ok(Strings { buf, strspace, argspace, startargv, endargv, endenvv, argc, envc, applec })
+    }
+
     /// `execargs_alloc`: `NCARGS` and a page for the path and `apple[]`.
     pub fn new() -> Strings {
         Strings { buf: Vec::new(), strspace: NCARGS + PAGE_SIZE as isize, argspace: NCARGS, startargv: 0, endargv: 0, endenvv: 0, argc: 0, envc: 0, applec: 0 }

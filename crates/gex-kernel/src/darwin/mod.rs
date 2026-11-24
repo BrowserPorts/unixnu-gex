@@ -23,6 +23,7 @@ pub mod applematch;
 pub mod attrcall;
 pub mod attrlist;
 pub mod bsd;
+pub mod carry;
 pub mod codesign;
 pub mod clist;
 pub mod commpage;

@@ -2552,6 +2552,9 @@ fn perform_block(
         // again at every release (each one's call wakes the parked,
         // `wakes_fd_waiters`), until it is granted, a signal ends it, or it
         // would now deadlock.
+        // Only the page's host makes it: this one starts a spawned child in
+        // its spawner's call (`start_darwin_spawn`).
+        BlockOp::SpawnStart { .. } => unreachable!("a spawner's wait for its child's start in another host, which only the page's host makes"),
         BlockOp::FileLock { locks, req } => loop {
             let seen = ready::seq();
             match locks.apply(&req) {

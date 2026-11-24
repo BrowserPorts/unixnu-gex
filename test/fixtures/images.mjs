@@ -93,12 +93,12 @@ const MEDIA = {
 // program spends its calls), beside the test programs (wine/units.mjs).
 const UNIT_DLLS = ['ntdll.dll', 'kernelbase.dll', 'kernel32.dll', 'msvcrt.dll', 'ucrtbase.dll'];
 
-export const outputs = { busybox: ['bb.tar.zst', 'rt-side.so'], slim: ['slim'], package: ['pkg', 'pkg-no-m64'], 'gl-probes': ['gl-probes.json'], wine64: ['wine64.tar', 'wine64-lazy.json', 'wine64'], 'win-progs': ['win-progs.tar'], 'win-media': ['win-media.tar'], 'wine64-units': ['wine64-units'], kde: ['kde'], 'wine-site': ['wine-site'], mem64: ['mem64-pick.x86', 'mem64-miss.x86', 'mem64-retry.x86', 'no-m64'], 'mesa-cold': ['mesa-cold'], 'native-progs': ['mount-tmpfs.x86', 'mount-tmpfs.a64', 'truncate-path.x86', 'truncate-path.a64'], 'darwin-static': ['darwin-static.json', 'darwin-static'] };
+export const outputs = { busybox: ['bb.tar.zst', 'rt-side.so'], slim: ['slim'], package: ['pkg', 'pkg-no-m64'], 'gl-probes': ['gl-probes.json'], wine64: ['wine64.tar', 'wine64-lazy.json', 'wine64'], 'win-progs': ['win-progs.tar'], 'win-media': ['win-media.tar'], 'wine64-units': ['wine64-units'], kde: ['kde'], 'wine-site': ['wine-site'], mem64: ['mem64-pick.x86', 'mem64-miss.x86', 'mem64-retry.x86', 'no-m64'], 'mesa-cold': ['mesa-cold'], 'native-progs': ['mount-tmpfs.x86', 'mount-tmpfs.a64', 'truncate-path.x86', 'truncate-path.a64'], 'darwin-static': ['darwin-static.json', 'darwin-static'], 'darwin-root': ['darwin-root'] };
 
 /** The `darwin-static` image's programs (tests/darwin/bin, as
  *  tests/darwin/build.sh builds them), and the boot payload's files
  *  tests/darwin/run.sh boots them with, where the payload has them. */
-const DARWIN_STATIC = ['hello-static', 'bsd-carry', 'tcall', 'bsdthr', 'waits', 'hold', 'cpuclk', 'pipewr', 'unixname', 'sysids', 'xproc', 'xmach', 'xsys', 'ownrec'];
+const DARWIN_STATIC = ['hello-static', 'bsd-carry', 'tcall', 'bsdthr', 'waits', 'hold', 'cpuclk', 'pipewr', 'unixname', 'sysids', 'xproc', 'xmach', 'xsys', 'ownrec', 'xspawn'];
 /** The programs gexc runs as another user than its own (xmach sets a host
  *  special port, through the host privilege port root's task has; xsys's
  *  memorystatus_control is root's). */
@@ -221,6 +221,36 @@ export const images = {
   // output, status and Darwin reports under this arch's gexc (GEXC_A64,
   // GEXC, then target/release) on that payload, strict
   // (GEX_DARWIN_STRICT=1), which the page's run must match.
+  // `darwin-root`: the Darwin root and disk0 gexc runs a dynamic program on
+  // (GEX_DARWIN_ROOT, GEX_DARWIN_DISK0 and its .missing), for the page
+  // without a copy: darwin-root/root a link to the root, darwin-root/disk0
+  // a link to the image (the work server reads a range of it alone), and
+  // the root as the page's filesystem takes it (tools/darwin-root-
+  // manifest.py): root.tar (directories, links, files with extended
+  // attributes) and root-lazy.json (every other file, read by URL when
+  // first opened). Made once per root; the root is Apple's, read in place.
+  async 'darwin-root'(work) {
+    const root = process.env.GEX_DARWIN_ROOT;
+    const disk0 = process.env.GEX_DARWIN_DISK0;
+    if (!root || !existsSync(join(root, 'usr/lib/dyld'))) return 'GEX_DARWIN_ROOT: a Darwin root with usr/lib/dyld';
+    if (!disk0 || !existsSync(disk0) || !existsSync(`${disk0}.missing`)) return 'GEX_DARWIN_DISK0: the disk0 image and its .missing';
+    const out = join(work, 'darwin-root');
+    mkdirSync(out, { recursive: true });
+    for (const [name, to] of [['root', realpathSync(root)], ['disk0', realpathSync(disk0)]]) {
+      const at = join(out, name);
+      rmSync(at, { force: true });
+      symlinkSync(to, at);
+    }
+    copyFileSync(`${disk0}.missing`, join(out, 'disk0.missing'));
+    const stamp = join(out, 'root.from');
+    if (!existsSync(join(out, 'root-lazy.json')) || !existsSync(stamp) || readFileSync(stamp, 'utf8') !== realpathSync(root)) {
+      const r = spawnSync('python3', ['-I', join(ROOT, 'tools/darwin-root-manifest.py'), realpathSync(root), '/work/darwin-root/root/', join(out, 'root.tar'), join(out, 'root-lazy.json')], { encoding: 'utf8', maxBuffer: 1 << 26 });
+      if (r.status !== 0) throw new Error(`tools/darwin-root-manifest.py: ${(r.stderr || r.stdout).trim().split('\n').slice(-3).join(' / ')}`);
+      if (r.stderr.trim()) console.error(r.stderr.trim());
+      writeFileSync(stamp, realpathSync(root));
+    }
+    return null;
+  },
   async 'darwin-static'(work) {
     const boot = process.env.GEX_DARWIN_BOOT;
     if (!boot) return 'GEX_DARWIN_BOOT: the device\'s boot payload (its TrustCache bundle, Sandbox profiles, ...)';

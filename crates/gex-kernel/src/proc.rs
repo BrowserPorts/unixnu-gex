@@ -2076,6 +2076,16 @@ impl ProcTable {
     /// (EACCES); never a session leader; a group joined must exist in the
     /// caller's session.
     pub fn darwin_setpgid(&self, caller: i32, pid: i32, pgid: i32) -> Result<(), Errno> {
+        // A table that is really somewhere else: the system's decides, and
+        // this one keeps the group it set, as `setpgid`'s does.
+        if self.remote.is_some() {
+            crate::darwin::share::darwin_setpgid(caller, pid, pgid)?;
+            let target = if pid == 0 { caller } else { pid };
+            if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == target) {
+                p.pgid = if pgid == 0 { target } else { pgid };
+            }
+            return Ok(());
+        }
         let mut t = self.lock();
         let alive = |t: &Table, pid: i32| t.procs.iter().find(|p| p.pid == pid && p.child.status.lock().map(|s| s.is_none()).unwrap_or(false)).map(|p| (p.pid, p.ppid, p.pgid, p.sid, p.execed));
         let Some(cur) = alive(&t, caller) else { return Err(Errno::ESRCH) };
@@ -2322,6 +2332,11 @@ impl ProcTable {
         if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == pid) {
             p.execed = true;
         }
+        // (in a table that is really somewhere else, the system's too,
+        // which another process's setpgid of it reads)
+        if self.remote.is_some() {
+            crate::darwin::share::execed(pid);
+        }
     }
 
     /// `pid`'s `P_NOCLDSTOP`, kept from its SIGCHLD action.
@@ -2380,6 +2395,14 @@ impl ProcTable {
 
     /// A stop's or a continue's news for `pid`'s waiting parent: its wait
     /// woken (`stop`'s `wakeup(parent)`).
+    /// Process `pid`'s waiters woken: what one of them waits for changed
+    /// outside this table (a spawned child's start in another host).
+    pub fn wake(&self, pid: i32) {
+        if let Some(p) = self.lock().procs.iter().find(|p| p.pid == pid) {
+            p.queue.notify();
+        }
+    }
+
     pub fn job_changed(&self, pid: i32) {
         let t = self.lock();
         if let Some(p) = t.procs.iter().find(|p| p.pid == pid) {

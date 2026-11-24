@@ -22,6 +22,15 @@
 //                     name, -2 or -3 when not), then kill's signal 0 to it:
 //                     "xproc peek E kill K", K the errno (0 when sent);
 //                     then makes FILE.done.
+//   xproc lead FILE   makes itself a group's leader (setpgid(0, 0)), writes
+//                     its pid to FILE, then waits (at most 20 s) for
+//                     FILE.done: "xproc led E L", E setpgid's errno, L 1 when
+//                     its group is then its pid (getpgid(0)).
+//   xproc pgid FILE   the group of the pid in FILE, once there (at most 20 s),
+//                     as the system's table has it, and setpgid of it, which
+//                     is not this process's descendant: "xproc pgid L E", L 1
+//                     when getpgid(pid) is that pid, E setpgid(pid, pid)'s
+//                     errno (ESRCH, 3); then makes FILE.done.
 
 #define SYS_exit 1
 #define SYS_write 4
@@ -32,6 +41,8 @@
 #define SYS_kill 37
 #define SYS_setpriority 96
 #define SYS_getpriority 100
+#define SYS_setpgid 82
+#define SYS_getpgid 151
 #define SYS_access 33
 #define SYS_select 93
 #define SYS_shm_open 266
@@ -128,6 +139,34 @@ static long bsdinfo(long pid) {
     // pbi_pid, and pbi_comm: this program's.
     if (*(int *)(info + 12) != (int)pid) return -2;
     if (!same((const char *)info + 48, "xproc")) return -3;
+    return 0;
+}
+
+/// The pid process FILE names, once it is there (at most 20 s); 0 for none.
+static long pid_in(const char *file) {
+    long pid = 0;
+    for (int tries = 0; tries < 200 && pid <= 0; tries++) {
+        char buf[24];
+        struct ret f = bsd(SYS_open, (long)file, O_RDONLY, 0, 0, 0, 0);
+        long n = f.carry ? -1 : bsd(SYS_read, f.x0, (long)buf, sizeof buf, 0, 0, 0).x0;
+        if (!f.carry) bsd(SYS_close, f.x0, 0, 0, 0, 0, 0);
+        for (long i = 0; i < n && buf[i] >= '0' && buf[i] <= '9'; i++) pid = pid * 10 + (buf[i] - '0');
+        if (pid <= 0) {
+            long tv[2] = {0, 100000};
+            bsd(SYS_select, 0, 0, 0, 0, (long)tv, 0);
+        }
+    }
+    return pid;
+}
+
+/// Whether FILE.done appears (at most 20 s).
+static int done_appears(const char *file) {
+    const char *done = done_of(file);
+    for (int i = 0; i < 200; i++) {
+        if (!err(bsd(SYS_access, (long)done, 0, 0, 0, 0, 0))) return 1;
+        long tv[2] = {0, 100000};
+        bsd(SYS_select, 0, 0, 0, 0, (long)tv, 0);
+    }
     return 0;
 }
 
@@ -251,6 +290,41 @@ void main_entry(long argc, char **argv) {
             // And kill's look for it (signal 0: found, and may be signalled).
             put(" kill ");
             num(err(bsd(SYS_kill, pid, 0, 1, 0, 0, 0)));
+            say();
+        }
+        struct ret d = bsd(SYS_open, (long)done_of(argv[2]), O_CREAT | O_WRONLY, 0644, 0, 0, 0);
+        if (d.carry) status = 3;
+    } else if (argc == 3 && same(argv[1], "lead")) {
+        long e = err(bsd(SYS_setpgid, 0, 0, 0, 0, 0, 0));
+        long me = bsd(SYS_getpid, 0, 0, 0, 0, 0, 0).x0;
+        struct ret f = bsd(SYS_open, (long)argv[2], O_CREAT | O_TRUNC | O_WRONLY, 0644, 0, 0, 0);
+        if (f.carry) {
+            status = 1;
+        } else {
+            num(me);
+            bsd(SYS_write, f.x0, (long)line, at, 0, 0, 0);
+            at = 0;
+            bsd(SYS_close, f.x0, 0, 0, 0, 0, 0);
+            if (!done_appears(argv[2])) {
+                status = 2;
+            } else {
+                put("xproc led ");
+                num(e);
+                put(" ");
+                num(bsd(SYS_getpgid, 0, 0, 0, 0, 0, 0).x0 == me);
+                say();
+            }
+        }
+    } else if (argc == 3 && same(argv[1], "pgid")) {
+        long pid = pid_in(argv[2]);
+        if (pid <= 0) {
+            status = 1;
+        } else {
+            struct ret g = bsd(SYS_getpgid, pid, 0, 0, 0, 0, 0);
+            put("xproc pgid ");
+            num(!g.carry && g.x0 == pid);
+            put(" ");
+            num(err(bsd(SYS_setpgid, pid, pid, 0, 0, 0, 0)));
             say();
         }
         struct ret d = bsd(SYS_open, (long)done_of(argv[2]), O_CREAT | O_WRONLY, 0644, 0, 0, 0);

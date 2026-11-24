@@ -795,8 +795,19 @@ impl Kernel {
         // exec_handle_spawnattr_policy, in the spawner's call.
         let (apptype, clamp, role) = after.policy;
         if apptype != super::taskpolicy::apptype::NONE || clamp != super::workq::qos::UNSPECIFIED || role != super::taskpolicy::role::UNSPECIFIED {
-            if let Some(p) = self.procs.task_policy(child.pid) {
-                p.lock().unwrap_or_else(|e| e.into_inner()).spawnpolicy(apptype, clamp, role);
+            // The child's entry in the system's table, which a page
+            // process's table does not hold: there, before the child starts
+            // (its start takes its policy from that entry).
+            let applied = match self.procs.task_policy(child.pid) {
+                Some(p) => {
+                    p.lock().unwrap_or_else(|e| e.into_inner()).spawnpolicy(apptype, clamp, role);
+                    true
+                }
+                None if super::share::remote().is_some() => super::share::spawn_policy(child.pid, apptype, clamp, role),
+                None => false,
+            };
+            if !applied {
+                self.darwin_unimplemented(format!("posix_spawn's policy attributes (app type {apptype}, QoS clamp {clamp}, role {role}) for child {}, whose task policy was not found", child.pid));
             }
         }
         // Its watch ports, bound to its task (an adaptive daemon's for

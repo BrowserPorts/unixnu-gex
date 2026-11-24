@@ -466,6 +466,12 @@ pub enum BlockOp {
     /// [`unix::FileLocks::apply`]) or the call again (the page), parking
     /// again if another got there first.
     FileLock { locks: Arc<unix::FileLocks>, req: crate::locks::LockReq },
+    /// A Darwin `posix_spawn`'s call, until its child, which another host
+    /// than its own runs (the page: a Worker of its own), has its image in
+    /// place or has failed to start (`darwin::share::spawn_start`); its pid
+    /// is written at `pid_addr` then. Only the page's host makes it: the
+    /// native host starts the child in the call (`start_darwin_spawn`).
+    SpawnStart { pid: i32, pid_addr: u64 },
 }
 
 /// What a Darwin `wait4` or `waitid` reports of a child (kern_exit.c).
@@ -589,6 +595,8 @@ impl BlockOp {
             BlockOp::ReadStream { .. } | BlockOp::WriteStream { .. } | BlockOp::AcceptWait { .. } | BlockOp::WriteWait { .. } | BlockOp::WaitChild { .. } | BlockOp::FileLock { .. } => {
                 Restart::SaRestart
             }
+            // No signal ends it: XNU starts the child in the call.
+            BlockOp::SpawnStart { .. } => Restart::Never,
         }
     }
 }

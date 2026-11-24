@@ -8,7 +8,7 @@
 // stderr. Exit 0 only when every test is ok (and skips, with --allow-skip).
 
 import { spawn, fork } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { closeSync, createReadStream, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
@@ -363,20 +363,40 @@ async function startBrowser() {
           }
           const f = join(WORK, name);
           if (!f.startsWith(WORK) || !existsSync(f) || !statSync(f).isFile()) return next();
-          const all = readFileSync(f);
           iso();
           const type = { '.mjs': 'text/javascript', '.js': 'text/javascript', '.wasm': 'application/wasm', '.json': 'application/json' }[f.slice(f.lastIndexOf('.'))];
           if (type) res.setHeader('Content-Type', type);
           res.setHeader('Accept-Ranges', 'bytes');
+          // A range is read alone: a work file may be a disk image of tens
+          // of GB (a link to it), of which a page reads a few blocks.
+          const size = statSync(f).size;
           const m = /bytes=(\d+)-(\d*)/.exec(req.headers.range ?? '');
           if (m) {
             const a = Number(m[1]);
-            const b = m[2] ? Number(m[2]) + 1 : all.length;
+            const b = Math.min(m[2] ? Number(m[2]) + 1 : size, size);
+            if (a >= size || b <= a) {
+              res.statusCode = 416;
+              res.setHeader('Content-Range', `bytes */${size}`);
+              return res.end();
+            }
+            const part = Buffer.alloc(b - a);
+            const fd = openSync(f, 'r');
+            try {
+              let at = 0;
+              while (at < part.length) {
+                const n = readSync(fd, part, at, part.length - at, a + at);
+                if (n <= 0) break;
+                at += n;
+              }
+            } finally {
+              closeSync(fd);
+            }
             res.statusCode = 206;
-            res.setHeader('Content-Range', `bytes ${a}-${b - 1}/${all.length}`);
-            return res.end(all.subarray(a, b));
+            res.setHeader('Content-Range', `bytes ${a}-${b - 1}/${size}`);
+            return res.end(part);
           }
-          res.end(all);
+          res.setHeader('Content-Length', String(size));
+          createReadStream(f).pipe(res);
         });
       },
     }],

@@ -184,6 +184,50 @@ pub mod op {
     /// look); the answer a byte (0 not yet, 1 a result, 2 the child ended
     /// without one) and the result.
     pub const SPAWN_TAKE: u32 = 64;
+    /// A process has exec'd (`P_EXEC`, [`crate::proc::ProcTable::set_execed`]):
+    /// the request its pid.
+    pub const EXECED: u32 = 65;
+    /// Darwin's `setpgid` in the system's table
+    /// ([`crate::proc::ProcTable::darwin_setpgid`]): the request the
+    /// caller, the pid and the group; the answer its errno (0 for none).
+    pub const DSETPGID: u32 = 66;
+    /// A spawn's app type, QoS clamp and role on its child's task policy
+    /// (`exec_handle_spawnattr_policy`), before the child starts: the
+    /// request the pid and the three bytes; the answer 1 when the child's
+    /// entry was there.
+    pub const SPAWN_POLICY: u32 = 67;
+}
+
+/// Process `pid` has exec'd: the system's table's `P_EXEC`.
+pub(crate) fn execed(pid: i32) {
+    let Some(r) = remote() else { return };
+    call(r, op::EXECED, &pid.to_le_bytes(), &mut []);
+}
+
+/// Darwin's `setpgid` by `caller` of `pid` to `pgid`, in the system's
+/// table: its errno.
+pub(crate) fn darwin_setpgid(caller: i32, pid: i32, pgid: i32) -> Result<(), crate::errno::Errno> {
+    let r = remote().expect("a Darwin setpgid through the global kernel");
+    let mut req = caller.to_le_bytes().to_vec();
+    req.extend_from_slice(&pid.to_le_bytes());
+    req.extend_from_slice(&pgid.to_le_bytes());
+    let mut o = [0u8; 4];
+    call(r, op::DSETPGID, &req, &mut o);
+    match i32::from_le_bytes(o) {
+        0 => Ok(()),
+        e => Err(crate::errno::Errno(e)),
+    }
+}
+
+/// A spawn's policy attributes on child `pid`'s task policy in the
+/// system's table: whether its entry was there.
+pub(crate) fn spawn_policy(pid: i32, apptype: u8, clamp: u8, role: u8) -> bool {
+    let r = remote().expect("a spawn's policy through the global kernel");
+    let mut req = pid.to_le_bytes().to_vec();
+    req.extend_from_slice(&[apptype, clamp, role]);
+    let mut o = [0u8; 1];
+    call(r, op::SPAWN_POLICY, &req, &mut o);
+    o[0] == 1
 }
 
 /// The spawned children's start results not yet taken by their spawners
@@ -1021,6 +1065,33 @@ pub fn serve(op: u32, req: &[u8], out: &mut [u8]) -> i64 {
             out[..p.0.len()].copy_from_slice(&p.0);
             p.0.len() as i64
         }
+        op::EXECED => {
+            let (Some(p), 4) = (system_procs(), req.len()) else { return -EINVAL };
+            p.set_execed(i32::from_le_bytes(req[..4].try_into().unwrap()));
+            0
+        }
+        op::DSETPGID => {
+            let (Some(p), 12, 4..) = (system_procs(), req.len(), out.len()) else { return -EINVAL };
+            let w = |i: usize| i32::from_le_bytes(req[i * 4..i * 4 + 4].try_into().unwrap());
+            let e = match p.darwin_setpgid(w(0), w(1), w(2)) {
+                Ok(()) => 0,
+                Err(e) => e.0,
+            };
+            out[..4].copy_from_slice(&e.to_le_bytes());
+            4
+        }
+        op::SPAWN_POLICY => {
+            let (Some(p), 7, 1..) = (system_procs(), req.len(), out.len()) else { return -EINVAL };
+            let pid = i32::from_le_bytes(req[..4].try_into().unwrap());
+            out[0] = match p.task_policy(pid) {
+                Some(cell) => {
+                    cell.lock().unwrap_or_else(|e| e.into_inner()).spawnpolicy(req[4], req[5], req[6]);
+                    1
+                }
+                None => 0,
+            };
+            1
+        }
         op::SPAWN_ACK => {
             let (Some(p), 12) = (system_procs(), req.len()) else { return -EINVAL };
             let w = |i: usize| i32::from_le_bytes(req[i * 4..i * 4 + 4].try_into().unwrap());
@@ -1277,11 +1348,48 @@ mod tests {
 
     #[test]
     fn every_call_has_a_number_of_its_own() {
-        let mut all = vec![op::NEXT, op::ORIGIN, op::SYSTEM_STRING, op::TC_SET_STATIC, op::TC_QUERY, op::TC_HAS_UUID, op::TC_LOAD, op::TC_BOOT_LOADED, op::TC_MARK_LOADED, op::CO_FORK, op::CO_ADOPT_CORPSE, op::CO_EXEC, op::CO_MEMBERSHIP, op::CO_THREAD_GROUP, op::CO_PRIVILEGED, op::CO_LEADER, op::CO_TASK_TERMINATED, op::CO_ACTIVATE, op::CO_RELEASE, op::CO_PLACE, op::CO_LIST, op::CO_CREATE, op::CO_TERMINATE, op::CO_KIND, op::CO_SET_NAME, op::HELD_CLAIM, op::HELD_HOLDER, op::HELD_LET_GO, op::HELD_ANY, op::HELD_TOUCH, op::HELD_COUNT, op::VALUE, op::BOOT_PAYLOAD, op::DEV_TIMES, op::MAILBOX_PUT, op::MAILBOX_TAKE, op::IPC_TAKE, op::IPC_PUT, op::IPC_LOST, op::WHOLE_TAKE, op::WHOLE_PUT, op::SCHED, op::PROC_SEED, op::RECORD_PUT, op::RECORD_GET, op::RECORD_EXITED, op::CHANGE_POST, op::CHANGE_TAKE, op::CHANGE_DONE, op::CHANGE_STATE, op::JOB_SET, op::DWAIT, op::SPAWN_ACK, op::SPAWN_TAKE];
+        let mut all = vec![op::NEXT, op::ORIGIN, op::SYSTEM_STRING, op::TC_SET_STATIC, op::TC_QUERY, op::TC_HAS_UUID, op::TC_LOAD, op::TC_BOOT_LOADED, op::TC_MARK_LOADED, op::CO_FORK, op::CO_ADOPT_CORPSE, op::CO_EXEC, op::CO_MEMBERSHIP, op::CO_THREAD_GROUP, op::CO_PRIVILEGED, op::CO_LEADER, op::CO_TASK_TERMINATED, op::CO_ACTIVATE, op::CO_RELEASE, op::CO_PLACE, op::CO_LIST, op::CO_CREATE, op::CO_TERMINATE, op::CO_KIND, op::CO_SET_NAME, op::HELD_CLAIM, op::HELD_HOLDER, op::HELD_LET_GO, op::HELD_ANY, op::HELD_TOUCH, op::HELD_COUNT, op::VALUE, op::BOOT_PAYLOAD, op::DEV_TIMES, op::MAILBOX_PUT, op::MAILBOX_TAKE, op::IPC_TAKE, op::IPC_PUT, op::IPC_LOST, op::WHOLE_TAKE, op::WHOLE_PUT, op::SCHED, op::PROC_SEED, op::RECORD_PUT, op::RECORD_GET, op::RECORD_EXITED, op::CHANGE_POST, op::CHANGE_TAKE, op::CHANGE_DONE, op::CHANGE_STATE, op::JOB_SET, op::DWAIT, op::SPAWN_ACK, op::SPAWN_TAKE, op::EXECED, op::DSETPGID, op::SPAWN_POLICY];
         let n = all.len();
         all.sort_unstable();
         all.dedup();
         assert_eq!(all.len(), n, "two of the channel's calls share a number");
+    }
+
+    /// A page process's Darwin setpgid, P_EXEC and a spawn's policy
+    /// attributes, served on the system's table: the group set there as
+    /// setpgid sets it (and refused for a child that has exec'd), the
+    /// child's entry marked exec'd, its task policy given the attributes;
+    /// a child the table does not have is said to be missing.
+    #[test]
+    fn a_page_process_s_setpgid_exec_and_spawn_policy_are_the_system_table_s() {
+        use crate::proc::{ProcTable, INIT_PID};
+        static TABLE: OnceLock<ProcTable> = OnceLock::new();
+        fn table() -> &'static ProcTable {
+            TABLE.get_or_init(ProcTable::new)
+        }
+        set_system_procs(table);
+        let t = system_procs().expect("the system's table");
+        let sh = t.spawn(INIT_PID);
+        t.setsid(sh).unwrap();
+        let c = t.spawn(sh);
+        let req = |a: i32, b: i32, g: i32| [a.to_le_bytes(), b.to_le_bytes(), g.to_le_bytes()].concat();
+        let mut o = [0u8; 4];
+        assert_eq!(serve(op::DSETPGID, &req(sh, c, c), &mut o), 4);
+        assert_eq!(i32::from_le_bytes(o), 0);
+        assert_eq!(t.pgid(INIT_PID, c), Ok(c));
+        assert_eq!(serve(op::EXECED, &c.to_le_bytes(), &mut []), 0);
+        assert!(t.execed(c));
+        assert_eq!(serve(op::DSETPGID, &req(sh, c, sh), &mut o), 4);
+        assert_eq!(crate::errno::Errno(i32::from_le_bytes(o)), crate::errno::Errno::EACCES);
+        let mut f = [0u8; 1];
+        let mut pol = c.to_le_bytes().to_vec();
+        pol.extend_from_slice(&[super::super::taskpolicy::apptype::DAEMON_STANDARD, 0, 0]);
+        assert_eq!(serve(op::SPAWN_POLICY, &pol, &mut f), 1);
+        assert_eq!(f[0], 1);
+        let mut missing = 9999i32.to_le_bytes().to_vec();
+        missing.extend_from_slice(&[super::super::taskpolicy::apptype::DAEMON_STANDARD, 0, 0]);
+        assert_eq!(serve(op::SPAWN_POLICY, &missing, &mut f), 1);
+        assert_eq!(f[0], 0);
     }
 
     #[test]

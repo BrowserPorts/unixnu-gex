@@ -688,8 +688,7 @@ impl Kernel {
             crash_count: spawn.map_or(old.crash_count, |s| s.crash_count),
             throttle_timeout: spawn.map_or(old.throttle_timeout, |s| s.throttle_timeout),
             map_min: 0,
-            // The new proc's p_pcaction is clear (forkproc), and its
-            // P_LVMRSRCOWNER; a spawn's child has what its spawn set.
+            // The new proc's P_LVMRSRCOWNER is clear (forkproc).
             // (exec_mach_imgact: the process has exec'd.)
             live: {
                 old.live.acflag.fetch_and(!super::kinfo::ac::AFORK, std::sync::atomic::Ordering::Relaxed);
@@ -698,10 +697,14 @@ impl Kernel {
             // The proc's p_stats (its start, its reaped children's sums)
             // stay; the new map's wirings are the ledger's from now on.
             rusage: std::sync::Arc::clone(&old.rusage),
-            pcaction: match spawn {
-                Some(sp) if sp.flags & super::spawn::flag::SETEXEC == 0 => old.pcaction,
-                _ => Default::default(),
-            },
+            // A spawn's child goes on in the proc its spawn made; an exec
+            // in place in the one cloneproc makes, which forkproc_init
+            // gives the old one's p_forkcopy (p_pcaction and
+            // p_workq_allow_sigmask among it) and its p_vfs_iopolicy's
+            // inherited flags.
+            pcaction: old.pcaction,
+            workq_allow_sigmask: old.workq_allow_sigmask,
+            vfs_iopolicy: if new_task { old.vfs_iopolicy & super::procpolicy::P_VFS_IOPOLICY_INHERITED_MASK } else { old.vfs_iopolicy },
             ..Default::default()
         };
         let wired = std::sync::Arc::clone(&self.dtask.rusage.wired);

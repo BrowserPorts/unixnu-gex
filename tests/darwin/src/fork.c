@@ -6,7 +6,10 @@
 // ports work (libSystem's fork handlers set them up again in its new
 // space) and thread calls (a kqueue timer fires in it), and its end is the
 // parent's to collect; the parent's EVFILT_PROC knote on itself hears
-// NOTE_FORK.
+// NOTE_FORK. Its process control (p_pcaction, PROC_SELFSET_PCONTROL's) is
+// the parent's (forkproc_init copies p_forkcopy), in a fork's child, a
+// spawn's without attributes, and that child after an exec in place (whose
+// new proc cloneproc makes the same way).
 
 #include <TargetConditionals.h>
 #include <errno.h>
@@ -19,6 +22,23 @@
 #include <sys/event.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int buffersize);
+int __proc_info(int callnum, int pid, int flavor, uint64_t arg, void *buffer, int buffersize);
+
+// PROC_PIDT_SHORTBSDINFO's.
+struct shortinfo {
+    uint32_t pid, ppid, pgid, status;
+    char comm[16];
+    uint32_t flags, uid, gid, ruid, rgid, svuid, svgid, rfu;
+};
+
+// Its pbi_flags' process control bits (PROC_FLAG_PC_*: 0x600).
+static unsigned control(void) {
+    struct shortinfo s;
+    if (proc_pidinfo(getpid(), 13, 0, &s, sizeof s) != sizeof s) return ~0u;
+    return s.flags & 0x600;
+}
 
 static int bad(const char *what, long v) {
     printf("fork: %s (%ld)\n", what, v);
@@ -36,8 +56,17 @@ extern char **environ;
 #endif
 
 int main(int argc, char **argv) {
-    // A spawned child: whether descriptor argv[1] is closed.
-    if (argc > 1) return fcntl(atoi(argv[1]), F_GETFD) == -1 && errno == EBADF ? 0 : 1;
+    // A spawned child: whether descriptor argv[1] is closed, its control
+    // its parent's (PROC_FLAG_PC_SUSP); then, after its exec in place,
+    // whether the control is still that.
+    if (argc > 2) return control() == 0x400 ? 0 : 3;
+    if (argc > 1) {
+        if (fcntl(atoi(argv[1]), F_GETFD) != -1 || errno != EBADF) return 1;
+        if (control() != 0x400) return 2;
+        char *xargs[] = {argv[0], argv[1], "exec", NULL};
+        execv(argv[0], xargs);
+        return 4;
+    }
     int cf = open("/dev/null", O_RDONLY | O_CLOFORK);
     if (cf < 0 || fcntl(cf, F_GETFD) != CLOFORK_GETFD) return bad("an O_CLOFORK open", errno);
     int p[2];
@@ -47,6 +76,8 @@ int main(int argc, char **argv) {
     EV_SET(&ev, getpid(), EVFILT_PROC, EV_ADD, NOTE_FORK, 0, 0);
     if (kevent(kq, &ev, 1, NULL, 0, NULL)) return bad("the knote", errno);
     pid_t parent = getpid();
+    // P_PCSUSP.
+    if (__proc_info(5, getpid(), 1, 2, NULL, 0) != 0 || control() != 0x400) return bad("PROC_SELFSET_PCONTROL", errno);
     pid_t pid = fork();
     if (pid < 0) return bad("fork", errno);
     if (pid == 0) {
@@ -55,6 +86,7 @@ int main(int argc, char **argv) {
         if (getpid() == parent || getppid() != parent) say = "child: pids";
         else if (fcntl(kq, F_GETFD) != -1 || errno != EBADF) say = "child: the kqueue";
         else if (fcntl(cf, F_GETFD) != -1 || errno != EBADF) say = "child: the O_CLOFORK descriptor";
+        else if (control() != 0x400) say = "child: its process control";
         else {
             int who = -1;
             if (pid_for_task(mach_task_self(), &who) != KERN_SUCCESS || who != getpid()) say = "child: its task port";
@@ -84,7 +116,7 @@ int main(int argc, char **argv) {
     snprintf(fdarg, sizeof fdarg, "%d", cf);
     char *sargs[] = {argv[0], fdarg, NULL};
     pid_t sp;
-    if (posix_spawn(&sp, argv[0], NULL, NULL, sargs, environ) || waitpid(sp, &st, 0) != sp || !WIFEXITED(st) || WEXITSTATUS(st) != 0) return bad("a spawned child's O_CLOFORK descriptor", st);
+    if (posix_spawn(&sp, argv[0], NULL, NULL, sargs, environ) || waitpid(sp, &st, 0) != sp || !WIFEXITED(st) || WEXITSTATUS(st) != 0) return bad("a spawned child's O_CLOFORK descriptor and process control (1, 2: before its exec; 3: after)", st);
     printf("fork ok\n");
     return 0;
 }

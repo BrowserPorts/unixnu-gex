@@ -1062,4 +1062,47 @@ mod tests {
         let a = Ent::Array(vec![Ent::String(b"a".to_vec()), Ent::Int(1), Ent::String(b"b".to_vec())]);
         assert_eq!(items(&a), vec![b"a".to_vec()]);
     }
+
+    /// A sandbox crosses to another process's host as it went, its
+    /// profiles named by their place in the boot payload's collections;
+    /// a profile past a collection's end is refused.
+    #[test]
+    #[ignore = "needs GEX_DARWIN_BOOT's sandbox_builtin.bin and sandbox_protobox.bin"]
+    fn a_sandbox_crosses_whole() {
+        use super::super::ipc::wire::{Get, Put};
+        let dir = std::env::var("GEX_DARWIN_BOOT").expect("GEX_DARWIN_BOOT");
+        let read = |n: &str| std::fs::read(format!("{dir}/{n}")).unwrap_or_else(|e| panic!("{n}: {e}"));
+        set_collections(Some(read("sandbox_builtin.bin")), Some(read("sandbox_protobox.bin"))).unwrap();
+        let b = BUILTIN.get().and_then(Option::as_ref).expect("the builtin collection");
+        let pb = PROTOBOX.get().and_then(Option::as_ref).expect("the protobox collection");
+        let profile = ProfileRef { set: Set::Builtin, index: b.profiles.len() - 1 };
+        let protobox = Some(ProfileRef { set: Set::Protobox, index: pb.profiles.len() - 1 });
+        let sb = Sandbox {
+            profile,
+            protobox,
+            flag_3b: true,
+            container_expected: true,
+            container: Some(b"/private/var/mobile/Containers/Data/Application/A".to_vec()),
+            extensions: vec![Extension { class: EXECUTABLE, path: b"/Applications/A.app".to_vec(), category: Some(b"c".to_vec()) }, Extension { class: EXECUTABLE, path: b"/b".to_vec(), category: None }],
+            masks: [Some(sandbox::mask_of([0x5a; sandbox::MASK_BYTES])), None, Some(sandbox::mask_of([1; sandbox::MASK_BYTES])), None],
+        };
+        let mut p = Put::default();
+        sb.put(&mut p);
+        let mut g = Get::new(&p.0);
+        let back = Sandbox::get(&mut g).unwrap();
+        assert!(g.done());
+        assert_eq!((back.profile, back.protobox, back.profile.name()), (profile, protobox, profile.name()));
+        assert!(back.flag_3b && back.container_expected);
+        assert_eq!((&back.container, &back.extensions), (&sb.container, &sb.extensions));
+        let bytes = |m: &[Option<sandbox::FilterMask>; 4]| m.iter().map(|m| m.as_ref().map(|m| sandbox::mask_bytes(m))).collect::<Vec<_>>();
+        assert_eq!(bytes(&back.masks), bytes(&sb.masks));
+        let mut q = Put::default();
+        back.put(&mut q);
+        assert_eq!(q.0, p.0);
+        // One past the builtin collection's last profile.
+        let mut bad = Put::default();
+        bad.u8(0);
+        bad.u64(b.profiles.len() as u64);
+        assert!(ProfileRef::get(&mut Get::new(&bad.0)).is_err());
+    }
 }

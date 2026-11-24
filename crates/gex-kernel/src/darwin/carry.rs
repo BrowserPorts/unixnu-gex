@@ -139,8 +139,187 @@ fn get_objs(g: &mut Get<'_>) -> Result<Vec<Option<super::ipc::ObjId>>, Bad> {
     (0..n).map(|_| g.opt(|g| g.u64())).collect()
 }
 
+/// The parts of `t`, a spawned child's task, that are not as a new
+/// process's has them and do not cross. Every field of the task is placed
+/// here by what becomes of it (the destructure has no rest pattern, so a
+/// field added to the task must be placed too): it crosses
+/// ([`put_task`]), wholly or in part with the rest a new process's; the
+/// child's host makes it again; the child's image switch replaces it
+/// (`darwin_exec_switch_body`); or it is a new process's, which is checked
+/// against a new task's.
+fn uncarried(t: &Task) -> Vec<&'static str> {
+    let fresh = Task::default();
+    let mut lost = Vec::new();
+    let differs = |a: &dyn std::fmt::Debug, b: &dyn std::fmt::Debug| format!("{a:?}") != format!("{b:?}");
+    let Task {
+        // Crosses.
+        pthread: _,
+        live: _,
+        vtimer_bits: _,
+        rlim_cpu: _,
+        vfs_iopolicy: _,
+        strict: _,
+        platform: _,
+        pidversion: _,
+        pending_watchports: _,
+        codesign: _,
+        csflags: _,
+        pcaction: _,
+        persona: _,
+        textoff: _,
+        uniqueid: _,
+        puniqueid: _,
+        uuid: _,
+        p_name: _,
+        user_faults: _,
+        cputype: _,
+        start: _,
+        cred: _,
+        sugid: _,
+        sandbox: _,
+        filter_msg: _,
+        syscall_mask: _,
+        mach_trap_mask: _,
+        kobj_mask: _,
+        exec_sandbox: _,
+        exec_launch: _,
+        original_ppid: _,
+        responsible_pid: _,
+        ladvlock: _,
+        sigacts: _,
+        rlimits: _,
+        disallow_mwl: _,
+        workq_allow_sigmask: _,
+        dispatchqueue_serialno_offset: _,
+        dispatchqueue_label_offset: _,
+        map_max: _,
+        crash_behavior: _,
+        crash_behavior_deadline: _,
+        crash_count: _,
+        throttle_timeout: _,
+        map_min: _,
+        task_uniqueid: _,
+        // Crosses in part, the rest a new process's.
+        rusage,
+        kports,
+        vouchers,
+        ipc_raw,
+        // Made again by the child's host: its job and policy cells (the
+        // system's process table's), what it has said, the record it has
+        // sent.
+        job: _,
+        policy: _,
+        said: _,
+        record_sent: _,
+        // Replaced by the child's image switch: its map's entries.
+        vm: _,
+        // A new process's.
+        pending_replies,
+        realtimer,
+        vtimers,
+        cpuusage,
+        wakeups,
+        threads,
+        waits,
+        ulocks,
+        psynch,
+        timers,
+        iomfb_call,
+        spawns,
+        connect_wait,
+        connect_waited,
+        tcp_socks,
+        tcp_socks_gen,
+        tcp_watch,
+        kcaller,
+        read_from,
+        child_ports,
+        semas,
+        mk_timers,
+        workq,
+        workq_wake,
+        in_callout,
+        callout_pidle,
+        callout_woken,
+        workq_creator_pending,
+        threadreqs,
+        next_threadreq,
+        kevents,
+        vmrsrcowner,
+        fork_ids,
+        activated,
+        lock_wakes,
+        ttyops,
+        custom_stack,
+        spawn_failed,
+        syscall_exit,
+        crash_notify,
+        corpse,
+        corpse_forks,
+        corpse_fork_results,
+        bt_deliveries,
+        bt_daemon,
+        corpse_source,
+        fault_code,
+        ktriage_unmodelled,
+        rpc_reply,
+        rpc_replies,
+        footprint_due,
+        footprint_releasing,
+        sema_wake,
+        pending_send,
+        pending_send_buf,
+        guard_kill,
+        fd_guard,
+        aio,
+        ca_client_wi,
+        psem_waits,
+        eventlink_waits,
+        image_files,
+        no_attach,
+        p_debugger,
+        force_quota,
+        stop,
+        job_event,
+    } = t;
+    macro_rules! new_process {
+        ($($f:ident),* $(,)?) => {
+            $(
+                if differs($f, &fresh.$f) {
+                    lost.push(stringify!($f));
+                }
+            )*
+        };
+    }
+    new_process!(
+        pending_replies, realtimer, vtimers, cpuusage, wakeups, threads, waits, ulocks, psynch, timers, iomfb_call, spawns, connect_wait, connect_waited, tcp_socks, tcp_socks_gen, tcp_watch, kcaller, read_from, child_ports, semas, mk_timers, workq, workq_wake, in_callout, callout_pidle, callout_woken, workq_creator_pending, threadreqs, next_threadreq, kevents, vmrsrcowner, fork_ids, activated, lock_wakes, ttyops, custom_stack, spawn_failed, syscall_exit, crash_notify, corpse, corpse_forks, corpse_fork_results, bt_deliveries, bt_daemon, corpse_source, fault_code, ktriage_unmodelled, rpc_reply, rpc_replies, footprint_due, footprint_releasing, sema_wake, pending_send, pending_send_buf, guard_kill, fd_guard, aio, ca_client_wi, psem_waits, eventlink_waits, image_files, no_attach, p_debugger, force_quota, stop, job_event,
+    );
+    // Its usage's start crosses; the rest of its usage is a new
+    // process's.
+    if differs(rusage, &super::rusage::Shared::new(rusage.start_abstime.load(Acquire))) {
+        lost.push("rusage");
+    }
+    // The rights ipc_task_init gave it cross; its task's own ports are
+    // made when its task is enabled.
+    let given = super::kobject::Kports { special: kports.special.clone(), special_dead: kports.special_dead.clone(), registered: kports.registered, exc: kports.exc, ..Default::default() };
+    if differs(kports, &given) {
+        lost.push("kports");
+    }
+    // The ids task_bank_init recorded cross; its bank context is made
+    // when it is first asked for.
+    let banked = match vouchers.bank_ids() {
+        Some((uid, gid)) => super::voucher::Vouchers::forked(uid, gid),
+        None => super::voucher::Vouchers::default(),
+    };
+    if differs(vouchers, &banked) {
+        lost.push("vouchers");
+    }
+    lost.extend(ipc_raw.uncarried());
+    lost
+}
+
 /// Put the spawned child's task `t`; the names of the parts of it that
-/// are not as a new process's and do not cross.
+/// are not as a new process's and do not cross ([`uncarried`]).
 pub fn put_task(t: &Task, p: &mut Put) -> Vec<&'static str> {
     let mut lost = Vec::new();
     // The new process's: its ids and start (`forkproc`'s), its usage's
@@ -240,31 +419,9 @@ pub fn put_task(t: &Task, p: &mut Put) -> Vec<&'static str> {
     // What the exec in progress keeps for its hooks.
     p.opt(t.exec_sandbox.as_ref(), put_pending);
     p.opt(t.exec_launch.as_ref(), put_launch);
-    // The rest is a new process's: its task ports are made when its task
-    // is enabled, in its own host, and it has run nothing.
-    let checks: Vec<(&'static str, bool)> = vec![
-        ("its task's ports (itk_self, the thread, flavored and special reply ports)", k.task.is_some() || !k.threads.is_empty() || k.flavored.iter().any(Option::is_some) || !k.thread_flavored.is_empty() || !k.special_reply.is_empty()),
-        ("its resume port", k.resume.is_some()),
-        ("its threads' exception actions", !k.thread_exc.is_empty()),
-        ("its restartable ranges", !k.restartable.is_empty()),
-        ("its bank context", t.vouchers.bank_context().is_some()),
-        ("its knotes", !t.kevents.knotes.is_empty()),
-        ("its workqueue", t.workq.is_some() || !t.threadreqs.is_empty()),
-        ("its semaphores and Mach timers", !t.semas.map.is_empty() || !t.mk_timers.is_empty()),
-        ("its interval timers", t.vtimers.iter().any(|v| v.interval != 0 || v.value != 0) || t.realtimer.itv.interval != 0 || t.realtimer.itv.value != 0),
-        ("its pending replies and sends", !t.pending_replies.is_empty() || !t.pending_send.is_empty() || !t.rpc_replies.is_empty()),
-        ("its corpse state", t.corpse.is_some() || !t.corpse_forks.is_empty() || t.crash_notify.is_some()),
-        ("its activation", t.activated.is_some()),
-        ("its image's files", !t.image_files.is_empty()),
-        ("a file guard its spawn tripped", t.fd_guard.is_some()),
-        ("its spawns", !t.spawns.is_empty()),
-        ("a spawn's failure", t.spawn_failed),
-    ];
-    for (what, set) in checks {
-        if set {
-            lost.push(what);
-        }
-    }
+    // Its task's key in the system's IPC table, if its spawn gave it one.
+    p.u64(t.ipc_raw.task);
+    lost.extend(uncarried(t));
     lost
 }
 
@@ -355,6 +512,7 @@ pub fn get_task(g: &mut Get<'_>) -> Result<Task, Bad> {
     }
     t.exec_sandbox = g.opt(get_pending)?;
     t.exec_launch = g.opt(get_launch)?;
+    t.ipc_raw.task = g.u64()?;
     Ok(t.with_wire_ledger())
 }
 
@@ -549,8 +707,9 @@ mod tests {
         let mut t = k.darwin_fork_task();
         t.kports.resume = Some(1);
         t.spawn_failed = true;
+        t.tcp_watch = true;
         let mut p = Put::default();
-        assert_eq!(put_task(&t, &mut p), vec!["its resume port", "a spawn's failure"]);
+        assert_eq!(put_task(&t, &mut p), vec!["tcp_watch", "spawn_failed", "kports"]);
     }
 
     /// A spawn's image crosses as it went.

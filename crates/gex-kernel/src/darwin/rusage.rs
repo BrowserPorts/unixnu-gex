@@ -161,6 +161,23 @@ pub struct Record {
 }
 
 impl Record {
+    /// The record as bytes, for another process of the page (its `p_ru` in
+    /// its record, [`super::procinfo::Facts::exited`]).
+    pub(crate) fn put(&self, p: &mut super::ipc::wire::Put) {
+        for &v in &self.w {
+            p.u64(v);
+        }
+        p.u64(self.unkept);
+    }
+
+    pub(crate) fn get(g: &mut super::ipc::wire::Get<'_>) -> Result<Record, super::ipc::wire::Bad> {
+        let mut w = [0u64; WORDS];
+        for v in w.iter_mut() {
+            *v = g.u64()?;
+        }
+        Ok(Record { w, unkept: g.u64()? })
+    }
+
     /// The structure's bytes.
     pub fn bytes(&self) -> Vec<u8> {
         self.w.iter().flat_map(|v| v.to_le_bytes()).collect()
@@ -808,9 +825,17 @@ pub fn crash_record(procs: &crate::proc::ProcTable, pid: i32, p: &super::procinf
 /// with no `p_ru` adds nothing ("lost p_ru").
 pub fn reaped(child: &super::procinfo::Public, parent: &super::procinfo::Public, times: u32) {
     let Some(r) = child.rusage.exited() else { return };
-    let mut c = parent.rusage.child.lock().unwrap_or_else(|e| e.into_inner());
-    for _ in 0..times {
-        c.add(&r);
+    parent.rusage.add_reaped(&r, times);
+}
+
+impl Shared {
+    /// `update_rusage_info_child` of a reaped child's `p_ru` `r` into this
+    /// process's, `times` times ([`reaped`]).
+    pub fn add_reaped(&self, r: &Record, times: u32) {
+        let mut c = self.child.lock().unwrap_or_else(|e| e.into_inner());
+        for _ in 0..times {
+            c.add(r);
+        }
     }
 }
 

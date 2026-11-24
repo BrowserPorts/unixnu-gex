@@ -1199,7 +1199,6 @@ impl ProcTable {
                 if !nowait {
                     c.reaped.store(true, Ordering::Release);
                     self.reap(c.pid);
-                    crate::darwin::held::process_reaped(c.pid);
                 }
                 return WaitStep::Ended { pid: c.pid, word, xhighbits };
             }
@@ -1695,6 +1694,12 @@ impl ProcTable {
             if dead {
                 if let Some(c) = t.procs.iter().find(|p| p.pid == pid) {
                     c.child.reaped.store(true, Ordering::Release);
+                }
+                // In the page the parent's record, whose children's usage
+                // proc_exit adds this child's p_ru to, is in the parent's
+                // own memory: the addition is lost, and said.
+                if let (Some(pp), true) = (ppid, crate::darwin::share::record_has_usage(pid)) {
+                    crate::darwin::share::note_lost(pp, &format!("process {pid}'s p_ru, which proc_exit adds to its P_NOCLDWAIT parent's children's usage (the parent's record is in its own memory in the page)"));
                 }
             }
             x

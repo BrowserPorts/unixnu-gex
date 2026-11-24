@@ -304,6 +304,10 @@ pub(crate) fn task_end(k: &mut gex_kernel::syscalls::Kernel) {
     if k.darwin {
         k.darwin_task_terminate();
         k.close_all_fds();
+        // proc_exit's stash of its usage in p_ru, which its parent's wait
+        // adds to its own, as the native host's end of it makes it (its
+        // table's end is the global kernel's, which has no record of it).
+        k.darwin_exit_stash();
         // Every thread still on a Worker of its own ends with it, as each
         // native host thread notes its end however its thread ended
         // (`run_guest_thread`'s guard).
@@ -824,7 +828,13 @@ fn wait_round(k: &mut gex_kernel::syscalls::Kernel, gm: &mut GuestMem<'_>, tid: 
     use gex_kernel::{BlockOp, Errno};
     let BlockOp::WaitChild { procs, ppid, want, wstatus, nohang, waitid, jobs: Some(j), .. } = op else { return None };
     let nowait = waitid.is_some_and(|w| w.nowait);
-    let step = gex_kernel::darwin::share::dwait(*ppid, *want, *j, nowait, waitid.is_some(), false);
+    let (step, usage) = gex_kernel::darwin::share::dwait(*ppid, *want, *j, nowait, waitid.is_some(), false);
+    // The child collected: its p_ru to this process's children's usage, as
+    // reap_child_locked adds it (this parent has no P_NOCLDWAIT, or the
+    // child would have been reaped at its end).
+    if let Some(u) = usage {
+        k.dtask.rusage.add_reaped(&u, 1);
+    }
     let r = match step {
         WaitStep::NoChild => Err(Errno::ECHILD),
         WaitStep::Ended { pid, word, xhighbits } => match waitid {

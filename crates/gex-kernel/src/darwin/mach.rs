@@ -100,10 +100,10 @@ pub mod trap {
 pub const TIMEBASE: (u32, u32) = (125, 3);
 
 /// The counter's origin, which is this system's boot, and the calendar
-/// time then.
+/// time then: the system's, where the global kernel holds it.
 fn origin() -> (Instant, std::time::SystemTime) {
     static START: std::sync::OnceLock<(Instant, std::time::SystemTime)> = std::sync::OnceLock::new();
-    *START.get_or_init(|| (Instant::now(), crate::darwin::time::realtime()))
+    *START.get_or_init(|| super::share::origin(super::share::Origin::Counter, (Instant::now(), crate::darwin::time::realtime())))
 }
 
 fn time_origin() -> Instant {

@@ -11,6 +11,7 @@ pub mod msg;
 pub mod port;
 pub mod right;
 pub mod space;
+pub mod wire;
 
 use crate::errno::Errno;
 use crate::syscalls::{Kernel, SyscallOutcome};
@@ -574,6 +575,9 @@ pub struct Ipc {
     /// While a thread call runs: the processes it told of something
     /// (what it woke there is not counted as an interrupt wakeup).
     pub callout_remotes: Mutex<Option<Vec<i32>>>,
+    /// This task's bank ledger, which a table taken from the global kernel
+    /// gives its own bank context ([`wire::OwnTask`]).
+    pub own_ledger: Option<Arc<super::rusage::BankLedger>>,
     /// This task's own link, kept for emptying its mailbox.
     pub link: Option<Arc<TaskLink>>,
     /// The kernel's own objects every task names alike (the host, host
@@ -666,6 +670,15 @@ pub enum Remote {
     /// ([`super::mig::later_reply`]), for the routine that waits for it in
     /// this task: its return code and scalar outputs.
     Later { token: u64, ret: i32, scalars: Vec<u64> },
+    /// A change another task's call made to this task's importance marks
+    /// and boost, which its element reaches as a mirror there
+    /// ([`super::importance::PolicyAt`]).
+    Policy(super::importance::PolicyOp),
+    /// A bill another task's call rolled up to this task's bank ledger,
+    /// which its bank context reaches by its key there
+    /// ([`super::voucher::LedgerAt`]): CPU time to it, by it, and whether
+    /// the bill held time not kept.
+    Ledger { to_me: u64, to_others: u64, unkept: bool },
 }
 
 /// How other tasks reach a task: its mailbox, and the bell of the thread
@@ -690,6 +703,31 @@ pub struct TaskLink {
     pub codesign: Option<super::codesign::CodeSign>,
     /// Its task policy, with its importance marks.
     pub policy: Option<super::importance::Policy>,
+    /// In the page, a task of another process: how to reach it there. None
+    /// for a task of this process (natively every task).
+    pub elsewhere: Option<Elsewhere>,
+}
+
+/// A task of another process of the page, as the table reaches it: its
+/// mailbox is the global kernel's, which its process empties, and a ring
+/// of its bell notifies the wait queue that process's thread-call runner
+/// sleeps on; its importance marks are its policy's as its process last
+/// gave the table back.
+#[derive(Clone, Debug)]
+pub struct Elsewhere {
+    pub bell: u32,
+    pub marks: Option<super::taskpolicy::Importance>,
+}
+
+impl TaskLink {
+    /// Ring the bell of the thread that empties its mailbox.
+    pub fn ring(&self) {
+        match &self.elsewhere {
+            None => self.bell.ring(),
+            Some(e) if e.bell != 0 => crate::wait::notify(e.bell),
+            Some(_) => super::note_unimplemented(format!("a ring of process {}'s thread calls, which run on no Worker the other processes of the page can wake", self.pid)),
+        }
+    }
 }
 
 /// What every task shares: the ports and sets (XNU's are kernel objects,
@@ -745,6 +783,15 @@ impl IpcCell {
     }
 }
 
+/// The table given back: to its cell, or in the page to the global kernel.
+fn give_back(cell: &IpcCell, s: IpcShared) {
+    if super::share::remote().is_some() {
+        wire::put_table(&s);
+    } else {
+        cell.put(s);
+    }
+}
+
 /// `ipc_port_request_table_next_size(2, osize, 16)` in entries (16-byte
 /// requests).
 fn request_table_grow(ocount: usize) -> usize {
@@ -770,10 +817,13 @@ impl Ipc {
     /// key and keeps the space it has). A task that has ended has neither:
     /// its kernel reaches the ports and the other tasks' spaces, its own
     /// space is the inactive one its end left it (`is_active` false: no
-    /// name is in it and none is given out), and it takes no key.
-    pub fn check_out(&mut self, cell: &Arc<IpcCell>) {
+    /// name is in it and none is given out), and it takes no key. `call`
+    /// names the kernel call taking it, for the global kernel's record.
+    pub fn check_out(&mut self, cell: &Arc<IpcCell>, call: impl FnOnce() -> String) {
         debug_assert!(!self.held);
-        let mut s = cell.take();
+        // In the page the table is the global kernel's, which every
+        // process of the page takes it from.
+        let mut s = if super::share::remote().is_some() { wire::take_table(&self.own_task(), &call()) } else { cell.take() };
         self.cell.get_or_insert_with(|| Arc::clone(cell));
         self.objects = std::mem::take(&mut s.objects);
         self.next_id = s.next_id;
@@ -794,6 +844,9 @@ impl Ipc {
         self.host_special = std::mem::take(&mut s.host_special);
         self.vouchers = std::mem::take(&mut s.vouchers);
         self.held = true;
+        if super::share::remote().is_some() && self.task != 0 {
+            wire::set_own_key(self.task);
+        }
         if !self.globals.iter().any(|(g, _)| *g == Kobject::UxHandler) {
             self.ux_handler_setup();
         }
@@ -814,7 +867,13 @@ impl Ipc {
         }
         let s = IpcShared { objects: std::mem::take(&mut self.objects), next_id: self.next_id, timestamp: self.timestamp, spaces, next_task: self.next_task_hint, queues: std::mem::take(&mut self.queues), links: std::mem::take(&mut self.links), globals: std::mem::take(&mut self.globals), host_special: std::mem::take(&mut self.host_special), host_exc: std::mem::take(&mut self.host_exc), vouchers: std::mem::take(&mut self.vouchers) };
         self.held = false;
-        cell.put(s);
+        give_back(&cell, s);
+    }
+
+    /// What this task holds of its own, for a table taken from the global
+    /// kernel.
+    fn own_task(&self) -> wire::OwnTask {
+        wire::OwnTask { task: self.task, policy: self.link.as_ref().and_then(|l| l.policy.clone()), ledger: self.own_ledger.clone(), link: self.link.clone() }
     }
 
     /// The task has ended: its (terminated) space leaves the table, and the
@@ -832,7 +891,7 @@ impl Ipc {
         if let Some(cell) = cell {
             let spaces = std::mem::take(&mut self.others);
             let s = IpcShared { objects: std::mem::take(&mut self.objects), next_id: self.next_id, timestamp: self.timestamp, spaces, next_task: self.next_task_hint, queues: std::mem::take(&mut self.queues), links: std::mem::take(&mut self.links), globals: std::mem::take(&mut self.globals), host_special: std::mem::take(&mut self.host_special), host_exc: std::mem::take(&mut self.host_exc), vouchers: std::mem::take(&mut self.vouchers) };
-            cell.put(s);
+            give_back(&cell, s);
         }
     }
 
@@ -851,11 +910,20 @@ impl Ipc {
     /// has ended.
     pub fn remote_or_back(&self, task: TaskKey, r: Remote) -> Result<(), Remote> {
         let Some(l) = self.links.get(&task) else { return Err(r) };
+        if l.elsewhere.is_some() {
+            // Another process's task: its mailbox is the global kernel's.
+            let Some(b) = wire::remote_bytes(&r) else {
+                super::note_unimplemented(format!("{r:?} for a task of process {}, which only this process's own tasks are told", l.pid));
+                return Err(r);
+            };
+            wire::mailbox_put(task, l.pid, &b);
+        } else {
+            l.mailbox.lock().unwrap_or_else(|e| e.into_inner()).push(r);
+        }
         if let Some(v) = self.callout_remotes.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             v.push(l.pid);
         }
-        l.mailbox.lock().unwrap_or_else(|e| e.into_inner()).push(r);
-        l.bell.ring();
+        l.ring();
         Ok(())
     }
 
@@ -877,7 +945,7 @@ impl Ipc {
         let link = Arc::new(link);
         self.links.insert(self.task, Arc::clone(&link));
         if ring {
-            link.bell.ring();
+            link.ring();
         }
         self.link = Some(link);
     }

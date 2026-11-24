@@ -39,7 +39,7 @@ pub struct Public {
     /// `p_pcaction`.
     pub pcaction: Arc<std::sync::atomic::AtomicU32>,
     /// `p_persona`.
-    pub persona: Option<Arc<super::persona::Persona>>,
+    pub persona: Option<super::persona::Persona>,
     /// `p_csflags`.
     pub csflags: Arc<std::sync::atomic::AtomicU32>,
     /// The signature on its executable (`p_textvp`'s blob at `p_textoff`).

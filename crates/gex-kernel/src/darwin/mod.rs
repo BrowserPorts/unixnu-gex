@@ -131,6 +131,8 @@ pub mod sockbuf;
 pub mod unixsock;
 pub mod sema;
 pub mod select;
+pub mod share;
+pub mod held;
 pub mod shm;
 pub mod signal;
 pub mod sockaddr;
@@ -249,7 +251,7 @@ pub fn boot(trust_cache: Option<&[u8]>, sandbox: SandboxProfiles, device_tree: O
         Some(b) => Some(trustcache::load_bundle(b).map_err(|e| format!("failed to load static trust cache module: 0 ({e:?})"))?),
         None => None,
     };
-    trustcache::set_static(m);
+    trustcache::set_static(m)?;
     // devfs's terminal nodes: ptmx, its replicas, tty.
     crate::vfs::devfs::set_darwin_ttys();
     mac::set_platform_profile(sandbox.platform)?;
@@ -389,7 +391,7 @@ pub struct Task {
     /// starvation throttled or suspended.
     pub vmrsrcowner: bool,
     /// `p_persona`.
-    pub persona: Option<std::sync::Arc<persona::Persona>>,
+    pub persona: Option<persona::Persona>,
     /// `p_textoff`: where the image's slice starts in its file.
     pub textoff: i64,
     /// `p_uniqueid` and `p_puniqueid` (its parent's at its fork), and
@@ -576,6 +578,15 @@ pub fn start_times() -> ((u64, u64), u64) {
 }
 
 impl Task {
+    /// The process starts now (`microtime_with_abstime`: its calendar and
+    /// Mach start times read together), as the run's first process does
+    /// once its host has made it.
+    pub fn start_now(&mut self) {
+        let (start, abs) = start_times();
+        self.start = start;
+        self.rusage.start_abstime.store(abs, std::sync::atomic::Ordering::Release);
+    }
+
     /// A forked task's process ids and start, as its fork chose them.
     pub fn forked_process(uniqueid: u64, pidversion: i32, start: (u64, u64), abs: u64) -> Task {
         Task { uniqueid, pidversion, start, rusage: rusage::Shared::new(abs), ..Task::default() }
@@ -653,11 +664,53 @@ impl crate::syscalls::Kernel {
     /// This task's IPC state, with the system's table taken for the rest
     /// of the kernel call ([`Self::darwin_ipc_leave`] gives it back).
     pub(crate) fn ipc(&mut self) -> &mut ipc::Ipc {
-        let ipc = &mut self.dtask.ipc_raw;
-        if !ipc.held {
-            ipc.check_out(&self.procs.darwin_ipc);
+        if !self.dtask.ipc_raw.held {
+            if share::remote().is_some() {
+                // The table the global kernel holds gives this task's own
+                // bank context its ledger; what other processes left for
+                // this task meanwhile is taken with it.
+                let l = std::sync::Arc::clone(&self.dtask.rusage.bank.lock().unwrap_or_else(|e| e.into_inner()));
+                self.dtask.ipc_raw.own_ledger = Some(l);
+                let (tid, pc) = (self.tid, self.syscall_pc);
+                self.dtask.ipc_raw.check_out(&self.procs.darwin_ipc, || format!("kernel call by thread {tid} (its last system call's pc {pc:#x})"));
+                self.darwin_mailbox_fetch();
+            } else {
+                self.dtask.ipc_raw.check_out(&self.procs.darwin_ipc, String::new);
+            }
         }
-        ipc
+        &mut self.dtask.ipc_raw
+    }
+
+    /// In the page, what other processes left in this task's global
+    /// mailbox, taken with the table: its policy's and ledger's changes
+    /// made now (the table gave its own elements the policy and ledger
+    /// themselves, which those changes are owed to before any other call
+    /// reads them), the rest left in its mailbox for its thread calls.
+    fn darwin_mailbox_fetch(&mut self) {
+        let key = self.dtask.ipc_raw.task;
+        let Some(link) = self.dtask.ipc_raw.link.clone() else { return };
+        if key == 0 {
+            return;
+        }
+        let mut rest = Vec::new();
+        for b in ipc::wire::mailbox_take(key) {
+            match ipc::wire::remote_of(&b) {
+                Ok(ipc::Remote::Policy(op)) => self.darwin_policy_with(|p| op.apply(p)),
+                Ok(ipc::Remote::Ledger { to_me, to_others, unkept }) => {
+                    use std::sync::atomic::Ordering::AcqRel;
+                    let l = std::sync::Arc::clone(&self.dtask.rusage.bank.lock().unwrap_or_else(|e| e.into_inner()));
+                    l.to_me.fetch_add(to_me, AcqRel);
+                    l.to_others.fetch_add(to_others, AcqRel);
+                    l.unkept.fetch_or(unkept, AcqRel);
+                }
+                Ok(r) => rest.push(r),
+                Err(e) => panic!("gex: a remote in task {key}'s global mailbox is not one ({e:?})"),
+            }
+        }
+        if !rest.is_empty() {
+            link.mailbox.lock().unwrap_or_else(|e| e.into_inner()).extend(rest);
+            link.ring();
+        }
     }
 
     /// `ipc_task_enable`: other tasks reach this task from here on, by its
@@ -680,6 +733,7 @@ impl crate::syscalls::Kernel {
             name_port: std::sync::Mutex::new(None),
             codesign: self.dtask.codesign.clone(),
             policy: self.dtask.policy.clone().or_else(|| self.procs.task_policy(self.pid)),
+            elsewhere: None,
         };
         self.ipc().task_enable(link);
         // The task's threads, whose time by effective QoS its policy's
@@ -733,16 +787,65 @@ impl crate::syscalls::Kernel {
         if self.dtask.policy.is_none() {
             self.dtask.policy = self.procs.task_policy(self.pid);
         }
-        match &self.dtask.policy {
-            Some(c) => f(&mut c.lock().unwrap_or_else(|e| e.into_inner())),
-            None => f(&mut taskpolicy::TaskPolicy::default()),
+        let Some(c) = self.dtask.policy.clone() else { return f(&mut taskpolicy::TaskPolicy::default()) };
+        let (r, changed) = {
+            let mut p = c.lock().unwrap_or_else(|e| e.into_inner());
+            let before = p.imp;
+            let r = f(&mut p);
+            (r, p.imp != before)
+        };
+        // In the page the other processes read this task's importance marks
+        // from the table: taken now, it has them as they are when the call
+        // gives it back.
+        if changed && share::remote().is_some() && self.dtask.ipc_raw.link.is_some() {
+            self.ipc();
         }
+        r
     }
 
     /// The gaps [`note_unimplemented`] noted in this call, reported.
     pub(crate) fn darwin_take_notes(&mut self) {
         for what in NOTES.with(|n| std::mem::take(&mut *n.borrow_mut())) {
             self.darwin_unimplemented(what);
+        }
+    }
+
+    /// A use of the Darwin system's state that reaches what process `pid`
+    /// of the page (or several, [`held::SEVERAL`]) holds of a subsystem that
+    /// is each process's own copy there ([`held`]): reported as not
+    /// implemented, for the caller to fail.
+    pub(crate) fn darwin_elsewhere(&mut self, what: &str, pid: i32) {
+        let who = if pid == held::SEVERAL { "other processes of the page".to_string() } else { format!("process {pid} of the page") };
+        self.darwin_unimplemented(format!("{what}, which {who} holds: in the page each process has its own copy of it, not the system's"));
+    }
+
+    /// Whether a change to the system-wide state `kind`, which every process
+    /// reads without asking (the mount list, a freeze), is one this process
+    /// may make where the state is each process's own copy: not when
+    /// another process of the page changed it, nor while another Darwin
+    /// process of the page runs (its copy would not change). Reported as
+    /// `what`, for the caller to fail.
+    pub(crate) fn darwin_system_change_refused(&mut self, kind: held::Kind, what: &str) -> bool {
+        let pid = self.pid;
+        let Some(h) = held::elsewhere(kind, &[], pid).or_else(|| held::any_elsewhere(held::Kind::Process, pid)) else { return false };
+        self.darwin_elsewhere(what, h);
+        true
+    }
+
+    /// A Darwin process of the page has started (its exec): it is one of
+    /// the page's from now on, and what other processes changed of the
+    /// system-wide state it reads from its start is reported: the mount
+    /// list, which every path it looks up reads, and a freeze, which every
+    /// write it makes checks.
+    pub fn darwin_page_start(&mut self) {
+        let pid = self.pid;
+        held::set_me(pid);
+        held::claim(held::Kind::Process, &pid.to_le_bytes(), pid);
+        if let Some(h) = held::elsewhere(held::Kind::Mounts, &[], pid) {
+            self.darwin_elsewhere("the mount list, which another process changed (mount(2), MNT_UPDATE or a shutdown's unmounts)", h);
+        }
+        if let Some(h) = held::elsewhere(held::Kind::Freeze, &[], pid) {
+            self.darwin_elsewhere("a filesystem freeze (F_FREEZE_FS), which every write checks", h);
         }
     }
 
@@ -794,11 +897,14 @@ impl crate::syscalls::Kernel {
     }
 }
 
-/// `nextpidversion`: one counter for the system, taken at each exec
-/// (`OSIncrementAtomic` returns the value before).
 /// The system's `nextuniqueid`: a new process takes the next (the kernel's
-/// own process is 0, so the first is 1).
+/// own process is 0, so the first is 1). The global kernel's where it holds
+/// the system's state ([`share`]).
 pub fn next_uniqueid() -> u64 {
+    share::next(share::Counter::Uniqueid).unwrap_or_else(local_next_uniqueid)
+}
+
+fn local_next_uniqueid() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
 }
@@ -810,6 +916,10 @@ pub fn next_uniqueid() -> u64 {
 /// child, an exec's new task in cloneproc, a corpse fork), and so do
 /// exec_handle_sugid (each image activated) and task_mark_corpse.
 pub fn next_task_uniqueid() -> u64 {
+    share::next(share::Counter::TaskUniqueid).unwrap_or_else(local_next_task_uniqueid)
+}
+
+fn local_next_task_uniqueid() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
@@ -817,11 +927,21 @@ pub fn next_task_uniqueid() -> u64 {
 /// The system's `thread_unique_id`: a new thread takes the next (the first
 /// is 101).
 pub fn next_thread_id() -> u64 {
+    share::next(share::Counter::ThreadId).unwrap_or_else(local_next_thread_id)
+}
+
+fn local_next_thread_id() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(100);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
 }
 
+/// `nextpidversion`: one counter for the system, taken at each exec
+/// (`OSIncrementAtomic` returns the value before).
 pub fn next_pidversion() -> i32 {
+    share::next(share::Counter::Pidversion).map_or_else(local_next_pidversion, |v| v as u32 as i32)
+}
+
+fn local_next_pidversion() -> i32 {
     static NEXT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }

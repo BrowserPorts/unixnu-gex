@@ -98,7 +98,11 @@ export const outputs = { busybox: ['bb.tar.zst', 'rt-side.so'], slim: ['slim'], 
 /** The `darwin-static` image's programs (tests/darwin/bin, as
  *  tests/darwin/build.sh builds them), and the boot payload's files
  *  tests/darwin/run.sh boots them with, where the payload has them. */
-const DARWIN_STATIC = ['hello-static', 'bsd-carry', 'tcall', 'bsdthr', 'waits', 'hold', 'cpuclk', 'pipewr', 'unixname'];
+const DARWIN_STATIC = ['hello-static', 'bsd-carry', 'tcall', 'bsdthr', 'waits', 'hold', 'cpuclk', 'pipewr', 'unixname', 'sysids', 'xproc', 'xmach', 'xsys'];
+/** The programs gexc runs as another user than its own (xmach sets a host
+ *  special port, through the host privilege port root's task has; xsys's
+ *  memorystatus_control is root's). */
+const DARWIN_STATIC_AS = { xmach: '0:0', xsys: '0:0' };
 const DARWIN_BOOT = ['DeviceTree', 'sandbox_profile.bin', 'sandbox_builtin.bin', 'sandbox_protobox.bin', 'img4_anchor.der', 'SystemVolume.attrs'];
 
 export const images = {
@@ -242,7 +246,7 @@ export const images = {
     const darwinFree = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('GEX_DARWIN_')));
     const native = {};
     for (const p of DARWIN_STATIC) {
-      const r = spawnSync(gexc, ['run', join(out, p)], { encoding: 'utf8', timeout: 300000, env: { ...darwinFree, GEX_DARWIN_BOOT: join(out, 'boot'), GEX_DARWIN_STRICT: '1' } });
+      const r = spawnSync(gexc, ['run', ...(DARWIN_STATIC_AS[p] ? ['--uid', DARWIN_STATIC_AS[p]] : []), join(out, p)], { encoding: 'utf8', timeout: 300000, env: { ...darwinFree, GEX_DARWIN_BOOT: join(out, 'boot'), GEX_DARWIN_STRICT: '1' } });
       if (r.error || r.status === null) throw new Error(`gexc run ${p}: ${r.error?.message ?? `signal ${r.signal}`}`);
       // And what its kernel reported (`[gex] Darwin: ...`, gexc's stderr),
       // which the page's system says on its console.

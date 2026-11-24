@@ -461,6 +461,9 @@ extern "C" {
     fn k_futex_wake(addr: u64);
     fn k_futex_gen(addr: u64) -> u32;
     fn k_lock_call(req: gex_kernel::PAddr, req_len: u32, out: gex_kernel::PAddr, out_len: u32, caller: i32) -> i64;
+    /// The Darwin system's state the page's processes share
+    /// (`gex_kernel::darwin::share`): one encoded call.
+    fn k_darwin_call(op: u32, req: gex_kernel::PAddr, req_len: u32, out: gex_kernel::PAddr, out_len: u32) -> i64;
     fn k_lock_queue() -> u32;
     fn k_lock_seq() -> u64;
     fn k_spawn(ppid: i32) -> i32;
@@ -1797,6 +1800,28 @@ fn shared_dns_name(addr: u32) -> Option<String> {
 
 fn gl_call(req: &[u8], out: &mut [u8]) -> i64 {
     unsafe { k_lock_call(req.as_ptr() as gex_kernel::PAddr, req.len() as u32, out.as_mut_ptr() as gex_kernel::PAddr, out.len() as u32, my_pid()) }
+}
+
+fn dc_call(op: u32, req: &[u8], out: &mut [u8]) -> i64 {
+    unsafe { k_darwin_call(op, req.as_ptr() as gex_kernel::PAddr, req.len() as u32, out.as_mut_ptr() as gex_kernel::PAddr, out.len() as u32) }
+}
+
+/// The Darwin system's park: this Worker's wait slot on global queue
+/// `queue` until `ready` says it may go on, `ready` asked again at each
+/// notify (the slot's sequence sampled before each ask, so a notify
+/// between the ask and the park ends the park at once).
+fn dc_park(queue: u32, ready: &mut dyn FnMut() -> bool) {
+    let slot = waitq::slot();
+    unsafe { k_wq_add(queue, slot as u32) };
+    loop {
+        let seq = unsafe { k_ws_seq(slot) };
+        if ready() {
+            break;
+        }
+        // (bounded, so a holder's 120 s is noticed by `ready`)
+        unsafe { k_ws_park(slot, seq, 1_000_000_000) };
+    }
+    unsafe { k_wq_del(queue, slot as u32) };
 }
 
 fn gl_queue() -> u32 {
@@ -4351,6 +4376,12 @@ fn install_panic_hook() {
         gex_kernel::darwin::report::set_sink(|b| unsafe { write(2, b.as_ptr() as usize, b.len() as u32) });
         // And the machine's end ([`darwin_machine_end`]).
         gex_kernel::darwin::machine::set_hook(darwin_machine_end);
+        // And the Darwin system's state, which every process of the page
+        // shares: the global kernel's, from before the first kernel here
+        // takes anything of it (a new task's identifiers).
+        if unsafe { k_present() } != 0 {
+            gex_kernel::darwin::share::set_remote(gex_kernel::darwin::share::Remote { call: dc_call, park: dc_park });
+        }
         std::panic::set_hook(Box::new(|info| {
             // Set while this hook runs: a panic inside it is not reported
             // through it (std aborts at once, its line on a stderr that
@@ -15711,10 +15742,7 @@ fn trap() -> ! {
 /// entry (`NATIVE_LEFT`, `NO_LEAVE`, the resume point). Those this shim
 /// can end itself, `trap` ends.
 fn check_scopes_at_trap() {
-    #[cfg(feature = "shared-memory")]
-    let kernel = DEPTH.with(|d| d.get()) > 0;
-    #[cfg(not(feature = "shared-memory"))]
-    let kernel = HOST.with(|h| h.try_borrow_mut().is_err());
+    let kernel = in_kernel_now();
     let defer = gl::DEFER.with(|d| d.get());
     if kernel || defer {
         warn_line(&format!(
@@ -15724,6 +15752,16 @@ fn check_scopes_at_trap() {
             LAST_SYSCALL.with(|c| c.get()) as i32,
         ));
     }
+}
+
+/// Whether this Worker is inside a kernel call: it holds the kernel lock
+/// (or, single-threaded, the host is borrowed). After a trap, whether the
+/// trap cut a kernel call off.
+fn in_kernel_now() -> bool {
+    #[cfg(feature = "shared-memory")]
+    return DEPTH.with(|d| d.get()) > 0;
+    #[cfg(not(feature = "shared-memory"))]
+    return HOST.with(|h| h.try_borrow_mut().is_err());
 }
 
 /// Which of the shim's own entry points is running, for a report that cannot
@@ -21001,6 +21039,9 @@ pub extern "C" fn gex_abandon(code: i32) {
     }
     let pid = home.pid();
     trace_line(&format!("[proc] abandon {pid}: the Worker stopped without an exit\n"));
+    // A Darwin process's task ends with it, as a killed one's, where its
+    // kernel's state allows (darwin.rs `abandoned`).
+    darwin::abandoned(in_kernel_now());
     // The descriptors, on the same terms as `exit_process`: a status alone
     // ends a `wait4` and nothing else. A parent reading a dead child's pipe
     // -- which is every `$(...)`, and every apt method -- is not waiting on
@@ -21163,6 +21204,8 @@ pub extern "C" fn gex_process_gone(status: i32) -> u32 {
         }
         return 0;
     }
+    // (its frames ended outside any kernel call)
+    darwin::abandoned(in_kernel_now());
     set_exited(true);
     waitq::wake_process();
     let pid = my_pid();

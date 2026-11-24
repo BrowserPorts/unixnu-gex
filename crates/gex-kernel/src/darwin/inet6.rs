@@ -873,9 +873,18 @@ impl Kernel {
                 self.darwin_ifunit(data)?;
                 self.darwin_suser()?;
                 let ifra = AliasReq::read(data, com == SIOCAIFADDR_IN6_64);
+                // lo0's addresses another process of the page changed are
+                // in its memory.
+                if let Some(h) = super::held::elsewhere(super::held::Kind::Lo0Inet6, &[], self.pid) {
+                    self.darwin_elsewhere("lo0's inet6 addresses (SIOCAIFADDR_IN6)", h);
+                    return Err(Errno::ENOSYS);
+                }
                 let mut lo0 = LO0.lock().unwrap_or_else(|e| e.into_inner());
                 match lo0.get_or_insert_with(Lo0Inet6::boot).aifaddr(&ifra) {
-                    Ok(()) => Ok(()),
+                    Ok(()) => {
+                        super::held::claim(super::held::Kind::Lo0Inet6, &[], self.pid);
+                        Ok(())
+                    }
                     Err(Fail::Refused(e)) => Err(e),
                     Err(Fail::Unported(what)) => {
                         drop(lo0);

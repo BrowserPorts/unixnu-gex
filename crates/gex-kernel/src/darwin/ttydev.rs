@@ -1133,6 +1133,12 @@ impl Kernel {
     /// The device `/dev/console`'s calls go to now (`cn_dev`), reported
     /// when it is one the console cannot reach.
     fn darwin_cn_dev(&mut self) -> Result<(Drv, u32, Arc<TtyCell>), Errno> {
+        // The console's terminal, which another process of the page opened,
+        // is in its memory.
+        if let Some(h) = super::held::claim(super::held::Kind::Console, &[], self.pid) {
+            self.darwin_elsewhere("the console's terminal (/dev/console)", h);
+            return Err(Errno::ENXIO);
+        }
         match km::cn_dev() {
             Ok((km::Cn::Km, d, c)) => Ok((Drv::Km, d, c)),
             Ok((km::Cn::Pts, d, c)) => Ok((Drv::Pts, d, c)),

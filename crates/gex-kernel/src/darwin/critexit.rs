@@ -180,7 +180,7 @@ impl Kernel {
         let message = message(&who, rv, reason.as_deref());
         // sync(p, NULL, NULL): what a process writes is through to its
         // file already (the `sync` call's VFS_SYNC has nothing to push).
-        machine::end(Event {
+        self.darwin_machine_end(Event {
             kind: Kind::Panic(Panic { cpu: machine::CPU, caller: caller::CRITICAL_EXIT, options: machine::DEBUGGER_OPTION_INITPROC_PANIC, message }),
             cause: Cause::CriticalExit,
             pid: self.pid,

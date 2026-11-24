@@ -1447,7 +1447,7 @@ fn run_process(
         // The run's first process: of the user it runs as.
         kernel.dtask.cred = gex_kernel::darwin::cred::Cred::of(kernel_uid, kernel_gid);
         kernel.dtask.uniqueid = gex_kernel::darwin::next_uniqueid();
-        kernel.dtask.start = gex_kernel::darwin::procinfo::microtime();
+        kernel.dtask.start_now();
         kernel.signals.thread().set_darwin_id(gex_kernel::darwin::next_thread_id());
         kernel.darwin_cred_tokens();
     }

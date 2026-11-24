@@ -1472,9 +1472,22 @@ impl Kernel {
         // APFS's VNOP_IOCTL ([`super::fsfreeze`]).
         let mnt = super::kern::mount_of_file(&file);
         if matches!(c, F_FREEZE_FS | F_THAW_FS) && mnt.fs == Fs::Apfs {
+            // The freeze every process's writes check, which in the page is
+            // each process's own copy.
+            if self.darwin_system_change_refused(super::held::Kind::Freeze, "F_FREEZE_FS or F_THAW_FS, a change to the filesystem freeze") {
+                return Err(Errno::ENOSYS);
+            }
             let procs = std::sync::Arc::clone(&self.procs);
-            return match super::fsfreeze::ioctl(mnt, c == F_THAW_FS, self.pid, self.dtask.cred.uid, &|p| procs.alive(p)) {
-                Ok(()) => Ok(0),
+            let me = self.pid;
+            return match super::fsfreeze::ioctl(mnt, c == F_THAW_FS, me, self.dtask.cred.uid, &|p| p == me || procs.alive(p)) {
+                Ok(()) => {
+                    if c == F_THAW_FS {
+                        super::held::let_go(super::held::Kind::Freeze, &[], me);
+                    } else {
+                        super::held::claim(super::held::Kind::Freeze, &[], me);
+                    }
+                    Ok(0)
+                }
                 Err(super::fsfreeze::Refused::Errno(e)) => Err(e),
                 Err(super::fsfreeze::Refused::Unmodelled(why)) => {
                     self.darwin_unimplemented(why);
@@ -2153,6 +2166,12 @@ impl Kernel {
     /// video console's `vc_user_options`, which anybody may write) and
     /// `sysctl_consoleoptions` (`sysctl_io_number` of their options word).
     fn darwin_sysctl_progressoptions(&mut self, m: &mut GuestMem<'_>, path: &str, req: &mut SysctlReq) -> Result<(), Errno> {
+        // The video console's options another process of the page changed
+        // (or its framebuffer took) are in its memory.
+        if let Some(h) = super::held::elsewhere(super::held::Kind::Vconsole, &[], self.pid) {
+            self.darwin_elsewhere(&format!("{path}, the video console's options"), h);
+            return Err(Errno::ENOSYS);
+        }
         let mut v = super::vconsole::user_options();
         let n = if path == "kern.consoleoptions" { 4 } else { v.len() };
         req.out(m, &v[..n])?;
@@ -2160,6 +2179,7 @@ impl Kernel {
             let b = req.input(m, n)?;
             v[..n].copy_from_slice(&b[..n]);
             super::vconsole::set_user_options(v);
+            super::held::touch(super::held::Kind::Vconsole, &[], self.pid);
         }
         Ok(())
     }

@@ -406,12 +406,12 @@ static OSRELEASETYPE: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new
 
 /// `kern.osreleasetype`'s value.
 pub fn os_release_type() -> Vec<u8> {
-    OSRELEASETYPE.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    SystemString::OsReleaseType.get_shared()
 }
 
 /// Set it, from launchd's one write.
 pub fn set_os_release_type(v: Vec<u8>) {
-    *OSRELEASETYPE.lock().unwrap_or_else(|e| e.into_inner()) = v;
+    SystemString::OsReleaseType.set_shared(v)
 }
 
 /// `kern.hostname`, `MAXHOSTNAMELEN` bytes at most, the system's.
@@ -420,12 +420,85 @@ pub const MAXHOSTNAMELEN: usize = 256;
 
 /// The hostname.
 pub fn hostname() -> Vec<u8> {
-    HOSTNAME.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_else(|| b"iPad".to_vec())
+    SystemString::Hostname.get_shared()
 }
 
 /// Set the hostname.
 pub fn set_hostname(v: Vec<u8>) {
-    *HOSTNAME.lock().unwrap_or_else(|e| e.into_inner()) = Some(v);
+    SystemString::Hostname.set_shared(v)
+}
+
+/// The system's strings a call sets: the global kernel's where it holds
+/// the system's state ([`super::share`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum SystemString {
+    OsReleaseType = 0,
+    Hostname = 1,
+}
+
+impl SystemString {
+    fn of(n: u8) -> Option<SystemString> {
+        match n {
+            0 => Some(SystemString::OsReleaseType),
+            1 => Some(SystemString::Hostname),
+            _ => None,
+        }
+    }
+
+    /// This kernel's own.
+    fn get(self) -> Vec<u8> {
+        match self {
+            SystemString::OsReleaseType => OSRELEASETYPE.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            SystemString::Hostname => HOSTNAME.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_else(|| b"iPad".to_vec()),
+        }
+    }
+
+    fn set(self, v: Vec<u8>) {
+        match self {
+            SystemString::OsReleaseType => *OSRELEASETYPE.lock().unwrap_or_else(|e| e.into_inner()) = v,
+            SystemString::Hostname => *HOSTNAME.lock().unwrap_or_else(|e| e.into_inner()) = Some(v),
+        }
+    }
+
+    fn get_shared(self) -> Vec<u8> {
+        match super::share::remote() {
+            Some(r) => super::share::call_read(r, super::share::op::SYSTEM_STRING, &[self as u8]),
+            None => self.get(),
+        }
+    }
+
+    fn set_shared(self, v: Vec<u8>) {
+        match super::share::remote() {
+            Some(r) => {
+                let mut req = vec![self as u8 | SET];
+                req.extend_from_slice(&v);
+                super::share::call(r, super::share::op::SYSTEM_STRING, &req, &mut []);
+            }
+            None => self.set(v),
+        }
+    }
+}
+
+/// [`super::share::op::SYSTEM_STRING`]'s first byte: a set, not a read.
+const SET: u8 = 0x80;
+
+/// A system string's read (its whole value, however long: as much as fits
+/// in `out`, and its length) or set, for the global kernel's channel.
+pub(crate) fn serve_string(req: &[u8], out: &mut [u8]) -> i64 {
+    let Some((&first, value)) = req.split_first() else { return -22 };
+    let Some(which) = SystemString::of(first & !SET) else { return -22 };
+    if first & SET != 0 {
+        which.set(value.to_vec());
+        return 0;
+    }
+    if !value.is_empty() {
+        return -22;
+    }
+    let v = which.get();
+    let n = v.len().min(out.len());
+    out[..n].copy_from_slice(&v[..n]);
+    v.len() as i64
 }
 
 #[cfg(test)]

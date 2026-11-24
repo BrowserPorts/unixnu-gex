@@ -115,6 +115,11 @@ fn bsd_get_ioctl(minor: u32, open_flag: u32) -> Got {
     bsd(|b| {
         let slot = &mut b.ttys[minor as usize];
         if open_flag & (pf::OPEN_M | pf::OPEN_S) != 0 && slot.is_none() {
+            // Made once for the system: another process of the page's is in
+            // its memory.
+            if super::held::noted_claim(super::held::Kind::BsdPty, &minor.to_le_bytes(), || format!("the BSD pty {minor}'s terminal")) {
+                return Got::None;
+            }
             *slot = Some(new_tty(PTY_DRIVER, minor));
         }
         slot.as_ref().map_or(Got::None, |t| Got::Tty(Arc::clone(t)))
@@ -281,6 +286,11 @@ pub fn ptmx_get_ioctl(minor: u32, open_flag: u32) -> Got {
         if s.list[m].is_some() {
             return Got::Raced;
         }
+        // The minor is the first free of the system's: one another process
+        // of the page has is not this one's to give.
+        if super::held::noted_claim(super::held::Kind::PtyUnit, &minor.to_le_bytes(), || format!("the ptmx replica {}", ptmx_get_name(minor))) {
+            return Got::None;
+        }
         let tty = new_tty(PTMX_DRIVER, minor);
         // The replica's node: /dev/ttysNNN, root's, group tty, 0620.
         s.list[m] = Some(Slot { tty, open: pf::OPEN_M, node: Some(PtsNode { uid: UID_ROOT, gid: GID_TTY, mode: 0o620 }) });
@@ -310,6 +320,7 @@ pub fn ptmx_free_ioctl(minor: u32, open_flag: u32) -> i32 {
     if slot.open & (pf::OPEN_M | pf::OPEN_S) == 0 {
         s.list[m] = None;
         s.free += 1;
+        super::held::let_go_mine(super::held::Kind::PtyUnit, &minor.to_le_bytes());
     }
     0
 }
@@ -322,12 +333,20 @@ pub fn ptmx_get_name(minor: u32) -> String {
 /// The replicas' nodes that exist: their minors and attributes, for
 /// devfs.
 pub fn pts_nodes() -> Vec<(u32, PtsNode)> {
+    // Those of other processes of the page are in their memories.
+    if let Some(h) = (super::held::me() > 0).then(|| super::held::any_elsewhere(super::held::Kind::PtyUnit, super::held::me())).flatten() {
+        super::note_unimplemented(format!("the ptmx replicas' nodes in /dev, some of which process {h} of the page holds: in the page each process has its own copy of them, not the system's"));
+    }
     state().list.iter().enumerate().filter_map(|(i, e)| e.as_ref().and_then(|s| s.node.map(|n| (i as u32, n)))).collect()
 }
 
 /// The replica node of `minor`, if it exists.
 pub fn pts_node(minor: u32) -> Option<PtsNode> {
-    state().list.get(minor as usize).and_then(|e| e.as_ref()).and_then(|s| s.node)
+    let n = state().list.get(minor as usize).and_then(|e| e.as_ref()).and_then(|s| s.node);
+    if n.is_none() {
+        super::held::noted_elsewhere(super::held::Kind::PtyUnit, &minor.to_le_bytes(), || format!("the ptmx replica {}", ptmx_get_name(minor)));
+    }
+    n
 }
 
 /// `_devfs_setattr(pt_devhandle, mode, uid, gid)`: the pty's node set,

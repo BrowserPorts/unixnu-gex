@@ -101,6 +101,23 @@ fn rung() {
     }
 }
 
+/// The host's wait queue its thread-call runner sleeps on, where the
+/// runner sleeps on one the processes of the page share
+/// ([`set_bell_queue`]): what another process notifies to ring this one's
+/// bell. 0 for none.
+static BELL_QUEUE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The thread-call runner sleeps on wait queue `id`, which every process
+/// of the page can notify.
+pub fn set_bell_queue(id: u32) {
+    BELL_QUEUE.store(id, std::sync::atomic::Ordering::Release);
+}
+
+/// [`set_bell_queue`]'s queue, 0 for none.
+pub fn bell_queue() -> u32 {
+    BELL_QUEUE.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// The armed thread calls, by deadline (and a sequence number, so two at
 /// the same instant both stay).
 #[derive(Debug, Default)]

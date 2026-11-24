@@ -4,12 +4,17 @@
 //! and exec. A process in a persona is counted against the persona's id
 //! rather than its real uid, and Sandbox and the bank read the persona of
 //! the current thread.
+//!
+//! A process holds a persona by its handle, which names one persona of the
+//! registry for good: the persona is valid while the registry lists it
+//! (`persona_valid`). In the page the registry is the global kernel's,
+//! which a process takes whole for as long as natively its lock is held
+//! ([`super::share::Whole::Personas`]).
 
 use crate::errno::Errno;
 use crate::syscalls::Kernel;
 use crate::GuestMem;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 /// `PERSONA_ID_NONE`.
 pub const ID_NONE: u32 = u32::MAX;
@@ -91,27 +96,28 @@ impl SpawnPersona {
     }
 }
 
-/// `struct persona`.
-#[derive(Debug)]
+/// `struct persona`, as a process holds it: its handle (`key`, which no
+/// other persona of the system has had or will have) and what never
+/// changes of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Persona {
+    key: u64,
     pub id: u32,
     ptype: i32,
     login: Vec<u8>,
     path: Option<Vec<u8>>,
     uid: u32,
-    /// `persona_valid`: in the list, not yet deallocated.
-    valid: AtomicBool,
 }
 
 impl Persona {
     /// `persona_get_type`: none once it is no longer valid.
     pub fn get_type(&self) -> i32 {
-        if self.valid.load(Ordering::Acquire) { self.ptype } else { ty::INVALID }
+        if self.valid() { self.ptype } else { ty::INVALID }
     }
 
     /// `persona_get_uid`.
     pub fn get_uid(&self) -> u32 {
-        if self.valid.load(Ordering::Acquire) { self.uid } else { super::cred::UID_NONE }
+        if self.valid() { self.uid } else { super::cred::UID_NONE }
     }
 
     /// `persona_is_adoption_allowed`: a system or system proxy persona.
@@ -119,31 +125,174 @@ impl Persona {
         self.ptype == ty::SYSTEM || self.ptype == ty::SYSTEM_PROXY
     }
 
+    /// `persona_valid`: in the list, not yet deallocated.
     fn valid(&self) -> bool {
-        self.valid.load(Ordering::Acquire)
+        registry().list.iter().any(|p| p.key == self.key)
+    }
+
+    fn put(&self, p: &mut super::ipc::wire::Put) {
+        p.u64(self.key);
+        p.u32(self.id);
+        p.i32(self.ptype);
+        p.bytes(&self.login);
+        p.opt(self.path.as_deref(), |p, s| p.bytes(s));
+        p.u32(self.uid);
+    }
+
+    fn get(g: &mut super::ipc::wire::Get<'_>) -> Result<Persona, super::ipc::wire::Bad> {
+        Ok(Persona { key: g.u64()?, id: g.u32()?, ptype: g.i32()?, login: g.bytes()?, path: g.opt(|g| g.bytes())?, uid: g.u32()? })
     }
 }
 
-/// `all_personas`, the newest first, and `g_next_persona_id`.
+/// `all_personas`, the newest first, `g_next_persona_id`, and the next
+/// handle.
+#[derive(Debug, PartialEq, Eq)]
 struct Registry {
-    list: Vec<Arc<Persona>>,
+    list: Vec<Persona>,
     next_id: u32,
+    next_key: u64,
 }
 
-fn registry() -> std::sync::MutexGuard<'static, Registry> {
-    static R: Mutex<Registry> = Mutex::new(Registry { list: Vec::new(), next_id: FIRST_PERSONA_ID });
+impl Registry {
+    const fn new() -> Registry {
+        Registry { list: Vec::new(), next_id: FIRST_PERSONA_ID, next_key: 1 }
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut p = super::ipc::wire::Put::default();
+        p.u32(self.next_id);
+        p.u64(self.next_key);
+        p.len(self.list.len());
+        for q in &self.list {
+            q.put(&mut p);
+        }
+        p.0
+    }
+
+    fn of_bytes(b: &[u8]) -> Result<Registry, super::ipc::wire::Bad> {
+        let g = &mut super::ipc::wire::Get::new(b);
+        let mut r = Registry { next_id: g.u32()?, next_key: g.u64()?, list: Vec::new() };
+        for _ in 0..g.len()? {
+            r.list.push(Persona::get(g)?);
+        }
+        if !g.done() {
+            return Err(g.bad("the end of the persona registry"));
+        }
+        Ok(r)
+    }
+}
+
+/// The registry this kernel holds, and, where it is the system's for the
+/// processes of the page (the global kernel's), the process holding it
+/// taken and the kernel call it took it in.
+struct Held {
+    r: Registry,
+    taken: Option<(i32, String)>,
+}
+
+static R: Mutex<Held> = Mutex::new(Held { r: Registry::new(), taken: None });
+
+fn held() -> std::sync::MutexGuard<'static, Held> {
     R.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The registry as a caller has it for as long as natively its lock is
+/// held: this kernel's, or in the page the system's taken whole from the
+/// global kernel, given back with what the caller changed when it goes.
+enum RegistryGuard {
+    Here(std::sync::MutexGuard<'static, Held>),
+    Taken(Registry),
+}
+
+impl std::ops::Deref for RegistryGuard {
+    type Target = Registry;
+    fn deref(&self) -> &Registry {
+        match self {
+            RegistryGuard::Here(g) => &g.r,
+            RegistryGuard::Taken(r) => r,
+        }
+    }
+}
+
+impl std::ops::DerefMut for RegistryGuard {
+    fn deref_mut(&mut self) -> &mut Registry {
+        match self {
+            RegistryGuard::Here(g) => &mut g.r,
+            RegistryGuard::Taken(r) => r,
+        }
+    }
+}
+
+impl Drop for RegistryGuard {
+    fn drop(&mut self) {
+        if let RegistryGuard::Taken(r) = self {
+            super::share::give_whole(super::share::Whole::Personas, &r.to_bytes());
+        }
+    }
+}
+
+/// The system's registry, locked: in the page, taken from the global
+/// kernel.
+fn registry() -> RegistryGuard {
+    if let Some(b) = super::share::take_whole(super::share::Whole::Personas, "kernel call") {
+        return match Registry::of_bytes(&b) {
+            Ok(r) => RegistryGuard::Taken(r),
+            Err(e) => panic!("gex: the global kernel's persona registry is not one ({e:?})"),
+        };
+    }
+    RegistryGuard::Here(held())
+}
+
+/// A process of the page takes the system's registry (this kernel's, the
+/// global one), in its kernel call `call`, with `room` bytes for it.
+pub(crate) fn system_take(pid: i32, call: String, room: usize) -> super::share::Taking {
+    use super::share::Taking;
+    let mut h = held();
+    if h.taken.is_some() {
+        return Taking::Held;
+    }
+    let b = h.r.to_bytes();
+    if b.len() > room {
+        return Taking::Long(b.len());
+    }
+    h.taken = Some((pid, call));
+    Taking::Got(b)
+}
+
+/// Its holder gives it back: the registry as it left it. `EINVAL` from a
+/// process that does not hold it, or for bytes that are not a registry.
+pub(crate) fn system_put(pid: i32, b: &[u8]) -> Result<(), i64> {
+    let mut h = held();
+    if !h.taken.as_ref().is_some_and(|(p, _)| *p == pid) {
+        return Err(22);
+    }
+    h.r = Registry::of_bytes(b).map_err(|_| 22)?;
+    h.taken = None;
+    Ok(())
+}
+
+/// Process `pid` of the page has exited: the registry, if it held it, as
+/// it was last given back, the loss recorded. Whether it held it.
+pub(crate) fn system_exited(pid: i32) -> bool {
+    let mut h = held();
+    if !h.taken.as_ref().is_some_and(|(p, _)| *p == pid) {
+        return false;
+    }
+    let (_, call) = h.taken.take().expect("held");
+    drop(h);
+    super::share::note_lost(pid, &super::share::lost_in_call(pid, "the persona registry", &call));
+    true
+}
+
 /// `persona_lookup`: the valid persona of id `id`.
-pub fn lookup(id: u32) -> Option<Arc<Persona>> {
-    registry().list.iter().find(|p| p.id == id && p.valid()).cloned()
+pub fn lookup(id: u32) -> Option<Persona> {
+    registry().list.iter().find(|p| p.id == id).cloned()
 }
 
 /// `persona_find_all`: the personas matching every one of the login, the
 /// id and the type given (at least one), the first `cap` of them, and how
 /// many match.
-fn find_all(login: Option<&[u8]>, uid: u32, ptype: i32, cap: usize) -> Result<(Vec<Arc<Persona>>, usize), (Errno, Option<usize>)> {
+fn find_all(login: Option<&[u8]>, uid: u32, ptype: i32, cap: usize) -> Result<(Vec<Persona>, usize), (Errno, Option<usize>)> {
     let mut want = 0;
     if login.is_some() {
         want += 1;
@@ -175,7 +324,7 @@ fn find_all(login: Option<&[u8]>, uid: u32, ptype: i32, cap: usize) -> Result<(V
         }
         if m == want {
             if cap > found {
-                out.push(Arc::clone(p));
+                out.push(p.clone());
             }
             found += 1;
         }
@@ -325,12 +474,13 @@ impl Kernel {
             r.next_id = r.next_id.wrapping_add(PERSONA_ID_STEP);
         }
         let uid = le32(&k, kinfo::UID);
-        let persona = Arc::new(Persona { id: pid, ptype, login, path, uid, valid: AtomicBool::new(true) });
         m.write_u32(idp, pid).map_err(|_| Errno::EFAULT)?;
         k[kinfo::ID..kinfo::ID + 4].copy_from_slice(&pid.to_le_bytes());
         kpersona_copyout(m, &k, infop)?;
-        // persona_init_end.
-        r.list.insert(0, persona);
+        // persona_init_end: listed, and valid from now on.
+        let key = r.next_key;
+        r.next_key += 1;
+        r.list.insert(0, Persona { key, id: pid, ptype, login, path, uid });
         Ok(())
     }
 
@@ -343,19 +493,17 @@ impl Kernel {
         let id = m.read_u32(idp).map_err(|_| Errno::EFAULT)?;
         // persona_lookup_and_invalidate.
         let mut r = registry();
+        // (The list holds the valid ones: one leaves it as it is
+        // invalidated.)
         let at = r.list.iter().position(|p| p.id == id).ok_or(Errno::ESRCH)?;
-        if !r.list[at].valid() {
-            return Err(Errno::ESRCH);
-        }
-        let p = r.list.remove(at);
-        p.valid.store(false, Ordering::Release);
+        r.list.remove(at);
         Ok(())
     }
 
     /// The persona `kpersona_info_syscall` and `kpersona_getpath_syscall`
     /// look up: the current one, or another (by root or the persona
     /// manager).
-    fn kpersona_lookup_asked(&mut self, m: &GuestMem<'_>, idp: u64) -> Result<Arc<Persona>, Errno> {
+    fn kpersona_lookup_asked(&mut self, m: &GuestMem<'_>, idp: u64) -> Result<Persona, Errno> {
         let id = m.read_u32(idp).map_err(|_| Errno::EFAULT)?;
         let mut look = self.darwin_current_persona_id();
         if id != 0 && id != look {
@@ -411,12 +559,12 @@ impl Kernel {
     }
 
     /// `current_persona_get`: the current persona, while it is valid.
-    pub(crate) fn darwin_current_persona(&mut self) -> Option<Arc<Persona>> {
+    pub(crate) fn darwin_current_persona(&mut self) -> Option<Persona> {
         lookup(self.darwin_current_persona_id())
     }
 
     /// `persona_proc_get`: process `pid`'s persona, valid or not.
-    fn darwin_persona_of(&self, pid: i32) -> Option<Arc<Persona>> {
+    fn darwin_persona_of(&self, pid: i32) -> Option<Persona> {
         if pid == self.pid {
             return self.dtask.persona.clone();
         }
@@ -477,12 +625,12 @@ impl Kernel {
     /// counted against the persona's id from now on unless that would pass
     /// its RLIMIT_NPROC (EACCES); with a spawn's ids, its credential
     /// changed as `kauth_cred_proc_update` changes it.
-    pub(crate) fn darwin_persona_adopt(&mut self, persona: Arc<Persona>, derive: Option<&SpawnPersona>) -> Result<(), Errno> {
+    pub(crate) fn darwin_persona_adopt(&mut self, persona: Persona, derive: Option<&SpawnPersona>) -> Result<(), Errno> {
         if !persona.valid() {
             return Err(Errno::EINVAL);
         }
         // proc_set_persona_internal.
-        if self.dtask.persona.as_ref().is_some_and(|p| Arc::ptr_eq(p, &persona)) {
+        if self.dtask.persona.as_ref().is_some_and(|p| p.key == persona.key) {
             return Ok(());
         }
         let new_uid = persona.id;
@@ -512,5 +660,42 @@ impl Kernel {
         // MULTIUSER_CONFIG is never set here, host_set_multiuser_config_flags
         // not being served.)
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_registry_is_the_same_registry_after_its_bytes() {
+        let r = Registry {
+            list: vec![
+                Persona { key: 2, id: 511, ptype: ty::SYSTEM, login: b"two".to_vec(), path: Some(b"/var/two".to_vec()), uid: 511 },
+                Persona { key: 1, id: 501, ptype: 2, login: b"one".to_vec(), path: None, uid: u32::MAX },
+            ],
+            next_id: 521,
+            next_key: 3,
+        };
+        let b = r.to_bytes();
+        assert_eq!(Registry::of_bytes(&b).unwrap(), r);
+        assert!(Registry::of_bytes(&b[..b.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn a_process_of_the_page_takes_the_systems_registry_whole() {
+        use crate::darwin::share::Taking;
+        // (this binary's registry is the one the global kernel holds;
+        // this test alone takes it, and puts it back as it was)
+        let Taking::Got(b) = system_take(81, "a call".into(), 1 << 20) else { panic!("taken") };
+        assert!(matches!(system_take(82, "a call".into(), 1 << 20), Taking::Held));
+        assert_eq!(system_put(82, &b), Err(22));
+        assert_eq!(system_put(81, &b[..b.len() - 1]), Err(22));
+        assert_eq!(system_put(81, &b), Ok(()));
+        let Taking::Got(_) = system_take(83, "kernel call by thread 9".into(), 1 << 20) else { panic!("taken") };
+        assert!(system_exited(83));
+        assert!(!system_exited(83));
+        assert!(String::from_utf8_lossy(&crate::darwin::share::lost_header(0)).contains("the persona registry's changes made by process 83's kernel call by thread 9"));
+        assert_eq!(held().r.to_bytes(), b);
     }
 }

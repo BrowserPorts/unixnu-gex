@@ -857,6 +857,18 @@ impl Kernel {
         }
     }
 
+    /// Whether vnode `v`'s locks are another process's of the page, whose
+    /// lock table is its own copy there (reported, for the caller to fail);
+    /// else this process may hold some of them from now on (until its end,
+    /// when the record lets them go with its locks).
+    fn darwin_locks_elsewhere(&mut self, v: Vnode, path: &str) -> bool {
+        let mut key = v.0.to_le_bytes().to_vec();
+        key.extend_from_slice(&v.1.to_le_bytes());
+        let Some(h) = super::held::claim(super::held::Kind::FileLocks, &key, self.pid) else { return false };
+        self.darwin_elsewhere(&format!("the advisory locks of {path}"), h);
+        true
+    }
+
     pub(crate) fn darwin_waker(&mut self) -> Waker {
         Waker { pid: self.pid, tid: self.tid, inbox: Arc::clone(&self.dtask.lock_wakes), bell: self.darwin_timer_bell() }
     }
@@ -925,6 +937,9 @@ impl Kernel {
             }
             return Err(Errno::EOPNOTSUPP);
         };
+        if self.darwin_locks_elsewhere(v, &file.path) {
+            return Err(Errno::ENOSYS);
+        }
         let offset = file.offset() as i64;
         let fg = Arc::as_ptr(&file) as usize;
         let size = || file.handle.metadata().map(|md| md.size as i64);
@@ -1038,6 +1053,9 @@ impl Kernel {
 
     /// A flock lock (`flock`, or `open`'s O_EXLOCK and O_SHLOCK).
     fn darwin_flock_set(&mut self, file: &Arc<OpenFile>, v: Vnode, ty: i16, wait: u32, open_fd: Option<i32>) -> Result<Option<(Cont, Option<crate::darwin::time::Instant>)>, Errno> {
+        if self.darwin_locks_elsewhere(v, &file.path) {
+            return Err(Errno::ENOSYS);
+        }
         let fg = Arc::as_ptr(file) as usize;
         let mut fl = Flock { whence: SEEK_SET, ty, ..Default::default() };
         if ty == F_UNLCK {

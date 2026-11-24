@@ -70,6 +70,16 @@ impl Instant {
         Instant(BIAS + (clock().monotonic)())
     }
 
+    /// The instant as a duration, for another kernel of the system, on
+    /// the same clock, to take back ([`Instant::of_reading`]).
+    pub(crate) fn reading(self) -> Duration {
+        self.0
+    }
+
+    pub(crate) fn of_reading(d: Duration) -> Instant {
+        Instant(d)
+    }
+
     /// The time from `earlier` to this one; zero when `earlier` is later.
     pub fn duration_since(&self, earlier: Instant) -> Duration {
         self.0.saturating_sub(earlier.0)

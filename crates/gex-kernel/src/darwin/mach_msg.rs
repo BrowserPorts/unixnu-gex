@@ -1614,7 +1614,17 @@ impl Kernel {
     /// its threads woken, its ports' and sets' knotes told.
     pub(crate) fn darwin_ipc_remote(&mut self, m: &mut GuestMem<'_>) {
         let Some(link) = self.dtask.ipc_raw.link.clone() else { return };
-        let got = std::mem::take(&mut *link.mailbox.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut got = std::mem::take(&mut *link.mailbox.lock().unwrap_or_else(|e| e.into_inner()));
+        // And what other processes of the page left in its global mailbox.
+        let key = self.dtask.ipc_raw.task;
+        if key != 0 {
+            for b in super::ipc::wire::mailbox_take(key) {
+                match super::ipc::wire::remote_of(&b) {
+                    Ok(r) => got.push(r),
+                    Err(e) => panic!("gex: a remote in task {key}'s global mailbox is not one ({e:?})"),
+                }
+            }
+        }
         if got.is_empty() {
             return;
         }
@@ -1647,6 +1657,14 @@ impl Kernel {
                     if let Some(reply) = super::mig::later_reply(token, ret, &scalars) {
                         self.darwin_answer_later(m, token, reply);
                     }
+                }
+                super::ipc::Remote::Policy(op) => self.darwin_policy_with(|p| op.apply(p)),
+                super::ipc::Remote::Ledger { to_me, to_others, unkept } => {
+                    use std::sync::atomic::Ordering::AcqRel;
+                    let l = std::sync::Arc::clone(&self.dtask.rusage.bank.lock().unwrap_or_else(|e| e.into_inner()));
+                    l.to_me.fetch_add(to_me, AcqRel);
+                    l.to_others.fetch_add(to_others, AcqRel);
+                    l.unkept.fetch_or(unkept, AcqRel);
                 }
             }
         }

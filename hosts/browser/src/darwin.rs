@@ -135,7 +135,15 @@ fn start(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> Result<u
     let ctx_addr = h.threads[cur()].ctx_addr();
     h.kernel.next_ctx_slot.reset(ctx_slots_below(ctx_addr).max(1));
 
-    // The system boots, with the page's payload (gexc's GEX_DARWIN_BOOT).
+    // This Worker's process, which the system's state the global kernel
+    // holds (the IPC table first) knows it by.
+    gex_kernel::darwin::held::set_me(h.kernel.pid);
+    // The system boots, with the page's payload (gexc's GEX_DARWIN_BOOT):
+    // the one every Darwin process of the page boots from.
+    {
+        let files = BOOT.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        darwin::share::boot_payload(&files).map_err(|e| load(format!("the boot payload: {e}")))?;
+    }
     h.kernel.darwin = true;
     let tc = boot_file("TrustCache");
     let sandbox = darwin::SandboxProfiles { platform: boot_file("sandbox_profile.bin"), builtin: boot_file("sandbox_builtin.bin"), protobox: boot_file("sandbox_protobox.bin") };
@@ -164,7 +172,7 @@ fn start(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> Result<u
     let (uid, gid) = (k.creds.uid(), k.creds.gid());
     k.dtask.cred = darwin::cred::Cred::of(uid, gid);
     k.dtask.uniqueid = darwin::next_uniqueid();
-    k.dtask.start = darwin::procinfo::microtime();
+    k.dtask.start_now();
     k.signals.thread().set_darwin_id(darwin::next_thread_id());
     k.darwin_cred_tokens();
     k.darwin_use_pages();
@@ -183,6 +191,9 @@ fn start(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> Result<u
     k.dtask.task_uniqueid = darwin::next_task_uniqueid();
     k.darwin_signals_init();
     k.darwin_nofile_sync();
+    // One of the page's Darwin processes from now on, and what the others
+    // changed of the state it reads from its start, reported.
+    k.darwin_page_start();
     // (No scheduler maintenance thread: the page runs none, and the
     // averages it would keep say so when asked, `Sched::check`.)
     // A system launchd has booted has its Preboot volume grafted: with
@@ -303,6 +314,33 @@ pub(crate) fn task_end(k: &mut gex_kernel::syscalls::Kernel) {
     }
 }
 
+/// This process ends without having ended its task: gex could not run it
+/// on (its Worker trapped out, `gex_abandon`, or its frames ended with no
+/// exit, `gex_process_gone`), and it ends as a killed one. Outside a kernel
+/// call its kernel's state is whole and its task ends as a killed
+/// process's does ([`task_end`]). A trap inside one (`in_call`) cut the
+/// call off where it was: its task cannot end, which is said here and
+/// recorded for every process of the page that takes the IPC table, as
+/// what this one lost of the system's IPC state. (The table, if the call
+/// held it, the global kernel takes back at the exit as it was last given
+/// back, and records that loss too: `ipc::wire::process_exited`.)
+/// Nothing for a Linux process.
+pub(crate) fn abandoned(in_call: bool) {
+    if !darwin_process() {
+        return;
+    }
+    if !in_call {
+        with_exec_lock(|h| task_end(&mut h.kernel));
+        return;
+    }
+    let pid = my_pid();
+    let what = format!(
+        "process {pid}'s task's end (it ended inside a kernel call, where gex failed): its IPC space, the rights in it and the ports it held stay in the system's table, none destroyed and no notification sent"
+    );
+    gex_kernel::darwin_say!("[gex:{pid}] Darwin: not implemented: {what}");
+    gex_kernel::darwin::share::note_lost(pid, &what);
+}
+
 /// The threads started on Workers of their own ([`adopted`]) that have not
 /// ended: what [`task_end`] ends with the process.
 fn on_workers() -> std::sync::MutexGuard<'static, Vec<i32>> {
@@ -392,6 +430,8 @@ fn calls_init(k: &mut gex_kernel::syscalls::Kernel) {
     if CALLS_Q.load(Ordering::Acquire) == 0 {
         CALLS_Q.store(unsafe { k_wq_new() }, Ordering::Release);
     }
+    // Which the other processes of the page notify to ring its bell.
+    gex_kernel::darwin::timer::set_bell_queue(CALLS_Q.load(Ordering::Acquire));
     gex_kernel::darwin::timer::set_ring_hook(rung);
     gex_kernel::darwin::timer::set_host_runs_thread_calls();
 }
@@ -477,8 +517,10 @@ pub extern "C" fn gex_darwin_thread_calls() -> u32 {
         let poll_due = polled && next_poll.map_or(true, |t| Instant::now() >= t);
         let piped = count > 0 && (woken || poll_due);
         let rewatch = REWATCH.swap(false, Ordering::AcqRel);
-        // The thread calls: the bell rang, or the earliest is due.
-        let rang = seen != Some(bell.generation());
+        // The thread calls: the bell rang (here, or another process of the
+        // page left this task something: a notify it woke for), or the
+        // earliest is due.
+        let rang = seen != Some(bell.generation()) || (woken && gex_kernel::darwin::ipc::wire::own_mail_waiting());
         let due = next_call.is_some_and(|t| Instant::now() >= t);
         if rang || due || piped || rewatch {
             seen = Some(bell.generation());

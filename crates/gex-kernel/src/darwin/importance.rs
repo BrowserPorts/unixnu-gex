@@ -29,6 +29,66 @@ use std::sync::Arc;
 /// A task's policy, shared by its process.
 pub type Policy = Arc<super::taskpolicy::PolicyCell>;
 
+/// A task's policy as its element reaches it: the cell, where the process
+/// holding the table is the task's own (natively every task's); else, in
+/// the page, a task of another process, whose policy is in that process's
+/// memory: a mirror of its importance marks, which that process sets each
+/// time it gives the table back, and whose changes made here go to it
+/// ([`super::ipc::Remote::Policy`]) as well.
+#[derive(Clone, Debug)]
+pub enum PolicyAt {
+    Cell(Policy),
+    Mirror(Importance),
+}
+
+impl PolicyAt {
+    /// The task's importance marks.
+    fn marks(&self) -> Importance {
+        match self {
+            PolicyAt::Cell(c) => c.lock().unwrap_or_else(|e| e.into_inner()).imp,
+            PolicyAt::Mirror(m) => *m,
+        }
+    }
+}
+
+/// A change another task's call makes to a task's importance marks and
+/// boost ([`PolicyAt`]), as the task's own process applies it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolicyOp {
+    /// `task_update_boost_locked`: boosted (with a transition) or not.
+    Boost(bool),
+    /// A live donor's mark propagated (`ipc_importance_task_update_live_donor`).
+    DonorPropagated(bool),
+    /// `ipc_importance_reset_locked`'s donor mark cleared.
+    ResetDonor,
+}
+
+impl PolicyOp {
+    /// The change, on the task's policy.
+    pub fn apply(self, p: &mut super::taskpolicy::TaskPolicy) {
+        self.apply_marks(&mut p.imp);
+        if let PolicyOp::Boost(b) = self {
+            p.set_boosted(b);
+        }
+    }
+
+    /// The change, on its importance marks alone (a mirror's).
+    fn apply_marks(self, imp: &mut Importance) {
+        match self {
+            PolicyOp::Boost(b) => {
+                if b {
+                    imp.transitions += 1;
+                }
+            }
+            PolicyOp::DonorPropagated(d) => imp.donor_propagated = d,
+            PolicyOp::ResetDonor => {
+                imp.donor = false;
+                imp.donor_propagated = false;
+            }
+        }
+    }
+}
+
 /// A live donor's donor mark changed with its effective policy: its
 /// importance is to be propagated ([`Ipc::importance_settle`]).
 pub static LIVE_DONOR_CHANGED: AtomicBool = AtomicBool::new(false);
@@ -60,9 +120,12 @@ pub struct ImpTask {
     kmsgs: Vec<u64>,
     /// `iit_task`: the task's key and process; none once disconnected.
     task: Option<(TaskKey, i32)>,
+    /// The task's key, kept after the task is disconnected: whose policy
+    /// this is.
+    owner: TaskKey,
     /// The task's policy, with its marks, which outlive the task as the
     /// element's do.
-    policy: Policy,
+    policy: PolicyAt,
     /// `iit_inherits`: the inherit elements made from this one (or from
     /// an inherit to it).
     inherits: Vec<u64>,
@@ -151,6 +214,25 @@ impl Ipc {
         }
     }
 
+    /// `op` on task element `h`'s policy: its cell's, or its mirror's and,
+    /// told to its task's process, the cell's there.
+    fn imp_policy_change(&mut self, h: u64, op: PolicyOp) {
+        let it = self.itask(h);
+        match &mut it.policy {
+            PolicyAt::Cell(c) => {
+                let c = Arc::clone(c);
+                op.apply(&mut c.lock().unwrap_or_else(|e| e.into_inner()));
+            }
+            PolicyAt::Mirror(m) => {
+                op.apply_marks(m);
+                let owner = it.owner;
+                // (a task that has ended hears nothing, as its policy
+                // outlives it unread)
+                self.remote(owner, super::ipc::Remote::Policy(op));
+            }
+        }
+    }
+
     fn itask_ref(&self, h: u64) -> &ImpTask {
         match self.vouchers.imp.elems.get(&h) {
             Some(Elem::Task(t)) => t,
@@ -207,7 +289,7 @@ impl Ipc {
 
     fn imp_marks(&self, t: Option<u64>) -> Importance {
         match t {
-            Some(h) => self.itask_ref(h).policy.lock().unwrap_or_else(|e| e.into_inner()).imp,
+            Some(h) => self.itask_ref(h).policy.marks(),
             None => Importance::default(),
         }
     }
@@ -263,10 +345,16 @@ impl Ipc {
             return None;
         }
         let link = self.links.get(&key)?;
-        let (pid, policy) = (link.pid, link.policy.clone()?);
+        let policy = match (&link.policy, &link.elsewhere) {
+            (Some(p), _) => PolicyAt::Cell(Arc::clone(p)),
+            // Another process's task: its marks as its process gave them.
+            (None, Some(super::ipc::Elsewhere { marks: Some(m), .. })) => PolicyAt::Mirror(*m),
+            _ => return None,
+        };
+        let pid = link.pid;
         let imp = self.imp();
         let h = imp.alloc();
-        imp.elems.insert(h, Elem::Task(ImpTask { refs: 1, made: 0, externcnt: 0, externdrop: 0, kmsgs: Vec::new(), task: Some((key, pid)), policy, inherits: Vec::new(), assertcnt: 0, legacy_externcnt: 0, legacy_externdrop: 0, filelocks: 0, updatepolicy: false, queued: false }));
+        imp.elems.insert(h, Elem::Task(ImpTask { refs: 1, made: 0, externcnt: 0, externdrop: 0, kmsgs: Vec::new(), task: Some((key, pid)), owner: key, policy, inherits: Vec::new(), assertcnt: 0, legacy_externcnt: 0, legacy_externdrop: 0, filelocks: 0, updatepolicy: false, queued: false }));
         imp.by_task.insert(key, h);
         Some(h)
     }
@@ -513,13 +601,7 @@ impl Ipc {
                 self.imp_release(t);
                 continue;
             }
-            let policy = Arc::clone(&it.policy);
-            let mut p = policy.lock().unwrap_or_else(|e| e.into_inner());
-            if boost {
-                p.imp.transitions += 1;
-            }
-            p.set_boosted(boost);
-            drop(p);
+            self.imp_policy_change(t, PolicyOp::Boost(boost));
             self.imp_release(t);
         }
         self.importance_settle();
@@ -531,15 +613,12 @@ impl Ipc {
         LIVE_DONOR_CHANGED.store(false, Ordering::Relaxed);
         let tasks: Vec<u64> = self.vouchers.imp.by_task.values().copied().collect();
         for t in tasks {
-            let policy = Arc::clone(&self.itask(t).policy);
-            let mut p = policy.lock().unwrap_or_else(|e| e.into_inner());
-            let imp = &mut p.imp;
+            let imp = self.itask_ref(t).policy.marks();
             if !imp.live_donor || imp.donor == imp.donor_propagated {
                 continue;
             }
-            imp.donor_propagated = imp.donor;
             let hold = imp.donor;
-            drop(p);
+            self.imp_policy_change(t, PolicyOp::DonorPropagated(hold));
             self.imp_propagate_assertion(t, hold, false);
         }
     }
@@ -670,10 +749,7 @@ impl Ipc {
     fn imp_reset(&mut self, h: u64, donor: bool) {
         let before = self.imp_is_donor(Some(h));
         if donor {
-            let policy = Arc::clone(&self.itask(h).policy);
-            let mut p = policy.lock().unwrap_or_else(|e| e.into_inner());
-            p.imp.donor = false;
-            p.imp.donor_propagated = false;
+            self.imp_policy_change(h, PolicyOp::ResetDonor);
         }
         let t = self.itask(h);
         t.externcnt -= t.legacy_externcnt;
@@ -1412,5 +1488,201 @@ impl Ipc {
             return Err(kr::INVALID_TASK);
         }
         unreachable!("a de-nap receiver's inherit: no task is one on iOS");
+    }
+}
+
+// -- the state as bytes ([`super::ipc::wire`]) ------------------------------------------
+
+use super::ipc::wire::{sorted, Bad, Get, OwnTask, Put};
+
+fn put_marks(p: &mut Put, m: &Importance) {
+    for b in [m.donor, m.live_donor, m.receiver, m.denap_receiver] {
+        p.bool(b);
+    }
+    p.u64(m.transitions);
+    p.bool(m.donor_propagated);
+}
+
+fn get_marks(g: &mut Get<'_>) -> Result<Importance, Bad> {
+    Ok(Importance { donor: g.bool()?, live_donor: g.bool()?, receiver: g.bool()?, denap_receiver: g.bool()?, transitions: g.u64()?, donor_propagated: g.bool()? })
+}
+
+fn put_u64s(p: &mut Put, v: &[u64]) {
+    p.len(v.len());
+    for &x in v {
+        p.u64(x);
+    }
+}
+
+fn get_u64s(g: &mut Get<'_>) -> Result<Vec<u64>, Bad> {
+    let n = g.len()?;
+    (0..n).map(|_| g.u64()).collect()
+}
+
+impl ImpState {
+    /// The elements and messages as bytes: a task element's policy as its
+    /// importance marks (a cell's as they are now), whose task the
+    /// element's owner names.
+    pub fn put(&self, p: &mut Put) {
+        p.len(self.elems.len());
+        for (&h, e) in sorted(&self.elems) {
+            p.u64(h);
+            match e {
+                Elem::Task(t) => {
+                    p.u8(0);
+                    for w in [t.refs, t.made, t.externcnt, t.externdrop] {
+                        p.u32(w);
+                    }
+                    put_u64s(p, &t.kmsgs);
+                    p.opt(t.task, |p, (k, pid)| {
+                        p.u64(k);
+                        p.i32(pid);
+                    });
+                    p.u64(t.owner);
+                    put_marks(p, &t.policy.marks());
+                    put_u64s(p, &t.inherits);
+                    for w in [t.assertcnt, t.legacy_externcnt, t.legacy_externdrop, t.filelocks] {
+                        p.u32(w);
+                    }
+                    p.bool(t.updatepolicy);
+                    p.bool(t.queued);
+                }
+                Elem::Inherit(i) => {
+                    p.u8(1);
+                    for w in [i.refs, i.made, i.externcnt, i.externdrop] {
+                        p.u32(w);
+                    }
+                    p.bool(i.donating);
+                    p.u32(i.depth);
+                    p.u64(i.to_task);
+                    p.opt(i.from_elem, Put::u64);
+                }
+            }
+        }
+        p.len(self.by_task.len());
+        for (&k, &h) in sorted(&self.by_task) {
+            p.u64(k);
+            p.u64(h);
+        }
+        let mut ended: Vec<TaskKey> = self.ended.iter().copied().collect();
+        ended.sort_unstable();
+        put_u64s(p, &ended);
+        p.len(self.kmsgs.len());
+        for (&k, m) in sorted(&self.kmsgs) {
+            p.u64(k);
+            p.opt(m.elem, Put::u64);
+            p.bool(m.raised);
+            p.u64(m.dest);
+        }
+        p.u64(self.next_kmsg);
+        p.u64(self.next_handle);
+        p.len(self.watchports.len());
+        for (&k, v) in sorted(&self.watchports) {
+            p.u64(k);
+            put_u64s(p, v);
+        }
+    }
+
+    /// The state [`ImpState::put`] made: the elements of `own`'s task have
+    /// its policy's cell, every other task's the marks as a mirror.
+    pub fn get(g: &mut Get<'_>, own: &OwnTask) -> Result<ImpState, Bad> {
+        let n = g.len()?;
+        let mut elems = HashMap::new();
+        for _ in 0..n {
+            let h = g.u64()?;
+            let e = match g.u8()? {
+                0 => {
+                    let (refs, made, externcnt, externdrop) = (g.u32()?, g.u32()?, g.u32()?, g.u32()?);
+                    let kmsgs = get_u64s(g)?;
+                    let task = g.opt(|g| Ok((g.u64()?, g.i32()?)))?;
+                    let owner = g.u64()?;
+                    let marks = get_marks(g)?;
+                    let policy = match &own.policy {
+                        Some(c) if owner == own.task => PolicyAt::Cell(Arc::clone(c)),
+                        _ => PolicyAt::Mirror(marks),
+                    };
+                    let inherits = get_u64s(g)?;
+                    Elem::Task(ImpTask { refs, made, externcnt, externdrop, kmsgs, task, owner, policy, inherits, assertcnt: g.u32()?, legacy_externcnt: g.u32()?, legacy_externdrop: g.u32()?, filelocks: g.u32()?, updatepolicy: g.bool()?, queued: g.bool()? })
+                }
+                1 => Elem::Inherit(ImpInherit { refs: g.u32()?, made: g.u32()?, externcnt: g.u32()?, externdrop: g.u32()?, donating: g.bool()?, depth: g.u32()?, to_task: g.u64()?, from_elem: g.opt(Get::u64)? }),
+                _ => return Err(g.bad("an importance element's kind")),
+            };
+            elems.insert(h, e);
+        }
+        let n = g.len()?;
+        let by_task = (0..n).map(|_| Ok((g.u64()?, g.u64()?))).collect::<Result<_, Bad>>()?;
+        let ended = get_u64s(g)?.into_iter().collect();
+        let n = g.len()?;
+        let kmsgs = (0..n).map(|_| Ok((g.u64()?, KmsgImp { elem: g.opt(Get::u64)?, raised: g.bool()?, dest: g.u64()? }))).collect::<Result<_, Bad>>()?;
+        let (next_kmsg, next_handle) = (g.u64()?, g.u64()?);
+        let n = g.len()?;
+        let watchports = (0..n).map(|_| Ok((g.u64()?, get_u64s(g)?))).collect::<Result<_, Bad>>()?;
+        Ok(ImpState { elems, by_task, ended, kmsgs, next_kmsg, next_handle, watchports })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::darwin::taskpolicy::{PolicyCell, TaskPolicy};
+
+    fn state(policy: &Policy) -> ImpState {
+        let mut s = ImpState::default();
+        let task = ImpTask { refs: 2, made: 1, externcnt: 3, externdrop: 1, kmsgs: vec![7], task: Some((5, 105)), owner: 5, policy: PolicyAt::Cell(Arc::clone(policy)), inherits: vec![0x40], assertcnt: 4, legacy_externcnt: 1, legacy_externdrop: 0, filelocks: 2, updatepolicy: false, queued: true };
+        s.elems.insert(0x4000_0040, Elem::Task(task));
+        s.elems.insert(0x4000_0080, Elem::Inherit(ImpInherit { refs: 1, made: 0, externcnt: 1, externdrop: 0, donating: true, depth: 2, to_task: 0x4000_0040, from_elem: None }));
+        s.by_task.insert(5, 0x4000_0040);
+        s.ended.insert(3);
+        s.kmsgs.insert(7, KmsgImp { elem: Some(0x4000_0080), raised: true, dest: 12 });
+        s.next_kmsg = 8;
+        s.next_handle = 0x4000_0080;
+        s.watchports.insert(5, vec![12, 13]);
+        s
+    }
+
+    fn bytes(s: &ImpState) -> Vec<u8> {
+        let mut p = Put::default();
+        s.put(&mut p);
+        p.0
+    }
+
+    #[test]
+    fn a_task_element_is_its_own_processs_cell_and_a_mirror_elsewhere() {
+        let mut tp = TaskPolicy::default();
+        tp.imp.mark_receiver(true);
+        tp.imp.mark_donor(true);
+        let policy: Policy = Arc::new(PolicyCell::new(tp));
+        let s = state(&policy);
+        let b = bytes(&s);
+        // Its own process: the cell itself.
+        let own = OwnTask { task: 5, policy: Some(Arc::clone(&policy)), ledger: None, link: None };
+        let mut g = Get::new(&b);
+        let mine = ImpState::get(&mut g, &own).expect("it decodes");
+        assert!(g.done());
+        let Some(Elem::Task(t)) = mine.elems.get(&0x4000_0040) else { panic!("the task element") };
+        assert!(matches!(&t.policy, PolicyAt::Cell(c) if Arc::ptr_eq(c, &policy)));
+        assert_eq!(bytes(&mine), b);
+        // Another: the marks, as they were.
+        let other = OwnTask { task: 6, policy: Some(Arc::new(PolicyCell::default())), ledger: None, link: None };
+        let theirs = ImpState::get(&mut Get::new(&b), &other).expect("it decodes");
+        let Some(Elem::Task(t)) = theirs.elems.get(&0x4000_0040) else { panic!("the task element") };
+        assert!(matches!(t.policy, PolicyAt::Mirror(m) if m == policy.lock().unwrap().imp));
+        assert_eq!(bytes(&theirs), b);
+        assert!(ImpState::get(&mut Get::new(&b[..b.len() - 1]), &other).is_err());
+    }
+
+    #[test]
+    fn a_change_is_the_same_on_a_mirror_as_on_the_cell() {
+        for op in [PolicyOp::Boost(true), PolicyOp::Boost(false), PolicyOp::DonorPropagated(false), PolicyOp::ResetDonor] {
+            let mut tp = TaskPolicy::default();
+            tp.imp.mark_donor(true);
+            let mut mirror = tp.imp;
+            op.apply(&mut tp);
+            op.apply_marks(&mut mirror);
+            assert_eq!(mirror, tp.imp, "{op:?}");
+        }
+        let mut tp = TaskPolicy::default();
+        PolicyOp::Boost(true).apply(&mut tp);
+        assert!(tp.requested.boosted);
     }
 }

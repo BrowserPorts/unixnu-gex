@@ -140,12 +140,27 @@ impl Clone for Aio {
 /// `_aio_exit` (and `_aio_exec`): what was never returned stops counting.
 impl Drop for Aio {
     fn drop(&mut self) {
-        TOTAL.fetch_sub((self.active.len() + self.done.len()) as i32, Ordering::Relaxed);
+        let n = (self.active.len() + self.done.len()) as i32;
+        TOTAL.fetch_sub(n, Ordering::Relaxed);
+        if n != 0 {
+            total_add(-n);
+        }
     }
 }
 
+/// `aio_total_count` changed by `delta` for this process: the system's
+/// count after, where the global kernel holds every process's of the page
+/// (each ended with its process); none elsewhere, where [`TOTAL`] is it.
+fn total_add(delta: i32) -> Option<i64> {
+    let me = super::held::me();
+    if me <= 0 {
+        return None;
+    }
+    super::held::count(super::held::Kind::Aio, me, delta)
+}
+
 fn has_any_work() -> bool {
-    TOTAL.load(Ordering::Relaxed) != 0
+    total_add(0).map_or_else(|| TOTAL.load(Ordering::Relaxed) != 0, |t| t != 0)
 }
 
 /// `aio_suspend`'s wait in progress (its list is in [`Aio::suspended`]).
@@ -193,6 +208,12 @@ impl Kernel {
             return false;
         }
         if TOTAL.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |t| (t < AIO_MAX).then_some(t + 1)).is_err() {
+            return false;
+        }
+        // The system's count, every process's in the page.
+        if total_add(1).is_some_and(|t| t > i64::from(AIO_MAX)) {
+            total_add(-1);
+            TOTAL.fetch_sub(1, Ordering::Relaxed);
             return false;
         }
         if let Some(g) = group {
@@ -319,6 +340,7 @@ impl Kernel {
         if let Some(i) = q.done.iter().position(|e| e.uaiocbp == a[0]) {
             let e = q.done.remove(i);
             TOTAL.fetch_sub(1, Ordering::Relaxed);
+            total_add(-1);
             return Ok(e.returnval as u64);
         }
         if q.active.iter().any(|e| e.uaiocbp == a[0]) {

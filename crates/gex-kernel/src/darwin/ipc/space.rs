@@ -170,6 +170,13 @@ impl Space {
         s
     }
 
+    /// Whether the space is as [`Space::new`] makes one, but for its
+    /// random seed and the free list's order that seed gave: active, at
+    /// its first size, with no name in it.
+    pub fn is_new(&self) -> bool {
+        self.active && self.size == ENTRY_SIZE * TABLE_MIN && self.hashed == 0 && self.rev.is_empty() && self.names().next().is_none()
+    }
+
     /// The space `ipc_space_terminate` leaves a task that has ended:
     /// inactive, its table gone, so no name is in it and none is given out
     /// (KERN_INVALID_TASK).

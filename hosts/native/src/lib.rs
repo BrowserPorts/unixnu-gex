@@ -4498,7 +4498,7 @@ fn exec_darwin(
 ) -> Result<(Exit, Stats)> {
     let loaded = match load_darwin_image(&kernel, &img) {
         Ok(l) => l,
-        Err(why) => {
+        Err((_, why)) => {
             // The process ends, its task with it, as one SIGKILL ended.
             kernel.darwin_task_terminate();
             kernel.close_all_fds();
@@ -4517,17 +4517,8 @@ fn darwin_killed(why: String) -> Result<(Exit, Stats)> {
 
 /// The activated image's file read, its slice loaded with dyld, and its
 /// signature checked as `load_code_signature` checks it.
-fn load_darwin_image(kernel: &Kernel, img: &gex_kernel::darwin::execve::Image) -> std::result::Result<gex_kernel::darwin::image::DarwinImage, String> {
-    let Some(bytes) = kernel.read_file(&img.path) else { return Err(format!("cannot read {}", img.path)) };
-    let Some(slice) = bytes.get(img.arch_offset as usize..(img.arch_offset + img.arch_size) as usize) else {
-        return Err(format!("{}'s slice is past its end", img.path));
-    };
-    let read = |p: &str| kernel.read_file(p).ok_or_else(|| format!("cannot read {p}"));
-    let loaded = gex_kernel::darwin::image::load(slice, &img.path, &read)?;
-    if let Some(cs) = &loaded.code_signature {
-        gex_kernel::darwin::codesign::validate_csblob(cs).map_err(|_| format!("{}'s code signature is not valid", img.path))?;
-    }
-    Ok(loaded)
+fn load_darwin_image(kernel: &Kernel, img: &gex_kernel::darwin::execve::Image) -> std::result::Result<gex_kernel::darwin::image::DarwinImage, (gex_kernel::errno::Errno, String)> {
+    kernel.darwin_load_image(img)
 }
 
 /// The process switched over to a loaded image: the other threads are
@@ -4635,20 +4626,18 @@ fn start_darwin_spawn(cx: &SpawnContext, mut child: Kernel) -> std::result::Resu
         procs.reap(pid);
         Err(e)
     };
+    // load_machfile's failure in exec_activate_image: the call's error
+    // (EBADEXEC for parse_machfile's LOAD_FAILURE or a bad signature,
+    // EBADMACHO, EIO for a file that cannot be read), the child ended as
+    // posix_spawn's failure ends it.
     let loaded = match load_darwin_image(&child, &img) {
         Ok(l) => l,
-        Err(why) => {
+        Err((e, why)) => {
             if std::env::var_os("GEX_TRACE_EXIT").is_some() {
                 eprintln!("[gex:{pid}] posix_spawn: {why}");
             }
-            let e = if child.read_file(&img.path).is_none() {
-                Errno::EIO
-            } else if why.contains("code signature") {
-                gex_kernel::darwin::errno::EBADEXEC
-            } else {
-                gex_kernel::darwin::errno::native(88)
-            };
-            return fail(&mut child, e);
+            child.darwin_spawn_load_failed();
+            return Err(e);
         }
     };
     // The child switched over to its image and the image activated, its

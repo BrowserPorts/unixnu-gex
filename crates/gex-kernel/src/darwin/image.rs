@@ -79,3 +79,104 @@ pub fn load(bytes: &[u8], name: &str, read: &dyn Fn(&str) -> Result<Vec<u8>, Str
         thread_stack,
     })
 }
+
+/// `MH_EXECUTE`, `MH_DYLINKER`, and the header flags `MH_DYLDLINK` and
+/// `MH_PIE` (`mach-o/loader.h`).
+const MH_EXECUTE: u32 = 0x2;
+const MH_DYLINKER: u32 = 0x7;
+const MH_DYLDLINK: u32 = 0x4;
+const MH_PIE: u32 = 0x0020_0000;
+/// `CPU_TYPE_X86_64` and `CPU_TYPE_ARM64` (`mach/machine.h`).
+const CPU_TYPE_X86_64: u32 = 0x0100_0007;
+const CPU_TYPE_ARM64: u32 = 0x0100_000c;
+
+/// `parse_machfile`'s check of the executable's header (xnu-10063
+/// mach_loader.c, the image at depth 1, as a RELEASE kernel builds it,
+/// the web device's): an `MH_EXECUTE` that names dyld (`MH_DYLDLINK`)
+/// must be position independent where `pie_required` says (arm64 always);
+/// one that does not, a static executable, is refused but for x86_64
+/// (and under Rosetta, which iOS does not have), its `#if !(DEVELOPMENT ||
+/// DEBUG)`; any other file type at that depth is refused. Each refusal is
+/// `LOAD_FAILURE`, which exec's `load_return_to_errno` makes `EBADEXEC`.
+/// What the header said, for a refused one; `None` for one it lets
+/// through, or a slice too short to hold a header (the load says why).
+pub fn exec_header_refused(slice: &[u8]) -> Option<String> {
+    let w = |o: usize| slice.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    let (Some(cputype), Some(filetype), Some(flags)) = (w(4), w(12), w(24)) else { return None };
+    match filetype {
+        MH_EXECUTE if flags & MH_DYLDLINK != 0 => (flags & MH_PIE == 0 && cputype == CPU_TYPE_ARM64).then(|| "a dynamic executable that is not position independent (MH_PIE), which arm64 requires (pie_required)".to_string()),
+        MH_EXECUTE if cputype == CPU_TYPE_X86_64 => None,
+        MH_EXECUTE => Some("a static executable (no MH_DYLDLINK), which only a DEVELOPMENT or DEBUG kernel loads".to_string()),
+        MH_DYLINKER => Some("dyld itself as the executable (MH_DYLINKER at depth 1)".to_string()),
+        t => Some(format!("a Mach-O file of type {t:#x}, not an executable")),
+    }
+}
+
+impl crate::syscalls::Kernel {
+    /// `load_machfile` of the image an exec or a spawn activated
+    /// (`img`'s slice of its file), as `exec_mach_imgact` calls it:
+    /// the image, or the errno its failure is (`EIO` for a file that cannot
+    /// be read, `EBADEXEC` for `parse_machfile`'s `LOAD_FAILURE` and for a
+    /// signature that is not valid, `EBADMACHO` for a file that does not
+    /// load) and why.
+    pub fn darwin_load_image(&self, img: &super::execve::Image) -> Result<DarwinImage, (crate::errno::Errno, String)> {
+        use super::errno::{EBADEXEC, EBADMACHO};
+        let Some(bytes) = self.read_file(&img.path) else { return Err((crate::errno::Errno::EIO, format!("cannot read {}", img.path))) };
+        let Some(slice) = bytes.get(img.arch_offset as usize..(img.arch_offset + img.arch_size) as usize) else {
+            return Err((EBADMACHO, format!("{}'s slice is past its end", img.path)));
+        };
+        if let Some(why) = exec_header_refused(slice) {
+            return Err((EBADEXEC, format!("{}: {why}", img.path)));
+        }
+        let read = |p: &str| self.read_file(p).ok_or_else(|| format!("cannot read {p}"));
+        let loaded = load(slice, &img.path, &read).map_err(|e| (EBADMACHO, e))?;
+        if let Some(cs) = &loaded.code_signature {
+            super::codesign::validate_csblob(cs).map_err(|_| (EBADEXEC, format!("{}'s code signature is not valid", img.path)))?;
+        }
+        Ok(loaded)
+    }
+
+    /// A spawn's child whose image did not load, in its spawner's call
+    /// (`exec_activate_image`'s error in `posix_spawn`): ended as that
+    /// call's failure ends it, `exit1(p, 1)` with `P_LIST_DEADPARENT` and
+    /// `p_posix_spawn_failed` (`proc_prepareexit`'s critical exit, which a
+    /// crash behavior of PANIC_ON_EXIT or _SPAWN_FAIL makes a panic), its
+    /// task ended, its descriptors closed, and gone unseen by its parent.
+    pub fn darwin_spawn_load_failed(&mut self) {
+        self.dtask.spawn_failed = true;
+        self.darwin_critical_exit(1);
+        self.darwin_task_terminate();
+        self.close_all_fds();
+        self.procs.reap(self.pid);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::exec_header_refused;
+
+    fn header(cputype: u32, filetype: u32, flags: u32) -> Vec<u8> {
+        let mut h = vec![0u8; 32];
+        h[..4].copy_from_slice(&0xfeed_facfu32.to_le_bytes());
+        h[4..8].copy_from_slice(&cputype.to_le_bytes());
+        h[12..16].copy_from_slice(&filetype.to_le_bytes());
+        h[24..28].copy_from_slice(&flags.to_le_bytes());
+        h
+    }
+
+    /// parse_machfile's switch on a RELEASE kernel: a dynamic position
+    /// independent arm64 executable loads; a static one, one not position
+    /// independent, dyld and any other file type do not.
+    #[test]
+    fn a_release_kernel_loads_only_dynamic_pie_executables() {
+        const ARM64: u32 = 0x0100_000c;
+        assert_eq!(exec_header_refused(&header(ARM64, 2, 0x0020_0085)), None);
+        assert!(exec_header_refused(&header(ARM64, 2, 0x0020_0001)).unwrap().contains("static"));
+        assert!(exec_header_refused(&header(ARM64, 2, 0x85)).unwrap().contains("MH_PIE"));
+        assert!(exec_header_refused(&header(ARM64, 7, 0x85)).is_some());
+        assert!(exec_header_refused(&header(ARM64, 6, 0x0020_0085)).is_some());
+        // x86_64 static executables are allowed (not iOS's, but as written).
+        assert_eq!(exec_header_refused(&header(0x0100_0007, 2, 0)), None);
+        assert_eq!(exec_header_refused(&[0u8; 8]), None);
+    }
+}

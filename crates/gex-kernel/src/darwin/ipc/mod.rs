@@ -812,6 +812,43 @@ fn request_table_grow(ocount: usize) -> usize {
 }
 
 impl Ipc {
+    /// What of this handle a process's other host cannot take: anything
+    /// but its task's key (which crosses), a space as a new task's (the
+    /// other host makes one, of its own random seed) and what it keeps of
+    /// the table's while it does not hold it (its cell, link, ledger, counters
+    /// and the host's exception actions, which its next check out takes
+    /// again). A handle that holds the table, or whose task is the first
+    /// or has ended, does not cross at all.
+    pub fn uncarried(&self) -> Vec<&'static str> {
+        let Ipc { objects, next_id: _, space, others, task: _, ended, initproc, cell: _, held, next_task_hint: _, links, callout_remotes, own_ledger: _, link: _, globals, host_special, host_exc: _, outbox, guards, queues, timestamp: _, pinned_hard, vouchers, ith_assertions, caller } = self;
+        let mut lost = Vec::new();
+        let differs = |a: &dyn std::fmt::Debug, b: &dyn std::fmt::Debug| format!("{a:?}") != format!("{b:?}");
+        for (what, set) in [
+            ("ipc_raw.held", *held),
+            ("ipc_raw.ended", *ended),
+            ("ipc_raw.initproc", *initproc),
+            ("ipc_raw.objects", !objects.is_empty()),
+            ("ipc_raw.space", !space.is_new()),
+            ("ipc_raw.others", !others.is_empty()),
+            ("ipc_raw.links", !links.is_empty()),
+            ("ipc_raw.callout_remotes", callout_remotes.lock().unwrap_or_else(|e| e.into_inner()).is_some()),
+            ("ipc_raw.globals", !globals.is_empty()),
+            ("ipc_raw.host_special", !host_special.is_empty()),
+            ("ipc_raw.outbox", !outbox.is_empty()),
+            ("ipc_raw.guards", !guards.is_empty()),
+            ("ipc_raw.queues", differs(queues, &msg::Queues::default())),
+            ("ipc_raw.pinned_hard", *pinned_hard),
+            ("ipc_raw.vouchers", differs(vouchers, &super::voucher::VoucherTables::default())),
+            ("ipc_raw.ith_assertions", *ith_assertions != 0),
+            ("ipc_raw.caller", caller.is_some()),
+        ] {
+            if set {
+                lost.push(what);
+            }
+        }
+        lost
+    }
+
     /// Take the system's table from `cell` for this task: its space comes
     /// out of the shared spaces (a task taking it the first time gets its
     /// key and keeps the space it has). A task that has ended has neither:

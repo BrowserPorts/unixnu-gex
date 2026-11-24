@@ -161,6 +161,23 @@ pub struct Record {
 }
 
 impl Record {
+    /// The record as bytes, for another process of the page (its `p_ru` in
+    /// its record, [`super::procinfo::Facts::exited`]).
+    pub(crate) fn put(&self, p: &mut super::ipc::wire::Put) {
+        for &v in &self.w {
+            p.u64(v);
+        }
+        p.u64(self.unkept);
+    }
+
+    pub(crate) fn get(g: &mut super::ipc::wire::Get<'_>) -> Result<Record, super::ipc::wire::Bad> {
+        let mut w = [0u64; WORDS];
+        for v in w.iter_mut() {
+            *v = g.u64()?;
+        }
+        Ok(Record { w, unkept: g.u64()? })
+    }
+
     /// The structure's bytes.
     pub fn bytes(&self) -> Vec<u8> {
         self.w.iter().flat_map(|v| v.to_le_bytes()).collect()
@@ -559,25 +576,55 @@ pub mod cpmu {
         (u128::from(ns) * u128::from(STATES_MHZ[state()]) / 1000) as u64
     }
 
+    /// Rollups under way (a thread's count moving from its context to its
+    /// task's ended threads': a thread's end, an exec's), and how many have
+    /// ended: a reader that met one reads again, so that no instruction is
+    /// missed or counted twice (XNU's recount moves a thread's counts into
+    /// its task's in one step).
+    static ROLLING: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    static ROLLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// A rollup of threads' counts into their task's, `f`, as a reader of
+    /// [`instructions`] sees it: whole, before or after.
+    pub fn rollup<R>(f: impl FnOnce() -> R) -> R {
+        use std::sync::atomic::Ordering::{AcqRel, Release};
+        ROLLING.fetch_add(1, AcqRel);
+        let r = f();
+        ROLLED.fetch_add(1, Release);
+        ROLLING.fetch_sub(1, Release);
+        r
+    }
+
     /// The task's instructions: its ended threads' (`dead`) and each of
-    /// `threads`' context's count, read with `read`; none where they are
-    /// not counted or a context cannot be read.
-    pub fn instructions(dead: u64, threads: Option<&crate::signal::ThreadSigs>, read: &mut dyn FnMut(u64) -> Option<u64>) -> Option<u64> {
+    /// `threads`' context's count, read with `read`, with no rollup
+    /// between ([`rollup`]); none where they are not counted or a context
+    /// cannot be read.
+    pub fn instructions(dead: &dyn Fn() -> u64, threads: Option<&crate::signal::ThreadSigs>, read: &mut dyn FnMut(u64) -> Option<u64>) -> Option<u64> {
+        use std::sync::atomic::Ordering::Acquire;
         if !gex_abi::count_instructions() {
             return None;
         }
-        let mut n = dead;
-        if let Some(threads) = threads {
-            for tid in threads.tids() {
-                let Some(t) = threads.get(tid) else { continue };
-                let c = t.ctx();
-                if c == 0 {
-                    continue;
+        loop {
+            let gen = ROLLED.load(Acquire);
+            if ROLLING.load(Acquire) != 0 {
+                std::thread::yield_now();
+                continue;
+            }
+            let mut n = dead();
+            if let Some(threads) = threads {
+                for tid in threads.tids() {
+                    let Some(t) = threads.get(tid) else { continue };
+                    let c = t.ctx();
+                    if c == 0 {
+                        continue;
+                    }
+                    n = n.wrapping_add(read(c + ctx::INSTRUCTIONS as u64)?);
                 }
-                n = n.wrapping_add(read(c + ctx::INSTRUCTIONS as u64)?);
+            }
+            if ROLLING.load(Acquire) == 0 && ROLLED.load(Acquire) == gen {
+                return Some(n);
             }
         }
-        Some(n)
     }
 }
 
@@ -735,7 +782,7 @@ pub fn instructions_from_outside(procs: &crate::proc::ProcTable, pid: i32, p: &s
     let mut n = None;
     peer.mem.with_guest(&mut |g| {
         let mut k = g.kernel();
-        n = cpmu::instructions(procs.dead_instructions(pid), p.threads.as_deref(), &mut |a| k.read_u64(a).ok());
+        n = cpmu::instructions(&|| procs.dead_instructions(pid), p.threads.as_deref(), &mut |a| k.read_u64(a).ok());
     });
     n
 }
@@ -808,9 +855,17 @@ pub fn crash_record(procs: &crate::proc::ProcTable, pid: i32, p: &super::procinf
 /// with no `p_ru` adds nothing ("lost p_ru").
 pub fn reaped(child: &super::procinfo::Public, parent: &super::procinfo::Public, times: u32) {
     let Some(r) = child.rusage.exited() else { return };
-    let mut c = parent.rusage.child.lock().unwrap_or_else(|e| e.into_inner());
-    for _ in 0..times {
-        c.add(&r);
+    parent.rusage.add_reaped(&r, times);
+}
+
+impl Shared {
+    /// `update_rusage_info_child` of a reaped child's `p_ru` `r` into this
+    /// process's, `times` times ([`reaped`]).
+    pub fn add_reaped(&self, r: &Record, times: u32) {
+        let mut c = self.child.lock().unwrap_or_else(|e| e.into_inner());
+        for _ in 0..times {
+            c.add(r);
+        }
     }
 }
 
@@ -843,7 +898,7 @@ impl Kernel {
                 let mut i = input(&self.procs, pid, &target);
                 i.instructions = if pid == self.pid {
                     let mut k = m.kernel();
-                    cpmu::instructions(self.procs.dead_instructions(pid), target.threads.as_deref(), &mut |a| k.read_u64(a).ok())
+                    cpmu::instructions(&|| self.procs.dead_instructions(pid), target.threads.as_deref(), &mut |a| k.read_u64(a).ok())
                 } else {
                     instructions_from_outside(&self.procs, pid, &target)
                 };
@@ -904,10 +959,12 @@ impl Kernel {
             if c == 0 {
                 continue;
             }
-            t.set_ctx(0);
-            if let Ok(n) = k.read_u64(c + gex_abi::ctx::INSTRUCTIONS as u64) {
-                self.procs.add_dead_instructions(self.pid, n);
-            }
+            cpmu::rollup(|| {
+                t.set_ctx(0);
+                if let Ok(n) = k.read_u64(c + gex_abi::ctx::INSTRUCTIONS as u64) {
+                    self.procs.add_dead_instructions(self.pid, n);
+                }
+            });
         }
     }
 
@@ -1026,7 +1083,7 @@ mod tests {
         // The states are the device tree's, the fast cores' top last.
         assert_eq!(cpmu::STATES_MHZ[cpmu::state()], 2400);
         // A task whose instructions are not counted has none.
-        assert_eq!(cpmu::instructions(5, None, &mut |_| Some(1)), gex_abi::count_instructions().then_some(5));
+        assert_eq!(cpmu::instructions(&|| 5, None, &mut |_| Some(1)), gex_abi::count_instructions().then_some(5));
     }
 
     #[test]

@@ -37,6 +37,13 @@ pub struct MkTimers {
     map: HashMap<ObjId, MkTimer>,
 }
 
+impl MkTimers {
+    /// Whether the task has no Mach timers.
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+}
+
 impl Kernel {
     /// `mk_timer_create_trap`: the name of a new timer's receive right, or
     /// null.

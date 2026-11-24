@@ -314,6 +314,12 @@ impl Kernel {
             vtimer_bits: if super::itimer::fork_rlim_cpu(t.rlimits.cur(super::rlimit::res::CPU)) != (0, 0) { super::itimer::vt::RLIM } else { 0 },
             dispatchqueue_serialno_offset: t.dispatchqueue_serialno_offset,
             dispatchqueue_label_offset: t.dispatchqueue_label_offset,
+            // forkproc_init: p_forkcopy's p_workq_allow_sigmask and
+            // p_pcaction (a spawn with attributes sets p_pcaction again
+            // from them), and p_vfs_iopolicy's inherited flags.
+            workq_allow_sigmask: t.workq_allow_sigmask,
+            pcaction: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(t.pcaction.load(std::sync::atomic::Ordering::Acquire))),
+            vfs_iopolicy: t.vfs_iopolicy & super::procpolicy::P_VFS_IOPOLICY_INHERITED_MASK,
             vm: t.vm.inherited(),
             map_max: t.map_max,
             map_min: t.map_min,
@@ -1223,4 +1229,24 @@ impl Kernel {
 /// `binary_match`'s CPU type `CPU_TYPE_ANY`, for the activators.
 pub(crate) fn is_any(cpu: u32) -> bool {
     cpu == CPU_TYPE_ANY
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::syscalls::Kernel;
+
+    /// forkproc_init's copies: p_workq_allow_sigmask and p_pcaction (of
+    /// p_forkcopy), and p_vfs_iopolicy less ALLOW_LOW_SPACE_WRITES.
+    #[test]
+    fn a_child_takes_what_forkproc_copies() {
+        let mut k = Kernel::new(0x1000, 0x10000, "/prog".into());
+        k.dtask.workq_allow_sigmask = 1 << 13;
+        k.dtask.pcaction.store(2, std::sync::atomic::Ordering::Release);
+        k.dtask.vfs_iopolicy = 0x0042 | super::super::procpolicy::P_VFS_IOPOLICY_ALLOW_LOW_SPACE_WRITES;
+        let t = k.darwin_fork_task();
+        assert_eq!(t.workq_allow_sigmask, 1 << 13);
+        assert_eq!(t.pcaction.load(std::sync::atomic::Ordering::Acquire), 2);
+        assert!(!std::sync::Arc::ptr_eq(&t.pcaction, &k.dtask.pcaction), "the child's own");
+        assert_eq!(t.vfs_iopolicy, 0x0042);
+    }
 }

@@ -161,6 +161,19 @@ pub mod op {
     pub const CHANGE_TAKE: u32 = 58;
     pub const CHANGE_DONE: u32 = 59;
     pub const CHANGE_STATE: u32 = 60;
+    /// A process's job state after a change, for its parent's wait
+    /// ([`crate::proc::ProcTable::job_set`]): the request the pid, the
+    /// change's event (a byte: 0 neither, 1 a stop, 2 a continue) and the
+    /// state.
+    pub const JOB_SET: u32 = 61;
+    /// One look of a Darwin wait ([`crate::proc::ProcTable::darwin_wait_step`]):
+    /// the request the parent's pid, the pid waited for, and a byte of
+    /// flags (ends 1, stops 2, continues 4, WNOWAIT 8, waitid 16, a look
+    /// only that takes nothing 32); the answer a byte for what it found (0
+    /// no child, 1 nothing yet, 2 an end, 3 a stop, 4 a continue), then the
+    /// pid, the status word or signal, and the end's p_xhighbits or the
+    /// continue's p_contproc.
+    pub const DWAIT: u32 = 62;
 }
 
 /// The system's process table, where this kernel is the global one: the
@@ -330,6 +343,18 @@ pub(crate) fn record_get(pid: i32) -> Option<(Vec<u8>, bool)> {
     Some((rest.to_vec(), exited != 0))
 }
 
+/// Whether process `pid`'s record here (the global kernel's) carries its
+/// `p_ru` (it ended, and stashed it).
+pub(crate) fn record_has_usage(pid: i32) -> bool {
+    record_usage(pid).is_some()
+}
+
+/// Process `pid`'s `p_ru`, as its record here carries it.
+fn record_usage(pid: i32) -> Option<super::rusage::Record> {
+    let b = records().get(&pid)?.0.clone();
+    super::procinfo::Public::of_record(pid, &b).ok()?.table?.exited
+}
+
 /// The records' end with their processes: an exit marks it (and ends the
 /// changes waiting for it: whether any were), a reap drops it (the global
 /// kernel's).
@@ -344,6 +369,51 @@ pub fn record_process_exited(pid: i32) -> bool {
         x.pending.clear();
     }
     waiting
+}
+
+/// Process `pid`'s job state after a change, for the global kernel's entry
+/// its parent's wait reads.
+pub(crate) fn job_set(pid: i32, j: crate::proc::Job, ev: crate::proc::JobEvent) {
+    let Some(r) = remote() else { return };
+    let mut p = super::ipc::wire::Put::default();
+    p.i32(pid);
+    p.u8(match ev {
+        crate::proc::JobEvent::Neither => 0,
+        crate::proc::JobEvent::Stop => 1,
+        crate::proc::JobEvent::Cont => 2,
+    });
+    j.put(&mut p);
+    call(r, op::JOB_SET, &p.0, &mut []);
+}
+
+/// One look of a Darwin wait by `ppid` for `want`, in the global kernel's
+/// table (`look`: only whether it would answer, taking nothing): what it
+/// found, and a child collected's `p_ru` when its record carries one.
+pub fn dwait(ppid: i32, want: i32, jobs: crate::syscalls::JobWait, nowait: bool, waitid: bool, look: bool) -> (crate::proc::WaitStep, Option<super::rusage::Record>) {
+    use crate::proc::WaitStep;
+    let r = remote().expect("a Darwin wait through the global kernel");
+    let mut req = ppid.to_le_bytes().to_vec();
+    req.extend_from_slice(&want.to_le_bytes());
+    let f = u8::from(jobs.exits) | u8::from(jobs.stops) << 1 | u8::from(jobs.continues) << 2 | u8::from(nowait) << 3 | u8::from(waitid) << 4 | u8::from(look) << 5;
+    req.push(f);
+    let mut o = [0u8; 13 + 1 + 8 * (super::rusage::WORDS + 1)];
+    let n = call_upto(r, op::DWAIT, &req, &mut o);
+    let g = &mut super::ipc::wire::Get::new(&o[..n]);
+    let got = (|| {
+        let (k, pid, a, b) = (g.u8()?, g.i32()?, g.u32()?, g.u32()?);
+        let usage = g.opt(super::rusage::Record::get)?;
+        Ok::<_, super::ipc::wire::Bad>((k, pid, a, b, usage))
+    })();
+    let Ok((k, pid, a, b, usage)) = got else { panic!("gex: the global kernel's Darwin wait answered {got:?}") };
+    let step = match k {
+        0 => WaitStep::NoChild,
+        1 => WaitStep::Nothing,
+        2 => WaitStep::Ended { pid, word: a, xhighbits: b as u8 },
+        3 => WaitStep::Stopped { pid, xstat: a },
+        4 => WaitStep::Continued { pid, xstat: a, contproc: b as i32 },
+        k => panic!("gex: the global kernel's Darwin wait answered {k}"),
+    };
+    (step, usage)
 }
 
 /// The changes other processes of the page left for each process: the
@@ -844,6 +914,59 @@ pub fn serve(op: u32, req: &[u8], out: &mut [u8]) -> i64 {
                 Ok(()) => 0,
                 Err(e) => -e,
             }
+        }
+        op::JOB_SET => {
+            let (Some(p), 5..) = (system_procs(), req.len()) else { return -EINVAL };
+            let pid = i32::from_le_bytes(req[..4].try_into().unwrap());
+            let ev = match req[4] {
+                0 => crate::proc::JobEvent::Neither,
+                1 => crate::proc::JobEvent::Stop,
+                2 => crate::proc::JobEvent::Cont,
+                _ => return -EINVAL,
+            };
+            let g = &mut super::ipc::wire::Get::new(&req[5..]);
+            let Ok(j) = crate::proc::Job::get(g) else { return -EINVAL };
+            p.job_set(pid, j, ev);
+            0
+        }
+        op::DWAIT => {
+            use crate::proc::WaitStep;
+            let (Some(p), 9) = (system_procs(), req.len()) else { return -EINVAL };
+            let ppid = i32::from_le_bytes(req[..4].try_into().unwrap());
+            let want = i32::from_le_bytes(req[4..8].try_into().unwrap());
+            let f = req[8];
+            let jobs = crate::syscalls::JobWait { exits: f & 1 != 0, stops: f & 2 != 0, continues: f & 4 != 0 };
+            let (nowait, look) = (f & 8 != 0, f & 32 != 0);
+            let step = p.darwin_wait_step(ppid, want, jobs, nowait, f & 16 != 0, look);
+            // A child collected: its p_ru for its parent's children's usage
+            // (reap_child_locked's update_rusage_info_child, which the parent
+            // makes in its own record), then it is no longer one of the
+            // page's processes.
+            let mut usage = None;
+            if let WaitStep::Ended { pid, .. } = step {
+                if !nowait && !look {
+                    usage = record_usage(pid);
+                    super::held::process_reaped(pid);
+                }
+            }
+            let (k, pid, a, b) = match step {
+                WaitStep::NoChild => (0u8, 0, 0, 0),
+                WaitStep::Nothing => (1, 0, 0, 0),
+                WaitStep::Ended { pid, word, xhighbits } => (2, pid, word, u32::from(xhighbits)),
+                WaitStep::Stopped { pid, xstat } => (3, pid, xstat, 0),
+                WaitStep::Continued { pid, contproc, xstat } => (4, pid, xstat, contproc as u32),
+            };
+            let mut p = super::ipc::wire::Put::default();
+            p.u8(k);
+            p.i32(pid);
+            p.u32(a);
+            p.u32(b);
+            p.opt(usage.as_ref(), |p, r| r.put(p));
+            if p.0.len() > out.len() {
+                return -EINVAL;
+            }
+            out[..p.0.len()].copy_from_slice(&p.0);
+            p.0.len() as i64
         }
         op::CHANGE_POST => {
             let 4.. = req.len() else { return -EINVAL };

@@ -14084,6 +14084,13 @@ fn wait_ready(waiting: &Waiting, blocked_on: &Option<gex_kernel::BlockOp>, now: 
         // waiting, and also when there are none at all -- that is `ECHILD`,
         // which is an answer and not a reason to sleep forever.
         Waiting::Child => match blocked_on {
+            // A Darwin wait: whether the global kernel's table has an end,
+            // a stop or a continue for it (a look, taking nothing), or no
+            // child; a halt or a signal ends it too.
+            Some(gex_kernel::BlockOp::WaitChild { procs, ppid, want, waitid, jobs: Some(j), .. }) => {
+                procs.halt_code().is_some()
+                    || !matches!(gex_kernel::darwin::share::dwait(*ppid, *want, *j, true, waitid.is_some(), true).0, gex_kernel::proc::WaitStep::Nothing)
+            }
             Some(gex_kernel::BlockOp::WaitChild {
                 children,
                 procs,
@@ -21080,8 +21087,28 @@ fn publish_exit(pid: i32, status: i32) {
     // SAFETY: no arguments; the host only waits for its own deliveries.
     unsafe { drain_output() };
     if let Some(home) = sigs::home() {
+        // An exit another process's exit1 committed it to (proc_shutdown's
+        // `p_xstat`, its own table's record: `ProcTable::claim_exit`) is the
+        // status, as the table's end takes it natively.
+        let status = match home.procs().forced_exit(pid) {
+            Some(rv) => forced_code(pid, rv),
+            None => status,
+        };
         outgrow_end(pid, status);
         home.procs().exit(pid, status);
+    }
+}
+
+/// A forced exit's `p_xstat` (a wait status) as the page's exit status (an
+/// exit code, or a signal's number negated), which says the same; a core
+/// flag, which that cannot say, is reported (no exit here dumps one).
+fn forced_code(pid: i32, rv: u32) -> i32 {
+    if rv & 0x80 != 0 {
+        gex_kernel::darwin_say!("[gex:{pid}] Darwin: not implemented: a forced exit's p_xstat {rv:#x} with its core flag, which the page's exit status does not carry");
+    }
+    match rv & 0x7f {
+        0 => ((rv >> 8) & 0xff) as i32,
+        sig => -(sig as i32),
     }
 }
 

@@ -7101,14 +7101,17 @@ impl ThreadEnd<'_> {
             self.procs.add_dead_runnable(pid, runnable);
         }
         // Its retired instructions (`recount_task_rollup_thread`'s, though
-        // the task's track has them already: it is what readers sum).
-        // No longer read from its context first: a reader between the two
-        // misses it rather than counting it twice.
+        // the task's track has them already: it is what readers sum):
+        // taken from its context into its task's ended threads' in one step
+        // as a reader sees it (`cpmu::rollup`), so a reader between the two
+        // neither misses them nor counts them twice.
         if gex_abi::count_instructions() {
-            self.thread.set_ctx(0);
-            if let (Ok(n), Some(pid)) = (m.kernel().read_u64(ctx_addr + ctx::INSTRUCTIONS as u64), self.procs.task_owner(tid)) {
-                self.procs.add_dead_instructions(pid, n);
-            }
+            crate::darwin::rusage::cpmu::rollup(|| {
+                self.thread.set_ctx(0);
+                if let (Ok(n), Some(pid)) = (m.kernel().read_u64(ctx_addr + ctx::INSTRUCTIONS as u64), self.procs.task_owner(tid)) {
+                    self.procs.add_dead_instructions(pid, n);
+                }
+            });
         }
         self.thread_fs.set(ctx_addr, None);
         self.threads.remove(tid);

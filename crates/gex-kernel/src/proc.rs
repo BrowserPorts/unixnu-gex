@@ -413,6 +413,30 @@ impl Job {
     }
 }
 
+/// What a process's job state change was, for its parent's wait: a stop
+/// (`stop()`: the wait record cleared, P_CONTINUED cleared) or a continue
+/// (P_CONTINUED set), or neither (a hold's count, a kill's end of a stop).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum JobEvent {
+    #[default]
+    Neither,
+    Stop,
+    Cont,
+}
+
+/// What a Darwin wait found ([`ProcTable::darwin_wait_step`]): no child to
+/// wait for, nothing yet, an end (its wait status and `p_xhighbits`), a
+/// stop not reported (the signal), or a continue (`p_contproc` and
+/// `p_xstat`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitStep {
+    NoChild,
+    Nothing,
+    Ended { pid: i32, word: u32, xhighbits: u8 },
+    Stopped { pid: i32, xstat: u32 },
+    Continued { pid: i32, contproc: i32, xstat: u32 },
+}
+
 /// What a process of the page takes of its own record from the global
 /// kernel's process table when it starts ([`ProcTable::seed_of`],
 /// [`ProcTable::adopt_own`]).
@@ -1121,6 +1145,99 @@ impl ProcTable {
         // forkproc's memorystatus init, then memorystatus_add.
         self.jetsam().add(pid, ppid, false, crate::darwin::memorystatus::relaunch::UNKNOWN);
         pid
+    }
+
+    /// A process of the page's job state, as its own table has it after a
+    /// change (`ev`): the system's entry made the same, for its parent's
+    /// wait, with what the parent alone changes of it (the stop reported,
+    /// the continue reported) kept but as the event sets it. The parent
+    /// is woken, as `stop()` and a continue wake it.
+    pub fn job_set(&self, pid: i32, j: Job, ev: JobEvent) {
+        let Some(cell) = self.lock().procs.iter().find(|p| p.pid == pid).map(|p| Arc::clone(&p.child.job)) else { return };
+        {
+            let mut g = cell.lock().unwrap_or_else(|e| e.into_inner());
+            let (waited, continued) = (g.waited, g.continued);
+            *g = Job { waited, continued, ..j };
+            match ev {
+                JobEvent::Stop => {
+                    g.waited = false;
+                    g.continued = false;
+                }
+                JobEvent::Cont => g.continued = true,
+                JobEvent::Neither => {}
+            }
+        }
+        self.job_changed(pid);
+    }
+
+    /// One look of a Darwin wait by `ppid` for `want` (-1 any): the end to
+    /// collect (taken, the child reaped, unless `nowait`), else a stop not
+    /// reported or a continue as `jobs` asks for them (each marked reported
+    /// unless `nowait`; a stop only under `waitid` keeps its mark under
+    /// WNOWAIT, as the native wait does), else whether there is any child
+    /// to wait for. Statuses here are the page's (an exit code, or a
+    /// signal's number negated), given back as wait statuses. A `look`
+    /// (whether a wait would answer) takes and marks nothing.
+    pub fn darwin_wait_step(&self, ppid: i32, want: i32, jobs: crate::syscalls::JobWait, nowait: bool, waitid: bool, look: bool) -> WaitStep {
+        let nowait = nowait || look;
+        let candidates: Vec<ChildHandle> = self.children(ppid).into_iter().filter(|c| want <= 0 || c.pid == want).collect();
+        if candidates.is_empty() || candidates.iter().all(|c| c.reaped.load(Ordering::Acquire)) {
+            return WaitStep::NoChild;
+        }
+        for c in candidates.iter().filter(|c| !c.reaped.load(Ordering::Acquire)) {
+            let ended: Result<i32, bool> = {
+                let mut st = c.status.lock().unwrap_or_else(|e| e.into_inner());
+                if st.is_some() && !jobs.exits {
+                    Err(true)
+                } else {
+                    (if nowait { *st } else { st.take() }).ok_or(false)
+                }
+            };
+            if let Ok(code) = ended {
+                let word = if code < 0 { (-code) as u32 & 0x7f } else { ((code as u32) & 0xff) << 8 };
+                let xhighbits = if waitid && !look { self.xhighbits(c.pid) } else { 0 };
+                if !nowait {
+                    c.reaped.store(true, Ordering::Release);
+                    self.reap(c.pid);
+                    crate::darwin::held::process_reaped(c.pid);
+                }
+                return WaitStep::Ended { pid: c.pid, word, xhighbits };
+            }
+            if ended != Err(false) {
+                continue;
+            }
+            let mut job = c.job.lock().unwrap_or_else(|e| e.into_inner());
+            if waitid {
+                if job.stopped {
+                    if jobs.stops && !job.waited {
+                        if !nowait {
+                            job.waited = true;
+                        }
+                        return WaitStep::Stopped { pid: c.pid, xstat: job.xstat };
+                    }
+                } else if jobs.continues && job.continued {
+                    if !nowait {
+                        job.continued = false;
+                    }
+                    return WaitStep::Continued { pid: c.pid, contproc: job.contproc, xstat: job.xstat };
+                }
+            } else {
+                // (wait4 has no WNOWAIT: only a look leaves the marks)
+                if job.stopped && !job.waited && jobs.stops {
+                    if !look {
+                        job.waited = true;
+                    }
+                    return WaitStep::Stopped { pid: c.pid, xstat: job.xstat };
+                }
+                if jobs.continues && job.continued {
+                    if !look {
+                        job.continued = false;
+                    }
+                    return WaitStep::Continued { pid: c.pid, contproc: job.contproc, xstat: job.xstat };
+                }
+            }
+        }
+        WaitStep::Nothing
     }
 
     /// Process `pid`'s record as a process of the page takes it at its
@@ -3155,6 +3272,34 @@ mod tests {
         assert!(matches!(t.darwin(c), Some((_, true))));
         t.reap(b);
         assert!(t.darwin(b).is_none());
+    }
+
+    /// A child's stops, continues and end as its process tells the system's
+    /// table of them, found by its parent's Darwin wait once each.
+    #[test]
+    fn a_darwin_wait_finds_what_the_child_told_the_table() {
+        use crate::syscalls::JobWait;
+        let t = ProcTable::new();
+        let p = t.spawn(INIT_PID);
+        let c = t.spawn(p);
+        let all = JobWait { exits: true, stops: true, continues: true };
+        assert_eq!(t.darwin_wait_step(p, -1, all, false, false, false), WaitStep::Nothing);
+        assert_eq!(t.darwin_wait_step(c, -1, all, false, false, false), WaitStep::NoChild);
+        t.job_set(c, Job { stopped: true, xstat: 17, holds: 1, ..Job::default() }, JobEvent::Stop);
+        // A look finds it and leaves it; the wait takes it once.
+        assert_eq!(t.darwin_wait_step(p, c, all, false, false, true), WaitStep::Stopped { pid: c, xstat: 17 });
+        assert_eq!(t.darwin_wait_step(p, c, all, false, false, false), WaitStep::Stopped { pid: c, xstat: 17 });
+        assert_eq!(t.darwin_wait_step(p, c, all, false, false, false), WaitStep::Nothing);
+        // A change that is no stop or continue leaves the report as it was.
+        t.job_set(c, Job { stopped: true, xstat: 17, holds: 2, ..Job::default() }, JobEvent::Neither);
+        assert_eq!(t.darwin_wait_step(p, c, all, false, false, false), WaitStep::Nothing);
+        t.job_set(c, Job { stopped: false, xstat: 19, contproc: c, continued: true, ..Job::default() }, JobEvent::Cont);
+        assert_eq!(t.darwin_wait_step(p, c, JobWait { continues: false, ..all }, false, false, false), WaitStep::Nothing);
+        assert_eq!(t.darwin_wait_step(p, c, all, false, true, false), WaitStep::Continued { pid: c, contproc: c, xstat: 19 });
+        t.exit_code(c, 3);
+        assert_eq!(t.darwin_wait_step(p, c, all, true, false, false), WaitStep::Ended { pid: c, word: 3 << 8, xhighbits: 0 });
+        assert_eq!(t.darwin_wait_step(p, c, all, false, false, false), WaitStep::Ended { pid: c, word: 3 << 8, xhighbits: 0 });
+        assert_eq!(t.darwin_wait_step(p, c, all, false, false, false), WaitStep::NoChild);
     }
 
     /// A page process takes its own record from the system's table as it

@@ -14084,6 +14084,13 @@ fn wait_ready(waiting: &Waiting, blocked_on: &Option<gex_kernel::BlockOp>, now: 
         // waiting, and also when there are none at all -- that is `ECHILD`,
         // which is an answer and not a reason to sleep forever.
         Waiting::Child => match blocked_on {
+            // A Darwin wait: whether the global kernel's table has an end,
+            // a stop or a continue for it (a look, taking nothing), or no
+            // child; a halt or a signal ends it too.
+            Some(gex_kernel::BlockOp::WaitChild { procs, ppid, want, waitid, jobs: Some(j), .. }) => {
+                procs.halt_code().is_some()
+                    || !matches!(gex_kernel::darwin::share::dwait(*ppid, *want, *j, true, waitid.is_some(), true), gex_kernel::proc::WaitStep::Nothing)
+            }
             Some(gex_kernel::BlockOp::WaitChild {
                 children,
                 procs,

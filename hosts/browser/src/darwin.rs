@@ -774,7 +774,7 @@ pub(crate) fn safepoint(ctx_addr: u64, pc: u64) {
 /// reads from the caller as the wait begins) is not parked.
 pub(crate) fn parks(op: &gex_kernel::BlockOp) -> bool {
     use gex_kernel::BlockOp;
-    matches!(op, BlockOp::FutexWait { .. } | BlockOp::ReadStream { .. } | BlockOp::AcceptWait { .. } | BlockOp::WriteStream { xnu: Some(_), .. } | BlockOp::WriteWait { .. })
+    matches!(op, BlockOp::FutexWait { .. } | BlockOp::ReadStream { .. } | BlockOp::AcceptWait { .. } | BlockOp::WriteStream { xnu: Some(_), .. } | BlockOp::WriteWait { .. } | BlockOp::WaitChild { jobs: Some(_), .. })
 }
 
 /// Whether Darwin call wait `op` is a stream's ([`stream_round`]).
@@ -805,8 +805,68 @@ fn waiting_of(op: &gex_kernel::BlockOp) -> Waiting {
                 Waiting::Write(Arc::clone(handle))
             }
         }
-        other => unreachable!("a Darwin wait the page parks is a futex wait or a stream's, not {other:?}"),
+        // A child's end, stop or continue: on the first turn for WNOHANG,
+        // else when the global kernel's table has one ([`wait_round`]).
+        BlockOp::WaitChild { nohang: true, .. } => Waiting::Runnable,
+        BlockOp::WaitChild { .. } => Waiting::Child,
+        other => unreachable!("a Darwin wait the page parks is a futex wait, a stream's or a child's, not {other:?}"),
     }
+}
+
+/// One look of a Darwin `wait4`/`waitid` in the global kernel's process
+/// table, as the native host's `perform_block` loop makes it (the same
+/// rules: `ProcTable::darwin_wait_step`): `None` while it still waits,
+/// else what the wait gives the kernel's `finish_blocking`, with the
+/// child's status written where the call asked. A halt, or a signal for the
+/// thread, ends it with `EINTR`, as natively.
+fn wait_round(k: &mut gex_kernel::syscalls::Kernel, gm: &mut GuestMem<'_>, tid: i32, op: &gex_kernel::BlockOp) -> Option<Result<u64, gex_kernel::Errno>> {
+    use gex_kernel::proc::WaitStep;
+    use gex_kernel::{BlockOp, Errno};
+    let BlockOp::WaitChild { procs, ppid, want, wstatus, nohang, waitid, jobs: Some(j), .. } = op else { return None };
+    let nowait = waitid.is_some_and(|w| w.nowait);
+    let step = gex_kernel::darwin::share::dwait(*ppid, *want, *j, nowait, waitid.is_some(), false);
+    let r = match step {
+        WaitStep::NoChild => Err(Errno::ECHILD),
+        WaitStep::Ended { pid, word, xhighbits } => match waitid {
+            Some(w) => w.report_with(gm, pid, word, xhighbits),
+            None => (|| {
+                if *wstatus != 0 {
+                    gm.write_u32(*wstatus, word)?;
+                }
+                Ok(pid as u64)
+            })(),
+        },
+        WaitStep::Stopped { pid, xstat } => match waitid {
+            Some(w) => gex_kernel::darwin::exit::waitid_job_report(gm, w.info, pid, gex_kernel::darwin::exit::CLD_STOPPED, xstat),
+            None => (|| {
+                if *wstatus != 0 {
+                    gm.write_u32(*wstatus, 0x7f | (gex_kernel::darwin::kern::signal_to_linux(xstat) << 8))?;
+                }
+                Ok(pid as u64)
+            })(),
+        },
+        WaitStep::Continued { pid, contproc, xstat } => match waitid {
+            Some(w) => gex_kernel::darwin::exit::waitid_job_report(gm, w.info, contproc, gex_kernel::darwin::exit::CLD_CONTINUED, xstat),
+            None => (|| {
+                if *wstatus != 0 {
+                    gm.write_u32(*wstatus, 0xffff)?;
+                }
+                Ok(pid as u64)
+            })(),
+        },
+        WaitStep::Nothing if *nohang => match waitid {
+            Some(w) => w.report(gm, 0, 0),
+            None => Ok(0),
+        },
+        WaitStep::Nothing => {
+            if procs.halt_code().is_some() || k.signal_pending_for(tid) {
+                Err(Errno::EINTR)
+            } else {
+                return None;
+            }
+        }
+    };
+    Some(r)
 }
 
 /// One look at a Darwin call's wait on a stream, as the native host's
@@ -942,6 +1002,11 @@ pub(crate) fn finished(h: &mut Host, r: &mut Run, i: usize, ctx_addr: u64, tid: 
         let mut gm = guest();
         let res = if stream {
             match stream_round(&mut h.kernel, &mut gm, tid, &op, &mut owed.darwin_written) {
+                Some(res) => res,
+                None => return None,
+            }
+        } else if matches!(op, gex_kernel::BlockOp::WaitChild { .. }) {
+            match wait_round(&mut h.kernel, &mut gm, tid, &op) {
                 Some(res) => res,
                 None => return None,
             }

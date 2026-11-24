@@ -556,6 +556,9 @@ pub struct Task {
     /// for the other processes ([`procinfo::Public::put_record`]): none
     /// before it first publishes one.
     pub(crate) record_sent: Option<Vec<u8>>,
+    /// What the next change of its job state is, for its parent's wait in
+    /// the page ([`crate::proc::ProcTable::job_set`]).
+    pub(crate) job_event: crate::proc::JobEvent,
 }
 
 impl Task {

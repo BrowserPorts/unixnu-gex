@@ -161,6 +161,19 @@ pub mod op {
     pub const CHANGE_TAKE: u32 = 58;
     pub const CHANGE_DONE: u32 = 59;
     pub const CHANGE_STATE: u32 = 60;
+    /// A process's job state after a change, for its parent's wait
+    /// ([`crate::proc::ProcTable::job_set`]): the request the pid, the
+    /// change's event (a byte: 0 neither, 1 a stop, 2 a continue) and the
+    /// state.
+    pub const JOB_SET: u32 = 61;
+    /// One look of a Darwin wait ([`crate::proc::ProcTable::darwin_wait_step`]):
+    /// the request the parent's pid, the pid waited for, and a byte of
+    /// flags (ends 1, stops 2, continues 4, WNOWAIT 8, waitid 16, a look
+    /// only that takes nothing 32); the answer a byte for what it found (0
+    /// no child, 1 nothing yet, 2 an end, 3 a stop, 4 a continue), then the
+    /// pid, the status word or signal, and the end's p_xhighbits or the
+    /// continue's p_contproc.
+    pub const DWAIT: u32 = 62;
 }
 
 /// The system's process table, where this kernel is the global one: the
@@ -344,6 +357,44 @@ pub fn record_process_exited(pid: i32) -> bool {
         x.pending.clear();
     }
     waiting
+}
+
+/// Process `pid`'s job state after a change, for the global kernel's entry
+/// its parent's wait reads.
+pub(crate) fn job_set(pid: i32, j: crate::proc::Job, ev: crate::proc::JobEvent) {
+    let Some(r) = remote() else { return };
+    let mut p = super::ipc::wire::Put::default();
+    p.i32(pid);
+    p.u8(match ev {
+        crate::proc::JobEvent::Neither => 0,
+        crate::proc::JobEvent::Stop => 1,
+        crate::proc::JobEvent::Cont => 2,
+    });
+    j.put(&mut p);
+    call(r, op::JOB_SET, &p.0, &mut []);
+}
+
+/// One look of a Darwin wait by `ppid` for `want`, in the global kernel's
+/// table (`look`: only whether it would answer, taking nothing).
+pub fn dwait(ppid: i32, want: i32, jobs: crate::syscalls::JobWait, nowait: bool, waitid: bool, look: bool) -> crate::proc::WaitStep {
+    use crate::proc::WaitStep;
+    let r = remote().expect("a Darwin wait through the global kernel");
+    let mut req = ppid.to_le_bytes().to_vec();
+    req.extend_from_slice(&want.to_le_bytes());
+    let f = u8::from(jobs.exits) | u8::from(jobs.stops) << 1 | u8::from(jobs.continues) << 2 | u8::from(nowait) << 3 | u8::from(waitid) << 4 | u8::from(look) << 5;
+    req.push(f);
+    let mut o = [0u8; 13];
+    call(r, op::DWAIT, &req, &mut o);
+    let w = |i: usize| u32::from_le_bytes(o[i..i + 4].try_into().unwrap());
+    let (pid, a, b) = (w(1) as i32, w(5), w(9));
+    match o[0] {
+        0 => WaitStep::NoChild,
+        1 => WaitStep::Nothing,
+        2 => WaitStep::Ended { pid, word: a, xhighbits: b as u8 },
+        3 => WaitStep::Stopped { pid, xstat: a },
+        4 => WaitStep::Continued { pid, xstat: a, contproc: b as i32 },
+        k => panic!("gex: the global kernel's Darwin wait answered {k}"),
+    }
 }
 
 /// The changes other processes of the page left for each process: the
@@ -844,6 +895,41 @@ pub fn serve(op: u32, req: &[u8], out: &mut [u8]) -> i64 {
                 Ok(()) => 0,
                 Err(e) => -e,
             }
+        }
+        op::JOB_SET => {
+            let (Some(p), 5..) = (system_procs(), req.len()) else { return -EINVAL };
+            let pid = i32::from_le_bytes(req[..4].try_into().unwrap());
+            let ev = match req[4] {
+                0 => crate::proc::JobEvent::Neither,
+                1 => crate::proc::JobEvent::Stop,
+                2 => crate::proc::JobEvent::Cont,
+                _ => return -EINVAL,
+            };
+            let g = &mut super::ipc::wire::Get::new(&req[5..]);
+            let Ok(j) = crate::proc::Job::get(g) else { return -EINVAL };
+            p.job_set(pid, j, ev);
+            0
+        }
+        op::DWAIT => {
+            use crate::proc::WaitStep;
+            let (Some(p), 9, 13..) = (system_procs(), req.len(), out.len()) else { return -EINVAL };
+            let ppid = i32::from_le_bytes(req[..4].try_into().unwrap());
+            let want = i32::from_le_bytes(req[4..8].try_into().unwrap());
+            let f = req[8];
+            let jobs = crate::syscalls::JobWait { exits: f & 1 != 0, stops: f & 2 != 0, continues: f & 4 != 0 };
+            let step = p.darwin_wait_step(ppid, want, jobs, f & 8 != 0, f & 16 != 0, f & 32 != 0);
+            let (k, pid, a, b) = match step {
+                WaitStep::NoChild => (0u8, 0, 0, 0),
+                WaitStep::Nothing => (1, 0, 0, 0),
+                WaitStep::Ended { pid, word, xhighbits } => (2, pid, word, u32::from(xhighbits)),
+                WaitStep::Stopped { pid, xstat } => (3, pid, xstat, 0),
+                WaitStep::Continued { pid, contproc, xstat } => (4, pid, xstat, contproc as u32),
+            };
+            out[0] = k;
+            out[1..5].copy_from_slice(&pid.to_le_bytes());
+            out[5..9].copy_from_slice(&a.to_le_bytes());
+            out[9..13].copy_from_slice(&b.to_le_bytes());
+            13
         }
         op::CHANGE_POST => {
             let 4.. = req.len() else { return -EINVAL };

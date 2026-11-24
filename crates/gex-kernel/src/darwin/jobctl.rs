@@ -76,7 +76,14 @@ impl Kernel {
     fn darwin_job_with<R>(&mut self, f: impl FnOnce(&mut Job) -> R) -> R {
         let j = self.darwin_job();
         let mut g = j.lock().unwrap_or_else(|e| e.into_inner());
-        f(&mut g)
+        let r = f(&mut g);
+        // In the page the system's entry, which its parent's wait reads,
+        // is the global kernel's: the change goes there too.
+        let ev = std::mem::replace(&mut self.dtask.job_event, crate::proc::JobEvent::Neither);
+        if self.procs.is_shared() {
+            super::share::job_set(self.pid, *g, ev);
+        }
+        r
     }
 
     /// psignal_internal's work for signal `l` (Linux's number), just made
@@ -128,6 +135,7 @@ impl Kernel {
             }
             if p & prop::CONT != 0 {
                 let pid = self.pid;
+                self.dtask.job_event = crate::proc::JobEvent::Cont;
                 self.darwin_job_with(|j| {
                     j.continued = true;
                     j.contproc = pid;
@@ -140,6 +148,7 @@ impl Kernel {
             // Caught, or a held continue of a stopped process: a continue
             // resumes it; anything else waits for it to be continued.
             if p & prop::CONT != 0 {
+                self.dtask.job_event = crate::proc::JobEvent::Cont;
                 self.darwin_job_with(|j| {
                     j.continued = true;
                     j.stopped = false;
@@ -162,6 +171,7 @@ impl Kernel {
             }
             dsig::SIGCONT => {
                 let pid = self.pid;
+                self.dtask.job_event = crate::proc::JobEvent::Cont;
                 self.darwin_job_with(|j| {
                     j.continued = true;
                     j.contproc = pid;
@@ -188,6 +198,7 @@ impl Kernel {
     /// `W_EXITCODE(signum, signum)` and any other's, as issignal records
     /// every one, as `WEXITSTATUS(p_xstat)`.
     pub(crate) fn darwin_stop(&mut self, d: u32, posted: bool) {
+        self.dtask.job_event = crate::proc::JobEvent::Stop;
         self.darwin_job_with(|j| {
             j.xstat = d;
             j.stopped = true;

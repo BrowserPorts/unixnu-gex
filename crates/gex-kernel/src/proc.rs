@@ -396,6 +396,64 @@ pub struct Job {
     pub pidsuspended: bool,
 }
 
+impl Job {
+    pub(crate) fn put(&self, p: &mut crate::darwin::ipc::wire::Put) {
+        p.bool(self.stopped);
+        p.u32(self.xstat);
+        p.bool(self.waited);
+        p.bool(self.continued);
+        p.i32(self.contproc);
+        p.u32(self.holds);
+        p.u32(self.legacy);
+        p.bool(self.pidsuspended);
+    }
+
+    pub(crate) fn get(g: &mut crate::darwin::ipc::wire::Get<'_>) -> Result<Job, crate::darwin::ipc::wire::Bad> {
+        Ok(Job { stopped: g.bool()?, xstat: g.u32()?, waited: g.bool()?, continued: g.bool()?, contproc: g.i32()?, holds: g.u32()?, legacy: g.u32()?, pidsuspended: g.bool()? })
+    }
+}
+
+/// What a process of the page takes of its own record from the global
+/// kernel's process table when it starts ([`ProcTable::seed_of`],
+/// [`ProcTable::adopt_own`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Seed {
+    pub ppid: i32,
+    pub pgid: i32,
+    pub sid: i32,
+    pub uid: u32,
+    pub nice: i32,
+    pub persona: Option<u32>,
+    pub policy: crate::darwin::taskpolicy::TaskPolicy,
+    pub job: Job,
+}
+
+impl Seed {
+    pub(crate) fn put(&self, p: &mut crate::darwin::ipc::wire::Put) {
+        p.i32(self.ppid);
+        p.i32(self.pgid);
+        p.i32(self.sid);
+        p.u32(self.uid);
+        p.i32(self.nice);
+        p.opt(self.persona, |p, v| p.u32(v));
+        self.policy.put_wire(p);
+        self.job.put(p);
+    }
+
+    pub(crate) fn get(g: &mut crate::darwin::ipc::wire::Get<'_>) -> Result<Seed, crate::darwin::ipc::wire::Bad> {
+        Ok(Seed {
+            ppid: g.i32()?,
+            pgid: g.i32()?,
+            sid: g.i32()?,
+            uid: g.u32()?,
+            nice: g.i32()?,
+            persona: g.opt(|g| g.u32())?,
+            policy: crate::darwin::taskpolicy::TaskPolicy::get_wire(g)?,
+            job: Job::get(g)?,
+        })
+    }
+}
+
 /// One process, as the table sees it.
 struct Proc {
     pid: i32,
@@ -1065,6 +1123,87 @@ impl ProcTable {
         pid
     }
 
+    /// Process `pid`'s record as a process of the page takes it at its
+    /// start ([`Self::adopt_own`]): none for no such process. Read in the
+    /// table that is the system's (the global kernel's).
+    pub fn seed_of(&self, pid: i32) -> Option<Seed> {
+        let t = self.lock();
+        let p = t.procs.iter().find(|p| p.pid == pid)?;
+        let s = Seed {
+            ppid: p.ppid,
+            pgid: p.pgid,
+            sid: p.sid,
+            uid: p.uid,
+            nice: p.nice,
+            persona: p.persona,
+            policy: *p.child.policy.lock().unwrap_or_else(|e| e.into_inner()),
+            job: *p.child.job.lock().unwrap_or_else(|e| e.into_inner()),
+        };
+        Some(s)
+    }
+
+    /// In a table that is really somewhere else (a process of the page),
+    /// this process's own record, as the system's had it at its start:
+    /// what the process itself keeps of it (its task policy, its job
+    /// state, its nice value, its Darwin record, its exit marks) is then
+    /// its own table's, as natively it is the one table's. The calls that
+    /// go to the system's table still do.
+    pub fn adopt_own(&self, pid: i32, s: Seed) {
+        let mut t = self.lock();
+        if t.procs.iter().any(|p| p.pid == pid) {
+            return;
+        }
+        let child = Child::new(pid);
+        *child.policy.lock().unwrap_or_else(|e| e.into_inner()) = s.policy;
+        *child.job.lock().unwrap_or_else(|e| e.into_inner()) = s.job;
+        t.procs.push(Proc {
+            pid,
+            ppid: s.ppid,
+            pgid: s.pgid,
+            sid: s.sid,
+            child,
+            pending: Arc::new(AtomicU64::new(0)),
+            killed: 0,
+            senders: [0; 64],
+            controlt: false,
+            posts: None,
+            xhighbits: 0,
+            uid: s.uid,
+            lterm: 0,
+            rval: None,
+            xstat: 0,
+            lexit: false,
+            exited: false,
+            exit_reason: None,
+            reboot: false,
+            dead_cpu: (0, 0),
+            children_cpu: (0, 0),
+            dead_runnable: 0,
+            dead_instructions: 0,
+            persona: s.persona,
+            child_end: None,
+            execed: false,
+            nocldstop: false,
+            nocldwait: false,
+            nice: s.nice,
+            to_threads: Vec::new(),
+            queue: crate::wait::Queue::new(),
+            info: Vec::new(),
+            creds: Vec::new(),
+            vm: None,
+            host_child: false,
+            darwin: None,
+            zseq: 0,
+            usage: Usage::default(),
+            crash: Vec::new(),
+            crash_more: Vec::new(),
+            shutdownstate: 0,
+            exitcount: false,
+            delayterm: false,
+            forced: None,
+        });
+    }
+
     /// Publish `pid`'s address space for other processes (at its start and
     /// at each `execve`), or withdraw it. A table that is somewhere else
     /// keeps none: there each process's memory is its own Worker's.
@@ -1692,7 +1831,11 @@ impl ProcTable {
     /// forks first so the child is not a leader.
     pub fn setsid(&self, pid: i32) -> Result<i32, Errno> {
         if let Some(r) = self.remote {
-            return errno_or((r.setsid)(pid));
+            let sid = errno_or((r.setsid)(pid))?;
+            if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == pid) {
+                (p.pgid, p.sid) = (sid, sid);
+            }
+            return Ok(sid);
         }
         let mut t = self.lock();
         if t.procs.iter().any(|p| p.pgid == pid) {
@@ -1767,7 +1910,12 @@ impl ProcTable {
     /// session leader.
     pub fn setpgid(&self, caller: i32, target: i32, pgid: i32) -> Result<(), Errno> {
         if let Some(r) = self.remote {
-            return errno_or((r.setpgid)(caller, target, pgid)).map(|_| ());
+            errno_or((r.setpgid)(caller, target, pgid))?;
+            let target = if target == 0 { caller } else { target };
+            if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == target) {
+                p.pgid = if pgid == 0 { target } else { pgid };
+            }
+            return Ok(());
         }
         let target = if target == 0 { caller } else { target };
         let pgid = if pgid == 0 { target } else { pgid };
@@ -1891,7 +2039,7 @@ impl ProcTable {
     /// somewhere else does not hold: in the page it is in that process's
     /// own memory, not the system's (noted, reported at the call's end).
     fn note_elsewhere(&self, pid: i32, what: &str) {
-        if self.remote.is_some() && pid != crate::darwin::held::me() && crate::darwin::held::darwin_process(pid) {
+        if self.remote.is_some() && crate::darwin::held::darwin_process(pid) {
             crate::darwin::note_unimplemented(format!("process {pid}'s {what}, which is in that process's own memory in the page, not the system's"));
         }
     }
@@ -2099,9 +2247,8 @@ impl ProcTable {
     /// `zombproc`, before its task is terminated. From here `proc_find`
     /// does not find it, and `proc_find_zombref` does until it is reaped.
     pub fn set_exited(&self, pid: i32) {
-        if self.remote.is_some() {
-            return;
-        }
+        // (in a table that is really somewhere else, the process's own
+        // record, if it holds it: [`Self::adopt_own`])
         self.lock().mark_exited(pid);
     }
 
@@ -2932,6 +3079,32 @@ mod tests {
         assert!(matches!(t.darwin(c), Some((_, true))));
         t.reap(b);
         assert!(t.darwin(b).is_none());
+    }
+
+    /// A page process takes its own record from the system's table as it
+    /// starts: the same ids, nice value, persona, policy and job state.
+    #[test]
+    fn a_process_takes_its_own_record_from_the_systems() {
+        let system = ProcTable::new();
+        let a = system.spawn(INIT_PID);
+        system.set_nice(a, 7);
+        system.task_policy(a).unwrap().lock().unwrap().requested.int_darwinbg = true;
+        system.job(a).unwrap().lock().unwrap().holds = 2;
+        let seed = system.seed_of(a).unwrap();
+        let mut b = crate::darwin::ipc::wire::Put::default();
+        seed.put(&mut b);
+        let g = &mut crate::darwin::ipc::wire::Get::new(&b.0);
+        assert_eq!(Seed::get(g).unwrap(), seed);
+        assert!(g.done());
+        assert!(system.seed_of(9999).is_none());
+        let own = ProcTable::new();
+        own.adopt_own(a, seed);
+        assert_eq!(own.live_nice(a), Some((seed.uid, 7)));
+        assert!(own.task_policy(a).unwrap().lock().unwrap().requested.int_darwinbg);
+        assert_eq!(own.job(a).unwrap().lock().unwrap().holds, 2);
+        // (taken once: a second adopt changes nothing)
+        own.adopt_own(a, Seed { nice: 1, ..seed });
+        assert_eq!(own.live_nice(a), Some((seed.uid, 7)));
     }
 
     /// A jetsam kill is `exit_with_reason`'s `proc_prepareexit`, in the

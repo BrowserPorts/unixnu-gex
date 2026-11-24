@@ -138,6 +138,10 @@ pub mod op {
     /// The scheduler's state ([`super::super::sched`]): the request one of
     /// its calls and the call's arguments, the answer its result.
     pub const SCHED: u32 = 14;
+    /// A process's own record as the system's process table has it
+    /// ([`crate::proc::Seed`]): the request its pid, the answer the record,
+    /// `-ESRCH` for no such process.
+    pub const PROC_SEED: u32 = 15;
 }
 
 /// The system's process table, where this kernel is the global one: the
@@ -271,6 +275,20 @@ pub(crate) fn take_parked(r: Remote, what: &str, ask: &mut dyn FnMut(&mut [u8]) 
         return true;
     });
     got.expect("taken")
+}
+
+/// Process `pid`'s own record as the system's process table has it, for
+/// the process itself at its start: none where this kernel's table is the
+/// system's.
+pub fn proc_seed(pid: i32) -> Option<crate::proc::Seed> {
+    let r = remote()?;
+    let mut out = [0u8; 512];
+    let n = call_upto(r, op::PROC_SEED, &pid.to_le_bytes(), &mut out);
+    let g = &mut super::ipc::wire::Get::new(&out[..n]);
+    match crate::proc::Seed::get(g) {
+        Ok(s) if g.done() => Some(s),
+        got => panic!("gex: the global kernel's record of process {pid} is not one ({got:?})"),
+    }
 }
 
 /// The system's tables, other than the IPC table, that a process of the
@@ -664,6 +682,17 @@ pub fn serve(op: u32, req: &[u8], out: &mut [u8]) -> i64 {
                 Ok(()) => 0,
                 Err(e) => -e,
             }
+        }
+        op::PROC_SEED => {
+            let (Some(p), 4) = (system_procs(), req.len()) else { return -EINVAL };
+            let Some(s) = p.seed_of(i32::from_le_bytes(req.try_into().unwrap())) else { return -3 };
+            let mut b = super::ipc::wire::Put::default();
+            s.put(&mut b);
+            if b.0.len() > out.len() {
+                return -EINVAL;
+            }
+            out[..b.0.len()].copy_from_slice(&b.0);
+            b.0.len() as i64
         }
         op::SCHED => match system_procs() {
             Some(p) => super::sched::serve(&p.sched, req, out),

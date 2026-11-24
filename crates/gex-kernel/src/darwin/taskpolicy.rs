@@ -169,6 +169,66 @@ impl Importance {
     }
 }
 
+impl TaskPolicy {
+    /// The policy as bytes, for a process of the page to take its own from
+    /// the global kernel's process table ([`super::share::op::PROC_SEED`]).
+    pub(crate) fn put_wire(&self, p: &mut super::ipc::wire::Put) {
+        let r = &self.requested;
+        for b in [r.int_darwinbg, r.ext_darwinbg, r.int_iopassive, r.ext_iopassive, r.terminated, r.boosted, r.sfi_managed, r.sup_active, r.sup_lowpri_cpu, r.sup_disk, r.sup_cpu, r.sup_bg_sockets] {
+            p.bool(b);
+        }
+        for v in [r.int_iotier, r.ext_iotier, r.bg_iotier, r.base_latency_qos, r.base_through_qos, r.apptype, r.role, r.over_latency_qos, r.over_through_qos, r.qos_clamp, r.sup_timer, r.sup_throughput] {
+            p.u8(v);
+        }
+        let e = &self.effective;
+        for b in [e.darwinbg, e.lowpri_cpu, e.io_passive, e.all_sockets_bg, e.new_sockets_bg, e.terminated, e.qos_ui_is_urgent, e.tal_engaged, e.watchers_bg, e.sup_active, e.suppressed_cpu, e.sfi_managed, e.live_donor, e.adaptive_bg] {
+            p.bool(b);
+        }
+        for v in [e.io_tier, e.bg_iotier, e.latency_qos, e.through_qos, e.role, e.qos_clamp, e.qos_ceiling] {
+            p.u8(v);
+        }
+        p.i32(self.priority);
+        p.i32(self.max_priority);
+        p.i32(self.importance);
+        let i = &self.imp;
+        for b in [i.donor, i.live_donor, i.receiver, i.denap_receiver, i.donor_propagated] {
+            p.bool(b);
+        }
+        p.u64(i.transitions);
+        p.bool(self.gpu_denied);
+        p.bool(self.game_mode);
+    }
+
+    pub(crate) fn get_wire(g: &mut super::ipc::wire::Get<'_>) -> Result<TaskPolicy, super::ipc::wire::Bad> {
+        let mut t = TaskPolicy::default();
+        let r = &mut t.requested;
+        for b in [&mut r.int_darwinbg, &mut r.ext_darwinbg, &mut r.int_iopassive, &mut r.ext_iopassive, &mut r.terminated, &mut r.boosted, &mut r.sfi_managed, &mut r.sup_active, &mut r.sup_lowpri_cpu, &mut r.sup_disk, &mut r.sup_cpu, &mut r.sup_bg_sockets] {
+            *b = g.bool()?;
+        }
+        for v in [&mut r.int_iotier, &mut r.ext_iotier, &mut r.bg_iotier, &mut r.base_latency_qos, &mut r.base_through_qos, &mut r.apptype, &mut r.role, &mut r.over_latency_qos, &mut r.over_through_qos, &mut r.qos_clamp, &mut r.sup_timer, &mut r.sup_throughput] {
+            *v = g.u8()?;
+        }
+        let e = &mut t.effective;
+        for b in [&mut e.darwinbg, &mut e.lowpri_cpu, &mut e.io_passive, &mut e.all_sockets_bg, &mut e.new_sockets_bg, &mut e.terminated, &mut e.qos_ui_is_urgent, &mut e.tal_engaged, &mut e.watchers_bg, &mut e.sup_active, &mut e.suppressed_cpu, &mut e.sfi_managed, &mut e.live_donor, &mut e.adaptive_bg] {
+            *b = g.bool()?;
+        }
+        for v in [&mut e.io_tier, &mut e.bg_iotier, &mut e.latency_qos, &mut e.through_qos, &mut e.role, &mut e.qos_clamp, &mut e.qos_ceiling] {
+            *v = g.u8()?;
+        }
+        t.priority = g.i32()?;
+        t.max_priority = g.i32()?;
+        t.importance = g.i32()?;
+        let i = &mut t.imp;
+        for b in [&mut i.donor, &mut i.live_donor, &mut i.receiver, &mut i.denap_receiver, &mut i.donor_propagated] {
+            *b = g.bool()?;
+        }
+        i.transitions = g.u64()?;
+        t.gpu_denied = g.bool()?;
+        t.game_mode = g.bool()?;
+        Ok(t)
+    }
+}
+
 /// A task's policy, and its priority range (`task->priority`,
 /// `task->max_priority`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

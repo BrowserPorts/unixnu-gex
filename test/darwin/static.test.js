@@ -1,5 +1,5 @@
 // Darwin programs with no dyld on the page (tests/darwin/src/hello-static.c,
-// bsd-carry.c, tcall.c, bsdthr.c, waits.c, hold.c and pipewr.c): each runs
+// bsd-carry.c, tcall.c, bsdthr.c, waits.c, hold.c, pipewr.c and ownrec.c): each runs
 // in a 64-bit memory of its own, on the boot payload tests/darwin/run.sh
 // boots them with (the `darwin-static` image), and must print what it
 // prints under gexc and end with the same status. tcall's timer is fired by its process's thread
@@ -9,14 +9,16 @@
 // park their thread until the kernel ends their waits; hold's spinning
 // thread, suspended, is held at its safepoints until it is resumed; pipewr's
 // writes to a pipe and a socket sleep for room their reader thread makes
-// (and one ends in EPIPE as its reader goes), each ended by the kernel.
+// (and one ends in EPIPE as its reader goes), each ended by the kernel;
+// ownrec's nice value and task policy are its own record's in its own
+// process table, taken from the global kernel's as it starts.
 import { System } from '../../page/runtime/src/index.js';
 import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
 
 export const meta = { hosts: ['browser'], arches: ['a64'], images: ['darwin-static'], timeout: 300 };
 
 /** What tests/darwin/run.sh expects of each (its `check`). */
-const WANT = { 'hello-static': ['hello from darwin\n', 0], 'bsd-carry': ['carry ok\n', 0], tcall: ['tcall ok\n', 0], bsdthr: ['bsdthr ok\n', 0], waits: ['waits ok\n', 0], hold: ['hold ok\n', 0], pipewr: ['pipewr ok\n', 0] };
+const WANT = { 'hello-static': ['hello from darwin\n', 0], 'bsd-carry': ['carry ok\n', 0], tcall: ['tcall ok\n', 0], bsdthr: ['bsdthr ok\n', 0], waits: ['waits ok\n', 0], hold: ['hold ok\n', 0], pipewr: ['pipewr ok\n', 0], ownrec: ['ownrec ok\n', 0] };
 
 export default async function (t) {
   const { eq, timeout } = t;

@@ -841,6 +841,14 @@ impl crate::syscalls::Kernel {
         let pid = self.pid;
         held::set_me(pid);
         held::claim(held::Kind::Process, &pid.to_le_bytes(), pid);
+        // Its own record, as the system's process table has it, in its own
+        // table, which keeps what the process keeps of it.
+        if self.procs.is_shared() {
+            let Some(seed) = share::proc_seed(pid) else { panic!("gex: process {pid} of the page started with no global kernel") };
+            self.procs.adopt_own(pid, seed);
+            self.dtask.policy = self.procs.task_policy(pid);
+            self.dtask.job = self.procs.job(pid);
+        }
         if let Some(h) = held::elsewhere(held::Kind::Mounts, &[], pid) {
             self.darwin_elsewhere("the mount list, which another process changed (mount(2), MNT_UPDATE or a shutdown's unmounts)", h);
         }

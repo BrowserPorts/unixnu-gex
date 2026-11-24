@@ -172,7 +172,7 @@ fn start(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> Result<u
     let (uid, gid) = (k.creds.uid(), k.creds.gid());
     k.dtask.cred = darwin::cred::Cred::of(uid, gid);
     k.dtask.uniqueid = darwin::next_uniqueid();
-    k.dtask.start = darwin::procinfo::microtime();
+    k.dtask.start_now();
     k.signals.thread().set_darwin_id(darwin::next_thread_id());
     k.darwin_cred_tokens();
     k.darwin_use_pages();

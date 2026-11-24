@@ -578,6 +578,15 @@ pub fn start_times() -> ((u64, u64), u64) {
 }
 
 impl Task {
+    /// The process starts now (`microtime_with_abstime`: its calendar and
+    /// Mach start times read together), as the run's first process does
+    /// once its host has made it.
+    pub fn start_now(&mut self) {
+        let (start, abs) = start_times();
+        self.start = start;
+        self.rusage.start_abstime.store(abs, std::sync::atomic::Ordering::Release);
+    }
+
     /// A forked task's process ids and start, as its fork chose them.
     pub fn forked_process(uniqueid: u64, pidversion: i32, start: (u64, u64), abs: u64) -> Task {
         Task { uniqueid, pidversion, start, rusage: rusage::Shared::new(abs), ..Task::default() }

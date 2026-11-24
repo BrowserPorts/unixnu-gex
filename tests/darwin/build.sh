@@ -16,7 +16,7 @@ cc() {
     xcrun -sdk iphoneos clang -target "$TARGET" "$@"
 }
 
-for p in hello-static bsd-carry commpage exclusive-pair aes tcall bsdthr waits hold cpuclk pipewr unixname sysids xproc xmach xsys ownrec; do
+for p in hello-static bsd-carry commpage exclusive-pair aes tcall bsdthr waits hold cpuclk pipewr unixname sysids xproc xmach xsys ownrec xspawn; do
     cc -O2 -ffreestanding -fno-stack-protector -nostdlib -static \
         -Wl,-e,_start -o "$OUT/$p" "$HERE/src/$p.c"
 done

@@ -305,9 +305,9 @@ pub(crate) fn serve(o: u32, req: &[u8], out: &mut [u8]) -> Option<i64> {
 pub fn process_exited(pid: i32) -> bool {
     held().retain(|(k, _), h| *h != pid || k.ends() != End::Exit);
     counts().retain(|(_, p), _| *p != pid);
-    super::share::record_process_exited(pid);
+    let changes = super::share::record_process_exited(pid);
     let whole = super::share::whole_exited(pid);
-    super::ipc::wire::process_exited(pid) || whole
+    super::ipc::wire::process_exited(pid) || whole || changes
 }
 
 /// Process `pid` of the page has been reaped: it is no longer one.

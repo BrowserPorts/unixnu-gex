@@ -208,6 +208,8 @@ impl Kernel {
 
     /// Fire every thread call that is due; the next deadline.
     fn darwin_thread_calls_body(&mut self, m: &mut GuestMem<'_>) -> Option<Instant> {
+        // What other processes of the page changed of this one's state.
+        self.darwin_changes_apply();
         // A corpse whose process has ended has only other tasks' requests
         // and its notification to see to.
         if self.darwin_corpse_thread_calls(m) {

@@ -401,7 +401,7 @@ impl Kernel {
     }
 
     /// `pid_suspend`'s and `pid_resume`'s common checks; the target's job.
-    fn darwin_pid_hold_target(&mut self, pid: i32) -> Result<std::sync::Arc<std::sync::Mutex<crate::proc::Job>>, Errno> {
+    fn darwin_pid_hold_target(&mut self, pid: i32) -> Result<(), Errno> {
         const ENTITLEMENT: &str = "com.apple.private.process.suspend-resume.any";
         if pid == 0 {
             return Err(Errno::EPERM);
@@ -415,22 +415,15 @@ impl Kernel {
         if self.darwin_mac_check_suspend_resume() != 0 {
             return Err(Errno::EPERM);
         }
-        self.procs.job(pid).ok_or(Errno::ESRCH)
+        Ok(())
     }
 
     /// `pid_suspend(pid)`: a hold of its own on the task, one at a time. The
     /// target's threads stop at their next look at the task's holds; the
     /// call does not wait for them as `task_wait_locked` does.
     pub(crate) fn darwin_pid_suspend(&mut self, pid: i32) -> Result<u64, Errno> {
-        let job = self.darwin_pid_hold_target(pid)?;
-        {
-            let mut j = job.lock().unwrap_or_else(|e| e.into_inner());
-            if j.pidsuspended {
-                return Err(Errno::EPERM);
-            }
-            j.pidsuspended = true;
-            j.holds += 1;
-        }
+        self.darwin_pid_hold_target(pid)?;
+        self.darwin_change(pid, super::change::Change::PidSuspend)?;
         if self.procs.jetsam().on_suspend(pid) {
             let _ = self.procs.kill(self.pid, pid, crate::signal::sig::SIGKILL as u32);
         }
@@ -439,18 +432,9 @@ impl Kernel {
 
     /// `pid_resume(pid)`: `pid_suspend`'s hold released.
     pub(crate) fn darwin_pid_resume(&mut self, pid: i32) -> Result<u64, Errno> {
-        let job = self.darwin_pid_hold_target(pid)?;
+        self.darwin_pid_hold_target(pid)?;
         self.procs.jetsam().on_resume(pid);
-        {
-            let mut j = job.lock().unwrap_or_else(|e| e.into_inner());
-            if !j.pidsuspended {
-                return Err(Errno::EPERM);
-            }
-            j.pidsuspended = false;
-            j.holds = j.holds.saturating_sub(1);
-        }
-        // Held threads wait on the host's readiness wake.
-        self.fd_activity = true;
+        self.darwin_change(pid, super::change::Change::PidResume)?;
         Ok(0)
     }
 

@@ -2052,6 +2052,12 @@ impl ProcTable {
         (t.procs.len(), t.procs.iter().filter(|p| p.persona.unwrap_or(p.uid) == uid).count())
     }
 
+    /// Whether this table holds process `pid`'s entry (in a table that is
+    /// really somewhere else, the process's own alone).
+    pub fn holds(&self, pid: i32) -> bool {
+        self.lock().procs.iter().any(|p| p.pid == pid)
+    }
+
     /// Whether process `pid` is on the process list, and whether as a
     /// zombie (`proc_find`, else `pzfind`): in a table that is really
     /// somewhere else, another Darwin process of the page's as its record
@@ -2064,6 +2070,19 @@ impl ProcTable {
         found
     }
 
+    /// In a table that is really somewhere else, a walk of `what` while
+    /// another Darwin process of the page is there: noted, its entry being
+    /// the global kernel's table's.
+    fn note_others(&self, what: &str) {
+        if self.remote.is_none() {
+            return;
+        }
+        let me = crate::darwin::held::me();
+        if let Some(other) = crate::darwin::held::any_elsewhere(crate::darwin::held::Kind::Process, me) {
+            crate::darwin::note_unimplemented(format!("{what} with process {other} of the page among them, whose entry is the global kernel's table's"));
+        }
+    }
+
     /// Every process in `proc_listpids`' order: the live ones, the latest
     /// made first, then the zombies, the latest first: (pid, ppid, pgid,
     /// zombie).
@@ -2073,12 +2092,7 @@ impl ProcTable {
     /// page is there is noted, the others' entries being the global
     /// kernel's table's.
     pub fn listing(&self) -> Vec<(i32, i32, i32, bool)> {
-        if self.remote.is_some() {
-            let me = crate::darwin::held::me();
-            if let Some(other) = crate::darwin::held::any_elsewhere(crate::darwin::held::Kind::Process, me) {
-                crate::darwin::note_unimplemented(format!("the process list (allproc, zombproc) with process {other} of the page in it, whose entry is the global kernel's table's"));
-            }
-        }
+        self.note_others("the process list (allproc, zombproc)");
         let t = self.lock();
         let mut live: Vec<&Proc> = t.procs.iter().filter(|p| p.zseq == 0).collect();
         live.reverse();
@@ -2151,6 +2165,7 @@ impl ProcTable {
     /// The members of group `pgid` (zombies too, as `PGMEMBERS_FOREACH`
     /// walks them), or of none: (pid, uid, nice, live).
     pub fn pgrp_members(&self, pgid: i32) -> Vec<(i32, u32, i32, bool)> {
+        self.note_others("a process group's members (PGMEMBERS_FOREACH)");
         self.lock()
             .procs
             .iter()
@@ -2161,6 +2176,7 @@ impl ProcTable {
 
     /// Every live process (`allproc`): (pid, uid, nice).
     pub fn all_live(&self) -> Vec<(i32, u32, i32)> {
+        self.note_others("every live process (proc_iterate)");
         self.lock()
             .procs
             .iter()

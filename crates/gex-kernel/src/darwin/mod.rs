@@ -133,6 +133,7 @@ pub mod sema;
 pub mod select;
 pub mod share;
 pub mod held;
+pub mod change;
 pub mod shm;
 pub mod signal;
 pub mod sockaddr;

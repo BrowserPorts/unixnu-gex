@@ -206,13 +206,7 @@ impl Kernel {
         if n < cur && self.creds.uid() != 0 {
             return Err(Errno::EACCES);
         }
-        self.procs.set_nice(pid, n);
-        if let Some(p) = self.procs.task_policy(pid) {
-            // task_importance's refusal for a control application is not
-            // the caller's error.
-            let _ = p.lock().unwrap_or_else(|e| e.into_inner()).set_importance(-n);
-        }
-        Ok(())
+        self.darwin_change(pid, super::change::Change::Nice(n))
     }
 
     /// `do_background_thread` for the calling thread: not a workqueue
@@ -245,10 +239,7 @@ impl Kernel {
             PRIO_DARWIN_NONUI => return Ok(()),
             _ => false,
         };
-        if let Some(p) = self.procs.task_policy(pid) {
-            p.lock().unwrap_or_else(|e| e.into_inner()).set_darwinbg(pid != self.pid, on);
-        }
-        Ok(())
+        self.darwin_change(pid, super::change::Change::DarwinBg { external: pid != self.pid, on })
     }
 
     /// `set_gpudeny_proc`: another process's GPU access.
@@ -261,10 +252,7 @@ impl Kernel {
             PRIO_DARWIN_GPU_ALLOW => false,
             _ => return Err(Errno::EINVAL),
         };
-        if let Some(p) = self.procs.task_policy(pid) {
-            p.lock().unwrap_or_else(|e| e.into_inner()).gpu_denied = deny;
-        }
-        Ok(())
+        self.darwin_change(pid, super::change::Change::GpuDenied(deny))
     }
 
     /// `proc_set_darwin_role`: an application's role (ENOTSUP for any other
@@ -276,14 +264,14 @@ impl Kernel {
             self.darwin_unimplemented("setpriority(PRIO_DARWIN_ROLE) of another user's process (a MAC policy's privilege grant)".into());
             return Err(Errno::EPERM);
         }
-        let Some(p) = self.procs.task_policy(pid) else { return Ok(()) };
-        let mut p = p.lock().unwrap_or_else(|e| e.into_inner());
+        // (none for a process gone; an application's: EOPNOTSUPP before
+        // EINVAL)
+        let Some(p) = self.procs.task_policy_state(pid) else { return Ok(()) };
         if !p.is_app() {
             return Err(Errno::EOPNOTSUPP);
         }
         let role = super::taskpolicy::darwin_role_to_task_role(prio as u32).ok_or(Errno::EINVAL)?;
-        p.set_role(role);
-        Ok(())
+        self.darwin_change(pid, super::change::Change::Role(role))
     }
 
     /// The entitlement game mode takes.
@@ -304,9 +292,6 @@ impl Kernel {
             1 => true,
             _ => return Err(Errno::EINVAL),
         };
-        if let Some(p) = self.procs.task_policy(pid) {
-            p.lock().unwrap_or_else(|e| e.into_inner()).game_mode = on;
-        }
-        Ok(())
+        self.darwin_change(pid, super::change::Change::GameMode(on))
     }
 }

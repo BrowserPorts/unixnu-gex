@@ -39,7 +39,7 @@ export default async function (t) {
   await t.saveFile('console.txt', sys.state.console);
   eq("the second process finds the first's record, and may signal it", peeked.stdout, 'xproc peek 0 kill 0\n', ctx(peeked));
   eq('and it ends', peeked.code, 0, peeked.signal ? `signal ${peeked.signal}` : undefined);
-  eq('the first sees its mark and ends', held.stdout, 'xproc held\n', ctx(held));
+  eq('the first sees its mark and ends', held.stdout, 'xproc held nice 0\n', ctx(held));
   eq('with status 0', held.code, 0, held.signal ? `signal ${held.signal}` : undefined);
   await sys.shutdown();
 }

@@ -929,11 +929,7 @@ impl Kernel {
         }
         let sig = self.procs.jetsam().on_terminate(pid);
         // proc_set_task_policy(TASK_POLICY_ATTRIBUTE, TASK_POLICY_TERMINATED).
-        if let Some(cell) = self.procs.task_policy(pid) {
-            let mut p = cell.lock().unwrap_or_else(|e| e.into_inner());
-            p.requested.terminated = true;
-            p.update(false);
-        }
+        self.darwin_change(pid, super::change::Change::Terminated)?;
         self.darwin_kill_post(pid, sig);
         Ok(u64::from(sig))
     }

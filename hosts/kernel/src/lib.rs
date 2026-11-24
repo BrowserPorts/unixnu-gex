@@ -1725,6 +1725,7 @@ pub extern "C" fn k_darwin_call(op: u32, req: gex_kmem::PAddr, req_len: u32, out
         return -14;
     }
     let mut o = vec![0u8; out_len as usize];
+    gex_kernel::darwin::share::set_system_procs(procs);
     let r = gex_kernel::darwin::share::serve(op, &b, &mut o);
     if r > 0 && !unsafe { gex_kmem::push_checked(out, o.as_ptr(), (r as u32).min(out_len)) } {
         return -14;
@@ -1758,7 +1759,9 @@ pub extern "C" fn k_exit(pid: i32, status: i32) {
     // Its record locks, however it ended.
     locks().release_pid(pid, None);
     // What it held of the Darwin system's state that ends with it; the IPC
-    // table, if it held it, to the processes waiting for it.
+    // table (or another it takes whole), if it held it, to the processes
+    // waiting for it.
+    gex_kernel::darwin::share::set_system_procs(procs);
     if gex_kernel::darwin::held::process_exited(pid) {
         if let Some(q) = gex_kernel::darwin::share::local_value(gex_kernel::darwin::share::Value::IpcQueue) {
             wait::k_wq_notify(q as u32);

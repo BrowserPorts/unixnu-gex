@@ -255,7 +255,6 @@ impl Kernel {
             // was idle (cpu_idle_count == real_ncpus), this call's thread
             // not yet running.
             self.dtask.callout_pidle = self.dtask.in_callout && self.procs.sched.processors_idle(None, 1);
-            self.darwin_pidle_elsewhere();
             self.darwin_ipc_callout(true);
             match action {
                 Action::MkTimer(port) => self.mk_timer_expire(m, port, key),
@@ -276,16 +275,6 @@ impl Kernel {
             self.dtask.callout_pidle = false;
         };
         [own, jetsam, tcp].into_iter().flatten().min()
-    }
-
-    /// Whether every processor was idle, as this process's scheduler state
-    /// says it: in the page, where another Darwin process runs threads this
-    /// one's state does not have, the platform-idle wakeups are not kept
-    /// (reported when read, as `proc_pid_rusage`'s unkept ledgers are).
-    pub(crate) fn darwin_pidle_elsewhere(&mut self) {
-        if self.procs.is_shared() && super::held::any_elsewhere(super::held::Kind::Process, self.pid).is_some() {
-            self.dtask.rusage.wkups_unkept.store(true, std::sync::atomic::Ordering::Release);
-        }
     }
 
     /// A thread call begins (`true`) or ends: the processes it told of

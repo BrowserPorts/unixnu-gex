@@ -34,9 +34,6 @@ pub enum Kind {
     ShmName = 1,
     /// A POSIX named semaphore's name ([`super::psem`]), until unlinked.
     PsemName = 2,
-    /// The persona registry ([`super::persona`]), keyed by nothing: the
-    /// process that changed it.
-    Personas = 3,
     /// A ptmx replica's minor ([`super::ptmx`]), while it is allocated.
     PtyUnit = 6,
     /// A BSD pty's terminal, keyed by its slot, once made (it is never
@@ -75,7 +72,6 @@ impl Kind {
             0 => Kind::Process,
             1 => Kind::ShmName,
             2 => Kind::PsemName,
-            3 => Kind::Personas,
             6 => Kind::PtyUnit,
             7 => Kind::BsdPty,
             8 => Kind::Console,
@@ -303,12 +299,14 @@ pub(crate) fn serve(o: u32, req: &[u8], out: &mut [u8]) -> Option<i64> {
 /// Process `pid` of the page has exited: what it held that ends at its
 /// exit goes, and so do its counts. Called by the global kernel, which
 /// holds the record.
-/// Whether it held the IPC table (given up for it: the processes waiting
-/// for the table are to be woken, [`super::share::ipc_queue`]).
+/// Whether it held the IPC table or another of the system's tables it
+/// takes whole (given up for it: the processes waiting for one are to be
+/// woken, on [`super::ipc::wire::table_queue`]'s queue).
 pub fn process_exited(pid: i32) -> bool {
     held().retain(|(k, _), h| *h != pid || k.ends() != End::Exit);
     counts().retain(|(_, p), _| *p != pid);
-    super::ipc::wire::process_exited(pid)
+    let whole = super::share::whole_exited(pid);
+    super::ipc::wire::process_exited(pid) || whole
 }
 
 /// Process `pid` of the page has been reaped: it is no longer one.

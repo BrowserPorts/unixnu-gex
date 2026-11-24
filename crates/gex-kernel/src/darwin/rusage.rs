@@ -852,9 +852,6 @@ impl Kernel {
                         i.footprint = Some(fp as u64);
                         i.resident = Some(self.dtask.rusage.meter.lock().pages().resident * (super::mach::PAGE_MASK + 1));
                         i.footprint_peaks = self.procs.jetsam().ledgers.get(&pid).map(|l| (l.lifetime_max as u64, l.interval_max as u64));
-                        if i.footprint_peaks.is_none() {
-                            self.darwin_jetsam_elsewhere("proc_pid_rusage's footprint peaks (the process's ledgers)");
-                        }
                     }
                 } else if let Some(l) = footprint_from_outside(&self.procs, pid, &target) {
                     i.footprint = Some(l.footprint);

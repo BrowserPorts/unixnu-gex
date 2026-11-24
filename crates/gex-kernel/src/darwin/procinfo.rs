@@ -39,7 +39,7 @@ pub struct Public {
     /// `p_pcaction`.
     pub pcaction: Arc<std::sync::atomic::AtomicU32>,
     /// `p_persona`.
-    pub persona: Option<Arc<super::persona::Persona>>,
+    pub persona: Option<super::persona::Persona>,
     /// `p_csflags`.
     pub csflags: Arc<std::sync::atomic::AtomicU32>,
     /// The signature on its executable (`p_textvp`'s blob at `p_textoff`).
@@ -724,9 +724,6 @@ impl Kernel {
 
     /// `proc_terminate_with_proc` of process `pid`.
     fn darwin_terminate_with_proc(&mut self, pid: i32) -> Result<u64, Errno> {
-        if self.darwin_jetsam_elsewhere("proc_terminate") {
-            return Err(Errno::ENOSYS);
-        }
         // Who may SIGKILL it may SIGTERM it too.
         if !self.darwin_cansignal(pid, super::signal::dsig::SIGKILL, true) {
             return Err(Errno::EPERM);

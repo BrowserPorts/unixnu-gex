@@ -125,6 +125,230 @@ pub mod op {
     pub const IPC_TAKE: u32 = 9;
     pub const IPC_PUT: u32 = 10;
     pub const IPC_LOST: u32 = 11;
+    /// One of the system's tables a process takes whole ([`super::Whole`],
+    /// [`super::take_whole`]): a take's request the table's number, the
+    /// taker's pid, how many of the losses it has been told of (4 bytes)
+    /// and the kernel call it takes it in; its answer as the IPC table's
+    /// (the losses, then the table's bytes), `-EAGAIN` while another holds
+    /// it, or the answer's length (not taken) when it is longer than the
+    /// room given. A give-back's request the table's number, the giver's
+    /// pid and the table.
+    pub const WHOLE_TAKE: u32 = 12;
+    pub const WHOLE_PUT: u32 = 13;
+    /// The scheduler's state ([`super::super::sched`]): the request one of
+    /// its calls and the call's arguments, the answer its result.
+    pub const SCHED: u32 = 14;
+}
+
+/// The system's process table, where this kernel is the global one: the
+/// one whose jetsam table and scheduler state are the system's (set by
+/// the global kernel before it serves a call).
+static SYSTEM_PROCS: OnceLock<fn() -> &'static crate::proc::ProcTable> = OnceLock::new();
+
+/// This kernel holds the system's process table, `procs`' (the global
+/// kernel's).
+pub fn set_system_procs(procs: fn() -> &'static crate::proc::ProcTable) {
+    let _ = SYSTEM_PROCS.set(procs);
+}
+
+/// The system's process table, where this kernel holds it.
+pub(crate) fn system_procs() -> Option<&'static crate::proc::ProcTable> {
+    SYSTEM_PROCS.get().map(|f| f())
+}
+
+/// What processes of the page lost of the system's state as they ended
+/// (each its pid and what it lost), held by the global kernel for every
+/// process that takes a table of the system's from then on to report. A
+/// process ends holding a table only when it ended inside a kernel call
+/// that had taken it, which is gex itself failing there; the table goes
+/// on as it was last given back, and what the call changed of it is lost.
+static LOST: std::sync::Mutex<Vec<(i32, String)>> = std::sync::Mutex::new(Vec::new());
+
+fn lost() -> std::sync::MutexGuard<'static, Vec<(i32, String)>> {
+    LOST.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// How many of the system's losses this process has reported.
+static LOST_SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Record what process `pid` of the page lost of the system's state as
+/// it ended (`what`), for every process that takes one of the system's
+/// tables from here on to report: in the global kernel's record, from a
+/// process of the page; in this kernel's own where it holds the record.
+pub fn note_lost(pid: i32, what: &str) {
+    match remote() {
+        Some(r) => {
+            let mut req = pid.to_le_bytes().to_vec();
+            req.extend_from_slice(what.as_bytes());
+            let n = (r.call)(op::IPC_LOST, &req, &mut []);
+            if n != 0 {
+                panic!("gex: the global kernel answered the record of a loss with {n}");
+            }
+        }
+        None => lost().push((pid, what.to_string())),
+    }
+}
+
+/// The start of a take's answer: how many losses are recorded, then the
+/// ones after the first `seen` (each its pid and text).
+pub(crate) fn lost_header(seen: usize) -> Vec<u8> {
+    use super::ipc::wire::Put;
+    let l = lost();
+    let mut p = Put::default();
+    p.u32(l.len() as u32);
+    let new = l.get(seen..).unwrap_or(&[]);
+    p.len(new.len());
+    for (who, what) in new {
+        p.i32(*who);
+        p.bytes(what.as_bytes());
+    }
+    p.0
+}
+
+/// A take's request: `head` (the table's number, none for the IPC
+/// table's), this process's pid, the losses it has been told of, and the
+/// kernel call it takes it in.
+pub(crate) fn take_request(head: &[u8], call: &str) -> Vec<u8> {
+    let mut req = head.to_vec();
+    req.extend_from_slice(&super::held::me().to_le_bytes());
+    req.extend_from_slice(&LOST_SEEN.load(std::sync::atomic::Ordering::Relaxed).to_le_bytes());
+    req.extend_from_slice(call.as_bytes());
+    req
+}
+
+/// The losses at the start of a take's answer, read, and the ones this
+/// process had not been told of reported (at the call's end): the rest of
+/// the answer, the table.
+pub(crate) fn report_lost(b: &[u8]) -> &[u8] {
+    use super::ipc::wire::{Bad, Get};
+    let g = &mut Get::new(b);
+    let got = (|| {
+        let total = g.u32()?;
+        let n = g.len()?;
+        let mut new = Vec::with_capacity(n);
+        for _ in 0..n {
+            let who = g.i32()?;
+            new.push((who, String::from_utf8_lossy(&g.bytes()?).into_owned()));
+        }
+        Ok::<_, Bad>((total, new))
+    })();
+    let Ok((total, new)) = got else { panic!("gex: the global kernel's record of losses is not one ({got:?})") };
+    LOST_SEEN.store(total, std::sync::atomic::Ordering::Relaxed);
+    for (who, what) in new {
+        super::note_unimplemented(format!("{what} (process {who} of the page)"));
+    }
+    g.rest()
+}
+
+/// Take a table of the system's from the global kernel, parked while
+/// another process holds it (`ask` the take's call: its answer's length,
+/// `-EAGAIN` while held): its answer.
+pub(crate) fn take_parked(r: Remote, what: &str, ask: &mut dyn FnMut(&mut [u8]) -> i64) -> Vec<u8> {
+    let q = super::ipc::wire::table_queue();
+    let mut got: Option<Vec<u8>> = None;
+    let mut out = vec![0u8; 64 << 10];
+    let since = super::time::Instant::now();
+    (r.park)(q, &mut || loop {
+        let n = ask(&mut out);
+        if n == -11 {
+            // Held, as the native lock waits; a holder that never gives it
+            // back is a broken system.
+            if since.elapsed() > std::time::Duration::from_secs(120) {
+                panic!("gex: {what} has been held for 120 s: a process of the page did not give it back");
+            }
+            return false;
+        }
+        if n < 0 {
+            panic!("gex: the global kernel answered the take of {what} with {n}");
+        }
+        let n = n as usize;
+        if n > out.len() {
+            // Longer than the room: asked again with room for it.
+            out = vec![0u8; n];
+            continue;
+        }
+        got = Some(out[..n].to_vec());
+        return true;
+    });
+    got.expect("taken")
+}
+
+/// The system's tables, other than the IPC table, that a process of the
+/// page takes whole from the global kernel for as long as natively their
+/// lock is held, and gives back with what it changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Whole {
+    /// The memorystatus state ([`super::memorystatus::Jetsam`]), the
+    /// system process table's.
+    Jetsam = 0,
+    /// The persona registry ([`super::persona`]).
+    Personas = 1,
+}
+
+impl Whole {
+    fn of(n: u8) -> Option<Whole> {
+        match n {
+            0 => Some(Whole::Jetsam),
+            1 => Some(Whole::Personas),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Whole::Jetsam => "the jetsam table",
+            Whole::Personas => "the persona registry",
+        }
+    }
+}
+
+/// What a whole table's take found: held by another process, too long for
+/// the room given (its length), or its bytes, taken.
+pub(crate) enum Taking {
+    Held,
+    Long(usize),
+    Got(Vec<u8>),
+}
+
+/// Take table `w` from the global kernel for this process's kernel call
+/// (`call` naming it): its bytes, after the losses this process had not
+/// been told of are reported. None where this kernel's own is the
+/// system's.
+pub(crate) fn take_whole(w: Whole, call: &str) -> Option<Vec<u8>> {
+    let r = remote()?;
+    let req = take_request(&[w as u8], call);
+    let b = take_parked(r, w.name(), &mut |out| (r.call)(op::WHOLE_TAKE, &req, out));
+    Some(report_lost(&b).to_vec())
+}
+
+/// Give table `w` back to the global kernel, and wake the processes
+/// waiting for it.
+pub(crate) fn give_whole(w: Whole, b: &[u8]) {
+    let r = remote().expect("a table taken from the global kernel");
+    let mut req = vec![w as u8];
+    req.extend_from_slice(&super::held::me().to_le_bytes());
+    req.extend_from_slice(b);
+    let n = (r.call)(op::WHOLE_PUT, &req, &mut []);
+    if n != 0 {
+        panic!("gex: the global kernel answered the give-back of {} with {n}", w.name());
+    }
+    crate::wait::notify(super::ipc::wire::table_queue());
+}
+
+/// Process `pid` of the page has exited: a whole table it held (it ended
+/// inside a kernel call) is let go as it was last given back, the loss
+/// recorded. Whether it held one.
+pub(crate) fn whole_exited(pid: i32) -> bool {
+    let a = system_procs().is_some_and(|p| super::memorystatus::system_exited(p, pid));
+    let b = super::persona::system_exited(pid);
+    a || b
+}
+
+/// The loss of what process `pid`'s kernel call changed of `what`, which
+/// it ended inside, holding it (`call` the call it took it in).
+pub(crate) fn lost_in_call(pid: i32, what: &str, call: &str) -> String {
+    format!("{what}'s changes made by process {pid}'s {call} (the process ended inside it, holding {what}): lost, the system's being the one it gave back before")
 }
 
 /// The boot payload every process of the page booted from: its files'
@@ -396,6 +620,55 @@ pub fn serve(op: u32, req: &[u8], out: &mut [u8]) -> i64 {
             out[..8].copy_from_slice(&slot.unwrap_or(0).to_le_bytes());
             8
         }
+        op::IPC_LOST => {
+            let 4.. = req.len() else { return -EINVAL };
+            let pid = i32::from_le_bytes(req[..4].try_into().unwrap());
+            lost().push((pid, String::from_utf8_lossy(&req[4..]).into_owned()));
+            0
+        }
+        op::WHOLE_TAKE => {
+            let (Some(w), 9..) = (req.first().and_then(|&n| Whole::of(n)), req.len()) else { return -EINVAL };
+            let pid = i32::from_le_bytes(req[1..5].try_into().unwrap());
+            let seen = u32::from_le_bytes(req[5..9].try_into().unwrap()) as usize;
+            let call = String::from_utf8_lossy(&req[9..]).into_owned();
+            let head = lost_header(seen);
+            let room = out.len().saturating_sub(head.len());
+            let got = match w {
+                Whole::Jetsam => match system_procs() {
+                    Some(p) => super::memorystatus::system_take(p, pid, call, room),
+                    None => return -ENOSYS,
+                },
+                Whole::Personas => super::persona::system_take(pid, call, room),
+            };
+            match got {
+                Taking::Held => -11,
+                Taking::Long(n) => (head.len() + n) as i64,
+                Taking::Got(b) => {
+                    out[..head.len()].copy_from_slice(&head);
+                    out[head.len()..head.len() + b.len()].copy_from_slice(&b);
+                    (head.len() + b.len()) as i64
+                }
+            }
+        }
+        op::WHOLE_PUT => {
+            let (Some(w), 5..) = (req.first().and_then(|&n| Whole::of(n)), req.len()) else { return -EINVAL };
+            let pid = i32::from_le_bytes(req[1..5].try_into().unwrap());
+            let r = match w {
+                Whole::Jetsam => match system_procs() {
+                    Some(p) => super::memorystatus::system_put(p, pid, &req[5..]),
+                    None => return -ENOSYS,
+                },
+                Whole::Personas => super::persona::system_put(pid, &req[5..]),
+            };
+            match r {
+                Ok(()) => 0,
+                Err(e) => -e,
+            }
+        }
+        op::SCHED => match system_procs() {
+            Some(p) => super::sched::serve(&p.sched, req, out),
+            None => -ENOSYS,
+        },
         _ => match super::trustcache::serve(op, req, out).or_else(|| super::coalition::serve(op, req, out)).or_else(|| super::held::serve(op, req, out)).or_else(|| super::devfs::serve(op, req, out)).or_else(|| super::ipc::wire::serve(op, req, out)) {
             Some(n) => n,
             None => -ENOSYS,

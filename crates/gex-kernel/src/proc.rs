@@ -844,6 +844,9 @@ pub struct ProcTable {
     pub darwin_ipc: std::sync::Arc<crate::darwin::ipc::IpcCell>,
     /// Every process's memorystatus state and the jetsam bands.
     pub jetsam: Mutex<crate::darwin::memorystatus::Jetsam>,
+    /// Notified when a process of the page gives the jetsam table back
+    /// (where this table is the system's for them: the global kernel's).
+    pub jetsam_free: std::sync::Condvar,
     /// The scheduler's runnable threads and averages, the whole system's.
     pub sched: crate::darwin::sched::Sched,
     /// Notified when a process crashes ([`ProcTable::crash_queue`]); made
@@ -876,6 +879,7 @@ impl ProcTable {
     pub fn new() -> ProcTable {
         let t = ProcTable {
             jetsam: Default::default(),
+            jetsam_free: std::sync::Condvar::new(),
             sched: Default::default(),
             halting: AtomicBool::new(false),
             halt_code: AtomicI32::new(0),
@@ -950,9 +954,22 @@ impl ProcTable {
         t
     }
 
-    /// The memorystatus state, locked.
-    pub fn jetsam(&self) -> std::sync::MutexGuard<'_, crate::darwin::memorystatus::Jetsam> {
-        self.jetsam.lock().unwrap_or_else(|e| e.into_inner())
+    /// The memorystatus state, locked: the system's. A table that is really
+    /// somewhere else (a process of the page) takes the system's whole
+    /// from the global kernel, whose table it is; there, a process of the
+    /// page that holds it taken is waited for.
+    pub fn jetsam(&self) -> crate::darwin::memorystatus::JetsamGuard<'_> {
+        use crate::darwin::memorystatus::{take_system, JetsamGuard};
+        if self.remote.is_some() {
+            if let Some(j) = take_system() {
+                return JetsamGuard::Taken(Box::new(j));
+            }
+        }
+        let mut g = self.jetsam.lock().unwrap_or_else(|e| e.into_inner());
+        while g.is_taken() {
+            g = self.jetsam_free.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+        JetsamGuard::Here(g)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Table> {
@@ -1100,12 +1117,8 @@ impl ProcTable {
         self.sched.thread_gone(tid);
     }
 
-    /// `averunnable.ldavg`, the whole system's: none from a table in
-    /// another memory, whose processes' threads this one cannot count.
+    /// `averunnable.ldavg`, the whole system's.
     pub fn darwin_loadavg(&self) -> Result<[u32; 3], &'static str> {
-        if self.remote.is_some() {
-            return Err("the scheduler's averages across the browser's Workers (a process table in another memory)");
-        }
         self.sched.averunnable()
     }
 
@@ -1863,9 +1876,24 @@ impl ProcTable {
         }
     }
 
-    /// `pid`'s task policy, a zombie's too.
+    /// `pid`'s task policy, a zombie's too. (A table that is really
+    /// somewhere else holds only this process's: another Darwin process's
+    /// of the page is noted, as [`Self::darwin`]'s record is.)
     pub fn task_policy(&self, pid: i32) -> Option<Arc<crate::darwin::taskpolicy::PolicyCell>> {
-        self.lock().procs.iter().find(|p| p.pid == pid).map(|p| Arc::clone(&p.child.policy))
+        let found = self.lock().procs.iter().find(|p| p.pid == pid).map(|p| Arc::clone(&p.child.policy));
+        if found.is_none() {
+            self.note_elsewhere(pid, "task policy");
+        }
+        found
+    }
+
+    /// Another Darwin process's `what`, which a table that is really
+    /// somewhere else does not hold: in the page it is in that process's
+    /// own memory, not the system's (noted, reported at the call's end).
+    fn note_elsewhere(&self, pid: i32, what: &str) {
+        if self.remote.is_some() && pid != crate::darwin::held::me() && crate::darwin::held::darwin_process(pid) {
+            crate::darwin::note_unimplemented(format!("process {pid}'s {what}, which is in that process's own memory in the page, not the system's"));
+        }
     }
 
     /// A live process's uid and `p_nice` (`proc_find`'s: no zombie).
@@ -1920,7 +1948,11 @@ impl ProcTable {
 
     pub fn live_nice(&self, pid: i32) -> Option<(u32, i32)> {
         let t = self.lock();
-        let p = t.procs.iter().find(|p| p.pid == pid)?;
+        let Some(p) = t.procs.iter().find(|p| p.pid == pid) else {
+            drop(t);
+            self.note_elsewhere(pid, "uid and nice value (proc_find)");
+            return None;
+        };
         let live = p.child.status.lock().map(|s| s.is_none()).unwrap_or(false);
         live.then_some((p.uid, p.nice))
     }
@@ -1997,7 +2029,11 @@ impl ProcTable {
 
     /// `pid`'s job control state, as its waiting parent sees it.
     pub fn job(&self, pid: i32) -> Option<Arc<Mutex<Job>>> {
-        self.lock().procs.iter().find(|p| p.pid == pid).map(|p| Arc::clone(&p.child.job))
+        let found = self.lock().procs.iter().find(|p| p.pid == pid).map(|p| Arc::clone(&p.child.job));
+        if found.is_none() {
+            self.note_elsewhere(pid, "job control state");
+        }
+        found
     }
 
     /// A stop's or a continue's news for `pid`'s waiting parent: its wait

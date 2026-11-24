@@ -391,7 +391,7 @@ pub struct Task {
     /// starvation throttled or suspended.
     pub vmrsrcowner: bool,
     /// `p_persona`.
-    pub persona: Option<std::sync::Arc<persona::Persona>>,
+    pub persona: Option<persona::Persona>,
     /// `p_textoff`: where the image's slice starts in its file.
     pub textoff: i64,
     /// `p_uniqueid` and `p_puniqueid` (its parent's at its fork), and

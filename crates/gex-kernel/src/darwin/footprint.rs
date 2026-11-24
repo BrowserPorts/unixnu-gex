@@ -93,6 +93,35 @@ pub enum Crossing {
 }
 
 impl Ledger {
+    /// The entry as bytes, for the jetsam table the processes of the page
+    /// share ([`super::memorystatus::Jetsam::to_bytes`]).
+    pub(crate) fn put(&self, p: &mut super::ipc::wire::Put) {
+        p.u64(self.balance as u64);
+        p.u64(self.lifetime_max as u64);
+        p.u64(self.interval_max as u64);
+        p.u64(self.limit as u64);
+        p.u32(self.warn_percent);
+        for b in [self.called_back, self.warned, self.memlimit_active, self.memlimit_fatal, self.exc_active, self.exc_inactive] {
+            p.bool(b);
+        }
+    }
+
+    pub(crate) fn get(g: &mut super::ipc::wire::Get<'_>) -> Result<Ledger, super::ipc::wire::Bad> {
+        Ok(Ledger {
+            balance: g.u64()? as i64,
+            lifetime_max: g.u64()? as i64,
+            interval_max: g.u64()? as i64,
+            limit: g.u64()? as i64,
+            warn_percent: g.u32()?,
+            called_back: g.bool()?,
+            warned: g.bool()?,
+            memlimit_active: g.bool()?,
+            memlimit_fatal: g.bool()?,
+            exc_active: g.bool()?,
+            exc_inactive: g.bool()?,
+        })
+    }
+
     /// `ledger_set_limit`.
     fn set_limit(&mut self, limit: i64, warn_level: u32) {
         self.limit = limit;
@@ -122,6 +151,18 @@ impl Ledger {
 
     fn limit_exceeded(&self) -> bool {
         (self.limit <= 0 && self.balance < self.limit) || (self.limit > 0 && self.balance > self.limit)
+    }
+
+    /// The lowest balance the ledger acts on (its warning level, or else
+    /// its limit): none for a limit no balance passes.
+    pub(crate) fn watched(&self) -> Option<i64> {
+        if self.limit <= 0 || self.limit == LIMIT_INFINITY {
+            return None;
+        }
+        if self.warn_percent != PERCENT_NONE {
+            return Some(((i128::from(self.limit) * i128::from(self.warn_percent)) >> 16) as i64);
+        }
+        Some(self.limit)
     }
 
     fn warn_level_exceeded(&self) -> bool {
@@ -565,6 +606,28 @@ impl Meter {
         Some(pm.balance() - (pm.own_in(&alt) * PAGE) as i64 + owned.footprint as i64)
     }
 
+    /// The most the `phys_footprint` can be now, without asking the host:
+    /// every page of the ranges the pmap enters held, with the leaf and twig
+    /// tables over them; none (no bound) where the task owns objects, whose
+    /// pages the map does not bound.
+    pub fn most(&self, mm: &crate::mem::Mm) -> Option<i64> {
+        if self.owner().objects().into_iter().next().is_some() {
+            return None;
+        }
+        let mut pages = 0u64;
+        let mut leaves = std::collections::BTreeSet::new();
+        let mut twigs: std::collections::BTreeSet<u64> = self.fixed_twigs().into_iter().collect();
+        for (s, e) in self.ranges(mm) {
+            if s >= e {
+                continue;
+            }
+            pages += (e - s).div_ceil(PAGE);
+            leaves.extend(s >> L3_SHIFT..=(e - 1) >> L3_SHIFT);
+            twigs.extend(s >> L2_SHIFT..=(e - 1) >> L2_SHIFT);
+        }
+        Some((pages * PAGE + ROOT_SIZE + (leaves.len() + twigs.len()) as u64 * PAGE) as i64)
+    }
+
     /// The ranges of map `mm` the pmap enters pages of: its mappings less
     /// the commpage alias and the submaps.
     pub fn ranges(&self, mm: &crate::mem::Mm) -> Vec<(u64, u64)> {
@@ -764,10 +827,34 @@ impl Kernel {
         if let Some(next) = self.dtask.footprint_due.filter(|&t| t > now) {
             return Some(next);
         }
-        if !self.procs.jetsam().ledgers.contains_key(&self.pid) {
-            return None;
+        let Some(watched) = self.procs.jetsam().ledgers.get(&self.pid).map(Ledger::watched) else { return None };
+        let rusage = std::sync::Arc::clone(&self.dtask.rusage);
+        let fp = {
+            let mut pm = rusage.meter.lock();
+            rusage.meter.measure(&mut pm, &self.mem, m)
+        };
+        match fp {
+            Some(fp) => {
+                if let Some((c, l)) = self.darwin_footprint_is(fp) {
+                    self.darwin_footprint_exceeded(m, c, l);
+                }
+            }
+            None => {
+                // A host that cannot say which pages are the task's (the
+                // page's) keeps no sample: that differs only where the
+                // task's balance could reach what its ledger acts on, which
+                // what its pmap could hold bounds.
+                if let Some(w) = watched {
+                    match rusage.meter.most(&self.mem) {
+                        Some(most) if most <= w => {}
+                        most => {
+                            let most = most.map_or_else(|| "objects it owns, which its map does not bound".to_string(), |b| format!("{b} bytes"));
+                            self.darwin_unimplemented(format!("phys_footprint's sampling against the task's ledger (its pages could reach {most}, past the {w} bytes its ledger acts on) on a host that cannot say which pages are a task's"));
+                        }
+                    }
+                }
+            }
         }
-        self.darwin_footprint_now(m)?;
         let next = now + SAMPLE;
         self.dtask.footprint_due = Some(next);
         Some(next)

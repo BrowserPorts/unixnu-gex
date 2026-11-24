@@ -18,6 +18,10 @@
 //! when it is asked for, and, for a thread on its CPU, once each tick (its
 //! first quantum's expiry after the tick, which the host's threads have no
 //! timer for, is taken at the tick).
+//!
+//! In the page the state is the global kernel's process table's, every
+//! call a call to it ([`super::share::op::SCHED`]): each process's threads
+//! are counted with every other's, as natively.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -198,6 +202,129 @@ pub struct Sched {
     driven: AtomicBool,
 }
 
+/// What keeps the averages from being kept here.
+const NOT_DRIVEN: &str = "the scheduler's averages: no maintenance thread runs here (sched_timeshare_maintenance_continue)";
+
+/// The scheduler's calls a process of the page makes of the global
+/// kernel's ([`serve`]).
+mod call {
+    pub const SET_STATE: u8 = 0;
+    pub const STATE: u8 = 1;
+    pub const UPDATE_USAGE: u8 = 2;
+    pub const RENEW_USAGE: u8 = 3;
+    pub const CPU_USAGE: u8 = 4;
+    pub const THREAD_GONE: u8 = 5;
+    pub const TASK_GONE: u8 = 6;
+    pub const PROCESSORS_IDLE: u8 = 7;
+    pub const CALLOUT: u8 = 8;
+    pub const DRIVEN: u8 = 9;
+    pub const HOST_LOAD: u8 = 10;
+    pub const AVERUNNABLE: u8 = 11;
+}
+
+fn state_byte(s: Option<RunState>) -> u8 {
+    match s {
+        None => 0,
+        Some(RunState::Run) => 1,
+        Some(RunState::Wait) => 2,
+        Some(RunState::Unint) => 3,
+    }
+}
+
+fn state_of(b: u8) -> Option<Option<RunState>> {
+    Some(match b {
+        0 => None,
+        1 => Some(RunState::Run),
+        2 => Some(RunState::Wait),
+        3 => Some(RunState::Unint),
+        _ => return None,
+    })
+}
+
+/// A call of the global kernel's scheduler state: its answer, `n` bytes.
+fn through(r: super::share::Remote, c: u8, args: &[u8], out: &mut [u8]) {
+    let mut req = vec![c];
+    req.extend_from_slice(args);
+    super::share::call(r, super::share::op::SCHED, &req, out);
+}
+
+fn words(w: &[u32]) -> Vec<u8> {
+    w.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
+fn three(b: &[u8]) -> [u32; 3] {
+    std::array::from_fn(|i| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap()))
+}
+
+/// A call [`super::share::op::SCHED`] carried, on `s`, the system's
+/// (the global kernel's process table's): the answer's length, or a
+/// negated errno.
+pub(crate) fn serve(s: &Sched, req: &[u8], out: &mut [u8]) -> i64 {
+    const EINVAL: i64 = 22;
+    let word = |i: usize| -> Option<u32> { req.get(1 + 4 * i..5 + 4 * i).map(|b| u32::from_le_bytes(b.try_into().unwrap())) };
+    let long = |at: usize| -> Option<u64> { req.get(at..at + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap())) };
+    let Some(&c) = req.first() else { return -EINVAL };
+    let mut answer = |b: &[u8]| -> i64 {
+        if out.len() < b.len() {
+            return -EINVAL;
+        }
+        out[..b.len()].copy_from_slice(b);
+        b.len() as i64
+    };
+    match (c, req.len()) {
+        (call::SET_STATE, 10) => {
+            let Some(state) = state_of(req[9]).flatten() else { return -EINVAL };
+            s.set_state(word(0).unwrap() as i32, word(1).unwrap() as i32, state);
+            0
+        }
+        (call::STATE, 5) => answer(&[state_byte(s.state(word(0).unwrap() as i32))]),
+        (call::UPDATE_USAGE, 13) => {
+            s.update_usage(word(0).unwrap() as i32, long(5).unwrap());
+            0
+        }
+        (call::RENEW_USAGE, 5) => {
+            s.renew_usage(word(0).unwrap() as i32);
+            0
+        }
+        (call::CPU_USAGE, 13) => match s.usage_now(word(0).unwrap() as i32, long(5).unwrap()) {
+            None => answer(&[0]),
+            Some(u) => {
+                let mut b = vec![1];
+                b.extend_from_slice(&u.to_le_bytes());
+                answer(&b)
+            }
+        },
+        (call::THREAD_GONE, 5) => {
+            s.thread_gone(word(0).unwrap() as i32);
+            0
+        }
+        (call::TASK_GONE, 5) => {
+            s.task_gone(word(0).unwrap() as i32);
+            0
+        }
+        (call::PROCESSORS_IDLE, 10) => {
+            // (whether a thread is left out, its id, the thread calls left out)
+            let except = (req[1] != 0).then(|| i32::from_le_bytes(req[2..6].try_into().unwrap()));
+            let callouts = u32::from_le_bytes(req[6..10].try_into().unwrap());
+            answer(&[u8::from(s.processors_idle(except, callouts))])
+        }
+        (call::CALLOUT, 2) => {
+            s.callout(req[1] != 0);
+            0
+        }
+        (call::DRIVEN, 1) => answer(&[u8::from(s.check().is_ok())]),
+        (call::HOST_LOAD, 1) => match s.host_load() {
+            Ok((a, m)) => answer(&[words(&a), words(&m)].concat()),
+            Err(_) => answer(&[]),
+        },
+        (call::AVERUNNABLE, 1) => match s.averunnable() {
+            Ok(l) => answer(&words(&l)),
+            Err(_) => answer(&[]),
+        },
+        _ => -EINVAL,
+    }
+}
+
 impl Sched {
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
@@ -208,6 +335,11 @@ impl Sched {
     /// A thread new to it starts at this tick (`thread_create_internal`'s
     /// `sched_stamp`), with no usage.
     pub fn set_state(&self, pid: i32, tid: i32, state: RunState) {
+        if let Some(r) = super::share::remote() {
+            let mut a = words(&[pid as u32, tid as u32]);
+            a.push(state_byte(Some(state)));
+            return through(r, call::SET_STATE, &a, &mut []);
+        }
         let mut s = self.lock();
         if s.ended.contains(&pid) {
             return;
@@ -220,6 +352,11 @@ impl Sched {
 
     /// Thread `tid`'s state, if the scheduler has it.
     pub fn state(&self, tid: i32) -> Option<RunState> {
+        if let Some(r) = super::share::remote() {
+            let mut o = [0u8; 1];
+            through(r, call::STATE, &words(&[tid as u32]), &mut o);
+            return state_of(o[0]).unwrap_or_else(|| panic!("gex: the global kernel's thread state {} is not one", o[0]));
+        }
         self.lock().threads.get(&tid).map(|t| t.state)
     }
 
@@ -227,6 +364,11 @@ impl Sched {
     /// processor time is now `total` (Mach time units): as it blocks, as
     /// it is made runnable (`thread_select`, `thread_setrun`).
     pub fn update_usage(&self, tid: i32, total: u64) {
+        if let Some(r) = super::share::remote() {
+            let mut a = words(&[tid as u32]);
+            a.extend_from_slice(&total.to_le_bytes());
+            return through(r, call::UPDATE_USAGE, &a, &mut []);
+        }
         let mut s = self.lock();
         let tick = s.tick as u32;
         if let Some(t) = s.threads.get_mut(&tid) {
@@ -239,6 +381,9 @@ impl Sched {
     /// The exec's new thread that thread `tid` becomes: its usage starts
     /// over at this tick, from the old thread's `sched_time_save`.
     pub fn renew_usage(&self, tid: i32) {
+        if let Some(r) = super::share::remote() {
+            return through(r, call::RENEW_USAGE, &words(&[tid as u32]), &mut []);
+        }
         let mut s = self.lock();
         let stamp = s.tick as u32;
         if let Some(t) = s.threads.get_mut(&tid) {
@@ -256,22 +401,42 @@ impl Sched {
         // Every update of the usage reads the thread's time from the
         // host's clocks.
         crate::darwin::workq::host_clocks().ok_or("the threads' usage (sched_usage): no per-thread clocks on the host")?;
+        if let Some(r) = super::share::remote() {
+            let mut a = words(&[tid as u32]);
+            a.extend_from_slice(&total.to_le_bytes());
+            let mut o = [0u8; 5];
+            let n = super::share::call_upto(r, super::share::op::SCHED, &[&[call::CPU_USAGE][..], &a].concat(), &mut o);
+            return Ok((n == 5 && o[0] == 1).then(|| i32::from_le_bytes(o[1..5].try_into().unwrap())));
+        }
+        Ok(self.usage_now(tid, total))
+    }
+
+    /// Thread `tid`'s usage brought up to date, its processor time now
+    /// `total`, and scaled ([`Sched::cpu_usage`]): none when the scheduler
+    /// does not have the thread.
+    fn usage_now(&self, tid: i32, total: u64) -> Option<i32> {
         let mut s = self.lock();
         let tick = s.tick as u32;
-        let Some(t) = s.threads.get_mut(&tid) else { return Ok(None) };
+        let t = s.threads.get_mut(&tid)?;
         if t.usage.stamp != tick {
             t.usage.update(tick, total);
         }
-        Ok(Some(scaled_usage(t.usage.cpu_usage)))
+        Some(scaled_usage(t.usage.cpu_usage))
     }
 
     /// Thread `tid` has ended.
     pub fn thread_gone(&self, tid: i32) {
+        if let Some(r) = super::share::remote() {
+            return through(r, call::THREAD_GONE, &words(&[tid as u32]), &mut []);
+        }
         self.lock().threads.remove(&tid);
     }
 
     /// Process `pid` has ended, every thread of it with it.
     pub fn task_gone(&self, pid: i32) {
+        if let Some(r) = super::share::remote() {
+            return through(r, call::TASK_GONE, &words(&[pid as u32]), &mut []);
+        }
         let mut s = self.lock();
         s.threads.retain(|_, t| t.pid != pid);
         s.ended.insert(pid);
@@ -288,12 +453,23 @@ impl Sched {
     /// The device's own kernel threads that gex does not run (its other
     /// thread calls, IOKit work loops) are taken to be idle.
     pub fn processors_idle(&self, except_tid: Option<i32>, except_callouts: u32) -> bool {
+        if let Some(r) = super::share::remote() {
+            let mut a = vec![u8::from(except_tid.is_some())];
+            a.extend_from_slice(&except_tid.unwrap_or(0).to_le_bytes());
+            a.extend_from_slice(&except_callouts.to_le_bytes());
+            let mut o = [0u8; 1];
+            through(r, call::PROCESSORS_IDLE, &a, &mut o);
+            return o[0] != 0;
+        }
         let s = self.lock();
         s.callouts.saturating_sub(except_callouts) == 0 && !s.threads.iter().any(|(&tid, t)| t.state == RunState::Run && Some(tid) != except_tid)
     }
 
     /// One of the kernel's thread calls starts (`run`) or finishes running.
     pub fn callout(&self, run: bool) {
+        if let Some(r) = super::share::remote() {
+            return through(r, call::CALLOUT, &[u8::from(run)], &mut []);
+        }
         let mut s = self.lock();
         if run {
             s.callouts += 1;
@@ -305,6 +481,9 @@ impl Sched {
     /// Claim the running of the maintenance: true for the one caller that
     /// is to run [`Sched::maintenance_thread`].
     pub fn claim_driver(&self) -> bool {
+        // (A host that runs the maintenance has the system's state: the
+        // page's host runs none.)
+        assert!(super::share::remote().is_none(), "gex: the scheduler's maintenance claimed by a process of the page, whose scheduler state is the global kernel's");
         !self.driven.swap(true, Ordering::AcqRel)
     }
 
@@ -331,6 +510,7 @@ impl Sched {
     /// the last (at least one, at most `SCHED_TICK_MAX_DELTA`), and the
     /// averages over them.
     pub fn maintenance(&self) {
+        assert!(super::share::remote().is_none(), "gex: the scheduler's maintenance run by a process of the page, whose scheduler state is the global kernel's");
         let mut s = self.lock();
         let ctime = absolute_time();
         let delta = if s.tick_last == 0 {
@@ -360,6 +540,11 @@ impl Sched {
 
     /// `averunnable.ldavg`, or what keeps it from being kept here.
     pub fn averunnable(&self) -> Result<[u32; 3], &'static str> {
+        if let Some(r) = super::share::remote() {
+            let mut o = [0u8; 12];
+            let n = super::share::call_upto(r, super::share::op::SCHED, &[call::AVERUNNABLE], &mut o);
+            return if n == 12 { Ok(three(&o)) } else { Err(NOT_DRIVEN) };
+        }
         self.check()?;
         Ok(self.lock().ldavg)
     }
@@ -367,14 +552,24 @@ impl Sched {
     /// `avenrun` and `mach_factor` (`HOST_LOAD_INFO`), or what keeps them
     /// from being kept here.
     pub fn host_load(&self) -> Result<([u32; 3], [u32; 3]), &'static str> {
+        if let Some(r) = super::share::remote() {
+            let mut o = [0u8; 24];
+            let n = super::share::call_upto(r, super::share::op::SCHED, &[call::HOST_LOAD], &mut o);
+            return if n == 24 { Ok((three(&o[..12]), three(&o[12..]))) } else { Err(NOT_DRIVEN) };
+        }
         self.check()?;
         let s = self.lock();
         Ok((s.avenrun, s.mach_factor))
     }
 
     fn check(&self) -> Result<(), &'static str> {
+        if let Some(r) = super::share::remote() {
+            let mut o = [0u8; 1];
+            through(r, call::DRIVEN, &[], &mut o);
+            return if o[0] != 0 { Ok(()) } else { Err(NOT_DRIVEN) };
+        }
         if !self.driven.load(Ordering::Acquire) {
-            return Err("the scheduler's averages: no maintenance thread runs here (sched_timeshare_maintenance_continue)");
+            return Err(NOT_DRIVEN);
         }
         Ok(())
     }
@@ -434,6 +629,38 @@ fn compute_averunnable(ldavg: &mut [u32; 3], nrun: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_call_through_the_channel_is_the_states() {
+        let s = Sched::default();
+        let call = |req: &[u8], out: &mut [u8]| serve(&s, req, out);
+        let mut a = vec![call::SET_STATE];
+        a.extend_from_slice(&words(&[5, 50]));
+        a.push(state_byte(Some(RunState::Run)));
+        assert_eq!(call(&a, &mut []), 0);
+        let mut o = [0u8; 8];
+        let mut q = vec![call::STATE];
+        q.extend_from_slice(&words(&[50]));
+        assert_eq!((call(&q, &mut o), o[0]), (1, 1));
+        let idle = |except: Option<i32>, o: &mut [u8]| {
+            let mut a = vec![call::PROCESSORS_IDLE, u8::from(except.is_some())];
+            a.extend_from_slice(&except.unwrap_or(0).to_le_bytes());
+            a.extend_from_slice(&0u32.to_le_bytes());
+            serve(&s, &a, o);
+            o[0] != 0
+        };
+        assert!(!idle(None, &mut o));
+        assert!(idle(Some(50), &mut o));
+        let mut g = vec![call::TASK_GONE];
+        g.extend_from_slice(&words(&[5]));
+        assert_eq!(call(&g, &mut []), 0);
+        assert_eq!((call(&q, &mut o), o[0]), (1, 0));
+        // Without a maintenance thread: no averages, said by an empty answer.
+        assert_eq!(call(&[call::AVERUNNABLE], &mut o), 0);
+        assert_eq!((call(&[call::DRIVEN], &mut o), o[0]), (1, 0));
+        assert_eq!(call(&[call::SET_STATE, 0], &mut []), -22);
+        assert_eq!(call(&[99], &mut o), -22);
+    }
 
     #[test]
     fn processors_are_idle_only_when_nothing_runs() {

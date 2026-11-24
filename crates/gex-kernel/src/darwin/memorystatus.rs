@@ -189,6 +189,10 @@ pub struct Jetsam {
     /// the probabilities of use (`memorystatus_global_probabilities_table`)
     /// and dasd's trial identifiers.
     pub freezer: Freezer,
+    /// Where this table is the system's for the processes of the page (the
+    /// global kernel's process table's), the process holding it taken and
+    /// the kernel call it took it in ([`system_take`]).
+    taken: Option<(i32, String)>,
 }
 
 /// What `memorystatus_control` gives the freezer (`kern_memorystatus_freeze.c`).
@@ -216,12 +220,274 @@ pub const GLOBAL_FROZEN_PROCS_SIZE: usize = 8 + 40 * 40;
 
 impl Default for Jetsam {
     fn default() -> Jetsam {
-        Jetsam { procs: HashMap::new(), buckets: vec![VecDeque::new(); BUCKETS], list_count: 0, demotions_sysprocs: 0, demotions_apps: 0, demotion_deadline: 0, dirty_count: 0, lenient: false, listeners: Vec::new(), effects: Effects::default(), ledgers: HashMap::new(), hwm_candidates: false, freezer: Freezer::default() }
+        Jetsam { procs: HashMap::new(), buckets: vec![VecDeque::new(); BUCKETS], list_count: 0, demotions_sysprocs: 0, demotions_apps: 0, demotion_deadline: 0, dirty_count: 0, lenient: false, listeners: Vec::new(), effects: Effects::default(), ledgers: HashMap::new(), hwm_candidates: false, freezer: Freezer::default(), taken: None }
     }
 }
 
 fn now() -> u64 {
     super::mach::absolute_time()
+}
+
+use super::ipc::wire::{Bad, Get, Put};
+
+fn put_memstat(p: &mut Put, m: &Memstat) {
+    p.u32(m.state);
+    p.u32(m.dirty);
+    p.i32(m.effective);
+    p.i32(m.requested);
+    p.i32(m.assertion);
+    p.u64(m.userdata);
+    p.u64(m.idle_start);
+    p.u64(m.idle_delta);
+    p.u64(m.idledeadline);
+    p.i32(m.memlimit);
+    p.i32(m.memlimit_active);
+    p.i32(m.memlimit_inactive);
+    p.u32(m.relaunch);
+    p.i32(m.ppid);
+    p.bool(m.entitled.increased_memory_limit);
+    p.bool(m.entitled.legacy_footprint);
+    p.bool(m.entitled.ios13extended_footprint);
+}
+
+fn get_memstat(g: &mut Get<'_>) -> Result<Memstat, Bad> {
+    Ok(Memstat {
+        state: g.u32()?,
+        dirty: g.u32()?,
+        effective: g.i32()?,
+        requested: g.i32()?,
+        assertion: g.i32()?,
+        userdata: g.u64()?,
+        idle_start: g.u64()?,
+        idle_delta: g.u64()?,
+        idledeadline: g.u64()?,
+        memlimit: g.i32()?,
+        memlimit_active: g.i32()?,
+        memlimit_inactive: g.i32()?,
+        relaunch: g.u32()?,
+        ppid: g.i32()?,
+        entitled: Entitled { increased_memory_limit: g.bool()?, legacy_footprint: g.bool()?, ios13extended_footprint: g.bool()? },
+    })
+}
+
+fn get_array<const N: usize>(g: &mut Get<'_>) -> Result<[u8; N], Bad> {
+    let b = g.bytes()?;
+    b.try_into().map_err(|_| g.bad("a fixed-size record"))
+}
+
+impl Jetsam {
+    /// The table as bytes, for the processes of the page (its maps in key
+    /// order, so a table is the same bytes): every field but the holder
+    /// mark.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut p = Put::default();
+        let mut pids: Vec<i32> = self.procs.keys().copied().collect();
+        pids.sort_unstable();
+        p.len(pids.len());
+        for pid in pids {
+            p.i32(pid);
+            put_memstat(&mut p, &self.procs[&pid]);
+        }
+        p.len(self.buckets.len());
+        for b in &self.buckets {
+            p.len(b.len());
+            for &pid in b {
+                p.i32(pid);
+            }
+        }
+        p.u32(self.list_count);
+        p.i32(self.demotions_sysprocs);
+        p.i32(self.demotions_apps);
+        p.u64(self.demotion_deadline);
+        p.u32(self.dirty_count);
+        p.bool(self.lenient);
+        p.len(self.listeners.len());
+        for &pid in &self.listeners {
+            p.i32(pid);
+        }
+        p.len(self.effects.ledger.len());
+        for w in &self.effects.ledger {
+            p.i32(w.pid);
+            p.i32(w.limit_mb);
+            p.bool(w.active);
+            p.bool(w.fatal);
+        }
+        p.len(self.effects.kill.len());
+        for &pid in &self.effects.kill {
+            p.i32(pid);
+        }
+        p.bool(self.effects.rescheduled);
+        let mut pids: Vec<i32> = self.ledgers.keys().copied().collect();
+        pids.sort_unstable();
+        p.len(pids.len());
+        for pid in pids {
+            p.i32(pid);
+            self.ledgers[&pid].put(&mut p);
+        }
+        p.bool(self.hwm_candidates);
+        let f = &self.freezer;
+        for list in [&f.freeze_list, &f.demote_list] {
+            p.len(list.len());
+            for e in list {
+                p.bytes(e);
+            }
+        }
+        p.len(f.probabilities.len());
+        for (name, prob) in &f.probabilities {
+            p.bytes(name);
+            p.i32(*prob);
+        }
+        p.opt(f.trial_identifiers.as_ref(), |p, t| p.bytes(t));
+        p.0
+    }
+
+    /// The table [`Jetsam::to_bytes`] made.
+    pub fn of_bytes(b: &[u8]) -> Result<Jetsam, Bad> {
+        let g = &mut Get::new(b);
+        let mut j = Jetsam { buckets: Vec::new(), ..Jetsam::default() };
+        for _ in 0..g.len()? {
+            let pid = g.i32()?;
+            j.procs.insert(pid, get_memstat(g)?);
+        }
+        let n = g.len()?;
+        if n != BUCKETS {
+            return Err(g.bad("the jetsam bands"));
+        }
+        for _ in 0..n {
+            let mut b = VecDeque::new();
+            for _ in 0..g.len()? {
+                b.push_back(g.i32()?);
+            }
+            j.buckets.push(b);
+        }
+        j.list_count = g.u32()?;
+        j.demotions_sysprocs = g.i32()?;
+        j.demotions_apps = g.i32()?;
+        j.demotion_deadline = g.u64()?;
+        j.dirty_count = g.u32()?;
+        j.lenient = g.bool()?;
+        for _ in 0..g.len()? {
+            j.listeners.push(g.i32()?);
+        }
+        for _ in 0..g.len()? {
+            j.effects.ledger.push(LedgerWrite { pid: g.i32()?, limit_mb: g.i32()?, active: g.bool()?, fatal: g.bool()? });
+        }
+        for _ in 0..g.len()? {
+            j.effects.kill.push(g.i32()?);
+        }
+        j.effects.rescheduled = g.bool()?;
+        for _ in 0..g.len()? {
+            let pid = g.i32()?;
+            j.ledgers.insert(pid, super::footprint::Ledger::get(g)?);
+        }
+        j.hwm_candidates = g.bool()?;
+        for _ in 0..g.len()? {
+            j.freezer.freeze_list.push(get_array(g)?);
+        }
+        for _ in 0..g.len()? {
+            j.freezer.demote_list.push(get_array(g)?);
+        }
+        for _ in 0..g.len()? {
+            let name = g.bytes()?;
+            j.freezer.probabilities.push((name, g.i32()?));
+        }
+        j.freezer.trial_identifiers = g.opt(|g| get_array(g))?;
+        if !g.done() {
+            return Err(g.bad("the end of the jetsam table"));
+        }
+        Ok(j)
+    }
+}
+
+/// The memorystatus state as a caller has it for as long as natively the
+/// process table's lock on it is held: that lock's guard, or in the page
+/// the system's table taken whole from the global kernel, given back with
+/// what the caller changed when the guard goes.
+pub enum JetsamGuard<'a> {
+    Here(std::sync::MutexGuard<'a, Jetsam>),
+    Taken(Box<Jetsam>),
+}
+
+impl std::ops::Deref for JetsamGuard<'_> {
+    type Target = Jetsam;
+    fn deref(&self) -> &Jetsam {
+        match self {
+            JetsamGuard::Here(g) => g,
+            JetsamGuard::Taken(j) => j,
+        }
+    }
+}
+
+impl std::ops::DerefMut for JetsamGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Jetsam {
+        match self {
+            JetsamGuard::Here(g) => &mut *g,
+            JetsamGuard::Taken(j) => &mut *j,
+        }
+    }
+}
+
+impl Drop for JetsamGuard<'_> {
+    fn drop(&mut self) {
+        if let JetsamGuard::Taken(j) = self {
+            super::share::give_whole(super::share::Whole::Jetsam, &j.to_bytes());
+        }
+    }
+}
+
+/// The system's memorystatus state, taken whole from the global kernel for
+/// a process of the page: none where this kernel's process table holds the
+/// system's.
+pub(crate) fn take_system() -> Option<Jetsam> {
+    let b = super::share::take_whole(super::share::Whole::Jetsam, "kernel call")?;
+    match Jetsam::of_bytes(&b) {
+        Ok(j) => Some(j),
+        Err(e) => panic!("gex: the global kernel's jetsam table is not one ({e:?})"),
+    }
+}
+
+/// A process of the page takes the system's table (the global kernel's
+/// process table's, `procs`), in its kernel call `call`, with `room`
+/// bytes for it.
+pub(crate) fn system_take(procs: &crate::proc::ProcTable, pid: i32, call: String, room: usize) -> super::share::Taking {
+    use super::share::Taking;
+    let mut j = procs.jetsam.lock().unwrap_or_else(|e| e.into_inner());
+    if j.taken.is_some() {
+        return Taking::Held;
+    }
+    let b = j.to_bytes();
+    if b.len() > room {
+        return Taking::Long(b.len());
+    }
+    j.taken = Some((pid, call));
+    Taking::Got(b)
+}
+
+/// Its holder gives it back: the table as it left it. `EINVAL` from a
+/// process that does not hold it, or for bytes that are not a table.
+pub(crate) fn system_put(procs: &crate::proc::ProcTable, pid: i32, b: &[u8]) -> Result<(), i64> {
+    let mut j = procs.jetsam.lock().unwrap_or_else(|e| e.into_inner());
+    if !j.taken.as_ref().is_some_and(|(p, _)| *p == pid) {
+        return Err(22);
+    }
+    *j = Jetsam::of_bytes(b).map_err(|_| 22)?;
+    drop(j);
+    procs.jetsam_free.notify_all();
+    Ok(())
+}
+
+/// Process `pid` of the page has exited: the table, if it held it, as it
+/// was last given back, the loss recorded. Whether it held it.
+pub(crate) fn system_exited(procs: &crate::proc::ProcTable, pid: i32) -> bool {
+    let mut j = procs.jetsam.lock().unwrap_or_else(|e| e.into_inner());
+    if !j.taken.as_ref().is_some_and(|(p, _)| *p == pid) {
+        return false;
+    }
+    let (_, call) = j.taken.take().expect("held");
+    drop(j);
+    procs.jetsam_free.notify_all();
+    super::share::note_lost(pid, &super::share::lost_in_call(pid, "the jetsam table", &call));
+    true
 }
 
 fn is_app(p: &Memstat) -> bool {
@@ -347,6 +613,11 @@ impl Jetsam {
 
     pub fn get(&self, pid: i32) -> Option<&Memstat> {
         self.procs.get(&pid)
+    }
+
+    /// Whether a process of the page holds this table taken.
+    pub fn is_taken(&self) -> bool {
+        self.taken.is_some()
     }
 
     fn p(&mut self, pid: i32) -> &mut Memstat {
@@ -1229,17 +1500,6 @@ impl crate::syscalls::Kernel {
         (deadline != 0).then(|| super::mach::abs_to_instant(deadline))
     }
 
-    /// Whether `what` reads or changes the jetsam table where it is not the
-    /// system's: in the page each process's process table holds a copy of
-    /// its own, with no process's entry (reported, for the caller to fail).
-    pub(crate) fn darwin_jetsam_elsewhere(&mut self, what: &str) -> bool {
-        if !self.procs.is_shared() {
-            return false;
-        }
-        self.darwin_unimplemented(format!("{what}: the jetsam table, which in the page is each process's own copy with no process's entry, not the system's"));
-        true
-    }
-
     /// `proc_dirtycontrol(pid, flavor, arg)`: `proc_info`'s
     /// PROC_INFO_CALL_DIRTYCONTROL. The value is the call's return.
     pub(crate) fn darwin_dirtycontrol(&mut self, pid: i32, flavor: u32, arg: u64) -> Result<u64, Errno> {
@@ -1247,9 +1507,6 @@ impl crate::syscalls::Kernel {
         const SET: u32 = 2;
         const GET: u32 = 3;
         const CLEAR: u32 = 4;
-        if self.darwin_jetsam_elsewhere("proc_dirtycontrol") {
-            return Err(Errno::ENOSYS);
-        }
         let pcontrol = arg as u32;
         let target = self.procs.live_nice(pid);
         let jetsam_has = self.procs.jetsam().get(pid).is_some();
@@ -1289,9 +1546,6 @@ impl crate::syscalls::Kernel {
     /// value is the call's return (`*ret`).
     pub(crate) fn darwin_memorystatus_control(&mut self, m: &mut crate::GuestMem<'_>, a: &[u64; 6]) -> Result<u64, Errno> {
         let (command, pid, flags, buffer, size) = (a[0] as u32, a[1] as i32, a[2] as u32, a[3], a[4]);
-        if self.darwin_jetsam_elsewhere("memorystatus_control") {
-            return Err(Errno::ENOSYS);
-        }
         let root = self.creds.uid() == 0;
         let entitled = self.darwin_task_entitled(MEMORYSTATUS_ENTITLEMENT);
         let skip_auth = matches!(command, cmd::SET_PROCESS_IS_FREEZABLE | cmd::GET_PROCESS_IS_FREEZABLE | cmd::GET_PROCESS_IS_FROZEN);
@@ -1559,5 +1813,56 @@ impl crate::syscalls::Kernel {
         };
         self.darwin_jetsam_effects();
         r
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_jetsam_table_is_the_same_table_after_its_bytes() {
+        use super::*;
+        let mut j = Jetsam::default();
+        j.add(1, 0, true, relaunch::UNKNOWN);
+        j.add(40, 1, false, relaunch::UNKNOWN);
+        j.add(41, 40, false, relaunch::UNKNOWN);
+        j.update(41, 10, 7, false, false, Some((30, true, 20, false)), true).unwrap();
+        j.privileged_listener(40, true);
+        j.freezer.probabilities.push((b"xsys".to_vec(), 70));
+        j.freezer.trial_identifiers = Some([3; TRIAL_IDENTIFIERS_SIZE]);
+        let b = j.to_bytes();
+        let k = Jetsam::of_bytes(&b).unwrap();
+        assert_eq!(k.to_bytes(), b);
+        assert_eq!(k.priority_entry(41, &|_| 0), j.priority_entry(41, &|_| 0));
+        assert_eq!(k.list_count(), 2);
+        assert!(Jetsam::of_bytes(&b[..b.len() - 1]).is_err());
+        let mut longer = b.clone();
+        longer.push(0);
+        assert!(Jetsam::of_bytes(&longer).is_err());
+    }
+
+    #[test]
+    fn a_process_of_the_page_takes_the_systems_jetsam_table_whole() {
+        use super::*;
+        use crate::darwin::share::Taking;
+        let procs = crate::proc::ProcTable::new();
+        procs.jetsam().add(70, 1, false, relaunch::UNKNOWN);
+        let Taking::Got(b) = system_take(&procs, 71, "a call".into(), 1 << 20) else { panic!("taken") };
+        assert!(matches!(system_take(&procs, 72, "a call".into(), 1 << 20), Taking::Held));
+        assert!(matches!(system_put(&procs, 72, &b), Err(22)));
+        let mut j = Jetsam::of_bytes(&b).unwrap();
+        j.remove(70);
+        assert_eq!(system_put(&procs, 71, &j.to_bytes()), Ok(()));
+        assert!(procs.jetsam().get(70).is_none());
+        // Too long for the room: not taken.
+        assert!(matches!(system_take(&procs, 72, "a call".into(), 4), Taking::Long(_)));
+        // A holder that ends lets it go as it was, the loss recorded.
+        let Taking::Got(_) = system_take(&procs, 72, "kernel call".into(), 1 << 20) else { panic!("taken") };
+        assert!(system_exited(&procs, 72));
+        assert!(!system_exited(&procs, 72));
+        let h = crate::darwin::share::lost_header(0);
+        assert!(String::from_utf8_lossy(&h).contains("the jetsam table's changes made by process 72's kernel call"));
+        // The global kernel's own use waits no more.
+        procs.jetsam().add(73, 1, false, relaunch::UNKNOWN);
+        assert!(procs.jetsam().get(73).is_some());
     }
 }

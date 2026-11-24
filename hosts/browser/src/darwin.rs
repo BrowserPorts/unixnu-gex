@@ -338,7 +338,7 @@ pub(crate) fn abandoned(in_call: bool) {
         "process {pid}'s task's end (it ended inside a kernel call, where gex failed): its IPC space, the rights in it and the ports it held stay in the system's table, none destroyed and no notification sent"
     );
     gex_kernel::darwin_say!("[gex:{pid}] Darwin: not implemented: {what}");
-    gex_kernel::darwin::ipc::wire::note_lost(pid, &what);
+    gex_kernel::darwin::share::note_lost(pid, &what);
 }
 
 /// The threads started on Workers of their own ([`adopted`]) that have not

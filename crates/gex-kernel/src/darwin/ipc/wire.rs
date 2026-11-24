@@ -954,15 +954,7 @@ pub(crate) fn serve(op: u32, req: &[u8], out: &mut [u8]) -> Option<i64> {
                 return Some(-11);
             }
             // The losses the taker has not been told of, then the table.
-            let mut p = Put::default();
-            p.u32(t.lost.len() as u32);
-            let new = t.lost.get(seen..).unwrap_or(&[]);
-            p.len(new.len());
-            for (who, what) in new {
-                p.i32(*who);
-                p.bytes(what.as_bytes());
-            }
-            let head = p.0;
+            let head = super::super::share::lost_header(seen);
             let n = head.len() + t.bytes.as_ref().map_or(0, Vec::len);
             if n > out.len() {
                 return Some(n as i64);
@@ -974,12 +966,6 @@ pub(crate) fn serve(op: u32, req: &[u8], out: &mut [u8]) -> Option<i64> {
             t.held = Some(pid);
             t.taker = String::from_utf8_lossy(&req[8..]).into_owned();
             Some(n as i64)
-        }
-        o::IPC_LOST => {
-            let 4.. = req.len() else { return Some(-EINVAL) };
-            let pid = i32::from_le_bytes(req[..4].try_into().unwrap());
-            table().lost.push((pid, String::from_utf8_lossy(&req[4..]).into_owned()));
-            Some(0)
         }
         o::IPC_PUT => {
             let 4.. = req.len() else { return Some(-EINVAL) };
@@ -1003,63 +989,39 @@ pub(crate) fn serve(op: u32, req: &[u8], out: &mut [u8]) -> Option<i64> {
 /// there): what that call changed is not in the table, which goes on as
 /// the process last gave it back (as every process gives it back at a
 /// call's end, a whole table), and the loss is recorded for every process
-/// that takes the table from here on to report.
+/// that takes a table of the system's from here on to report.
 pub fn process_exited(pid: i32) -> bool {
     mailboxes().retain(|_, (p, _)| *p != pid);
     let mut t = table();
     if t.held == Some(pid) {
         t.held = None;
-        let what = format!(
-            "the IPC table's changes made by process {pid}'s {} (the process ended inside it, holding the table): lost, the system's table being the one it gave back before",
-            std::mem::take(&mut t.taker)
-        );
-        t.lost.push((pid, what));
+        let call = std::mem::take(&mut t.taker);
+        drop(t);
+        super::super::share::note_lost(pid, &super::super::share::lost_in_call(pid, "the IPC table", &call));
         return true;
     }
     false
 }
 
-/// What process `pid` of the page lost of the system's IPC state as it
-/// ended (`what`), recorded for every process that takes the table from
-/// here on to report.
-pub fn note_lost(pid: i32, what: &str) {
-    use super::super::share::{op, remote};
-    match remote() {
-        Some(r) => {
-            let mut req = pid.to_le_bytes().to_vec();
-            req.extend_from_slice(what.as_bytes());
-            let n = (r.call)(op::IPC_LOST, &req, &mut []);
-            if n != 0 {
-                panic!("gex: the global kernel answered the IPC table's loss with {n}");
-            }
-        }
-        None => table().lost.push((pid, what.to_string())),
-    }
-}
-
 /// The system's IPC table where the global kernel holds it for the
 /// processes of the page: its bytes as last given back (none before the
-/// first), the process holding it and the kernel call it took it in, and
-/// what processes that ended lost of the system's IPC state.
+/// first), the process holding it and the kernel call it took it in.
 struct Table {
     bytes: Option<Vec<u8>>,
     held: Option<i32>,
     taker: String,
-    lost: Vec<(i32, String)>,
 }
 
-static TABLE: std::sync::Mutex<Table> = std::sync::Mutex::new(Table { bytes: None, held: None, taker: String::new(), lost: Vec::new() });
+static TABLE: std::sync::Mutex<Table> = std::sync::Mutex::new(Table { bytes: None, held: None, taker: String::new() });
 
 fn table() -> std::sync::MutexGuard<'static, Table> {
     TABLE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// How many of the table's recorded losses this process has reported.
-static LOST_SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
-/// The wait queue a process waiting for the table parks on: the system's,
-/// made by the first process to want it.
-fn table_queue() -> u32 {
+/// The wait queue a process waiting for the table (or another of the
+/// system's tables it takes whole, [`super::super::share::Whole`]) parks
+/// on: the system's, made by the first process to want it.
+pub(crate) fn table_queue() -> u32 {
     use super::super::share::{value, Value};
     static Q: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *Q.get_or_init(|| {
@@ -1080,60 +1042,15 @@ fn table_queue() -> u32 {
 /// The system's IPC table, from the global kernel, for this process
 /// (`own` its task) in the kernel call `call` names: taken whole, the
 /// caller parked while another process holds it; a new table before any
-/// process has given one back. What processes that ended lost of it since
-/// this process last took it is reported (for the call's end).
+/// process has given one back. What processes that ended lost of the
+/// system's state since this process last took a table is reported (for
+/// the call's end).
 pub(super) fn take_table(own: &OwnTask, call: &str) -> super::IpcShared {
-    use super::super::share::{op, remote};
-    use std::sync::atomic::Ordering::Relaxed;
+    use super::super::share::{op, remote, report_lost, take_parked, take_request};
     let r = remote().expect("the page's table is the global kernel's");
-    let pid = super::super::held::me();
-    let q = table_queue();
-    let mut got: Option<Vec<u8>> = None;
-    let mut out = vec![0u8; 64 << 10];
-    let mut req = pid.to_le_bytes().to_vec();
-    req.extend_from_slice(&LOST_SEEN.load(Relaxed).to_le_bytes());
-    req.extend_from_slice(call.as_bytes());
-    let since = super::super::time::Instant::now();
-    (r.park)(q, &mut || loop {
-        let n = (r.call)(op::IPC_TAKE, &req, &mut out);
-        if n == -11 {
-            // Held, as the native cell's take waits; a holder that never
-            // gives it back is a broken system.
-            if since.elapsed() > std::time::Duration::from_secs(120) {
-                panic!("gex: the Darwin IPC table has been held for 120 s: a process of the page did not give it back");
-            }
-            return false;
-        }
-        if n < 0 {
-            panic!("gex: the global kernel answered the IPC table's take with {n}");
-        }
-        let n = n as usize;
-        if n > out.len() {
-            // Longer than the room: asked again with room for it.
-            out = vec![0u8; n];
-            continue;
-        }
-        got = Some(out[..n].to_vec());
-        return true;
-    });
-    let b = got.expect("taken");
-    let g = &mut Get::new(&b);
-    let lost = (|| {
-        let total = g.u32()?;
-        let n = g.len()?;
-        let mut new = Vec::with_capacity(n);
-        for _ in 0..n {
-            let who = g.i32()?;
-            new.push((who, String::from_utf8_lossy(&g.bytes()?).into_owned()));
-        }
-        Ok::<_, Bad>((total, new))
-    })();
-    let Ok((total, new)) = lost else { panic!("gex: the global kernel's IPC table's losses are not a record ({lost:?})") };
-    LOST_SEEN.store(total, Relaxed);
-    for (who, what) in new {
-        super::super::note_unimplemented(format!("{what} (process {who} of the page)"));
-    }
-    let b = g.rest();
+    let req = take_request(&[], call);
+    let b = take_parked(r, "the Darwin IPC table", &mut |out| (r.call)(op::IPC_TAKE, &req, out));
+    let b = report_lost(&b);
     if b.is_empty() {
         return super::IpcShared::default();
     }
@@ -1389,7 +1306,7 @@ mod tests {
 
     #[test]
     fn the_table_is_one_processs_at_a_time() {
-        use super::super::super::share::op;
+        use super::super::super::share::{self, op};
         // (the global kernel's table is this binary's; this test alone
         // takes it)
         let take = |pid: i32, seen: u32, call: &str, out: &mut [u8]| {
@@ -1411,41 +1328,49 @@ mod tests {
             let new: Vec<(i32, String)> = (0..n).map(|_| (g.i32().unwrap(), String::from_utf8(g.bytes().unwrap()).unwrap())).collect();
             (total, new, g.rest().to_vec())
         };
-        const HEAD: usize = 4 + 8;
-        let mut out = [0u8; HEAD + 8];
+        // (other tests record losses as they run: every count here is
+        // from where it was)
+        let total_now = || Get::new(&share::lost_header(0)).u32().unwrap();
+        let mut room = [0u8; 1 << 16];
+        let seen = total_now();
         // Before any is given back: none, taken.
-        assert_eq!(take(31, 0, "a call", &mut out), Some(HEAD as i64));
-        assert_eq!(answer(&out[..HEAD]), (0, vec![], vec![]));
-        assert_eq!(take(32, 0, "a call", &mut out), Some(-11));
+        let n = take(31, seen, "a call", &mut room).unwrap();
+        assert!(n > 0);
+        assert_eq!(answer(&room[..n as usize]).2, Vec::<u8>::new());
+        assert_eq!(take(32, seen, "a call", &mut room), Some(-11));
         // Only its holder gives it back.
         assert_eq!(put(32, &[1, 2, 3]), Some(-22));
         assert_eq!(put(31, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]), Some(0));
         // Too long for the room: its length, not taken.
-        assert_eq!(take(32, 0, "a call", &mut out), Some(HEAD as i64 + 10));
-        let mut room = [0u8; 512];
-        assert_eq!(take(32, 0, "kernel call by thread 5", &mut room), Some(HEAD as i64 + 10));
-        assert_eq!(answer(&room[..HEAD + 10]), (0, vec![], vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]));
+        let seen = total_now();
+        let head = share::lost_header(seen as usize).len();
+        let n = take(32, seen, "a call", &mut room[..head + 4]).unwrap();
+        assert!(n as usize >= head + 10, "{n}");
+        let n = take(32, seen, "kernel call by thread 5", &mut room).unwrap() as usize;
+        assert_eq!(answer(&room[..n]).2, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
         // A holder's end lets it go, as it was last given back, and what
         // its call changed is recorded as lost, naming the call.
         assert!(process_exited(32));
         assert!(!process_exited(32));
-        let n = take(33, 0, "a call", &mut room).unwrap() as usize;
+        let n = take(33, seen, "a call", &mut room).unwrap() as usize;
         let (total, new, table) = answer(&room[..n]);
-        assert_eq!((total, new.len(), new[0].0, table), (1, 1, 32, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]));
-        assert!(new[0].1.contains("process 32's kernel call by thread 5"), "{}", new[0].1);
+        assert!(total > seen);
+        assert_eq!(table, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert!(new.iter().any(|(who, what)| *who == 32 && what.contains("the IPC table's changes made by process 32's kernel call by thread 5")), "{new:?}");
         assert_eq!(put(33, &[]), Some(0));
         // A taker told of it already is not told again; one ending's own
         // record of what it lost is told to every taker after.
-        note_lost(34, "its task's end");
-        let n = take(33, 1, "a call", &mut room).unwrap() as usize;
-        assert_eq!(answer(&room[..n]), (2, vec![(34, "its task's end".to_string())], vec![]));
+        share::note_lost(34, "its task's end");
+        let n = take(33, total, "a call", &mut room).unwrap() as usize;
+        let (later, new, _) = answer(&room[..n]);
+        assert!(later > total && !new.iter().any(|(who, _)| *who == 32) && new.iter().any(|(who, w)| *who == 34 && w == "its task's end"), "{new:?}");
         assert_eq!(put(33, &[]), Some(0));
         let n = take(35, 0, "a call", &mut room).unwrap() as usize;
-        assert_eq!(answer(&room[..n]).0, 2);
-        assert_eq!(answer(&room[..n]).1.len(), 2);
+        let (_, new, _) = answer(&room[..n]);
+        assert!(new.iter().any(|(who, _)| *who == 32) && new.iter().any(|(who, _)| *who == 34));
         assert_eq!(put(35, &[]), Some(0));
         assert_eq!(serve(op::IPC_TAKE, &[0; 7], &mut room), Some(-22));
-        assert_eq!(serve(op::IPC_LOST, &[0; 3], &mut room), Some(-22));
+        assert_eq!(share::serve(op::IPC_LOST, &[0; 3], &mut room), -22);
     }
 
 }

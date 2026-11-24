@@ -60,6 +60,12 @@ pub mod sub {
     pub const IMP_DONATION: i32 = 3;
 }
 
+/// `P_VFS_IOPOLICY_ALLOW_LOW_SPACE_WRITES` (proc_internal.h), the one of
+/// `p_vfs_iopolicy`'s flags a child does not inherit.
+pub(crate) const P_VFS_IOPOLICY_ALLOW_LOW_SPACE_WRITES: u32 = 0x0100;
+/// `P_VFS_IOPOLICY_INHERITED_MASK`: every other flag (0x0001 to 0x0800).
+pub(crate) const P_VFS_IOPOLICY_INHERITED_MASK: u32 = 0x0eff;
+
 impl Kernel {
     /// `iopolicysys(cmd, arg)`, of the disk's policy; the file system's
     /// policies each keep a bit of their own, which are not kept here.
@@ -82,7 +88,6 @@ impl Kernel {
         if iotype == IOPOL_TYPE_VFS_ALLOW_LOW_SPACE_WRITES {
             // iopolicysys_vfs_allow_lowspace_writes: this process's alone.
             const ENTITLEMENT: &str = "com.apple.private.vfs.allow-low-space-writes";
-            const P_VFS_IOPOLICY_ALLOW_LOW_SPACE_WRITES: u32 = 0x010;
             const OFF: u32 = 0;
             const ON: u32 = 1;
             if scope != IOPOL_SCOPE_PROCESS {

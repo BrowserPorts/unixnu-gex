@@ -587,6 +587,7 @@ impl Kernel {
         // Into TH_RUN or out of it: a wait at the interrupt level its
         // call set (THREAD_UNINT for task_exception_notify's), or parked.
         let unint = tid == self.tid && self.darwin_finish.as_ref().is_some_and(|w| w.uninterruptible());
+        let mut clock_read = false;
         if let Some(t) = self.dtask.threads.map.get_mut(&tid) {
             if t.offcpu != off || !t.sched_seen {
                 t.sched_seen = true;
@@ -605,10 +606,14 @@ impl Kernel {
                 // THREAD_BASIC_INFO's cpu_usage, reads the times first and
                 // reports that.
                 if let Some(ns) = self.thread_signals.get(tid).and_then(|s| s.cpu.times()).map(|(u, s)| u + s) {
+                    clock_read = true;
                     self.procs.sched.update_usage(tid, super::mach::ns_to_abs(ns));
                 }
             }
             t.offcpu = off;
+        }
+        if clock_read {
+            self.darwin_clock_read();
         }
         if off {
             // thread_dispatch: the time it ran goes to its bank ledger.

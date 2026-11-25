@@ -135,6 +135,27 @@ mod tests {
         }));
     }
 
+    /// A pre-index access writes its base back after the access, as a
+    /// post-index one does: an access check that faults hands the host the
+    /// registers as the instruction found them, so the instruction made
+    /// again once the fault is handled (a first touch entered) moves its
+    /// base once. `stp x29, x30, [sp, #-16]!` and `ldr x0, [x1, #8]!`.
+    #[test]
+    fn a_pre_index_base_is_written_after_its_access_checks() {
+        for (raw, base_reg) in [(0xa9bf7bfd_u32, GuestReg::Sp), (0xf8408c20, GuestReg::X(1))] {
+            let pc = 0x1000u64;
+            let mut b = Builder::new(pc);
+            b.check_accesses();
+            b.set_insn(pc);
+            let flow = Lifter::new(&mut b).with_raw(raw).lift(&decode(raw, pc), pc);
+            assert!(matches!(flow, Flow::Next));
+            let block = b.finish(Term::Goto { target: pc + INST_BYTES });
+            let last_check = block.stmts.iter().rposition(|s| matches!(s, Stmt::MemCheck { .. })).expect("an access check");
+            let base_write = block.stmts.iter().position(|s| matches!(s, Stmt::WriteReg { reg, .. } if *reg == base_reg)).expect("the base written back");
+            assert!(base_write > last_check, "{raw:#010x}: the base is written before its access is checked\n{}", print::block(&block));
+        }
+    }
+
     /// Build a fetch closure over a slice of instruction words at `base`.
     fn words(base: u64, code: &'static [u32]) -> impl Fn(u64) -> Option<u32> {
         move |pc| {

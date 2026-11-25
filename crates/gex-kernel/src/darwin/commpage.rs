@@ -226,11 +226,43 @@ pub fn tick(m: &mut crate::GuestMem<'_>, abstime: u64) {
     let at = placements()[1] + off::ATM_DIAGNOSTIC_CONFIG as u64;
     let atm = super::share::value(super::share::Value::AtmDiagnosticConfig, 0, 0).map_or_else(|| ATM_DIAGNOSTIC_CONFIG.load(Ordering::Relaxed), |v| v as u32);
     k.write(at, &atm.to_le_bytes()).expect("the commpage's read-write page");
-    if word(&k, off::APPROX_TIME) < abstime {
-        set_word(&mut k, off::APPROX_TIME, abstime);
-    }
+    update_approximate_time(&mut k, abstime);
     let gen = super::share::next(super::share::Counter::Quiesce).unwrap_or_else(local_next_quiesce);
     set_word(&mut k, off::CPU_QUIESCENT_COUNTER, gen);
+}
+
+/// `commpage_update_mach_approximate_time`: the word raised to `abstime`
+/// when it is behind, by a compare-and-swap of the value read (a writer
+/// that changed it since has written a time new enough).
+pub fn update_approximate_time(m: &mut crate::GuestMem<'_>, abstime: u64) {
+    let at = placements()[1] + off::APPROX_TIME as u64;
+    let saved = m.read_u64(at).expect("the commpage's read-write page");
+    if saved < abstime {
+        let _ = m.cmpxchg_u64(at, saved, abstime).expect("the commpage's read-write page");
+    }
+}
+
+std::thread_local! {
+    /// When the running thread's quantum ends, in absolute time: the next
+    /// [`quantum_expire`] on this host thread.
+    static QUANTUM_END: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// `thread_quantum_expire`'s `commpage_update_mach_approximate_time` on the
+/// running thread's own processor, as a Darwin thread that runs on without
+/// entering the kernel reaches a safepoint: once its quantum has passed
+/// since the last one on its host thread, the approximate time is brought
+/// up to now. The thread-call Worker's [`tick`] does the same every
+/// quantum, but a thread that spins must not depend on another thread
+/// being scheduled, as the device's timer interrupt is its own processor's.
+pub fn quantum_expire(m: &mut crate::GuestMem<'_>) {
+    let now = super::mach::absolute_time();
+    QUANTUM_END.with(|end| {
+        if now >= end.get() {
+            update_approximate_time(m, now);
+            end.set(now + super::mach::ns_to_abs(QUANTUM.as_nanos() as u64));
+        }
+    });
 }
 
 /// `commpage_set_timestamp`: the calendar time `(sec, frac)` at absolute

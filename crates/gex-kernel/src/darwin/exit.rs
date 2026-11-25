@@ -79,6 +79,45 @@ pub fn waitid_job_report(m: &mut GuestMem<'_>, info: u64, pid: i32, code: u32, s
     Ok(0)
 }
 
+/// `wait4`'s copy of the child `pid` it collects (`kern_exit.c`): its
+/// `p_ru->ru` (`munge_user64_rusage`) to `at`, ENOMEM where it has none
+/// (`proc_exit` could not make one), EFAULT where `at` cannot be written.
+/// The caller reaps the child only after this succeeds.
+pub fn wait4_rusage(m: &mut GuestMem<'_>, at: u64, ru: Option<super::ru::Ru>) -> Result<(), Errno> {
+    let r = ru.ok_or(Errno::ENOMEM)?;
+    m.write(at, &r.bytes())
+}
+
+/// Whether a Darwin wait (`op`, a `WaitChild`) finds nothing to report as
+/// it is made, so `wait4` or `waitid` reaches its `msleep0`: no child it
+/// asks for has ended (an end it collects), or has a stop or continue it
+/// reports. In the page the system's table is asked, taking nothing, and
+/// with it the wakeups the waiter's children have given it so far (none
+/// natively).
+pub fn wait_would_sleep(op: &crate::syscalls::BlockOp) -> (bool, Option<u64>) {
+    use std::sync::atomic::Ordering;
+    let crate::syscalls::BlockOp::WaitChild { children, procs, ppid, want, group, waitid, jobs: Some(j), .. } = op else { return (false, None) };
+    if procs.is_shared() {
+        let (step, _, _, wakes) = super::share::dwait(*ppid, (*want, *group), *j, true, waitid.is_some(), true);
+        return (matches!(step, crate::proc::WaitStep::Nothing), Some(wakes));
+    }
+    let sleeps = !children.iter().filter(|c| !c.reaped.load(Ordering::Acquire)).any(|c| {
+        let ended = c.status.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+        if ended {
+            return j.exits;
+        }
+        let job = c.job.lock().unwrap_or_else(|e| e.into_inner());
+        (j.stops && job.stopped && !job.waited) || (j.continues && job.continued)
+    });
+    (sleeps, None)
+}
+
+/// Process `pid`'s `p_ru->ru` in this table's record of it.
+pub fn exit_ru(procs: &crate::proc::ProcTable, pid: i32) -> Option<super::ru::Ru> {
+    let (r, _) = procs.darwin(pid)?;
+    r.downcast::<super::procinfo::Public>().ok()?.rusage.ru.exited()
+}
+
 impl Kernel {
     /// `waitid(idtype, id, infop, options)` and `waitid_nocancel`: a child's
     /// end (`WEXITED`), its stop not yet reported (`WSTOPPED`) or its
@@ -96,12 +135,18 @@ impl Kernel {
         if (idtype == P_PID || idtype == P_PGID) && id < 0 {
             return fail(self, m, Errno::EINVAL);
         }
+        // No child has pid 0 (kern_exit.c compares each child's p_pid).
+        if idtype == P_PID && id == 0 {
+            return fail(self, m, Errno::ECHILD);
+        }
         // In the page the children are the system's table's, which the
-        // page's wait asks for one child or for any (share::dwait).
-        let want = match self.darwin_page_wait_want(if idtype == P_PID { id } else if idtype == P_PGID { 0 } else { WAIT_ANY }, "waitid(P_PGID)") {
-            Ok(w) => w,
-            Err(e) => return fail(self, m, e),
-        };
+        // page's wait asks for one child, any, or a group's (share::dwait):
+        // P_PGID's are those whose p_pgrpid is id.
+        let want = self.darwin_page_wait_want(match idtype {
+            P_PID => (id, false),
+            P_PGID => (id, true),
+            _ => (WAIT_ANY, false),
+        });
         // Any other idtype matches every child, as in kern_exit.c.
         let children: Vec<_> = self
             .procs
@@ -120,31 +165,23 @@ impl Kernel {
             children,
             procs: std::sync::Arc::clone(&self.procs),
             ppid: self.pid,
-            want: want.unwrap_or(0),
+            want: want.map_or(0, |w| w.0),
+            group: want.is_some_and(|w| w.1),
             wstatus: 0,
             nohang: options & WNOHANG != 0,
             waitid: Some(crate::syscalls::WaitidOut { info, nowait: options & WNOWAIT != 0, compat: false, darwin: true }),
             jobs: Some(crate::syscalls::JobWait { exits: options & WEXITED != 0, stops: options & WSTOPPED != 0, continues: options & WCONTINUED != 0 }),
+            rusage: 0,
         })
     }
 
-    /// In the page, which children a wait for `pid` (one, any, or a process
-    /// group's: 0 or below -1) asks the system's table for: the process table
-    /// here holds none of them, and the page's wait looks (share::dwait)
-    /// for one child or for any, so a group's is reported (`what`) and
-    /// refused. None natively, where the children are this table's.
-    fn darwin_page_wait_want(&mut self, pid: i32, what: &str) -> Result<Option<i32>, Errno> {
-        if !self.procs.is_shared() {
-            return Ok(None);
-        }
-        match pid {
-            WAIT_ANY => Ok(Some(-1)),
-            p if p > 0 => Ok(Some(p)),
-            _ => {
-                self.darwin_unimplemented(format!("{what} in the page (the system's table's wait looks for one child or any)"));
-                Err(Errno::ENOSYS)
-            }
-        }
+    /// In the page, which children a wait asks the system's table for (the
+    /// process table here holds none of them): `(want, group)`, one child
+    /// (`want` its pid), any (-1), or a process group's (`group`, `want` its
+    /// id), as `share::dwait` asks. None natively, where the children are
+    /// this table's.
+    fn darwin_page_wait_want(&self, (want, group): (i32, bool)) -> Option<(i32, bool)> {
+        self.procs.is_shared().then_some((want, group))
     }
 
     /// `wait4(pid, status, options, rusage)` and `wait4_nocancel`: the
@@ -165,14 +202,8 @@ impl Kernel {
         if pid == i32::MIN {
             return fail(self, m, Errno::EINVAL);
         }
-        if rusage != 0 {
-            self.darwin_unimplemented("wait4's rusage (the child's resource usage at its end)".into());
-            return fail(self, m, Errno::EINVAL);
-        }
-        let want = match self.darwin_page_wait_want(pid, "wait4 of a process group's children") {
-            Ok(w) => w,
-            Err(e) => return fail(self, m, e),
-        };
+        // In the page: one child, any, or (below -1) the group -pid's.
+        let want = self.darwin_page_wait_want(if pid < -1 { (-pid, true) } else { (pid, false) });
         let children: Vec<_> = self
             .procs
             .children(self.pid)
@@ -182,30 +213,53 @@ impl Kernel {
         if children.is_empty() && want.is_none() {
             return fail(self, m, Errno::ECHILD);
         }
-        self.darwin_wait4 = Some(status);
+        self.darwin_wait4 = Some((status, rusage));
         SyscallOutcome::Blocking(BlockOp::WaitChild {
             children,
             procs: std::sync::Arc::clone(&self.procs),
             ppid: self.pid,
-            want: want.unwrap_or(0),
+            want: want.map_or(0, |w| w.0),
+            group: want.is_some_and(|w| w.1),
             wstatus: status,
             nohang: options & WNOHANG != 0,
             waitid: None,
             jobs: Some(crate::syscalls::JobWait { exits: true, stops: options & WUNTRACED != 0, continues: options & WCONTINUED != 0 }),
+            rusage,
         })
     }
 
-    /// A `wait4` that collected a child: its status in Darwin's encoding,
-    /// and, the last child reaped, a pending SIGCHLD the thread masks
-    /// dropped.
-    pub(crate) fn darwin_wait4_done(&mut self, m: &mut GuestMem<'_>, status: u64, r: &Result<u64, Errno>) {
-        let Ok(pid) = r else { return };
-        if *pid == 0 {
-            return;
+    /// A `wait4` whose wait is over: for an ended child (which the host
+    /// leaves there), the status copied out, then its `p_ru->ru` to
+    /// `rusage`, and only then the child reaped (`reap_child_locked`),
+    /// either copy failing ending the call with the child left to wait for;
+    /// for a stop or a continue, its status in Darwin's encoding. Then,
+    /// the last child reaped, a pending SIGCHLD the thread masks dropped.
+    pub(crate) fn darwin_wait4_done(&mut self, m: &mut GuestMem<'_>, (status, rusage): (u64, u64), r: Result<u64, Errno>) -> Result<u64, Errno> {
+        let Ok(pid) = r else { return r };
+        if pid == 0 {
+            return r;
         }
-        if status != 0 {
-            if let Ok(w) = m.read_u32(status) {
-                let _ = m.write_u32(status, status_from_linux(w) & 0xffff);
+        match self.darwin_wait4_ended(pid as i32) {
+            Some((word, ru)) => {
+                if status != 0 {
+                    m.write_u32(status, status_from_linux(word) & 0xffff)?;
+                }
+                if rusage != 0 {
+                    wait4_rusage(m, rusage, ru)?;
+                }
+                self.darwin_wait4_reap(pid as i32);
+                if rusage != 0 {
+                    for t in ru.map(|r| r.stand_in_texts()).unwrap_or_default() {
+                        self.darwin_stand_in(t);
+                    }
+                }
+            }
+            None => {
+                if status != 0 {
+                    if let Ok(w) = m.read_u32(status) {
+                        let _ = m.write_u32(status, status_from_linux(w) & 0xffff);
+                    }
+                }
             }
         }
         if self.procs.children(self.pid).is_empty() {
@@ -214,6 +268,55 @@ impl Kernel {
                 self.collect_signals();
                 self.signals.discard_everywhere(l, &self.thread_signals);
             }
+        }
+        r
+    }
+
+    /// Child `pid`'s end that a wait4 found and has not collected: its wait
+    /// status (the host's encoding) and its `p_ru->ru`; none for a child
+    /// whose stop or continue it reported.
+    fn darwin_wait4_ended(&mut self, pid: i32) -> Option<(u32, Option<super::ru::Ru>)> {
+        if self.procs.is_shared() {
+            let all = crate::syscalls::JobWait { exits: true, stops: false, continues: false };
+            return match super::share::dwait(self.pid, (pid, false), all, true, false, true) {
+                (crate::proc::WaitStep::Ended { word, .. }, _, ru, _) => Some((word, ru)),
+                _ => None,
+            };
+        }
+        let c = self.procs.children(self.pid).into_iter().find(|c| c.pid == pid)?;
+        if c.reaped.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        let code = (*c.status.lock().unwrap_or_else(|e| e.into_inner()))?;
+        Some((code as u32, exit_ru(&self.procs, pid)))
+    }
+
+    /// The child `pid` a wait4 copied out collected: reaped, and in the page
+    /// its usage added to this process's children's.
+    fn darwin_wait4_reap(&mut self, pid: i32) {
+        if self.procs.is_shared() {
+            let all = crate::syscalls::JobWait { exits: true, stops: false, continues: false };
+            let (_, usage, ru, _) = super::share::dwait(self.pid, (pid, false), all, false, false, false);
+            self.darwin_page_collected(usage, ru);
+            return;
+        }
+        if let Some(c) = self.procs.children(self.pid).into_iter().find(|c| c.pid == pid) {
+            c.status.lock().unwrap_or_else(|e| e.into_inner()).take();
+            c.reaped.store(true, std::sync::atomic::Ordering::Release);
+            self.procs.reap(pid);
+        }
+    }
+
+    /// In the page, a child a wait collected: its `p_ru` to this process's
+    /// children's usage, as `reap_child_locked` adds it (this parent has no
+    /// P_NOCLDWAIT, or the child would have been reaped at its end):
+    /// `p_ru->ri` to `ri_child`, `p_ru->ru` to `p_cru`.
+    pub fn darwin_page_collected(&mut self, usage: Option<super::rusage::Record>, ru: Option<super::ru::Ru>) {
+        if let Some(u) = usage {
+            self.dtask.rusage.add_reaped(&u, 1);
+        }
+        if let Some(r) = ru {
+            self.dtask.rusage.ru.add_reaped(&r);
         }
     }
 }

@@ -208,15 +208,9 @@ pub mod perm {
     pub const BOTH_SHIFT: u32 = 4;
 }
 
-/// A prototype's map of the pages a Darwin process's code has touched (the
-/// `touch-map` build: one byte per [`PERM_PAGE`] of [`LIMIT64`], set by
-/// each access check), after [`PERM_TABLE64`] and the zero byte past it.
-pub const TOUCH_MAP64: u64 = (PERM_TABLE64 + PERM_TABLE_BYTES + 0xf_ffff) & !0xf_ffff;
-
 /// End of a Darwin process's M64 tables, rounded to 1 MiB: the zero byte
-/// past [`PERM_TABLE64`] an access check may read is in it (and, in the
-/// `touch-map` build, the [`TOUCH_MAP64`] after it).
-pub const DARWIN_TABLES_END: u64 = if cfg!(feature = "touch-map") { TOUCH_MAP64 + PERM_TABLE_BYTES } else { TOUCH_MAP64 };
+/// past [`PERM_TABLE64`] an access check may read is in it.
+pub const DARWIN_TABLES_END: u64 = (PERM_TABLE64 + PERM_TABLE_BYTES + 0xf_ffff) & !0xf_ffff;
 
 /// This process's M64 tables, `[start, end)`: a Darwin process's (its
 /// runner folds the commpage, [`commpage_fold`]) at

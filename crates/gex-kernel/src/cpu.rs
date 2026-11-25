@@ -340,41 +340,50 @@ impl crate::syscalls::Kernel {
         Some((user, sys))
     }
 
-    /// `getrusage(who, rusage)`: this process's (RUSAGE_SELF, its times
-    /// from `calcru`), or its reaped children's (RUSAGE_CHILDREN); EINVAL
-    /// for anything else.
+    /// `getrusage(who, rusage)`: this process's `p_ru` as `calcru` makes
+    /// it (RUSAGE_SELF), or its reaped children's `p_cru`
+    /// (RUSAGE_CHILDREN); EINVAL for anything else. The figures that
+    /// stand in for what gex cannot see are said.
     pub(crate) fn darwin_getrusage(&mut self, m: &mut crate::GuestMem<'_>, who: i32, at: u64) -> Result<u64, crate::Errno> {
         const RUSAGE_SELF: i32 = 0;
         const RUSAGE_CHILDREN: i32 = -1;
-        let tvs = match who {
-            RUSAGE_SELF => match live_times(&self.thread_signals) {
-                Some(live) => calcru(self.procs.dead_cpu(self.pid), &live),
-                None => {
+        let r = match who {
+            RUSAGE_SELF => {
+                let r = self.darwin_calcru(m);
+                if r.times_unknown {
                     self.darwin_unimplemented("getrusage's times on a host without per-thread clocks".into());
                     return Err(crate::Errno::ENOSYS);
                 }
-            },
+                r
+            }
             RUSAGE_CHILDREN => {
-                // The reaped children's times are their threads' (each
-                // thread's at its end, and those live at the child's), all
-                // read from the host's clocks.
-                if crate::darwin::workq::host_clocks().is_none() {
+                let r = self.dtask.rusage.ru.cru();
+                if r.times_unknown {
                     self.darwin_unimplemented("getrusage(RUSAGE_CHILDREN)'s times on a host without per-thread clocks".into());
                     return Err(crate::Errno::ENOSYS);
                 }
-                let (user, sys) = self.procs.children_cpu(self.pid);
-                [user, sys].map(|ns| (ns / 1_000_000_000, (ns % 1_000_000_000 / 1000) as u32))
+                r
             }
             _ => return Err(crate::Errno::EINVAL),
         };
-        // struct user64_rusage: the two timevals, then fourteen longs.
-        let mut b = [0u8; 144];
-        for (i, (secs, usecs)) in tvs.into_iter().enumerate() {
-            b[16 * i..16 * i + 8].copy_from_slice(&secs.to_le_bytes());
-            b[16 * i + 8..16 * i + 12].copy_from_slice(&usecs.to_le_bytes());
+        for t in r.stand_in_texts() {
+            self.darwin_stand_in(t);
         }
-        m.write(at, &b)?;
+        m.write(at, &r.bytes())?;
         Ok(0)
+    }
+
+    /// `calcru` of this process: its times (none without the host's
+    /// clocks), its task's faults and page-ins, and its resident peak from
+    /// a look at its pages now, where the host gives one.
+    pub(crate) fn darwin_calcru(&mut self, m: &mut crate::GuestMem<'_>) -> crate::darwin::ru::Ru {
+        let times = live_times(&self.thread_signals).map(|live| calcru(self.procs.dead_cpu(self.pid), &live));
+        let rusage = std::sync::Arc::clone(&self.dtask.rusage);
+        let maxrss = {
+            let mut pm = rusage.meter.lock();
+            rusage.meter.measure(&mut pm, &self.mem, m).map(|_| pm.peaks.resident * (crate::darwin::mach::PAGE_MASK + 1))
+        };
+        rusage.ru.calcru(times, rusage.pageins.load(std::sync::atomic::Ordering::Acquire), maxrss)
     }
 
     /// `thread_selfusage()`: the calling thread's user and system time, in
@@ -384,6 +393,7 @@ impl crate::syscalls::Kernel {
             self.darwin_unimplemented("thread_selfusage on a host without per-thread clocks".into());
             return Err(crate::Errno::ENOSYS);
         };
+        self.darwin_clock_read();
         let (numer, denom) = crate::darwin::mach::TIMEBASE;
         Ok((u128::from(u + s) * u128::from(denom) / u128::from(numer)) as u64)
     }

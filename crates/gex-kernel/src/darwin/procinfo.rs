@@ -28,8 +28,10 @@ pub struct Facts {
     pub job: crate::proc::Job,
     pub policy: super::taskpolicy::TaskPolicy,
     pub nfiles: u32,
-    /// `p_ru`: its usage as `proc_exit` stashed it, once it has ended.
+    /// `p_ru`: its usage as `proc_exit` stashed it, once it has ended
+    /// (`p_ru->ri`, and `p_ru->ru` with it).
     pub exited: Option<super::rusage::Record>,
+    pub exited_ru: Option<super::ru::Ru>,
 }
 
 /// A live part of a process's record: the process's own, or, in a record
@@ -202,6 +204,7 @@ impl Public {
         table.policy.put_wire(p);
         p.u32(table.nfiles);
         p.opt(table.exited.as_ref(), |p, r| r.put(p));
+        p.opt(table.exited_ru.as_ref(), |p, r| r.put(p));
     }
 
     /// Process `pid`'s record from what [`Public::put_record`] made: its
@@ -241,7 +244,7 @@ impl Public {
             user_stack: AtomicU64::new(g.u64()?),
             realtimer: std::sync::Mutex::new((super::itimer::Itimerval { interval: g.u64()?, value: g.u64()? }, g.u64()?)),
         };
-        let table = Some(Facts { uid: g.u32()?, nice: g.i32()?, job: crate::proc::Job::get(g)?, policy: super::taskpolicy::TaskPolicy::get_wire(g)?, nfiles: g.u32()?, exited: g.opt(super::rusage::Record::get)? });
+        let table = Some(Facts { uid: g.u32()?, nice: g.i32()?, job: crate::proc::Job::get(g)?, policy: super::taskpolicy::TaskPolicy::get_wire(g)?, nfiles: g.u32()?, exited: g.opt(super::rusage::Record::get)?, exited_ru: g.opt(super::ru::Ru::get)? });
         if !g.done() {
             return Err(g.bad("the end of a process's record"));
         }
@@ -547,7 +550,7 @@ impl Kernel {
     pub(crate) fn darwin_record_send(&mut self) {
         let (uid, nice) = self.procs.live_nice(self.pid).unwrap_or((self.dtask.cred.ruid, 0));
         let job = self.procs.job_state(self.pid).unwrap_or_default();
-        let facts = Facts { uid, nice, job, policy: self.darwin_policy(), nfiles: self.fds.nfiles() as u32, exited: self.dtask.rusage.exited() };
+        let facts = Facts { uid, nice, job, policy: self.darwin_policy(), nfiles: self.fds.nfiles() as u32, exited: self.dtask.rusage.exited(), exited_ru: self.dtask.rusage.ru.exited() };
         let mut p = super::ipc::wire::Put::default();
         self.darwin_public_now().put_record(&facts, &mut p);
         if self.dtask.record_sent.as_ref() != Some(&p.0) {
@@ -1702,7 +1705,9 @@ mod tests {
         policy.requested.ext_darwinbg = true;
         let mut ru = crate::darwin::rusage::Record { w: [0; crate::darwin::rusage::WORDS], unkept: 5 };
         ru.w[3] = 77;
-        let facts = Facts { uid: 501, nice: 4, job, policy, nfiles: 6, exited: Some(ru) };
+        let mut bsd = crate::darwin::ru::Ru { utime: (3, 4), stand_ins: crate::darwin::ru::ALWAYS, ..Default::default() };
+        bsd.l[crate::darwin::ru::l::NVCSW] = 12;
+        let facts = Facts { uid: 501, nice: 4, job, policy, nfiles: 6, exited: Some(ru), exited_ru: Some(bsd) };
         let mut b = crate::darwin::ipc::wire::Put::default();
         p.put_record(&facts, &mut b);
         let q = Public::of_record(40, &b.0).unwrap();

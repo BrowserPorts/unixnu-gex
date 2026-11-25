@@ -143,6 +143,9 @@ struct Address {
     /// constant, because the register-offset form's amount is only known at
     /// run time.
     post: Option<(RegSel, Value)>,
+    /// Pre-index writeback: the base register's new value, the address
+    /// accessed, written once the access is made.
+    pre: Option<(RegSel, Value)>,
 }
 
 impl<'a> Lifter<'a> {
@@ -479,9 +482,11 @@ impl<'a> Lifter<'a> {
 
     // -- addressing --------------------------------------------------------
 
-    /// Resolve an addressing mode into a base value plus a constant offset,
-    /// performing any pre-index base update. Post-index writeback is deferred
-    /// to [`Self::finish_address`] so it happens *after* the access.
+    /// Resolve an addressing mode into a base value plus a constant offset.
+    /// Writeback, pre-index or post-index, is deferred to
+    /// [`Self::finish_address`] so it happens *after* the access: an access
+    /// that faults leaves the base register as it was, and the instruction
+    /// is made again from the start once the fault is handled.
     fn address(&mut self, addr: &AddrMode) -> Address {
         match *addr {
             AddrMode::Offset { rn, off } => {
@@ -490,17 +495,18 @@ impl<'a> Lifter<'a> {
                     base,
                     offset: off,
                     post: None,
+                    pre: None,
                 }
             }
             AddrMode::PreIndex { rn, off } => {
                 let base = self.rd_addr(rn);
                 let delta = self.b.const_i64(off as u64);
                 let updated = self.b.bin(BinOp::Add, Ty::I64, base, delta);
-                self.wr_addr(rn, updated);
                 Address {
                     base: updated,
                     offset: 0,
                     post: None,
+                    pre: Some((rn, updated)),
                 }
             }
             AddrMode::PostIndex { rn, off } => {
@@ -510,6 +516,7 @@ impl<'a> Lifter<'a> {
                     base,
                     offset: 0,
                     post: Some((rn, delta)),
+                    pre: None,
                 }
             }
             AddrMode::PostIndexReg { rn, rm } => {
@@ -521,6 +528,7 @@ impl<'a> Lifter<'a> {
                     base,
                     offset: 0,
                     post: Some((rn, delta)),
+                    pre: None,
                 }
             }
             AddrMode::RegOffset {
@@ -536,6 +544,7 @@ impl<'a> Lifter<'a> {
                     base: sum,
                     offset: 0,
                     post: None,
+                    pre: None,
                 }
             }
             AddrMode::Literal { addr } => {
@@ -544,12 +553,24 @@ impl<'a> Lifter<'a> {
                     base,
                     offset: 0,
                     post: None,
+                    pre: None,
                 }
             }
         }
     }
 
+    /// A pre-index writeback made now (for a load whose destination is
+    /// written after it), not at [`Self::finish_address`].
+    fn write_back_pre(&mut self, a: &mut Address) {
+        if let Some((rn, updated)) = a.pre.take() {
+            self.wr_addr(rn, updated);
+        }
+    }
+
     fn finish_address(&mut self, a: &Address) {
+        if let Some((rn, updated)) = a.pre {
+            self.wr_addr(rn, updated);
+        }
         if let Some((rn, delta)) = a.post {
             let base = self.rd_addr(rn);
             let updated = self.b.bin(BinOp::Add, Ty::I64, base, delta);
@@ -1019,7 +1040,7 @@ impl<'a> Lifter<'a> {
                 ref addr,
                 order,
             } => {
-                let a = self.address(addr);
+                let mut a = self.address(addr);
                 let ty = ty_of(dest);
                 let v = self.b.def(Expr::Load {
                     addr: a.base,
@@ -1029,6 +1050,9 @@ impl<'a> Lifter<'a> {
                     ty,
                     order: order_of(order),
                 });
+                // The base before the destination, which is what remains
+                // where they are the same register.
+                self.write_back_pre(&mut a);
                 self.wr_gp(rt, dest, v);
                 self.finish_address(&a);
                 Flow::Next
@@ -1061,7 +1085,7 @@ impl<'a> Lifter<'a> {
                 rt2,
                 ref addr,
             } => {
-                let a = self.address(addr);
+                let mut a = self.address(addr);
                 let (ty, dest) = if sz == MemSz::D || signed {
                     (Ty::I64, Sz::X)
                 } else {
@@ -1084,6 +1108,7 @@ impl<'a> Lifter<'a> {
                     ty,
                     order: Order::Relaxed,
                 });
+                self.write_back_pre(&mut a);
                 self.wr_gp(rt, dest, v1);
                 self.wr_gp(rt2, dest, v2);
                 self.finish_address(&a);

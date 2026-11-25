@@ -1377,6 +1377,9 @@ impl Kernel {
             return;
         }
         let now = self.thread_signals.get(tid).and_then(|s| s.cpu.times()).map(|(u, s)| u + s);
+        if now.is_some() {
+            self.darwin_clock_read();
+        }
         if let Some(t) = self.dtask.threads.map.get_mut(&tid) {
             t.bank_deduct = now;
         }

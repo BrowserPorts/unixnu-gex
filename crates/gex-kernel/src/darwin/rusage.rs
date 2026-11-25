@@ -311,6 +311,8 @@ pub struct Shared {
     /// exec's task takes the old one's (`ledger_rollup_entry`).
     pub logical_writes: std::sync::atomic::AtomicI64,
     child: Mutex<Child>,
+    /// `p_stats`' `struct rusage`s: `p_ru`'s counts, `p_cru`, and `p_ru->ru`.
+    pub ru: super::ru::Stats,
     /// `p_ru->ri`: what `proc_exit` gathered.
     exit: Mutex<Option<Record>>,
 }
@@ -818,14 +820,29 @@ pub fn footprint_from_outside(procs: &crate::proc::ProcTable, pid: i32, p: &supe
 /// becomes a zombie, for `proc_pid_rusage` to read: its pages looked at a
 /// last time first, as its threads have stopped and before its map goes
 /// (`vm_map_terminate` only releases), so the peaks are its whole life's.
+///
+/// With it `p_ru->ru`: `calcru` (its times, its task's faults and
+/// page-ins, its resident peak from that look) and its reaped children's
+/// `p_cru` added.
 pub fn proc_exit(procs: &crate::proc::ProcTable, pid: i32, p: &super::procinfo::Public) {
     let mut i = input(procs, pid, p);
-    i.footprint_peaks = footprint_from_outside(procs, pid, p).map(|l| l.peaks);
+    let looked = footprint_from_outside(procs, pid, p);
+    i.footprint_peaks = looked.map(|l| l.peaks);
     i.instructions = instructions_from_outside(procs, pid, p);
     i.bills = *p.rusage.exit_bills.lock().unwrap_or_else(|e| e.into_inner());
     i.exit_abstime = Some(super::mach::absolute_time());
     let r = gather(&i);
     *p.rusage.exit.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+    let times = super::workq::host_clocks().and_then(|()| {
+        let live = match p.threads.as_ref() {
+            Some(threads) => crate::cpu::live_times(threads)?,
+            None => Vec::new(),
+        };
+        Some(crate::cpu::calcru(procs.dead_cpu(pid), &live))
+    });
+    let maxrss = looked.map(|_| p.rusage.meter.lock().peaks.resident * (super::mach::PAGE_MASK + 1));
+    let ru = p.rusage.ru.calcru(times, p.rusage.pageins.load(Ordering::Acquire), maxrss);
+    p.rusage.ru.set_exit(ru);
 }
 
 /// `gather_rusage_info(p, ri, RUSAGE_INFO_CURRENT)` with `ri_phys_footprint`
@@ -920,6 +937,10 @@ impl Kernel {
         let unkept = r.unkept_within(size);
         if !unkept.is_empty() {
             self.darwin_unimplemented(format!("proc_pid_rusage flavor {flavor}: {}, not kept (given as 0)", unkept.join(", ")));
+        }
+        // Its times are the threads' clocks'.
+        if r.unkept & (1 << ri::USER_TIME) == 0 {
+            self.darwin_clock_read();
         }
         m.write(buf, &r.bytes()[..size]).map_err(|_| EFAULT)?;
         Ok(0)

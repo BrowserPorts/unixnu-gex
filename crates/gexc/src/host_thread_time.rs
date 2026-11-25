@@ -23,7 +23,7 @@ extern "C" {
 
 /// Hand the kernel this host's per-thread clocks.
 pub fn install() {
-    gex_kernel::darwin::workq::set_thread_time(register, unregister, runtime);
+    gex_kernel::darwin::workq::set_thread_time(register, unregister, runtime, false);
 }
 
 /// Note the calling host thread as guest thread `tid`'s.

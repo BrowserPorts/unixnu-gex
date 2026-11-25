@@ -442,7 +442,12 @@ impl Kernel {
         if task.flags & rflag::PERTHR_LIMIT == 0 && !has_ledger {
             return;
         }
-        // The time it has run, credited.
+        // The time it has run, credited. A busy time's over-count (the
+        // page's clocks) would raise EXC_RESOURCE, or kill, early.
+        if super::workq::host_clocks().is_some() && super::workq::exact_clocks().is_none() {
+            self.darwin_unimplemented("the CPU usage monitor on a host whose per-thread clocks are a busy time, not the threads' processor time (a page's Workers': its limit would be reached early)".into());
+            return;
+        }
         let Some(total) = self.darwin_thread_cpu_abs(tid) else {
             self.darwin_unimplemented("the CPU usage monitor on a host without per-thread clocks".into());
             return;

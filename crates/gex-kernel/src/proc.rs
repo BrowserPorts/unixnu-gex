@@ -537,8 +537,6 @@ struct Proc {
     /// The user and system time of its threads that have ended
     /// (`task->total_user_time`, `total_system_time`), in nanoseconds.
     dead_cpu: (u64, u64),
-    /// Its reaped children's (`p_stats->p_cru`'s times).
-    children_cpu: (u64, u64),
     /// Its ended threads' runnable time (`task->total_runnable_time`), in
     /// Mach time units.
     dead_runnable: u64,
@@ -998,7 +996,6 @@ impl ProcTable {
                     exit_reason: None,
                     reboot: false,
                     dead_cpu: (0, 0),
-                    children_cpu: (0, 0),
                     dead_runnable: 0,
                     dead_instructions: 0,
                     persona: None,
@@ -1116,7 +1113,6 @@ impl ProcTable {
             exit_reason: None,
             reboot: false,
             dead_cpu: (0, 0),
-            children_cpu: (0, 0),
             dead_runnable: 0,
             dead_instructions: 0,
             persona,
@@ -1154,6 +1150,10 @@ impl ProcTable {
     /// is woken, as `stop()` and a continue wake it.
     pub fn job_set(&self, pid: i32, j: Job, ev: JobEvent) {
         let Some(cell) = self.lock().procs.iter().find(|p| p.pid == pid).map(|p| Arc::clone(&p.child.job)) else { return };
+        // stop()'s wakeup of the parent.
+        if ev == JobEvent::Stop {
+            self.child_woke(pid);
+        }
         {
             let mut g = cell.lock().unwrap_or_else(|e| e.into_inner());
             let (waited, continued) = (g.waited, g.continued);
@@ -1178,9 +1178,10 @@ impl ProcTable {
     /// to wait for. Statuses here are the page's (an exit code, or a
     /// signal's number negated), given back as wait statuses. A `look`
     /// (whether a wait would answer) takes and marks nothing.
-    pub fn darwin_wait_step(&self, ppid: i32, want: i32, jobs: crate::syscalls::JobWait, nowait: bool, waitid: bool, look: bool) -> WaitStep {
+    pub fn darwin_wait_step(&self, ppid: i32, (want, group): (i32, bool), jobs: crate::syscalls::JobWait, nowait: bool, waitid: bool, look: bool) -> WaitStep {
         let nowait = nowait || look;
-        let candidates: Vec<ChildHandle> = self.children(ppid).into_iter().filter(|c| want <= 0 || c.pid == want).collect();
+        // A group's: the children whose p_pgrpid is `want` (kern_exit.c).
+        let candidates: Vec<ChildHandle> = self.children(ppid).into_iter().filter(|c| if group { self.pgid(ppid, c.pid) == Ok(want) } else { want <= 0 || c.pid == want }).collect();
         if candidates.is_empty() || candidates.iter().all(|c| c.reaped.load(Ordering::Acquire)) {
             return WaitStep::NoChild;
         }
@@ -1293,7 +1294,6 @@ impl ProcTable {
             exit_reason: None,
             reboot: false,
             dead_cpu: (0, 0),
-            children_cpu: (0, 0),
             dead_runnable: 0,
             dead_instructions: 0,
             persona: s.persona,
@@ -1620,6 +1620,10 @@ impl ProcTable {
             let mut t = self.lock();
             t.mark_exited(pid);
             let ppid = t.procs.iter().find(|p| p.pid == pid).map(|p| p.ppid);
+            // proc_exit's wakeup of the parent.
+            if let Some(pp) = ppid.and_then(|ppid| t.procs.iter().find(|p| p.pid == ppid)) {
+                pp.child.wakes.fetch_add(1, Ordering::AcqRel);
+            }
             // proc_exit's fixjobc, before its children go to init.
             if let Some((pgid, sid)) = t.procs.iter().find(|p| p.pid == pid).map(|p| (p.pgid, p.sid)) {
                 t.fixjobc(pid, pgid, sid, false, &mut jobc_orphaned);
@@ -1793,37 +1797,22 @@ impl ProcTable {
         if let Some(r) = self.remote {
             return (r.reap)(pid);
         }
-        // reap_child_locked's ruadd of the child's final rusage (its own
-        // times, its threads' at its end, and its reaped children's, as
-        // proc_exit made it) to its parent's p_cru, unless the parent has
-        // P_NOCLDWAIT.
-        let ended = {
+        // reap_child_locked: the child's p_ru->ru added to its parent's
+        // p_cru unless the parent has P_NOCLDWAIT, and its p_ru->ri to the
+        // parent's ri_child whatever the parent's P_NOCLDWAIT (for one that
+        // has it, proc_exit added the child once already).
+        {
             let t = self.lock();
-            t.procs.iter().find(|p| p.pid == pid).map(|p| {
+            if let Some(p) = t.procs.iter().find(|p| p.pid == pid) {
                 let parent = t.procs.iter().find(|q| q.pid == p.ppid);
                 let rollup = parent.is_some_and(|q| !q.nocldwait);
-                // update_rusage_info_child, whatever the parent's
-                // P_NOCLDWAIT: for one that has it, proc_exit added the
-                // child once already.
                 if let (Some(child), Some(parent)) = (p.darwin.clone().and_then(|r| r.downcast::<crate::darwin::procinfo::Public>().ok()), parent.and_then(|q| q.darwin.clone()).and_then(|r| r.downcast::<crate::darwin::procinfo::Public>().ok())) {
                     let times = if rollup { 1 } else { 2 };
                     crate::darwin::rusage::reaped(&child, &parent, times);
-                }
-                (p.ppid, (p.dead_cpu.0 + p.children_cpu.0, p.dead_cpu.1 + p.children_cpu.1), p.darwin.clone(), rollup)
-            })
-        };
-        if let Some((ppid, (mut user, mut sys), record, true)) = ended {
-            if let Some(threads) = record.and_then(|r| r.downcast::<crate::darwin::procinfo::Public>().ok()).and_then(|p| (*p.threads).clone()) {
-                for tid in threads.tids() {
-                    if let Some((u, s)) = threads.get(tid).and_then(|t| t.cpu.times()) {
-                        user += u;
-                        sys += s;
+                    if let (true, Some(ru)) = (rollup, child.rusage.ru.exited()) {
+                        parent.rusage.ru.add_reaped(&ru);
                     }
                 }
-            }
-            if let Some(parent) = self.lock().procs.iter_mut().find(|p| p.pid == ppid) {
-                parent.children_cpu.0 += user;
-                parent.children_cpu.1 += sys;
             }
         }
         self.lock().forget(|p| p.pid == pid);
@@ -2403,6 +2392,22 @@ impl ProcTable {
         }
     }
 
+    /// Process `pid`'s parent is woken by it (a stop's wakeup): counted
+    /// ([`crate::syscalls::Child::wakes`]).
+    fn child_woke(&self, pid: i32) {
+        let t = self.lock();
+        let Some(ppid) = t.procs.iter().find(|p| p.pid == pid).map(|p| p.ppid) else { return };
+        if let Some(pp) = t.procs.iter().find(|p| p.pid == ppid) {
+            pp.child.wakes.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// The wakeups process `pid`'s children have given it so far
+    /// ([`crate::syscalls::Child::wakes`]).
+    pub fn child_wakes(&self, pid: i32) -> u64 {
+        self.lock().procs.iter().find(|p| p.pid == pid).map_or(0, |p| p.child.wakes.load(Ordering::Acquire))
+    }
+
     pub fn job_changed(&self, pid: i32) {
         let t = self.lock();
         if let Some(p) = t.procs.iter().find(|p| p.pid == pid) {
@@ -2730,11 +2735,6 @@ impl ProcTable {
     /// `pid`'s ended threads' runnable time.
     pub fn dead_runnable(&self, pid: i32) -> u64 {
         self.lock().procs.iter().find(|p| p.pid == pid).map_or(0, |p| p.dead_runnable)
-    }
-
-    /// `pid`'s reaped children's user and system time.
-    pub fn children_cpu(&self, pid: i32) -> (u64, u64) {
-        self.lock().procs.iter().find(|p| p.pid == pid).map_or((0, 0), |p| p.children_cpu)
     }
 
     /// `pid`'s ended threads' user and system time.
@@ -3311,23 +3311,44 @@ mod tests {
         let p = t.spawn(INIT_PID);
         let c = t.spawn(p);
         let all = JobWait { exits: true, stops: true, continues: true };
-        assert_eq!(t.darwin_wait_step(p, -1, all, false, false, false), WaitStep::Nothing);
-        assert_eq!(t.darwin_wait_step(c, -1, all, false, false, false), WaitStep::NoChild);
+        assert_eq!(t.darwin_wait_step(p, (-1, false), all, false, false, false), WaitStep::Nothing);
+        assert_eq!(t.darwin_wait_step(c, (-1, false), all, false, false, false), WaitStep::NoChild);
         t.job_set(c, Job { stopped: true, xstat: 17, holds: 1, ..Job::default() }, JobEvent::Stop);
         // A look finds it and leaves it; the wait takes it once.
-        assert_eq!(t.darwin_wait_step(p, c, all, false, false, true), WaitStep::Stopped { pid: c, xstat: 17 });
-        assert_eq!(t.darwin_wait_step(p, c, all, false, false, false), WaitStep::Stopped { pid: c, xstat: 17 });
-        assert_eq!(t.darwin_wait_step(p, c, all, false, false, false), WaitStep::Nothing);
+        assert_eq!(t.darwin_wait_step(p, (c, false), all, false, false, true), WaitStep::Stopped { pid: c, xstat: 17 });
+        assert_eq!(t.darwin_wait_step(p, (c, false), all, false, false, false), WaitStep::Stopped { pid: c, xstat: 17 });
+        assert_eq!(t.darwin_wait_step(p, (c, false), all, false, false, false), WaitStep::Nothing);
         // A change that is no stop or continue leaves the report as it was.
         t.job_set(c, Job { stopped: true, xstat: 17, holds: 2, ..Job::default() }, JobEvent::Neither);
-        assert_eq!(t.darwin_wait_step(p, c, all, false, false, false), WaitStep::Nothing);
+        assert_eq!(t.darwin_wait_step(p, (c, false), all, false, false, false), WaitStep::Nothing);
         t.job_set(c, Job { stopped: false, xstat: 19, contproc: c, continued: true, ..Job::default() }, JobEvent::Cont);
-        assert_eq!(t.darwin_wait_step(p, c, JobWait { continues: false, ..all }, false, false, false), WaitStep::Nothing);
-        assert_eq!(t.darwin_wait_step(p, c, all, false, true, false), WaitStep::Continued { pid: c, contproc: c, xstat: 19 });
+        assert_eq!(t.darwin_wait_step(p, (c, false), JobWait { continues: false, ..all }, false, false, false), WaitStep::Nothing);
+        assert_eq!(t.darwin_wait_step(p, (c, false), all, false, true, false), WaitStep::Continued { pid: c, contproc: c, xstat: 19 });
         t.exit_code(c, 3);
-        assert_eq!(t.darwin_wait_step(p, c, all, true, false, false), WaitStep::Ended { pid: c, word: 3 << 8, xhighbits: 0 });
-        assert_eq!(t.darwin_wait_step(p, c, all, false, false, false), WaitStep::Ended { pid: c, word: 3 << 8, xhighbits: 0 });
-        assert_eq!(t.darwin_wait_step(p, c, all, false, false, false), WaitStep::NoChild);
+        assert_eq!(t.darwin_wait_step(p, (c, false), all, true, false, false), WaitStep::Ended { pid: c, word: 3 << 8, xhighbits: 0 });
+        assert_eq!(t.darwin_wait_step(p, (c, false), all, false, false, false), WaitStep::Ended { pid: c, word: 3 << 8, xhighbits: 0 });
+        assert_eq!(t.darwin_wait_step(p, (c, false), all, false, false, false), WaitStep::NoChild);
+    }
+
+    /// A Darwin wait for a process group's children (wait4's pid below -1,
+    /// waitid's P_PGID) takes only the children in that group, and finds
+    /// none (ECHILD) where no child is in it.
+    #[test]
+    fn a_darwin_group_wait_takes_the_groups_children_only() {
+        use crate::syscalls::JobWait;
+        let t = ProcTable::new();
+        let p = t.spawn(INIT_PID);
+        let a = t.spawn(p);
+        let b = t.spawn(p);
+        t.setpgid(p, b, b).unwrap();
+        let all = JobWait { exits: true, stops: true, continues: true };
+        let pg = t.pgid(p, p).unwrap();
+        t.exit_code(a, 1);
+        t.exit_code(b, 2);
+        assert_eq!(t.darwin_wait_step(p, (b, true), all, false, false, false), WaitStep::Ended { pid: b, word: 2 << 8, xhighbits: 0 });
+        assert_eq!(t.darwin_wait_step(p, (b, true), all, false, false, false), WaitStep::NoChild);
+        assert_eq!(t.darwin_wait_step(p, (0, true), all, false, false, false), WaitStep::NoChild);
+        assert_eq!(t.darwin_wait_step(p, (pg, true), all, false, false, false), WaitStep::Ended { pid: a, word: 1 << 8, xhighbits: 0 });
     }
 
     /// A page process takes its own record from the system's table as it

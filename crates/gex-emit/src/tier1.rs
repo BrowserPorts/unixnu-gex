@@ -1843,20 +1843,6 @@ impl<'a> Emitter<'a> {
             self.f.end();
         }
         self.f.end();
-        // The prototype's touch map: the access's first and last bytes'
-        // pages marked.
-        #[cfg(feature = "touch-map")]
-        for past in [0, size - 1].into_iter().take(if size > 1 { 2 } else { 1 }) {
-            self.f.local_get(t);
-            if past != 0 {
-                self.f.i64_const(past as i64);
-                self.f.byte(0x7c); // i64.add
-            }
-            self.f.i64_const(PERM_PAGE_SHIFT as i64);
-            self.f.byte(0x88); // i64.shr_u
-            self.f.i32_const(1);
-            self.f.store64(0x3a, 0, gex_abi::TOUCH_MAP64); // i32.store8
-        }
     }
 
     /// Whether `v` is the context address plus offsets (`value_ctx`).

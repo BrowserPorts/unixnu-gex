@@ -448,6 +448,10 @@ pub enum BlockOp {
         ppid: i32,
         /// Which child, or -1 for any.
         want: i32,
+        /// `want` is a process group's id: the children in that group (a
+        /// Darwin wait in the page, which asks the system's table; where
+        /// the table is local `children` holds them already).
+        group: bool,
         /// Where to write the wait status, or zero.
         wstatus: u64,
         /// `WNOHANG`: report nothing rather than blocking.
@@ -458,6 +462,10 @@ pub enum BlockOp {
         /// A Darwin wait's: which of a child's ends, stops and continues it
         /// reports (`None`: ends only).
         jobs: Option<JobWait>,
+        /// A Darwin `wait4`'s `rusage` (0: none): the collected child's
+        /// `p_ru->ru` copied there after its status, before it is reaped
+        /// ([`crate::darwin::exit::wait4_rusage`]).
+        rusage: u64,
     },
     /// `fcntl(F_SETLKW)`, `F_OFD_SETLKW` or a blocking `flock` with the
     /// lock held in the way: until `locks` would grant `req`
@@ -784,9 +792,9 @@ pub struct Kernel {
     /// The file the Darwin call in progress is to make, and its attributes,
     /// once its checks have passed: recorded when the call has made it.
     pub darwin_creation: Option<crate::darwin::macvfs::Creating>,
-    /// A parked Darwin `wait4`'s status address, for its status in Darwin's
-    /// encoding ([`crate::darwin::exit`]).
-    pub darwin_wait4: Option<u64>,
+    /// A parked Darwin `wait4`'s status and rusage addresses, for its
+    /// status in Darwin's encoding ([`crate::darwin::exit`]).
+    pub darwin_wait4: Option<(u64, u64)>,
     /// A Darwin call that waited for its socket (a receive with nothing to
     /// read, a send with no room before its first byte): its number and
     /// arguments, made again once the wait is over, when the kernel has the
@@ -7439,10 +7447,12 @@ fn wait_child(procs: &Arc<ProcTable>, pid: i32, a: [u64; 6]) -> BlockOp {
         procs: Arc::clone(procs),
         ppid: pid,
         want: a[0] as i32,
+        group: false,
         wstatus: a[1],
         nohang: a[2] & 1 != 0,
         waitid: None,
         jobs: None,
+        rusage: 0,
     }
 }
 
@@ -10488,11 +10498,16 @@ pub struct Child {
     /// A Darwin process's task policy, which other processes reach too
     /// (setpriority's).
     pub policy: Arc<crate::darwin::taskpolicy::PolicyCell>,
+    /// The wakeups this process's children have given its `wait4` sleep
+    /// (XNU's `msleep0` on the proc): each child's end (`proc_exit`'s
+    /// `wakeup` of its parent) and stop (`stop()`'s), counted.
+    pub wakes: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Child {
     pub fn new(pid: i32) -> Child {
         Child {
+            wakes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             pid,
             status: Arc::new(Mutex::new(None)),
             done: Arc::new(std::sync::Condvar::new()),
@@ -10543,8 +10558,8 @@ pub struct PendingCall {
     /// A parked write to a Darwin pipe: whether its EPIPE sends the process
     /// SIGPIPE (the open file has no `FG_NOSIGPIPE`).
     pub darwin_pipe_sigpipe: Option<bool>,
-    /// A parked Darwin `wait4`: where its status goes.
-    pub darwin_wait4: Option<u64>,
+    /// A parked Darwin `wait4`: where its status and rusage go.
+    pub darwin_wait4: Option<(u64, u64)>,
     /// A Darwin socket call made again after its wait.
     pub darwin_retry: Option<(u64, [u64; 6])>,
 }
@@ -12487,9 +12502,10 @@ impl Kernel {
         if self.darwin_pipe_sigpipe.take() == Some(true) && r == Err(Errno::EPIPE) {
             self.darwin_send_sigpipe();
         }
-        if let Some(status) = self.darwin_wait4.take() {
-            self.darwin_wait4_done(m, status, &r);
-        }
+        let r = match self.darwin_wait4.take() {
+            Some(at) => self.darwin_wait4_done(m, at, r),
+            None => r,
+        };
         if std::mem::take(&mut self.write_blocked) && r == Err(Errno::EPIPE) {
             self.signals.raise_from(
                 crate::signal::sig::SIGPIPE,

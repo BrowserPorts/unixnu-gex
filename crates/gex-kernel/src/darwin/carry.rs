@@ -210,6 +210,7 @@ fn uncarried(t: &Task) -> Vec<&'static str> {
         job: _,
         policy: _,
         said: _,
+        clock_said: _,
         record_sent: _,
         // Replaced by the child's image switch: its map's entries.
         vm: _,

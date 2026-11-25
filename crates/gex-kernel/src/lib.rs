@@ -498,6 +498,15 @@ impl<'a> GuestMem<'a> {
         self.write(addr, &v.to_le_bytes())
     }
 
+    /// A relaxed compare-and-swap of the aligned word at `addr`, written as
+    /// the kernel's own (no protection check): `Ok(Ok(current))` swapped,
+    /// `Ok(Err(seen))` it held `seen`; EFAULT outside the memory or
+    /// unaligned.
+    pub fn cmpxchg_u64(&mut self, addr: u64, current: u64, new: u64) -> Result<Result<u64, u64>, Errno> {
+        let r = self.range(addr, 8)?;
+        self.span.cmpxchg_u64(r.start, current, new).ok_or(Errno::EFAULT)
+    }
+
     pub fn read_u32(&self, addr: u64) -> Result<u32, Errno> {
         let b: [u8; 4] = self.read(addr, 4)?.try_into().unwrap();
         Ok(u32::from_le_bytes(b))

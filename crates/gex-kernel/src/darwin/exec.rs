@@ -671,6 +671,19 @@ impl Kernel {
         self.dtask.vm.clip_range(alloc, alloc + guard);
         Ok(MainStack { sp, bytes, alloc, size, guard })
     }
+
+    /// The main stack `st` in the map, once its host has written its
+    /// strings: the guard, then the stack, which the pmap enters as
+    /// anonymous memory is entered, at each page's first access, but for
+    /// the pages `exec_copyout_strings` wrote (its copyout's faults
+    /// entered them).
+    pub fn darwin_stack_mapped(&mut self, st: &MainStack) {
+        use crate::mem::prot;
+        let mut mm = self.mem.lock();
+        mm.insert(st.alloc, st.alloc + st.guard, prot::NONE, "[stack]");
+        mm.insert(st.alloc + st.guard, st.alloc + st.size, prot::READ | prot::WRITE, "[stack]");
+        mm.set_unentered(st.alloc + st.guard, (st.sp & !super::mach::PAGE_MASK).max(st.alloc + st.guard));
+    }
 }
 
 #[cfg(test)]

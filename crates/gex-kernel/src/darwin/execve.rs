@@ -637,6 +637,7 @@ impl Kernel {
             policy: old.policy,
             vouchers: old.vouchers.for_exec(),
             said: old.said,
+            clock_said: old.clock_said,
             // p_csflags: the exec's own, made at its start from these.
             csflags: old.csflags,
             // An exec's process keeps its unique ids and start time, and its

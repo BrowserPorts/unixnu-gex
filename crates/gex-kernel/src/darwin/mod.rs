@@ -120,6 +120,7 @@ pub mod reason;
 pub mod reboot;
 pub mod report;
 pub mod rlimit;
+pub mod ru;
 pub mod rusage;
 pub mod sandbox;
 pub mod sockev;
@@ -552,6 +553,9 @@ pub struct Task {
     pub force_quota: bool,
     /// What has been reported as not done, so each is said once.
     said: std::collections::HashSet<String>,
+    /// Whether the threads' processor time has been said to stand in
+    /// ([`crate::syscalls::Kernel::darwin_clock_read`]).
+    clock_said: bool,
     /// Under strict mode, the unimplemented thing that stops the process
     /// when the call returns.
     stop: Option<String>,
@@ -650,14 +654,17 @@ impl crate::syscalls::Kernel {
         let copied = std::mem::take(&mut *soft.copied.lock().unwrap_or_else(|e| e.into_inner()));
         if !touched.is_empty() || !copied.is_empty() {
             let mut mm = self.mem.lock();
+            // Each the copy's vm_fault, counted in the task's faults.
+            let mut faults = 0;
             for p in touched {
-                mm.enter_page(p);
+                faults += u64::from(mm.enter_page(p));
             }
             // A write's fault on a file's page copied it.
             for p in copied {
-                mm.copied(p);
+                faults += u64::from(mm.copied(p));
             }
             drop(mm);
+            self.dtask.rusage.ru.faults.fetch_add(faults, std::sync::atomic::Ordering::AcqRel);
             self.darwin_flush_perms(m);
         }
         let mut pages = std::mem::take(&mut *soft.written.lock().unwrap_or_else(|e| e.into_inner()));
@@ -882,6 +889,29 @@ impl crate::syscalls::Kernel {
         }
         if self.dtask.strict && self.dtask.stop.is_none() {
             self.dtask.stop = Some(what);
+        }
+    }
+
+    /// What a figure the process is given stands in for, said once per
+    /// process; unlike [`Self::darwin_unimplemented`] it does not stop a
+    /// strict run (the figure is what gex counts, and the report names
+    /// what it misses).
+    pub fn darwin_stand_in(&mut self, what: &str) {
+        if self.dtask.said.insert(format!("stand-in: {what}")) || self.trace {
+            crate::darwin_say!("[gex:{}] Darwin: stand-in: {what}", self.pid);
+        }
+    }
+
+    /// A thread's processor time is read, for the program or for what it
+    /// sets going (a timer, the scheduler's decay): where the host's
+    /// clocks are a busy time, that stand-in is said, once per process.
+    pub(crate) fn darwin_clock_read(&mut self) {
+        if self.dtask.clock_said {
+            return;
+        }
+        if let Some(what) = workq::clock_stand_in() {
+            self.dtask.clock_said = true;
+            self.darwin_stand_in(what);
         }
     }
 

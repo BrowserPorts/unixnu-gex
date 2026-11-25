@@ -80,7 +80,10 @@ pub(super) fn thread_info(k: &mut Kernel, t: i32, fl: i32, count: u32) -> Reply 
                 return Reply::err(KERN_INVALID_ARGUMENT);
             }
             match basic_info(k, t) {
-                Ok(w) => Reply::ok(super::mig::words(&w)),
+                Ok(w) => {
+                    k.darwin_clock_read();
+                    Reply::ok(super::mig::words(&w))
+                }
                 Err(why) => loud(why),
             }
         }
@@ -250,6 +253,37 @@ fn basic_info(k: &Kernel, t: i32) -> Result<[u32; 10], String> {
     Ok([secs as u32, usecs, 0, 0, cpu_usage as u32, policy, run_state, flags, suspend_count, 0])
 }
 
+/// An `_sleep` entered again by the running thread's wait (`kern_synch.c`
+/// counts each entry in `p_stats->p_ru.ru_nvcsw`): the wait's loop in XNU
+/// was woken and sleeps again, as `pipe_read`'s does when another reader
+/// took what the write that woke it put in, `pipe_write`'s when it has
+/// filled the buffer again after the room a read made, `soreceive`'s
+/// `sbwait` when another receiver took the data, and `wait4`'s `msleep0`
+/// when a child's end or stop woke it and is not one it reports. The
+/// first entry is counted as the call blocks ([`Kernel::darwin_note_wait`]);
+/// a host's own turns (its polls) are no wakeups and count nothing. The
+/// running thread's process's (`current_proc()`'s): none outside a Darwin
+/// process.
+pub fn sleep_again() {
+    super::pagecache::count_ru(super::ru::l::NVCSW);
+}
+
+impl Kernel {
+    /// The page's Darwin wait of the running thread (a `wait4` or
+    /// `waitid`) is over, its children having given it `wakes` wakeups by
+    /// now (`share::dwait`'s count), `woken` whether the last of them is
+    /// what it reports (an end or a stop): each other one since it slept
+    /// woke its `msleep0` to nothing it reports, and it slept again
+    /// ([`sleep_again`]). The page parks such a wait until the child it
+    /// asks for has something, so these are counted at its end.
+    pub fn darwin_wait_woken(&mut self, wakes: u64, woken: bool) {
+        let Some(since) = self.darwin_me().wait_wakes.take() else { return };
+        for _ in 0..wakes.saturating_sub(since).saturating_sub(u64::from(woken)) {
+            sleep_again();
+        }
+    }
+}
+
 impl Kernel {
     /// The calling thread blocks in `op`: whether XNU's wait for the call
     /// blocks at a continuation, which discards the thread's kernel stack
@@ -257,6 +291,48 @@ impl Kernel {
     pub(crate) fn darwin_note_wait(&mut self, op: &BlockOp) {
         let k = self.darwin_wait_kstack(op);
         self.darwin_me().kstack = k;
+        if self.darwin_wait_sleeps(op) {
+            self.dtask.rusage.ru.count(super::ru::l::NVCSW);
+        }
+    }
+
+    /// Whether XNU's wait for what `op` waits for is an `_sleep` (`msleep`,
+    /// `msleep0`, `msleep1`, `tsleep0`, `tsleep1`), whose entry counts a
+    /// voluntary switch in `p_stats->p_ru.ru_nvcsw` (`kern_synch.c`): the
+    /// BSD waits, not the Mach ones (a thread_block on a waitq: psynch,
+    /// ulock, mach_msg, semaphores, kevent's scan, workq parks).
+    fn darwin_wait_sleeps(&mut self, op: &BlockOp) -> bool {
+        use super::sysno as sys;
+        if let (BlockOp::FutexWait { .. }, Some(w)) = (op, &self.darwin_finish) {
+            return match w.cont {
+                // kern_lockf.c's msleep, kern_aio.c's aio_suspend msleep1,
+                // kern_sig.c's __sigwait msleep, tty.c's ttysleep msleep0.
+                Finish::Lockf(_) | Finish::AioSuspend(_) | Finish::Sigwait { .. } | Finish::Tty => true,
+                // select's tsleep1 (sys_generic.c); poll's scan blocks on
+                // the kqueue's waitq.
+                Finish::Kevent(super::kevent::Cont::Poll { .. }) => matches!(self.darwin_uu_syscall_code(), sys::SELECT | sys::SELECT_NOCANCEL | sys::PSELECT | sys::PSELECT_NOCANCEL),
+                _ => false,
+            };
+        }
+        match op {
+            // sys_pipe.c's piperd and pipewr msleep, uipc_socket2.c's
+            // sbwait, accept's and connect's msleep (uipc_syscalls.c).
+            BlockOp::ReadStream { .. } | BlockOp::WriteStream { .. } | BlockOp::WriteWait { .. } | BlockOp::AcceptWait { .. } | BlockOp::Connect { .. } => true,
+            // lf_advlock's msleep.
+            BlockOp::FileLock { .. } => true,
+            // wait4's and waitid's msleep0, reached when no child it asks
+            // for has anything to report (never under WNOHANG). In the
+            // page, the wakeups its children have given it so far, which
+            // its wait's end counts from (`sleeps_since`).
+            BlockOp::WaitChild { nohang: false, .. } => {
+                let (sleeps, wakes) = super::exit::wait_would_sleep(op);
+                self.darwin_me().wait_wakes = wakes.filter(|_| sleeps);
+                sleeps
+            }
+            // sigsuspend's tsleep0, entered whatever is pending.
+            BlockOp::SigSuspend { .. } => true,
+            _ => false,
+        }
     }
 
     fn darwin_wait_kstack(&mut self, op: &BlockOp) -> KStack {

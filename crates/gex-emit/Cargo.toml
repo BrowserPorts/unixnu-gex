@@ -14,8 +14,3 @@ gex-ir.workspace = true
 # reaches this crate compiled to wasm where `std::thread::scope` is absent.
 default = []
 parallel = []
-# A prototype, for measuring its cost: each Darwin access check also marks
-# the first and last bytes' pages touched in a byte map
-# (`gex_abi::TOUCH_MAP64`), what a page host would answer a task's
-# footprint from.
-touch-map = ["gex-abi/touch-map"]

@@ -824,7 +824,10 @@ impl Kernel {
                 return;
             }
         }
-        let rw = mnt.state().apfs_ro != Some(true);
+        // The container holds the volume read-write once its boot's mount
+        // made it so: a later process of the page joins the booted system,
+        // whose mount (and the writes it made) is not made again.
+        let rw = mnt.state().apfs_ro != Some(true) && !super::disknode::holds_rw(index);
         match if rw { super::disknode::mount_rw(index) } else { Ok(()) } {
             Ok(()) => {
                 for g in super::preboot::BOOTED_GRAFTS {
@@ -876,6 +879,11 @@ impl Kernel {
             return Err(format!("{}: an unsealed image", file.path));
         }
         self.darwin_apfs_graft_make(volume, &file, &dir, flags, image).map_err(|e| format!("apfs_graft: {e:?}"))?;
+        // Its trust cache, once a boot: a later process of the page joins a
+        // system whose boot loaded it.
+        if super::trustcache::boot_type_loaded(g.tc_type) {
+            return Ok(());
+        }
         let tc = payload_of(self, &at(g.trust_cache))?;
         super::trustcache::load_module(g.tc_type, Ok(tc)).map_err(|e| format!("its trust cache: {e:?}"))?;
         super::trustcache::mark_loaded(g.tc_type);

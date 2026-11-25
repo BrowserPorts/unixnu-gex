@@ -27,9 +27,34 @@ pub extern "C" fn k_disk0_set(url: gex_kmem::PAddr, url_len: u32, size: u64, mis
     // not as a lazy file of the root (hosts/browser js/lazy-fetch.mjs).
     let url = format!("{}#device", crate::path_of_raw(url, url_len));
     let missing = crate::path_of_raw(missing, missing_len);
-    match DISK0.set(Device::new(url, size, missing, crate::fetch_lazy)) {
+    if DISK0.set(Device::new(url, size, missing, crate::fetch_lazy)).is_err() {
+        return -16;
+    }
+    // The kernel's container on it, which every process's calls on the
+    // container reach here (gex_kernel::darwin::disknode, share op NX).
+    let d = DISK0.get().expect("set above");
+    let steps = d.missing().lines().filter(|l| !l.is_empty()).map(str::to_string).collect();
+    match gex_kernel::darwin::disknode::install(std::sync::Arc::new(Here(d)), steps) {
         Ok(()) => 0,
-        Err(_) => -16,
+        Err(_) => -22,
+    }
+}
+
+/// The device as the global kernel's own disk nodes' medium.
+struct Here(&'static Device);
+
+impl gex_kernel::darwin::apfsread::Medium for Here {
+    fn size(&self) -> u64 {
+        self.0.size()
+    }
+    fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<(), String> {
+        self.0.read_at(off, buf)
+    }
+}
+
+impl gex_kernel::darwin::apfswrite::Sink for Here {
+    fn write_at(&self, off: u64, buf: &[u8]) -> Result<(), String> {
+        self.0.write_at(off, buf)
     }
 }
 

@@ -52,12 +52,14 @@ export default async function (t) {
   eq("output, as gexc's", r.stdout, native.stdout, ctx);
   eq("status, as gexc's", r.code, native.status, r.signal ? `signal ${r.signal}` : ctx);
   t.say(`the run took ${(ms / 1000).toFixed(1)} s in the page, ${(native.ms / 1000).toFixed(1)} s under gexc`);
-  // A second run in the same system: its code translated again in a
-  // process of its own, the cache's bytes this time in the device's
-  // memory and the page's units.
+  // A second run in the same system: a process that joins the booted
+  // system (its container, grafts and trust caches the system's), its code
+  // translated again in a process of its own.
   const s0 = performance.now();
   const again = await timeout(sys.run([PROG, 'a', 'b']), 800000, 'hello again');
-  t.say(`a second run took ${((performance.now() - s0) / 1000).toFixed(1)} s (${again.code}: ${again.stdout.trim() || again.stderr.slice(-300)})`);
+  t.say(`a second run took ${((performance.now() - s0) / 1000).toFixed(1)} s`);
+  eq("a second run's output, as gexc's", again.stdout, native.stdout, `stderr: ${again.stderr.slice(-2000)}\nconsole: ${sys.state.console.slice(-3000)}`);
+  eq("and its status", again.code, native.status);
   const said = sys.state.console.split('\n');
   for (const line of native.reports.filter((l) => !l.startsWith(HOST_STREAMS))) {
     const subject = line.slice(0, line.indexOf(':', line.indexOf(':') + 1) + 1);

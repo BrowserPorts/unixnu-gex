@@ -135,12 +135,10 @@ pub fn volume(index: u32) -> Result<super::apfsread::Volume, String> {
     let d = DISK.get().ok_or("no disk0 image (GEX_DARWIN_DISK0)")?;
     let (base, size) = storage::partition_extent();
     let c = Arc::new(super::apfsread::Container::open(Arc::new(PartMedium(Arc::clone(&d.sink), base, size))).map_err(|e| format!("the container in the disk0 image: {e}"))?);
-    let sb = with_container(|nx| {
-        if nx.vol_oid(index as usize).is_none() {
-            return Err(format!("the container in the disk0 image has no volume in slot {index}"));
-        }
-        Ok(nx.vol_sb_read(index as usize)?.0.to_vec())
-    })?;
+    let sb = match super::share::remote() {
+        Some(r) => through(r, Call::VolSb, index, &[])?,
+        None => vol_sb_here(index)?,
+    };
     super::apfsread::Volume::live(c, &sb, Arc::new(KernelTree(index))).map_err(|e| format!("volume {index} of the container in the disk0 image: {e}"))
 }
 
@@ -149,11 +147,209 @@ struct KernelTree(u32);
 
 impl super::apfsread::btree::LiveNodes for KernelTree {
     fn root(&self) -> super::apfsread::Result<u64> {
-        with_container(|nx| nx.fs_tree_root(self.0 as usize)).map_err(super::apfsread::Error::Io)
+        match super::share::remote() {
+            Some(r) => through(r, Call::Root, self.0, &[]).map(|b| u64::from_le_bytes(b[..8].try_into().unwrap())),
+            None => with_container(|nx| nx.fs_tree_root(self.0 as usize)),
+        }
+        .map_err(super::apfsread::Error::Io)
     }
     fn node(&self, oid: u64) -> super::apfsread::Result<Arc<[u8]>> {
-        with_container(|nx| nx.fs_tree_node(self.0 as usize, oid)).map(Into::into).map_err(super::apfsread::Error::Io)
+        match super::share::remote() {
+            Some(r) => through(r, Call::Node, self.0, &oid.to_le_bytes()).map(Into::into),
+            None => with_container(|nx| nx.fs_tree_node(self.0 as usize, oid)).map(Into::into),
+        }
+        .map_err(super::apfsread::Error::Io)
     }
+}
+
+/// Volume `index`'s superblock as the kernel's container holds it.
+fn vol_sb_here(index: u32) -> Result<Vec<u8>, String> {
+    with_container(|nx| {
+        if nx.vol_oid(index as usize).is_none() {
+            return Err(format!("the container in the disk0 image has no volume in slot {index}"));
+        }
+        Ok(nx.vol_sb_read(index as usize)?.0.to_vec())
+    })
+}
+
+/// The calls on the kernel's container a process of the page makes of the
+/// global kernel's ([`serve`]): in the page the container's state in
+/// memory (its object cache, space manager and open transaction) is the
+/// system's, as it is natively, not each process's copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum Call {
+    Root = 1,
+    Node = 2,
+    VolSb = 3,
+    MountRw = 4,
+    VfsSync = 5,
+    UnmountForced = 6,
+    VnodeGet = 7,
+    Setattr = 8,
+    HeldTimes = 9,
+    HoldsRw = 10,
+    CapsFacts = 11,
+    VolumeIds = 12,
+    Xattr = 13,
+    JobjGe = 14,
+    AllocJobj = 15,
+}
+
+impl Call {
+    fn of(n: u8) -> Option<Call> {
+        use Call::*;
+        Some(match n {
+            1 => Root,
+            2 => Node,
+            3 => VolSb,
+            4 => MountRw,
+            5 => VfsSync,
+            6 => UnmountForced,
+            7 => VnodeGet,
+            8 => Setattr,
+            9 => HeldTimes,
+            10 => HoldsRw,
+            11 => CapsFacts,
+            12 => VolumeIds,
+            13 => Xattr,
+            14 => JobjGe,
+            15 => AllocJobj,
+            _ => return None,
+        })
+    }
+
+    /// Whether the call changes the container: its answer is never asked
+    /// for twice (a short one: an error said within [`SAID_MAX`]).
+    fn changes(self) -> bool {
+        matches!(self, Call::MountRw | Call::VfsSync | Call::UnmountForced | Call::VnodeGet | Call::Setattr | Call::AllocJobj)
+    }
+}
+
+/// The longest error a changing call's answer carries: the answer always
+/// fits the first room [`super::share::call_read`] gives it.
+const SAID_MAX: usize = 3800;
+
+/// Call `c` on volume slot `index` with `args`, of the global kernel's
+/// container, the caller's clock carried: its answer, or its error.
+fn through(r: super::share::Remote, c: Call, index: u32, args: &[u8]) -> Result<Vec<u8>, String> {
+    let mut q = vec![c as u8];
+    q.extend_from_slice(&index.to_le_bytes());
+    q.extend_from_slice(&clock_now().to_le_bytes());
+    q.extend_from_slice(args);
+    let b = super::share::call_read(r, super::share::op::NX, &q);
+    match b.split_first() {
+        Some((0, rest)) => Ok(rest.to_vec()),
+        Some((_, said)) => Err(String::from_utf8_lossy(said).into_owned()),
+        None => Err("the global kernel's container gave no answer".into()),
+    }
+}
+
+fn put_attrs(q: &mut Vec<u8>, a: &crate::vfs::VnodeAttrs) {
+    let mut some = 0u8;
+    for (i, on) in [a.uid.is_some(), a.gid.is_some(), a.mode.is_some(), a.flags.is_some(), a.atime.is_some(), a.mtime.is_some()].into_iter().enumerate() {
+        some |= (on as u8) << i;
+    }
+    q.push(some);
+    for v in [a.uid, a.gid, a.mode, a.flags] {
+        q.extend_from_slice(&v.unwrap_or(0).to_le_bytes());
+    }
+    for t in [a.atime, a.mtime] {
+        let (s, ns) = t.unwrap_or((0, 0));
+        q.extend_from_slice(&s.to_le_bytes());
+        q.extend_from_slice(&ns.to_le_bytes());
+    }
+}
+
+fn get_attrs(b: &[u8]) -> Option<crate::vfs::VnodeAttrs> {
+    let (&some, b) = b.split_first()?;
+    if b.len() != 16 + 24 {
+        return None;
+    }
+    let w = |i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
+    let t = |o: usize| (i64::from_le_bytes(b[o..o + 8].try_into().unwrap()), u32::from_le_bytes(b[o + 8..o + 12].try_into().unwrap()));
+    let on = |i: u8| some & (1 << i) != 0;
+    Some(crate::vfs::VnodeAttrs {
+        uid: on(0).then(|| w(0)),
+        gid: on(1).then(|| w(1)),
+        mode: on(2).then(|| w(2)),
+        flags: on(3).then(|| w(3)),
+        atime: on(4).then(|| t(16)),
+        mtime: on(5).then(|| t(28)),
+    })
+}
+
+/// A call on the kernel's container from a process of the page, served on
+/// this (the global kernel's) container, the caller's clock read where
+/// APFS reads `nanotime`: the answer's length (all of it, written as far
+/// as `out` holds it), or `-EINVAL` for a request that is not one.
+pub(crate) fn serve(req: &[u8], out: &mut [u8]) -> i64 {
+    const EINVAL: i64 = 22;
+    let (Some(c), 13..) = (req.first().and_then(|&n| Call::of(n)), req.len()) else { return -EINVAL };
+    let index = u32::from_le_bytes(req[1..5].try_into().unwrap());
+    let now = u64::from_le_bytes(req[5..13].try_into().unwrap());
+    let a = &req[13..];
+    let u = |o: usize| a.get(o..o + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap()));
+    CARRIED_NOW.with(|t| t.set(Some(now)));
+    let answer: Result<Vec<u8>, String> = (|| {
+        Ok(match c {
+            Call::Root => with_container(|nx| nx.fs_tree_root(index as usize))?.to_le_bytes().to_vec(),
+            Call::Node => with_container(|nx| nx.fs_tree_node(index as usize, u(0).ok_or("no oid")?))?.to_vec(),
+            Call::VolSb => vol_sb_here(index)?,
+            Call::MountRw => mount_rw(index).map(|()| Vec::new())?,
+            Call::VfsSync => vfs_sync(index, a.get(..4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).ok_or("no waitfor")?).map(|()| Vec::new())?,
+            Call::UnmountForced => unmount_forced(index).map(|()| Vec::new())?,
+            Call::VnodeGet => vnode_get(index, u(0).ok_or("no inode")?).map(|()| Vec::new())?,
+            Call::Setattr => {
+                let ino = u(0).ok_or("no inode")?;
+                let fd = *a.get(8).ok_or("no fd flag")? != 0;
+                let attrs = get_attrs(&a[9..]).ok_or("no attributes")?;
+                match setattr(index, ino, &attrs, fd)? {
+                    Ok(()) => vec![0],
+                    Err(e) => [&[1u8][..], &e.to_le_bytes()].concat(),
+                }
+            }
+            Call::HeldTimes => match held_times(index, u(0).ok_or("no inode")?)? {
+                Some((m, c)) => [&[1u8][..], &m.to_le_bytes(), &c.to_le_bytes()].concat(),
+                None => vec![0],
+            },
+            Call::HoldsRw => vec![holds_rw(index) as u8],
+            Call::CapsFacts => {
+                let f = caps_facts(index)?;
+                [&f.role.to_le_bytes()[..], &f.incompat.to_le_bytes(), &f.ro_compat.to_le_bytes(), &f.fs_flags.to_le_bytes(), &[f.grouped as u8]].concat()
+            }
+            Call::VolumeIds => {
+                let (next, uuid) = volume_ids(index)?;
+                [&next.to_le_bytes()[..], &uuid].concat()
+            }
+            Call::Xattr => match xattr(index, u(0).ok_or("no inode")?, std::str::from_utf8(&a[8..]).map_err(|_| "a name that is not UTF-8")?)? {
+                Some(v) => [&[1u8][..], &v].concat(),
+                None => vec![0],
+            },
+            Call::JobjGe => match jobj_at_or_above(index, u(0).ok_or("no identifier")?)? {
+                Some(v) => [&[1u8][..], &v.to_le_bytes()].concat(),
+                None => vec![0],
+            },
+            Call::AllocJobj => match allocate_graft_jobj_range(index, u(0).ok_or("no inode")?, u(8).ok_or("no length")?)? {
+                Ok(base) => [&[0u8][..], &base.to_le_bytes()].concat(),
+                Err(e) => [&[1u8][..], &e.to_le_bytes()].concat(),
+            },
+        })
+    })();
+    CARRIED_NOW.with(|t| t.set(None));
+    let b = match answer {
+        Ok(v) => [&[0u8][..], &v].concat(),
+        Err(why) => {
+            let mut said = why.into_bytes();
+            if c.changes() {
+                said.truncate(SAID_MAX);
+            }
+            [&[1u8][..], &said].concat()
+        }
+    };
+    let n = b.len().min(out.len());
+    out[..n].copy_from_slice(&b[..n]);
+    b.len() as i64
 }
 
 /// Whether a disk0 image is served.
@@ -186,13 +382,6 @@ fn with_container<R>(f: impl FnOnce(&mut super::apfswrite::tx::Nx<'static>) -> R
     let d = DISK.get().ok_or("no disk0 image (GEX_DARWIN_DISK0)")?;
     let mut g = KERNEL_NX.lock().unwrap_or_else(|e| e.into_inner());
     if g.is_none() {
-        // In the page, the container's state in memory is the process's
-        // that mounted it: another's mount would be a second container
-        // writing the system's disk.
-        let me = super::held::me();
-        if let Some(h) = (me > 0).then(|| super::held::claim(super::held::Kind::Disk0Container, &[], me)).flatten() {
-            return Err(format!("the kernel's container in the disk0 image, which process {h} of the page holds: in the page each process has its own copy of it, not the system's"));
-        }
         let (base, size) = storage::partition_extent();
         let part: &'static PartMedium = Box::leak(Box::new(PartMedium(Arc::clone(&d.sink), base, size)));
         let mut nx = Nx::mounted(part, Mode::Kernel).map_err(|e| format!("the kernel's mount of the container in the disk0 image: {e}"))?;
@@ -226,9 +415,23 @@ fn kernel_op<R>(f: impl FnOnce(&mut super::apfswrite::tx::Nx<'static>) -> Result
 }
 
 /// The kernel's clock as APFS reads it (`nanotime`): nanoseconds since
-/// 1970.
+/// 1970. In the global kernel, which reads no clock, the calling
+/// process's reading, carried with its call ([`serve`]).
 fn nanotime() -> u64 {
+    if let Some(t) = CARRIED_NOW.with(std::cell::Cell::get) {
+        return t;
+    }
+    clock_now()
+}
+
+fn clock_now() -> u64 {
     crate::darwin::time::realtime().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+}
+
+thread_local! {
+    /// The calling process's `nanotime`, while the global kernel serves its
+    /// call on the container.
+    static CARRIED_NOW: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
 /// A writing mount of the volume in slot `index` (`apfs_vfsop_mount`):
@@ -238,6 +441,9 @@ fn nanotime() -> u64 {
 /// the volume's read-write mount and the writes it makes
 /// ([`super::apfswrite::fsops::mount_rw`]).
 pub fn mount_rw(index: u32) -> Result<(), String> {
+    if let Some(r) = super::share::remote() {
+        return through(r, Call::MountRw, index, &[]).map(|_| ());
+    }
     kernel_op(|nx| {
         nx.mount_rw()?;
         super::apfswrite::fsops::mount_rw(nx, index as usize, &mut nanotime)
@@ -249,6 +455,9 @@ pub fn mount_rw(index: u32) -> Result<(), String> {
 /// pass and the commit of the container's open transaction
 /// ([`super::apfswrite::fsops::vfs_sync`]).
 pub fn vfs_sync(index: u32, waitfor: u32) -> Result<(), String> {
+    if let Some(r) = super::share::remote() {
+        return through(r, Call::VfsSync, index, &waitfor.to_le_bytes()).map(|_| ());
+    }
     kernel_op(|nx| super::apfswrite::fsops::vfs_sync(nx, index as usize, waitfor, &mut nanotime))
 }
 
@@ -260,6 +469,9 @@ pub fn vfs_sync(index: u32, waitfor: u32) -> Result<(), String> {
 /// a content-protected volume its teardown of the crypto-state caches
 /// (the ep cache's invalidation, K 0x66cbc24) is not implemented.
 pub fn unmount_forced(index: u32) -> Result<(), String> {
+    if let Some(r) = super::share::remote() {
+        return through(r, Call::UnmountForced, index, &[]).map(|_| ());
+    }
     kernel_op(|nx| {
         let (sb, _) = nx.vol_sb_read(index as usize)?;
         if u64::from_le_bytes(sb[0x108..0x110].try_into().unwrap()) & super::apfsread::APFS_FS_UNENCRYPTED == 0 {
@@ -276,6 +488,9 @@ pub fn unmount_forced(index: u32) -> Result<(), String> {
 /// its load, which its updates start from
 /// ([`super::apfswrite::fsops::vnode_load`]).
 pub fn vnode_get(index: u32, ino: u64) -> Result<(), String> {
+    if let Some(r) = super::share::remote() {
+        return through(r, Call::VnodeGet, index, &ino.to_le_bytes()).map(|_| ());
+    }
     kernel_op(|nx| super::apfswrite::fsops::vnode_load(nx, index as usize, ino, &|| format!("a lookup of inode {ino:#x} on volume slot {index} at run time")))
 }
 
@@ -286,6 +501,13 @@ pub fn vnode_get(index: u32, ino: u64) -> Result<(), String> {
 /// mounted read-write is not written. `Ok(Err(errno))` is the call's own
 /// error.
 pub fn setattr(index: u32, ino: u64, a: &crate::vfs::VnodeAttrs, fd: bool) -> Result<Result<(), i32>, String> {
+    if let Some(r) = super::share::remote() {
+        let mut q = ino.to_le_bytes().to_vec();
+        q.push(fd as u8);
+        put_attrs(&mut q, a);
+        let b = through(r, Call::Setattr, index, &q)?;
+        return Ok(if b[0] == 0 { Ok(()) } else { Err(i32::from_le_bytes(b[1..5].try_into().unwrap())) });
+    }
     kernel_op(|nx| {
         if !nx.mounted.contains(&(index as usize)) {
             return Err(format!("a setattr of inode {ino:#x} of volume slot {index}, which the kernel's container does not hold mounted read-write"));
@@ -297,18 +519,30 @@ pub fn setattr(index: u32, ino: u64, a: &crate::vfs::VnodeAttrs, fd: bool) -> Re
 /// The modification and change times inode `ino` of the volume in slot
 /// `index` holds unwritten in its in-memory object, if any.
 pub fn held_times(index: u32, ino: u64) -> Result<Option<(u64, u64)>, String> {
+    if let Some(r) = super::share::remote() {
+        let b = through(r, Call::HeldTimes, index, &ino.to_le_bytes())?;
+        return Ok((b[0] == 1).then(|| (u64::from_le_bytes(b[1..9].try_into().unwrap()), u64::from_le_bytes(b[9..17].try_into().unwrap()))));
+    }
     with_container(|nx| Ok(nx.jobj_times.get(&(index as usize, ino)).copied()))
 }
 
 /// Whether the kernel's container holds the volume in slot `index`
 /// mounted read-write.
 pub fn holds_rw(index: u32) -> bool {
+    if let Some(r) = super::share::remote() {
+        return through(r, Call::HoldsRw, index, &[]).is_ok_and(|b| b[0] == 1);
+    }
     KERNEL_NX.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|nx| nx.mounted.contains(&(index as usize)))
 }
 
 /// What of the volume in slot `index`'s superblock, as the kernel holds
 /// it, `apfs_vfsop_getattr` makes its capabilities of.
 pub fn caps_facts(index: u32) -> Result<super::attrcall::CapsFacts, String> {
+    if let Some(r) = super::share::remote() {
+        let b = through(r, Call::CapsFacts, index, &[])?;
+        let q = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+        return Ok(super::attrcall::CapsFacts { role: u16::from_le_bytes([b[0], b[1]]), incompat: q(2), ro_compat: q(10), fs_flags: q(18), grouped: b[26] != 0 });
+    }
     with_container(|nx| {
         let (sb, _) = nx.vol_sb_read(index as usize)?;
         let q = |o: usize| u64::from_le_bytes(sb[o..o + 8].try_into().unwrap());
@@ -319,6 +553,10 @@ pub fn caps_facts(index: u32) -> Result<super::attrcall::CapsFacts, String> {
 /// The volume in slot `index` as the kernel holds it: its next object
 /// identifier (`apfs_next_obj_id`) and its UUID.
 pub fn volume_ids(index: u32) -> Result<(u64, [u8; 16]), String> {
+    if let Some(r) = super::share::remote() {
+        let b = through(r, Call::VolumeIds, index, &[])?;
+        return Ok((u64::from_le_bytes(b[..8].try_into().unwrap()), b[8..24].try_into().unwrap()));
+    }
     with_container(|nx| {
         let (sb, _) = nx.vol_sb_read(index as usize)?;
         Ok((u64::from_le_bytes(sb[0xb0..0xb8].try_into().unwrap()), sb[0xf0..0x100].try_into().unwrap()))
@@ -330,6 +568,12 @@ pub fn volume_ids(index: u32) -> Result<(u64, [u8; 16]), String> {
 /// the object has no such record. A value kept in a data stream is not
 /// read here (reported).
 pub fn xattr(index: u32, ino: u64, name: &str) -> Result<Option<Vec<u8>>, String> {
+    if let Some(r) = super::share::remote() {
+        let mut q = ino.to_le_bytes().to_vec();
+        q.extend_from_slice(name.as_bytes());
+        let b = through(r, Call::Xattr, index, &q)?;
+        return Ok((b[0] == 1).then(|| b[1..].to_vec()));
+    }
     with_container(|nx| {
         let Some(v) = super::apfswrite::fsops::xattr_record(nx, index as usize, ino, name)? else { return Ok(None) };
         let flags = u16::from_le_bytes([v[0], v[1]]);
@@ -345,6 +589,10 @@ pub fn xattr(index: u32, ino: u64, name: &str) -> Result<Option<Vec<u8>>, String
 /// `from` that a record of the volume in slot `index`'s file-system tree
 /// is keyed by, if any.
 pub fn jobj_at_or_above(index: u32, from: u64) -> Result<Option<u64>, String> {
+    if let Some(r) = super::share::remote() {
+        let b = through(r, Call::JobjGe, index, &from.to_le_bytes())?;
+        return Ok((b[0] == 1).then(|| u64::from_le_bytes(b[1..9].try_into().unwrap())));
+    }
     with_container(|nx| {
         let (t, mut st) = nx.fs_tree(index as usize)?;
         Ok(t.get_gt(&mut st, &from.to_le_bytes())?.map(|(k, _)| u64::from_le_bytes(k[..8].try_into().unwrap()) & 0x0fff_ffff_ffff_ffff))
@@ -355,6 +603,12 @@ pub fn jobj_at_or_above(index: u32, from: u64) -> Result<Option<u64>, String> {
 /// read-write, for image file `ino`'s graft of a volume whose next object
 /// identifier is `len` ([`super::apfswrite::fsops::allocate_graft_jobj_range`]).
 pub fn allocate_graft_jobj_range(index: u32, ino: u64, len: u64) -> Result<Result<u64, i32>, String> {
+    if let Some(r) = super::share::remote() {
+        let mut q = ino.to_le_bytes().to_vec();
+        q.extend_from_slice(&len.to_le_bytes());
+        let b = through(r, Call::AllocJobj, index, &q)?;
+        return Ok(if b[0] == 0 { Ok(u64::from_le_bytes(b[1..9].try_into().unwrap())) } else { Err(i32::from_le_bytes(b[1..5].try_into().unwrap())) });
+    }
     kernel_op(|nx| super::apfswrite::fsops::allocate_graft_jobj_range(nx, index as usize, ino, len, &mut nanotime))
 }
 
@@ -1132,6 +1386,31 @@ pub fn ioctl(n: &'static Node, com: u64, data: &mut [u8]) -> Answer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A setattr's attributes cross the channel whole, each one there or
+    /// not; a request that is not one is refused; a call on the container
+    /// with no disk0 image is its error, with its clock carried and let go.
+    #[test]
+    fn calls_on_the_container_cross_the_channel() {
+        let a = crate::vfs::VnodeAttrs { uid: Some(501), gid: None, mode: Some(0o640), flags: Some(2), atime: None, mtime: Some((1_700_000_000, 5)) };
+        let mut q = Vec::new();
+        put_attrs(&mut q, &a);
+        let b = get_attrs(&q).unwrap();
+        assert_eq!((b.uid, b.gid, b.mode, b.flags, b.atime, b.mtime), (a.uid, a.gid, a.mode, a.flags, a.atime, a.mtime));
+        assert!(get_attrs(&q[..q.len() - 1]).is_none());
+        let mut out = [0u8; 64];
+        assert_eq!(serve(&[99], &mut out), -22);
+        assert_eq!(serve(&[Call::HoldsRw as u8, 0, 0, 0, 0], &mut out), -22);
+        let mut req = vec![Call::VolumeIds as u8];
+        req.extend_from_slice(&4u32.to_le_bytes());
+        req.extend_from_slice(&7u64.to_le_bytes());
+        let n = serve(&req, &mut out) as usize;
+        if !installed() {
+            assert_eq!(out[0], 1, "an error without an image");
+            assert!(String::from_utf8_lossy(&out[1..n]).contains("no disk0 image"));
+        }
+        assert_eq!(CARRIED_NOW.with(std::cell::Cell::get), None);
+    }
 
     /// A disk of `n` bytes in memory, which fails I/O at or past `bad`.
     struct Mem(Mutex<Vec<u8>>, u64);

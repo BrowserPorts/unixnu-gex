@@ -1090,6 +1090,9 @@ pub(crate) fn fault_and_leave(ctx_addr: u64, pc: u64, raise: impl FnOnce(&mut ge
 /// `sigs::deliver`); with none, its hold ([`to_user`]).
 pub(crate) fn safepoint(ctx_addr: u64, pc: u64) {
     use gex_kernel::signal::Delivery;
+    // Its quantum's end on its own processor: the commpage's approximate
+    // time, whatever the thread-call Worker's tick is doing.
+    gex_kernel::darwin::commpage::quantum_expire(&mut guest());
     let d = with_exec_lock(|h| {
         let mut gm = guest();
         let d = h.kernel.deliver_pending(&mut gm);

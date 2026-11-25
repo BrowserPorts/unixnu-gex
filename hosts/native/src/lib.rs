@@ -7030,7 +7030,15 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             if let Some(s) = &state.spawn {
                 s.gate.pause_point();
             }
-            let delivery = match state.with_kernel(|k| k.deliver_pending(&mut gm)) {
+            let delivery = match state.with_kernel(|k| {
+                // A Darwin thread's quantum's end on its own processor: the
+                // commpage's approximate time, whatever the tick thread is
+                // doing.
+                if k.darwin {
+                    gex_kernel::darwin::commpage::quantum_expire(&mut gm);
+                }
+                k.deliver_pending(&mut gm)
+            }) {
                 // A held Darwin thread waits here (its handler, if one was
                 // set up meanwhile, runs once it is let go).
                 gex_kernel::signal::Delivery::None => match darwin_return_to_user(state, memory.bytes(), true) {

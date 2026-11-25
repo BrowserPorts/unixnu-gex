@@ -111,6 +111,23 @@ impl<'a> Span<'a> {
         true
     }
 
+    /// A compare-and-swap of the aligned 64-bit word at `start` (relaxed, as
+    /// `os_atomic_cmpxchg(..., relaxed)`): `Ok` with `current` when it held
+    /// `current` and now holds `new`, `Err` with what it held otherwise;
+    /// `None` outside the span, at address 0 or unaligned.
+    pub fn cmpxchg_u64(&mut self, start: usize, current: u64, new: u64) -> Option<Result<u64, u64>> {
+        if !self.ok(start, 8) || start % 8 != 0 {
+            return None;
+        }
+        // SAFETY: in bounds, not at address 0 (`ok`) and 8-byte aligned;
+        // the memory is shared with the guest's threads, which is what an
+        // atomic access to it allows.
+        let word = unsafe { std::sync::atomic::AtomicU64::from_ptr(self.at(start).cast::<u64>()) };
+        // The guest's words are little-endian, as `u64::to_le` makes them on
+        // any host.
+        Some(word.compare_exchange(current.to_le(), new.to_le(), std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed).map(u64::from_le).map_err(u64::from_le))
+    }
+
     /// The whole span as a slice, on a host where it is one (native: a real
     /// allocation). `None` for a span from address 0.
     pub fn as_slice_mut(&mut self) -> Option<&mut [u8]> {

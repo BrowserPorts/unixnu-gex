@@ -14,6 +14,13 @@ use gex_abi::ctx;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+/// Whether `file` is a pipe the page's global kernel holds (a page
+/// program's standard streams among them), not one of this kernel's: a
+/// pipe, with no vnode, which no Darwin pipe call reaches here.
+pub(crate) fn held_elsewhere(file: &OpenFile) -> bool {
+    file.path.starts_with("pipe:[") && file.handle.pipe_end().is_none() && file.handle.pipe_state().is_some()
+}
+
 /// `FG_NOSIGPIPE`.
 pub const FG_NOSIGPIPE: u32 = 0x40;
 
@@ -35,6 +42,32 @@ pub fn caller() -> i32 {
 
 /// `UIO_MAXIOV`.
 const UIO_MAXIOV: u64 = 1024;
+
+/// `pipe_stat` of a pipe the page's global kernel holds
+/// ([`held_elsewhere`]), for a caller of ids `uid`, `gid`: a FIFO of the
+/// caller's, whose size is what is buffered and whose block size is the
+/// size of its buffer (the global kernel's pipe's,
+/// [`crate::pipe::PIPE_BUF`]); for the write end, its peer's while it has
+/// a reader, else none (the default size). Its times are none, as an iOS
+/// pipe's (`pipe_touch` is macOS's only).
+pub(crate) fn held_pipe_stat(file: &OpenFile, uid: u32, gid: u32) -> Option<crate::fs::Stat> {
+    if !held_elsewhere(file) {
+        return None;
+    }
+    let st = file.handle.pipe_state()?;
+    let md = file.handle.metadata().ok()?;
+    let (count, size) = if !file.writable || !st.closed { (st.buffered as usize, crate::pipe::PIPE_BUF) } else { (0, xnu::PIPE_SIZE.max(xnu::BLOCKS[0])) };
+    Some(crate::fs::Stat {
+        ino: md.ino,
+        mode: 0o010000 | 0o660,
+        uid,
+        gid,
+        size: count as i64,
+        blksize: size as i32,
+        blocks: count.div_ceil(size) as i64,
+        ..Default::default()
+    })
+}
 
 impl Kernel {
     /// `pipe()`: the read end in x0, the write end in x1.

@@ -850,6 +850,12 @@ impl crate::vfs::FileHandle for RemotePipeEnd {
         })
     }
 
+    fn pipe_state(&self) -> Option<crate::vfs::PipeState> {
+        let e = (self.remote.ends)(self.id);
+        let (readers, writers) = if e < 0 { (0, 0) } else { (e >> 16, e & 0xffff) };
+        Some(crate::vfs::PipeState { buffered: (self.remote.buffered)(self.id).max(0) as u64, closed: readers == 0 || writers == 0, xnu: None })
+    }
+
     fn write_room(&self) -> Option<u64> {
         // Not reported: a number here could be invalidated by another Worker
         // between the claim and the write. Short writes are carried by the

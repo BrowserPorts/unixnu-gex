@@ -4087,6 +4087,13 @@ impl PathIo<'_> {
     pub fn fstat(&self, m: &mut GuestMem<'_>, fd: i32, buf: u64) -> SysResult {
         let file = self.map.fds.get(fd)?;
         let md = file.metadata()?;
+        // A pipe the page's global kernel holds: `pipe_stat`'s.
+        if self.darwin {
+            if let Some(st) = crate::darwin::pipe::held_pipe_stat(&file, self.creds.uid(), self.creds.gid()) {
+                m.write(buf, &self.encode_stat(&st, &md, None, None))?;
+                return Ok(0);
+            }
+        }
         // (a descriptor of a link itself, O_SYMLINK's, is the link's)
         let at = self.darwin.then(|| crate::darwin::vattr::vnode_path(self.ns, &file.path, &md));
         // (the vnode's mount the one it was opened on)

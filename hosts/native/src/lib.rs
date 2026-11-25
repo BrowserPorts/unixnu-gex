@@ -2596,7 +2596,7 @@ fn perform_block(
             jobs,
             rusage: _,
             // The children list passed in is already this process's, so ppid
-            // is redundant here.
+            // is redundant here, and a group's children are in it already.
             ppid: _,
         } => {
             let nowait = waitid.is_some_and(|w| w.nowait);
@@ -2615,6 +2615,7 @@ fn perform_block(
             loop {
                 // A child the system reaped as it ended (a Darwin parent
                 // with P_NOCLDWAIT) is no longer there to wait for; none
+            group: _,
                 // left, the wait finds none.
                 if candidates.iter().all(|c| c.reaped.load(std::sync::atomic::Ordering::Acquire)) {
                     return Err(Errno::ECHILD);

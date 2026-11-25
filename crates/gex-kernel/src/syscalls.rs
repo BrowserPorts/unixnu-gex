@@ -448,6 +448,10 @@ pub enum BlockOp {
         ppid: i32,
         /// Which child, or -1 for any.
         want: i32,
+        /// `want` is a process group's id: the children in that group (a
+        /// Darwin wait in the page, which asks the system's table; where
+        /// the table is local `children` holds them already).
+        group: bool,
         /// Where to write the wait status, or zero.
         wstatus: u64,
         /// `WNOHANG`: report nothing rather than blocking.
@@ -7443,6 +7447,7 @@ fn wait_child(procs: &Arc<ProcTable>, pid: i32, a: [u64; 6]) -> BlockOp {
         procs: Arc::clone(procs),
         ppid: pid,
         want: a[0] as i32,
+        group: false,
         wstatus: a[1],
         nohang: a[2] & 1 != 0,
         waitid: None,

@@ -1174,9 +1174,10 @@ impl ProcTable {
     /// to wait for. Statuses here are the page's (an exit code, or a
     /// signal's number negated), given back as wait statuses. A `look`
     /// (whether a wait would answer) takes and marks nothing.
-    pub fn darwin_wait_step(&self, ppid: i32, want: i32, jobs: crate::syscalls::JobWait, nowait: bool, waitid: bool, look: bool) -> WaitStep {
+    pub fn darwin_wait_step(&self, ppid: i32, (want, group): (i32, bool), jobs: crate::syscalls::JobWait, nowait: bool, waitid: bool, look: bool) -> WaitStep {
         let nowait = nowait || look;
-        let candidates: Vec<ChildHandle> = self.children(ppid).into_iter().filter(|c| want <= 0 || c.pid == want).collect();
+        // A group's: the children whose p_pgrpid is `want` (kern_exit.c).
+        let candidates: Vec<ChildHandle> = self.children(ppid).into_iter().filter(|c| if group { self.pgid(ppid, c.pid) == Ok(want) } else { want <= 0 || c.pid == want }).collect();
         if candidates.is_empty() || candidates.iter().all(|c| c.reaped.load(Ordering::Acquire)) {
             return WaitStep::NoChild;
         }
@@ -3286,23 +3287,44 @@ mod tests {
         let p = t.spawn(INIT_PID);
         let c = t.spawn(p);
         let all = JobWait { exits: true, stops: true, continues: true };
-        assert_eq!(t.darwin_wait_step(p, -1, all, false, false, false), WaitStep::Nothing);
-        assert_eq!(t.darwin_wait_step(c, -1, all, false, false, false), WaitStep::NoChild);
+        assert_eq!(t.darwin_wait_step(p, (-1, false), all, false, false, false), WaitStep::Nothing);
+        assert_eq!(t.darwin_wait_step(c, (-1, false), all, false, false, false), WaitStep::NoChild);
         t.job_set(c, Job { stopped: true, xstat: 17, holds: 1, ..Job::default() }, JobEvent::Stop);
         // A look finds it and leaves it; the wait takes it once.
-        assert_eq!(t.darwin_wait_step(p, c, all, false, false, true), WaitStep::Stopped { pid: c, xstat: 17 });
-        assert_eq!(t.darwin_wait_step(p, c, all, false, false, false), WaitStep::Stopped { pid: c, xstat: 17 });
-        assert_eq!(t.darwin_wait_step(p, c, all, false, false, false), WaitStep::Nothing);
+        assert_eq!(t.darwin_wait_step(p, (c, false), all, false, false, true), WaitStep::Stopped { pid: c, xstat: 17 });
+        assert_eq!(t.darwin_wait_step(p, (c, false), all, false, false, false), WaitStep::Stopped { pid: c, xstat: 17 });
+        assert_eq!(t.darwin_wait_step(p, (c, false), all, false, false, false), WaitStep::Nothing);
         // A change that is no stop or continue leaves the report as it was.
         t.job_set(c, Job { stopped: true, xstat: 17, holds: 2, ..Job::default() }, JobEvent::Neither);
-        assert_eq!(t.darwin_wait_step(p, c, all, false, false, false), WaitStep::Nothing);
+        assert_eq!(t.darwin_wait_step(p, (c, false), all, false, false, false), WaitStep::Nothing);
         t.job_set(c, Job { stopped: false, xstat: 19, contproc: c, continued: true, ..Job::default() }, JobEvent::Cont);
-        assert_eq!(t.darwin_wait_step(p, c, JobWait { continues: false, ..all }, false, false, false), WaitStep::Nothing);
-        assert_eq!(t.darwin_wait_step(p, c, all, false, true, false), WaitStep::Continued { pid: c, contproc: c, xstat: 19 });
+        assert_eq!(t.darwin_wait_step(p, (c, false), JobWait { continues: false, ..all }, false, false, false), WaitStep::Nothing);
+        assert_eq!(t.darwin_wait_step(p, (c, false), all, false, true, false), WaitStep::Continued { pid: c, contproc: c, xstat: 19 });
         t.exit_code(c, 3);
-        assert_eq!(t.darwin_wait_step(p, c, all, true, false, false), WaitStep::Ended { pid: c, word: 3 << 8, xhighbits: 0 });
-        assert_eq!(t.darwin_wait_step(p, c, all, false, false, false), WaitStep::Ended { pid: c, word: 3 << 8, xhighbits: 0 });
-        assert_eq!(t.darwin_wait_step(p, c, all, false, false, false), WaitStep::NoChild);
+        assert_eq!(t.darwin_wait_step(p, (c, false), all, true, false, false), WaitStep::Ended { pid: c, word: 3 << 8, xhighbits: 0 });
+        assert_eq!(t.darwin_wait_step(p, (c, false), all, false, false, false), WaitStep::Ended { pid: c, word: 3 << 8, xhighbits: 0 });
+        assert_eq!(t.darwin_wait_step(p, (c, false), all, false, false, false), WaitStep::NoChild);
+    }
+
+    /// A Darwin wait for a process group's children (wait4's pid below -1,
+    /// waitid's P_PGID) takes only the children in that group, and finds
+    /// none (ECHILD) where no child is in it.
+    #[test]
+    fn a_darwin_group_wait_takes_the_groups_children_only() {
+        use crate::syscalls::JobWait;
+        let t = ProcTable::new();
+        let p = t.spawn(INIT_PID);
+        let a = t.spawn(p);
+        let b = t.spawn(p);
+        t.setpgid(p, b, b).unwrap();
+        let all = JobWait { exits: true, stops: true, continues: true };
+        let pg = t.pgid(p, p).unwrap();
+        t.exit_code(a, 1);
+        t.exit_code(b, 2);
+        assert_eq!(t.darwin_wait_step(p, (b, true), all, false, false, false), WaitStep::Ended { pid: b, word: 2 << 8, xhighbits: 0 });
+        assert_eq!(t.darwin_wait_step(p, (b, true), all, false, false, false), WaitStep::NoChild);
+        assert_eq!(t.darwin_wait_step(p, (0, true), all, false, false, false), WaitStep::NoChild);
+        assert_eq!(t.darwin_wait_step(p, (pg, true), all, false, false, false), WaitStep::Ended { pid: a, word: 1 << 8, xhighbits: 0 });
     }
 
     /// A page process takes its own record from the system's table as it

@@ -14169,9 +14169,9 @@ fn wait_ready(waiting: &Waiting, blocked_on: &Option<gex_kernel::BlockOp>, now: 
             // A Darwin wait: whether the global kernel's table has an end,
             // a stop or a continue for it (a look, taking nothing), or no
             // child; a halt or a signal ends it too.
-            Some(gex_kernel::BlockOp::WaitChild { procs, ppid, want, waitid, jobs: Some(j), .. }) => {
+            Some(gex_kernel::BlockOp::WaitChild { procs, ppid, want, group, waitid, jobs: Some(j), .. }) => {
                 procs.halt_code().is_some()
-                    || !matches!(gex_kernel::darwin::share::dwait(*ppid, *want, *j, true, waitid.is_some(), true).0, gex_kernel::proc::WaitStep::Nothing)
+                    || !matches!(gex_kernel::darwin::share::dwait(*ppid, (*want, *group), *j, true, waitid.is_some(), true).0, gex_kernel::proc::WaitStep::Nothing)
             }
             Some(gex_kernel::BlockOp::WaitChild {
                 children,
@@ -15684,6 +15684,8 @@ fn finish_parked(
             waitid,
             jobs,
             rusage: _,
+            // A Linux wait's is never a group's (`wait_child`).
+            group: _,
         } => {
             // Only a Darwin wait asks for stops and continues, and a Darwin
             // process's waits never park here (`darwin::unparked`).

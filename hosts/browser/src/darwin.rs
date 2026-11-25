@@ -1211,7 +1211,8 @@ fn waiting_of(op: &gex_kernel::BlockOp) -> Waiting {
 fn wait_round(k: &mut gex_kernel::syscalls::Kernel, gm: &mut GuestMem<'_>, tid: i32, op: &gex_kernel::BlockOp) -> Option<Result<u64, gex_kernel::Errno>> {
     use gex_kernel::proc::WaitStep;
     use gex_kernel::{BlockOp, Errno};
-    let BlockOp::WaitChild { procs, ppid, want, wstatus, nohang, waitid, jobs: Some(j), .. } = op else { return None };
+    let BlockOp::WaitChild { procs, ppid, want, group, wstatus, nohang, waitid, jobs: Some(j), .. } = op else { return None };
+    let want = (*want, *group);
     let nowait = waitid.is_some_and(|w| w.nowait);
     // A wait4's end is the kernel's to copy out and collect
     // (`darwin_wait4_done`): it copies the status, then the child's usage,
@@ -1219,11 +1220,11 @@ fn wait_round(k: &mut gex_kernel::syscalls::Kernel, gm: &mut GuestMem<'_>, tid: 
     // there to wait for (kern_exit.c). So it is looked at here, taking
     // nothing (a stop's mark included).
     if waitid.is_none() {
-        if let (WaitStep::Ended { pid, .. }, ..) = gex_kernel::darwin::share::dwait(*ppid, *want, *j, true, false, true) {
+        if let (WaitStep::Ended { pid, .. }, ..) = gex_kernel::darwin::share::dwait(*ppid, want, *j, true, false, true) {
             return Some(Ok(pid as u64));
         }
     }
-    let (step, usage, ru) = gex_kernel::darwin::share::dwait(*ppid, *want, *j, nowait, waitid.is_some(), false);
+    let (step, usage, ru) = gex_kernel::darwin::share::dwait(*ppid, want, *j, nowait, waitid.is_some(), false);
     if matches!(step, WaitStep::Ended { .. }) && !nowait {
         k.darwin_page_collected(usage, ru);
     }

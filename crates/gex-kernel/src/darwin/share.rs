@@ -492,16 +492,17 @@ pub(crate) fn job_set(pid: i32, j: crate::proc::Job, ev: crate::proc::JobEvent) 
     call(r, op::JOB_SET, &p.0, &mut []);
 }
 
-/// One look of a Darwin wait by `ppid` for `want`, in the global kernel's
-/// table (`look`: only whether it would answer, taking nothing): what it
-/// found, and an ended child's `p_ru` (`p_ru->ri`, `p_ru->ru`) where its
-/// record carries one, whether or not the wait collected it.
-pub fn dwait(ppid: i32, want: i32, jobs: crate::syscalls::JobWait, nowait: bool, waitid: bool, look: bool) -> (crate::proc::WaitStep, Option<super::rusage::Record>, Option<super::ru::Ru>) {
+/// One look of a Darwin wait by `ppid` for `want` (a child, -1 any, or with
+/// `group` a process group's), in the global kernel's table (`look`: only
+/// whether it would answer, taking nothing): what it found, an ended
+/// child's `p_ru` (`p_ru->ri`, `p_ru->ru`) where its record carries one,
+/// whether or not the wait collected it.
+pub fn dwait(ppid: i32, (want, group): (i32, bool), jobs: crate::syscalls::JobWait, nowait: bool, waitid: bool, look: bool) -> (crate::proc::WaitStep, Option<super::rusage::Record>, Option<super::ru::Ru>) {
     use crate::proc::WaitStep;
     let r = remote().expect("a Darwin wait through the global kernel");
     let mut req = ppid.to_le_bytes().to_vec();
     req.extend_from_slice(&want.to_le_bytes());
-    let f = u8::from(jobs.exits) | u8::from(jobs.stops) << 1 | u8::from(jobs.continues) << 2 | u8::from(nowait) << 3 | u8::from(waitid) << 4 | u8::from(look) << 5;
+    let f = u8::from(jobs.exits) | u8::from(jobs.stops) << 1 | u8::from(jobs.continues) << 2 | u8::from(nowait) << 3 | u8::from(waitid) << 4 | u8::from(look) << 5 | u8::from(group) << 6;
     req.push(f);
     let mut o = [0u8; 13 + 1 + 8 * (super::rusage::WORDS + 1) + 1 + 2 * 12 + 14 * 8 + 5];
     let n = call_upto(r, op::DWAIT, &req, &mut o);
@@ -1049,7 +1050,7 @@ pub fn serve(op: u32, req: &[u8], out: &mut [u8]) -> i64 {
             let f = req[8];
             let jobs = crate::syscalls::JobWait { exits: f & 1 != 0, stops: f & 2 != 0, continues: f & 4 != 0 };
             let (nowait, look) = (f & 8 != 0, f & 32 != 0);
-            let step = p.darwin_wait_step(ppid, want, jobs, nowait, f & 16 != 0, look);
+            let step = p.darwin_wait_step(ppid, (want, f & 64 != 0), jobs, nowait, f & 16 != 0, look);
             // An ended child: its p_ru for its parent's wait4 to copy and,
             // once collected, its parent's children's usage
             // (reap_child_locked's ruadd and update_rusage_info_child, which

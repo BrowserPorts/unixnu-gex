@@ -590,14 +590,6 @@ impl FuncBody {
         write_u64(&mut self.code, offset);
     }
 
-    /// A store whose static offset may pass 4 GiB ([`Self::load64`]'s).
-    pub fn store64(&mut self, opcode: u8, align_log2: u32, offset: u64) {
-        self.byte(opcode);
-        self.u32(align_log2);
-        debug_assert!(gex_abi::mem64() || offset <= u32::MAX as u64);
-        write_u64(&mut self.code, offset);
-    }
-
     /// Emit a store. `opcode` is the single-byte store opcode.
     pub fn store(&mut self, opcode: u8, align_log2: u32, offset: u32) {
         self.byte(opcode);

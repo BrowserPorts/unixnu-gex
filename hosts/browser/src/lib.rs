@@ -464,6 +464,14 @@ extern "C" {
     /// The Darwin system's state the page's processes share
     /// (`gex_kernel::darwin::share`): one encoded call.
     fn k_darwin_call(op: u32, req: gex_kernel::PAddr, req_len: u32, out: gex_kernel::PAddr, out_len: u32) -> i64;
+    /// The Darwin system's disk0, the global kernel's device over the
+    /// page's image (hosts/kernel disk0.rs): its size (0: none), what its
+    /// build reported missing, and its reads and writes (0 or a negated
+    /// errno).
+    fn k_disk0_size() -> u64;
+    fn k_disk0_missing(out: gex_kernel::PAddr, out_len: u32) -> i64;
+    fn k_disk0_read(off: u64, dst: gex_kernel::PAddr, len: u32) -> i32;
+    fn k_disk0_write(off: u64, src: gex_kernel::PAddr, len: u32) -> i32;
     fn k_lock_queue() -> u32;
     fn k_lock_seq() -> u64;
     fn k_spawn(ppid: i32) -> i32;

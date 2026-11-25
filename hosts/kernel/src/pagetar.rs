@@ -65,15 +65,17 @@ fn entry(g: &mut Ingest, h: Header) {
             g.files += 1;
         }
         Kind::File => g.file = Some((h, Vec::new())),
+        // What is at the name goes first, a directory with everything
+        // under it: the later layer's path wins.
         Kind::Symlink => {
             parent();
-            let _ = fs.unlink(&p);
+            let _ = fs.remove_tree(&p);
             let _ = fs.symlink(&h.link, &p);
             finish(&p, &h);
         }
         Kind::Hard => {
             parent();
-            let _ = fs.unlink(&p);
+            let _ = fs.remove_tree(&p);
             let _ = fs.link(&under(&g.at, &h.link), &p);
         }
         Kind::Other => {}

@@ -361,12 +361,53 @@ export function kernelThread(k, top) {
   return sp;
 }
 
+/** A device's image (`URL#device`: hosts/kernel disk0.rs), which is not a
+ *  file of the page's filesystem: read by ranges from this Worker alone,
+ *  never the background fill's, the page's cache of lazy files' (the
+ *  device keeps the chunks it reads, and a disk image is tens of GB) or a
+ *  rest bundle's. Only a ranged answer is taken: a server that sends the
+ *  whole image is refused. */
+const DEVICE = '#device';
+function deviceRead(href, from, memory, dst, len) {
+  if (typeof XMLHttpRequest !== 'function') return -1;
+  const abs = absolute(href.slice(0, -DEVICE.length));
+  let last = 'no response';
+  const got = retrySync(() => {
+    const x = new XMLHttpRequest();
+    x.open('GET', abs, false);
+    x.responseType = 'arraybuffer';
+    x.setRequestHeader('Range', `bytes=${from}-${from + len - 1}`);
+    x.setRequestHeader('Cache-Control', 'no-store');
+    try {
+      x.send();
+    } catch (e) {
+      last = String(e);
+      return null;
+    }
+    const b = new Uint8Array(x.response ?? new ArrayBuffer(0));
+    last = `status ${x.status}, ${b.length} bytes`;
+    return x.status === 206 && b.length === len ? b : null;
+  });
+  if (!got) {
+    console.error(`[lazy] ${abs} @${from}+${len}: a device's ranged read failed (${last})`);
+    return -1;
+  }
+  new Uint8Array(memory.buffer, dst, len).set(got);
+  return len;
+}
+
 /** `lazy_fetch(url, urlLen, offset, dst, len)` against the kernel memory `memory`. */
 export function lazyFetch(memory) {
   return (url, urlLen, offset, dst, len) => {
     url >>>= 0; urlLen >>>= 0; dst >>>= 0; len >>>= 0;
     const from = Number(offset);
     const href = new TextDecoder().decode(new Uint8Array(memory.buffer, url, urlLen).slice());
+    if (href.endsWith(DEVICE)) {
+      const done = noteFetch(href, len);
+      const n = deviceRead(href, from, memory, dst, len);
+      done(n > 0 ? n : 0);
+      return n;
+    }
     if (fill) {
       const n = fromFill(href, from, memory, dst, len);
       if (n >= 0) return n;

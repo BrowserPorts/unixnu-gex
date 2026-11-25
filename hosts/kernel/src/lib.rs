@@ -20,6 +20,7 @@ use std::sync::{Mutex, OnceLock};
 use gex_kernel::proc::ProcTable;
 
 mod audio;
+mod disk0;
 mod joy;
 mod pagefs;
 mod pagespawn;

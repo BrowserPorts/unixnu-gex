@@ -488,6 +488,10 @@ impl Kernel {
         if file.handle.pipe_end().is_some() || std::sync::Arc::clone(&file.handle).as_kqueue().is_some() || std::sync::Arc::clone(&file.handle).as_posix_shm().is_some() {
             return None;
         }
+        // A pipe the page's global kernel holds: a pipe too, no vnode.
+        if super::pipe::held_elsewhere(file) {
+            return None;
+        }
         let md = file.handle.metadata().ok()?;
         if md.file_type == crate::vfs::FileType::Socket {
             return None;

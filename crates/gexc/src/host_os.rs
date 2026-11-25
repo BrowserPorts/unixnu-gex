@@ -21,7 +21,7 @@ mod xnu {
     const PROC_PIDTHREADID64INFO: libc::c_int = 15;
 
     pub fn install() {
-        gex_kernel::hostos::install(Calls { ids, fd_path, thread_id, thread_cpu_ns, alive, name_thread });
+        gex_kernel::hostos::install(Calls { ids, fd_path, thread_id, thread_cpu_ns, alive, name_thread, xnu_ioctl_int, xnu_fdinfo });
     }
 
     fn ids() -> Option<Ids> {
@@ -93,6 +93,19 @@ mod xnu {
         // SAFETY: signal 0 checks and sends nothing.
         let r = unsafe { libc::kill(pid, 0) };
         r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+
+    fn xnu_ioctl_int(fd: i32, cmd: u64) -> Option<Result<i32, Errno>> {
+        let mut v: libc::c_int = 0;
+        // SAFETY: an int-sized out argument, which these commands take.
+        let r = unsafe { libc::ioctl(fd, cmd as libc::c_ulong, &mut v as *mut libc::c_int) };
+        Some(if r < 0 { Err(Errno::from_io(&std::io::Error::last_os_error())) } else { Ok(v) })
+    }
+
+    fn xnu_fdinfo(fd: i32, flavor: i32, out: &mut [u8]) -> Option<Result<usize, Errno>> {
+        // SAFETY: a buffer of the size passed, written by the call.
+        let n = unsafe { libc::proc_pidfdinfo(libc::getpid(), fd, flavor, out.as_mut_ptr() as *mut libc::c_void, out.len() as libc::c_int) };
+        Some(if n <= 0 { Err(Errno::from_io(&std::io::Error::last_os_error())) } else { Ok(n as usize) })
     }
 
     fn name_thread(name: &str) {

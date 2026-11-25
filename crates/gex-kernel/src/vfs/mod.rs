@@ -727,6 +727,18 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         false
     }
 
+    /// One of the host's standard streams, itself.
+    fn as_std_stream(&self) -> Option<&crate::stdio::StdStream> {
+        None
+    }
+
+    /// For one of the host's standard streams, what the host's descriptor
+    /// really is ([`crate::stdio::HostKind`]); `None` for anything else, or
+    /// where the host cannot say.
+    fn host_kind(&self) -> Option<crate::stdio::HostKind> {
+        None
+    }
+
     /// This handle as a unix socket, when it is one: the syscalls that need
     /// the concrete type (descriptor passing, `listen`, `accept`) recover it
     /// from the handle, whichever process made it.

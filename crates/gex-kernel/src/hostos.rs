@@ -36,6 +36,14 @@ pub struct Calls {
     pub alive: fn(pid: u32) -> bool,
     /// Name this host thread (what a host's per-thread CPU view shows).
     pub name_thread: fn(name: &str),
+    /// An `ioctl` that reads an int (`FIONREAD`, `SIOCATMARK`) on a host
+    /// descriptor, as the host's XNU answers it: the int, or its error;
+    /// `None` on a host whose kernel is not XNU.
+    pub xnu_ioctl_int: fn(fd: i32, cmd: u64) -> Option<Result<i32, Errno>>,
+    /// `proc_pidfdinfo` of this host process's descriptor `fd`, flavor
+    /// `flavor`, into `out` (its size): the bytes written, or the error;
+    /// `None` on a host whose kernel is not XNU.
+    pub xnu_fdinfo: fn(fd: i32, flavor: i32, out: &mut [u8]) -> Option<Result<usize, Errno>>,
 }
 
 static CALLS: OnceLock<Calls> = OnceLock::new();
@@ -60,6 +68,8 @@ const LINUX: Calls = Calls {
     name_thread: |name| {
         let _ = std::fs::write("/proc/thread-self/comm", name);
     },
+    xnu_ioctl_int: |_, _| None,
+    xnu_fdinfo: |_, _, _| None,
 };
 
 /// `/proc/self/status`: "Uid:\treal\teffective\tsaved\tfs", Gid the same,

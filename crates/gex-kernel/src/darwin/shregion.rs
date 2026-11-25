@@ -909,6 +909,14 @@ fn install(mm: &crate::mem::Mm, m: &mut GuestMem<'_>, c: &Contents, mp: &Mapping
             if offset.saturating_add(len) > fsize.div_ceil(PAGE_MASK + 1) * (PAGE_MASK + 1) {
                 return Err(format!("a shared region mapping of {} past its end ({:#x}+{len:#x} of {fsize:#x} bytes): those pages fault on a device", f.path, offset));
             }
+            // Another process of the page mapped these bytes already: the
+            // same file's, at the same slide.
+            let key = REGION_STORE.get().map(|_| store_key(c, f, *offset, len, mp.slide.as_ref().map(|v| v.as_slice())));
+            if let (Some(st), Some(k)) = (REGION_STORE.get(), &key) {
+                if (st.find)(k, len).is_some_and(|at| (st.get)(at, start, len)) {
+                    return Ok(installed(mm, mp, start, len));
+                }
+            }
             match &mp.slide {
                 None => {
                     let mapped = f.handle.host_fd().is_some_and(|fd| offset + len <= fsize && m.map_file(start, len, fd, *offset).unwrap_or(false));
@@ -933,8 +941,19 @@ fn install(mm: &crate::mem::Mm, m: &mut GuestMem<'_>, c: &Contents, mp: &Mapping
                     }
                 }
             }
+            // Kept for the page's other processes.
+            if let (Some(st), Some(k)) = (REGION_STORE.get(), &key) {
+                (st.put)(k, start, len);
+            }
         }
     }
+    installed(mm, mp, start, len);
+    Ok(())
+}
+
+/// A mapping's bytes in place: its entry in the task's map, at its initial
+/// protection.
+fn installed(mm: &crate::mem::Mm, mp: &Mapping, start: u64, len: u64) {
     let mut pr = 0;
     if mp.init_prot & prot::READ != 0 {
         pr |= crate::mem::prot::READ;
@@ -947,7 +966,47 @@ fn install(mm: &crate::mem::Mm, m: &mut GuestMem<'_>, c: &Contents, mp: &Mapping
     }
     let name = if matches!(mp.source, Source::File { .. }) { "[shared-cache]" } else { "[shared-cache-data]" };
     mm.lock().insert(start, start + len, pr, name);
-    Ok(())
+}
+
+/// A host's store of the region's mappings as one process mapped them, for
+/// its other processes' copies (the page's: each process of the page maps
+/// its own copy of the system's region): a mapping's place in the store by
+/// its key and length, its bytes copied to an address of this process,
+/// and this process's bytes at an address kept under a key.
+#[derive(Clone, Copy)]
+pub struct RegionStore {
+    pub find: fn(key: &[u8], len: u64) -> Option<u64>,
+    pub get: fn(at: u64, dst: u64, len: u64) -> bool,
+    pub put: fn(key: &[u8], src: u64, len: u64),
+}
+
+static REGION_STORE: std::sync::OnceLock<RegionStore> = std::sync::OnceLock::new();
+
+/// The host's store of the region's mappings, set before any region is
+/// entered.
+pub fn set_region_store(s: RegionStore) {
+    let _ = REGION_STORE.set(s);
+}
+
+/// What names a mapping's bytes: its cache file's UUID, its place and
+/// length in it, and a slid mapping's slide information and slide.
+fn store_key(c: &Contents, f: &File, offset: u64, len: u64, info: Option<&[u8]>) -> Vec<u8> {
+    use sha2::Digest;
+    let mut uuid = [0u8; 16];
+    read_full(f.handle.as_ref(), 0x58, &mut uuid);
+    let mut h = sha2::Sha256::new();
+    h.update(b"gex dsc region 1\0");
+    h.update(uuid);
+    h.update(offset.to_le_bytes());
+    h.update(len.to_le_bytes());
+    if let Some(info) = info {
+        h.update([1u8]);
+        h.update(info);
+        h.update(c.slide.to_le_bytes());
+    } else {
+        h.update([0u8]);
+    }
+    h.finalize().to_vec()
 }
 
 /// A removed entry out of a task's memory and its map (through the kernel's
@@ -1080,8 +1139,11 @@ impl Kernel {
         let data_at = BASE - PAGE;
         let (start, _) = first.dynamic;
         files.push(SrFile { fd: -1, file: None, mappings: vec![MappingNp { address: start, size: PAGE, file_offset: data_at, slide_size: 0, slide_start: 0, max_prot: prot::READ, init_prot: prot::READ }], slide: 0 });
-        // shared_region_map_and_slide_2_np's slide, every mapping moved by it.
-        let slide = choose_slide(max_slide);
+        // shared_region_map_and_slide_2_np's slide, every mapping moved by it:
+        // the system's one region's, which in the page each process makes
+        // of the same files at the same slide, drawn once.
+        let drawn = choose_slide(max_slide);
+        let slide = super::share::value(super::share::Value::BootRegionSlide, 2, u64::from(drawn)).map_or(drawn, |v| v as u32);
         for f in files.iter_mut() {
             f.slide = slide;
             for mp in f.mappings.iter_mut() {

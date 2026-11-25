@@ -6,12 +6,17 @@
 // which the boot's update of the container to read-write wrote (its
 // NX_CLEANLY_UNMOUNTED cleared, which the image's has: the page reads the
 // image's here from the image itself); its output and status must be
-// gexc's. A second run in the same system reads the
-// same disk the first one's boot wrote, the system's: its own boot does
-// not mount the container again (the container's state in memory is the
-// first process's), and says so.
+// gexc's. A second run in the same system reads the same disk the first
+// one's boot wrote, the system's: it joins the booted system, whose
+// container (the global kernel's) holds Preboot read-write already and
+// whose grafts' trust caches are loaded, so its boot neither mounts nor
+// loads again, and it reports nothing the first did not.
 import { System } from '../../page/runtime/src/index.js';
 import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+
+/** What gexc says of its own standard streams, its host's (darwin/hoststd.rs):
+ *  not the page's, whose streams are its pipes. */
+const HOST_STREAMS = "[gex] Darwin: the host's standard streams stand in:";
 
 export const meta = { hosts: ['browser'], arches: ['a64'], images: ['darwin-disk'], timeout: 300 };
 
@@ -39,14 +44,18 @@ export default async function (t) {
   // What the Darwin kernel reported, as gexc's (by subject: up to its
   // second colon).
   const said = sys.state.console.split('\n');
-  for (const line of native.reports) {
+  for (const line of native.reports.filter((l) => !l.startsWith(HOST_STREAMS))) {
     const subject = line.slice(0, line.indexOf(':', line.indexOf(':') + 1) + 1);
     t.check(`the Darwin kernel's report on the console: ${subject}`, said.some((l) => l.startsWith(subject)), sys.state.console.slice(-2000));
   }
   // A second process: the same disk, as the first one's boot left it.
+  const unimplemented = (text) => new Set(text.split('\n').filter((l) => l.includes('Darwin: not implemented: ')).map((l) => l.slice(l.indexOf('not implemented: '))));
+  const first = unimplemented(sys.state.console);
+  const before = sys.state.console.length;
   const again = await timeout(sys.run(['/var/tmp/diskrw']), 150000, 'diskrw again');
   eq('a second run reads the disk as the first left it', again.stdout, r.stdout, `stderr: ${again.stderr.slice(-2000)}`);
-  t.check("and its boot's container mount is refused, said", sys.state.console.includes("the kernel's container in the disk0 image, which process "), sys.state.console.slice(-3000));
+  const more = [...unimplemented(sys.state.console.slice(before))].filter((l) => !first.has(l));
+  eq('and its boot joins the booted system: nothing the first did not report', more, []);
   for (const l of sys.state.console.split('\n').filter((l) => l.includes('Darwin: not implemented'))) t.say(`console: ${l.slice(0, 240)}`);
   await sys.shutdown();
 }

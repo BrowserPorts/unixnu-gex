@@ -39,11 +39,15 @@ pub mod cmd {
     pub const SIOCATMARK: u64 = 0x4004_7307;
     pub const SIOCSPGRP: u64 = 0x8004_7308;
     pub const SIOCGPGRP: u64 = 0x4004_7309;
+    pub const SIOCSETOT: u64 = 0x8004_7380;
 }
 
 /// The `FCNTLFLAGS` (`FAPPEND|FASYNC|FFSYNC|FFDSYNC|FNONBLOCK`) as Darwin
 /// numbers them.
 pub const FCNTLFLAGS: u64 = 0x8 | 0x40 | 0x80 | 0x40_0000 | 0x4;
+
+/// `AF_UNIX`.
+const AF_UNIX: i32 = 1;
 
 /// What an open file is, for `fo_ioctl`.
 enum Kind {
@@ -53,6 +57,12 @@ enum Kind {
     Socket,
     /// The host's standard stream: a terminal, or a pipe or file there.
     HostStream(bool),
+    /// One of the host's standard streams that is an anonymous pipe, or a
+    /// socket, as the host's XNU says ([`crate::stdio::HostKind`]).
+    HostPipe,
+    HostSocket,
+    /// A pipe the page's global kernel holds ([`super::pipe::held_elsewhere`]).
+    HeldPipe,
     Vnode(FileType),
     NoIoctl,
     Other,
@@ -175,14 +185,19 @@ impl Kernel {
         if Arc::clone(&file.handle).as_kqueue().is_some() || Arc::clone(&file.handle).as_posix_shm().is_some() {
             return Kind::NoIoctl;
         }
+        match file.handle.host_kind() {
+            Some(crate::stdio::HostKind::Pipe { .. }) => return Kind::HostPipe,
+            Some(crate::stdio::HostKind::Socket(_)) => return Kind::HostSocket,
+            _ => {}
+        }
         let ty = file.handle.metadata().map(|md| md.file_type);
         if matches!(file.path.as_str(), "/dev/stdin" | "/dev/stdout" | "/dev/stderr") && ty == Ok(FileType::CharDevice) {
             return Kind::HostStream(file.handle.is_tty());
         }
         // A pipe the page's global kernel holds (the page's own, a program's
-        // standard streams among them): a pipe on the host, as gexc's.
-        if file.path.starts_with("pipe:[") && ty == Ok(FileType::Fifo) {
-            return Kind::HostStream(false);
+        // standard streams among them).
+        if super::pipe::held_elsewhere(file) {
+            return Kind::HeldPipe;
         }
         match ty {
             Ok(FileType::Socket) => Kind::Socket,
@@ -283,7 +298,13 @@ impl Kernel {
                 o.set_pgid(owner);
                 return Ok(0);
             }
-            Kind::Pipe(..) => {}
+            // The host socket's so_pgid, kept as the guest gave it.
+            Kind::HostSocket => {
+                let Some(s) = file.handle.as_std_stream() else { return Err(Errno::EBADF) };
+                s.pgid.store(owner, std::sync::atomic::Ordering::Relaxed);
+                return Ok(0);
+            }
+            Kind::Pipe(..) | Kind::HostPipe => {}
             _ => {
                 if tmp <= 0 {
                     tmp = -tmp;
@@ -301,6 +322,9 @@ impl Kernel {
     /// FIOGETOWN and F_GETOWN: a socket's `so_pgid` as it is; another
     /// file's TIOCGPGRP answer, negated.
     pub(crate) fn darwin_getown(&mut self, file: &Arc<OpenFile>) -> Result<i32, Errno> {
+        if matches!(self.darwin_file_kind(file), Kind::HostSocket) {
+            return file.handle.as_std_stream().map(|s| s.pgid.load(std::sync::atomic::Ordering::Relaxed)).ok_or(Errno::EBADF);
+        }
         if matches!(self.darwin_file_kind(file), Kind::Socket) {
             let Some((o, _)) = file.handle.so_owner() else {
                 self.darwin_unimplemented(format!("the owner (so_pgid) of {}, a socket the global kernel holds", file.path));
@@ -311,6 +335,32 @@ impl Kernel {
         let mut b = [0u8; 8];
         self.darwin_fo_ioctl(file, cmd::TIOCGPGRP, &mut b)?;
         Ok(-int(&b))
+    }
+
+    /// An int-reading command on one of the host's streams, as the host's
+    /// XNU answers it (reported where the host is not XNU).
+    fn darwin_host_int(&mut self, file: &Arc<OpenFile>, com: u64, data: &mut [u8]) -> Result<(), Errno> {
+        match file.handle.as_std_stream().and_then(|s| s.xnu_ioctl_int(com)) {
+            Some(Ok(v)) => {
+                put_int(data, v);
+                Ok(())
+            }
+            Some(Err(e)) => Err(e),
+            None => {
+                self.darwin_unimplemented(format!("ioctl {com:#x} on {}, a host stream on a host that is not XNU", file.path));
+                Err(Errno::EOPNOTSUPP)
+            }
+        }
+    }
+
+    /// The family of the host's socket `file` is, from the host's XNU
+    /// (`socket_info`'s `soi_family`).
+    fn darwin_host_socket_family(&self, file: &Arc<OpenFile>) -> Option<i32> {
+        let mut b = vec![0u8; super::procinfo::SOCKET_FDINFO_SIZE];
+        match file.handle.as_std_stream()?.xnu_fdinfo(super::procinfo::PIDFDSOCKETINFO, &mut b)? {
+            Ok(n) if n == b.len() => Some(super::procinfo::soi_family(&b)),
+            _ => None,
+        }
     }
 
     /// The file type's `fo_ioctl`.
@@ -384,6 +434,81 @@ impl Kernel {
                     self.darwin_unimplemented(format!("ioctl {com:#x} on a socket (soo_ioctl)"));
                     Err(Errno::EOPNOTSUPP)
                 }
+            },
+            // pipe_ioctl of the host's pipe: what is buffered on this end
+            // as the host's XNU counts it; the owner the guest's own.
+            // PIPE_ASYNC's SIGIO would come from the host's wakeups, which
+            // gex does not see.
+            Kind::HostPipe => match com {
+                cmd::FIONBIO => Ok(()),
+                cmd::FIOASYNC if int(data) == 0 => Ok(()),
+                cmd::FIOASYNC => {
+                    self.darwin_unimplemented(format!("FIOASYNC on {}, the host's pipe (its SIGIO at the host's wakeups)", file.path));
+                    Err(Errno::EOPNOTSUPP)
+                }
+                cmd::FIONREAD => self.darwin_host_int(file, com, data),
+                cmd::TIOCSPGRP | cmd::TIOCGPGRP => {
+                    let s = file.handle.as_std_stream().ok_or(Errno::EBADF)?;
+                    if com == cmd::TIOCSPGRP {
+                        s.pgid.store(int(data), std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        put_int(data, s.pgid.load(std::sync::atomic::Ordering::Relaxed));
+                    }
+                    Ok(())
+                }
+                _ => Err(Errno::ENOTTY),
+            },
+            // pipe_ioctl of a pipe the page's global kernel holds: this
+            // end's buffered bytes (a write end has none); its owner and
+            // SIGIO are the global kernel's pipe's, which keeps neither.
+            Kind::HeldPipe => match com {
+                cmd::FIONBIO => Ok(()),
+                cmd::FIOASYNC if int(data) == 0 => Ok(()),
+                cmd::FIONREAD => {
+                    let st = file.handle.pipe_state().ok_or(Errno::EBADF)?;
+                    put_int(data, if file.writable { 0 } else { st.buffered.min(i32::MAX as u64) as i32 });
+                    Ok(())
+                }
+                cmd::FIOASYNC | cmd::TIOCSPGRP | cmd::TIOCGPGRP => {
+                    self.darwin_unimplemented(format!("ioctl {com:#x} on {}, a pipe the page's global kernel holds (its pipe_state's PIPE_ASYNC and pipe_pgid)", file.path));
+                    Err(Errno::EOPNOTSUPP)
+                }
+                _ => Err(Errno::ENOTTY),
+            },
+            // soioctl of the host's socket: its generic commands, its
+            // counts the host's XNU's; the owner the guest's own; an
+            // interface's or a route's command the device's (not this
+            // socket's), and another its protocol's pru_control, which for
+            // a local socket refuses every command.
+            Kind::HostSocket => match com {
+                cmd::FIONBIO => Ok(()),
+                cmd::FIOASYNC if int(data) == 0 => Ok(()),
+                cmd::FIOASYNC => {
+                    self.darwin_unimplemented(format!("FIOASYNC on {}, the host's socket (its SIGIO at the host's wakeups)", file.path));
+                    Err(Errno::EOPNOTSUPP)
+                }
+                cmd::FIONREAD | cmd::SIOCATMARK => self.darwin_host_int(file, com, data),
+                cmd::SIOCSPGRP | cmd::SIOCGPGRP => {
+                    let s = file.handle.as_std_stream().ok_or(Errno::EBADF)?;
+                    if com == cmd::SIOCSPGRP {
+                        s.pgid.store(int(data), std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        put_int(data, s.pgid.load(std::sync::atomic::Ordering::Relaxed));
+                    }
+                    Ok(())
+                }
+                cmd::SIOCSETOT => Err(Errno::EOPNOTSUPP),
+                _ if matches!((com >> 8) & 0xff, 0x69 | 0x72) => {
+                    self.darwin_unimplemented(format!("ioctl {com:#x} on {}, the host's socket (ifioctl or rtioctl of the device's interfaces and routes)", file.path));
+                    Err(Errno::EOPNOTSUPP)
+                }
+                _ => match self.darwin_host_socket_family(file) {
+                    Some(AF_UNIX) => Err(Errno::EOPNOTSUPP),
+                    family => {
+                        self.darwin_unimplemented(format!("ioctl {com:#x} on {}, the host's socket of family {family:?} (its protocol's pru_control)", file.path));
+                        Err(Errno::EOPNOTSUPP)
+                    }
+                },
             },
             // A terminal on the host is a tty here: FIODTYPE says D_TTY,
             // and the tty's own commands are ttioctl's.

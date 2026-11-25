@@ -196,6 +196,11 @@ pub mod op {
     /// request the pid and the three bytes; the answer 1 when the child's
     /// entry was there.
     pub const SPAWN_POLICY: u32 = 67;
+    /// A call on the kernel's APFS container on disk0, which the global
+    /// kernel holds for the system ([`super::super::disknode`]): the
+    /// request its call, volume slot, the caller's `nanotime` and the
+    /// call's arguments; the answer 0 and its result, or 1 and its error.
+    pub const NX: u32 = 68;
 }
 
 /// Process `pid` has exec'd: the system's table's `P_EXEC`.
@@ -798,10 +803,13 @@ pub enum Value {
     /// The wait queue a process waiting for the IPC table parks on
     /// ([`super::super::ipc::wire::take_table`]).
     IpcQueue = 3,
+    /// The boot's shared region's slide, drawn once
+    /// ([`super::super::shregion`]).
+    BootRegionSlide = 4,
 }
 
 /// The values this kernel holds for the system's: each set or not.
-static VALUES: std::sync::Mutex<[Option<u64>; 4]> = std::sync::Mutex::new([None; 4]);
+static VALUES: std::sync::Mutex<[Option<u64>; 5]> = std::sync::Mutex::new([None; 5]);
 
 /// Value `which`: the global kernel's, where it holds the system's state,
 /// after `how` (0 read, 1 set to `v`, 2 set to `v` unless set before, 3 or
@@ -944,6 +952,7 @@ pub fn serve(op: u32, req: &[u8], out: &mut [u8]) -> i64 {
             24
         }
         op::SYSTEM_STRING => super::sysctl::serve_string(req, out),
+        op::NX => super::disknode::serve(req, out),
         op::BOOT_PAYLOAD => {
             let (32, 32..) = (req.len(), out.len()) else { return -EINVAL };
             let got = BOOT_DIGEST.get_or_init(|| req.try_into().unwrap());
@@ -951,7 +960,7 @@ pub fn serve(op: u32, req: &[u8], out: &mut [u8]) -> i64 {
             32
         }
         op::VALUE => {
-            let (Some(&which @ (0..=3)), Some(&how @ (0..=4)), 10, 8..) = (req.first(), req.get(1), req.len(), out.len()) else { return -EINVAL };
+            let (Some(&which @ (0..=4)), Some(&how @ (0..=4)), 10, 8..) = (req.first(), req.get(1), req.len(), out.len()) else { return -EINVAL };
             let v = u64::from_le_bytes(req[2..10].try_into().unwrap());
             let mut t = VALUES.lock().unwrap_or_else(|e| e.into_inner());
             let slot = &mut t[which as usize];
@@ -1299,9 +1308,20 @@ mod tests {
         assert_eq!(u64::from_le_bytes(o), 7);
         call(r, op::VALUE, &req(0, 0), &mut o);
         assert_eq!(u64::from_le_bytes(o), 7);
-        assert_eq!(serve(op::VALUE, &[4, 0, 0, 0, 0, 0, 0, 0, 0, 0], &mut o), -22);
+        assert_eq!(serve(op::VALUE, &[5, 0, 0, 0, 0, 0, 0, 0, 0, 0], &mut o), -22);
         assert_eq!(serve(op::VALUE, &[0, 5, 0, 0, 0, 0, 0, 0, 0, 0], &mut o), -22);
         assert_eq!(serve(op::VALUE, &[0, 0], &mut o), -22);
+        // The boot region's slide: the first process's draw is every
+        // process's.
+        let slide = |v: u64| {
+            let mut b = vec![Value::BootRegionSlide as u8, 2];
+            b.extend_from_slice(&v.to_le_bytes());
+            let mut o = [0u8; 8];
+            call(r, op::VALUE, &b, &mut o);
+            u64::from_le_bytes(o)
+        };
+        assert_eq!(slide(0x1234000), 0x1234000);
+        assert_eq!(slide(0x8000), 0x1234000);
     }
 
     #[test]
@@ -1348,7 +1368,7 @@ mod tests {
 
     #[test]
     fn every_call_has_a_number_of_its_own() {
-        let mut all = vec![op::NEXT, op::ORIGIN, op::SYSTEM_STRING, op::TC_SET_STATIC, op::TC_QUERY, op::TC_HAS_UUID, op::TC_LOAD, op::TC_BOOT_LOADED, op::TC_MARK_LOADED, op::CO_FORK, op::CO_ADOPT_CORPSE, op::CO_EXEC, op::CO_MEMBERSHIP, op::CO_THREAD_GROUP, op::CO_PRIVILEGED, op::CO_LEADER, op::CO_TASK_TERMINATED, op::CO_ACTIVATE, op::CO_RELEASE, op::CO_PLACE, op::CO_LIST, op::CO_CREATE, op::CO_TERMINATE, op::CO_KIND, op::CO_SET_NAME, op::HELD_CLAIM, op::HELD_HOLDER, op::HELD_LET_GO, op::HELD_ANY, op::HELD_TOUCH, op::HELD_COUNT, op::VALUE, op::BOOT_PAYLOAD, op::DEV_TIMES, op::MAILBOX_PUT, op::MAILBOX_TAKE, op::IPC_TAKE, op::IPC_PUT, op::IPC_LOST, op::WHOLE_TAKE, op::WHOLE_PUT, op::SCHED, op::PROC_SEED, op::RECORD_PUT, op::RECORD_GET, op::RECORD_EXITED, op::CHANGE_POST, op::CHANGE_TAKE, op::CHANGE_DONE, op::CHANGE_STATE, op::JOB_SET, op::DWAIT, op::SPAWN_ACK, op::SPAWN_TAKE, op::EXECED, op::DSETPGID, op::SPAWN_POLICY];
+        let mut all = vec![op::NEXT, op::ORIGIN, op::SYSTEM_STRING, op::TC_SET_STATIC, op::TC_QUERY, op::TC_HAS_UUID, op::TC_LOAD, op::TC_BOOT_LOADED, op::TC_MARK_LOADED, op::CO_FORK, op::CO_ADOPT_CORPSE, op::CO_EXEC, op::CO_MEMBERSHIP, op::CO_THREAD_GROUP, op::CO_PRIVILEGED, op::CO_LEADER, op::CO_TASK_TERMINATED, op::CO_ACTIVATE, op::CO_RELEASE, op::CO_PLACE, op::CO_LIST, op::CO_CREATE, op::CO_TERMINATE, op::CO_KIND, op::CO_SET_NAME, op::HELD_CLAIM, op::HELD_HOLDER, op::HELD_LET_GO, op::HELD_ANY, op::HELD_TOUCH, op::HELD_COUNT, op::VALUE, op::BOOT_PAYLOAD, op::DEV_TIMES, op::MAILBOX_PUT, op::MAILBOX_TAKE, op::IPC_TAKE, op::IPC_PUT, op::IPC_LOST, op::WHOLE_TAKE, op::WHOLE_PUT, op::SCHED, op::PROC_SEED, op::RECORD_PUT, op::RECORD_GET, op::RECORD_EXITED, op::CHANGE_POST, op::CHANGE_TAKE, op::CHANGE_DONE, op::CHANGE_STATE, op::JOB_SET, op::DWAIT, op::SPAWN_ACK, op::SPAWN_TAKE, op::EXECED, op::DSETPGID, op::SPAWN_POLICY, op::NX];
         let n = all.len();
         all.sort_unstable();
         all.dedup();

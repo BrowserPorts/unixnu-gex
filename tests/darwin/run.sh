@@ -417,11 +417,63 @@ run() {
     # From the root, where the platform profile's process-exec rules know
     # the path's owner: a RELEASE kernel's EBADEXEC (85), then ECHILD (10).
     xspawn) check_root xspawn "xspawn 85 10" 0 ;;
-    # The host's standard streams, as gexc stands them in: character
-    # devices of the caller's.
-    stdstat) check_as 0:0 stdstat "fd 0 mode 20620 nlink 1 uid 0 gid 0 size 0 blksize 65536 flags 0
-fd 1 mode 20620 nlink 1 uid 0 gid 0 size 0 blksize 65536 flags 0
-fd 2 mode 20620 nlink 1 uid 0 gid 0 size 0 blksize 65536 flags 0" 0 ;;
+    # The host's standard streams as XNU shows what each really is, as
+    # root: standard input a regular file (the file's stat, the caller's),
+    # standard output a pipe (pipe_stat, the host's buffer), standard error
+    # the host's null device (the system's /dev/null); then each a pipe.
+    stdstat)
+        out=$(with_disk0 "$GEXC" run --uid 0:0 "$HERE/bin/stdstat" < "$HERE/src/stdstat-in.txt" 2>/dev/null)
+        report stdstat-file "$out" $? "fd 0 mode 100644 nlink 1 uid 0 gid 0 size 8 blksize 4096 flags 0
+fd 1 mode 10660 nlink 0 uid 0 gid 0 size 0 blksize 16384 flags 0
+fd 2 mode 20666 nlink 1 uid 0 gid 0 size 0 blksize 65536 flags 0" 0
+        out=$(printf 'abcdef' | with_disk0 "$GEXC" run --uid 0:0 "$HERE/bin/stdstat" wait 2>/dev/null)
+        report stdstat-pipe "$out" $? "fd 0 mode 10660 nlink 0 uid 0 gid 0 size 6 blksize 16384 flags 0" 0
+        # Each a pipe: their kinds (proc_pidfdlist), FIONREAD and a vnode's
+        # fcntl refused, their owners (pipe_pgid), proc_pidfdinfo's
+        # pipe_info.
+        for mode in kinds owner fdinfo; do
+            out=$(printf 'abcdef' | with_disk0 "$GEXC" run --uid 0:0 "$HERE/bin/stdstat" $mode 2>/dev/null)
+            case $mode in
+            kinds) want="fd 0 type 6 nread 6 nocache 9
+fd 1 type 6 nread 0 nocache 9" ;;
+            owner) want="fd 0 pgid 0 4242
+fd 1 pgid 0 4242" ;;
+            fdinfo) want="fd 0 info 0 size 184 mode 10660 uid 0 fsize 6
+fd 1 info 0 size 184 mode 10660 uid 0 fsize 0" ;;
+            esac
+            report "stdstat-$mode" "$out" $? "$want" 0
+        done
+        # Each a socket (a socket pair's end, as a parent may hand one over):
+        # the same, so_pgid, and socket_fdinfo (whose soi_stat
+        # fill_socketinfo leaves zero).
+        for mode in kinds owner fdinfo; do
+            out=$(python3 -I -c '
+import socket, subprocess, sys
+a, b = socket.socketpair()
+c, d = socket.socketpair()
+a.sendall(b"abcdef")
+p = subprocess.Popen(sys.argv[1:], stdin=b, stdout=d, stderr=subprocess.DEVNULL)
+b.close()
+d.close()
+got = b""
+while True:
+    x = c.recv(4096)
+    if not x:
+        break
+    got += x
+sys.stdout.write(got.decode())
+sys.exit(p.wait())
+' "$GEXC" run --uid 0:0 "$HERE/bin/stdstat" $mode)
+            case $mode in
+            kinds) want="fd 0 type 2 nread 6 nocache 9
+fd 1 type 2 nread 0 nocache 9" ;;
+            owner) want="fd 0 pgid 0 4242
+fd 1 pgid 0 4242" ;;
+            fdinfo) want="fd 0 info 0 size 792 mode 0 uid 0 fsize 0
+fd 1 info 0 size 792 mode 0 uid 0 fsize 0" ;;
+            esac
+            report "stdstat-socket-$mode" "$out" $? "$want" 0
+        done ;;
     # disk0's character node as root, on the run's own clone of the image:
     # the GPT, its backup, the container's superblock as the boot's update
     # of the container to read-write wrote it (not cleanly unmounted), a
@@ -478,6 +530,12 @@ hello from /var/tmp/gex-exec-fat with 1 argument" 0
         check_root spawn "spawn ok" 0
         ;;
     wait) check_root wait "wait ok" 0 ;;
+    # A dynamic child spawned in its own group, refused a setpgid after
+    # its exec, waited for, its time among the reaped children's, its
+    # shared cache the parent's.
+    dynspawn) check_root dynspawn "dynspawn spawn 0 pgid 1 setpgid 13 wait 1 exit 7
+dynspawn usage 1
+dynspawn ok" 0 ;;
     sigchld) check_root sigchld "sigchld ok" 0 ;;
     procknote) check_root procknote "procknote ok" 0 ;;
     fork) check_root fork "fork ok" 0 ;;
@@ -942,7 +1000,7 @@ if [ "$named" -gt 0 ]; then
         run "$p"
     done
 else
-    for p in hello-static bsd-carry commpage exclusive-pair aes tcall bsdthr waits hold cpuclk pipewr unixname sysids xproc xmach xsys ownrec xspawn diskrw stdstat hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate thinfo tasksuspend portrefs crosstask spawnports taskname taskreg procfind debugport excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl iokit storagereg ioreg accel accelr metalwire metal iosurface iosurfacex iosurfacesplash iosurfacexpreboard iogpudev iomfb iomfbmain xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts evsock pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit sbxinit sbxexec sbxkill hostspecial sbxmask sbxnet sbxiokit sepmgr sepmgrdeny sbxpriv sbxfile sbxscrub cfrunloop xpc-anon layout overlay stackfb launchcon shregion console owners apfsroles disknodes diskio fsfreeze fmount mntupdate fsstatwait ignition graftdmg tcload inet6 rusage vmshare remap vmwrite freezer ment ubcmap purgeable mentreuse mapfirst ignitionweb nvram hostuuid crashpanic crashpanic-exit crashpanic-onexit crashpanic-deadline crashpanic-crash crashpanic-abort crashpanic-terminate crashpanic-spawnfail rebootcall rebootcall-panic rebootcall-halt rebootcall-restart rebootcall-hostrestart rebootcall-upsdelay rebootcall-hostupsdelay rebootcall-full rebootcall-fullhalt corpse corpsefork; do
+    for p in hello-static bsd-carry commpage exclusive-pair aes tcall bsdthr waits hold cpuclk pipewr unixname sysids xproc xmach xsys ownrec xspawn diskrw stdstat hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate thinfo tasksuspend portrefs crosstask spawnports taskname taskreg procfind debugport excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait boottime timebase sysctlnodes kernproc vmregion msync rlimitctl iokit storagereg ioreg accel accelr metalwire metal iosurface iosurfacex iosurfacesplash iosurfacexpreboard iogpudev iomfb iomfbmain xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts evsock pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit sbxinit sbxexec sbxkill hostspecial sbxmask sbxnet sbxiokit sepmgr sepmgrdeny sbxpriv sbxfile sbxscrub cfrunloop xpc-anon layout overlay stackfb launchcon shregion console owners apfsroles disknodes diskio fsfreeze fmount mntupdate fsstatwait ignition graftdmg tcload inet6 rusage vmshare remap vmwrite freezer ment ubcmap purgeable mentreuse mapfirst ignitionweb nvram hostuuid crashpanic crashpanic-exit crashpanic-onexit crashpanic-deadline crashpanic-crash crashpanic-abort crashpanic-terminate crashpanic-spawnfail rebootcall rebootcall-panic rebootcall-halt rebootcall-restart rebootcall-hostrestart rebootcall-upsdelay rebootcall-hostupsdelay rebootcall-full rebootcall-fullhalt corpse corpsefork dynspawn; do
         run "$p"
     done
 fi

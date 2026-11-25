@@ -15,6 +15,10 @@
 import { System } from '../../page/runtime/src/index.js';
 import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
 
+/** What gexc says of its own standard streams, its host's (darwin/hoststd.rs):
+ *  not the page's, whose streams are its pipes. */
+const HOST_STREAMS = "[gex] Darwin: the host's standard streams stand in:";
+
 export const meta = { hosts: ['browser'], arches: ['a64'], images: ['darwin-static'], timeout: 300 };
 
 /** What tests/darwin/run.sh expects of each (its `check`). */
@@ -44,7 +48,9 @@ export default async function (t) {
   // host: the page cannot tell a file's holes, SEEK_DATA/SEEK_HOLE).
   await t.saveFile('console.txt', sys.state.console);
   const said = sys.state.console.split('\n');
-  const reports = new Set(progs.flatMap((p) => image.native[p].reports));
+  // (but those of gexc's own standard streams, which are its host's: the
+  // page's are its pipes)
+  const reports = new Set(progs.flatMap((p) => image.native[p].reports).filter((l) => !l.startsWith(HOST_STREAMS)));
   for (const line of reports) {
     const subject = line.slice(0, line.indexOf(':', line.indexOf(':') + 1) + 1);
     const ours = said.find((l) => l.startsWith(subject));

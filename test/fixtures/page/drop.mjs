@@ -47,6 +47,7 @@ const env = {
   process: proc,
   lazy_fetch: () => 0, block_io: () => -1, page_fs: () => -5,
   process64: new WebAssembly.Memory({ address: 'i64', initial: 0n, maximum: 0n, shared: true }),
+  region: new WebAssembly.Memory({ address: 'i64', initial: 0n, maximum: 0n, shared: true }),
 };
 // The page's own instance, which reads back what the Worker wrote.
 const k = (await WebAssembly.instantiate(module, { env })).exports;

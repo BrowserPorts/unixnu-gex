@@ -472,6 +472,12 @@ extern "C" {
     fn k_disk0_missing(out: gex_kernel::PAddr, out_len: u32) -> i64;
     fn k_disk0_read(off: u64, dst: gex_kernel::PAddr, len: u32) -> i32;
     fn k_disk0_write(off: u64, src: gex_kernel::PAddr, len: u32) -> i32;
+    /// The page's store of the Darwin system's shared region (hosts/kernel
+    /// region.rs): a mapping's offset by its key, a mapping kept, and a
+    /// mapping copied into this memory.
+    fn k_region_find(key: gex_kernel::PAddr, key_len: u32, len: u64) -> i64;
+    fn k_region_put(key: gex_kernel::PAddr, key_len: u32, src: gex_kernel::PAddr, len: u64) -> i64;
+    fn k_region_get(off: u64, dst: gex_kernel::PAddr, len: u64) -> i32;
     fn k_lock_queue() -> u32;
     fn k_lock_seq() -> u64;
     fn k_spawn(ppid: i32) -> i32;

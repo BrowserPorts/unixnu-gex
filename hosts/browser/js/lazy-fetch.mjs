@@ -227,8 +227,16 @@ export function spareMemories(shared = true) {
   const spare = { count };
   spare.m32 = wasmMemory({ initial: 0, maximum: 0, shared }, 'the spare 32-bit memory', spare);
   spare.m64 = wasmMemory({ address: 'i64', initial: 0n, maximum: 0n, shared }, 'the spare memory64', spare);
+  // The page's one store of the Darwin system's shared region
+  // (hosts/kernel region.rs), which every Worker's kernel instance imports
+  // as the same memory: empty until a Darwin process maps the region.
+  spare.region = wasmMemory({ address: 'i64', initial: 0n, maximum: REGION_PAGES, shared }, 'the Darwin shared region store', spare);
   return spare;
 }
+
+/** The region store's most pages: 4 GiB, the shared region's size
+ *  (hosts/kernel/build.sh `PREGION`). */
+const REGION_PAGES = (4n << 30n) / 65536n;
 
 // The first kernel spec's count, for this realm's memories made without one:
 // on the realm, not in this module, as a built package has its own copy of
@@ -313,7 +321,17 @@ export function processMemories(mem, is64 = false, spare = null) {
       : wasmMemory({ address: 'i64', initial: 0n, maximum: 0n, shared }, 'an empty memory64', spare);
     emptyMemories.set(key, empty);
   }
-  return is64 ? { process: empty, process64: mem } : { process: mem, process64: empty };
+  // The region store: the kernel spec's, else an empty one of this realm
+  // (a Worker with no spec: its Darwin processes keep no copy for others).
+  let region = spare?.region;
+  if (region && (typeof SharedArrayBuffer !== 'undefined' && region.buffer instanceof SharedArrayBuffer) !== shared) region = null;
+  const rkey = `region:${shared}`;
+  region ??= emptyMemories.get(rkey);
+  if (!region) {
+    region = wasmMemory({ address: 'i64', initial: 0n, maximum: 0n, shared }, 'an empty region store', spare);
+    emptyMemories.set(rkey, region);
+  }
+  return is64 ? { process: empty, process64: mem, region } : { process: mem, process64: empty, region };
 }
 
 /**

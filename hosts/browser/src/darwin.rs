@@ -179,6 +179,11 @@ fn start(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> Result<u
     // The SEP's inputs, none of which the page gives: what needs the SEP
     // stops and names what is missing.
     darwin::sep::set_inputs(darwin::sep::core::Inputs { sepos: None, seprom: None, device_dir: None }).map_err(load)?;
+    // The page's store of the system's shared region, which every process's
+    // copy of the region is made from once one process has mapped it.
+    if unsafe { k_present() } != 0 {
+        darwin::shregion::set_region_store(darwin::shregion::RegionStore { find: region_find, get: region_get, put: region_put });
+    }
     // The disk nodes' image: the page's disk0, which the global kernel
     // serves every process (gexc's GEX_DARWIN_DISK0), with what its build
     // reported missing.
@@ -190,6 +195,9 @@ fn start(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> Result<u
     let (img, spawn_exec): (darwin::image::DarwinImage, Option<Box<darwin::execve::Image>>) = match (first, spawned) {
         (None, Some(blob)) => {
             let (img, exec) = spawned_start(h, &blob)?;
+            // The booted system's grafts, in this process's view of the
+            // system it joins (as each process of the page has them).
+            h.kernel.darwin_boot_grafts();
             (img, Some(exec))
         }
         (Some(img), _) => {
@@ -270,8 +278,10 @@ fn start(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> Result<u
     // init, so the boot's region holds the cache launchd's dyld mapped
     // into it at boot: the OS cryptex's, from its graft (darwin::CACHE_PATH,
     // whose trust cache the boot's grafts loaded), for a program with dyld
-    // (gexc maps no cache for a static one).
-    if spawn_exec.is_none() && img.program.interp.is_some() {
+    // (gexc maps no cache for a static one). In the page each process holds
+    // its own copy of the system's region, made of the same files at the
+    // system's one slide; a posix_spawn's child too.
+    if img.program.interp.is_some() {
         let (dir, main) = darwin::CACHE_PATH.rsplit_once('/').expect("the shared cache's path");
         let t0 = now_ns();
         h.kernel.darwin_boot_shared_region(dir, main).map_err(|e| load(format!("the boot's shared region: {e}")))?;
@@ -394,6 +404,24 @@ impl gex_kernel::darwin::apfswrite::Sink for PageDisk0 {
     }
 }
 
+fn region_find(key: &[u8], len: u64) -> Option<u64> {
+    // SAFETY: the key is this module's memory, borrowed for the call.
+    let at = unsafe { k_region_find(key.as_ptr() as gex_kernel::PAddr, key.len() as u32, len) };
+    (at >= 0).then_some(at as u64)
+}
+
+fn region_get(at: u64, dst: u64, len: u64) -> bool {
+    // SAFETY: the kernel copies into this process's memory, checked there.
+    unsafe { k_region_get(at, dst, len) == 0 }
+}
+
+fn region_put(key: &[u8], src: u64, len: u64) {
+    // SAFETY: as `region_find`'s; the bytes are this process's, read there.
+    // (A store that cannot hold them keeps nothing: the next process maps
+    // its copy from the files, as this one did.)
+    unsafe { k_region_put(key.as_ptr() as gex_kernel::PAddr, key.len() as u32, src, len) };
+}
+
 /// The most of disk0 one call to the global kernel moves: a buffer that
 /// size in its memory for each.
 const DISK0_PART: usize = 1 << 20;
@@ -423,20 +451,6 @@ fn disk0() -> Option<(std::sync::Arc<dyn gex_kernel::darwin::apfswrite::Sink>, V
     }
     let missing = String::from_utf8_lossy(&out).lines().filter(|l| !l.is_empty()).map(str::to_string).collect();
     Some((std::sync::Arc::new(PageDisk0(size)), missing))
-}
-
-/// A posix_spawn's child in the page runs no dyld: its shared cache is
-/// the boot's region, which in the page is each process's own copy, made
-/// from the boot's grafts, and those are the first Darwin process's (the
-/// kernel's container on disk0 is held by the process that mounted it).
-fn static_only(img: &gex_kernel::darwin::image::DarwinImage) -> Result<(), String> {
-    match img.program.interp {
-        Some(_) => Err(format!(
-            "a dynamic Darwin program (it names {}) as a posix_spawn's child: its shared cache is the boot's region, which in the page is each process's own, made from the boot's grafts, which the first Darwin process of the page holds",
-            img.dylinker.as_deref().unwrap_or("dyld")
-        )),
-        None => Ok(()),
-    }
 }
 
 thread_local! {
@@ -617,17 +631,6 @@ fn spawned_start(h: &mut Host, blob: &[u8]) -> Result<(gex_kernel::darwin::image
             return Err(Fail::Unseen);
         }
     };
-    // Natively it would run; the page runs no dyld for it: said, the child
-    // let go (its task ended, its descriptors closed, its pid reaped) and
-    // its spawner's call failed with ENOSYS.
-    if let Err(why) = static_only(&loaded) {
-        warn_line(&format!("gex: posix_spawn's child {pid}: {}: {why}; its call fails with ENOSYS\n", img.path));
-        k.darwin_task_terminate();
-        k.close_all_fds();
-        k.procs.reap(pid);
-        share::spawn_started(pid, ppid, Errno::ENOSYS.0);
-        return Err(Fail::Unseen);
-    }
     // switch_to_darwin_image, then the image activated, its signature and
     // labels set (a policy's refusal kills the child at its start).
     let tid = if k.sig_tid != 0 { k.sig_tid } else { k.tid };
@@ -638,7 +641,7 @@ fn spawned_start(h: &mut Host, blob: &[u8]) -> Result<(gex_kernel::darwin::image
     {
         let l = darwin::exec::Loaded {
             mach_header: loaded.program.exe.segments.iter().map(|s| s.vaddr).min().unwrap_or(0),
-            dylinker: None,
+            dylinker: loaded.dylinker.as_deref().filter(|_| loaded.program.interp.is_some()),
             stacksize: loaded.stacksize,
             exe_path: &img.path,
             file_start: img.arch_offset,

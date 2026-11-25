@@ -803,10 +803,13 @@ pub enum Value {
     /// The wait queue a process waiting for the IPC table parks on
     /// ([`super::super::ipc::wire::take_table`]).
     IpcQueue = 3,
+    /// The boot's shared region's slide, drawn once
+    /// ([`super::super::shregion`]).
+    BootRegionSlide = 4,
 }
 
 /// The values this kernel holds for the system's: each set or not.
-static VALUES: std::sync::Mutex<[Option<u64>; 4]> = std::sync::Mutex::new([None; 4]);
+static VALUES: std::sync::Mutex<[Option<u64>; 5]> = std::sync::Mutex::new([None; 5]);
 
 /// Value `which`: the global kernel's, where it holds the system's state,
 /// after `how` (0 read, 1 set to `v`, 2 set to `v` unless set before, 3 or
@@ -957,7 +960,7 @@ pub fn serve(op: u32, req: &[u8], out: &mut [u8]) -> i64 {
             32
         }
         op::VALUE => {
-            let (Some(&which @ (0..=3)), Some(&how @ (0..=4)), 10, 8..) = (req.first(), req.get(1), req.len(), out.len()) else { return -EINVAL };
+            let (Some(&which @ (0..=4)), Some(&how @ (0..=4)), 10, 8..) = (req.first(), req.get(1), req.len(), out.len()) else { return -EINVAL };
             let v = u64::from_le_bytes(req[2..10].try_into().unwrap());
             let mut t = VALUES.lock().unwrap_or_else(|e| e.into_inner());
             let slot = &mut t[which as usize];
@@ -1305,9 +1308,20 @@ mod tests {
         assert_eq!(u64::from_le_bytes(o), 7);
         call(r, op::VALUE, &req(0, 0), &mut o);
         assert_eq!(u64::from_le_bytes(o), 7);
-        assert_eq!(serve(op::VALUE, &[4, 0, 0, 0, 0, 0, 0, 0, 0, 0], &mut o), -22);
+        assert_eq!(serve(op::VALUE, &[5, 0, 0, 0, 0, 0, 0, 0, 0, 0], &mut o), -22);
         assert_eq!(serve(op::VALUE, &[0, 5, 0, 0, 0, 0, 0, 0, 0, 0], &mut o), -22);
         assert_eq!(serve(op::VALUE, &[0, 0], &mut o), -22);
+        // The boot region's slide: the first process's draw is every
+        // process's.
+        let slide = |v: u64| {
+            let mut b = vec![Value::BootRegionSlide as u8, 2];
+            b.extend_from_slice(&v.to_le_bytes());
+            let mut o = [0u8; 8];
+            call(r, op::VALUE, &b, &mut o);
+            u64::from_le_bytes(o)
+        };
+        assert_eq!(slide(0x1234000), 0x1234000);
+        assert_eq!(slide(0x8000), 0x1234000);
     }
 
     #[test]

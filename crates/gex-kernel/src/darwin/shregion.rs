@@ -1080,8 +1080,11 @@ impl Kernel {
         let data_at = BASE - PAGE;
         let (start, _) = first.dynamic;
         files.push(SrFile { fd: -1, file: None, mappings: vec![MappingNp { address: start, size: PAGE, file_offset: data_at, slide_size: 0, slide_start: 0, max_prot: prot::READ, init_prot: prot::READ }], slide: 0 });
-        // shared_region_map_and_slide_2_np's slide, every mapping moved by it.
-        let slide = choose_slide(max_slide);
+        // shared_region_map_and_slide_2_np's slide, every mapping moved by it:
+        // the system's one region's, which in the page each process makes
+        // of the same files at the same slide, drawn once.
+        let drawn = choose_slide(max_slide);
+        let slide = super::share::value(super::share::Value::BootRegionSlide, 2, u64::from(drawn)).map_or(drawn, |v| v as u32);
         for f in files.iter_mut() {
             f.slide = slide;
             for mp in f.mappings.iter_mut() {

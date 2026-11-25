@@ -103,6 +103,9 @@ const DARWIN_STATIC = ['hello-static', 'bsd-carry', 'tcall', 'bsdthr', 'waits', 
  *  special port, through the host privilege port root's task has; xsys's
  *  memorystatus_control is root's). */
 const DARWIN_STATIC_AS = { xmach: '0:0', xsys: '0:0', stdstat: '0:0' };
+/** The `darwin-dyn` image's dynamic programs, each with the arguments gexc
+ *  runs it with. */
+const DARWIN_DYN = { hello: ['a', 'b'], dynspawn: [] };
 const DARWIN_BOOT = ['DeviceTree', 'sandbox_profile.bin', 'sandbox_builtin.bin', 'sandbox_protobox.bin', 'img4_anchor.der', 'SystemVolume.attrs'];
 
 export const images = {
@@ -303,12 +306,13 @@ export const images = {
     }
     return null;
   },
-  // `darwin-dyn`: a dynamic program through dyld and the shared cache
-  // (tests/darwin/src/hello.c), from the root's /var/tmp as
-  // tests/darwin/run.sh places it (gex-darwin-hello, owned by root), the
-  // boot payload with it trusted, and what gexc prints running it on the
-  // root (GEX_DARWIN_ROOT) and a clone of disk0 (GEX_DARWIN_DISK0), strict,
-  // with the time it took. The page lays the root from `darwin-root`.
+  // `darwin-dyn`: dynamic programs through dyld and the shared cache
+  // (DARWIN_DYN: tests/darwin/src/hello.c, dynspawn.c), each from the
+  // root's /var/tmp as tests/darwin/run.sh places it (gex-darwin-NAME,
+  // owned by root), the boot payload with them trusted, and what gexc
+  // prints running each on the root (GEX_DARWIN_ROOT) and a clone of disk0
+  // (GEX_DARWIN_DISK0), strict, with the time it took. The page lays the
+  // root from `darwin-root`.
   async 'darwin-dyn'(work) {
     const boot = process.env.GEX_DARWIN_BOOT;
     const root = process.env.GEX_DARWIN_ROOT;
@@ -316,15 +320,14 @@ export const images = {
     if (!boot || !existsSync(join(boot, 'TrustCache'))) return 'GEX_DARWIN_BOOT: the device\'s boot payload (its TrustCache bundle, Sandbox profiles, ...)';
     if (!root || !existsSync(join(root, 'usr/lib/dyld'))) return 'GEX_DARWIN_ROOT: a Darwin root with usr/lib/dyld';
     if (!disk0 || !existsSync(disk0) || !existsSync(`${disk0}.missing`)) return 'GEX_DARWIN_DISK0: the disk0 image and its .missing';
-    const prog = join(ROOT, 'tests/darwin/bin/hello');
-    if (!existsSync(prog)) return 'no tests/darwin/bin/hello (tests/darwin/build.sh)';
+    for (const p of Object.keys(DARWIN_DYN)) if (!existsSync(join(ROOT, 'tests/darwin/bin', p))) return `no tests/darwin/bin/${p} (tests/darwin/build.sh)`;
     const gexc = process.env.GEXC_A64 || process.env.GEXC || join(ROOT, 'target/release/gexc');
     if (!existsSync(gexc)) return `no gexc at ${gexc} (GEXC_A64)`;
     const out = join(work, 'darwin-dyn');
     rmSync(out, { recursive: true, force: true });
     mkdirSync(join(out, 'boot'), { recursive: true });
-    copyFileSync(prog, join(out, 'hello'));
-    const tc = spawnSync('python3', ['-I', join(ROOT, 'tools/darwin-trust-cache.py'), '-o', join(out, 'boot/TrustCache'), '--bundle', join(boot, 'TrustCache'), join(out, 'hello')], { encoding: 'utf8' });
+    for (const p of Object.keys(DARWIN_DYN)) copyFileSync(join(ROOT, 'tests/darwin/bin', p), join(out, p));
+    const tc = spawnSync('python3', ['-I', join(ROOT, 'tools/darwin-trust-cache.py'), '-o', join(out, 'boot/TrustCache'), '--bundle', join(boot, 'TrustCache'), ...Object.keys(DARWIN_DYN).map((p) => join(out, p))], { encoding: 'utf8' });
     if (tc.status !== 0) throw new Error(`tools/darwin-trust-cache.py: ${(tc.stderr || tc.stdout).trim()}`);
     const files = ['TrustCache'];
     for (const f of DARWIN_BOOT) {
@@ -332,28 +335,31 @@ export const images = {
       copyFileSync(join(boot, f), join(out, 'boot', f));
       files.push(f);
     }
-    // In the root as tests/darwin/run.sh's `place` puts it.
-    const placed = join(root, 'var/tmp/gex-darwin-hello');
-    if (!existsSync(placed) || !readFileSync(placed).equals(readFileSync(prog))) {
-      copyFileSync(prog, placed);
-      execFileSync('chmod', ['755', placed]);
-      execFileSync('xattr', ['-w', 'user.gex.darwin.attrs', 'uid=0 gid=0 mode=0755 flags=0', placed]);
+    const native = {};
+    for (const [p, args] of Object.entries(DARWIN_DYN)) {
+      // In the root as tests/darwin/run.sh's `place` puts it.
+      const placed = join(root, `var/tmp/gex-darwin-${p}`);
+      if (!existsSync(placed) || !readFileSync(placed).equals(readFileSync(join(out, p)))) {
+        copyFileSync(join(out, p), placed);
+        execFileSync('chmod', ['755', placed]);
+        execFileSync('xattr', ['-w', 'user.gex.darwin.attrs', 'uid=0 gid=0 mode=0755 flags=0', placed]);
+      }
+      const clone = join(out, '.disk0-run');
+      const cp = spawnSync('cp', ['-c', realpathSync(disk0), clone], { encoding: 'utf8' });
+      if (cp.status !== 0) return `cannot clone ${disk0} beside the work directory (cp -c: ${(cp.stderr || '').trim()}): the work directory must be on the image's APFS volume`;
+      try {
+        copyFileSync(`${disk0}.missing`, `${clone}.missing`);
+        const darwinFree = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('GEX_DARWIN_')));
+        const t0 = Date.now();
+        const r = spawnSync(gexc, ['run', '--sysroot', root, placed, ...args], { encoding: 'utf8', timeout: 300000, env: { ...darwinFree, GEX_DARWIN_BOOT: join(out, 'boot'), GEX_DARWIN_DISK0: clone, GEX_DARWIN_STRICT: '1' } });
+        if (r.error || r.status === null) throw new Error(`gexc run ${p}: ${r.error?.message ?? `signal ${r.signal}`}`);
+        native[p] = { stdout: r.stdout, status: r.status, ms: Date.now() - t0, reports: r.stderr.split('\n').filter((l) => l.startsWith('[gex] Darwin: ')) };
+      } finally {
+        rmSync(clone, { force: true });
+        rmSync(`${clone}.missing`, { force: true });
+      }
     }
-    const clone = join(out, '.disk0-run');
-    const cp = spawnSync('cp', ['-c', realpathSync(disk0), clone], { encoding: 'utf8' });
-    if (cp.status !== 0) return `cannot clone ${disk0} beside the work directory (cp -c: ${(cp.stderr || '').trim()}): the work directory must be on the image's APFS volume`;
-    try {
-      copyFileSync(`${disk0}.missing`, `${clone}.missing`);
-      const darwinFree = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('GEX_DARWIN_')));
-      const t0 = Date.now();
-      const r = spawnSync(gexc, ['run', '--sysroot', root, placed, 'a', 'b'], { encoding: 'utf8', timeout: 300000, env: { ...darwinFree, GEX_DARWIN_BOOT: join(out, 'boot'), GEX_DARWIN_DISK0: clone, GEX_DARWIN_STRICT: '1' } });
-      if (r.error || r.status === null) throw new Error(`gexc run hello: ${r.error?.message ?? `signal ${r.signal}`}`);
-      const native = { stdout: r.stdout, status: r.status, ms: Date.now() - t0, reports: r.stderr.split('\n').filter((l) => l.startsWith('[gex] Darwin: ')) };
-      writeFileSync(join(work, 'darwin-dyn.json'), JSON.stringify({ boot: files, native }));
-    } finally {
-      rmSync(clone, { force: true });
-      rmSync(`${clone}.missing`, { force: true });
-    }
+    writeFileSync(join(work, 'darwin-dyn.json'), JSON.stringify({ boot: files, native }));
     return null;
   },
   async 'darwin-static'(work) {

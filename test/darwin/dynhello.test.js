@@ -26,7 +26,7 @@ const PROG = '/var/tmp/gex-darwin-hello';
 export default async function (t) {
   const { eq, timeout } = t;
   const image = await (await fetch(t.work('darwin-dyn.json'))).json();
-  const native = image.native;
+  const native = image.native.hello;
   eq("gexc's run", [native.stdout, native.status], [`hello from ${PROG} with 2 arguments\n`, 0]);
   const boot = Object.fromEntries(image.boot.map((f) => [f, new URL(t.work(`darwin-dyn/boot/${f}`))]));
   const disk0 = { url: t.work('darwin-root/disk0'), missing: new URL(t.work('darwin-root/disk0.missing')) };

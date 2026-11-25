@@ -91,21 +91,25 @@ pub fn wait4_rusage(m: &mut GuestMem<'_>, at: u64, ru: Option<super::ru::Ru>) ->
 /// Whether a Darwin wait (`op`, a `WaitChild`) finds nothing to report as
 /// it is made, so `wait4` or `waitid` reaches its `msleep0`: no child it
 /// asks for has ended (an end it collects), or has a stop or continue it
-/// reports. In the page the system's table is asked, taking nothing.
-pub fn wait_would_sleep(op: &crate::syscalls::BlockOp) -> bool {
+/// reports. In the page the system's table is asked, taking nothing, and
+/// with it the wakeups the waiter's children have given it so far (none
+/// natively).
+pub fn wait_would_sleep(op: &crate::syscalls::BlockOp) -> (bool, Option<u64>) {
     use std::sync::atomic::Ordering;
-    let crate::syscalls::BlockOp::WaitChild { children, procs, ppid, want, group, waitid, jobs: Some(j), .. } = op else { return false };
+    let crate::syscalls::BlockOp::WaitChild { children, procs, ppid, want, group, waitid, jobs: Some(j), .. } = op else { return (false, None) };
     if procs.is_shared() {
-        return matches!(super::share::dwait(*ppid, (*want, *group), *j, true, waitid.is_some(), true).0, crate::proc::WaitStep::Nothing);
+        let (step, _, _, wakes) = super::share::dwait(*ppid, (*want, *group), *j, true, waitid.is_some(), true);
+        return (matches!(step, crate::proc::WaitStep::Nothing), Some(wakes));
     }
-    !children.iter().filter(|c| !c.reaped.load(Ordering::Acquire)).any(|c| {
+    let sleeps = !children.iter().filter(|c| !c.reaped.load(Ordering::Acquire)).any(|c| {
         let ended = c.status.lock().unwrap_or_else(|e| e.into_inner()).is_some();
         if ended {
             return j.exits;
         }
         let job = c.job.lock().unwrap_or_else(|e| e.into_inner());
         (j.stops && job.stopped && !job.waited) || (j.continues && job.continued)
-    })
+    });
+    (sleeps, None)
 }
 
 /// Process `pid`'s `p_ru->ru` in this table's record of it.
@@ -275,7 +279,7 @@ impl Kernel {
         if self.procs.is_shared() {
             let all = crate::syscalls::JobWait { exits: true, stops: false, continues: false };
             return match super::share::dwait(self.pid, (pid, false), all, true, false, true) {
-                (crate::proc::WaitStep::Ended { word, .. }, _, ru) => Some((word, ru)),
+                (crate::proc::WaitStep::Ended { word, .. }, _, ru, _) => Some((word, ru)),
                 _ => None,
             };
         }
@@ -292,7 +296,7 @@ impl Kernel {
     fn darwin_wait4_reap(&mut self, pid: i32) {
         if self.procs.is_shared() {
             let all = crate::syscalls::JobWait { exits: true, stops: false, continues: false };
-            let (_, usage, ru) = super::share::dwait(self.pid, (pid, false), all, false, false, false);
+            let (_, usage, ru, _) = super::share::dwait(self.pid, (pid, false), all, false, false, false);
             self.darwin_page_collected(usage, ru);
             return;
         }

@@ -253,6 +253,37 @@ fn basic_info(k: &Kernel, t: i32) -> Result<[u32; 10], String> {
     Ok([secs as u32, usecs, 0, 0, cpu_usage as u32, policy, run_state, flags, suspend_count, 0])
 }
 
+/// An `_sleep` entered again by the running thread's wait (`kern_synch.c`
+/// counts each entry in `p_stats->p_ru.ru_nvcsw`): the wait's loop in XNU
+/// was woken and sleeps again, as `pipe_read`'s does when another reader
+/// took what the write that woke it put in, `pipe_write`'s when it has
+/// filled the buffer again after the room a read made, `soreceive`'s
+/// `sbwait` when another receiver took the data, and `wait4`'s `msleep0`
+/// when a child's end or stop woke it and is not one it reports. The
+/// first entry is counted as the call blocks ([`Kernel::darwin_note_wait`]);
+/// a host's own turns (its polls) are no wakeups and count nothing. The
+/// running thread's process's (`current_proc()`'s): none outside a Darwin
+/// process.
+pub fn sleep_again() {
+    super::pagecache::count_ru(super::ru::l::NVCSW);
+}
+
+impl Kernel {
+    /// The page's Darwin wait of the running thread (a `wait4` or
+    /// `waitid`) is over, its children having given it `wakes` wakeups by
+    /// now (`share::dwait`'s count), `woken` whether the last of them is
+    /// what it reports (an end or a stop): each other one since it slept
+    /// woke its `msleep0` to nothing it reports, and it slept again
+    /// ([`sleep_again`]). The page parks such a wait until the child it
+    /// asks for has something, so these are counted at its end.
+    pub fn darwin_wait_woken(&mut self, wakes: u64, woken: bool) {
+        let Some(since) = self.darwin_me().wait_wakes.take() else { return };
+        for _ in 0..wakes.saturating_sub(since).saturating_sub(u64::from(woken)) {
+            sleep_again();
+        }
+    }
+}
+
 impl Kernel {
     /// The calling thread blocks in `op`: whether XNU's wait for the call
     /// blocks at a continuation, which discards the thread's kernel stack
@@ -290,8 +321,14 @@ impl Kernel {
             // lf_advlock's msleep.
             BlockOp::FileLock { .. } => true,
             // wait4's and waitid's msleep0, reached when no child it asks
-            // for has anything to report (never under WNOHANG).
-            BlockOp::WaitChild { nohang: false, .. } => super::exit::wait_would_sleep(op),
+            // for has anything to report (never under WNOHANG). In the
+            // page, the wakeups its children have given it so far, which
+            // its wait's end counts from (`sleeps_since`).
+            BlockOp::WaitChild { nohang: false, .. } => {
+                let (sleeps, wakes) = super::exit::wait_would_sleep(op);
+                self.darwin_me().wait_wakes = wakes.filter(|_| sleeps);
+                sleeps
+            }
             // sigsuspend's tsleep0, entered whatever is pending.
             BlockOp::SigSuspend { .. } => true,
             _ => false,

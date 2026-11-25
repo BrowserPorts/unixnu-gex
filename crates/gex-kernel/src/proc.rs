@@ -1150,6 +1150,10 @@ impl ProcTable {
     /// is woken, as `stop()` and a continue wake it.
     pub fn job_set(&self, pid: i32, j: Job, ev: JobEvent) {
         let Some(cell) = self.lock().procs.iter().find(|p| p.pid == pid).map(|p| Arc::clone(&p.child.job)) else { return };
+        // stop()'s wakeup of the parent.
+        if ev == JobEvent::Stop {
+            self.child_woke(pid);
+        }
         {
             let mut g = cell.lock().unwrap_or_else(|e| e.into_inner());
             let (waited, continued) = (g.waited, g.continued);
@@ -1616,6 +1620,10 @@ impl ProcTable {
             let mut t = self.lock();
             t.mark_exited(pid);
             let ppid = t.procs.iter().find(|p| p.pid == pid).map(|p| p.ppid);
+            // proc_exit's wakeup of the parent.
+            if let Some(pp) = ppid.and_then(|ppid| t.procs.iter().find(|p| p.pid == ppid)) {
+                pp.child.wakes.fetch_add(1, Ordering::AcqRel);
+            }
             // proc_exit's fixjobc, before its children go to init.
             if let Some((pgid, sid)) = t.procs.iter().find(|p| p.pid == pid).map(|p| (p.pgid, p.sid)) {
                 t.fixjobc(pid, pgid, sid, false, &mut jobc_orphaned);
@@ -2382,6 +2390,22 @@ impl ProcTable {
         if let Some(p) = self.lock().procs.iter().find(|p| p.pid == pid) {
             p.queue.notify();
         }
+    }
+
+    /// Process `pid`'s parent is woken by it (a stop's wakeup): counted
+    /// ([`crate::syscalls::Child::wakes`]).
+    fn child_woke(&self, pid: i32) {
+        let t = self.lock();
+        let Some(ppid) = t.procs.iter().find(|p| p.pid == pid).map(|p| p.ppid) else { return };
+        if let Some(pp) = t.procs.iter().find(|p| p.pid == ppid) {
+            pp.child.wakes.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// The wakeups process `pid`'s children have given it so far
+    /// ([`crate::syscalls::Child::wakes`]).
+    pub fn child_wakes(&self, pid: i32) -> u64 {
+        self.lock().procs.iter().find(|p| p.pid == pid).map_or(0, |p| p.child.wakes.load(Ordering::Acquire))
     }
 
     pub fn job_changed(&self, pid: i32) {

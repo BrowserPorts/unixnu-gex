@@ -1219,12 +1219,20 @@ fn wait_round(k: &mut gex_kernel::syscalls::Kernel, gm: &mut GuestMem<'_>, tid: 
     // before it reaps the child, and either copy failing leaves the child
     // there to wait for (kern_exit.c). So it is looked at here, taking
     // nothing (a stop's mark included).
+    // The wakeups the caller's children have given its wait are counted
+    // as it ends (`darwin_wait_woken`), the last of them what it reports
+    // where that is an end or a stop.
     if waitid.is_none() {
-        if let (WaitStep::Ended { pid, .. }, ..) = gex_kernel::darwin::share::dwait(*ppid, want, *j, true, false, true) {
+        if let (WaitStep::Ended { pid, .. }, _, _, wakes) = gex_kernel::darwin::share::dwait(*ppid, want, *j, true, false, true) {
+            k.darwin_wait_woken(wakes, true);
             return Some(Ok(pid as u64));
         }
     }
-    let (step, usage, ru) = gex_kernel::darwin::share::dwait(*ppid, want, *j, nowait, waitid.is_some(), false);
+    let (step, usage, ru, wakes) = gex_kernel::darwin::share::dwait(*ppid, want, *j, nowait, waitid.is_some(), false);
+    // (Over unless it finds nothing and goes on waiting.)
+    if !matches!(step, WaitStep::Nothing) || *nohang || procs.halt_code().is_some() || k.signal_pending_for(tid) {
+        k.darwin_wait_woken(wakes, matches!(step, WaitStep::Ended { .. } | WaitStep::Stopped { .. }));
+    }
     if matches!(step, WaitStep::Ended { .. }) && !nowait {
         k.darwin_page_collected(usage, ru);
     }
@@ -1296,9 +1304,13 @@ fn stream_round(k: &mut gex_kernel::syscalls::Kernel, gm: &mut GuestMem<'_>, tid
         BlockOp::ReadStream { handle, buf, len, vectors } => {
             if handle.poll_readable() {
                 let mut tmp = vec![0u8; *len];
-                // Another reader of the same stream took it: wait again.
+                // Another reader of the same stream took it: wait again
+                // (its loop's msleep again, one more `_sleep`).
                 let n = match handle.read_at(0, &mut tmp) {
-                    Err(Errno::EAGAIN) => return turn(k),
+                    Err(Errno::EAGAIN) => {
+                        gex_kernel::darwin::thinfo::sleep_again();
+                        return turn(k);
+                    }
                     Err(e) => return Some(Err(e)),
                     Ok(n) => n,
                 };
@@ -1310,26 +1322,41 @@ fn stream_round(k: &mut gex_kernel::syscalls::Kernel, gm: &mut GuestMem<'_>, tid
             }
             turn(k)
         }
-        BlockOp::WriteStream { handle, gathered: Some(data), xnu: Some((orig, before)), .. } => loop {
-            let done = *written;
-            if done == data.len() {
-                return Some(Ok(before + done as u64));
-            }
-            if !handle.write_ready(data.len() - done, *orig) {
-                if k.signal_pending_for(tid) {
-                    let total = before + done as u64;
-                    return Some(if total > 0 { Ok(total) } else { Err(Errno::EINTR) });
+        BlockOp::WriteStream { handle, gathered: Some(data), xnu: Some((orig, before)), .. } => {
+            // What went in before this look: a write that put some in and
+            // finds no room again sleeps again (`pipe_write`'s msleep, one
+            // more `_sleep`).
+            let had = *written;
+            loop {
+                let done = *written;
+                if done == data.len() {
+                    return Some(Ok(before + done as u64));
                 }
-                return None;
+                if !handle.write_ready(data.len() - done, *orig) {
+                    if k.signal_pending_for(tid) {
+                        let total = before + done as u64;
+                        return Some(if total > 0 { Ok(total) } else { Err(Errno::EINTR) });
+                    }
+                    if done > had {
+                        gex_kernel::darwin::thinfo::sleep_again();
+                    }
+                    return None;
+                }
+                match handle.write_part(&data[done..], *orig) {
+                    Err(Errno::EPIPE) => return Some(Err(Errno::EPIPE)),
+                    Ok(0) => return None,
+                    // Another writer took the room it was woken for: it
+                    // sleeps again.
+                    Err(Errno::EAGAIN) => {
+                        gex_kernel::darwin::thinfo::sleep_again();
+                        return None;
+                    }
+                    Ok(n) => *written += n as usize,
+                    Err(_) if done > 0 => return Some(Ok(before + done as u64)),
+                    Err(e) => return Some(Err(e)),
+                }
             }
-            match handle.write_part(&data[done..], *orig) {
-                Err(Errno::EPIPE) => return Some(Err(Errno::EPIPE)),
-                Ok(0) | Err(Errno::EAGAIN) => return None,
-                Ok(n) => *written += n as usize,
-                Err(_) if done > 0 => return Some(Ok(before + done as u64)),
-                Err(e) => return Some(Err(e)),
-            }
-        },
+        }
         BlockOp::AcceptWait { socket } => {
             if socket.poll_readable() {
                 return Some(Ok(0));
@@ -1565,6 +1592,9 @@ pub(crate) fn adopted(i: usize) -> Option<u64> {
         gex_kernel::darwin::workq::thread_started(ks.tid);
         on_workers().push(ks.tid);
         h.kernel.enter_thread(&ks);
+        // Its processor time counts from its first entry; a wait the entry
+        // parks it in is no running time.
+        let cpu = h.kernel.thread_cpu_start();
         let mut gm = guest();
         let mut out = h.kernel.darwin_thread_entry(&mut gm);
         if let Some(SyscallOutcome::Blocking(op)) = &out {
@@ -1581,6 +1611,9 @@ pub(crate) fn adopted(i: usize) -> Option<u64> {
                 let _ = gm.write_u64(ks.ctx_addr + ctx::PC as u64, pc);
             }
             Some(SyscallOutcome::Blocking(op)) => {
+                if let Some(c) = &cpu {
+                    c.leave(true);
+                }
                 // Parked from the start: the context's pc is where it goes
                 // once its wait ends (`finished`).
                 let gex_kernel::BlockOp::FutexWait { table, uaddr, deadline, parked, val } = &op else { unreachable!("a Darwin wait the page parks is a futex wait") };
@@ -1593,9 +1626,6 @@ pub(crate) fn adopted(i: usize) -> Option<u64> {
                 let mut r = h.threads[i].run();
                 r.pc = 0;
                 r.waiting = r.park_as(waiting);
-        // Its processor time counts from its first entry; a wait the entry
-        // parks it in is no running time.
-        let cpu = h.kernel.thread_cpu_start();
                 r.blocked_on = Some(op);
                 r.owed = Owed { darwin: true, ..Owed::default() };
                 return Some(None);
@@ -1612,9 +1642,6 @@ pub(crate) fn adopted(i: usize) -> Option<u64> {
             }
             Some(SyscallOutcome::Killed { signal, .. }) => {
                 task_end(&mut h.kernel);
-                if let Some(c) = &cpu {
-                    c.leave(true);
-                }
                 killed(signal as i32, 0);
                 return None;
             }

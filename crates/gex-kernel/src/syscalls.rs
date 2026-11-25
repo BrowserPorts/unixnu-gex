@@ -10498,11 +10498,16 @@ pub struct Child {
     /// A Darwin process's task policy, which other processes reach too
     /// (setpriority's).
     pub policy: Arc<crate::darwin::taskpolicy::PolicyCell>,
+    /// The wakeups this process's children have given its `wait4` sleep
+    /// (XNU's `msleep0` on the proc): each child's end (`proc_exit`'s
+    /// `wakeup` of its parent) and stop (`stop()`'s), counted.
+    pub wakes: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Child {
     pub fn new(pid: i32) -> Child {
         Child {
+            wakes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             pid,
             status: Arc::new(Mutex::new(None)),
             done: Arc::new(std::sync::Condvar::new()),

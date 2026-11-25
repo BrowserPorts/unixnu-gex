@@ -233,6 +233,9 @@ pub struct DThread {
     /// Whether its wait, while it is off its CPU, keeps its kernel stack
     /// (`thread->kernel_stack`).
     pub kstack: KStack,
+    /// In the page, the wakeups its process's children had given it as its
+    /// `wait4` or `waitid` slept ([`crate::syscalls::Child::wakes`]).
+    pub wait_wakes: Option<u64>,
     /// Its registers were set: it goes back to user space at its pc.
     pub redirect: bool,
     /// The thread, made but not started (created suspended).

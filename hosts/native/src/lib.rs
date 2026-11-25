@@ -2458,6 +2458,10 @@ fn perform_block(
             // (fp_writev).
             let (orig, before) = xnu.map_or((data.len(), 0), |(orig, before)| (orig, before));
             let mut done = 0usize;
+            // Whether some went in since the wait last began: a Darwin pipe
+            // write's loop sleeps again once it has filled the room a read
+            // woke it for (`pipe_write`'s msleep, one more `_sleep`).
+            let mut progressed = false;
             while done < data.len() {
                 let seen = ready::seq();
                 if !handle.write_ready(data.len() - done, orig) {
@@ -2467,18 +2471,27 @@ fn perform_block(
                         let total = before + done as u64;
                         return if total > 0 { Ok(total) } else { Err(Errno::EINTR) };
                     }
+                    if std::mem::take(&mut progressed) {
+                        gex_kernel::darwin::thinfo::sleep_again();
+                    }
                     blocked::write_stream(seen, std::time::Duration::from_millis(1));
                     continue;
                 }
                 match handle.write_part(&data[done..], orig) {
                     Err(Errno::EPIPE) if xnu.is_some() => return Err(Errno::EPIPE),
                     Ok(0) => std::thread::sleep(std::time::Duration::from_millis(1)),
-                    Ok(n) => done += n as usize,
+                    Ok(n) => {
+                        done += n as usize;
+                        progressed = true;
+                    }
                     // Another writer filled it between the check and the
                     // write: wait again, as the page does, never EAGAIN on a
                     // descriptor that is not non-blocking. (Or a small write
-                    // waiting for room for all of it.)
+                    // waiting for room for all of it.) The room it was woken
+                    // for went to another: it sleeps again.
                     Err(Errno::EAGAIN) => {
+                        progressed = false;
+                        gex_kernel::darwin::thinfo::sleep_again();
                         blocked::write_stream(seen, std::time::Duration::from_millis(1));
                         continue;
                     }
@@ -2497,9 +2510,13 @@ fn perform_block(
                 service(data);
                 if handle.poll_readable() {
                     // Another reader of the same pipe can take what woke
-                    // this one: wait again, as the page does.
+                    // this one: wait again, as the page does (its loop's
+                    // msleep again, one more `_sleep`).
                     let n = match handle.read_at(0, &mut tmp) {
-                        Err(Errno::EAGAIN) => continue,
+                        Err(Errno::EAGAIN) => {
+                            gex_kernel::darwin::thinfo::sleep_again();
+                            continue;
+                        }
                         r => r?,
                     };
                     let mut mem = GuestMem::new(data);
@@ -2598,6 +2615,7 @@ fn perform_block(
             // The children list passed in is already this process's, so ppid
             // is redundant here, and a group's children are in it already.
             ppid: _,
+            group: _,
         } => {
             let nowait = waitid.is_some_and(|w| w.nowait);
             let candidates: Vec<_> = children
@@ -2612,10 +2630,24 @@ fn perform_block(
             // stop only; a continue here is acted on in the child, after the
             // sender's kill has returned, so a wait begun after that kill must
             // still find it.)
+            // Each child's end and stop as last looked at: XNU's wait4
+            // sleeps (msleep0) until a child's end or stop wakes it
+            // (proc_exit's and stop()'s wakeup of the parent), any child's,
+            // and one it does not report sends it back to sleep, one more
+            // `_sleep`.
+            let events = || -> Vec<(bool, bool)> {
+                children
+                    .iter()
+                    .map(|c| {
+                        let ended = c.reaped.load(std::sync::atomic::Ordering::Acquire) || c.status.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+                        (ended, c.job.lock().unwrap_or_else(|e| e.into_inner()).stopped)
+                    })
+                    .collect()
+            };
+            let mut looked = events();
             loop {
                 // A child the system reaped as it ended (a Darwin parent
                 // with P_NOCLDWAIT) is no longer there to wait for; none
-            group: _,
                 // left, the wait finds none.
                 if candidates.iter().all(|c| c.reaped.load(std::sync::atomic::Ordering::Acquire)) {
                     return Err(Errno::ECHILD);
@@ -2728,6 +2760,11 @@ fn perform_block(
                 if interrupted() {
                     return Err(Errno::EINTR);
                 }
+                let now = events();
+                if now.iter().zip(&looked).any(|(n, l)| (n.0 && !l.0) || (n.1 && !l.1)) {
+                    gex_kernel::darwin::thinfo::sleep_again();
+                }
+                looked = now;
                 // Any child's condvar will do to park on; they are woken
                 // together with the status they set.
                 let c = candidates[0];

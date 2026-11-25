@@ -39,6 +39,16 @@ pub mod xnu {
     /// `PIPE_KVAMAX`, `maxpipekva`'s value.
     pub const KVA_MAX: i64 = 1024 * 1024 * 16;
 
+    /// The bits of a `struct pipe`'s `pipe_state` (`bsd/sys/pipe.h`) a
+    /// pipe keeps, or makes of its ends ([`super::Pipe::pipe_status`]).
+    pub mod state {
+        pub const ASYNC: u32 = 0x004;
+        pub const WANTR: u32 = 0x008;
+        pub const WANTW: u32 = 0x010;
+        pub const EOF: u32 = 0x080;
+        pub const WSELECT: u32 = 0x4000;
+    }
+
     /// `amountpipekva`: what every Darwin pipe's buffer holds, together.
     pub static KVA: AtomicI64 = AtomicI64::new(0);
 
@@ -89,6 +99,13 @@ struct State {
     /// its `PIPE_ASYNC`.
     pgid: [i32; 2],
     async_io: [bool; 2],
+    /// The `pipe_state` bits of each side's `struct pipe` (read, write)
+    /// that its sleepers and `select` set ([`xnu::state`]): `PIPE_WANTR`
+    /// and `PIPE_WANTW` (both the read side's, which holds the buffer),
+    /// `PIPE_WSELECT` (the peer's of an end selected for writing).
+    xnu_bits: [u32; 2],
+    /// What names a Darwin pipe in every process ([`Pipe::set_ident`]).
+    ident: [u64; 2],
 }
 
 /// One pipe, shared by both ends.
@@ -145,6 +162,8 @@ impl Pipe {
                 xnu_size: None,
                 pgid: [0; 2],
                 async_io: [false; 2],
+                xnu_bits: [0; 2],
+                ident: [0; 2],
             }),
             ready: Condvar::new(),
             queue: crate::wait::Queue::new(),
@@ -161,6 +180,18 @@ impl Pipe {
         p
     }
 
+    /// What names this pipe in every process that holds an end of it, no
+    /// other pipe's while it lives: its maker's and its number there, for
+    /// the handles `fill_pipeinfo` makes of its ends' addresses.
+    pub fn set_ident(&self, ident: [u64; 2]) {
+        self.state.lock().unwrap().ident = ident;
+    }
+
+    /// See [`Pipe::set_ident`].
+    pub fn ident(&self) -> [u64; 2] {
+        self.state.lock().unwrap().ident
+    }
+
     /// The `pipe_pgid` of the write side or the read side.
     pub fn pgid(&self, write: bool) -> i32 {
         self.state.lock().unwrap().pgid[usize::from(write)]
@@ -174,6 +205,36 @@ impl Pipe {
     pub fn set_async(&self, write: bool, on: bool, send: std::sync::Arc<dyn Fn(i32) + Send + Sync>) {
         self.state.lock().unwrap().async_io[usize::from(write)] = on;
         *self.sigio.lock().unwrap() = Some(Sigio(send));
+    }
+
+    /// `bits` set in the `pipe_state` of side `write`'s struct, as
+    /// `pipe_read`'s and `pipe_write`'s sleeps (`PIPE_WANTR`, `PIPE_WANTW`)
+    /// and `pipe_select` (`PIPE_WSELECT`) set them; none once that side has
+    /// closed (its peer's `pipe_peer` is then NULL).
+    pub fn mark(&self, write: bool, bits: u32) {
+        let mut s = self.state.lock().unwrap();
+        let open = if write { s.writers } else { s.readers } > 0;
+        if open {
+            s.xnu_bits[usize::from(write)] |= bits;
+        }
+    }
+
+    /// The `pipe_state` of side `write`'s struct (`fill_pipeinfo`'s
+    /// `pipe_status`): the bits its sleepers and `select` set, `PIPE_ASYNC`
+    /// as `FIOASYNC` set it, and `PIPE_EOF` once the other side has closed
+    /// (`pipeclose` of its peer).
+    pub fn pipe_status(&self, write: bool) -> u32 {
+        let s = self.state.lock().unwrap();
+        let side = usize::from(write);
+        let peer_open = if write { s.readers } else { s.writers } > 0;
+        let mut bits = s.xnu_bits[side];
+        if s.async_io[side] {
+            bits |= xnu::state::ASYNC;
+        }
+        if !peer_open {
+            bits |= xnu::state::EOF;
+        }
+        bits
     }
 
     /// `pipeselwakeup`'s SIGIO, for side `write` of a Darwin pipe: to its
@@ -194,7 +255,12 @@ impl Pipe {
     /// side's SIGIO.
     fn xnu_after_read(&self) {
         let room = {
-            let s = self.state.lock().unwrap();
+            let mut s = self.state.lock().unwrap();
+            // pipe_read's end: a writer that slept for room is woken, its
+            // PIPE_WANTW cleared, while the buffer holds less than its size.
+            if s.xnu_size.unwrap_or(PIPE_BUF) > s.buf.len() {
+                s.xnu_bits[0] &= !xnu::state::WANTW;
+            }
             s.xnu_size.is_some_and(|size| size > s.buf.len())
         };
         if room {
@@ -245,6 +311,9 @@ impl Pipe {
             s.broken += 1;
             return Err(Errno::EPIPE);
         }
+        // A reader that slept for bytes is woken, with what this pass puts
+        // in or before the writer sleeps for room: its PIPE_WANTR cleared.
+        s.xnu_bits[0] &= !xnu::state::WANTR;
         let size = s.xnu_size.expect("a Darwin pipe");
         let mut space = size.saturating_sub(s.buf.len());
         if space < left && orig <= xnu::PIPE_BUF {
@@ -448,6 +517,9 @@ impl Pipe {
                     Err(Errno::EPIPE)
                 };
             }
+            // A reader that slept for bytes is woken (its PIPE_WANTR, for
+            // a Darwin process's sleep on it, cleared).
+            s.xnu_bits[0] &= !xnu::state::WANTR;
             let room = PIPE_BUF.saturating_sub(s.buf.len());
             // A small write waits for room for all of it (`EAGAIN` here; the
             // syscall layer parks a blocking one and tries it whole again).
@@ -705,6 +777,34 @@ mod tests {
         assert_eq!(p.write(b"x").unwrap(), 1);
     }
 
+    /// A Darwin pipe's sides' `pipe_state`: a sleeping reader's
+    /// PIPE_WANTR until a write, a sleeping writer's PIPE_WANTW until a
+    /// read (both the read side's), FIOASYNC's PIPE_ASYNC, a select's
+    /// PIPE_WSELECT, and PIPE_EOF once the other side has closed; a side
+    /// that has closed takes no mark.
+    #[test]
+    fn a_darwin_pipes_status_follows_its_sleepers_and_its_ends() {
+        use xnu::state::*;
+        let p = Pipe::new_xnu();
+        assert_eq!((p.pipe_status(false), p.pipe_status(true)), (0, 0));
+        p.mark(false, WANTR);
+        assert_eq!((p.pipe_status(false), p.pipe_status(true)), (WANTR, 0));
+        p.xnu_begin_write(3).unwrap();
+        assert_eq!(p.xnu_write_with(3, 3, |d, _| d.fill(1)).unwrap(), 3);
+        assert_eq!(p.pipe_status(false), 0);
+        p.mark(false, WANTW);
+        let mut b = [0u8; 8];
+        assert_eq!(p.read(&mut b).unwrap(), 3);
+        assert_eq!(p.pipe_status(false), 0);
+        p.set_async(false, true, Arc::new(|_: i32| {}));
+        p.mark(true, WSELECT);
+        assert_eq!((p.pipe_status(false), p.pipe_status(true)), (ASYNC, WSELECT));
+        p.close_end(true);
+        assert_eq!(p.pipe_status(false), ASYNC | EOF);
+        p.mark(true, WANTW);
+        assert_eq!(p.pipe_status(true), WSELECT, "a closed side takes no mark");
+    }
+
     #[test]
     fn a_small_write_goes_in_whole_or_not_at_all() {
         // At most PIPE_ATOMIC bytes: never split, so no other writer's
@@ -754,6 +854,10 @@ pub struct Remote {
     pub buffered: extern "C" fn(id: i32) -> i32,
     /// The pipe's wait queue (`crate::wait`).
     pub queue: extern "C" fn(id: i32) -> u32,
+    /// [`Pipe::mark`] of a side (`write` 1 the write side's).
+    pub mark: extern "C" fn(id: i32, write: i32, bits: u32),
+    /// [`Pipe::pipe_status`] of a side; negative when the pipe is gone.
+    pub status: extern "C" fn(id: i32, write: i32) -> i32,
 }
 
 /// One end of a pipe in the global kernel. Dropping closes that end there, so
@@ -782,6 +886,10 @@ impl Drop for RemotePipeEnd {
 }
 
 impl crate::vfs::FileHandle for RemotePipeEnd {
+    fn as_remote_pipe(&self) -> Option<&RemotePipeEnd> {
+        Some(self)
+    }
+
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> SysResult {
         if self.write {
             return Err(Errno::EBADF);

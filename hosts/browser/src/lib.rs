@@ -672,6 +672,8 @@ extern "C" {
     fn k_pipe_readable(id: i32) -> i32;
     fn k_pipe_writable(id: i32) -> i32;
     fn k_pipe_buffered(id: i32) -> i32;
+    fn k_pipe_mark(id: i32, write: i32, bits: u32);
+    fn k_pipe_status(id: i32, write: i32) -> i32;
 
     // inotify instances, kept beside the shared tree whose changes they hear
     // (gex_kernel::inotify::Remote).
@@ -1381,6 +1383,12 @@ extern "C" fn rp_writable(id: i32) -> i32 {
 extern "C" fn rp_buffered(id: i32) -> i32 {
     unsafe { k_pipe_buffered(id) }
 }
+extern "C" fn rp_mark(id: i32, write: i32, bits: u32) {
+    unsafe { k_pipe_mark(id, write, bits) }
+}
+extern "C" fn rp_status(id: i32, write: i32) -> i32 {
+    unsafe { k_pipe_status(id, write) }
+}
 
 // The terminal, which is one object for the whole system and not one per
 // process. See `gex_kernel::tty`.
@@ -1555,6 +1563,8 @@ pub(crate) fn global_pipes() -> Option<gex_kernel::pipe::Remote> {
         readable: rp_readable,
         writable: rp_writable,
         buffered: rp_buffered,
+        mark: rp_mark,
+        status: rp_status,
     })
 }
 

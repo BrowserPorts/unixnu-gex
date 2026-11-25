@@ -143,6 +143,12 @@ impl Kernel {
         for (i, &(set, fd)) in wanted.iter().enumerate() {
             let events = [pollev::IN, pollev::OUT, pollev::PRI][set];
             let mut revents = 0;
+            // pipe_select for writing marks the end's peer (PIPE_WSELECT).
+            if set == 1 {
+                if let Ok(file) = self.fds.get(fd as i32) {
+                    super::pipe::selected_for_write(file.handle.as_ref());
+                }
+            }
             if self.darwin_select_always(fd as i32, set) {
                 revents = events;
                 rfds += 1;

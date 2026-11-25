@@ -291,6 +291,12 @@ impl Kernel {
     pub(crate) fn darwin_note_wait(&mut self, op: &BlockOp) {
         let k = self.darwin_wait_kstack(op);
         self.darwin_me().kstack = k;
+        // A pipe's reader or writer marks the pipe as it sleeps.
+        match op {
+            BlockOp::ReadStream { handle, .. } => super::pipe::sleeps(handle.as_ref(), false),
+            BlockOp::WriteStream { handle, xnu: Some(_), .. } => super::pipe::sleeps(handle.as_ref(), true),
+            _ => {}
+        }
         if self.darwin_wait_sleeps(op) {
             self.dtask.rusage.ru.count(super::ru::l::NVCSW);
         }

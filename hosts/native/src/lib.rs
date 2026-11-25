@@ -2465,6 +2465,9 @@ fn perform_block(
             while done < data.len() {
                 let seen = ready::seq();
                 if !handle.write_ready(data.len() - done, orig) {
+                    // A Darwin pipe's writer marks the pipe as it sleeps
+                    // for room (PIPE_WANTW), a signal ending it or not.
+                    gex_kernel::darwin::pipe::sleeps(handle.as_ref(), true);
                     // A partial write already delivered is the caller's
                     // answer; only an untouched write reports the signal.
                     if interrupted() {
@@ -2492,6 +2495,7 @@ fn perform_block(
                     Err(Errno::EAGAIN) => {
                         progressed = false;
                         gex_kernel::darwin::thinfo::sleep_again();
+                        gex_kernel::darwin::pipe::sleeps(handle.as_ref(), true);
                         blocked::write_stream(seen, std::time::Duration::from_millis(1));
                         continue;
                     }
@@ -2527,6 +2531,9 @@ fn perform_block(
                     }
                     return Ok(n);
                 }
+                // A Darwin pipe's reader marks the pipe as it sleeps
+                // (PIPE_WANTR).
+                gex_kernel::darwin::pipe::sleeps(handle.as_ref(), false);
                 turn!(read_stream, seen);
             }
         }

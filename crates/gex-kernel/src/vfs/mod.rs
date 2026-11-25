@@ -732,6 +732,12 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// An end of a pipe another module holds (the page's global kernel's),
+    /// itself.
+    fn as_remote_pipe(&self) -> Option<&crate::pipe::RemotePipeEnd> {
+        None
+    }
+
     /// For one of the host's standard streams, what the host's descriptor
     /// really is ([`crate::stdio::HostKind`]); `None` for anything else, or
     /// where the host cannot say.

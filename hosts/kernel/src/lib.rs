@@ -2342,6 +2342,22 @@ pub extern "C" fn k_pipe_buffered(id: i32) -> i32 {
     pipe_at(id).map_or(0, |p| p.buffered() as i32)
 }
 
+/// Bits set in a side's `pipe_state` (`Pipe::mark`): a Darwin process's
+/// sleep on the pipe, or its `select` for writing.
+#[no_mangle]
+pub extern "C" fn k_pipe_mark(id: i32, write: i32, bits: u32) {
+    if let Some(p) = pipe_at(id) {
+        p.mark(write != 0, bits);
+    }
+}
+
+/// A side's `pipe_state` (`Pipe::pipe_status`), for `fill_pipeinfo`;
+/// -EBADF when the pipe is gone.
+#[no_mangle]
+pub extern "C" fn k_pipe_status(id: i32, write: i32) -> i32 {
+    pipe_at(id).map_or(-9, |p| p.pipe_status(write != 0) as i32)
+}
+
 // ---------------------------------------------------------------------------
 // Unix98 pseudoterminals. The same shape as pipes -- a numbered pair in the
 // global kernel, bytes copied across memories -- with the terminal added: the

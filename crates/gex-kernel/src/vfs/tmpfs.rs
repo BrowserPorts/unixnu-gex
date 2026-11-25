@@ -1314,6 +1314,29 @@ impl TmpFs {
         persist::late_laid(&mut inner, &path, ino);
     }
 
+    /// `path` and everything under it gone, for seeding: a layer that lays
+    /// a link or a file where a directory is replaces the directory, as a
+    /// later layer's path wins (kernel pagetar.rs). Nothing for a name
+    /// that is not there.
+    pub fn remove_tree(&self, path: &str) -> Result<(), Errno> {
+        let path = path.trim_start_matches('/');
+        let mut under: Vec<(String, bool)> = {
+            let inner = self.inner.lock().unwrap();
+            let prefix = format!("{path}/");
+            inner.nodes.iter().filter(|(k, _)| *k == path || k.starts_with(&prefix)).map(|(k, n)| (k.clone(), matches!(n, Node::Dir))).collect()
+        };
+        // Deepest first: a directory once its entries are gone.
+        under.sort_by_key(|(k, _)| std::cmp::Reverse(k.matches('/').count()));
+        for (k, dir) in under {
+            if dir {
+                self.rmdir(&k)?;
+            } else {
+                self.unlink(&k)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Where a lazy file's bytes are ([`TmpFs::add_lazy`]) and its size,
     /// while it is one (not yet made an ordinary file by a write).
     pub fn lazy_source(&self, path: &str) -> Option<(String, u64)> {
@@ -2966,6 +2989,25 @@ mod tests {
         assert_eq!(fs.rmdir("d").err(), Some(Errno::ENOTEMPTY));
         fs.unlink("d/f").unwrap();
         assert!(fs.rmdir("d").is_ok());
+    }
+
+    #[test]
+    fn a_tree_removed_for_a_layer_goes_whole() {
+        let fs = TmpFs::new();
+        fs.add_dir("/var/tmp/deep");
+        fs.add_file("var/run.pid", b"1".to_vec());
+        fs.add_symlink("var/tmp/link", "x");
+        fs.add_dir("/varnish");
+        fs.remove_tree("/var").unwrap();
+        for p in ["var", "var/tmp", "var/tmp/deep", "var/run.pid", "var/tmp/link"] {
+            assert_eq!(fs.metadata_nofollow(p).err(), Some(Errno::ENOENT), "{p}");
+        }
+        // A name that only starts the same stays.
+        assert!(fs.metadata("varnish").is_ok());
+        fs.add_symlink("var", "private/var");
+        assert_eq!(fs.read_link("var").unwrap(), "private/var");
+        // Nothing there: nothing to do.
+        fs.remove_tree("absent").unwrap();
     }
 
     #[test]

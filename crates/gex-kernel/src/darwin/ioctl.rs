@@ -179,6 +179,11 @@ impl Kernel {
         if matches!(file.path.as_str(), "/dev/stdin" | "/dev/stdout" | "/dev/stderr") && ty == Ok(FileType::CharDevice) {
             return Kind::HostStream(file.handle.is_tty());
         }
+        // A pipe the page's global kernel holds (the page's own, a program's
+        // standard streams among them): a pipe on the host, as gexc's.
+        if file.path.starts_with("pipe:[") && ty == Ok(FileType::Fifo) {
+            return Kind::HostStream(false);
+        }
         match ty {
             Ok(FileType::Socket) => Kind::Socket,
             Ok(t) => Kind::Vnode(t),

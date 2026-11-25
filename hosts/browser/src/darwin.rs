@@ -102,11 +102,12 @@ fn start(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> Result<u
         Some(_) => None,
         None => {
             let Some(bytes) = h.kernel.read_file(path) else { return Err(load("cannot read it".into())) };
+            // dyld, when it names one, from the page's root (gexc's
+            // --sysroot).
             let img = {
                 let k = &h.kernel;
                 darwin::image::load(&bytes, path, &|p: &str| k.read_file(p).ok_or_else(|| format!("cannot read {p}"))).map_err(load)?
             };
-            static_only(&img).map_err(load)?;
             Some(img)
         }
     };
@@ -221,8 +222,8 @@ fn start(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> Result<u
             k.darwin_page_start();
             // (No scheduler maintenance thread: the page runs none, and the
             // averages it would keep say so when asked, `Sched::check`.)
-            // A system launchd has booted has its Preboot volume grafted: with
-            // the disk0 image only, which the page does not give yet.
+            // A system launchd has booted has its Preboot volume mounted,
+            // with the boot cryptexes grafted on it (with the page's disk0).
             k.darwin_boot_grafts();
             // Its first thread is in its task's list from the start.
             if k.sig_tid == 0 {
@@ -264,10 +265,30 @@ fn start(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> Result<u
         let sp = img.thread_stack;
         h.kernel.darwin_unimplemented(format!("an LC_UNIXTHREAD that names its stack ({sp:#x}, load_threadstack's custom stack): the default stack is made instead"));
     }
-    // Its shared region, as it enters it at exec (`vm_map_exec`): with
-    // pid 1 the page kernel's own, an empty one (the boot's holds the
-    // cache launchd's dyld mapped, which a static program does not use).
-    h.kernel.darwin_shared_region_enter(&mut data, false);
+    // Its shared region, as it enters it at exec (`vm_map_exec`), as dyld
+    // left it. Pid 1 is the page kernel's own, as with gexc's virtual
+    // init, so the boot's region holds the cache launchd's dyld mapped
+    // into it at boot: the OS cryptex's, from its graft (darwin::CACHE_PATH,
+    // whose trust cache the boot's grafts loaded), for a program with dyld
+    // (gexc maps no cache for a static one).
+    if spawn_exec.is_none() && img.program.interp.is_some() {
+        let (dir, main) = darwin::CACHE_PATH.rsplit_once('/').expect("the shared cache's path");
+        let t0 = now_ns();
+        h.kernel.darwin_boot_shared_region(dir, main).map_err(|e| load(format!("the boot's shared region: {e}")))?;
+        if h.kernel.trace {
+            warn_line(&format!("[gex:{}] the boot's shared region mapped in {} ms\n", h.kernel.pid, (now_ns() - t0) / 1_000_000));
+        }
+    }
+    // Its region's mappings are written into its memory as it enters it:
+    // the memory first grown over the whole of the address space it maps,
+    // up to its commpage's alias at the top.
+    let top = gex_abi::DARWIN_COMMPAGE_ALIAS + (gex_abi::DARWIN_COMMPAGE_END - gex_abi::DARWIN_COMMPAGE_RO);
+    if !grow_memory_to(top) {
+        return Err(load(format!("its address space up to {top:#x}: the memory will not grow to it")));
+    }
+    // IMGPF_DRIVER: a spawn as a driver.
+    let driverkit = spawn_exec.as_ref().and_then(|i| i.spawn.as_ref()).is_some_and(|sp| sp.policy.0 == darwin::taskpolicy::apptype::DRIVER);
+    h.kernel.darwin_shared_region_enter(&mut data, driverkit);
     // And its commpage, at the alias its constant addresses are folded to.
     {
         use darwin::commpage;
@@ -293,7 +314,7 @@ fn start(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> Result<u
         let exec = spawn_exec.as_deref();
         let loaded = darwin::exec::Loaded {
             mach_header: header,
-            dylinker: None,
+            dylinker: img.dylinker.as_deref().filter(|_| img.program.interp.is_some()),
             stacksize: img.stacksize,
             exe_path: path,
             file_start: exec.map_or(0, |i| i.arch_offset),
@@ -312,8 +333,9 @@ fn start(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> Result<u
         mm.insert(st.alloc, st.alloc + st.guard, prot::NONE, "[stack]");
         mm.insert(st.alloc + st.guard, st.alloc + st.size, prot::READ | prot::WRITE, "[stack]");
     }
-    // Its registers: clear, its stack pointer and its entry.
-    let entry = img.program.exe.entry;
+    // Its registers: clear, its stack pointer and its entry: dyld's when
+    // it has one.
+    let entry = img.program.entry();
     let c = ctx_addr as usize;
     for i in 0..31u8 {
         write_u64(&mut data, c + ctx::x(i), 0);
@@ -403,13 +425,14 @@ fn disk0() -> Option<(std::sync::Arc<dyn gex_kernel::darwin::apfswrite::Sink>, V
     Some((std::sync::Arc::new(PageDisk0(size)), missing))
 }
 
-/// A program the page runs has no dyld: dyld and the shared cache it maps
-/// are the root's, from the boot's graft of the OS cryptex on the disk's
-/// Preboot volume, which the page does not give a Darwin system yet.
+/// A posix_spawn's child in the page runs no dyld: its shared cache is
+/// the boot's region, which in the page is each process's own copy, made
+/// from the boot's grafts, and those are the first Darwin process's (the
+/// kernel's container on disk0 is held by the process that mounted it).
 fn static_only(img: &gex_kernel::darwin::image::DarwinImage) -> Result<(), String> {
     match img.program.interp {
         Some(_) => Err(format!(
-            "a dynamic Darwin program (it names {}), whose shared cache comes from the boot's graft of the OS cryptex (the disk0 image), which the page does not give its Darwin system yet",
+            "a dynamic Darwin program (it names {}) as a posix_spawn's child: its shared cache is the boot's region, which in the page is each process's own, made from the boot's grafts, which the first Darwin process of the page holds",
             img.dylinker.as_deref().unwrap_or("dyld")
         )),
         None => Ok(()),
@@ -594,7 +617,7 @@ fn spawned_start(h: &mut Host, blob: &[u8]) -> Result<(gex_kernel::darwin::image
             return Err(Fail::Unseen);
         }
     };
-    // Natively it would run; the page has no dyld for it: said, the child
+    // Natively it would run; the page runs no dyld for it: said, the child
     // let go (its task ended, its descriptors closed, its pid reaped) and
     // its spawner's call failed with ENOSYS.
     if let Err(why) = static_only(&loaded) {

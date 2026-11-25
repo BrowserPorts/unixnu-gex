@@ -4,7 +4,8 @@
 // FIFO (S_IFIFO | 0660) of the caller's ids, no links, its size what is
 // buffered for reading and its block size the size of its buffer (the
 // global kernel's pipe's, 64 KiB), the write ends their reader's. Bytes
-// written to standard input show as its size. (gexc's standard streams
+// written to standard input show as its size, and as FIONREAD's count;
+// proc_pidfdlist says each is a pipe. (gexc's standard streams
 // are the host's, each shown as what it is: tests/darwin/run.sh's
 // stdstat.)
 import { System } from '../../page/runtime/src/index.js';
@@ -27,6 +28,10 @@ export default async function (t) {
   eq('and it ends', r.code, 0, ctx);
   const w = await timeout(sys.run(['/var/tmp/stdstat', 'wait'], { input: 'abcdef' }), 60000, 'stdstat wait');
   eq("standard input's size is what is buffered", w.stdout, pipe(0, 6), `stderr: ${w.stderr.slice(-1000)}`);
+  // Their kinds as proc_pidfdlist gives them (pipes), FIONREAD (this end's
+  // buffered bytes; a write end has none), and a vnode's fcntl refused.
+  const k = await timeout(sys.run(['/var/tmp/stdstat', 'kinds'], { input: 'abcdef' }), 60000, 'stdstat kinds');
+  eq('each is a pipe to proc_pidfdlist and to FIONREAD', k.stdout, 'fd 0 type 6 nread 6 nocache 9\nfd 1 type 6 nread 0 nocache 9\n', `stderr: ${k.stderr.slice(-1000)}\nconsole: ${sys.state.console.slice(-2000)}`);
   // gexc's: its host's streams as the image's run gave them, Node's
   // socket pairs, each soo_stat's (S_IFSOCK).
   t.say(`gexc's: ${JSON.stringify(image.native.stdstat?.stdout)}`);

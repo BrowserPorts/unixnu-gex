@@ -74,6 +74,10 @@ pub struct StdStream {
     /// file`, `pcre2grep -m`) and concurrent writers to one log file share
     /// the offset as on Linux.
     host_file: bool,
+    /// The process group a Darwin process set on this stream, a pipe's
+    /// `pipe_pgid` or a socket's `so_pgid` (`TIOCSPGRP`, `SIOCSPGRP`): the
+    /// guest's own, kept here, never the host's.
+    pub pgid: std::sync::atomic::AtomicI32,
 }
 
 /// The host's own descriptor for a stream: a duplicate, which shares the
@@ -97,11 +101,40 @@ impl StdStream {
         let host_file = !tty && host(stream).is_some_and(|f| f.metadata().is_ok_and(|m| m.is_file()));
         #[cfg(target_family = "wasm")]
         let host_file = false;
-        StdStream { stream, tty, host_file }
+        StdStream { stream, tty, host_file, pgid: std::sync::atomic::AtomicI32::new(0) }
+    }
+}
+
+impl StdStream {
+    /// An int-reading `ioctl` on the host's descriptor, as the host's XNU
+    /// answers it; `None` off XNU or without a descriptor.
+    pub fn xnu_ioctl_int(&self, cmd: u64) -> Option<Result<i32, Errno>> {
+        (crate::hostos::calls().xnu_ioctl_int)(self.host_fd()?, cmd)
+    }
+
+    /// `proc_pidfdinfo` of the host's descriptor, as the host's XNU
+    /// answers it; `None` off XNU or without a descriptor.
+    pub fn xnu_fdinfo(&self, flavor: i32, out: &mut [u8]) -> Option<Result<usize, Errno>> {
+        (crate::hostos::calls().xnu_fdinfo)(self.host_fd()?, flavor, out)
+    }
+
+    #[cfg(all(unix, not(target_family = "wasm")))]
+    fn host_fd(&self) -> Option<i32> {
+        use std::os::fd::AsRawFd;
+        host(self.stream).map(|f| f.as_raw_fd())
+    }
+
+    #[cfg(not(all(unix, not(target_family = "wasm"))))]
+    fn host_fd(&self) -> Option<i32> {
+        None
     }
 }
 
 impl FileHandle for StdStream {
+    fn as_std_stream(&self) -> Option<&StdStream> {
+        Some(self)
+    }
+
     fn is_host_stdio(&self) -> bool {
         true
     }

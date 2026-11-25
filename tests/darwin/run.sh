@@ -427,7 +427,53 @@ run() {
 fd 1 mode 10660 nlink 0 uid 0 gid 0 size 0 blksize 16384 flags 0
 fd 2 mode 20666 nlink 1 uid 0 gid 0 size 0 blksize 65536 flags 0" 0
         out=$(printf 'abcdef' | with_disk0 "$GEXC" run --uid 0:0 "$HERE/bin/stdstat" wait 2>/dev/null)
-        report stdstat-pipe "$out" $? "fd 0 mode 10660 nlink 0 uid 0 gid 0 size 6 blksize 16384 flags 0" 0 ;;
+        report stdstat-pipe "$out" $? "fd 0 mode 10660 nlink 0 uid 0 gid 0 size 6 blksize 16384 flags 0" 0
+        # Each a pipe: their kinds (proc_pidfdlist), FIONREAD and a vnode's
+        # fcntl refused, their owners (pipe_pgid), proc_pidfdinfo's
+        # pipe_info.
+        for mode in kinds owner fdinfo; do
+            out=$(printf 'abcdef' | with_disk0 "$GEXC" run --uid 0:0 "$HERE/bin/stdstat" $mode 2>/dev/null)
+            case $mode in
+            kinds) want="fd 0 type 6 nread 6 nocache 9
+fd 1 type 6 nread 0 nocache 9" ;;
+            owner) want="fd 0 pgid 0 4242
+fd 1 pgid 0 4242" ;;
+            fdinfo) want="fd 0 info 0 size 184 mode 10660 uid 0 fsize 6
+fd 1 info 0 size 184 mode 10660 uid 0 fsize 0" ;;
+            esac
+            report "stdstat-$mode" "$out" $? "$want" 0
+        done
+        # Each a socket (a socket pair's end, as a parent may hand one over):
+        # the same, so_pgid, and socket_fdinfo (whose soi_stat
+        # fill_socketinfo leaves zero).
+        for mode in kinds owner fdinfo; do
+            out=$(python3 -I -c '
+import socket, subprocess, sys
+a, b = socket.socketpair()
+c, d = socket.socketpair()
+a.sendall(b"abcdef")
+p = subprocess.Popen(sys.argv[1:], stdin=b, stdout=d, stderr=subprocess.DEVNULL)
+b.close()
+d.close()
+got = b""
+while True:
+    x = c.recv(4096)
+    if not x:
+        break
+    got += x
+sys.stdout.write(got.decode())
+sys.exit(p.wait())
+' "$GEXC" run --uid 0:0 "$HERE/bin/stdstat" $mode)
+            case $mode in
+            kinds) want="fd 0 type 2 nread 6 nocache 9
+fd 1 type 2 nread 0 nocache 9" ;;
+            owner) want="fd 0 pgid 0 4242
+fd 1 pgid 0 4242" ;;
+            fdinfo) want="fd 0 info 0 size 792 mode 0 uid 0 fsize 0
+fd 1 info 0 size 792 mode 0 uid 0 fsize 0" ;;
+            esac
+            report "stdstat-socket-$mode" "$out" $? "$want" 0
+        done ;;
     # disk0's character node as root, on the run's own clone of the image:
     # the GPT, its backup, the container's superblock as the boot's update
     # of the container to read-write wrote it (not cleanly unmounted), a

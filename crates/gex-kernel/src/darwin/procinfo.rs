@@ -1031,9 +1031,11 @@ impl Kernel {
         let (kind, size) = match fl {
             1 => (Info::Vnode, 176),
             2 => (Info::VnodePath, 1200),
+            3 => (Info::Socket, SOCKET_FDINFO_SIZE as u32),
             4 => (Info::Psem, 1184),
             5 => (Info::Pshm, 1192),
-            3 | 6..=10 => {
+            6 => (Info::Pipe, PIPE_FDINFO_SIZE as u32),
+            7..=10 => {
                 self.darwin_unimplemented(format!("proc_pidfdinfo flavor {fl} (a socket, pipe, kqueue or channel)"));
                 return Err(e::EINVAL);
             }
@@ -1092,9 +1094,11 @@ impl Kernel {
             VNODEPATHINFO if ty != dtype::VNODE => return Err(e::ENOTSUP),
             VNODEPATHINFO => Info::VnodePath,
             SOCKETINFO if ty != dtype::SOCKET => return Err(e::EOPNOTSUPP),
+            SOCKETINFO => Info::Socket,
             PSHMINFO if ty != dtype::PSXSHM => return Err(e::EBADF),
             PSHMINFO => Info::Pshm,
             PIPEINFO if ty != dtype::PIPE => return Err(e::EBADF),
+            PIPEINFO => Info::Pipe,
             _ => {
                 self.darwin_unimplemented(format!("proc_pidfileportinfo flavor {fl} (a socket's or pipe's state)"));
                 return Err(e::EINVAL);
@@ -1113,6 +1117,33 @@ impl Kernel {
         const MAXPATHLEN: usize = 1024;
         let mut out = Vec::with_capacity(1200);
         match kind {
+            // fill_socketinfo and fill_pipeinfo of one of the host's
+            // streams: the host's XNU's, after this process's
+            // proc_fileinfo of it; a pipe's vinfo_stat owned by the caller
+            // (kauth_getuid, fill_pipeinfo's), a socket's left as
+            // fill_socketinfo leaves it (zero).
+            Info::Socket | Info::Pipe => {
+                let (flavor, size, ty) = if kind == Info::Socket { (PIDFDSOCKETINFO, SOCKET_FDINFO_SIZE, dtype::SOCKET) } else { (PIDFDPIPEINFO, PIPE_FDINFO_SIZE, dtype::PIPE) };
+                let mut b = vec![0u8; size];
+                match file.handle.as_std_stream().and_then(|s| s.xnu_fdinfo(flavor, &mut b)) {
+                    Some(Ok(n)) if n == size => {}
+                    Some(Ok(n)) => {
+                        self.darwin_unimplemented(format!("proc_pidfdinfo flavor {flavor} of {}: the host's XNU gave {n} bytes for {size}", file.path));
+                        return Err(e::EINVAL);
+                    }
+                    Some(Err(err)) => return Err(super::errno::to_darwin(err.0)),
+                    None => {
+                        self.darwin_unimplemented(format!("proc_pidfdinfo flavor {flavor} of {} (a socket's or pipe's state: only the host's own streams on an XNU host are given)", file.path));
+                        return Err(e::EINVAL);
+                    }
+                }
+                b[..24].copy_from_slice(&fileinfo(desc, file, ty));
+                if kind == Info::Pipe {
+                    b[24 + 16..24 + 20].copy_from_slice(&self.creds.uid().to_le_bytes());
+                    b[24 + 20..24 + 24].copy_from_slice(&self.creds.gid().to_le_bytes());
+                }
+                out.extend_from_slice(&b);
+            }
             Info::Psem => {
                 let Some(p) = Arc::clone(&file.handle).as_posix_sem() else { return Err(e::EBADF) };
                 out.extend_from_slice(&fileinfo(desc, file, dtype::PSXSEM));
@@ -1519,6 +1550,16 @@ pub(crate) fn fg_sendable(f: &Arc<crate::file::OpenFile>) -> bool {
 }
 
 fn fdtype(f: &Arc<crate::file::OpenFile>) -> u32 {
+    // One of the host's standard streams is what the host's XNU says it
+    // is; a pipe the page's global kernel holds is a pipe.
+    match f.handle.host_kind() {
+        Some(crate::stdio::HostKind::Pipe { .. }) => return dtype::PIPE,
+        Some(crate::stdio::HostKind::Socket(_)) => return dtype::SOCKET,
+        _ => {}
+    }
+    if super::pipe::held_elsewhere(f) {
+        return dtype::PIPE;
+    }
     if f.handle.pipe_end().is_some() {
         dtype::PIPE
     } else if Arc::clone(&f.handle).as_kqueue().is_some() {
@@ -1541,6 +1582,8 @@ enum Info {
     VnodePath,
     Psem,
     Pshm,
+    Socket,
+    Pipe,
 }
 
 impl Info {
@@ -1549,8 +1592,24 @@ impl Info {
             Info::Vnode | Info::VnodePath => dtype::VNODE,
             Info::Psem => dtype::PSXSEM,
             Info::Pshm => dtype::PSXSHM,
+            Info::Socket => dtype::SOCKET,
+            Info::Pipe => dtype::PIPE,
         }
     }
+}
+
+/// `PROC_PIDFDSOCKETINFO` and `PROC_PIDFDPIPEINFO`, and the sizes of their
+/// `socket_fdinfo` and `pipe_fdinfo`.
+pub(crate) const PIDFDSOCKETINFO: i32 = 3;
+pub(crate) const PIDFDPIPEINFO: i32 = 6;
+pub(crate) const SOCKET_FDINFO_SIZE: usize = 792;
+pub(crate) const PIPE_FDINFO_SIZE: usize = 184;
+
+/// `socket_fdinfo`'s `psi.soi_family`: after its `proc_fileinfo` (24
+/// bytes), `soi_stat` (a `vinfo_stat`, 136), `soi_so` and `soi_pcb`, and
+/// `soi_type` and `soi_protocol`.
+pub(crate) fn soi_family(b: &[u8]) -> i32 {
+    i32::from_le_bytes(b[184..188].try_into().unwrap())
 }
 
 /// `fill_fileinfo` (`struct proc_fileinfo`, 24 bytes): the file's flags as

@@ -727,6 +727,11 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         false
     }
 
+    /// One of the host's standard streams, itself.
+    fn as_std_stream(&self) -> Option<&crate::stdio::StdStream> {
+        None
+    }
+
     /// For one of the host's standard streams, what the host's descriptor
     /// really is ([`crate::stdio::HostKind`]); `None` for anything else, or
     /// where the host cannot say.

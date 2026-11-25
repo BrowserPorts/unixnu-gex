@@ -1967,6 +1967,11 @@ export class ProcessHost {
           const f = m.child.mem64 ?? this.#mem64(pid);
           if (f !== !!this.#extra?.mem64) this.#flavourOf.set(m.child.pid, f);
           else this.#flavourOf.delete(m.child.pid);
+          // A Darwin program's (a Darwin posix_spawn's child): its Workers
+          // translate for the Darwin layout from the first (`#darwinOf`),
+          // as an exec of one does (`execAway`).
+          if (m.child.darwin) this.#darwinOf.add(Number(m.child.pid));
+          else this.#darwinOf.delete(Number(m.child.pid));
         }
         this.#onFork(m.child, pid);
         if (TEST_FORK_RECORDS) this.#forkRecords.set(m.child.pid, new WeakRef(m.child));

@@ -8,8 +8,9 @@
 //
 // With no argument: "dynspawn spawn E pgid G setpgid S wait W exit X", E
 // posix_spawn's error, G 1 when the child's group is its pid, S setpgid's
-// errno, W 1 when wait4 answered the child, X its exit status (the child
-// exits with 7 when its cache is the parent's, 8 when it is not); then
+// errno, W 1 when wait4 answered the child (else its errno, negated), X
+// its exit status, or its signal negated (the child exits with 7 when its
+// cache is the parent's, 8 when it is not); then
 // "dynspawn usage U", U 1 when the reaped children's user time is not zero
 // (else getrusage's errno, negated); then "dynspawn ok".
 // "dynspawn cache": "dynspawn cache A", A the shared cache's start
@@ -59,8 +60,9 @@ int main(int argc, char **argv) {
     int sp = setpgid(pid, getpgrp()) == 0 ? 0 : errno;
     int st = 0;
     pid_t w = e == 0 ? wait4(pid, &st, 0, NULL) : -1;
-    int code = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
-    printf("dynspawn spawn %d pgid %d setpgid %d wait %d exit %d\n", e, pgid, sp, w == pid, code);
+    int werr = w == pid ? 0 : errno;
+    int code = WIFEXITED(st) ? WEXITSTATUS(st) : WIFSIGNALED(st) ? -WTERMSIG(st) : -1000;
+    printf("dynspawn spawn %d pgid %d setpgid %d wait %d exit %d\n", e, pgid, sp, w == pid ? 1 : -werr, code);
     struct rusage ru;
     memset(&ru, 0, sizeof ru);
     int usage = getrusage(RUSAGE_CHILDREN, &ru) ? -errno : (ru.ru_utime.tv_sec || ru.ru_utime.tv_usec);

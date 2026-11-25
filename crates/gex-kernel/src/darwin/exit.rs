@@ -96,6 +96,12 @@ impl Kernel {
         if (idtype == P_PID || idtype == P_PGID) && id < 0 {
             return fail(self, m, Errno::EINVAL);
         }
+        // In the page the children are the system's table's, which the
+        // page's wait asks for one child or for any (share::dwait).
+        let want = match self.darwin_page_wait_want(if idtype == P_PID { id } else if idtype == P_PGID { 0 } else { WAIT_ANY }, "waitid(P_PGID)") {
+            Ok(w) => w,
+            Err(e) => return fail(self, m, e),
+        };
         // Any other idtype matches every child, as in kern_exit.c.
         let children: Vec<_> = self
             .procs
@@ -107,19 +113,38 @@ impl Kernel {
                 _ => true,
             })
             .collect();
-        if children.is_empty() {
+        if children.is_empty() && want.is_none() {
             return fail(self, m, Errno::ECHILD);
         }
         SyscallOutcome::Blocking(BlockOp::WaitChild {
             children,
             procs: std::sync::Arc::clone(&self.procs),
             ppid: self.pid,
-            want: 0,
+            want: want.unwrap_or(0),
             wstatus: 0,
             nohang: options & WNOHANG != 0,
             waitid: Some(crate::syscalls::WaitidOut { info, nowait: options & WNOWAIT != 0, compat: false, darwin: true }),
             jobs: Some(crate::syscalls::JobWait { exits: options & WEXITED != 0, stops: options & WSTOPPED != 0, continues: options & WCONTINUED != 0 }),
         })
+    }
+
+    /// In the page, which children a wait for `pid` (one, any, or a process
+    /// group's: 0 or below -1) asks the system's table for: the process table
+    /// here holds none of them, and the page's wait looks (share::dwait)
+    /// for one child or for any, so a group's is reported (`what`) and
+    /// refused. None natively, where the children are this table's.
+    fn darwin_page_wait_want(&mut self, pid: i32, what: &str) -> Result<Option<i32>, Errno> {
+        if !self.procs.is_shared() {
+            return Ok(None);
+        }
+        match pid {
+            WAIT_ANY => Ok(Some(-1)),
+            p if p > 0 => Ok(Some(p)),
+            _ => {
+                self.darwin_unimplemented(format!("{what} in the page (the system's table's wait looks for one child or any)"));
+                Err(Errno::ENOSYS)
+            }
+        }
     }
 
     /// `wait4(pid, status, options, rusage)` and `wait4_nocancel`: the
@@ -144,13 +169,17 @@ impl Kernel {
             self.darwin_unimplemented("wait4's rusage (the child's resource usage at its end)".into());
             return fail(self, m, Errno::EINVAL);
         }
+        let want = match self.darwin_page_wait_want(pid, "wait4 of a process group's children") {
+            Ok(w) => w,
+            Err(e) => return fail(self, m, e),
+        };
         let children: Vec<_> = self
             .procs
             .children(self.pid)
             .into_iter()
             .filter(|c| pid == WAIT_ANY || c.pid == pid || (pid < -1 && self.procs.pgid(self.pid, c.pid) == Ok(-pid)))
             .collect();
-        if children.is_empty() {
+        if children.is_empty() && want.is_none() {
             return fail(self, m, Errno::ECHILD);
         }
         self.darwin_wait4 = Some(status);
@@ -158,7 +187,7 @@ impl Kernel {
             children,
             procs: std::sync::Arc::clone(&self.procs),
             ppid: self.pid,
-            want: 0,
+            want: want.unwrap_or(0),
             wstatus: status,
             nohang: options & WNOHANG != 0,
             waitid: None,

@@ -4,7 +4,9 @@
 // off a processor), so the page's Darwin kernel keeps no thread's time. Each
 // call that would give one out fails instead, with the kernel's report on the
 // system's console, where gexc's run of the same program succeeds at each.
-// The run is not strict: a strict one stops at the first report.
+// The reaped children's usage (getrusage RUSAGE_CHILDREN) is their times as
+// each child's end gave them: with no child reaped it is all zero, known, and
+// given. The run is not strict: a strict one stops at the first report.
 import { System } from '../../page/runtime/src/index.js';
 import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
 
@@ -17,7 +19,6 @@ const KERN_NOT_SUPPORTED = 46;
 /** Each call the page refuses, its error, and the report it makes. */
 const REFUSED = [
   ['getrusage-self', ENOSYS, "getrusage's times on a host without per-thread clocks"],
-  ['getrusage-children', ENOSYS, "getrusage(RUSAGE_CHILDREN)'s times on a host without per-thread clocks"],
   ['thread_selfusage', ENOSYS, 'thread_selfusage on a host without per-thread clocks'],
   ['setitimer-virtual', ENOSYS, 'a virtual timer on a host without per-thread clocks'],
   ['setitimer-prof', ENOSYS, 'a virtual timer on a host without per-thread clocks'],

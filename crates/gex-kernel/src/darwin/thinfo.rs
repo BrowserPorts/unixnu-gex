@@ -257,6 +257,42 @@ impl Kernel {
     pub(crate) fn darwin_note_wait(&mut self, op: &BlockOp) {
         let k = self.darwin_wait_kstack(op);
         self.darwin_me().kstack = k;
+        if self.darwin_wait_sleeps(op) {
+            self.dtask.rusage.ru.count(super::ru::l::NVCSW);
+        }
+    }
+
+    /// Whether XNU's wait for what `op` waits for is an `_sleep` (`msleep`,
+    /// `msleep0`, `msleep1`, `tsleep0`, `tsleep1`), whose entry counts a
+    /// voluntary switch in `p_stats->p_ru.ru_nvcsw` (`kern_synch.c`): the
+    /// BSD waits, not the Mach ones (a thread_block on a waitq: psynch,
+    /// ulock, mach_msg, semaphores, kevent's scan, workq parks).
+    fn darwin_wait_sleeps(&mut self, op: &BlockOp) -> bool {
+        use super::sysno as sys;
+        if let (BlockOp::FutexWait { .. }, Some(w)) = (op, &self.darwin_finish) {
+            return match w.cont {
+                // kern_lockf.c's msleep, kern_aio.c's aio_suspend msleep1,
+                // kern_sig.c's __sigwait msleep, tty.c's ttysleep msleep0.
+                Finish::Lockf(_) | Finish::AioSuspend(_) | Finish::Sigwait { .. } | Finish::Tty => true,
+                // select's tsleep1 (sys_generic.c); poll's scan blocks on
+                // the kqueue's waitq.
+                Finish::Kevent(super::kevent::Cont::Poll { .. }) => matches!(self.darwin_uu_syscall_code(), sys::SELECT | sys::SELECT_NOCANCEL | sys::PSELECT | sys::PSELECT_NOCANCEL),
+                _ => false,
+            };
+        }
+        match op {
+            // sys_pipe.c's piperd and pipewr msleep, uipc_socket2.c's
+            // sbwait, accept's and connect's msleep (uipc_syscalls.c).
+            BlockOp::ReadStream { .. } | BlockOp::WriteStream { .. } | BlockOp::WriteWait { .. } | BlockOp::AcceptWait { .. } | BlockOp::Connect { .. } => true,
+            // lf_advlock's msleep.
+            BlockOp::FileLock { .. } => true,
+            // wait4's and waitid's msleep0, reached when no child it asks
+            // for has anything to report (never under WNOHANG).
+            BlockOp::WaitChild { nohang: false, .. } => super::exit::wait_would_sleep(op),
+            // sigsuspend's tsleep0, entered whatever is pending.
+            BlockOp::SigSuspend { .. } => true,
+            _ => false,
+        }
     }
 
     fn darwin_wait_kstack(&mut self, op: &BlockOp) -> KStack {

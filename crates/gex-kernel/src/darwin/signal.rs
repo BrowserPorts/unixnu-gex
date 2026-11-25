@@ -967,6 +967,9 @@ impl Kernel {
                 mm.is_unentered(page) && mm.vma_at(at).is_some_and(|v| v.prot & need != 0) && mm.enter_page(page)
             };
             if entered {
+                // vm_fault_internal's count of the task's faults, as every
+                // vm_fault here makes it.
+                self.dtask.rusage.ru.fault();
                 // A load's fault on a vnode page no store has entered:
                 // read only until a store faults on it again.
                 if self.darwin_file_page_fault(at, write) {
@@ -988,6 +991,7 @@ impl Kernel {
                 (mm.is_copy_pending(p) && mm.vma_at(at).is_some_and(|v| v.prot & crate::mem::prot::WRITE != 0) && mm.copied(p)).then_some(at)
             };
             if let Some(at) = copied {
+                self.dtask.rusage.ru.fault();
                 // A store's fault on a vnode page a load's fault entered
                 // read only (a private mapping's copies it instead).
                 self.darwin_file_page_fault(at, true);
@@ -1002,6 +1006,8 @@ impl Kernel {
                 return (Delivery::Resume(pc), 0);
             }
         }
+        // A fault vm_fault refuses is counted as the others are.
+        self.dtask.rusage.ru.fault();
         let prot = if addr >= gex_abi::DARWIN_GUEST_FLOOR { self.mem.lock().vma_at(addr).map(|v| v.prot) } else { None };
         let l = match prot {
             None => crate::signal::sig::SIGSEGV,
@@ -1024,6 +1030,7 @@ impl Kernel {
     /// KERN_MEMORY_ERROR, which `ux_exception` makes SIGBUS. An access the
     /// mapping does not allow is KERN_PROTECTION_FAILURE, SIGBUS too.
     fn darwin_absent_fault(&mut self, m: &mut GuestMem<'_>, pc: u64, addr: u64, write: bool) -> (Delivery, u32) {
+        self.dtask.rusage.ru.fault();
         let need = if write { crate::mem::prot::WRITE } else { crate::mem::prot::READ };
         let allowed = self.mem.lock().vma_at(addr).is_some_and(|v| v.prot & need != 0);
         // KERN_MEMORY_ERROR, or KERN_PROTECTION_FAILURE.
@@ -1146,6 +1153,9 @@ impl Kernel {
             ps.signodefer &= !bit;
             self.darwin_sig_mirror(d);
         }
+        // postsig_locked's count of a signal taken by a handler, before
+        // sendsig.
+        self.dtask.rusage.ru.count(super::ru::l::NSIGNALS);
         match self.darwin_sendsig(m, catcher, d, mask_from_linux(return_l), siginfo, source) {
             Ok(pc) => Delivery::Resume(pc),
             Err(_) => {

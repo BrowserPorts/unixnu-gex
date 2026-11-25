@@ -452,6 +452,14 @@ impl Kernel {
             // XNU keeps them.
             sys::WRITE | sys::WRITE_NOCANCEL | sys::WRITEV | sys::WRITEV_NOCANCEL | sys::SENDTO | sys::SENDTO_NOCANCEL | sys::SENDMSG | sys::SENDMSG_NOCANCEL if self.darwin_xnu_stream(a[0]).is_some() => Some(self.darwin_unix_send(m, raw, a)),
             sys::READ | sys::READ_NOCANCEL | sys::READV | sys::READV_NOCANCEL | sys::RECVFROM | sys::RECVFROM_NOCANCEL | sys::RECVMSG | sys::RECVMSG_NOCANCEL if self.darwin_xnu_stream(a[0]).is_some() => Some(self.darwin_unix_recv(m, raw, a)),
+            // Any other socket's sends and receives are the host's socket
+            // code's: sosend's and soreceive's counts are not made for them.
+            sys::WRITE | sys::WRITE_NOCANCEL | sys::WRITEV | sys::WRITEV_NOCANCEL | sys::SENDTO | sys::SENDTO_NOCANCEL | sys::SENDMSG | sys::SENDMSG_NOCANCEL | sys::SENDMSG_X | sys::READ | sys::READ_NOCANCEL | sys::READV | sys::READV_NOCANCEL | sys::RECVFROM | sys::RECVFROM_NOCANCEL | sys::RECVMSG | sys::RECVMSG_NOCANCEL | sys::RECVMSG_X
+                if self.fds.get(a[0] as i32).is_ok_and(|f| f.handle.so_state().is_some()) =>
+            {
+                self.dtask.rusage.ru.unseen(super::ru::stand_in::MSGS);
+                None
+            }
             sys::READ | sys::READ_NOCANCEL | sys::READV | sys::READV_NOCANCEL | sys::WRITE | sys::WRITE_NOCANCEL | sys::WRITEV | sys::WRITEV_NOCANCEL if self.darwin_tty_of(a[0]).is_some() => Some(self.darwin_tty_rw(m, raw, a)),
             // valid_for_random_access: a terminal (VISTTY) takes no offset.
             sys::PREAD | sys::PREAD_NOCANCEL | sys::PWRITE | sys::PWRITE_NOCANCEL | sys::PREADV | sys::PREADV_NOCANCEL | sys::PWRITEV | sys::PWRITEV_NOCANCEL if self.darwin_tty_of(a[0]).is_some() => {

@@ -15683,6 +15683,7 @@ fn finish_parked(
             nohang,
             waitid,
             jobs,
+            rusage: _,
         } => {
             // Only a Darwin wait asks for stops and continues, and a Darwin
             // process's waits never park here (`darwin::unparked`).

@@ -448,6 +448,17 @@ pub fn set_task(t: &std::sync::Arc<super::rusage::Shared>) {
     });
 }
 
+/// One more of long `i` of the running thread's process's `p_ru` (a count
+/// XNU makes in `current_proc()`'s, as `bio_doread`'s `ru_inblock`); none
+/// while the thread works for the kernel's own task.
+pub fn count_ru(i: usize) {
+    TASK.with(|c| {
+        if let Some(t) = c.borrow().as_ref() {
+            t.ru.count(i);
+        }
+    });
+}
+
 /// The running thread works for the kernel's own task (an aio worker's
 /// request): until [`restore_task`], nothing is charged to its task.
 pub fn take_task() -> Option<std::sync::Arc<super::rusage::Shared>> {

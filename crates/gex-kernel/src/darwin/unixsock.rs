@@ -111,7 +111,7 @@ impl Kernel {
     /// `write`, `writev`, `sendto` or `sendmsg` (`raw`) on a Darwin unix
     /// stream socket.
     pub(crate) fn darwin_unix_send(&mut self, m: &mut GuestMem<'_>, raw: u64, a: &[u64; 6]) -> SyscallOutcome {
-        let r = self.darwin_unix_send_step(m, raw, a);
+        let r = self.darwin_unix_send_step(m, raw, a, false);
         self.darwin_socket_end(m, r)
     }
 
@@ -139,7 +139,7 @@ impl Kernel {
     /// A socket call whose wait is over, made again: its result, or the
     /// wait it is in again.
     pub(crate) fn darwin_socket_again(&mut self, m: &mut GuestMem<'_>, raw: u64, a: [u64; 6]) -> Result<SysResult, BlockOp> {
-        let r = if is_send(raw) { self.darwin_unix_send_step(m, raw, &a) } else { self.darwin_unix_recv_step(m, raw, &a) };
+        let r = if is_send(raw) { self.darwin_unix_send_step(m, raw, &a, true) } else { self.darwin_unix_recv_step(m, raw, &a) };
         match r {
             Ok(Step::Done(n)) => Ok(Ok(n)),
             Ok(Step::Wait(op)) => Err(op),
@@ -219,12 +219,14 @@ impl Kernel {
         }
     }
 
-    fn darwin_unix_send_step(&mut self, m: &mut GuestMem<'_>, raw: u64, a: &[u64; 6]) -> Result<Step, Errno> {
+    /// A send (`again`: made again after its wait for room, inside the
+    /// one `sosend` it is).
+    fn darwin_unix_send_step(&mut self, m: &mut GuestMem<'_>, raw: u64, a: &[u64; 6], again: bool) -> Result<Step, Errno> {
         let (file, sock) = self.darwin_xnu_stream(a[0]).ok_or(Errno::EBADF)?;
         let send = self.darwin_send_args(m, raw, a, &file)?;
         let st = file.handle.so_state().ok_or(Errno::ENOTSOCK)?;
         let nosigpipe = Self::darwin_sockopts(&file, &st).nosigpipe || (!send.write && send.flags & msg::NOSIGNAL != 0);
-        let r = self.darwin_sosend(m, raw, a, &file, &sock, send);
+        let r = self.darwin_sosend(m, raw, a, &file, &sock, send, again);
         match &r {
             // sendit's (or soo_write's) psignal.
             Err(Errno::EPIPE) if !nosigpipe => self.darwin_send_sigpipe(),
@@ -238,10 +240,14 @@ impl Kernel {
     /// `sosend` of a stream: `sosendcheck`, waiting while there is no room
     /// (but on a non-blocking socket: `SS_NBIO`, or `MSG_NBIO`), then
     /// rounds of passes until all is sent.
-    fn darwin_sosend(&mut self, m: &mut GuestMem<'_>, raw: u64, a: &[u64; 6], file: &Arc<OpenFile>, sock: &Arc<UnixSocket>, send: Send) -> Result<Step, Errno> {
+    fn darwin_sosend(&mut self, m: &mut GuestMem<'_>, raw: u64, a: &[u64; 6], file: &Arc<OpenFile>, sock: &Arc<UnixSocket>, send: Send, again: bool) -> Result<Step, Errno> {
         let Send { vecs, resid, flags, control, .. } = send;
         if resid > INT_MAX || flags & msg::EOR != 0 {
             return Err(Errno::EINVAL);
+        }
+        // sosend's count of the send, once whatever it waits for.
+        if !again {
+            self.dtask.rusage.ru.count(super::ru::l::MSGSND);
         }
         let nbio = file.flags() & oflags::O_NONBLOCK != 0 || flags & msg::NBIO != 0;
         let resid = resid as usize;
@@ -449,6 +455,11 @@ impl Kernel {
             }
             Err(e) => return Err(e),
         };
+        // soreceive's dontblock: a record to take (none at the end of the
+        // stream, which it leaves at release).
+        if !out.data.is_empty() || out.control.is_some() {
+            self.dtask.rusage.ru.count(super::ru::l::MSGRCV);
+        }
         let n = out.data.len();
         let mut at = 0usize;
         for &(base, len) in &vecs {

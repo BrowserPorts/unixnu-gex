@@ -537,8 +537,6 @@ struct Proc {
     /// The user and system time of its threads that have ended
     /// (`task->total_user_time`, `total_system_time`), in nanoseconds.
     dead_cpu: (u64, u64),
-    /// Its reaped children's (`p_stats->p_cru`'s times).
-    children_cpu: (u64, u64),
     /// Its ended threads' runnable time (`task->total_runnable_time`), in
     /// Mach time units.
     dead_runnable: u64,
@@ -998,7 +996,6 @@ impl ProcTable {
                     exit_reason: None,
                     reboot: false,
                     dead_cpu: (0, 0),
-                    children_cpu: (0, 0),
                     dead_runnable: 0,
                     dead_instructions: 0,
                     persona: None,
@@ -1116,7 +1113,6 @@ impl ProcTable {
             exit_reason: None,
             reboot: false,
             dead_cpu: (0, 0),
-            children_cpu: (0, 0),
             dead_runnable: 0,
             dead_instructions: 0,
             persona,
@@ -1293,7 +1289,6 @@ impl ProcTable {
             exit_reason: None,
             reboot: false,
             dead_cpu: (0, 0),
-            children_cpu: (0, 0),
             dead_runnable: 0,
             dead_instructions: 0,
             persona: s.persona,
@@ -1793,37 +1788,22 @@ impl ProcTable {
         if let Some(r) = self.remote {
             return (r.reap)(pid);
         }
-        // reap_child_locked's ruadd of the child's final rusage (its own
-        // times, its threads' at its end, and its reaped children's, as
-        // proc_exit made it) to its parent's p_cru, unless the parent has
-        // P_NOCLDWAIT.
-        let ended = {
+        // reap_child_locked: the child's p_ru->ru added to its parent's
+        // p_cru unless the parent has P_NOCLDWAIT, and its p_ru->ri to the
+        // parent's ri_child whatever the parent's P_NOCLDWAIT (for one that
+        // has it, proc_exit added the child once already).
+        {
             let t = self.lock();
-            t.procs.iter().find(|p| p.pid == pid).map(|p| {
+            if let Some(p) = t.procs.iter().find(|p| p.pid == pid) {
                 let parent = t.procs.iter().find(|q| q.pid == p.ppid);
                 let rollup = parent.is_some_and(|q| !q.nocldwait);
-                // update_rusage_info_child, whatever the parent's
-                // P_NOCLDWAIT: for one that has it, proc_exit added the
-                // child once already.
                 if let (Some(child), Some(parent)) = (p.darwin.clone().and_then(|r| r.downcast::<crate::darwin::procinfo::Public>().ok()), parent.and_then(|q| q.darwin.clone()).and_then(|r| r.downcast::<crate::darwin::procinfo::Public>().ok())) {
                     let times = if rollup { 1 } else { 2 };
                     crate::darwin::rusage::reaped(&child, &parent, times);
-                }
-                (p.ppid, (p.dead_cpu.0 + p.children_cpu.0, p.dead_cpu.1 + p.children_cpu.1), p.darwin.clone(), rollup)
-            })
-        };
-        if let Some((ppid, (mut user, mut sys), record, true)) = ended {
-            if let Some(threads) = record.and_then(|r| r.downcast::<crate::darwin::procinfo::Public>().ok()).and_then(|p| (*p.threads).clone()) {
-                for tid in threads.tids() {
-                    if let Some((u, s)) = threads.get(tid).and_then(|t| t.cpu.times()) {
-                        user += u;
-                        sys += s;
+                    if let (true, Some(ru)) = (rollup, child.rusage.ru.exited()) {
+                        parent.rusage.ru.add_reaped(&ru);
                     }
                 }
-            }
-            if let Some(parent) = self.lock().procs.iter_mut().find(|p| p.pid == ppid) {
-                parent.children_cpu.0 += user;
-                parent.children_cpu.1 += sys;
             }
         }
         self.lock().forget(|p| p.pid == pid);
@@ -2730,11 +2710,6 @@ impl ProcTable {
     /// `pid`'s ended threads' runnable time.
     pub fn dead_runnable(&self, pid: i32) -> u64 {
         self.lock().procs.iter().find(|p| p.pid == pid).map_or(0, |p| p.dead_runnable)
-    }
-
-    /// `pid`'s reaped children's user and system time.
-    pub fn children_cpu(&self, pid: i32) -> (u64, u64) {
-        self.lock().procs.iter().find(|p| p.pid == pid).map_or((0, 0), |p| p.children_cpu)
     }
 
     /// `pid`'s ended threads' user and system time.

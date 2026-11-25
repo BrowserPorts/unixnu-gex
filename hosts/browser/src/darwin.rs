@@ -1201,12 +1201,19 @@ fn wait_round(k: &mut gex_kernel::syscalls::Kernel, gm: &mut GuestMem<'_>, tid: 
     use gex_kernel::{BlockOp, Errno};
     let BlockOp::WaitChild { procs, ppid, want, wstatus, nohang, waitid, jobs: Some(j), .. } = op else { return None };
     let nowait = waitid.is_some_and(|w| w.nowait);
-    let (step, usage) = gex_kernel::darwin::share::dwait(*ppid, *want, *j, nowait, waitid.is_some(), false);
-    // The child collected: its p_ru to this process's children's usage, as
-    // reap_child_locked adds it (this parent has no P_NOCLDWAIT, or the
-    // child would have been reaped at its end).
-    if let Some(u) = usage {
-        k.dtask.rusage.add_reaped(&u, 1);
+    // A wait4's end is the kernel's to copy out and collect
+    // (`darwin_wait4_done`): it copies the status, then the child's usage,
+    // before it reaps the child, and either copy failing leaves the child
+    // there to wait for (kern_exit.c). So it is looked at here, taking
+    // nothing (a stop's mark included).
+    if waitid.is_none() {
+        if let (WaitStep::Ended { pid, .. }, ..) = gex_kernel::darwin::share::dwait(*ppid, *want, *j, true, false, true) {
+            return Some(Ok(pid as u64));
+        }
+    }
+    let (step, usage, ru) = gex_kernel::darwin::share::dwait(*ppid, *want, *j, nowait, waitid.is_some(), false);
+    if matches!(step, WaitStep::Ended { .. }) && !nowait {
+        k.darwin_page_collected(usage, ru);
     }
     let r = match step {
         WaitStep::NoChild => Err(Errno::ECHILD),

@@ -835,6 +835,9 @@ fn bdev_read(n: &Node, mut off: u64, buf: &mut [u8]) -> Result<usize, Errno> {
                 failed = failed.or(Some(e(EIO)));
                 continue;
             }
+            // bio_doread: a buffer whose data is not valid is read, and the
+            // read paid for in the caller's ru_inblock.
+            super::pagecache::count_ru(super::ru::l::INBLOCK);
             match bdev_fill(d, m, g, b, bsize) {
                 Ok(bytes) => {
                     vn.bufs.insert(b, bytes);

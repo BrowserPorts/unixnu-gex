@@ -2594,6 +2594,7 @@ fn perform_block(
             nohang,
             waitid,
             jobs,
+            rusage: _,
             // The children list passed in is already this process's, so ppid
             // is redundant here.
             ppid: _,
@@ -2638,6 +2639,15 @@ fn perform_block(
                             }
                             let mut mem = GuestMem::new(data);
                             return w.report_with(&mut mem, c.pid, code as u32, xhighbits);
+                        }
+                        // A Darwin wait4's end is the kernel's to copy out
+                        // and collect (`darwin_wait4_done`): it copies the
+                        // status, then the child's usage, before it reaps
+                        // the child, and either copy failing leaves the
+                        // child there to wait for (kern_exit.c).
+                        if jobs.is_some() {
+                            *c.status.lock().unwrap_or_else(|e| e.into_inner()) = Some(code);
+                            return Ok(c.pid as u64);
                         }
                         c.reaped.store(true, std::sync::atomic::Ordering::Release);
                         // Collected, so the table can forget it. Without this

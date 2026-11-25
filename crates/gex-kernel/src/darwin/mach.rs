@@ -1548,10 +1548,13 @@ impl Kernel {
     }
 
     /// `vm_map_enter` of anonymous memory at a place already chosen, the
-    /// entry below looked at for its protection (`cur`).
+    /// entry below looked at for its protection (`cur`). It enters no page
+    /// in the pmap: each is entered at its first access, its `vm_fault`'s
+    /// zero fill being the map's fresh memory, which reads as zero.
     pub(crate) fn darwin_vm_enter_anon(&mut self, start: u64, end: u64, attrs: super::vm::Attrs, cur: u64) {
         let below = self.mem.lock().vma_at(start.wrapping_sub(1)).map(|v| u64::from(v.prot)) == Some(cur);
         self.dtask.vm.enter_anon(start, end, attrs, below);
+        self.mem.lock().set_unentered(start, end);
     }
 
     /// `vm_shared_region_remove`: the region's range, cache and holes

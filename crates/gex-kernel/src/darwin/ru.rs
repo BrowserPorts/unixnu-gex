@@ -74,8 +74,8 @@ pub mod stand_in {
 }
 
 /// Each stand-in bit: the field and what it stands in for.
-pub const STAND_INS: [(u32, &str); 6] = [
-    (stand_in::MINFLT, "ru_minflt: the faults gex does not take (vm_fault counts each in task->faults): a first touch of anonymous memory, which the host backs from its mapping, and the faults the page-ins leave unseen (instruction fetches, the shared cache's first touches, copyin and copyout of a file's pages, the kernel's faults for exec and dyld) (stand-in: the faults gex takes, less the page-ins; measure ru_minflt on the device across touching N new pages of a fresh anonymous mapping)"),
+pub const STAND_INS: [(u32, &str); 7] = [
+    (stand_in::MINFLT, "ru_minflt: the faults gex does not take (vm_fault counts each in task->faults): those the page-ins leave unseen (instruction fetches, the shared cache's first touches, copyin and copyout of a file's pages, the kernel's faults for exec and dyld) (stand-in: the faults gex takes, less the page-ins; measure ru_minflt on the device across a first run of a known binary that maps a known file)"),
     (stand_in::NIVCSW, "ru_nivcsw: the threads' switches onto a core (thread_invoke's c_switch, which calcru takes ru_nvcsw from), which the host's scheduler makes and does not tell a thread's (macOS's thread_info flavours give no switch count, proc_pidinfo's pti_csw is the whole host process's) (stand-in: 0; measure ru_nivcsw on the device of a CPU-bound process over a known run time)"),
     (stand_in::INBLOCK, "ru_inblock: APFS's own buffer reads on a miss (obj_read through nx_buf_bread and buf_meta_bread's bio_doread), which need its object cache's state, not kept for the volumes (stand-in: only a block disk node's buffer-cache misses are counted; measure ru_inblock on the device across a first stat of N files in a new directory)"),
     (stand_in::OUBLOCK, "ru_oublock: synchronous buffer writes (buf_bwrite) and the kexts' proc_increment_ru_oublock calls, APFS's among them, whose state is not kept (stand-in: 0; measure ru_oublock on the device across creating and fsyncing a file)"),

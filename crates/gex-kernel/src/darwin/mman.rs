@@ -392,6 +392,9 @@ impl Kernel {
         if attrs.kind == kind::ANON {
             let below = self.mem.lock().vma_at(at.wrapping_sub(1)).map(|v| u64::from(v.prot)) == Some(u64::from(cur));
             self.dtask.vm.enter_anon(at, at + size, attrs, below && !purgeable);
+            // No page entered until its first access (vm_fault's zero fill,
+            // the map's fresh memory, then pmap_enter).
+            self.mem.lock().set_unentered(at, at + size);
             // VM_FLAGS_PURGABLE: the memory a new purgeable object.
             if purgeable {
                 return match self.darwin_purgeable_over(m, at, size) {

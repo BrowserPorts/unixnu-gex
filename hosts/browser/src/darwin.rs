@@ -338,11 +338,7 @@ fn start(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> Result<u
         return Err(Fail::Killed(format!("its stack {:#x}..{:#x}: the memory will not grow to it", st.alloc, st.alloc + st.size)));
     }
     data.write(st.sp, &st.bytes).map_err(|_| Fail::Killed(format!("its stack at {:#x} is outside the memory", st.sp)))?;
-    {
-        let mut mm = h.kernel.mem.lock();
-        mm.insert(st.alloc, st.alloc + st.guard, prot::NONE, "[stack]");
-        mm.insert(st.alloc + st.guard, st.alloc + st.size, prot::READ | prot::WRITE, "[stack]");
-    }
+    h.kernel.darwin_stack_mapped(&st);
     // Its registers: clear, its stack pointer and its entry: dyld's when
     // it has one.
     let entry = img.program.entry();

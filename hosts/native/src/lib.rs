@@ -5619,7 +5619,7 @@ fn place_image(
     let layout = if opts.darwin {
         let header = image.segments.iter().map(|s| s.vaddr).min().unwrap_or(0);
         let path = opts.exe.clone().or_else(|| opts.args.first().cloned()).unwrap_or_default();
-        let st = store
+        let mut st = store
             .data_mut()
             .with_kernel(|k| {
                 // An exec's activated strings, or the run's first program's.
@@ -5644,8 +5644,8 @@ fn place_image(
                 st
             })
             .map_err(|e| anyhow::Error::new(DarwinStartFailed(format!("starting {path}: errno {}", e.0))))?;
-        let layout = gex_ld::stack::StackLayout { sp: st.sp, low: st.sp, bytes: st.bytes };
-        darwin_stack = Some((st.alloc, st.size, st.guard));
+        let layout = gex_ld::stack::StackLayout { sp: st.sp, low: st.sp, bytes: std::mem::take(&mut st.bytes) };
+        darwin_stack = Some(st);
         layout
     } else {
         build_initial_stack(
@@ -5667,11 +5667,7 @@ fn place_image(
 
     match darwin_stack {
         // The allocation, its bottom the guard below the stack limit.
-        Some((alloc, size, guard)) => store.data_mut().with_kernel(|k| {
-            let mut mm = k.mem.lock();
-            mm.insert(alloc, alloc + guard, prot::NONE, "[stack]");
-            mm.insert(alloc + guard, alloc + size, prot::READ | prot::WRITE, "[stack]");
-        }),
+        Some(st) => store.data_mut().with_kernel(|k| k.darwin_stack_mapped(&st)),
         None => {
             let stack_low = gex_abi::STACK_TOP - gex_abi::STACK_SIZE;
             store.data_mut().with_kernel(|k| {

@@ -13,6 +13,10 @@
 import { System } from '../../page/runtime/src/index.js';
 import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
 
+/** What gexc says of its own standard streams, its host's (darwin/hoststd.rs):
+ *  not the page's, whose streams are its pipes. */
+const HOST_STREAMS = "[gex] Darwin: the host's standard streams stand in:";
+
 export const meta = { hosts: ['browser'], arches: ['a64'], images: ['darwin-disk'], timeout: 300 };
 
 export default async function (t) {
@@ -39,7 +43,7 @@ export default async function (t) {
   // What the Darwin kernel reported, as gexc's (by subject: up to its
   // second colon).
   const said = sys.state.console.split('\n');
-  for (const line of native.reports) {
+  for (const line of native.reports.filter((l) => !l.startsWith(HOST_STREAMS))) {
     const subject = line.slice(0, line.indexOf(':', line.indexOf(':') + 1) + 1);
     t.check(`the Darwin kernel's report on the console: ${subject}`, said.some((l) => l.startsWith(subject)), sys.state.console.slice(-2000));
   }

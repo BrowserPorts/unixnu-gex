@@ -4093,6 +4093,27 @@ impl PathIo<'_> {
                 m.write(buf, &self.encode_stat(&st, &md, None, None))?;
                 return Ok(0);
             }
+            // One of the host's standard streams: what XNU shows for what
+            // it really is.
+            if let Some(kind) = file.handle.host_kind() {
+                if kind == crate::stdio::HostKind::Null {
+                    let null = self.ns.metadata("/dev/null")?;
+                    let mnt = crate::darwin::kern::mount_of("/dev/null");
+                    let st = self.stat_owned(&null, Some("/dev/null"), None, Some(mnt))?;
+                    m.write(buf, &self.encode_stat(&st, &null, Some("/dev/null"), Some(mnt)))?;
+                    return Ok(0);
+                }
+                return match crate::darwin::hoststd::stat(kind, &md, self.creds.uid(), self.creds.gid()) {
+                    Ok(st) => {
+                        m.write(buf, &self.encode_darwin_stat(st))?;
+                        Ok(0)
+                    }
+                    Err(what) => {
+                        crate::darwin::note_unimplemented(format!("fstat of a standard stream that is {what}"));
+                        Err(Errno::EOPNOTSUPP)
+                    }
+                };
+            }
         }
         // (a descriptor of a link itself, O_SYMLINK's, is the link's)
         let at = self.darwin.then(|| crate::darwin::vattr::vnode_path(self.ns, &file.path, &md));
@@ -4107,6 +4128,20 @@ impl PathIo<'_> {
     /// its mount's (`va_fsid`, `f_fsid.val[0]`): `mnt`, an open file's, or
     /// the one `at` is on; a socket or anything else not in the namespace
     /// has none.
+    /// A Darwin `struct stat` of `st` as it stands (its device its own:
+    /// nothing in the namespace), in this process's flavour.
+    fn encode_darwin_stat(&self, mut st: Stat) -> crate::fs::StatBytes {
+        if self.stat_scrub {
+            (st.atime, st.atime_ns, st.mtime, st.mtime_ns, st.ctime, st.ctime_ns) = (0, 0, 0, 0, 0, 0);
+            st.birth = Some((0, 0));
+        }
+        if self.stat_ino32 {
+            st.encode_darwin_ino32()
+        } else {
+            st.encode_darwin()
+        }
+    }
+
     fn encode_stat(&self, st: &Stat, md: &crate::vfs::Metadata, at: Option<&str>, mnt: Option<&crate::darwin::kern::Mount>) -> crate::fs::StatBytes {
         if self.darwin {
             let mut st = st.clone();

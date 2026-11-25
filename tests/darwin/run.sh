@@ -417,11 +417,17 @@ run() {
     # From the root, where the platform profile's process-exec rules know
     # the path's owner: a RELEASE kernel's EBADEXEC (85), then ECHILD (10).
     xspawn) check_root xspawn "xspawn 85 10" 0 ;;
-    # The host's standard streams, as gexc stands them in: character
-    # devices of the caller's.
-    stdstat) check_as 0:0 stdstat "fd 0 mode 20620 nlink 1 uid 0 gid 0 size 0 blksize 65536 flags 0
-fd 1 mode 20620 nlink 1 uid 0 gid 0 size 0 blksize 65536 flags 0
-fd 2 mode 20620 nlink 1 uid 0 gid 0 size 0 blksize 65536 flags 0" 0 ;;
+    # The host's standard streams as XNU shows what each really is, as
+    # root: standard input a regular file (the file's stat, the caller's),
+    # standard output a pipe (pipe_stat, the host's buffer), standard error
+    # the host's null device (the system's /dev/null); then each a pipe.
+    stdstat)
+        out=$(with_disk0 "$GEXC" run --uid 0:0 "$HERE/bin/stdstat" < "$HERE/src/stdstat-in.txt" 2>/dev/null)
+        report stdstat-file "$out" $? "fd 0 mode 100644 nlink 1 uid 0 gid 0 size 8 blksize 4096 flags 0
+fd 1 mode 10660 nlink 0 uid 0 gid 0 size 0 blksize 16384 flags 0
+fd 2 mode 20666 nlink 1 uid 0 gid 0 size 0 blksize 65536 flags 0" 0
+        out=$(printf 'abcdef' | with_disk0 "$GEXC" run --uid 0:0 "$HERE/bin/stdstat" wait 2>/dev/null)
+        report stdstat-pipe "$out" $? "fd 0 mode 10660 nlink 0 uid 0 gid 0 size 6 blksize 16384 flags 0" 0 ;;
     # disk0's character node as root, on the run's own clone of the image:
     # the GPT, its backup, the container's superblock as the boot's update
     # of the container to read-write wrote it (not cleanly unmounted), a

@@ -15,6 +15,10 @@ import { System } from '../../page/runtime/src/index.js';
 import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
 import { ROOT_OWNED, tarWithXattrs } from '../fixtures/xattr-tar.js';
 
+/** What gexc says of its own standard streams, its host's (darwin/hoststd.rs):
+ *  not the page's, whose streams are its pipes. */
+const HOST_STREAMS = "[gex] Darwin: the host's standard streams stand in:";
+
 export const meta = { hosts: ['browser'], arches: ['a64'], images: ['darwin-root', 'darwin-dyn'], timeout: 900 };
 
 const PROG = '/var/tmp/gex-darwin-hello';
@@ -55,7 +59,7 @@ export default async function (t) {
   const again = await timeout(sys.run([PROG, 'a', 'b']), 800000, 'hello again');
   t.say(`a second run took ${((performance.now() - s0) / 1000).toFixed(1)} s (${again.code}: ${again.stdout.trim() || again.stderr.slice(-300)})`);
   const said = sys.state.console.split('\n');
-  for (const line of native.reports) {
+  for (const line of native.reports.filter((l) => !l.startsWith(HOST_STREAMS))) {
     const subject = line.slice(0, line.indexOf(':', line.indexOf(':') + 1) + 1);
     t.check(`the Darwin kernel's report on the console: ${subject}`, said.some((l) => l.startsWith(subject)), sys.state.console.slice(-2000));
   }

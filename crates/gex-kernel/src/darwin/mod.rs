@@ -110,6 +110,7 @@ pub mod noncemag;
 pub mod nvram;
 pub mod persona;
 pub mod pipe;
+pub mod hoststd;
 pub mod priority;
 pub mod procinfo;
 pub mod procpolicy;

@@ -1,8 +1,9 @@
-// fstat64 of the standard streams, as the process's caller gave them: under
-// gexc the host's streams (gex's character-device stand-in for them, owned
-// by the caller); in the page, pipes the page's global kernel holds, which
-// are pipes (`pipe_stat`: a FIFO of the caller's, its size what is buffered,
-// its block size its buffer's).
+// fstat64 of the standard streams, as the process's caller gave them, as
+// XNU shows what each is: a pipe `pipe_stat`'s (a FIFO of the caller's, its
+// size what is buffered, its block size its buffer's), a regular file the
+// file's, the null device the system's /dev/null. Under gexc they are the
+// host's streams (tests/darwin/run.sh arranges a file, a pipe and the null
+// device); in the page, pipes the page's global kernel holds.
 //
 // With no argument: one line a descriptor, "fd N mode M nlink L uid U gid G
 // size S blksize B flags F" (M in octal).

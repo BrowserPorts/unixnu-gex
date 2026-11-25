@@ -5,9 +5,8 @@
 // buffered for reading and its block size the size of its buffer (the
 // global kernel's pipe's, 64 KiB), the write ends their reader's. Bytes
 // written to standard input show as its size. (gexc's standard streams
-// are the host's, which gex stands in for as character devices: the
-// darwin-static image's native run says so, and the page's differ there
-// by design.)
+// are the host's, each shown as what it is: tests/darwin/run.sh's
+// stdstat.)
 import { System } from '../../page/runtime/src/index.js';
 import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
 
@@ -28,6 +27,9 @@ export default async function (t) {
   eq('and it ends', r.code, 0, ctx);
   const w = await timeout(sys.run(['/var/tmp/stdstat', 'wait'], { input: 'abcdef' }), 60000, 'stdstat wait');
   eq("standard input's size is what is buffered", w.stdout, pipe(0, 6), `stderr: ${w.stderr.slice(-1000)}`);
-  t.say(`gexc's, the host's streams: ${JSON.stringify(image.native.stdstat?.stdout)}`);
+  // gexc's: its host's streams as the image's run gave them, Node's
+  // socket pairs, each soo_stat's (S_IFSOCK).
+  t.say(`gexc's: ${JSON.stringify(image.native.stdstat?.stdout)}`);
+  eq("gexc's standard streams, Node's socket pairs, are sockets", image.native.stdstat?.stdout.split('\n').filter(Boolean).map((l) => / mode (\d+) /.exec(l)?.[1].slice(0, 3)), ['140', '140', '140']);
   await sys.shutdown();
 }

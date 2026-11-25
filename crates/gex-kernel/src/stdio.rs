@@ -25,6 +25,42 @@ pub enum Stream {
 /// stops dead).
 pub static STDIN_READY: std::sync::OnceLock<fn() -> bool> = std::sync::OnceLock::new();
 
+/// What a host's standard stream really is, from the host's `fstat` of
+/// its descriptor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostKind {
+    /// An anonymous pipe (a FIFO with no name: no links): the bytes
+    /// buffered (`st_size`), its buffer's size (`st_blksize`) and its inode
+    /// number as the host gives them.
+    Pipe { size: u64, blksize: u64, ino: u64 },
+    /// A named FIFO (or, on a host other than macOS, any FIFO).
+    Fifo,
+    /// A terminal.
+    Tty,
+    /// A regular file (`prog < file`, `> file`), and its I/O size as the
+    /// host gives it (`st_blksize`).
+    File { blksize: u64 },
+    /// A socket: on macOS, what the host's own XNU says of it (`soo_stat`
+    /// and the protocol's `pru_sense`: its mode, the bytes it has to read,
+    /// its send buffer's high-water mark as its block size, its inode and
+    /// device); `None` elsewhere.
+    Socket(Option<HostSocket>),
+    /// The host's null device (`/dev/null`).
+    Null,
+    /// Any other device.
+    Device,
+}
+
+/// A host socket's `fstat` as macOS's XNU gives it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostSocket {
+    pub mode: u32,
+    pub size: u64,
+    pub blksize: u64,
+    pub ino: u64,
+    pub dev: u64,
+}
+
 /// A standard stream, optionally reported as a terminal.
 #[derive(Debug)]
 pub struct StdStream {
@@ -68,6 +104,32 @@ impl StdStream {
 impl FileHandle for StdStream {
     fn is_host_stdio(&self) -> bool {
         true
+    }
+
+    #[cfg(all(unix, not(target_family = "wasm")))]
+    fn host_kind(&self) -> Option<HostKind> {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        if self.tty {
+            return Some(HostKind::Tty);
+        }
+        let md = host(self.stream)?.metadata().ok()?;
+        let t = md.file_type();
+        Some(if t.is_file() {
+            HostKind::File { blksize: md.blksize() }
+        } else if cfg!(target_os = "macos") && t.is_fifo() && md.nlink() == 0 {
+            // The host's own XNU's `pipe_stat` (no links, as only a pipe
+            // has); another host's pipe is told from a named FIFO by
+            // nothing here.
+            HostKind::Pipe { size: md.size(), blksize: md.blksize(), ino: md.ino() }
+        } else if t.is_fifo() {
+            HostKind::Fifo
+        } else if t.is_socket() {
+            HostKind::Socket(cfg!(target_os = "macos").then(|| HostSocket { mode: md.mode(), size: md.size(), blksize: md.blksize(), ino: md.ino(), dev: md.dev() }))
+        } else if t.is_char_device() && std::fs::metadata("/dev/null").is_ok_and(|n| n.rdev() == md.rdev()) {
+            HostKind::Null
+        } else {
+            HostKind::Device
+        })
     }
 
     fn poll_readable(&self) -> bool {

@@ -22,7 +22,7 @@ export default async function (t) {
   const image = await (await fetch(t.work('darwin-dyn.json'))).json();
   const boot = Object.fromEntries(image.boot.map((f) => [f, new URL(t.work(`darwin-dyn/boot/${f}`))]));
   const disk0 = { url: t.work('darwin-root/disk0'), missing: new URL(t.work('darwin-root/disk0.missing')) };
-  const sys = new System({ baseUrl: t.baseUrl, arch: 'aarch64', darwin: { boot, disk0, strict: false }, debug: t.debug() });
+  const sys = new System({ baseUrl: t.baseUrl, arch: 'aarch64', darwin: { boot, disk0, strict: true }, debug: t.debug() });
   const fs = new MemoryFilesystem(sys);
   fs.addTar(t.work('darwin-root/root.tar'), { lazy: t.work('darwin-root/root-lazy.json') });
   const body = new Uint8Array(await (await fetch(t.work('darwin-dyn/dynspawn'))).arrayBuffer());

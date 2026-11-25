@@ -7,9 +7,11 @@
 //! internal and not reusable, and the page tables mapping its pages), kept
 //! in a record of the task's pages ([`Pmap`]) rather than credited page by
 //! page: a page the task touched is seen in the host's VM, which faults it
-//! in. The device modelled runs no pageout (its pressure level stays
-//! normal, `kfilt`), so a page once entered stays the task's until a
-//! kernel operation removes it, and a page table stays until a
+//! in, or, on a host that keeps no page states (the page's), in the map,
+//! which holds every page not yet touched as not entered until its first
+//! access enters it. The device modelled runs no pageout (its pressure
+//! level stays normal, `kfilt`), so a page once entered stays the task's
+//! until a kernel operation removes it, and a page table stays until a
 //! `pmap_remove` empties it: what the host compresses or reclaims of a
 //! clean page (a page read and never written, a page `MADV_FREE` killed, a
 //! file's page) changes nothing here. Between kernel operations the
@@ -453,6 +455,31 @@ impl Pmap {
         by_chunk(s, e).any(|(c, i0, i1)| self.chunks.get(&c).is_some_and(|w| (i0..i1).any(|i| matches!((get(w, i), own_only), (Held::Own, _) | (Held::Reusable | Held::File, false)))))
     }
 
+    /// The runs of pages it holds as [`Held::Reusable`], `[start, end)` by
+    /// address, sorted.
+    fn reusable_runs(&self) -> Vec<(u64, u64)> {
+        let mut out: Vec<(u64, u64)> = Vec::new();
+        if self.reusable == 0 {
+            return out;
+        }
+        for (&c, words) in &self.chunks {
+            for (wi, &w) in words.iter().enumerate() {
+                // The low bit of each field holding Reusable (binary 10).
+                let mut bits = (w >> 1) & LOW & !w;
+                while bits != 0 {
+                    let i = u64::from(bits.trailing_zeros() / 2);
+                    bits &= bits - 1;
+                    let at = (c * CHUNK_PAGES + wi as u64 * 32 + i) << PAGE_SHIFT;
+                    match out.last_mut() {
+                        Some(last) if last.1 == at => last.1 = at + PAGE,
+                        _ => out.push((at, at + PAGE)),
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Change the pages of `[s, e)` by `f`.
     fn change(&mut self, s: u64, e: u64, f: impl Fn(Held) -> Held) {
         for (c, i0, i1) in by_chunk(s, e) {
@@ -524,6 +551,26 @@ fn hide_unentered(unentered: &[(u64, u64)], at: u64, out: &mut [u8]) {
     for &(s, e) in unentered[i..].iter().take_while(|&&(s, _)| s < end) {
         let (a, b) = (((s.max(at) - at) >> PAGE_SHIFT) as usize, ((e.min(end) - at) >> PAGE_SHIFT) as usize);
         out[a..b].fill(0);
+    }
+}
+
+/// The states of the pages from `at` in `out` on a host that keeps none
+/// (the page's memory, which is no host allocation): the pmap's own
+/// entries say them. The map holds each page the task has not touched as
+/// not entered, or absent, which a look leaves out ([`hide_unentered`]);
+/// every other page of it is entered, so present: reusable where the
+/// record holds it so (`PMAP_OPTIONS_SET_REUSABLE` stays on a page until a
+/// reuse clears it), else the task's own. A private mapping's page the
+/// file's still is made external by the caller, as it is for a host's.
+fn entered_states(reusable: &[(u64, u64)], at: u64, out: &mut [u8]) {
+    out.fill(ps::PRESENT);
+    let end = at + ((out.len() as u64) << PAGE_SHIFT);
+    let i = reusable.partition_point(|&(_, e)| e <= at);
+    for &(s, e) in reusable[i..].iter().take_while(|&&(s, _)| s < end) {
+        let (a, b) = (((s.max(at) - at) >> PAGE_SHIFT) as usize, ((e.min(end) - at) >> PAGE_SHIFT) as usize);
+        for st in &mut out[a..b] {
+            *st |= ps::REUSABLE;
+        }
     }
 }
 
@@ -665,11 +712,18 @@ impl Meter {
             u.sort_unstable();
             (u, mm.copy_pending_runs())
         };
+        // A host that keeps no page states: the pmap's entries say them.
+        let reusable = (!m.host_keeps_page_states()).then(|| pm.reusable_runs());
         // A private mapping's page it has not written is the file's,
         // whatever the host made of it.
         let ok = pm.look(&ranges, &twigs, &unentered, &mut |at, n, out| {
-            if !m.page_states(at, n * PAGE, PAGE, out).unwrap_or(false) {
-                return false;
+            match &reusable {
+                Some(r) => entered_states(r, at, out),
+                None => {
+                    if !m.page_states(at, n * PAGE, PAGE, out).unwrap_or(false) {
+                        return false;
+                    }
+                }
             }
             let (first, end) = (at >> PAGE_SHIFT, (at >> PAGE_SHIFT) + n);
             let i = pending.partition_point(|&(_, e)| e <= first);
@@ -698,14 +752,27 @@ impl Meter {
             return true;
         }
         let ranges: Vec<(u64, u64)> = self.ranges(mm).into_iter().filter(|&(rs, re)| rs < e && re > s).map(|(rs, re)| (rs.max(s), re.min(e))).collect();
-        let unentered = mm.lock().unentered_ranges();
+        // What is not entered, and what is absent, as a look leaves it out.
+        let unentered = {
+            let mm = mm.lock();
+            let mut u = mm.unentered_ranges();
+            u.extend(mm.absent_ranges());
+            u.sort_unstable();
+            u
+        };
+        let reusable = (!m.host_keeps_page_states()).then(|| pm.reusable_runs());
         let mut out = vec![0u8; CHUNK_PAGES as usize];
         for (rs, re) in ranges {
             for (c, i0, i1) in by_chunk(rs, re) {
                 let at = (c * CHUNK_PAGES + i0 as u64) << PAGE_SHIFT;
                 let n = i1 - i0;
-                if !m.page_states(at, n as u64 * PAGE, PAGE, &mut out[..n]).unwrap_or(false) {
-                    return true;
+                match &reusable {
+                    Some(r) => entered_states(r, at, &mut out[..n]),
+                    None => {
+                        if !m.page_states(at, n as u64 * PAGE, PAGE, &mut out[..n]).unwrap_or(false) {
+                            return true;
+                        }
+                    }
                 }
                 hide_unentered(&unentered, at, &mut out[..n]);
                 if out[..n].iter().any(|&st| matches!((Held::None.looked(st), own_only), (Held::Own, _) | (Held::Reusable | Held::File, false))) {
@@ -1312,6 +1379,37 @@ mod tests {
         assert!(pm.look(&range, &[0], &unentered, &mut host(&st)));
         assert_eq!(pm.balance(), FIXED + 2 * PAGE as i64 + PAGE as i64);
         assert_eq!((pm.held(BASE + 2 * PAGE), pm.held(BASE + 7 * PAGE), pm.held(BASE)), (Held::Own, Held::Own, Held::None));
+    }
+
+    /// A host that keeps no page states (the page's): what is entered is
+    /// held, a reusable page stays so until a reuse, and pages not entered
+    /// hold nothing.
+    #[test]
+    fn the_pmaps_own_entries_say_what_a_host_cannot() {
+        let range = [(BASE, BASE + 8 * PAGE)];
+        let mut pm = Pmap::default();
+        let entered = |pm: &mut Pmap, unentered: &[(u64, u64)]| {
+            let reusable = pm.reusable_runs();
+            assert!(pm.look(&range, &[0], unentered, &mut |at, _, out| {
+                entered_states(&reusable, at, out);
+                true
+            }));
+        };
+        // Three pages touched.
+        entered(&mut pm, &[(BASE + 3 * PAGE, BASE + 8 * PAGE)]);
+        assert_eq!(pm.pages(), Pages { resident: 3, internal: 3, external: 0, reusable: 0 });
+        assert_eq!(pm.balance(), FIXED + 3 * PAGE as i64 + PAGE as i64);
+        // Two made reusable: still entered, no longer counted, and so at
+        // the next look.
+        pm.made_reusable(BASE + PAGE, BASE + 3 * PAGE);
+        assert_eq!(pm.reusable_runs(), vec![(BASE + PAGE, BASE + 3 * PAGE)]);
+        entered(&mut pm, &[(BASE + 3 * PAGE, BASE + 8 * PAGE)]);
+        assert_eq!(pm.pages(), Pages { resident: 3, internal: 1, external: 0, reusable: 2 });
+        // Reused: the task's own again.
+        pm.reused(BASE, BASE + 8 * PAGE);
+        entered(&mut pm, &[(BASE + 4 * PAGE, BASE + 8 * PAGE)]);
+        assert_eq!(pm.pages(), Pages { resident: 4, internal: 4, external: 0, reusable: 0 });
+        assert!(pm.reusable_runs().is_empty());
     }
 
     #[test]

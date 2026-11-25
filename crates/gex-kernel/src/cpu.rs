@@ -393,6 +393,7 @@ impl crate::syscalls::Kernel {
             self.darwin_unimplemented("thread_selfusage on a host without per-thread clocks".into());
             return Err(crate::Errno::ENOSYS);
         };
+        self.darwin_clock_read();
         let (numer, denom) = crate::darwin::mach::TIMEBASE;
         Ok((u128::from(u + s) * u128::from(denom) / u128::from(numer)) as u64)
     }

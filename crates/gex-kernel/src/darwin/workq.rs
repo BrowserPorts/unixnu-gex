@@ -2176,6 +2176,7 @@ impl Kernel {
             self.darwin_unimplemented("a thread's running time (the workqueue quantum)".into());
             return;
         };
+        self.darwin_clock_read();
         self.workq_disarm_quantum(tid);
         let t = self.wqt(tid);
         t.quantum_deadline = runtime + size;
@@ -2829,14 +2830,23 @@ struct ThreadTime {
     started: fn(i32),
     ended: fn(i32),
     runtime: fn(i32) -> Option<u64>,
+    busy: bool,
 }
 
 static THREAD_TIME: std::sync::OnceLock<ThreadTime> = std::sync::OnceLock::new();
 
+/// What a host's per-thread clock that is its threads' busy time
+/// ([`set_thread_time`]'s `busy`) stands in for, said once per process by
+/// each reader of a thread's time.
+pub const BUSY_TIME: &str = "the threads' processor time (ru_utime and ru_stime, ri_user_time, ri_cycles, ri_cpu_time_qos_*, ri_runnable_time, ri_child_user_time, thread_info's and task_info's times, thread_selfusage, ITIMER_VIRTUAL and ITIMER_PROF, a terminal's status line, the bank's bills, the scheduler's usage decay and the workqueue quantum) on a host that gives no per-thread processor clock: a page thread's time is its Worker's busy time, every stretch it is not parked while it runs the thread, which also holds the time the browser has the Worker descheduled and gex's own work on the thread (translating its code) (stand-in: the Worker's busy time)";
+
 /// The host's per-thread clocks: what a guest thread's host thread notes as
 /// it starts and forgets as it ends, and its running time in nanoseconds.
-pub fn set_thread_time(started: fn(i32), ended: fn(i32), runtime: fn(i32) -> Option<u64>) {
-    let _ = THREAD_TIME.set(ThreadTime { started, ended, runtime });
+/// `busy`: the time is the host thread's busy time, not its processor time
+/// (a page's Worker: the browser gives no processor clock), which
+/// [`BUSY_TIME`] says.
+pub fn set_thread_time(started: fn(i32), ended: fn(i32), runtime: fn(i32) -> Option<u64>, busy: bool) {
+    let _ = THREAD_TIME.set(ThreadTime { started, ended, runtime, busy });
 }
 
 /// Guest thread `tid`'s host thread's processor time in nanoseconds.
@@ -2847,6 +2857,20 @@ pub(crate) fn host_thread_ns(tid: i32) -> Option<u64> {
 /// Whether the host has per-thread clocks.
 pub(crate) fn host_clocks() -> Option<()> {
     THREAD_TIME.get().map(|_| ())
+}
+
+/// Whether the host's per-thread clocks are each thread's processor time
+/// itself: what stops or signals a process on the time it has used
+/// (RLIMIT_CPU, the CPU usage monitor) needs it, which a busy time's
+/// over-count would set off early.
+pub(crate) fn exact_clocks() -> Option<()> {
+    THREAD_TIME.get().filter(|t| !t.busy).map(|_| ())
+}
+
+/// What stands in for the threads' processor time, where the host's
+/// clocks are a busy time ([`BUSY_TIME`]).
+pub(crate) fn clock_stand_in() -> Option<&'static str> {
+    THREAD_TIME.get().filter(|t| t.busy).map(|_| BUSY_TIME)
 }
 
 /// A guest thread starts on the calling host thread.

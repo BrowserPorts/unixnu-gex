@@ -80,7 +80,10 @@ pub(super) fn thread_info(k: &mut Kernel, t: i32, fl: i32, count: u32) -> Reply 
                 return Reply::err(KERN_INVALID_ARGUMENT);
             }
             match basic_info(k, t) {
-                Ok(w) => Reply::ok(super::mig::words(&w)),
+                Ok(w) => {
+                    k.darwin_clock_read();
+                    Reply::ok(super::mig::words(&w))
+                }
                 Err(why) => loud(why),
             }
         }

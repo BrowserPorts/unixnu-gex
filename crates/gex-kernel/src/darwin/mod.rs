@@ -553,6 +553,9 @@ pub struct Task {
     pub force_quota: bool,
     /// What has been reported as not done, so each is said once.
     said: std::collections::HashSet<String>,
+    /// Whether the threads' processor time has been said to stand in
+    /// ([`crate::syscalls::Kernel::darwin_clock_read`]).
+    clock_said: bool,
     /// Under strict mode, the unimplemented thing that stops the process
     /// when the call returns.
     stop: Option<String>,
@@ -896,6 +899,19 @@ impl crate::syscalls::Kernel {
     pub fn darwin_stand_in(&mut self, what: &str) {
         if self.dtask.said.insert(format!("stand-in: {what}")) || self.trace {
             crate::darwin_say!("[gex:{}] Darwin: stand-in: {what}", self.pid);
+        }
+    }
+
+    /// A thread's processor time is read, for the program or for what it
+    /// sets going (a timer, the scheduler's decay): where the host's
+    /// clocks are a busy time, that stand-in is said, once per process.
+    pub(crate) fn darwin_clock_read(&mut self) {
+        if self.dtask.clock_said {
+            return;
+        }
+        if let Some(what) = workq::clock_stand_in() {
+            self.dtask.clock_said = true;
+            self.darwin_stand_in(what);
         }
     }
 

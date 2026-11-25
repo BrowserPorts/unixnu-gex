@@ -5,7 +5,9 @@
 //!
 //! The virtual and profiling timers count down the task's user time, and
 //! its user and system time, as `bsd_ast` charges them from the host's
-//! per-thread clocks; on a host without them, arming one fails loudly.
+//! per-thread clocks; on a host without them, arming one fails loudly. A
+//! host whose clocks are a busy time (the page's) runs them on it, said as
+//! a stand-in; RLIMIT_CPU's timer, which kills, it refuses.
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -78,6 +80,9 @@ impl Kernel {
         if which != ITIMER_REAL && v.value != 0 && super::workq::host_clocks().is_none() {
             self.darwin_unimplemented("a virtual timer on a host without per-thread clocks".into());
             return Err(Errno::ENOSYS);
+        }
+        if which != ITIMER_REAL && v.value != 0 {
+            self.darwin_clock_read();
         }
         write_itimerval(m, itv, v)?;
         Ok(0)
@@ -287,6 +292,17 @@ impl Kernel {
 
     /// `task_vtimer_set(task, which)`: each thread's time now its save.
     pub(crate) fn darwin_vtimer_set(&mut self, which: u32) {
+        // RLIMIT_CPU's timer ends in SIGXCPU, whose default kills: a busy
+        // time's over-count (the page's clocks) would end it early. (An
+        // inherited limit is set here at the exec or spawn; a setrlimit is
+        // refused before.)
+        if which == vt::RLIM && super::workq::host_clocks().is_some() && super::workq::exact_clocks().is_none() {
+            self.darwin_unimplemented("RLIMIT_CPU's timer on a host whose per-thread clocks are a busy time, not the threads' processor time (a page's Workers': the limit would be reached early)".into());
+            return;
+        }
+        if which != vt::RLIM {
+            self.darwin_clock_read();
+        }
         self.dtask.vtimer_bits |= which;
         let i = match which {
             vt::USER => 0,
@@ -387,6 +403,12 @@ impl Kernel {
             self.darwin_vtimer_clear(vt::RLIM);
             self.dtask.rlim_cpu = (0, 0);
             return Ok(());
+        }
+        // The limit kills the process at its end: a busy time's
+        // over-count (the page's clocks) would kill it early.
+        if super::workq::host_clocks().is_some() && super::workq::exact_clocks().is_none() {
+            self.darwin_unimplemented("setrlimit(RLIMIT_CPU) on a host whose per-thread clocks are a busy time, not the threads' processor time (a page's Workers': the limit would be reached early)".into());
+            return Err(Errno::EINVAL);
         }
         let Some((user, sys)) = self.task_times() else {
             self.darwin_unimplemented("setrlimit(RLIMIT_CPU) on a host without per-thread clocks".into());

@@ -6,9 +6,9 @@
 // made from the first's, which the page keeps once. Then a posix_spawn's
 // dynamic child (dynspawn with no argument): spawned in a group of its own,
 // refused a setpgid after its exec (EACCES), waited for, its exit status
-// gexc's, its cache its parent's. Its time among the reaped children's is
-// not measurable in the page (a Worker has no per-thread clock), which
-// getrusage reports and refuses (ENOSYS), so the page's run is not strict.
+// gexc's, its cache its parent's, and its time among the reaped children's
+// (getrusage RUSAGE_CHILDREN): the child's threads' Workers' busy time (a
+// Worker has no processor clock), which the kernel says stands in.
 import { System } from '../../page/runtime/src/index.js';
 import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
 import { ROOT_OWNED, tarWithXattrs } from '../fixtures/xattr-tar.js';
@@ -41,10 +41,8 @@ export default async function (t) {
   const spawned = await timeout(sys.run([PROG]), 800000, 'dynspawn');
   t.say(`the spawn, its child's start and run and its wait took ${((performance.now() - p0) / 1000).toFixed(1)} s`);
   await t.saveFile('console.txt', sys.state.console);
-  const [line, usage] = spawned.stdout.split('\n');
-  eq('the spawned child: its group, its setpgid, its wait and its status, as gexc\'s', line, native.stdout.split('\n')[0], ctx(spawned));
-  eq('its usage, which the page cannot measure, refused (ENOSYS)', usage, 'dynspawn usage -78');
-  t.check('and said', sys.state.console.includes("getrusage(RUSAGE_CHILDREN)'s times on a host without per-thread clocks"), sys.state.console.slice(-2000));
+  eq('the spawned child: its group, its setpgid, its wait and its status, and its usage, as gexc\'s', spawned.stdout, native.stdout, ctx(spawned));
+  t.check("its usage's stand-in said", sys.state.console.includes("Darwin: stand-in: the threads' processor time ("), sys.state.console.slice(-2000));
   for (const l of sys.state.console.split('\n').filter((l) => l.includes('Darwin: not implemented'))) t.say(`console: ${l.slice(0, 240)}`);
   await sys.shutdown();
 }

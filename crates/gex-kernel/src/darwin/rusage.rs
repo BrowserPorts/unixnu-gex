@@ -938,6 +938,10 @@ impl Kernel {
         if !unkept.is_empty() {
             self.darwin_unimplemented(format!("proc_pid_rusage flavor {flavor}: {}, not kept (given as 0)", unkept.join(", ")));
         }
+        // Its times are the threads' clocks'.
+        if r.unkept & (1 << ri::USER_TIME) == 0 {
+            self.darwin_clock_read();
+        }
         m.write(buf, &r.bytes()[..size]).map_err(|_| EFAULT)?;
         Ok(0)
     }

@@ -71,6 +71,9 @@ pub mod stand_in {
     /// `ru_msgsnd`, `ru_msgrcv`: sockets whose sends and receives are not
     /// `sosend`'s and `soreceive`'s here.
     pub const MSGS: u32 = 1 << 5;
+    /// `ru_utime`, `ru_stime`: a host thread's busy time, not its processor
+    /// time ([`super::super::workq::BUSY_TIME`]).
+    pub const TIMES: u32 = 1 << 6;
 }
 
 /// Each stand-in bit: the field and what it stands in for.
@@ -81,6 +84,7 @@ pub const STAND_INS: [(u32, &str); 7] = [
     (stand_in::OUBLOCK, "ru_oublock: synchronous buffer writes (buf_bwrite) and the kexts' proc_increment_ru_oublock calls, APFS's among them, whose state is not kept (stand-in: 0; measure ru_oublock on the device across creating and fsyncing a file)"),
     (stand_in::MAXRSS, "ru_maxrss: the phys_mem ledger's lifetime peak, which needs a look at the task's pages the host does not give (stand-in: 0; measure ru_maxrss on the device of a process that touches a known number of pages)"),
     (stand_in::MSGS, "ru_msgsnd and ru_msgrcv of a socket other than a unix stream (its sends and receives are the host's socket code's, not sosend's and soreceive's) (stand-in: those not counted; measure on the device ru_msgsnd and ru_msgrcv across N sends and receives on a datagram socket)"),
+    (stand_in::TIMES, super::workq::BUSY_TIME),
 ];
 
 /// The stand-ins gex always makes in a record: what it cannot see on any
@@ -237,6 +241,9 @@ impl Stats {
             Some([u, s]) => {
                 r.utime = u;
                 r.stime = s;
+                if super::workq::clock_stand_in().is_some() {
+                    r.stand_ins |= stand_in::TIMES;
+                }
             }
             None => r.times_unknown = true,
         }
@@ -247,7 +254,7 @@ impl Stats {
         // counted, so ru_nivcsw is clamped to 0 as calcru clamps it.
         r.l[l::NIVCSW] = 0;
         r.l[l::MAXRSS] = maxrss.unwrap_or(0) as i64;
-        r.stand_ins = ALWAYS | self.unseen.load(Ordering::Acquire) | if maxrss.is_none() { stand_in::MAXRSS } else { 0 };
+        r.stand_ins |= ALWAYS | self.unseen.load(Ordering::Acquire) | if maxrss.is_none() { stand_in::MAXRSS } else { 0 };
         r
     }
 

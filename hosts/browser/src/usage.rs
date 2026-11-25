@@ -18,9 +18,16 @@
 //! task (`ProcTable::add_task_cpu`, `/proc/<pid>/task/<tid>/stat`) once a
 //! tick of it has gathered, when the Worker turns to another thread, and as
 //! the process exits.
+//!
+//! A Darwin thread's processor time is the same busy time, kept per thread
+//! in the process's memory so any of its Workers can read another's
+//! ([`thread_ns`]): the kernel's per-thread clock
+//! (`gex_kernel::darwin::workq::set_thread_time`, given as a busy time).
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
 
 /// `USER_HZ`'s tick: what `/proc` counts in, so saying less is not worth a call.
 const SAY_EVERY_NS: u64 = 10_000_000;
@@ -50,6 +57,55 @@ thread_local! {
     static TASK: Cell<(i32, u64)> = const { Cell::new((0, 0)) };
 }
 
+/// A thread's busy time as the kernel's clock reads it: its finished
+/// stretches, and when the stretch it is in began on its Worker (0 while it
+/// is not in one).
+#[derive(Clone, Copy, Default)]
+struct Busy {
+    done: u64,
+    since: u64,
+}
+
+/// The process's threads the kernel's clock knows ([`thread_started`]), in
+/// the process's memory: each Worker's stretches go to its thread's.
+fn threads() -> std::sync::MutexGuard<'static, HashMap<i32, Busy>> {
+    static T: std::sync::OnceLock<Mutex<HashMap<i32, Busy>>> = std::sync::OnceLock::new();
+    T.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Thread `tid` (if the clock knows it) has `d` more of finished busy time,
+/// and its stretch now began at `since` (0: it is in none).
+fn note(tid: i32, d: u64, since: u64) {
+    if tid <= 0 {
+        return;
+    }
+    if let Some(b) = threads().get_mut(&tid) {
+        b.done += d;
+        b.since = since;
+    }
+}
+
+/// A Darwin thread starts on this Worker: the clock knows it from now, its
+/// time counted from the stretch this Worker is in (if it is this Worker's
+/// thread already).
+pub(crate) fn thread_started(tid: i32) {
+    let (bound, _) = TASK.with(|c| c.get());
+    let since = if bound == tid { BUSY_SINCE.with(|c| c.get()) } else { 0 };
+    threads().insert(tid, Busy { done: 0, since });
+}
+
+/// A Darwin thread has ended: the clock forgets it.
+pub(crate) fn thread_ended(tid: i32) {
+    threads().remove(&tid);
+}
+
+/// Thread `tid`'s busy time so far in nanoseconds, from any Worker of the
+/// process: none for a thread the clock does not know.
+pub(crate) fn thread_ns(tid: i32) -> Option<u64> {
+    let b = *threads().get(&tid)?;
+    Some(b.done + if b.since == 0 { 0 } else { now().saturating_sub(b.since) })
+}
+
 /// `d` of this Worker's busy time is its thread's: told to the table once a
 /// tick has gathered (or now, `now`).
 fn to_task(d: u64, now: bool) {
@@ -73,6 +129,7 @@ pub(crate) fn bind(tid: i32) {
         return;
     }
     let since = BUSY_SINCE.with(|c| c.get());
+    let mut started = 0;
     if since != 0 {
         let t = now();
         BUSY_SINCE.with(|c| c.set(t));
@@ -80,10 +137,13 @@ pub(crate) fn bind(tid: i32) {
         MINE_NS.with(|c| c.set(c.get() + d));
         PROC_NS.fetch_add(d, Ordering::AcqRel);
         to_task(d, true);
+        note(was, d, 0);
+        started = t;
     } else {
         to_task(0, true);
     }
     TASK.with(|c| c.set((tid, 0)));
+    note(tid, 0, started);
 }
 
 fn now() -> u64 {
@@ -104,6 +164,8 @@ pub(crate) fn fork_child() {
     // the child's first thread is a new task (its pid): the bind that names
     // it starts its count
     TASK.with(|c| c.set((0, 0)));
+    // the parent's threads are not the child's
+    threads().clear();
     PROC_NS.store(0, Ordering::Release);
     BASE_NS.store(0, Ordering::Release);
     BASE_READ.store(true, Ordering::Release);
@@ -120,6 +182,7 @@ pub(crate) fn park_begin() {
     }
     let d = now().saturating_sub(since);
     MINE_NS.with(|c| c.set(c.get() + d));
+    note(TASK.with(|c| c.get()).0, d, 0);
     to_task(d, false);
     let total = PROC_NS.fetch_add(d, Ordering::AcqRel) + d;
     if total.saturating_sub(SAID_NS.load(Ordering::Acquire)) >= SAY_EVERY_NS {
@@ -129,11 +192,11 @@ pub(crate) fn park_begin() {
 
 /// This Worker runs again.
 pub(crate) fn park_end() {
-    BUSY_SINCE.with(|c| {
-        if c.get() == 0 {
-            c.set(now());
-        }
-    });
+    if BUSY_SINCE.with(|c| c.get()) == 0 {
+        let t = now();
+        BUSY_SINCE.with(|c| c.set(t));
+        note(TASK.with(|c| c.get()).0, 0, t);
+    }
 }
 
 /// A system call: every so often, a busy stretch long enough is folded into
@@ -160,6 +223,7 @@ pub(crate) fn tick() {
     BUSY_SINCE.with(|c| c.set(t));
     let d = t - since;
     MINE_NS.with(|c| c.set(c.get() + d));
+    note(TASK.with(|c| c.get()).0, d, t);
     to_task(d, false);
     let total = PROC_NS.fetch_add(d, Ordering::AcqRel) + d;
     if total.saturating_sub(SAID_NS.load(Ordering::Acquire)) >= SAY_EVERY_NS {

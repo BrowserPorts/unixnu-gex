@@ -352,7 +352,11 @@ fn start(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> Result<u
     data.write((c + ctx::SAFEPOINT_COUNTER) as u64, &1024i32.to_le_bytes()).map_err(|_| load("its thread's context is outside the memory".into()))?;
     h.threads.reset(h.kernel.pid, ctx_addr, ThreadCell::new(Run::new(entry, Waiting::Runnable)));
     set_current(h, 0);
+    install_thread_clock();
     darwin::workq::thread_started(h.kernel.tid);
+    // Its processor time counts from here, as the native host's thread
+    // loop starts it.
+    let _ = h.kernel.thread_cpu_start();
     // Its thread-call Worker, which the page starts now.
     let _ = CALLS.compare_exchange(CALLS_CAN, CALLS_WANTED, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire);
     // A spawned child's memory built and its image and stack in place: its
@@ -716,6 +720,15 @@ pub(crate) fn abandoned(in_call: bool) {
 fn on_workers() -> std::sync::MutexGuard<'static, Vec<i32>> {
     static ON: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
     ON.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The kernel's per-thread clocks (`workq::set_thread_time`): each Darwin
+/// thread's busy time on the Workers that run it ([`crate::usage`]), a busy
+/// time, as the browser gives a Worker no processor clock (said as a
+/// stand-in where it is read; what would end a process on it, RLIMIT_CPU
+/// and the CPU usage monitor, is refused).
+fn install_thread_clock() {
+    gex_kernel::darwin::workq::set_thread_time(crate::usage::thread_started, crate::usage::thread_ended, crate::usage::thread_ns, true);
 }
 
 /// Darwin thread `tid` has ended (`workq::thread_ended`), its Worker no
@@ -1579,6 +1592,9 @@ pub(crate) fn adopted(i: usize) -> Option<u64> {
                 let mut r = h.threads[i].run();
                 r.pc = 0;
                 r.waiting = r.park_as(waiting);
+        // Its processor time counts from its first entry; a wait the entry
+        // parks it in is no running time.
+        let cpu = h.kernel.thread_cpu_start();
                 r.blocked_on = Some(op);
                 r.owed = Owed { darwin: true, ..Owed::default() };
                 return Some(None);
@@ -1595,6 +1611,9 @@ pub(crate) fn adopted(i: usize) -> Option<u64> {
             }
             Some(SyscallOutcome::Killed { signal, .. }) => {
                 task_end(&mut h.kernel);
+                if let Some(c) = &cpu {
+                    c.leave(true);
+                }
                 killed(signal as i32, 0);
                 return None;
             }

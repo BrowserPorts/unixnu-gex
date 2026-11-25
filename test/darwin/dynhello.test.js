@@ -6,11 +6,11 @@
 // the image's, read by ranges; the program is in the root's /var/tmp with
 // its owner recorded, as tests/darwin/run.sh places it. Its output and
 // status must be gexc's (the `darwin-dyn` image, strict). The page's run is
-// not strict: the page cannot say which pages of its memory a task has
-// touched, so libmalloc's phys_footprint is reported as not done there
-// (and a strict run stops at it); every such report is said. The time the run
-// took (most of it mapping the cache and translating dyld's and the
-// cache's code) is said, against gexc's.
+// strict too, so anything the kernel reports as not done stops it (its
+// phys_footprint, which libmalloc reads, is the pages the task's pmap
+// entered at their first access). The time the run took (most of it mapping
+// the cache and translating dyld's and the cache's code) is said, against
+// gexc's.
 import { System } from '../../page/runtime/src/index.js';
 import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
 import { ROOT_OWNED, tarWithXattrs } from '../fixtures/xattr-tar.js';
@@ -32,7 +32,7 @@ export default async function (t) {
   const disk0 = { url: t.work('darwin-root/disk0'), missing: new URL(t.work('darwin-root/disk0.missing')) };
   // `log: 'debug'`: each process's numbers at its end (its translation's
   // time and its modules' compiles), on the browser's console.
-  const sys = new System({ baseUrl: t.baseUrl, arch: 'aarch64', darwin: { boot, disk0, strict: false }, debug: t.debug({ log: 'debug' }) });
+  const sys = new System({ baseUrl: t.baseUrl, arch: 'aarch64', darwin: { boot, disk0, strict: true }, debug: t.debug({ log: 'debug' }) });
   const fs = new MemoryFilesystem(sys);
   fs.addTar(t.work('darwin-root/root.tar'), { lazy: t.work('darwin-root/root-lazy.json') });
   const body = new Uint8Array(await (await fetch(t.work('darwin-dyn/hello'))).arrayBuffer());

@@ -581,12 +581,19 @@ impl Kernel {
     }
 
     /// A segment the loader mapped for the image (`load_segment`): its
-    /// file's pages copy-on-write, the zero fill past them anonymous.
+    /// file's pages copy-on-write, the zero fill past them anonymous. Its
+    /// host placed the segment in the task's memory and map; the pmap
+    /// enters none of it (`map_segment`'s `vm_map_enter_mem_object_control`
+    /// and `vm_map_enter_mem_object` enter no page): each page is entered
+    /// at its first access, a file page read only until a store copies it.
     pub fn darwin_image_segment(&mut self, vaddr: u64, filesize: u64, memsize: u64, file_off: u64, maxprot: u8) {
         let (start, end) = (vaddr & !PAGE_MASK, round(vaddr + memsize));
         let file_end = round(vaddr + filesize).min(end);
         self.dtask.vm.enter(start, file_end, Attrs { kind: kind::FILE_PRIVATE, max: maxprot, ..Attrs::default() }, file_off);
         self.dtask.vm.enter_anon(file_end, end, Attrs { max: maxprot, ..Attrs::default() }, false);
+        let mut mm = self.mem.lock();
+        mm.set_unentered(start, end);
+        mm.set_copy_pending(start, file_end);
     }
 
     /// The new image's map, as `proc_apply_jit_and_vm_policies` makes it

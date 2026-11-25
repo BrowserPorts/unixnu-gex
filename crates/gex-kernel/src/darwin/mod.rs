@@ -656,12 +656,18 @@ impl crate::syscalls::Kernel {
             let mut mm = self.mem.lock();
             // Each the copy's vm_fault, counted in the task's faults.
             let mut faults = 0;
+            let mut entered = Vec::new();
             for p in touched {
-                faults += u64::from(mm.enter_page(p));
+                if mm.enter_page(p) {
+                    faults += 1;
+                    entered.push(p);
+                }
             }
-            // A write's fault on a file's page copied it.
+            entered.sort_unstable();
+            // A write's fault on a file's page copied it: the same fault
+            // as the one that entered it, where one did.
             for p in copied {
-                faults += u64::from(mm.copied(p));
+                faults += u64::from(mm.copied(p) && entered.binary_search(&p).is_err());
             }
             drop(mm);
             self.dtask.rusage.ru.faults.fetch_add(faults, std::sync::atomic::Ordering::AcqRel);

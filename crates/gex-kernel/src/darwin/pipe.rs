@@ -43,6 +43,42 @@ pub fn caller() -> i32 {
 /// `UIO_MAXIOV`.
 const UIO_MAXIOV: u64 = 1024;
 
+/// `sizeof(struct pipe_info)`: a `vinfo_stat`, the two handles, the
+/// status and a reserved word.
+pub const PIPE_INFO_SIZE: usize = 160;
+
+/// A Darwin call's wait on the stream `handle` sleeps (`pipe_read`'s
+/// `piperd` or `pipe_write`'s `pipewr` msleep, the first time or again): a
+/// pipe's read side marks it as they do, `PIPE_WANTR` for a reader and
+/// `PIPE_WANTW` for a writer (the side that holds the buffer, which the
+/// next write or read clears).
+pub fn sleeps(handle: &dyn crate::vfs::FileHandle, write: bool) {
+    let bit = if write { xnu::state::WANTW } else { xnu::state::WANTR };
+    if let Some((pipe, _)) = handle.pipe_end() {
+        if pipe.is_xnu() {
+            pipe.mark(false, bit);
+        }
+    } else if let Some(r) = handle.as_remote_pipe() {
+        (r.remote.mark)(r.id, 0, bit);
+    }
+}
+
+/// `pipe_select` of pipe end `handle` for writing: `PIPE_WSELECT` in its
+/// peer's state, while it has one.
+pub fn selected_for_write(handle: &dyn crate::vfs::FileHandle) {
+    if let Some((pipe, write)) = handle.pipe_end() {
+        if pipe.is_xnu() {
+            pipe.mark(!write, xnu::state::WSELECT);
+        }
+    } else if let Some(r) = handle.as_remote_pipe() {
+        (r.remote.mark)(r.id, i32::from(!r.write), xnu::state::WSELECT);
+    }
+}
+
+/// A Darwin pipe's next number in the process that makes it
+/// ([`crate::pipe::Pipe::set_ident`]).
+static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// `pipe_stat` of a pipe the page's global kernel holds
 /// ([`held_elsewhere`]), for a caller of ids `uid`, `gid`: a FIFO of the
 /// caller's, whose size is what is buffered and whose block size is the
@@ -73,6 +109,7 @@ impl Kernel {
     /// `pipe()`: the read end in x0, the write end in x1.
     pub(crate) fn darwin_pipe(&mut self, m: &mut GuestMem<'_>) -> Result<u64, Errno> {
         let p = Arc::new(Pipe::new_xnu());
+        p.set_ident([self.dtask.uniqueid, SERIAL.fetch_add(1, Ordering::Relaxed)]);
         let r = OpenFile::new(Arc::new(PipeEnd { pipe: Arc::clone(&p), write: false }), "pipe:[0]".into(), oflags::O_RDONLY, true, false);
         let w = OpenFile::new(Arc::new(PipeEnd { pipe: p, write: true }), "pipe:[0]".into(), oflags::O_WRONLY, false, true);
         let rfd = self.fds.insert(r, false)?;
@@ -210,4 +247,93 @@ impl Kernel {
         m.write(buf, &if self.darwin_stat_ino32 { st.encode_darwin_ino32() } else { st.encode_darwin() })?;
         Ok(0)
     }
+
+    /// `fill_pipeinfo` of the pipe end `file` is: its `struct pipe_info`,
+    /// for the caller. The read side holds the buffer; the write side
+    /// describes its peer's while it has one, else none (`PIPE_SIZE`,
+    /// nothing buffered). Its status is the side's `pipe_state`
+    /// ([`crate::pipe::Pipe::pipe_status`]). None for a file that is no
+    /// pipe gex keeps (the host's own streams, which the host's XNU
+    /// describes); a BSD errno where the salt cannot be drawn.
+    pub(crate) fn darwin_pipe_info(&mut self, file: &OpenFile) -> Result<Option<[u8; PIPE_INFO_SIZE]>, i32> {
+        // The end: what names its pipe, its side, what the read side's
+        // buffer holds and its MAX_PIPESIZE, and the side's state.
+        let (ident, write, count, max, status) = if let Some((pipe, write)) = file.handle.pipe_end() {
+            let Some((_, max, cnt)) = pipe.xnu_sizes() else { return Ok(None) };
+            let [owner, serial] = pipe.ident();
+            ([0, owner, serial], write, cnt, max, pipe.pipe_status(write))
+        } else if let Some(r) = file.handle.as_remote_pipe() {
+            // The global kernel's pipe: its buffer is the size of the
+            // pipe's (crate::pipe::PIPE_BUF), which MAX_PIPESIZE is.
+            let status = (r.remote.status)(r.id, i32::from(r.write));
+            if status < 0 {
+                return Err(super::errno::to_darwin(-status));
+            }
+            let cnt = (r.remote.buffered)(r.id).max(0) as usize;
+            ([1, r.id as u64, 0], r.write, cnt, crate::pipe::PIPE_BUF.max(xnu::PIPE_SIZE), status as u32)
+        } else {
+            return Ok(None);
+        };
+        let peer = status & xnu::state::EOF == 0;
+        let (pipe_size, pipe_count) = if !write || peer { (max, count) } else { (0, 0) };
+        // (A peer's buffer caught in a transient state.)
+        let pipe_size = if pipe_size == 0 { xnu::PIPE_SIZE } else { pipe_size };
+        let mut b = [0u8; PIPE_INFO_SIZE];
+        // vst_mode, vst_nlink, then the caller's ids (kauth_getuid,
+        // kauth_getgid).
+        b[4..6].copy_from_slice(&((0o010000 | 0o660) as u16).to_le_bytes());
+        b[6..8].copy_from_slice(&1u16.to_le_bytes());
+        b[16..20].copy_from_slice(&self.creds.uid().to_le_bytes());
+        b[20..24].copy_from_slice(&self.creds.gid().to_le_bytes());
+        // nanotime: the access, modification and status change times.
+        let now = crate::darwin::time::realtime().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        for at in [24, 40, 56] {
+            b[at..at + 8].copy_from_slice(&(now.as_secs() as i64).to_le_bytes());
+            b[at + 8..at + 16].copy_from_slice(&i64::from(now.subsec_nanos()).to_le_bytes());
+        }
+        b[88..96].copy_from_slice(&(pipe_count as i64).to_le_bytes());
+        b[96..104].copy_from_slice(&(pipe_count.div_ceil(pipe_size) as i64).to_le_bytes());
+        b[104..108].copy_from_slice(&(pipe_size as i32).to_le_bytes());
+        // VM_KERNEL_ADDRHASH of this end's struct and of its peer's (0 for
+        // none).
+        let salt = self.darwin_addrhash_salt()?;
+        self.darwin_stand_in("pipe_handle and pipe_peerhandle, VM_KERNEL_ADDRHASH of each pipe end's struct pipe, a kernel address gex has none of (stand-in: SHA-256 of the system's salt and what names the end, which is the same end's in every process; 0 for a peer that has closed)");
+        b[136..144].copy_from_slice(&addrhash(salt, ident, write).to_le_bytes());
+        b[144..152].copy_from_slice(&if peer { addrhash(salt, ident, !write) } else { 0 }.to_le_bytes());
+        b[152..156].copy_from_slice(&status.to_le_bytes());
+        Ok(Some(b))
+    }
+
+    /// `vm_kernel_addrhash_salt`: `early_random()`, once a boot, the
+    /// system's (the global kernel keeps the page's).
+    fn darwin_addrhash_salt(&mut self) -> Result<u64, i32> {
+        static SALT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        if let Some(&s) = SALT.get() {
+            return Ok(s);
+        }
+        let drawn = match self.darwin_read_random() {
+            Ok(v) => v,
+            Err(e) => {
+                self.darwin_unimplemented(format!("vm_kernel_addrhash_salt's early_random (the kernel's random source failed: errno {})", e.0));
+                return Err(5);
+            }
+        };
+        let salt = super::share::value(super::share::Value::AddrHashSalt, 2, drawn).unwrap_or(drawn);
+        Ok(*SALT.get_or_init(|| salt))
+    }
+}
+
+/// What stands in for `VM_KERNEL_ADDRHASH` of a pipe end's `struct pipe`
+/// (`vm_kernel_addrhash_internal`: the first word of SHA-256 of the salt
+/// and the address): the first word of SHA-256 of the salt, what names the
+/// end's pipe and its side.
+fn addrhash(salt: u64, ident: [u64; 3], write: bool) -> u64 {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(salt.to_le_bytes());
+    for w in ident {
+        h.update(w.to_le_bytes());
+    }
+    h.update([u8::from(write)]);
+    u64::from_le_bytes(h.finalize()[..8].try_into().unwrap())
 }

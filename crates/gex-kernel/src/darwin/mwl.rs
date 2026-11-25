@@ -323,6 +323,12 @@ impl Kernel {
             }
             m.write(at, &page).map_err(|_| Kr::Failure)?;
         }
+        // The pager's pages are entered at their first access (the
+        // mapping is `vm_map_enter_mem_object`'s copy of the pager's
+        // object, which enters none), read only until a store copies one.
+        let mut mm = self.mem.lock();
+        mm.set_unentered(r.address, r.address + size);
+        mm.set_copy_pending(r.address, r.address + size);
         Ok(())
     }
 }

@@ -1114,7 +1114,8 @@ impl Kernel {
     }
 
     /// A file's `proc_fileinfo`, then its object's: `pid_vnodeinfo`,
-    /// `pid_vnodeinfopath`, `pid_pseminfo` or `pid_pshminfo`. `desc` is
+    /// `pid_vnodeinfopath`, `pid_pseminfo`, `pid_pshminfo` or
+    /// `pid_pipeinfo`. `desc` is
     /// the process's descriptor of it, when there is a process.
     fn darwin_file_info(&mut self, kind: Info, file: &Arc<crate::file::OpenFile>, desc: Option<(&crate::file::FdTable, i32)>) -> Result<Vec<u8>, i32> {
         const MAXPATHLEN: usize = 1024;
@@ -1126,6 +1127,15 @@ impl Kernel {
             // (kauth_getuid, fill_pipeinfo's), a socket's left as
             // fill_socketinfo leaves it (zero).
             Info::Socket | Info::Pipe => {
+                // pid_pipeinfo of a pipe gex keeps: proc_fileinfo, then
+                // fill_pipeinfo.
+                if kind == Info::Pipe {
+                    if let Some(info) = self.darwin_pipe_info(file)? {
+                        out.extend_from_slice(&fileinfo(desc, file, dtype::PIPE));
+                        out.extend_from_slice(&info);
+                        return Ok(out);
+                    }
+                }
                 let (flavor, size, ty) = if kind == Info::Socket { (PIDFDSOCKETINFO, SOCKET_FDINFO_SIZE, dtype::SOCKET) } else { (PIDFDPIPEINFO, PIPE_FDINFO_SIZE, dtype::PIPE) };
                 let mut b = vec![0u8; size];
                 match file.handle.as_std_stream().and_then(|s| s.xnu_fdinfo(flavor, &mut b)) {

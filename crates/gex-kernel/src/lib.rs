@@ -476,6 +476,13 @@ impl<'a> GuestMem<'a> {
         Ok(HOST_PAGES.get().is_some_and(|f| f(base + r.start, r.len(), page as usize, out)))
     }
 
+    /// Whether the host keeps page states for this memory at all
+    /// ([`Self::page_states`]): none for the browser's, which is no host
+    /// allocation, nor where no query is installed.
+    pub fn host_keeps_page_states(&mut self) -> bool {
+        self.host_base().is_some() && HOST_PAGES.get().is_some()
+    }
+
     /// `len` bytes at `addr` (page aligned) read as zero after: the host's
     /// fresh pages where it can give them ([`HostAdvice::Discard`], which
     /// reads nothing and frees what was there), else [`Self::zero_dirty`].

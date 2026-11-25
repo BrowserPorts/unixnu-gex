@@ -1300,6 +1300,12 @@ fn wait_round(k: &mut gex_kernel::syscalls::Kernel, gm: &mut GuestMem<'_>, tid: 
 fn stream_round(k: &mut gex_kernel::syscalls::Kernel, gm: &mut GuestMem<'_>, tid: i32, op: &gex_kernel::BlockOp, written: &mut usize) -> Option<Result<u64, gex_kernel::Errno>> {
     use gex_kernel::{BlockOp, Errno};
     let turn = |k: &mut gex_kernel::syscalls::Kernel| k.signal_pending_for(tid).then_some(Err(Errno::EINTR));
+    // The wait sleeps again: a pipe's reader marks the pipe as it goes to
+    // sleep (PIPE_WANTR), whether or not a signal ends the sleep at once.
+    let sleep = |k: &mut gex_kernel::syscalls::Kernel, handle: &dyn gex_kernel::vfs::FileHandle| {
+        gex_kernel::darwin::pipe::sleeps(handle, false);
+        turn(k)
+    };
     match op {
         BlockOp::ReadStream { handle, buf, len, vectors } => {
             if handle.poll_readable() {
@@ -1309,7 +1315,7 @@ fn stream_round(k: &mut gex_kernel::syscalls::Kernel, gm: &mut GuestMem<'_>, tid
                 let n = match handle.read_at(0, &mut tmp) {
                     Err(Errno::EAGAIN) => {
                         gex_kernel::darwin::thinfo::sleep_again();
-                        return turn(k);
+                        return sleep(k, handle.as_ref());
                     }
                     Err(e) => return Some(Err(e)),
                     Ok(n) => n,
@@ -1320,7 +1326,7 @@ fn stream_round(k: &mut gex_kernel::syscalls::Kernel, gm: &mut GuestMem<'_>, tid
                 };
                 return Some(put.map(|()| n));
             }
-            turn(k)
+            sleep(k, handle.as_ref())
         }
         BlockOp::WriteStream { handle, gathered: Some(data), xnu: Some((orig, before)), .. } => {
             // What went in before this look: a write that put some in and
@@ -1333,6 +1339,9 @@ fn stream_round(k: &mut gex_kernel::syscalls::Kernel, gm: &mut GuestMem<'_>, tid
                     return Some(Ok(before + done as u64));
                 }
                 if !handle.write_ready(data.len() - done, *orig) {
+                    // A pipe's writer marks the pipe as it goes to sleep
+                    // for room (PIPE_WANTW), a signal ending it or not.
+                    gex_kernel::darwin::pipe::sleeps(handle.as_ref(), true);
                     if k.signal_pending_for(tid) {
                         let total = before + done as u64;
                         return Some(if total > 0 { Ok(total) } else { Err(Errno::EINTR) });
@@ -1349,6 +1358,7 @@ fn stream_round(k: &mut gex_kernel::syscalls::Kernel, gm: &mut GuestMem<'_>, tid
                     // sleeps again.
                     Err(Errno::EAGAIN) => {
                         gex_kernel::darwin::thinfo::sleep_again();
+                        gex_kernel::darwin::pipe::sleeps(handle.as_ref(), true);
                         return None;
                     }
                     Ok(n) => *written += n as usize,

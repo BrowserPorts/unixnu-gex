@@ -21,6 +21,7 @@ use gex_kernel::proc::ProcTable;
 
 mod audio;
 mod disk0;
+mod region;
 mod joy;
 mod pagefs;
 mod pagespawn;

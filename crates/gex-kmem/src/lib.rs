@@ -243,3 +243,95 @@ pub unsafe fn push_checked(dst: PAddr, src: *const u8, len: u32) -> bool {
     unsafe { push(dst, src, len) };
     true
 }
+
+/// The page's store of the Darwin system's shared region (a memory64, the
+/// fourth memory, `env.region`: `hosts/kernel/add-memory.mjs`), which every
+/// Worker's kernel instance imports as the same memory: what one process
+/// mapped of the region, kept once for the others' copies.
+pub const REGION_MEMORY: u32 = 3;
+
+/// Pages of the region store.
+#[inline]
+pub fn region_pages() -> u64 {
+    let n: u64;
+    unsafe {
+        core::arch::asm!(
+            "memory.size 3",
+            "local.set {n}",
+            n = out(local) n,
+        );
+    }
+    n
+}
+
+/// Grow the region store by `pages`: whether it grew.
+#[inline]
+pub fn region_grow(pages: u64) -> bool {
+    let r: i64;
+    unsafe {
+        core::arch::asm!(
+            "local.get {pages}",
+            "memory.grow 3",
+            "local.set {r}",
+            pages = in(local) pages,
+            r = out(local) r,
+        );
+    }
+    r != -1
+}
+
+/// Whether `at..at+len` is inside the region store.
+#[inline]
+pub fn in_region(at: u64, len: u64) -> bool {
+    at.checked_add(len).is_some_and(|end| end <= region_pages() << 16)
+}
+
+/// Whether `at..at+len` is inside the calling process's memory64.
+#[inline]
+pub fn in_process64(at: PAddr, len: u64) -> bool {
+    at.checked_add(len).is_some_and(|end| end <= pages64() << 16)
+}
+
+/// Copy `len` bytes of the calling process's memory64 at `src` into the
+/// region store at `dst`: false (nothing copied) for a range outside
+/// either.
+#[inline]
+pub fn region_from_process64(dst: u64, src: PAddr, len: u64) -> bool {
+    if !in_region(dst, len) || !in_process64(src, len) {
+        return false;
+    }
+    unsafe {
+        core::arch::asm!(
+            "local.get {dst}",
+            "local.get {src}",
+            "local.get {len}",
+            "memory.copy 3, 2",
+            dst = in(local) dst,
+            src = in(local) src,
+            len = in(local) len,
+        );
+    }
+    true
+}
+
+/// Copy `len` bytes of the region store at `src` into the calling
+/// process's memory64 at `dst`: false (nothing copied) for a range outside
+/// either.
+#[inline]
+pub fn region_to_process64(dst: PAddr, src: u64, len: u64) -> bool {
+    if !in_region(src, len) || !in_process64(dst, len) {
+        return false;
+    }
+    unsafe {
+        core::arch::asm!(
+            "local.get {dst}",
+            "local.get {src}",
+            "local.get {len}",
+            "memory.copy 2, 3",
+            dst = in(local) dst,
+            src = in(local) src,
+            len = in(local) len,
+        );
+    }
+    true
+}

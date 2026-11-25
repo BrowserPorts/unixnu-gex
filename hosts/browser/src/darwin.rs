@@ -179,6 +179,11 @@ fn start(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> Result<u
     // The SEP's inputs, none of which the page gives: what needs the SEP
     // stops and names what is missing.
     darwin::sep::set_inputs(darwin::sep::core::Inputs { sepos: None, seprom: None, device_dir: None }).map_err(load)?;
+    // The page's store of the system's shared region, which every process's
+    // copy of the region is made from once one process has mapped it.
+    if unsafe { k_present() } != 0 {
+        darwin::shregion::set_region_store(darwin::shregion::RegionStore { find: region_find, get: region_get, put: region_put });
+    }
     // The disk nodes' image: the page's disk0, which the global kernel
     // serves every process (gexc's GEX_DARWIN_DISK0), with what its build
     // reported missing.
@@ -392,6 +397,24 @@ impl gex_kernel::darwin::apfswrite::Sink for PageDisk0 {
         }
         Ok(())
     }
+}
+
+fn region_find(key: &[u8], len: u64) -> Option<u64> {
+    // SAFETY: the key is this module's memory, borrowed for the call.
+    let at = unsafe { k_region_find(key.as_ptr() as gex_kernel::PAddr, key.len() as u32, len) };
+    (at >= 0).then_some(at as u64)
+}
+
+fn region_get(at: u64, dst: u64, len: u64) -> bool {
+    // SAFETY: the kernel copies into this process's memory, checked there.
+    unsafe { k_region_get(at, dst, len) == 0 }
+}
+
+fn region_put(key: &[u8], src: u64, len: u64) {
+    // SAFETY: as `region_find`'s; the bytes are this process's, read there.
+    // (A store that cannot hold them keeps nothing: the next process maps
+    // its copy from the files, as this one did.)
+    unsafe { k_region_put(key.as_ptr() as gex_kernel::PAddr, key.len() as u32, src, len) };
 }
 
 /// The most of disk0 one call to the global kernel moves: a buffer that

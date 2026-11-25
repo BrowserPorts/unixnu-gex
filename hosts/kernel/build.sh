@@ -95,12 +95,21 @@ RUSTFLAGS="$REMAP -C link-arg=--import-memory \
 # wasm32 server beside a 64-bit memory's loader, or the X server under
 # `?mem64=1`), the second to start read the first's state wrong. Minimum 0
 # for both: the empty one has no pages.
+#
+# Then a third, `region`, a memory64 (gex-kmem's memory 3): the page's one
+# store of the Darwin system's shared region, which every Worker's instance
+# imports as the same memory, so that a process's copy of the region is
+# made from what another mapped (hosts/kernel region.rs). At most 4 GiB,
+# the region's size (SHARED_REGION_SIZE_ARM64, 0x100000000).
 P64=$(((16 << 30) / 65536))
+PREGION=$(((4 << 30) / 65536))
 ADD_MEMORY_MORE=1 node hosts/kernel/add-memory.mjs "$OUT" "$OUT.p32" env process 0 1
-node hosts/kernel/add-memory.mjs "$OUT.p32" page/public/gex/gex_kernel$INFIX.wasm env process64 0 1 $P64 64
+ADD_MEMORY_MORE=1 node hosts/kernel/add-memory.mjs "$OUT.p32" "$OUT.p64" env process64 0 1 $P64 64
+node hosts/kernel/add-memory.mjs "$OUT.p64" page/public/gex/gex_kernel$INFIX.wasm env region 0 1 $PREGION 64
 ADD_MEMORY_MORE=1 node hosts/kernel/add-memory.mjs "$OUT" "$OUT.p32" env process 0 0
-node hosts/kernel/add-memory.mjs "$OUT.p32" page/public/gex/gex_kernel$INFIX.plain.wasm env process64 0 0 $P64 64
-rm -f "$OUT.p32"
+ADD_MEMORY_MORE=1 node hosts/kernel/add-memory.mjs "$OUT.p32" "$OUT.p64" env process64 0 0 $P64 64
+node hosts/kernel/add-memory.mjs "$OUT.p64" page/public/gex/gex_kernel$INFIX.plain.wasm env region 0 0 $PREGION 64
+rm -f "$OUT.p32" "$OUT.p64"
 
 # The `.m64` name a 64-bit memory's page loads (runtime.js, run-node.mjs):
 # the same module, since it serves both flavours.

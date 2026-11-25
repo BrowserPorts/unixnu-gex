@@ -964,7 +964,13 @@ impl Kernel {
             let entered = {
                 let mut mm = self.mem.lock();
                 let need = if write { crate::mem::prot::WRITE } else { crate::mem::prot::READ };
-                mm.is_unentered(page) && mm.vma_at(at).is_some_and(|v| v.prot & need != 0) && mm.enter_page(page)
+                let entered = mm.is_unentered(page) && mm.vma_at(at).is_some_and(|v| v.prot & need != 0) && mm.enter_page(page);
+                // A store's fault on a private mapping's file page copies
+                // it in the same fault (vm_fault_page's copy-on-write).
+                if entered && write {
+                    mm.copied(page);
+                }
+                entered
             };
             if entered {
                 // vm_fault_internal's count of the task's faults, as every

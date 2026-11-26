@@ -1027,6 +1027,17 @@ impl Kernel {
             None => crate::signal::sig::SIGSEGV,
             Some(p) => {
                 if p & if write { crate::mem::prot::WRITE } else { crate::mem::prot::READ } != 0 {
+                    // Another thread's fault entered the page after this
+                    // one's check read the table, and finished before this
+                    // one had the kernel: vm_fault finds the page resident
+                    // and the access is made again. The check reads the
+                    // page's byte as this does, so it passes then.
+                    self.darwin_flush_perms(m);
+                    let need = if write { gex_abi::perm::WRITE } else { gex_abi::perm::READ };
+                    let byte = m.kernel().read(gex_abi::PERM_TABLE64 + (addr >> gex_abi::PERM_PAGE_SHIFT), 1).ok().map(|b| b[0]);
+                    if byte.is_some_and(|b| b & need == need) {
+                        return (Delivery::Resume(pc), 0);
+                    }
                     self.darwin_unimplemented(format!("an access check at {addr:#x} (pc {pc:#x}) failed for a page whose protection {p:#x} allows it: the protection table is out of date"));
                 }
                 crate::signal::sig::SIGBUS

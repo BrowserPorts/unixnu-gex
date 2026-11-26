@@ -1423,6 +1423,9 @@ impl ProcTable {
             exitcount: false,
             delayterm: false,
             forced: None,
+            ended: None,
+            crash_told: false,
+            noticed: Vec::new(),
         });
     }
 

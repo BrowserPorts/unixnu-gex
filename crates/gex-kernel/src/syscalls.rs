@@ -9127,10 +9127,12 @@ pub fn futex_wait_op(cx: &FutexCx<'_>, m: &GuestMem<'_>, uaddr: u64, val: u32, d
         return None;
     }
     let parked = cx.table.park(uaddr);
-    if m.read_u32(uaddr).ok()? != val {
+    // The host's cross-Worker generation, before the word, as there.
+    let shared_gen = futex::shared_gen(uaddr);
+    if m.load_u32(uaddr).ok()? != val {
         return None;
     }
-    Some(BlockOp::FutexWait { table: Arc::clone(cx.table), uaddr, val, deadline, parked: Some(parked) })
+    Some(BlockOp::FutexWait { table: Arc::clone(cx.table), uaddr, val, deadline, parked: Some(parked), shared_gen })
 }
 
 /// The park for a `FUTEX_LOCK_PI` that found the lock held ([`futex_call`]

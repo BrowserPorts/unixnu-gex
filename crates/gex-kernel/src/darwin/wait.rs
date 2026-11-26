@@ -115,13 +115,17 @@ impl Kernel {
     /// Sleep on `word` (again) until `wait`'s deadline or the next timer
     /// the kernel must fire, whichever is first.
     fn darwin_sleep(&mut self, m: &mut GuestMem<'_>, word: u64, wait: Wait) -> SyscallOutcome {
-        let val = m.kernel().read_u32(word).unwrap_or(0);
+        // The queue place and the host's cross-Worker generation before
+        // the word is read (syscalls.rs `futex_block`): a wake landing
+        // between them either changed the word or bumps past both.
+        let table = std::sync::Arc::clone(&self.futexes);
+        let parked = Some(table.park(word));
+        let shared_gen = crate::futex::shared_gen(word);
+        let val = m.kernel().load_u32(word).unwrap_or(0);
         let now = Instant::now();
         let deadline = wait.deadline.map(|t| t.saturating_duration_since(now));
         self.darwin_finish = Some(wait);
-        let table = std::sync::Arc::clone(&self.futexes);
-        let parked = Some(table.park(word));
-        SyscallOutcome::Blocking(BlockOp::FutexWait { table, uaddr: word, val, deadline, parked })
+        SyscallOutcome::Blocking(BlockOp::FutexWait { table, uaddr: word, val, deadline, parked, shared_gen })
     }
 
     /// Wake `tid` with `result` if it is waiting; whether it was.

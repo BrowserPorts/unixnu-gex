@@ -1068,7 +1068,7 @@ fn global_procs() -> Option<Arc<gex_kernel::proc::ProcTable>> {
         chain: |from, to| unsafe { k_wq_chain(from, to) },
         unchain: |from, to| unsafe { k_wq_unchain(from, to) },
     });
-    Some(Arc::new(gex_kernel::proc::ProcTable::shared(
+    let table = gex_kernel::proc::ProcTable::shared(
         gex_kernel::proc::Remote {
             queue: r_queue,
             spawn: r_spawn,
@@ -1107,7 +1107,35 @@ fn global_procs() -> Option<Arc<gex_kernel::proc::ProcTable>> {
             set_crash: r_set_crash,
             count: r_count,
         },
-    )))
+    );
+    // This Worker's memory is its process's own, which its kernel reaches
+    // for a routine sent to its own task.
+    table.set_own_memory(Arc::new(OwnMemory));
+    Some(Arc::new(table))
+}
+
+/// This Worker's process's memory, as its own kernel reaches it outside a
+/// call's (`ProcTable::own_memory`): the guest's memory from address 0.
+struct OwnMemory;
+
+impl gex_kernel::proc::PeerMem for OwnMemory {
+    fn read(&self, addr: u64, out: &mut [u8]) -> bool {
+        match guest().read(addr, out.len()) {
+            Ok(b) => {
+                out.copy_from_slice(b);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn write(&self, addr: u64, data: &[u8]) -> bool {
+        guest().write(addr, data).is_ok()
+    }
+
+    fn with_guest(&self, f: &mut dyn FnMut(&mut GuestMem<'_>)) {
+        f(&mut guest())
+    }
 }
 
 extern "C" fn r_queue(pid: i32) -> u32 {

@@ -105,7 +105,7 @@ const DARWIN_STATIC = ['hello-static', 'bsd-carry', 'tcall', 'bsdthr', 'waits', 
 const DARWIN_STATIC_AS = { xmach: '0:0', xsys: '0:0', stdstat: '0:0' };
 /** The `darwin-dyn` image's dynamic programs, each with the arguments gexc
  *  runs it with. */
-const DARWIN_DYN = { hello: ['a', 'b'], dynspawn: [], pipespawn: [] };
+const DARWIN_DYN = { hello: ['a', 'b'], dynspawn: [], pipespawn: [], regioncow: [] };
 const DARWIN_BOOT = ['DeviceTree', 'sandbox_profile.bin', 'sandbox_builtin.bin', 'sandbox_protobox.bin', 'img4_anchor.der', 'SystemVolume.attrs'];
 
 export const images = {
@@ -307,7 +307,7 @@ export const images = {
     return null;
   },
   // `darwin-dyn`: dynamic programs through dyld and the shared cache
-  // (DARWIN_DYN: tests/darwin/src/hello.c, dynspawn.c, pipespawn.c), each from the
+  // (DARWIN_DYN: tests/darwin/src/hello.c, dynspawn.c, pipespawn.c, regioncow.c), each from the
   // root's /var/tmp as tests/darwin/run.sh places it (gex-darwin-NAME,
   // owned by root), the boot payload with them trusted, and what gexc
   // prints running each on the root (GEX_DARWIN_ROOT) and a clone of disk0

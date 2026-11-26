@@ -973,6 +973,11 @@ impl Kernel {
                 entered
             };
             if entered {
+                // A store through the shared region's submap entry: the
+                // task's copy of the region's entry there first.
+                if write {
+                    self.darwin_region_cow(at);
+                }
                 // vm_fault_internal's count of the task's faults, as every
                 // vm_fault here makes it.
                 self.dtask.rusage.ru.fault();
@@ -997,6 +1002,9 @@ impl Kernel {
                 (mm.is_copy_pending(p) && mm.vma_at(at).is_some_and(|v| v.prot & crate::mem::prot::WRITE != 0) && mm.copied(p)).then_some(at)
             };
             if let Some(at) = copied {
+                // A store through the shared region's submap entry: the
+                // task's copy of the region's entry there first.
+                self.darwin_region_cow(at);
                 self.dtask.rusage.ru.fault();
                 // A store's fault on a vnode page a load's fault entered
                 // read only (a private mapping's copies it instead).

@@ -935,6 +935,9 @@ pub struct ProcTable {
     /// `proc_shutdown_exitcount`'s sleep channel, with the table's lock as
     /// its mutex (`proc_list_mlock`).
     shutdown_cv: std::sync::Condvar,
+    /// Where the table is somewhere else: the memory of the process whose
+    /// host holds this table, its own ([`Self::set_own_memory`]).
+    own_memory: std::sync::OnceLock<Arc<dyn PeerMem>>,
 }
 
 impl std::fmt::Debug for ProcTable {
@@ -1027,6 +1030,7 @@ impl ProcTable {
                 shutdown_wakeups: 0,
             }),
             shutdown_cv: std::sync::Condvar::new(),
+            own_memory: std::sync::OnceLock::new(),
         };
         // forkproc's cloning of initproc: init is internal, in no band.
         t.jetsam().add(INIT_PID, 0, true, crate::darwin::memorystatus::relaunch::UNKNOWN);
@@ -1341,6 +1345,27 @@ impl ProcTable {
         }
         let t = self.lock();
         t.procs.iter().find(|p| p.pid == pid).and_then(|p| p.vm.clone()).ok_or(Errno::ESRCH)
+    }
+
+    /// In a table that is somewhere else (a process of the page, whose
+    /// memory is its own Worker's), that process's memory, which its host
+    /// gives once: no other process reaches it there, but the process's
+    /// own kernel does, as a routine sent to its own task needs it.
+    pub fn set_own_memory(&self, mem: Arc<dyn PeerMem>) {
+        if self.remote.is_some() {
+            let _ = self.own_memory.set(mem);
+        }
+    }
+
+    /// The memory of `pid`, the calling kernel's own process, for a
+    /// routine that came as a message: its published address space's, or
+    /// where the table is somewhere else the memory its host gave
+    /// ([`Self::set_own_memory`]); `ENOSYS` where there is none.
+    pub fn own_memory(&self, pid: i32) -> Result<Arc<dyn PeerMem>, Errno> {
+        if self.remote.is_some() {
+            return self.own_memory.get().cloned().ok_or(Errno::ENOSYS);
+        }
+        self.vm(pid).map(|v| Arc::clone(&v.mem))
     }
 
     /// A new thread of `pid`, and its id: from the numbering the processes'

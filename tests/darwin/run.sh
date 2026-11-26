@@ -553,6 +553,10 @@ hello from /var/tmp/gex-exec-fat with 1 argument" 0
     dynspawn) check_root dynspawn "dynspawn spawn 0 pgid 1 setpgid 13 wait 1 exit 7
 dynspawn usage 1
 dynspawn ok" 0 ;;
+    # A pipe() pipe's ends inherited by a spawned dynamic child, which
+    # reads the parent's message to the end of the file and answers it.
+    pipespawn) check_root pipespawn "pipespawn spawn 0 answer 21:through a darwin pipe wait 1 exit 0
+pipespawn ok" 0 ;;
     sigchld) check_root sigchld "sigchld ok" 0 ;;
     procknote) check_root procknote "procknote ok" 0 ;;
     fork) check_root fork "fork ok" 0 ;;
@@ -808,6 +812,13 @@ EOF2
     ment) check_root ment "ment ok" 0 ;;
     ubcmap) check_root ubcmap "ubcmap ok" 0 ;;
     mapfirst) check_root mapfirst "mapfirst ok" 0 ;;
+    # A mapping over a file's mapping: its pages past the file's end are
+    # memory, an in-place remap keeps them absent.
+    mapover) check_root mapover "mapover ok" 0 ;;
+    # A store to a writable shared-cache page: the region's entry there
+    # becomes the task's copy, the page its own.
+    regioncow) check_root regioncow "regioncow before submap 1 prot 1 max 1 inherit 0 after submap 0 prot 3 max 3 inherit 1 grew 1
+regioncow ok" 0 ;;
     purgeable) check_root purgeable "purgeable ok" 0 ;;
     mentreuse) check_root mentreuse "mentreuse ok" 0 ;;
     sockevent) check_root sockevent "sockevent ok" 0 ;;
@@ -1018,7 +1029,7 @@ if [ "$named" -gt 0 ]; then
         run "$p"
     done
 else
-    for p in hello-static bsd-carry commpage exclusive-pair aes tcall bsdthr waits hold cpuclk pipewr pipeinfo unixname sysids xproc xmach xsys ownrec xspawn diskrw stdstat hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate thinfo tasksuspend portrefs crosstask spawnports taskname taskreg procfind debugport excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait bsdru boottime timebase sysctlnodes kernproc vmregion msync rlimitctl iokit storagereg ioreg accel accelr metalwire metal iosurface iosurfacex iosurfacesplash iosurfacexpreboard iogpudev iomfb iomfbmain xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts evsock pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit sbxinit sbxexec sbxkill hostspecial sbxmask sbxnet sbxiokit sepmgr sepmgrdeny sbxpriv sbxfile sbxscrub cfrunloop xpc-anon layout overlay stackfb launchcon shregion console owners apfsroles disknodes diskio fsfreeze fmount mntupdate fsstatwait ignition graftdmg tcload inet6 rusage vmshare remap vmwrite freezer ment ubcmap purgeable mentreuse mapfirst ignitionweb nvram hostuuid crashpanic crashpanic-exit crashpanic-onexit crashpanic-deadline crashpanic-crash crashpanic-abort crashpanic-terminate crashpanic-spawnfail rebootcall rebootcall-panic rebootcall-halt rebootcall-restart rebootcall-hostrestart rebootcall-upsdelay rebootcall-hostupsdelay rebootcall-full rebootcall-fullhalt corpse corpsefork dynspawn; do
+    for p in hello-static bsd-carry commpage exclusive-pair aes tcall bsdthr waits hold cpuclk pipewr pipeinfo unixname sysids xproc xmach xsys ownrec xspawn diskrw stdstat hello pthread dispatch dispatch-signal sighandler kq-pipe pipe ioctl lockf fsops sigthread sigio vnode codesig rlimit apple exec spawn wait sigchld procknote fork jobctl setexec taskpolicy priority threadpolicy poll itimer threadsuspend threadstate thinfo tasksuspend portrefs crosstask spawnports taskname taskreg procfind debugport excports pages mmapflags madvise memlimit excdeliver startsusp readports taskthreads amfi policy creds uniqueid procinfo persona killperm exitreason sigwait pagezero cputime vtimer protect efault procpolicy cpumon nocldwait bsdru boottime timebase sysctlnodes kernproc vmregion msync rlimitctl iokit storagereg ioreg accel accelr metalwire metal iosurface iosurfacex iosurfacesplash iosurfacexpreboard iogpudev iomfb iomfbmain xattr fileport guarded vectored pathconf mlock fdinfo setattr vmcopy sockevent thcwd clone renameswap pidhold fixedcalls sockerr select filesec psem aio statino statfsino dirino workinterval eventlink voucherx circular importance lockimp coalition spawnfa watchport ipcfd fpinfo openmode pshared lastclose setexecbad sockname machclock atmflag timeouts wlqos halfclose vnextend procmask guardesc rcvlarge extractright sonce vmwx sockopts evsock pathrules pty ptyjob ptyclose bsdpty devfs devattr loadavg ttyinfo hoststat ttydead fcntltty nosigpipe realdev ttydrain revoke dgrambuf streambuf jit sbxinit sbxexec sbxkill hostspecial sbxmask sbxnet sbxiokit sepmgr sepmgrdeny sbxpriv sbxfile sbxscrub cfrunloop xpc-anon layout overlay stackfb launchcon shregion console owners apfsroles disknodes diskio fsfreeze fmount mntupdate fsstatwait ignition graftdmg tcload inet6 rusage vmshare remap vmwrite freezer ment ubcmap purgeable mentreuse mapfirst mapover regioncow ignitionweb nvram hostuuid crashpanic crashpanic-exit crashpanic-onexit crashpanic-deadline crashpanic-crash crashpanic-abort crashpanic-terminate crashpanic-spawnfail rebootcall rebootcall-panic rebootcall-halt rebootcall-restart rebootcall-hostrestart rebootcall-upsdelay rebootcall-hostupsdelay rebootcall-full rebootcall-fullhalt corpse corpsefork dynspawn pipespawn; do
         run "$p"
     done
 fi

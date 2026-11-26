@@ -298,11 +298,15 @@ fn uncarried(t: &Task) -> Vec<&'static str> {
     // Its usage's start crosses; the rest of its usage is a new
     // process's, but for its objects' owner's pid, which its publishing
     // set (`darwin_publish`, as the child's start does again), and its
-    // meter's submaps, its map's (the shared region's it inherited), which
-    // the image switch's new map and its entry into its region make again.
+    // meter's submaps and entries with `use_pmap` off, its map's (the
+    // shared region's it inherited, nested or unnested where its parent
+    // wrote it, and the parent's purgeable and tagged objects' entries),
+    // which the image switch's new map and its entry into its region make
+    // again.
     let new_usage = super::rusage::Shared::new(rusage.start_abstime.load(Acquire));
     new_usage.meter.owner().set_pid(rusage.meter.owner().pid());
     *new_usage.meter.submaps.lock().unwrap_or_else(|e| e.into_inner()) = rusage.meter.submaps.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    *new_usage.meter.alt.lock().unwrap_or_else(|e| e.into_inner()) = rusage.meter.alt.lock().unwrap_or_else(|e| e.into_inner()).clone();
     if differs(rusage, &new_usage) {
         lost.push("rusage");
     }
@@ -704,6 +708,27 @@ mod tests {
         assert_eq!(u.vouchers.bank_ids(), Some((501, 20)));
         assert_eq!(u.exec_sandbox.as_ref().map(|s| (s.script.clone(), s.marked)), Some((Some("/bin/s".into()), true)));
         assert_eq!(u.exec_launch.as_ref().map(|s| s.launch_type), Some(2));
+    }
+
+    /// A spawning task that wrote the shared region (one twig of its
+    /// submap entry unnested, `use_pmap` off there) hands its child a map
+    /// whose submap and unnested parts its meter shows: those are the
+    /// map's, which the child's image switch makes again, not usage that
+    /// fails to cross.
+    #[test]
+    fn an_unnested_region_twig_does_not_keep_the_child_from_crossing() {
+        use super::super::vm::{kind, Attrs};
+        const TWIG: u64 = 32 << 20;
+        let mut k = Kernel::new(0x1000, 0x10000, "/prog".into());
+        let (base, size) = (0x1_8000_0000, 4 * TWIG);
+        k.dtask.vm.enter(base, base + size, Attrs { kind: kind::SUBMAP, ..Attrs::default() }, 0);
+        k.dtask.vm.update(base + TWIG, base + 2 * TWIG, |a| a.alt = true);
+        k.dtask.vm.fork(&[(base, base + size)]);
+        let t = k.darwin_fork_task();
+        assert_eq!(*t.rusage.meter.alt.lock().unwrap(), vec![(base + TWIG, base + 2 * TWIG)]);
+        assert_eq!(*t.rusage.meter.submaps.lock().unwrap(), vec![(base, base + TWIG), (base + 2 * TWIG, base + size)]);
+        let mut p = Put::default();
+        assert_eq!(put_task(&t, &mut p), Vec::<&str>::new());
     }
 
     /// A child with state a new process has not cannot cross whole: the

@@ -965,7 +965,15 @@ fn installed(mm: &crate::mem::Mm, mp: &Mapping, start: u64, len: u64) {
         pr |= crate::mem::prot::EXEC;
     }
     let name = if matches!(mp.source, Source::File { .. }) { "[shared-cache]" } else { "[shared-cache-data]" };
-    mm.lock().insert(start, start + len, pr, name);
+    let mut mm = mm.lock();
+    mm.insert(start, start + len, pr, name);
+    // A writable entry's pages are the region's until the task writes
+    // one: the task's entry for the region is the submap entered
+    // copy-on-write, so its first store to each faults
+    // (`Kernel::darwin_region_cow`).
+    if mp.init_prot & prot::WRITE != 0 {
+        mm.set_copy_pending(start, start + len);
+    }
 }
 
 /// A host's store of the region's mappings as one process mapped them, for
@@ -1375,7 +1383,7 @@ impl Kernel {
                 continue;
             }
             let file = self.fds.get(srf.fd)?;
-            if file.handle.pipe_end().is_some() || Arc::clone(&file.handle).as_kqueue().is_some() {
+            if file.handle.pipe_end().is_some() || super::pipe::held_elsewhere(&file) || Arc::clone(&file.handle).as_kqueue().is_some() {
                 return Err(Errno::EINVAL);
             }
             if !file.readable {
@@ -1448,6 +1456,74 @@ impl Kernel {
         if let Some(why) = err {
             self.darwin_unimplemented(why);
         }
+    }
+
+    /// `vm_map_lookup_and_lock_object` of a write at `at` that reaches the
+    /// shared region through the task's entry for it, a submap entered
+    /// copy-on-write (`vm_shared_region_enter`'s copy): the twig of the
+    /// task's pmap around `at` is unnested (`vm_map_clip_unnest`, the
+    /// pmap's 32 MiB nesting granule: its pages leave the task's pmap and
+    /// are entered again as they are touched, none of them the task's own),
+    /// and the part of it the region's entry at `at` covers becomes an
+    /// entry of the task's own, a copy of that entry's object (the file's,
+    /// its slid pages' or the anonymous memory's) to be copied page by page
+    /// as it is written, its protections the region entry's, inherited by
+    /// copy. The page at `at` is entered, as the fault that follows enters
+    /// it. Nothing for an address outside the region's entry.
+    pub(crate) fn darwin_region_cow(&mut self, at: u64) {
+        use super::vm::{inherit, kind, Attrs};
+        /// `pmap_shared_region_size_min` of a 16 KiB-page pmap: an L2
+        /// block's size, the level the region is nested at.
+        const TWIG: u64 = 32 << 20;
+        let Some(e) = self.dtask.vm.at_or_after(at).filter(|e| e.start <= at && e.attrs.kind == kind::SUBMAP) else { return };
+        let Some(region) = self.darwin_shared_region.as_ref().map(|r| Arc::clone(r.region())) else {
+            self.darwin_unimplemented(format!("a write at {at:#x} to a submap entry of a task without a shared region"));
+            return;
+        };
+        let found = {
+            let c = region.contents();
+            c.mappings.iter().find(|mp| mp.address <= at && at - mp.address < mp.size).map(|mp| {
+                let offset = match (&mp.source, &mp.slide) {
+                    (Source::File { offset, .. }, None) => *offset,
+                    _ => 0,
+                };
+                (mp.address, mp.address + mp.size, matches!(mp.source, Source::File { .. }), mp.init_prot, mp.max_prot, offset)
+            })
+        };
+        // The submap has no entry there (vm_map_lookup_entry's
+        // KERN_INVALID_ADDRESS), which no store reaches: the region maps
+        // nothing writable there.
+        let Some((mstart, mend, file, init_prot, max_prot, file_offset)) = found else {
+            self.darwin_unimplemented(format!("a write at {at:#x} to the shared region where its map has no entry"));
+            return;
+        };
+        if init_prot & prot::WRITE != 0 && init_prot & prot::EXECUTE != 0 {
+            self.darwin_unimplemented(format!("a copy-on-write of the shared region's writable and executable entry at {mstart:#x} (VM_MAP_POLICY_WX_STRIP_X of the task's copy)"));
+            return;
+        }
+        let twig = at & !(TWIG - 1);
+        let (ts, te) = (twig.max(e.start), (twig + TWIG).min(e.end));
+        if !e.attrs.alt {
+            self.dtask.vm.update(ts, te, |a| a.alt = true);
+            let mut mm = self.mem.lock();
+            let mapped: Vec<(u64, u64)> = mm.vmas().iter().filter(|v| v.start < te && ts < v.end).map(|v| (v.start.max(ts), v.end.min(te))).collect();
+            for (s, e) in mapped {
+                mm.set_unentered(s, e);
+            }
+        }
+        // The smallest nested chunk around the write, within the region's
+        // entry there: an entry of the task's own, a copy of the object.
+        let (cs, ce) = (ts.max(mstart), te.min(mend));
+        let attrs = Attrs {
+            kind: if file { kind::FILE_PRIVATE } else { kind::ANON },
+            max: ((prot::READ | max_prot) & prot::ALL) as u8,
+            alias: e.attrs.alias,
+            inherit: if e.attrs.inherit == inherit::SHARE { inherit::COPY } else { e.attrs.inherit },
+            cow: !file,
+            ..Attrs::default()
+        };
+        self.dtask.vm.enter(cs, ce, attrs, file_offset + (cs - mstart));
+        self.mem.lock().enter_page(at >> gex_abi::PERM_PAGE_SHIFT);
     }
 
     /// `task_create_internal`: a new task (a fork's child, a spawn's before

@@ -119,7 +119,7 @@ impl Kernel {
     /// and what is neither they nor a vnode for nothing.
     pub(crate) fn darwin_fpathconf(&mut self, fd: i32, name: i32) -> Result<u64, Errno> {
         let file = self.fds.get(fd)?;
-        let pipe = file.handle.pipe_end().is_some() && file.path.starts_with("pipe:[");
+        let pipe = (file.handle.pipe_end().is_some() && file.path.starts_with("pipe:[")) || super::pipe::held_elsewhere(&file);
         let ty = file.handle.metadata().map(|md| md.file_type);
         if pipe || ty == Ok(FileType::Socket) {
             return if name == pc::PIPE_BUF { Ok(PIPE_BUF) } else { Err(Errno::EINVAL) };
@@ -133,7 +133,7 @@ impl Kernel {
     /// `freadlink(fd, buf, bufsize)`: the link an O_SYMLINK open holds.
     pub(crate) fn darwin_freadlink(&mut self, m: &mut GuestMem<'_>, fd: i32, buf: u64, bufsize: u64) -> Result<u64, Errno> {
         let file = self.fds.get(fd)?;
-        let pipe = file.handle.pipe_end().is_some() && file.path.starts_with("pipe:[");
+        let pipe = (file.handle.pipe_end().is_some() && file.path.starts_with("pipe:[")) || super::pipe::held_elsewhere(&file);
         let ty = file.handle.metadata().map(|md| md.file_type);
         if pipe || ty == Ok(FileType::Socket) || Arc::clone(&file.handle).as_kqueue().is_some() || Arc::clone(&file.handle).as_posix_shm().is_some() {
             return Err(Errno::EINVAL);

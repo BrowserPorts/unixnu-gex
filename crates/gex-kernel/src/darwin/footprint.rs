@@ -574,6 +574,30 @@ fn entered_states(reusable: &[(u64, u64)], at: u64, out: &mut [u8]) {
     }
 }
 
+/// Whether an operation [`Kernel::darwin_footprint_release`] made failed.
+pub(crate) trait Outcome {
+    fn failed(&self) -> bool;
+}
+
+impl<T, E> Outcome for Result<T, E> {
+    fn failed(&self) -> bool {
+        self.is_err()
+    }
+}
+
+impl Outcome for bool {
+    fn failed(&self) -> bool {
+        !*self
+    }
+}
+
+/// A `kern_return_t`.
+impl Outcome for u64 {
+    fn failed(&self) -> bool {
+        *self != super::ipc::kr::SUCCESS
+    }
+}
+
 /// What a kernel operation releases of the pages of its range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Release {
@@ -823,24 +847,36 @@ impl Kernel {
     /// the record follows the release (no other task's look comes between).
     /// The limit's callbacks are made after the operation, as the ledger's
     /// AST makes them on the way back to user space.
-    pub(crate) fn darwin_footprint_release<R>(&mut self, m: &mut GuestMem<'_>, s: u64, e: u64, how: Release, op: impl FnOnce(&mut Kernel, &mut GuestMem<'_>) -> R) -> R {
-        if self.dtask.footprint_releasing || s >= e {
+    ///
+    /// A removal is `vm_map_delete`'s: the pmap's entries of the range go
+    /// before `op` runs, with what was waiting to be entered there, and the
+    /// entries' objects with them (what the map keeps of them: a file's
+    /// pages past its end, a private mapping's pages the file's still),
+    /// which an `op` that fails puts back, its pages not entered.
+    pub(crate) fn darwin_footprint_release<R: Outcome>(&mut self, m: &mut GuestMem<'_>, s: u64, e: u64, how: Release, op: impl FnOnce(&mut Kernel, &mut GuestMem<'_>) -> R) -> R {
+        if s >= e {
             return op(self, m);
         }
-        // pmap_remove takes the range's entries, and with them what was
-        // waiting to be entered there.
-        let cleared = |k: &mut Kernel| {
-            if how == Release::Remove {
-                k.mem.lock().clear_unentered(s, e);
+        let removed = |k: &mut Kernel| (how == Release::Remove).then(|| k.mem.lock().entries_removed(s, e));
+        let back = |k: &mut Kernel, r: &R, gone: Option<crate::mem::RemovedEntries>| {
+            if let Some(gone) = gone.filter(|_| r.failed()) {
+                k.mem.lock().entries_back(gone);
             }
         };
+        let plain = |k: &mut Kernel, m: &mut GuestMem<'_>| {
+            let gone = removed(k);
+            let r = op(k, m);
+            back(k, &r, gone);
+            r
+        };
+        if self.dtask.footprint_releasing {
+            return plain(self, m);
+        }
         let rusage = std::sync::Arc::clone(&self.dtask.rusage);
         let mut pm = rusage.meter.lock();
         if !rusage.meter.releases(&pm, &self.mem, m, s, e, how) {
             drop(pm);
-            let r = op(self, m);
-            cleared(self);
-            return r;
+            return plain(self, m);
         }
         let before = rusage.meter.measure(&mut pm, &self.mem, m);
         let mut crossings = Vec::new();
@@ -848,9 +884,8 @@ impl Kernel {
             crossings.extend(self.darwin_footprint_is(fp));
         }
         self.dtask.footprint_releasing = true;
-        let r = op(self, m);
+        let r = plain(self, m);
         self.dtask.footprint_releasing = false;
-        cleared(self);
         match how {
             Release::Remove => pm.remove(s, e),
             Release::Reusable => pm.made_reusable(s, e),

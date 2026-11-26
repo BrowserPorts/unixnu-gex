@@ -858,6 +858,38 @@ pub struct Remote {
     pub mark: extern "C" fn(id: i32, write: i32, bits: u32),
     /// [`Pipe::pipe_status`] of a side; negative when the pipe is gone.
     pub status: extern "C" fn(id: i32, write: i32) -> i32,
+    /// A Darwin process's pipe ([`Pipe::new_xnu`]), as [`Remote::new`]
+    /// makes one: XNU's rules, kept by the global kernel's pipe itself.
+    pub new_xnu: extern "C" fn(pid: i32) -> i32,
+    /// [`Pipe::xnu_begin_write`] of `orig` bytes: 0 or a negative errno.
+    pub xnu_begin: extern "C" fn(id: i32, orig: u32) -> i32,
+    /// A pass of a write, `left` bytes at `at` of the `orig` it was asked
+    /// for: [`Pipe::xnu_write_with`] for a Darwin pipe, [`Pipe::write_with`]
+    /// for another. Bytes, or a negative errno.
+    pub xnu_write: extern "C" fn(id: i32, at: crate::PAddr, left: u32, orig: u32) -> i32,
+    /// [`Pipe::xnu_write_ready`] for a Darwin pipe, [`Pipe::writable`] for
+    /// another.
+    pub xnu_ready: extern "C" fn(id: i32, left: u32, orig: u32) -> i32,
+    /// [`Pipe::xnu_sizes`], packed ([`pack_xnu_sizes`]); negative for a
+    /// pipe without XNU's rules, or one that is gone.
+    pub xnu_sizes: extern "C" fn(id: i32) -> i64,
+    /// [`Pipe::set_async`] of a side: its SIGIO the global kernel sends.
+    pub set_async: extern "C" fn(id: i32, write: i32, on: i32),
+    /// [`Pipe::pgid`] and [`Pipe::set_pgid`] of a side.
+    pub pgid: extern "C" fn(id: i32, write: i32) -> i32,
+    pub set_pgid: extern "C" fn(id: i32, write: i32, pgid: i32),
+}
+
+/// [`Pipe::xnu_sizes`] packed for [`Remote::xnu_sizes`]: `size << 42 |
+/// max << 21 | count` (each below 2 MiB), or -1 for none.
+pub fn pack_xnu_sizes(sizes: Option<(usize, usize, usize)>) -> i64 {
+    sizes.map_or(-1, |(size, max, cnt)| ((size as i64) << 42) | ((max as i64) << 21) | cnt as i64)
+}
+
+/// Unpack [`pack_xnu_sizes`]'s answer.
+pub fn unpack_xnu_sizes(v: i64) -> Option<(usize, usize, usize)> {
+    const MASK: i64 = (1 << 21) - 1;
+    (v >= 0).then(|| ((v >> 42) as usize, ((v >> 21) & MASK) as usize, (v & MASK) as usize))
 }
 
 /// One end of a pipe in the global kernel. Dropping closes that end there, so
@@ -885,6 +917,14 @@ impl Drop for RemotePipeEnd {
     }
 }
 
+impl RemotePipeEnd {
+    /// The pipe's buffer size, `MAX_PIPESIZE` and bytes buffered, when it
+    /// keeps XNU's rules (a Darwin process's pipe).
+    pub fn xnu_sizes(&self) -> Option<(usize, usize, usize)> {
+        unpack_xnu_sizes((self.remote.xnu_sizes)(self.id))
+    }
+}
+
 impl crate::vfs::FileHandle for RemotePipeEnd {
     fn as_remote_pipe(&self) -> Option<&RemotePipeEnd> {
         Some(self)
@@ -903,6 +943,15 @@ impl crate::vfs::FileHandle for RemotePipeEnd {
     fn write_at(&self, _offset: u64, buf: &[u8]) -> SysResult {
         if !self.write {
             return Err(Errno::EBADF);
+        }
+        // A Darwin pipe written whole in one pass, as a write of its own
+        // (`PipeEnd::write_at`).
+        if self.xnu_sizes().is_some() {
+            match (self.remote.xnu_begin)(self.id, buf.len() as u32) {
+                0 => {}
+                e => return Err(Errno(-e)),
+            }
+            return self.write_part(buf, buf.len());
         }
         match (self.remote.write)(self.id, buf.as_ptr() as crate::PAddr, buf.len() as u32) {
             n if n >= 0 => Ok(n as u64),
@@ -961,7 +1010,25 @@ impl crate::vfs::FileHandle for RemotePipeEnd {
     fn pipe_state(&self) -> Option<crate::vfs::PipeState> {
         let e = (self.remote.ends)(self.id);
         let (readers, writers) = if e < 0 { (0, 0) } else { (e >> 16, e & 0xffff) };
-        Some(crate::vfs::PipeState { buffered: (self.remote.buffered)(self.id).max(0) as u64, closed: readers == 0 || writers == 0, xnu: None })
+        let xnu = self.xnu_sizes().map(|(size, max, _)| (size as u64, max as u64));
+        Some(crate::vfs::PipeState { buffered: (self.remote.buffered)(self.id).max(0) as u64, closed: readers == 0 || writers == 0, xnu })
+    }
+
+    fn write_part(&self, buf: &[u8], orig: usize) -> SysResult {
+        if !self.write {
+            return Err(Errno::EBADF);
+        }
+        match (self.remote.xnu_write)(self.id, buf.as_ptr() as crate::PAddr, buf.len() as u32, orig as u32) {
+            n if n >= 0 => Ok(n as u64),
+            n => Err(Errno(-n)),
+        }
+    }
+
+    fn write_ready(&self, left: usize, orig: usize) -> bool {
+        if self.write {
+            return (self.remote.xnu_ready)(self.id, left as u32, orig as u32) != 0;
+        }
+        self.poll_writable()
     }
 
     fn write_room(&self) -> Option<u64> {

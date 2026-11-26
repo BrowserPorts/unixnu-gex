@@ -137,7 +137,9 @@ pub struct Attrs {
     pub obj: u64,
     /// `!use_pmap`: its object (purgeable or ledger-tagged) has ledgers of
     /// its own, and a page the pmap enters here is alternate accounting,
-    /// not the task's footprint.
+    /// not the task's footprint. A submap's entry so is not nested
+    /// (`vm_map_clip_unnest`): its pages are entered in the task's pmap as
+    /// they are touched, none of them the task's own.
     pub alt: bool,
 }
 
@@ -379,7 +381,9 @@ impl Map {
     /// The submap entries, told to the gauge.
     fn submaps_changed(&self) {
         if let Some(g) = &self.submap_gauge {
-            *g.lock().unwrap_or_else(|e| e.into_inner()) = self.submaps(0, u64::MAX);
+            // The nested ones: an unnested one's pages are the task's
+            // pmap's (`Attrs::alt`).
+            *g.lock().unwrap_or_else(|e| e.into_inner()) = self.ranges.iter().filter(|(_, e)| e.attrs.kind == kind::SUBMAP && !e.attrs.alt).map(|(&s, e)| (s, e.end)).collect();
         }
     }
 
@@ -508,7 +512,8 @@ impl Map {
         for (_, e) in self.ranges.range_mut(start..end) {
             let (was, obj, was_alt) = (e.attrs.kind == kind::SUBMAP, e.attrs.obj, e.attrs.alt);
             f(&mut e.attrs);
-            submap |= was != (e.attrs.kind == kind::SUBMAP);
+            let is = e.attrs.kind == kind::SUBMAP;
+            submap |= was != is || (is && was_alt != e.attrs.alt);
             alt |= was_alt != e.attrs.alt;
             if obj != e.attrs.obj {
                 objs.push((obj, e.attrs.obj));

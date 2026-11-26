@@ -2188,6 +2188,7 @@ pub extern "C" fn k_pipe_forget(pid: i32) -> u32 {
         h.remove(&pid).unwrap_or_default()
     };
     let n = held.len() as u32;
+    gex_kernel::darwin::pipe::set_caller(pid);
     for (id, write) in held {
         if let Some(p) = pipe_at(id) {
             p.close_end(write);
@@ -2208,16 +2209,97 @@ fn pipe_at(id: i32) -> Option<std::sync::Arc<gex_kernel::pipe::Pipe>> {
 /// at one reference.
 #[no_mangle]
 pub extern "C" fn k_pipe_new(pid: i32) -> i32 {
-    let id = {
-        let mut t = pipes().lock().unwrap_or_else(|e| e.into_inner());
-        t.push(std::sync::Arc::new(gex_kernel::pipe::Pipe::new()));
-        (t.len() - 1) as i32
-    };
+    let id = pipe_add(gex_kernel::pipe::Pipe::new());
     // Holder registration for these two ends is disabled while a trap after
     // `exit_group` on `ls | cat` is ruled out; `pid` stays in the signature so
     // the ABI does not churn. See tasks 143 and 146.
     let _ = pid;
     id
+}
+
+fn pipe_add(p: gex_kernel::pipe::Pipe) -> i32 {
+    let mut t = pipes().lock().unwrap_or_else(|e| e.into_inner());
+    t.push(std::sync::Arc::new(p));
+    (t.len() - 1) as i32
+}
+
+/// A Darwin process's `pipe()` (`pipepair_alloc`): a pipe with XNU's rules,
+/// both ends open, its buffer counted in this kernel's `amountpipekva`,
+/// which is the system's. Returns its id.
+#[no_mangle]
+pub extern "C" fn k_pipe_new_xnu(pid: i32) -> i32 {
+    let _ = pid;
+    pipe_add(gex_kernel::pipe::Pipe::new_xnu())
+}
+
+/// `pipe_write`'s start for `orig` bytes (`Pipe::xnu_begin_write`): 0 or a
+/// negative errno.
+#[no_mangle]
+pub extern "C" fn k_pipe_xnu_begin(id: i32, orig: u32) -> i32 {
+    let Some(p) = pipe_at(id) else { return -9 };
+    match p.xnu_begin_write(orig as usize) {
+        Ok(()) => 0,
+        Err(e) => -(e.0 as i32),
+    }
+}
+
+/// One pass of a write by `pid` of `left` bytes at `at` in its memory, of
+/// the `orig` it was asked for: XNU's (`Pipe::xnu_write_with`) for a Darwin
+/// pipe, else as `k_pipe_write`. Bytes, or a negative errno.
+#[no_mangle]
+pub extern "C" fn k_pipe_xnu_write(id: i32, at: gex_kmem::PAddr, left: u32, orig: u32, pid: i32) -> i32 {
+    let Some(p) = pipe_at(id) else { return -9 };
+    gex_kernel::darwin::pipe::set_caller(pid);
+    let fill = |dst: &mut [u8], from: usize| unsafe {
+        gex_kmem::pull_checked(dst.as_mut_ptr(), at + from as gex_kmem::PAddr, dst.len() as u32);
+    };
+    let r = if p.is_xnu() { p.xnu_write_with(left as usize, orig as usize, fill) } else { p.write_with(left as usize, fill) };
+    match r {
+        Ok(n) => n as i32,
+        Err(e) => -(e.0 as i32),
+    }
+}
+
+/// Whether a parked write with `left` of `orig` bytes to go would go on.
+#[no_mangle]
+pub extern "C" fn k_pipe_xnu_ready(id: i32, left: u32, orig: u32) -> i32 {
+    pipe_at(id).is_some_and(|p| if p.is_xnu() { p.xnu_write_ready(left as usize, orig as usize) } else { p.writable() }) as i32
+}
+
+/// A Darwin pipe's buffer size, `MAX_PIPESIZE` and bytes buffered, packed
+/// (`gex_kernel::pipe::pack_xnu_sizes`); -1 for another pipe or none.
+#[no_mangle]
+pub extern "C" fn k_pipe_xnu_sizes(id: i32) -> i64 {
+    gex_kernel::pipe::pack_xnu_sizes(pipe_at(id).and_then(|p| p.xnu_sizes()))
+}
+
+/// `FIOASYNC` on a side, by `pid`: its `PIPE_ASYNC`, and its SIGIO sent
+/// from here to the side's owner at the pipe's wakeups, as from the process
+/// whose call wakes it (`pipeselwakeup`).
+#[no_mangle]
+pub extern "C" fn k_pipe_set_async(id: i32, write: i32, on: i32, pid: i32) {
+    if let Some(p) = pipe_at(id) {
+        gex_kernel::darwin::pipe::set_caller(pid);
+        let send: std::sync::Arc<dyn Fn(i32) + Send + Sync> = std::sync::Arc::new(|owner: i32| {
+            let sig = gex_kernel::darwin::kern::signal_to_linux(23);
+            let _ = k_kill(gex_kernel::darwin::pipe::caller(), owner, sig);
+        });
+        p.set_async(write != 0, on != 0, send);
+    }
+}
+
+/// A side's `pipe_pgid`.
+#[no_mangle]
+pub extern "C" fn k_pipe_pgid(id: i32, write: i32) -> i32 {
+    pipe_at(id).map_or(0, |p| p.pgid(write != 0))
+}
+
+/// `TIOCSPGRP` on a side: its `pipe_pgid`.
+#[no_mangle]
+pub extern "C" fn k_pipe_set_pgid(id: i32, write: i32, pgid: i32) {
+    if let Some(p) = pipe_at(id) {
+        p.set_pgid(write != 0, pgid);
+    }
 }
 
 /// The last message written to a pipe, into the caller's memory. A diagnostic;
@@ -2267,6 +2349,8 @@ pub extern "C" fn k_pipe_open_end(id: i32, write: i32, pid: i32) {
 #[no_mangle]
 pub extern "C" fn k_pipe_close_end(id: i32, write: i32, pid: i32) {
     if let Some(p) = pipe_at(id) {
+        // A Darwin pipe's last close wakes its sides (their SIGIO).
+        gex_kernel::darwin::pipe::set_caller(pid);
         p.close_end(write != 0);
         let mut h = pipe_holders().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(v) = h.get_mut(&pid) {
@@ -2299,8 +2383,10 @@ pub extern "C" fn k_pipe_write(id: i32, at: gex_kmem::PAddr, len: u32) -> i32 {
 /// Read up to `len` bytes into the caller's memory, straight from the pipe's
 /// buffer. See [`k_pipe_write`].
 #[no_mangle]
-pub extern "C" fn k_pipe_read(id: i32, at: gex_kmem::PAddr, len: u32) -> i32 {
+pub extern "C" fn k_pipe_read(id: i32, at: gex_kmem::PAddr, len: u32, pid: i32) -> i32 {
     let Some(p) = pipe_at(id) else { return -9 };
+    // A Darwin pipe's read wakes its write side (its SIGIO), as `pid`.
+    gex_kernel::darwin::pipe::set_caller(pid);
     // No bigger than what is buffered, sized under the pipe's lock
     // (`Pipe::read_with`): a reader asking for 128 KiB of a pipe holding a
     // few bytes zeroed the whole request on every call, and a size taken

@@ -1541,7 +1541,7 @@ impl Kernel {
             // fp_getfvp: a vnode's descriptor.
             let file = self.fds.get(a[0] as i32)?;
             let h = &file.handle;
-            if h.pipe_end().is_some() || std::sync::Arc::clone(h).as_kqueue().is_some() || std::sync::Arc::clone(h).as_posix_shm().is_some() || h.metadata().is_ok_and(|md| md.file_type == crate::vfs::FileType::Socket) {
+            if h.pipe_end().is_some() || super::pipe::held_elsewhere(&file) || std::sync::Arc::clone(h).as_kqueue().is_some() || std::sync::Arc::clone(h).as_posix_shm().is_some() || h.metadata().is_ok_and(|md| md.file_type == crate::vfs::FileType::Socket) {
                 return Err(super::errno::errno_of(45));
             }
             return self.canonical(m, nr::FSTAT, [a[0], a[2], 0, 0, 0, 0]);

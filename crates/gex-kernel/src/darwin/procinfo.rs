@@ -539,7 +539,12 @@ impl Kernel {
             return;
         }
         let p = self.darwin_public_now();
-        super::rusage::proc_exit(&self.procs, self.pid, &p);
+        // Its pages and counters looked at through its own memory, the one
+        // view of them in the page (the table's look from outside has none).
+        match self.procs.own_memory(self.pid) {
+            Ok(mem) => super::rusage::proc_exit_here(&self.procs, self.pid, &p, &self.mem, &*mem),
+            Err(_) => super::rusage::proc_exit(&self.procs, self.pid, &p),
+        }
         if self.dtask.record_sent.is_some() {
             self.darwin_record_send();
         }

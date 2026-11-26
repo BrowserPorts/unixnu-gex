@@ -304,7 +304,7 @@ impl Kernel {
                 s.pgid.store(owner, std::sync::atomic::Ordering::Relaxed);
                 return Ok(0);
             }
-            Kind::Pipe(..) | Kind::HostPipe => {}
+            Kind::Pipe(..) | Kind::HostPipe | Kind::HeldPipe => {}
             _ => {
                 if tmp <= 0 {
                     tmp = -tmp;
@@ -459,22 +459,40 @@ impl Kernel {
                 _ => Err(Errno::ENOTTY),
             },
             // pipe_ioctl of a pipe the page's global kernel holds: this
-            // end's buffered bytes (a write end has none); its owner and
-            // SIGIO are the global kernel's pipe's, which keeps neither.
-            Kind::HeldPipe => match com {
-                cmd::FIONBIO => Ok(()),
-                cmd::FIOASYNC if int(data) == 0 => Ok(()),
-                cmd::FIONREAD => {
-                    let st = file.handle.pipe_state().ok_or(Errno::EBADF)?;
-                    put_int(data, if file.writable { 0 } else { st.buffered.min(i32::MAX as u64) as i32 });
-                    Ok(())
+            // end's buffered bytes (a write end has none), and the side's
+            // pipe_pgid and PIPE_ASYNC, kept by the global kernel's pipe,
+            // which sends the SIGIO of a Darwin process's pipe (one with
+            // XNU's rules) at its wakeups; another pipe there has none.
+            Kind::HeldPipe => {
+                let Some(r) = file.handle.as_remote_pipe() else { return Err(Errno::EBADF) };
+                let side = i32::from(r.write);
+                match com {
+                    cmd::FIONBIO => Ok(()),
+                    cmd::FIOASYNC if r.xnu_sizes().is_some() => {
+                        (r.remote.set_async)(r.id, side, i32::from(int(data) != 0));
+                        Ok(())
+                    }
+                    cmd::FIOASYNC if int(data) == 0 => Ok(()),
+                    cmd::FIONREAD => {
+                        let st = file.handle.pipe_state().ok_or(Errno::EBADF)?;
+                        put_int(data, if file.writable { 0 } else { st.buffered.min(i32::MAX as u64) as i32 });
+                        Ok(())
+                    }
+                    cmd::FIOASYNC => {
+                        self.darwin_unimplemented(format!("FIOASYNC on {}, a pipe the page's global kernel holds without XNU's rules (its SIGIO at its wakeups)", file.path));
+                        Err(Errno::EOPNOTSUPP)
+                    }
+                    cmd::TIOCSPGRP => {
+                        (r.remote.set_pgid)(r.id, side, int(data));
+                        Ok(())
+                    }
+                    cmd::TIOCGPGRP => {
+                        put_int(data, (r.remote.pgid)(r.id, side));
+                        Ok(())
+                    }
+                    _ => Err(Errno::ENOTTY),
                 }
-                cmd::FIOASYNC | cmd::TIOCSPGRP | cmd::TIOCGPGRP => {
-                    self.darwin_unimplemented(format!("ioctl {com:#x} on {}, a pipe the page's global kernel holds (its pipe_state's PIPE_ASYNC and pipe_pgid)", file.path));
-                    Err(Errno::EOPNOTSUPP)
-                }
-                _ => Err(Errno::ENOTTY),
-            },
+            }
             // soioctl of the host's socket: its generic commands, its
             // counts the host's XNU's; the owner the guest's own; an
             // interface's or a route's command the device's (not this

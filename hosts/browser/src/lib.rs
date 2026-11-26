@@ -657,7 +657,7 @@ extern "C" {
     fn k_pipe_last_message(id: i32, at: gex_kernel::PAddr, cap: u32) -> i32;
     fn k_pipe_close_end(id: i32, write: i32, pid: i32);
     fn k_pipe_forget(pid: i32) -> u32;
-    fn k_pipe_read(id: i32, at: gex_kernel::PAddr, len: u32) -> i32;
+    fn k_pipe_read(id: i32, at: gex_kernel::PAddr, len: u32, pid: i32) -> i32;
     fn k_pipe_write(id: i32, at: gex_kernel::PAddr, len: u32) -> i32;
     fn k_audio_write(stream: u32, at: gex_kernel::PAddr, len: u32, format: u32, rate: u32, channels: u32, now_ms: u32) -> i32;
     fn k_audio_ring() -> u32;
@@ -674,6 +674,14 @@ extern "C" {
     fn k_pipe_buffered(id: i32) -> i32;
     fn k_pipe_mark(id: i32, write: i32, bits: u32);
     fn k_pipe_status(id: i32, write: i32) -> i32;
+    fn k_pipe_new_xnu(pid: i32) -> i32;
+    fn k_pipe_xnu_begin(id: i32, orig: u32) -> i32;
+    fn k_pipe_xnu_write(id: i32, at: gex_kernel::PAddr, left: u32, orig: u32, pid: i32) -> i32;
+    fn k_pipe_xnu_ready(id: i32, left: u32, orig: u32) -> i32;
+    fn k_pipe_xnu_sizes(id: i32) -> i64;
+    fn k_pipe_set_async(id: i32, write: i32, on: i32, pid: i32);
+    fn k_pipe_pgid(id: i32, write: i32) -> i32;
+    fn k_pipe_set_pgid(id: i32, write: i32, pgid: i32);
 
     // inotify instances, kept beside the shared tree whose changes they hear
     // (gex_kernel::inotify::Remote).
@@ -1060,7 +1068,7 @@ fn global_procs() -> Option<Arc<gex_kernel::proc::ProcTable>> {
         chain: |from, to| unsafe { k_wq_chain(from, to) },
         unchain: |from, to| unsafe { k_wq_unchain(from, to) },
     });
-    Some(Arc::new(gex_kernel::proc::ProcTable::shared(
+    let table = gex_kernel::proc::ProcTable::shared(
         gex_kernel::proc::Remote {
             queue: r_queue,
             spawn: r_spawn,
@@ -1099,7 +1107,35 @@ fn global_procs() -> Option<Arc<gex_kernel::proc::ProcTable>> {
             set_crash: r_set_crash,
             count: r_count,
         },
-    )))
+    );
+    // This Worker's memory is its process's own, which its kernel reaches
+    // for a routine sent to its own task.
+    table.set_own_memory(Arc::new(OwnMemory));
+    Some(Arc::new(table))
+}
+
+/// This Worker's process's memory, as its own kernel reaches it outside a
+/// call's (`ProcTable::own_memory`): the guest's memory from address 0.
+struct OwnMemory;
+
+impl gex_kernel::proc::PeerMem for OwnMemory {
+    fn read(&self, addr: u64, out: &mut [u8]) -> bool {
+        match guest().read(addr, out.len()) {
+            Ok(b) => {
+                out.copy_from_slice(b);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn write(&self, addr: u64, data: &[u8]) -> bool {
+        guest().write(addr, data).is_ok()
+    }
+
+    fn with_guest(&self, f: &mut dyn FnMut(&mut GuestMem<'_>)) {
+        f(&mut guest())
+    }
 }
 
 extern "C" fn r_queue(pid: i32) -> u32 {
@@ -1369,7 +1405,7 @@ extern "C" fn rp_close_end(id: i32, write: i32) {
     pipe_note("close", id, write);
 }
 extern "C" fn rp_read(id: i32, at: gex_kernel::PAddr, len: u32) -> i32 {
-    unsafe { k_pipe_read(id, at, len) }
+    unsafe { k_pipe_read(id, at, len, my_pid()) }
 }
 extern "C" fn rp_write(id: i32, at: gex_kernel::PAddr, len: u32) -> i32 {
     unsafe { k_pipe_write(id, at, len) }
@@ -1388,6 +1424,32 @@ extern "C" fn rp_mark(id: i32, write: i32, bits: u32) {
 }
 extern "C" fn rp_status(id: i32, write: i32) -> i32 {
     unsafe { k_pipe_status(id, write) }
+}
+extern "C" fn rp_new_xnu(pid: i32) -> i32 {
+    let id = unsafe { k_pipe_new_xnu(pid) };
+    pipe_note("new (XNU's rules)", id, 1);
+    id
+}
+extern "C" fn rp_xnu_begin(id: i32, orig: u32) -> i32 {
+    unsafe { k_pipe_xnu_begin(id, orig) }
+}
+extern "C" fn rp_xnu_write(id: i32, at: gex_kernel::PAddr, left: u32, orig: u32) -> i32 {
+    unsafe { k_pipe_xnu_write(id, at, left, orig, my_pid()) }
+}
+extern "C" fn rp_xnu_ready(id: i32, left: u32, orig: u32) -> i32 {
+    unsafe { k_pipe_xnu_ready(id, left, orig) }
+}
+extern "C" fn rp_xnu_sizes(id: i32) -> i64 {
+    unsafe { k_pipe_xnu_sizes(id) }
+}
+extern "C" fn rp_set_async(id: i32, write: i32, on: i32) {
+    unsafe { k_pipe_set_async(id, write, on, my_pid()) }
+}
+extern "C" fn rp_pgid(id: i32, write: i32) -> i32 {
+    unsafe { k_pipe_pgid(id, write) }
+}
+extern "C" fn rp_set_pgid(id: i32, write: i32, pgid: i32) {
+    unsafe { k_pipe_set_pgid(id, write, pgid) }
 }
 
 // The terminal, which is one object for the whole system and not one per
@@ -1565,6 +1627,14 @@ pub(crate) fn global_pipes() -> Option<gex_kernel::pipe::Remote> {
         buffered: rp_buffered,
         mark: rp_mark,
         status: rp_status,
+        new_xnu: rp_new_xnu,
+        xnu_begin: rp_xnu_begin,
+        xnu_write: rp_xnu_write,
+        xnu_ready: rp_xnu_ready,
+        xnu_sizes: rp_xnu_sizes,
+        set_async: rp_set_async,
+        pgid: rp_pgid,
+        set_pgid: rp_set_pgid,
     })
 }
 
@@ -10374,9 +10444,9 @@ pub(crate) fn stage_fork_fds(h: &Host, child: i32, maps: bool) {
 /// an `epoll_ctl` on one side after the fork is not seen by the other, where
 /// Linux shares the one set. `None`: nothing with a name -- a local socket.
 fn carry_name(file: &gex_kernel::file::OpenFile, holder: i32) -> Option<String> {
-    if let Some(id) = pipe_id(&file.path) {
+    if let Some(id) = held_pipe_id(file) {
         unsafe { k_pipe_open_end(id, file.writable as i32, holder) };
-        return Some(file.path.clone());
+        return Some(format!("pipe:[{id}]"));
     }
     if let Some((id, master)) = pty_ref(&file.path) {
         unsafe { k_pty_open_end(id, master as i32, holder) };
@@ -10448,7 +10518,7 @@ fn carry_name(file: &gex_kernel::file::OpenFile, holder: i32) -> Option<String> 
 /// global kernel may still refuse to duplicate, which the hand-on says), a
 /// process descriptor of another process, or a file by its absolute path.
 pub(crate) fn carriable(file: &gex_kernel::file::OpenFile, holder: i32) -> bool {
-    if pipe_id(&file.path).is_some() || pty_ref(&file.path).is_some() {
+    if held_pipe_id(file).is_some() || pty_ref(&file.path).is_some() {
         return true;
     }
     if Arc::clone(&file.handle).as_memfd().is_some() || file.handle.remote_id().is_some() || gex_kernel::syscalls::Kernel::remote_unix_of_file(file).is_some() {
@@ -10516,7 +10586,16 @@ fn console_handle(path: &str) -> Option<(Arc<dyn FileHandle>, bool, bool)> {
 /// writes (gex.mjs `#doorPublish`).
 #[no_mangle]
 pub extern "C" fn gex_fd_pipe_id(fd: i32) -> i32 {
-    fds_free().and_then(|fds| fds.get(fd).ok()).and_then(|f| pipe_id(&f.path)).unwrap_or(-1)
+    fds_free().and_then(|fds| fds.get(fd).ok()).and_then(|f| held_pipe_id(&f)).unwrap_or(-1)
+}
+
+/// The global kernel's id of the pipe `file` is an end of, if the global
+/// kernel holds it. Not from its path: a pipe of this memory's own (a
+/// Darwin pipe of a kernel without a global one, or a Linux pipe of one)
+/// is `pipe:[0]` too, and is no pipe of the global kernel's.
+fn held_pipe_id(file: &gex_kernel::file::OpenFile) -> Option<i32> {
+    let r = file.handle.as_remote_pipe()?;
+    file.path.starts_with("pipe:[").then_some(r.id)
 }
 
 fn pipe_id(path: &str) -> Option<i32> {

@@ -1291,11 +1291,11 @@ impl Kernel {
     }
 
     /// `f` with this task's memory, for a routine that came as a message:
-    /// none on a host whose processes cannot see each other's.
+    /// none on a host that gives the kernel no view of it.
     pub(crate) fn darwin_own_memory<R>(&mut self, f: impl FnOnce(&mut Kernel, &mut GuestMem<'_>) -> R) -> Result<R, super::kobject::Reply> {
         const KERN_FAILURE: i32 = 5;
         // A corpse's map outlives its process.
-        let peer = match self.procs.vm(self.pid).or_else(|e| self.dtask.corpse.as_ref().and_then(|c| c.vm.clone()).ok_or(e)) {
+        let peer = match self.procs.own_memory(self.pid).or_else(|e| self.dtask.corpse.as_ref().and_then(|c| c.vm.as_ref().map(|v| std::sync::Arc::clone(&v.mem))).ok_or(e)) {
             Ok(p) => p,
             Err(e) => {
                 let mut r = super::kobject::Reply::err(KERN_FAILURE);
@@ -1304,7 +1304,7 @@ impl Kernel {
             }
         };
         let (mut f, mut out) = (Some(f), None);
-        peer.mem.with_guest(&mut |m| out = f.take().map(|f| f(self, m)));
+        peer.with_guest(&mut |m| out = f.take().map(|f| f(self, m)));
         Ok(out.expect("with_guest calls its function"))
     }
 
@@ -1562,8 +1562,13 @@ impl Kernel {
     /// `VM_MEMORY_DYLD`; the task keeps the address space.
     pub(crate) fn darwin_shared_region_remove(&mut self, m: &mut GuestMem<'_>, start: u64, size: u64) {
         use crate::mem::flags as mf;
-        self.dtask.vm.clear(start, start + size);
-        if self.canonical(m, nr::MMAP, [start, size, 0, mf::PRIVATE | mf::ANONYMOUS | mf::FIXED, u64::MAX, 0]).is_ok() {
+        // vm_map_enter's overwrite: vm_map_delete of the region's entries,
+        // the task's copies of its entries' pages among them.
+        let made = self.darwin_footprint_release(m, start, start + size, super::footprint::Release::Remove, |k, m| {
+            k.dtask.vm.clear(start, start + size);
+            k.canonical(m, nr::MMAP, [start, size, 0, mf::PRIVATE | mf::ANONYMOUS | mf::FIXED, u64::MAX, 0])
+        });
+        if made.is_ok() {
             self.darwin_vm_enter_anon(start, start + size, super::vm::Attrs { alias: super::vm::tag::DYLD, max: 0, ..Default::default() }, 0);
         }
     }

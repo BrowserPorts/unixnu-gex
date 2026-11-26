@@ -666,10 +666,19 @@ impl crate::syscalls::Kernel {
             entered.sort_unstable();
             // A write's fault on a file's page copied it: the same fault
             // as the one that entered it, where one did.
+            let mut wrote = Vec::new();
             for p in copied {
-                faults += u64::from(mm.copied(p) && entered.binary_search(&p).is_err());
+                if mm.copied(p) {
+                    wrote.push(p);
+                    faults += u64::from(entered.binary_search(&p).is_err());
+                }
             }
             drop(mm);
+            // One through the shared region's submap entry: the task's
+            // copy of the region's entry there.
+            for p in wrote {
+                self.darwin_region_cow(p << gex_abi::PERM_PAGE_SHIFT);
+            }
             self.dtask.rusage.ru.faults.fetch_add(faults, std::sync::atomic::Ordering::AcqRel);
             self.darwin_flush_perms(m);
         }

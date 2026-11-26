@@ -569,6 +569,9 @@ struct CompiledUnit {
     /// translations, of which a large program has tens of thousands and a
     /// thread runs few.
     lazy: bool,
+    /// Its blocks are the process's other mode's (`gex_abi::ALT_PAGE`):
+    /// how their addresses name their pages.
+    alt: bool,
 }
 
 /// Whether a thread instantiates tier-1's translations as it first reaches
@@ -7815,6 +7818,7 @@ fn publish_unit(
         bridges: Vec::new(),
         // By its id, which is how a miss finds it: one without stays eager.
         lazy: lazy_tier1() && translated.module_id != 0,
+        alt: translated.page_table.alt(),
     });
     let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
     for &(page, base) in &translated.dir_entries {
@@ -8039,8 +8043,23 @@ fn write_current_dir(
 ) -> Result<()> {
     let jit = cx.as_context().data().jit.as_ref().unwrap();
     let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
-    let current: Vec<(u64, u32)> =
+    let mut current: Vec<(u64, u32)> =
         unit.dir_entries.iter().copied().filter(|&(p, b)| sh.page_table.lookup(p) == Some(b)).collect();
+    // And the current base of every page it has a block in. A unit numbers
+    // only the pages new to it; another unit numbered the rest and wrote
+    // their entries in the memory of the process that installed it. A
+    // forked child and its parent share their translations but not their
+    // memories: with tier-1 installed at a first miss, the one that had not
+    // made that other unit installed this one with its slots filled and its
+    // page's entry still zero, and missed there for good.
+    for (a, _) in &unit.exported_blocks {
+        let page = gex_abi::page_key(*a, unit.alt);
+        if !current.iter().any(|&(p, _)| p == page) {
+            if let Some(b) = sh.page_table.lookup(page) {
+                current.push((page, b));
+            }
+        }
+    }
     write_dispatch_dir(memory, &current, sh.alt_dir)
 }
 

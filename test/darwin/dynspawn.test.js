@@ -43,6 +43,7 @@ export default async function (t) {
   await t.saveFile('console.txt', sys.state.console);
   eq('the spawned child: its group, its setpgid, its wait and its status, and its usage, as gexc\'s', spawned.stdout, native.stdout, ctx(spawned));
   t.check("its usage's stand-in said", sys.state.console.includes("Darwin: stand-in: the threads' processor time ("), sys.state.console.slice(-2000));
+  t.check('its resident peak measured, not stood in for', !sys.state.console.includes('Darwin: stand-in: ru_maxrss'), sys.state.console.split('\n').filter((l) => l.includes('ru_maxrss')).join('\n').slice(0, 2000));
   for (const l of sys.state.console.split('\n').filter((l) => l.includes('Darwin: not implemented'))) t.say(`console: ${l.slice(0, 240)}`);
   await sys.shutdown();
 }

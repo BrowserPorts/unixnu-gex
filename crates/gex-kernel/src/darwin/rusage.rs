@@ -781,8 +781,14 @@ fn input(procs: &crate::proc::ProcTable, pid: i32, p: &super::procinfo::Public) 
 /// no view of it.
 pub fn instructions_from_outside(procs: &crate::proc::ProcTable, pid: i32, p: &super::procinfo::Public) -> Option<u64> {
     let peer = procs.vm(pid).ok()?;
+    instructions_through(procs, pid, p, &*peer.mem)
+}
+
+/// Process `pid`'s instructions retired, its live threads' counters read
+/// through `mem`, its memory.
+pub fn instructions_through(procs: &crate::proc::ProcTable, pid: i32, p: &super::procinfo::Public, mem: &dyn crate::proc::PeerMem) -> Option<u64> {
     let mut n = None;
-    peer.mem.with_guest(&mut |g| {
+    mem.with_guest(&mut |g| {
         let mut k = g.kernel();
         n = cpmu::instructions(&|| procs.dead_instructions(pid), p.threads.as_deref(), &mut |a| k.read_u64(a).ok());
     });
@@ -803,11 +809,17 @@ pub struct Looked {
 /// left to it); none where the host keeps no view of its memory.
 pub fn footprint_from_outside(procs: &crate::proc::ProcTable, pid: i32, p: &super::procinfo::Public) -> Option<Looked> {
     let peer = procs.vm(pid).ok()?;
+    footprint_through(procs, pid, p, &peer.mm, &*peer.mem)
+}
+
+/// A look at process `pid`'s pages through `mm`, its map, and `mem`, its
+/// memory, its ledger told as [`footprint_from_outside`]'s.
+pub fn footprint_through(procs: &crate::proc::ProcTable, pid: i32, p: &super::procinfo::Public, mm: &crate::mem::Mm, mem: &dyn crate::proc::PeerMem) -> Option<Looked> {
     let meter = &p.rusage.meter;
     let (fp, resident) = {
         let mut pm = meter.lock();
         let mut fp = None;
-        peer.mem.with_guest(&mut |g| fp = meter.measure(&mut pm, &peer.mm, g));
+        mem.with_guest(&mut |g| fp = meter.measure(&mut pm, mm, g));
         (fp?, pm.pages().resident * (super::mach::PAGE_MASK + 1))
     };
     let mut j = procs.jetsam();
@@ -825,10 +837,27 @@ pub fn footprint_from_outside(procs: &crate::proc::ProcTable, pid: i32, p: &supe
 /// page-ins, its resident peak from that look) and its reaped children's
 /// `p_cru` added.
 pub fn proc_exit(procs: &crate::proc::ProcTable, pid: i32, p: &super::procinfo::Public) {
+    proc_exit_looking(procs, pid, p, None)
+}
+
+/// [`proc_exit`] made by the ending process's own kernel, its pages and
+/// counters looked at through `mm`, its map, and `mem`, its memory: in the
+/// page, where its table is the global kernel's and keeps no view of them.
+pub fn proc_exit_here(procs: &crate::proc::ProcTable, pid: i32, p: &super::procinfo::Public, mm: &crate::mem::Mm, mem: &dyn crate::proc::PeerMem) {
+    proc_exit_looking(procs, pid, p, Some((mm, mem)))
+}
+
+fn proc_exit_looking(procs: &crate::proc::ProcTable, pid: i32, p: &super::procinfo::Public, own: Option<(&crate::mem::Mm, &dyn crate::proc::PeerMem)>) {
     let mut i = input(procs, pid, p);
-    let looked = footprint_from_outside(procs, pid, p);
+    let looked = match own {
+        Some((mm, mem)) => footprint_through(procs, pid, p, mm, mem),
+        None => footprint_from_outside(procs, pid, p),
+    };
     i.footprint_peaks = looked.map(|l| l.peaks);
-    i.instructions = instructions_from_outside(procs, pid, p);
+    i.instructions = match own {
+        Some((_, mem)) => instructions_through(procs, pid, p, mem),
+        None => instructions_from_outside(procs, pid, p),
+    };
     i.bills = *p.rusage.exit_bills.lock().unwrap_or_else(|e| e.into_inner());
     i.exit_abstime = Some(super::mach::absolute_time());
     let r = gather(&i);

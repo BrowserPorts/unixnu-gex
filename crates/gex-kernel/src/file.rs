@@ -641,6 +641,10 @@ struct Table {
     /// XNU's `fd_nfiles`, the size its descriptor array has grown to (a
     /// Darwin process's `proc_bsdinfo` reports it; Linux has no use for it).
     nfiles: usize,
+    /// Descriptors a Darwin close holds `UF_RESERVED` while it drains the
+    /// calls in them (`fp_close_and_unlock`): gone from the table, their
+    /// numbers not handed out until `fdrelse`.
+    reserved: Vec<usize>,
 }
 
 /// XNU's `NDFILE` and `NDEXTENT`.
@@ -743,7 +747,10 @@ impl std::fmt::Debug for FdTable {
 impl Clone for FdTable {
     /// Each descriptor of the copy holds its file too (`fdt_fork`'s `fg_ref`).
     fn clone(&self) -> FdTable {
-        let t = self.read(|t| t.clone());
+        // A descriptor being closed is none in the copy (fdt_fork skips a
+        // UF_RESERVED one), and its number free there.
+        let mut t = self.read(|t| t.clone());
+        t.reserved.clear();
         for f in t.entries.iter().flatten() {
             f.fg_retain();
         }
@@ -988,7 +995,8 @@ impl FdTable {
             }
             let slot = t.entries[min..]
                 .iter()
-                .position(|e| e.is_none())
+                .enumerate()
+                .position(|(i, e)| e.is_none() && !t.reserved.contains(&(i + min)))
                 .map(|p| p + min);
             let idx = match slot {
                 Some(i) if i < limit => i,
@@ -1022,13 +1030,13 @@ impl FdTable {
     pub fn insert_all(&self, files: Vec<Arc<OpenFile>>) -> Result<Vec<i32>, Errno> {
         let limit = self.limit();
         self.update(|t| {
-            let free = t.entries.iter().take(limit).filter(|e| e.is_none()).count() + limit.saturating_sub(t.entries.len());
+            let free = t.entries.iter().take(limit).enumerate().filter(|(i, e)| e.is_none() && !t.reserved.contains(i)).count() + limit.saturating_sub(t.entries.len());
             if free < files.len() {
                 return Err(Errno::EMFILE);
             }
             let mut fds = Vec::with_capacity(files.len());
             for file in files {
-                let idx = match t.entries.iter().position(|e| e.is_none()) {
+                let idx = match t.entries.iter().enumerate().position(|(i, e)| e.is_none() && !t.reserved.contains(&i)) {
                     Some(i) => i,
                     None => {
                         t.entries.push(None);
@@ -1128,6 +1136,38 @@ impl FdTable {
             }
             _ => Err(Errno::EBADF),
         })
+    }
+
+    /// Take descriptor `fd` out of the table for a Darwin close that drains
+    /// the calls in it, its number held back (`UF_RESERVED|UF_CLOSING`):
+    /// lookups of it fail from now on, and no new descriptor takes it until
+    /// [`FdTable::release_reserved`].
+    pub fn close_reserving(&self, fd: i32) -> Result<(), Errno> {
+        if fd < 0 {
+            self.generation.fetch_add(1, Ordering::Relaxed);
+            return Err(Errno::EBADF);
+        }
+        self.update(|t| match t.entries.get_mut(fd as usize) {
+            Some(slot) if slot.is_some() => {
+                *slot = None;
+                t.reserved.push(fd as usize);
+                Ok(())
+            }
+            _ => Err(Errno::EBADF),
+        })
+    }
+
+    /// `fdrelse` of a descriptor [`FdTable::close_reserving`] held back.
+    pub fn release_reserved(&self, fd: i32) {
+        let _ = self.update(|t| {
+            t.reserved.retain(|&r| r != fd as usize);
+            Ok::<_, Errno>(())
+        });
+    }
+
+    /// Whether descriptor `fd` is held back by a close draining it.
+    pub fn is_reserved(&self, fd: i32) -> bool {
+        fd >= 0 && self.read(|t| t.reserved.contains(&(fd as usize)))
     }
 
     /// Mark an open descriptor close-on-fork (XNU's `FP_CLOFORK`).

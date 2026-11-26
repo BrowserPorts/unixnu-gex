@@ -11736,6 +11736,7 @@ impl Kernel {
         if self.darwin {
             if let SyscallOutcome::Blocking(op) = &out {
                 self.darwin_note_wait(op);
+                self.darwin_fp_enter(m);
                 self.darwin_workq_sched_block();
                 let tid = self.tid;
                 self.darwin_set_offcpu(m, tid, true);
@@ -11854,6 +11855,7 @@ impl Kernel {
                         }
                         self.darwin_arg_base = first;
                         self.darwin_set_syscall_code(nr);
+                        self.darwin_me().syscall_args = a;
                         nr
                     }
                     crate::darwin::Bsd::Enosys => {
@@ -12572,6 +12574,9 @@ impl Kernel {
                 self.darwin_workq_sched_block();
                 let tid = self.tid;
                 self.darwin_set_offcpu(m, tid, true);
+            } else {
+                // The call is over: its fp_drop.
+                self.darwin_fp_leave(m);
             }
         }
         out

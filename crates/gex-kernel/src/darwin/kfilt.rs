@@ -1537,9 +1537,11 @@ impl Kernel {
         fp.handle.pipe_state().expect("a pipe knote's pipe")
     }
 
-    /// `filt_pipe_draincommon`: either end gone is EOF.
+    /// `filt_pipe_draincommon`: either end gone, or draining for a close
+    /// (`PIPE_DRAIN`), is EOF.
     fn filt_pipe_draincommon(&mut self, n: KnId) -> u32 {
-        if self.knote_pipe(n).closed {
+        let draining = self.knote(n).fp.as_ref().and_then(|f| f.handle.pipe_end()).is_some_and(|(p, _)| p.draining());
+        if self.knote_pipe(n).closed || draining {
             self.knote(n).flags |= ev::EOF;
             return 1;
         }

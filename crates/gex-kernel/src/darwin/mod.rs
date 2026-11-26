@@ -50,6 +50,7 @@ pub mod errno;
 pub mod exec;
 pub mod eventlink;
 pub mod fileport;
+pub mod fpdrain;
 pub mod footprint;
 pub mod xattr;
 pub mod iokit;

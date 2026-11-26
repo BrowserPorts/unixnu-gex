@@ -1,7 +1,7 @@
 # The host's build environment, included by the Makefiles after they set ROOT.
 #
 # A macOS host takes its tools and build folders from scripts/host-env.sh: GNU tools
-# ahead of the system's, bash 5 for recipes, and the caches on the case-sensitive volume.
+# ahead of the system's, bash 5 for recipes, and the build folders and caches it names.
 # A sub-make finds GEX_HOST_ENV set and keeps what its parent exported.
 ifeq ($(shell uname -s),Darwin)
 ifeq ($(filter 4.%,$(MAKE_VERSION)),)

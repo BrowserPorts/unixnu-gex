@@ -11,7 +11,9 @@
 // Floors: 150 MiB for a fresh process, 160 a fork child's (its parent's copy
 // plus its own runtime's first claims). With the window: 247 MiB, 303
 // forked, 231 spawned; without it, 206, 262 and 190; with small first heap
-// spans, 177, 218 and 176; with no slot map, 139, 142 and 138.
+// spans, 177, 218 and 176; with no slot map, 139, 142 and 138. Measured
+// without the shared memory's headroom (GEX_NO_HEADROOM), which is address
+// space grown ahead of need and not where anything was placed.
 import { join } from 'node:path';
 import { gexcc, FIXTURES } from '../lib/gexcc.mjs';
 import { guest, tail } from '../lib/guest.mjs';
@@ -27,7 +29,7 @@ export default async function (t) {
   const d = c.dir('noplace-floor');
   await c.build(['-O1', '-o', join(d, 'w'), join(FIXTURES, 'noplace-floor/w.c')]);
   await c.hostBuild(['-O1', '-static', '-o', join(d, 'x'), join(FIXTURES, 'noplace-floor/x.c')]);
-  const r = await g.run(seed, join(d, 'w'), [], { files: { '/t/w': join(d, 'w'), '/t/x': join(d, 'x') }, argv0: '/t/w', flags: ['--cwd', '/t'], env: { GEX_LOG: 'off', GEX_SHARED: '1' }, timeout: 300000 });
+  const r = await g.run(seed, join(d, 'w'), [], { files: { '/t/w': join(d, 'w'), '/t/x': join(d, 'x') }, argv0: '/t/w', flags: ['--cwd', '/t'], env: { GEX_LOG: 'off', GEX_SHARED: '1', GEX_NO_HEADROOM: '1' }, timeout: 300000 });
   const out = r.stdout.split('\n').filter((l) => !/^\[(host|gex|worker)\] |^\[gex-console/.test(l));
   const value = (re) => out.map((l) => re.exec(l)?.[1]).find((v) => v !== undefined);
   for (const [who, most] of Object.entries(FLOOR)) {

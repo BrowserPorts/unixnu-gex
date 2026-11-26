@@ -2241,13 +2241,14 @@ impl MemFd {
             }
             return b.truncate(upto).map(|_| 0);
         }
-        if (upto as usize) <= data.len() {
+        let upto = mem_len(upto)?;
+        if upto <= data.len() {
             return Ok(0);
         }
         if seals & seal::GROW != 0 {
             return Err(Errno::EPERM);
         }
-        data.resize(upto as usize, 0);
+        grow_to(&mut data, upto)?;
         Ok(0)
     }
 
@@ -2267,6 +2268,21 @@ impl MemFd {
     }
 }
 
+/// A memfd's length in the kernel's memory: EFBIG past what a `Vec` there
+/// holds (the kernel is wasm32, where `len as usize` wraps). The guest
+/// picks it, so never a panic.
+fn mem_len(len: u64) -> Result<usize, Errno> {
+    usize::try_from(len).ok().filter(|&l| l <= isize::MAX as usize).ok_or(Errno::EFBIG)
+}
+
+/// `data` grown to `len` zero-filled, or ENOSPC when the kernel's memory
+/// cannot hold it.
+fn grow_to(data: &mut Vec<u8>, len: usize) -> Result<(), Errno> {
+    data.try_reserve(len.saturating_sub(data.len())).map_err(|_| Errno::ENOSPC)?;
+    data.resize(len, 0);
+    Ok(())
+}
+
 impl FileHandle for MemFd {
     fn as_memfd(self: Arc<Self>) -> Option<Arc<MemFd>> {
         Some(self)
@@ -2278,7 +2294,7 @@ impl FileHandle for MemFd {
             drop(data);
             return b.read_at(offset, buf);
         }
-        let start = (offset as usize).min(data.len());
+        let start = usize::try_from(offset).unwrap_or(usize::MAX).min(data.len());
         let n = buf.len().min(data.len() - start);
         buf[..n].copy_from_slice(&data[start..start + n]);
         Ok(n as u64)
@@ -2297,12 +2313,13 @@ impl FileHandle for MemFd {
             }
             return b.write_at(offset, buf);
         }
-        let start = offset as usize;
-        if start + buf.len() > data.len() {
+        let end = mem_len(offset.saturating_add(buf.len() as u64))?;
+        let start = end - buf.len();
+        if end > data.len() {
             if seals & seal::GROW != 0 {
                 return Err(Errno::EPERM);
             }
-            data.resize(start + buf.len(), 0);
+            grow_to(&mut data, end)?;
         }
         data[start..start + buf.len()].copy_from_slice(buf);
         Ok(buf.len() as u64)
@@ -2319,14 +2336,18 @@ impl FileHandle for MemFd {
             }
             return b.truncate(len);
         }
-        let len = len as usize;
+        let len = mem_len(len)?;
         if len < data.len() && seals & seal::SHRINK != 0 {
             return Err(Errno::EPERM);
         }
         if len > data.len() && seals & seal::GROW != 0 {
             return Err(Errno::EPERM);
         }
-        data.resize(len, 0);
+        if len > data.len() {
+            grow_to(&mut data, len)?;
+        } else {
+            data.truncate(len);
+        }
         Ok(())
     }
 

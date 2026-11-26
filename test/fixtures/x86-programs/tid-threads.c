@@ -46,13 +46,23 @@ static void *kid_main(void *p) {
     return 0;
 }
 
+/* The futex call whose timeout is this libc's struct timespec: musl's is
+ * 64-bit on i386, where SYS_futex reads a 32-bit one (a zero timeout from
+ * this struct, so each wait returned at once and the thirty seconds below
+ * were 3000 calls: a loaded host's thread had not exited by then). */
+#ifdef SYS_futex_time64
+#define FUTEX_NR SYS_futex_time64
+#else
+#define FUTEX_NR SYS_futex
+#endif
+
 /* Wait until *w is zero, at most about thirty seconds (a loaded host). */
 static int wait_clear(_Atomic int *w) {
     for (int i = 0; i < 3000; i++) {
         int v = atomic_load(w);
         if (v == 0) return 1;
         struct timespec ts = {0, 10 * 1000 * 1000};
-        syscall(SYS_futex, w, FUTEX_WAIT, v, &ts, 0, 0);
+        syscall(FUTEX_NR, w, FUTEX_WAIT, v, &ts, 0, 0);
     }
     return atomic_load(w) == 0;
 }

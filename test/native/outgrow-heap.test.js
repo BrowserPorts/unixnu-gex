@@ -1,7 +1,8 @@
 // A program whose heap grows past what its memory can hold: refused once
 // (ENOMEM), it may ask for less and go on; one that asks again for as much
-// is ended (SIGKILL) rather than left to retry for ever, its crash notice
-// says why, and gex says the arena could not grow once, not once a try.
+// is ended (SIGKILL) rather than left to retry for ever, its notice says
+// why (no crash: it moves to a 64-bit memory at its next start), and gex
+// says the arena could not grow once, not once a try.
 // fixtures/native/outgrow-heap/main.c, built static with the musl cross
 // gcc, natively under this arch's gexc and on the page's shim.
 import { native } from '../lib/native.mjs';
@@ -19,7 +20,7 @@ export default async function (t) {
 
   const spin = await n.gexc(['run', prog, 'spin']);
   t.eq('native: the second ask for as much ends it (SIGKILL)', [lines(spin.stdout), spin.code], ['outgrow-heap full (ENOMEM)', 137], detail(spin));
-  t.check('native: its crash notice says gex ended it', /ended by gex: it asked again for 0x8000000 bytes/.test(spin.stderr), detail(spin));
+  t.check('native: its notice says gex ended it, and that it moves', /^gex: pid \d+ \(outgrow-heap\): ended by gex: it asked again for 0x8000000 bytes[^\n]*; needs 64-bit memory/m.test(spin.stderr), detail(spin));
   const fb = await n.gexc(['run', prog, 'fallback']);
   t.eq('native: one that asks for less goes on', [lines(fb.stdout), fb.code], ['outgrow-heap full (ENOMEM)\noutgrow-heap fallback ok', 0], detail(fb));
 

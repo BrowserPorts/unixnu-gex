@@ -1,0 +1,7 @@
+LIBRARY defdll.dll
+EXPORTS
+  defdll_get
+  defdll_get
+  name=defdll_get
+  defdll_val ; the DLL's int
+  defdll_val2

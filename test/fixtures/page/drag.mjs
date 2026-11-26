@@ -1,4 +1,4 @@
-// The page's drop of host files on a guest window (page/src/drag.js over
+// The page's drop of host files on a guest window (runtime/src/host/drag.js over
 // hosts/browser/js/wl-bridge.mjs): the events the page sends the window's
 // process, what the guest says back through its block, and the drag's
 // text/uri-list. A stand-in guest answers as the shim's compositor does
@@ -13,7 +13,7 @@ import assert from 'node:assert/strict';
 // gex: the checkout these fixtures are in, or GEX_ROOT.
 const GEX_ROOT = process.env.GEX_ROOT || join(import.meta.dirname, '..', '..', '..');
 const wl = await import(pathToFileURL(join(GEX_ROOT, 'hosts/browser/js/wl-bridge.mjs')).href);
-const { PageDrag, uriList } = await import(pathToFileURL(join(GEX_ROOT, 'page/src/drag.js')).href);
+const { PageDrag, uriList } = await import(pathToFileURL(join(GEX_ROOT, 'runtime/src/host/drag.js')).href);
 
 const channel = wl.makeWlChannel();
 const proxy = new wl.WlProxy(channel, () => {}, () => 7);

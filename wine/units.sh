@@ -4,7 +4,7 @@
 #   wine32/units.sh LOG UNITS GEXC DIST GAMEDIR [PREFIX]
 #
 # Every image LOG names without a unit ("unitless: PATH BASE" from
-# wine/page/page-run.mjs, "image PATH at base BASE: no
+# the test harness's page run, "image PATH at base BASE: no
 # function-tier unit" from the page, "PATH at BASE: no function-tier unit" from
 # gexc) gets `gexc cgen-image PATH --pe-base BASE` into the unit cache UNITS
 # (GEX_CGEN_CACHE), and so does the NT trampoline page when LOG names it

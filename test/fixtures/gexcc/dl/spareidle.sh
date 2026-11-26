@@ -3,16 +3,19 @@
 # seconds with no thread to take: a program starts three threads (each taken
 # by a waiting spare), sleeps eight seconds, then starts a fourth, which
 # starts on a Worker of its own. Every thread runs, in order, and the idle
-# spare's release is logged. In the browser runtime (run-node, GEX_ROOT's
-# x86 shim).
+# spare's release is logged. And the process's memory stays where a page
+# leg reads it (GEX_MEMORIES, as `?memories=1`): the spare's Worker ending is
+# not the process's, so from its release to the fourth thread the harness
+# still finds the memory. In the browser runtime (run-node, GEX_ROOT's x86
+# shim).
 #
 #   test/fixtures/gexcc/dl/spareidle.sh DIR   (gexcc on PATH; GEX_ROOT: a gex checkout
-#                                   with page/public/gex built for x86; DIR:
+#                                   with runtime/files/out/gex built for x86; DIR:
 #                                   where gex can see, not /dev/shm)
 set -u
 command -v gexcc > /dev/null || { echo "skip spareidle: gexcc not on PATH (toolchain/gexcc/install.sh)"; exit 0; }
 ROOT=${GEX_ROOT:?set GEX_ROOT to a gex checkout}
-SEED=$ROOT/page/public/gex/seed.x86.shared.wasm
+SEED=$ROOT/runtime/files/out/gex/seed.x86.shared.wasm
 [ -f "$SEED" ] || { echo "skip spareidle: no $SEED"; exit 0; }
 W=$(mktemp -d "${1:?DIR}/spareidle.XXXXXX")
 trap 'rm -rf "$W"' EXIT
@@ -30,7 +33,7 @@ int main(void) {
 }
 X
 gexcc -pthread -o "$W/s" "$W/s.c" || { echo "FAIL spareidle: build"; exit 1; }
-out=$(GEX_ARCH=x86 GEX_SHARED=1 GEX_LOG=spare GEX_TEST_SPARE_MODULES=1 timeout 120 \
+out=$(GEX_ARCH=x86 GEX_SHARED=1 GEX_LOG=spare GEX_TEST_SPARE_MODULES=1 GEX_MEMORIES=1 GEX_TEST_MEMORIES=0 timeout 120 \
     node "$ROOT/hosts/browser/js/run-node.mjs" --file /t/s="$W/s" --argv0 /t/s "$SEED" "$W/s" 2>&1)
 rc=$?
 threads=$(printf '%s\n' "$out" | grep '^thread ' | tr '\n' ' ')
@@ -38,5 +41,9 @@ fail=0
 [ $rc -eq 0 ] || { echo "FAIL spareidle: exit $rc"; fail=1; }
 [ "$threads" = "thread 1 thread 2 thread 3 thread 4 " ] || { echo "FAIL spareidle: threads [$threads]"; fail=1; }
 printf '%s\n' "$out" | grep -q 'let go, no thread in 5 s' || { echo "FAIL spareidle: no idle spare let go"; fail=1; }
+# From the release to the fourth thread: the memory read every half second, never gone.
+idle=$(printf '%s\n' "$out" | sed -n '/let go, no thread in 5 s/,/^thread 4/p' | grep '\[test\] memories:')
+[ -n "$idle" ] || { echo "FAIL spareidle: no memories read after the spare went"; fail=1; }
+printf '%s\n' "$idle" | grep -q 'memories: none' && { echo "FAIL spareidle: the spare's end let go of its process's memory"; fail=1; }
 [ $fail -eq 0 ] && echo "ok spareidle" || printf '%s\n' "$out" | tail -20
 exit $fail

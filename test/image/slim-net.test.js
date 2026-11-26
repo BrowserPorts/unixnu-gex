@@ -1,5 +1,5 @@
 // apt from a repository the page serves, through the network: the example
-// RepoNetwork (page/runtime/examples/repo-network.mjs) answers the guest's
+// RepoNetwork (runtime/examples/repo-network.mjs) answers the guest's
 // connections to gex-repo:80 by fetching under a base URL, here a small
 // HTTP server of the test's over the image's repository (GEX_TEST_SLIM).
 // First the server alone: requests sent together answered in their order,
@@ -10,9 +10,9 @@ import { createServer } from 'node:http';
 import { createReadStream, readFileSync, statSync } from 'node:fs';
 import { join, normalize } from 'node:path';
 import { gzipSync } from 'node:zlib';
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
-import { RepoNetwork } from '../../page/runtime/examples/repo-network.mjs';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
+import { RepoNetwork } from '../../runtime/examples/repo-network.mjs';
 
 export const meta = { hosts: ['node'], images: ['slim'], timeout: 600 };
 

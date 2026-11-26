@@ -11,7 +11,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, utimesSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-const { untar } = await import(gexUrl('page/src/tar.js'));
+const { untar } = await import(gexUrl('runtime/src/host/tar.js'));
 
 const w = mkdtempSync(join(tmpdir(), 'gex-tar-times-'));
 mkdirSync(join(w, 't/d'), { recursive: true });

@@ -12,7 +12,7 @@
 import { pathToFileURL as gexPathToFileURL } from 'node:url';
 import { join as gexJoin } from 'node:path';
 const GEX_ROOT = process.env.GEX_ROOT || gexJoin(import.meta.dirname, '..', '..', '..');
-const { controllersWine } = await import(gexPathToFileURL(gexJoin(GEX_ROOT, 'page/src/run-program.js')).href);
+const { controllersWine } = await import(gexPathToFileURL(gexJoin(GEX_ROOT, 'runtime/src/host/run-program.js')).href);
 
 let failed = 0;
 const check = (what, got, want) => {

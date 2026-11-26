@@ -39,16 +39,19 @@ trap 'rm -rf "$tmp"' EXIT
 # d3d11.dll and dxgi.dll,
 # third_party/mesa/subprojects/dxvk/tests/dirk/w64/build.sh): for each,
 # NAME.so.r.o, NAME.so.exports, NAME.spec and NAME.imports (a comma list) in
-# DIR. Their skeletons go in OUTDIR/extra, not beside the others: a prefix
-# loads them only when told to (a DLL override), its own DLLs of those names
-# staying.
-extra=() extras=()
+# DIR. Their code is linked into the core, where it serves the dist's own
+# builtin d3d11.dll and dxgi.dll: a prefix runs dirk with no DLL override (with
+# the page's d3d device, start's d3d: true), and a d3d11,dxgi=n override makes
+# the loader look for a native DLL and fail ("import_dll Library d3d11.dll ...
+# not found"). No separate copy of them is staged: skeletons in OUTDIR/extra
+# failed to initialise in every setup tried (c000001d as builtins, c0000135 as
+# natives, in the page and natively).
+extra=()
 if [ -n "${WINE64_EXTRA_DLLS:-}" ]; then
     for ro in "$WINE64_EXTRA_DLLS"/*.so.r.o; do
         [ -e "$ro" ] || continue
         n=$(basename "$ro" .so.r.o)
         extra+=(--extra "$n" "$ro" "${ro%.r.o}.exports" "$(cat "$WINE64_EXTRA_DLLS/${n%.*}.imports")")
-        extras+=("$n")
     done
 fi
 # WINE64_SPLIT_DLLS="DLL ...": those DLLs each linked as a module of their
@@ -64,13 +67,6 @@ keep=(); [ -z "${WINE64_EXPORTS_OF:-}" ] || keep=(--exports-of "$WINE64_EXPORTS_
 PATH=$bin$PATH TMPDIR=$tmp python3 "$here/pelink.py" "${link[@]}" "${split[@]}" "${keep[@]}" "${extra[@]}" "$build" "$src" "$tmp/winepe.wasm" "$@"
 cp "$tmp/winepe.wasm" "$out/winepe.wasm"
 for dll in "${splits[@]}"; do cp "$tmp/$dll.wasm" "$out/$dll.wasm"; done
-if [ ${#extras[@]} -gt 0 ]; then
-    mkdir -p "$out/extra"
-    for dll in "${extras[@]}"; do
-        "$winebuild" -w -b "$target" --cc-cmd="$cc" --dll -E "$WINE64_EXTRA_DLLS/${dll%.*}.spec" \
-            --fake-module --wasm-shared winepe.wasm -F "$dll" -o "$out/extra/$dll"
-    done
-fi
 for dll in "$@" "${splits[@]}"; do
     name=${dll%.*}
     module=winepe.wasm

@@ -10,9 +10,9 @@
 // .uploads) are taken at each phase line it prints, once they have settled:
 // the client waits for the test's cue to start each phase (--wait). Also: the still output
 // reads back, the same twice. SwiftShader here; on a GPU through bench.sh.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
-import { CompositorWindows } from '../../page/runtime/src/windows/compositor.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
+import { CompositorWindows } from '../../runtime/src/windows/compositor.js';
 
 export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 300, html: '<canvas id="out" width="1280" height="720"></canvas>' };
 

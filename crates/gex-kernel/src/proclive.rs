@@ -208,6 +208,11 @@ impl ProcSource for KernelProcSource {
     fn task_owner(&self, id: i32) -> Option<i32> {
         self.0.get()?.procs.task_owner(id)
     }
+    fn set_task_name(&self, tid: i32, name: &[u8]) -> bool {
+        let Some(l) = self.0.get() else { return false };
+        l.procs.set_task_name(tid, name);
+        true
+    }
     fn status(&self, tid: i32, threads: usize, task: Option<&crate::proc::TaskUsage>) -> String {
         let Some(l) = self.0.get() else { return String::new() };
         let (ppid, _, _) = relations(&l);

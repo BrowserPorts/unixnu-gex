@@ -3,8 +3,8 @@
 // the test programs at /progs/{x64,x86}. Then `run(exe, args)` copies a test
 // program into C:\ and runs it with Wine: `{ code, stdout, stderr }`, the
 // output's line ends Unix ones.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
 
 export const WINE = '/wine64/lib/wine/x86_64-unix/wine';
 
@@ -12,10 +12,11 @@ export const WINE = '/wine64/lib/wine/x86_64-unix/wine';
  *  classes, made before boot; `system`: more of System's options (`units`,
  *  `xcache`) and `debug` its switches; `wow64`: 32-bit programs through WoW64 (the
  *  install's i386-windows); `nullDriver`: USER with no display (Wine's null
- *  graphics driver; WoW64's default). */
-export async function bootWine(t, { env = {}, parts, wow64 = false, nullDriver = wow64, system = {}, debug = {} } = {}) {
+ *  graphics driver; WoW64's default); `filesystem(sys)`: the root's
+ *  Filesystem (a MemoryFilesystem otherwise). */
+export async function bootWine(t, { env = {}, parts, wow64 = false, nullDriver = wow64, system = {}, debug = {}, filesystem } = {}) {
   const sys = new System({ baseUrl: t.baseUrl, debug: t.debug(debug), ...system });
-  const fs = new MemoryFilesystem(sys);
+  const fs = filesystem ? filesystem(sys) : new MemoryFilesystem(sys);
   fs.addTar(t.work('wine64.tar'), { lazy: t.work('wine64-lazy.json') });
   fs.addTar(t.work('win-progs.tar'), { at: '/progs' });
   const more = parts?.(sys, fs);
@@ -76,7 +77,12 @@ export async function exitStats(t) {
     pid: /pid (\d+(?::\d+)*): lived/.exec(l)[1],
     cmd: /\{([^}]*)\}/.exec(l)?.[1] ?? '',
     slotsLeftK: Number(/(\d+)k dispatch slots left/.exec(l)?.[1] ?? NaN),
-    memoryMib: Number(/memory (\d+) MiB/.exec(l)?.[1] ?? NaN),
+    memoryMib: Number(/memory (?:size )?(\d+) MiB/.exec(l)?.[1] ?? NaN),
+    // What of it the process used: the guest's mappings, the runtime's heap,
+    // Worker stacks.
+    inUseMib: Number(/in use (\d+) MiB/.exec(l)?.[1] ?? NaN),
+    // Its pages that hold anything, what the browser keeps resident.
+    residentMib: Number(/resident (\d+) MiB/.exec(l)?.[1] ?? NaN),
     kernelMib: Number(/kernel (\d+) MiB/.exec(l)?.[1] ?? NaN),
     tables: /tables blocks (\d+) ftab (\d+)/.exec(l)?.slice(1).map(Number) ?? null,
     // name=blocks@first..last

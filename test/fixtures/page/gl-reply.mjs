@@ -1,4 +1,4 @@
-// A batch's reply against the ring's reply area (page/src/gl-reply.js): what
+// A batch's reply against the ring's reply area (runtime/src/host/gl-reply.js): what
 // fits goes back whole; more is cut to the area, as the native host does,
 // never refused. `node test/fixtures/page/gl-reply.mjs`; prints "gl-reply ok".
 import { pathToFileURL as gexPathToFileURL } from 'node:url';
@@ -6,7 +6,7 @@ import { join as gexJoin } from 'node:path';
 // gex: the checkout these fixtures are in, or GEX_ROOT.
 const GEX_ROOT = process.env.GEX_ROOT || gexJoin(import.meta.dirname, '..', '..', '..');
 const gexUrl = (p) => gexPathToFileURL(gexJoin(GEX_ROOT, p)).href;
-const { fitReply } = await import(gexUrl('page/src/gl-reply.js'));
+const { fitReply } = await import(gexUrl('runtime/src/host/gl-reply.js'));
 
 let failed = 0;
 const check = (name, cond) => { console.log(`${cond ? 'ok  ' : 'FAIL'} ${name}`); if (!cond) failed++; };

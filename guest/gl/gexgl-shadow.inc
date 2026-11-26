@@ -38,7 +38,7 @@ struct shadow_matrix {
     int known;
 };
 
-static struct {
+static GEXGL_TLS struct {
     /* 0 modelview, 1 projection, 2 a stack not kept here, -1 not known. */
     int mode;
     /* Each stack's depth, -1 once it is not known. */

@@ -1,9 +1,10 @@
 // A program that reserves memory at a fixed address past 16 GiB, more than
 // any gex memory reaches (reserve32g.c: 8 GiB at 32 GiB, as MSYS2's and
 // Cygwin's runtime does for its heap), under gexc with the native PE core
-// (GEX_TEST_WINE64_NATIVE): the reservation fails, and Wine says once that
-// the program needs more than 16 GiB of address space, naming it and the
-// reservation, instead of the program failing later with nothing said. The
+// (GEX_TEST_WINE64_NATIVE): the reservation fails, and it is said once that
+// the program needs more than 16 GiB of address space, naming the
+// reservation: Wine's notice, which gex says (its line, naming the process),
+// instead of the program failing later with nothing said. The
 // run is the prefix's first start too (wineboot --init, its services and
 // their drivers' units), which a loaded host has taken past 100 s for: the
 // run's time is the other wine64 tests' (300 s).
@@ -17,7 +18,7 @@ export default async function (t) {
     wineEnv: { USER: 'gex', HOME: '/tmp' }, name: 'reserve32g' });
   t.check('the reservation fails', /^reserve32g refused, error \d+/m.test(r.out), w.detail(r, 4));
   const said = r.out.split('\n').filter((l) => /needs more than 16 GiB of address space/.test(l));
-  t.check('Wine says why, once', said.length === 1 && /reserve32g\.exe/.test(said[0]) && /a reservation at 0x800000000 of 8192 MiB is beyond it/.test(said[0]),
+  t.check('Wine says why, once', said.length === 1 && /^gex: pid \d+ \(.*\): needs more than 16 GiB of address space \(a reservation at 0x800000000 of 8192 MiB is beyond it\)$/.test(said[0].trim()),
     said.join(' / ') || w.detail(r, 4));
   w.clean();
 }

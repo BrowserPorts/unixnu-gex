@@ -13,6 +13,9 @@ x86_64-w64-mingw32-gcc / -g++ / -cc / -c++:
     (peimports.py). Out: X (the skeleton) and X.wasm beside it. -s (or
     GEXCC_WIN_STRIP=1) is a release link: names gex never reads out
     (stripnames.py); GEXCC_WIN_STRIP=0 keeps them.
+x86_64-pc-windows-msvc-clang / -clang++ (or --target=x86_64-pc-windows-msvc): the same with
+  clang-cl's identity (_MSC_VER, _M_X64, no __GNUC__) and Wine's headers,
+  for projects written for MSVC.
 x86_64-w64-mingw32-windres: Wine's wrc (-o X.res, or a COFF .o made from it).
 x86_64-w64-mingw32-{ar,ranlib,nm,objcopy,objdump}: llvm's; strip does
   nothing (a release link strips).
@@ -20,7 +23,7 @@ x86_64-w64-mingw32-{ar,ranlib,nm,objcopy,objdump}: llvm's; strip does
 The install's PREFIX/lib/gexcc-win/config names the 64-bit Wine build and
 source it builds against, the wasm64 sysroot and the libc++ prefix.
 """
-import os, subprocess, sys, tempfile, shutil
+import os, re, subprocess, sys, tempfile, shutil
 
 here = os.path.dirname(os.path.realpath(__file__))
 PREFIX = os.path.dirname(os.path.dirname(os.path.abspath(sys.argv[0])))
@@ -133,9 +136,109 @@ def compile_wmain(cmd, obj):
     return r
 
 
+def compile_coff_asm(cc, args, src):
+    """-c of one assembly file SRC written for a COFF assembler: preprocessed
+    (with the dependency flags, which belong to this step), rewritten by
+    coffasm.py, then assembled."""
+    tmp = tempfile.mkdtemp()
+    try:
+        pre, fixed = os.path.join(tmp, 'pre.s'), os.path.join(tmp, 'coff.s')
+        if src.endswith('.S'):
+            a, i = [], 0
+            while i < len(args):
+                if args[i] == '-c': i += 1; continue
+                if args[i] == '-o': a += ['-o', pre]; i += 2; continue
+                a.append(args[i]); i += 1
+            # (the dependency file's target: the object, not this step's output)
+            if '-o' in args and not any(x.startswith(('-MT', '-MQ')) for x in args):
+                a += ['-MT', args[args.index('-o') + 1]]
+            r = subprocess.call(cc + ['-E', '-x', 'assembler-with-cpp'] + a)
+            if r: return r
+        else:
+            shutil.copy(src, pre)
+        subprocess.check_call([sys.executable, os.path.join(here, 'coffasm.py'), pre, fixed])
+        a, i = [], 0
+        while i < len(args):
+            x = args[i]
+            if x in ('-MF', '-MT', '-MQ'): i += 2; continue
+            if x in ('-MD', '-MMD', '-MP') or x.startswith(('-MF', '-MT', '-MQ', '-Wp,-M')): i += 1; continue
+            a.append(fixed if x == src else x); i += 1
+        return subprocess.call(cc + a)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def expand_rsp(args):
+    """@FILE arguments (a response file, one or more arguments a line,
+    shell-quoted) replaced by their contents, as gcc and clang read them;
+    and the linker's, -Wl,@FILE, whose lines are the link's inputs."""
+    import shlex
+    out = []
+    for a in args:
+        if a.startswith('@') and os.path.isfile(a[1:]):
+            out += expand_rsp(shlex.split(open(a[1:]).read()))
+        elif a.startswith('-Wl,@') and os.path.isfile(a[5:]):
+            out += expand_rsp(shlex.split(open(a[5:]).read()))
+        else:
+            out.append(a)
+    return out
+
+
+IMPLIB_MEMBER = '__gexw_implib'
+
+
+def implib_of(path):
+    """The DLL name an import library gexcc-win wrote (-Wl,--out-implib)
+    names, or None for any other archive."""
+    try:
+        with open(path, 'rb') as f:
+            data = f.read(4096)
+    except OSError:
+        return None
+    if not data.startswith(b'!<arch>\n'):
+        return None
+    pos = 8
+    while pos + 60 <= len(data):
+        name, size = data[pos:pos + 16].rstrip(b' '), int(data[pos + 48:pos + 58].strip() or 0)
+        body = data[pos + 60:pos + 60 + size]
+        if name.rstrip(b'/') == IMPLIB_MEMBER.encode():
+            return body.decode().split()[0]
+        if name not in (b'/', b'//', b'/SYM64/'):
+            return None
+        pos += 60 + size + (size & 1)
+    return None
+
+
 tool = os.path.basename(sys.argv[0])
-tool = tool[len('x86_64-w64-mingw32-'):] if tool.startswith('x86_64-w64-mingw32-') else tool
-args = sys.argv[1:]
+args = expand_rsp(sys.argv[1:])
+# The compiler's identity: MinGW GCC's (x86_64-w64-mingw32-*, the default), or
+# clang-cl's for a project written for MSVC (x86_64-pc-windows-msvc-clang, or
+# --target=x86_64-pc-windows-msvc): _MSC_VER and _M_X64, no __GNUC__ or
+# __MINGW64__, Wine's headers as its SDK, as Wine builds its own PE code with
+# clang's msvc target. Each identity is what that real compiler predefines;
+# code reaches the other's paths only as it would there.
+MSVC_TRIPLES = ('x86_64-pc-windows-msvc', 'x86_64-windows-msvc', 'x86_64-windows')
+msvc = False
+for pre in ('x86_64-w64-mingw32-', 'x86_64-pc-windows-msvc-'):
+    if tool.startswith(pre):
+        tool = tool[len(pre):]
+        msvc = pre.startswith('x86_64-pc-windows-msvc')
+if tool == 'clang':
+    tool = 'gcc'
+elif tool == 'clang++':
+    tool = 'g++'
+for i, a in enumerate(list(args)):
+    t = a[len('--target='):] if a.startswith('--target=') else None
+    if t is None and a in ('-target', '--target') and i + 1 < len(args):
+        t = args[i + 1]
+    if t in MSVC_TRIPLES + ('x86_64-w64-mingw32', 'x86_64-w64-windows-gnu'):
+        msvc = t in MSVC_TRIPLES
+        args = [x for j, x in enumerate(args) if j != i and not (a in ('-target', '--target') and j == i + 1)]
+        break
+if msvc:
+    # (mingw-w64's headers are written for GCC's identity: with clang-cl's,
+    # Wine's are the SDK, as when Wine builds its PE code with clang)
+    conf.pop('MINGW_INCLUDE', None)
 
 if tool in ('ar', 'ranlib', 'nm', 'strip', 'objcopy', 'objdump'):
     if tool == 'strip':
@@ -146,6 +249,17 @@ if tool == 'windres':
     # windres syntax through wrc: -i/-o/--input/--output, -I, -D, -O coff
     T = tools_dir()
     inp = out = None; incl = []; fmt = None; i = 0
+    # (a long option abbreviated, as getopt_long takes it: --include for
+    # --include-dir)
+    LONG = ('--input', '--output', '--output-format', '--include-dir', '--define', '--undefine',
+            '--input-format', '--preprocessor', '--language', '--codepage', '--target', '--verbose')
+    def unabbrev(a):
+        k, eq, v = a.partition('=')
+        if not k.startswith('--') or k in LONG:
+            return a
+        hits = [l for l in LONG if l.startswith(k)]
+        return hits[0] + eq + v if len(hits) == 1 else a
+    args = [unabbrev(a) for a in args]
     while i < len(args):
         a = args[i]
         if a in ('-i', '--input'): inp = args[i + 1]; i += 2; continue
@@ -163,9 +277,52 @@ if tool == 'windres':
             else: out = a
         i += 1
     res = out if out and out.endswith('.res') else (out or 'a') + '.res'
-    cmd = [T + '/tools/wrc/wrc', '-m64', '--nostdinc', '-I' + B + '/include', '-I' + S + '/include', '-I' + here + '/include',
-           '--nls-dir=' + S + '/nls', '-D_WIN32', '-D_WIN64', '-o', res] + incl + [inp]
-    r = subprocess.call(cmd)
+    wrc = [T + '/tools/wrc/wrc', '-m64', '--nostdinc', '--nls-dir=' + S + '/nls', '-D_WIN32', '-D_WIN64', '-o', res]
+    if conf.get('MINGW_INCLUDE'):
+        # with mingw-w64's headers as MinGW's windres does it: the C
+        # preprocessor (this toolchain's) with RC_INVOKED, dropping what the
+        # included C headers (*.h) declare, then the resource compiler on the
+        # rest; the script's files are found beside it
+        cc_ = os.path.join(PREFIX, 'bin', 'x86_64-w64-mingw32-gcc')
+        p = subprocess.run([cc_, '-E', '-xc', '-DRC_INVOKED', '-D_WIN32', '-D_WIN64'] + incl + [inp],
+                           stdout=subprocess.PIPE, text=True, errors='surrogateescape')
+        r = p.returncode
+        if not r:
+            keep, lines = True, []
+            for line in p.stdout.split('\n'):
+                m = re.match(r'# \d+ "(.*)"', line)
+                if m:
+                    keep = not m.group(1).lower().endswith(('.h', '.hpp', '.hh', '.hxx'))
+                elif keep:
+                    # (a file a statement names with Windows' separator,
+                    # "icons\\x.ico", which wrc would read as an escape)
+                    lines.append(re.sub(r'"([^"]*\\[^"]*\.\w{1,8})"\s*$',
+                                        lambda m: '"%s"' % re.sub(r'\\+', '/', m.group(1)), line))
+            fd, pre = tempfile.mkstemp(suffix='.rc')
+            with os.fdopen(fd, 'w', errors='surrogateescape') as f:
+                f.write('\n'.join(lines) + '\n')
+            try:
+                r = subprocess.call(wrc + ['-I' + (os.path.dirname(inp) or '.')] + [a for a in incl if a.startswith('-I')] + [pre])
+            finally:
+                os.unlink(pre)
+    else:
+        # (and the C runtime's, which rc finds through INCLUDE: a script that
+        # includes a program's C headers reaches stdarg.h and the rest)
+        # (the script's file names with Windows' separator, "icons\\x.ico", as
+        # rc reads them, not as escapes: a copy with '/', its files found
+        # beside the original)
+        text = open(inp, errors='surrogateescape').read()
+        fixed = re.sub(r'"([^"\n]*\\[^"\n]*\.\w{1,8})"(\s*)$', lambda m: '"%s"%s' % (re.sub(r'\\+', '/', m.group(1)), m.group(2)), text, flags=re.M)
+        pre = None
+        if fixed != text:
+            fd, pre = tempfile.mkstemp(suffix='.rc')
+            with os.fdopen(fd, 'w', errors='surrogateescape') as f:
+                f.write(fixed)
+        try:
+            r = subprocess.call(wrc + ['-I' + (os.path.dirname(inp) or '.'), '-I' + B + '/include', '-I' + S + '/include', '-I' + S + '/include/msvcrt', '-I' + here + '/include'] + incl + [pre or inp])
+        finally:
+            if pre:
+                os.unlink(pre)
     if r or res == out:
         sys.exit(r)
     # a ".o" the link takes: the .res itself (the link passes .res files
@@ -175,9 +332,54 @@ if tool == 'windres':
 
 cxx = tool in ('g++', 'c++', 'clang++')
 if args[:1] == ['-dumpmachine']:
-    print('x86_64-w64-mingw32'); sys.exit(0)
+    print('x86_64-pc-windows-msvc' if msvc else 'x86_64-w64-mingw32'); sys.exit(0)
 cc = os.path.join(W, 'wcc64++' if cxx else 'wcc64')
-base = ['-D_WIN32', '-D_UCRT', '-DWINE_UNICODE_NATIVE', '-DWINBOOL=BOOL', '-D__stdcall=', '-D__cdecl=', '-D__fastcall=', '-D__thiscall=', '-D__vectorcall=', '-D__MINGW32__', '-D__MINGW64__', '-Wno-ignored-attributes', '-Wno-unknown-attributes', '-U__linux__', '-U__linux', '-Ulinux', '-U__gnu_linux__', '-U__unix__', '-U__unix', '-Uunix', '-U__ELF__', '-fPIC', '-Wno-unused-command-line-argument',
+# the SDK headers: mingw-w64's (MINGW_INCLUDE, installed by mingw-headers.py),
+# or Wine's own; before them either way the headers of gexcc-win's own
+# runtime (include-rt: what libmingwex has for MinGW)
+# (a libc++ built against the other SDK's headers is another ABI: Wine's
+# mbstate_t is an int, mingw-w64's UCRT one _Mbstatet; build-cxx.sh records
+# which it was built with)
+try:
+    cxx_sdk = open(CXX + '/sdk').read().strip()
+except OSError:
+    cxx_sdk = None
+if cxx and cxx_sdk and cxx_sdk != ('mingw' if conf.get('MINGW_INCLUDE') else 'wine'):
+    sys.exit('gexcc-win: %s was built against %s headers, this compile uses %s ones (build-cxx.sh for this install)'
+             % (CXX, cxx_sdk, 'mingw-w64' if conf.get('MINGW_INCLUDE') else "Wine's"))
+if conf.get('MINGW_INCLUDE'):
+    # (clang defines _GNU_SOURCE for C++ on the wasm target, as on Linux;
+    # a MinGW clang doesn't, and with it mingw-w64's stdio.h takes libmingwex's
+    # printf)
+    sdk_dirs = ['-U_GNU_SOURCE', '-D__GEXW_SDK_X64__', '-isystem', here + '/include-rt', '-isystem', here + '/include-mingw-pre',
+                '-isystem', conf['MINGW_INCLUDE']]
+    # (their names matched regardless of case, as on Windows)
+    if os.path.exists(conf['MINGW_INCLUDE'] + '/nocase.yaml'):
+        sdk_dirs += ['-ivfsoverlay', conf['MINGW_INCLUDE'] + '/nocase.yaml']
+    crt_dirs = []
+else:
+    sdk_dirs = ['-isystem', here + '/include-rt', '-isystem', here + '/include-pre', '-isystem', B + '/include', '-isystem', S + '/include']
+    # (their names matched regardless of case, as on Windows)
+    if os.path.exists(LIB + '/wine-nocase.yaml'):
+        sdk_dirs += ['-ivfsoverlay', LIB + '/wine-nocase.yaml']
+    crt_dirs = ['-isystem', S + '/include/msvcrt']
+    # (MinGW's names Wine's headers lack, and Wine's wide-char mode)
+    sdk_dirs += ['-DWINE_UNICODE_NATIVE', '-DWINBOOL=BOOL']
+if msvc:
+    # (clang-cl's: _MSC_VER of Visual Studio 2022 17.10, the x64 machine, the
+    # DLL runtime /MD gives, Microsoft's extensions and compatibility)
+    IDENTITY = ['-U__GNUC__', '-U__GNUC_MINOR__', '-U__GNUC_PATCHLEVEL__', '-U__GNUC_STDC_INLINE__', '-U__GXX_ABI_VERSION',
+                '-D_MSC_VER=1940', '-D_MSC_FULL_VER=194033811', '-D_MSC_BUILD=1', '-D_MSC_EXTENSIONS=1',
+                '-D_M_X64=100', '-D_M_AMD64=100', '-D_INTEGRAL_MAX_BITS=64', '-D_MT', '-D_DLL', '-D_WIN64',
+                '-fms-extensions', '-fms-compatibility',
+                # (the intrinsics MSVC has built in, which Wine's headers only
+                # declare: those clang on wasm lacks, in C)
+                '-include', 'gexw-intrin.h']
+    if cxx:
+        IDENTITY += ['-D_MSVC_LANG=201703L', '-D_CPPRTTI=1', '-D_NATIVE_WCHAR_T_DEFINED=1', '-D_WCHAR_T_DEFINED=1']
+else:
+    IDENTITY = ['-D__MINGW32__', '-D__MINGW64__']
+base = ['-D_WIN32', '-D_UCRT', '-D__stdcall=', '-D__cdecl=', '-D__fastcall=', '-D__thiscall=', '-D__vectorcall=', '-D_stdcall=', '-D_cdecl=', '-D_fastcall=', '-D_thiscall=', *IDENTITY, '-Wno-ignored-attributes', '-Wno-unknown-attributes', '-U__linux__', '-U__linux', '-Ulinux', '-U__gnu_linux__', '-U__unix__', '-U__unix', '-Uunix', '-U__ELF__', '-fPIC', '-Wno-unused-command-line-argument',
         # (long is 32-bit here, but what the backend lowers these builtins to
         # returns the target's 64-bit long)
         '-fno-builtin-lround', '-fno-builtin-lroundf', '-fno-builtin-lroundl', '-fno-builtin-lrint',
@@ -185,18 +387,44 @@ base = ['-D_WIN32', '-D_UCRT', '-DWINE_UNICODE_NATIVE', '-DWINBOOL=BOOL', '-D__s
         # libc++ calls __builtin_lround* directly; the backend types those with a 64-bit long
         *['-D__builtin_%s=%s' % (n, n) for n in ('lround', 'lroundf', 'lroundl', 'lrint', 'lrintf', 'lrintl')],
         # (system dirs: a program's own -I comes first, its config.h before Wine's)
-        '-isystem', here + '/include-pre', '-isystem', B + '/include', '-isystem', S + '/include']
+        *sdk_dirs]
 if cxx:
     # (COM methods that return a struct, Direct2D's GetSize and the rest, as
     # Windows returns them and Wine's C implementations do: through a
     # pointer the method also returns, the headers' explicit form)
-    base = ['-include', here + '/include/gexcc-win-cxx.h', '-nostdinc++', '-isystem', CXX + '/include/c++/v1', '-D_LIBCPP_HAS_NO_PRAGMA_SYSTEM_HEADER',
+    # (with mingw-w64's headers only math.h: libc++'s lround and lrint call the
+    # C runtime's, the -D__builtin_lround=lround below and the rest)
+    # (not when only preprocessing: what a program preprocesses, such as
+    # JavaScript sources, would carry the header's lines)
+    # (after the program's own -include files: the header pulls in C++
+    # headers, and a program's wrappers of them, as Firefox's stl_wrappers
+    # reaching mfbt/Types.h, would otherwise run before the program's
+    # config header, mozilla-config.h's WIN32, and MOZ_EXPORT come out empty)
+    pre = '-E' in args
+    if not pre:
+        last = max([i + (2 if a == '-include' else 1) for i, a in enumerate(args)
+                    if a.startswith('-include') and not a.startswith('-include-')], default=0)
+        args[last:last] = ['-include', 'math.h' if conf.get('MINGW_INCLUDE') else here + '/include/gexcc-win-cxx.h']
+    base = ['-nostdinc++', '-isystem', CXX + '/include/c++/v1', '-D_LIBCPP_HAS_NO_PRAGMA_SYSTEM_HEADER',
             '-DWIDL_EXPLICIT_AGGREGATE_RETURNS'] + base
-base += ['-isystem', S + '/include/msvcrt', '-idirafter', here + '/include', '-fdeclspec']
+# (__forceinline as MinGW's _mingw.h has it)
+base += [*crt_dirs, '-idirafter', here + '/include', '-fdeclspec',
+         '-D__forceinline=__inline__ __attribute__((__always_inline__))',
+         # (dllexport and dllimport as the GexLLP64 plugin's attributes: default
+         # visibility, what the wasm target exports and imports by)
+         '-Ddllexport=__gexw_dllexport', '-Ddllimport=__gexw_dllimport',
+         # (wasm code has no return address to read; the wasm back end refuses
+         # the builtin outside Emscripten)
+         '-D__builtin_return_address(level)=((void *)0)']
 # compile-only modes
 if any(a in ('-c', '-S', '-E', '-M', '-MM') for a in args) or not any(not a.startswith('-') for a in args):
     if cxx and '-fno-exceptions' not in args:
         base += ['-fexceptions', '-fwasm-exceptions']
+    # assembly written for MinGW's COFF assembler (coffasm.py), preprocessed
+    # first when it is .S
+    asms = [a for a in args if a.endswith(('.S', '.s')) and not a.startswith('-')]
+    if '-c' in args and len(asms) == 1:
+        sys.exit(compile_coff_asm([cc] + base, args, asms[0]))
     # -c: wmain's type is checked once the object is made (compile_wmain)
     srcs = [a for a in args if a.endswith(('.c', '.cc', '.cpp', '.cxx')) and not a.startswith('-')]
     if '-c' not in args or not srcs or any(a in ('-E', '-S', '-M', '-MM') for a in args):
@@ -212,6 +440,8 @@ if any(a in ('-c', '-S', '-E', '-M', '-MM') for a in args) or not any(not a.star
 T = tools_dir()
 out = 'a.exe'; shared = False; objs = []; libs = []; libdirs = []; ress = []; srcs = []; defs = []
 subsys = None; extra_cflags = []; unicode = False; deflibs = True
+out_implib = None
+at = {}  # an object's or -l library's place on the link line
 # -s (or GEXCC_WIN_STRIP=1): a release build, the module's name and debug sections
 # out; GEXCC_WIN_STRIP=0 keeps them whatever the build asks
 strip = os.environ.get('GEXCC_WIN_STRIP') == '1'
@@ -226,13 +456,20 @@ while i < len(args):
     elif a == '-municode': unicode = True
     elif a in ('-nostdlib', '-nodefaultlibs'): deflibs = False
     elif a.startswith('-Wl,'):
-        for p in a[4:].split(','):
+        ps = a[4:].split(',')
+        if ps[0] == '--out-implib' and len(ps) == 1 and i + 1 < len(args) and args[i + 1].startswith('-Wl,'):
+            out_implib = args[i + 1][4:]; i += 2; continue
+        if ps[0] == '--out-implib' and len(ps) > 1:
+            out_implib = ps[1]
+        elif ps[0].startswith('--out-implib='):
+            out_implib = ps[0].split('=', 1)[1]
+        for p in ps:
             if p in ('-s', '--strip-all'): strip = True
             if p.startswith('--subsystem'):
                 subsys = p.split('=', 1)[1] if '=' in p else None
     elif a.startswith('-L'): libdirs.append(a[2:] or args[i + 1]); i += (1 if a[2:] else 2); continue
     elif a.startswith('-l'):
-        libs.append(a[2:] or args[i + 1]); i += (1 if a[2:] else 2); continue
+        libs.append(a[2:] or args[i + 1]); at.setdefault('-l' + libs[-1], i); i += (1 if a[2:] else 2); continue
     elif a.endswith('.res'): ress.append(a)
     elif a.endswith('.def'): defs.append(a)
     elif a.endswith(('.c', '.cc', '.cpp', '.cxx')) and not a.startswith('-'): srcs.append(a)
@@ -241,7 +478,12 @@ while i < len(args):
         with open(a, 'rb') as f:
             head = f.read(32)
         (ress if head[:8] == b'\0\0\0\0\x20\0\0\0' else objs).append(a)
-    elif a.startswith(('-I', '-D', '-U', '-O', '-f', '-std', '-m', '-W', '-g')):
+        at.setdefault(a, i)
+    elif a in ('-include', '-imacros', '-isystem', '-iquote', '-idirafter') and i + 1 < len(args):
+        # (a one-step compile's forced headers, the prelude spliced in above
+        # among them, in their order)
+        extra_cflags += [a, args[i + 1]]; i += 2; continue
+    elif a.startswith(('-I', '-D', '-U', '-O', '-f', '-std', '-m', '-W', '-g', '-include', '-imacros')):
         extra_cflags.append(a)
     i += 1
 if subsys and subsys.startswith('windows'): subsys = 'windows'
@@ -263,16 +505,133 @@ try:
                 return B + '/dlls/%s/lib%s.a' % (x, d)
         return B + '/dlls/%s/lib%s.a' % (d, d)
     dlls = []; archives = []
+    # (with mingw-w64's headers, its static libraries ahead of Wine's: the
+    # GUIDs those headers declare, install.sh's L/mingw; dll-too lists those
+    # whose MinGW libNAME.a also imports the DLL, ksuser's and the rest)
+    mw = LIB + '/mingw' if conf.get('MINGW_INCLUDE') else None
+    dll_too = set(open(mw + '/dll-too').read().split()) if mw and os.path.exists(mw + '/dll-too') else set()
     for l in libs:
         p = next((os.path.join(d, 'lib%s.a' % l) for d in libdirs if os.path.exists(os.path.join(d, 'lib%s.a' % l))), None)
+        if not p and mw and os.path.exists(mw + '/lib%s.a' % l):
+            p = mw + '/lib%s.a' % l
+            if l in dll_too: dlls.append(l)
+        if not p and os.path.exists(LIB + '/lib%s.a' % l):
+            p = LIB + '/lib%s.a' % l  # gexcc-win's own: ffi
         if not p and os.path.exists(B + '/libs/%s/lib%s.a' % (l, l)):
             p = B + '/libs/%s/lib%s.a' % (l, l)  # Wine's static ones: uuid, dxguid, strmiids
         if p:
             archives.append(p)
+            at.setdefault(p, at['-l' + l])
         elif l in ('stdc++', 'c++', 'supc++', 'gcc', 'gcc_s', 'gcc_eh', 'mingw32', 'mingwex', 'moldname', 'pthread', 'm', 'msvcrt', 'ucrt', 'winpthread'):
             continue
         else:
             dlls.append(l)
+    # import libraries of gexcc-win's own DLLs (-Wl,--out-implib), given as
+    # files or found by -l: the DLL's export list and signatures, for
+    # pelink to bind the program's calls to (--other), not archives
+    own = []
+    for lst in (objs, archives):
+        for a in list(lst):
+            n = a.endswith('.a') and implib_of(a)
+            if n:
+                lst.remove(a)
+                d = os.path.join(tmp, 'own-' + n)
+                if not os.path.isdir(d):
+                    os.makedirs(d)
+                    subprocess.check_call(['llvm-ar', 'x', '--output', d, os.path.abspath(a)])
+                    own.append((at.get(a, len(args)), n, os.path.join(d, n + '.so.exports')))
+    # (in link-line order: a name two of them export binds to the first, as
+    # GNU ld takes it from the first import library that defines it)
+    own = [(n, ex) for _, n, ex in sorted(own)]
+    # A .def that exports a name twice: the first entry is taken, as MSVC's
+    # link and GNU ld take it (winebuild refuses the second). An export the
+    # objects define as data is data, DATA or not, as link finds it (winebuild
+    # would make it a function)
+    data = None
+    if defs:
+        data = set()
+        # (the objects and the static archives -l found: both are the DLL's)
+        r = subprocess.run(['llvm-nm', '--defined-only', '--extern-only'] + [o for o in objs + archives if o.endswith(('.o', '.obj', '.a'))],
+                           capture_output=True, text=True)
+        if r.returncode:
+            sys.stderr.write('gexcc-win: llvm-nm failed, a .def\'s data exports may be taken for functions: %s\n'
+                             % r.stderr.strip().split('\n')[-1])
+        for line in r.stdout.splitlines():
+            w = line.split()
+            if len(w) == 3 and w[1] in 'DBRVdbr':
+                data.add(w[2])
+    listed = set()  # the names the .def files export, external and internal
+    for k, d in enumerate(defs):
+        seen, lines, dup, sect = set(), [], False, ''
+        for line in open(d, errors='surrogateescape'):
+            w = line.split(';', 1)[0].split()
+            # (the keywords are upper case, as MSVC's link takes them: an
+            # export named `name` or `version` is an export)
+            if w and w[0] in ('EXPORTS', 'IMPORTS', 'LIBRARY', 'NAME', 'SECTIONS', 'HEAPSIZE', 'STACKSIZE', 'VERSION', 'DESCRIPTION'):
+                sect = w[0]
+                w = w[1:]
+            if sect == 'EXPORTS' and w:
+                # (EXTERNAL=INTERNAL: deduped by the external name, the
+                # objects define the internal one)
+                n, _, internal = w[0].partition('=')
+                internal = internal or n
+                if n in seen:
+                    dup = True
+                    continue
+                seen.add(n)
+                listed |= {n, internal}
+                if internal in data and 'DATA' not in w[1:]:
+                    code, sc, comment = line.rstrip('\n').partition(';')
+                    line = code.rstrip() + ' DATA' + (' ;' + comment if sc else '') + '\n'
+                    dup = True
+            lines.append(line)
+        if dup:
+            defs[k] = os.path.join(tmp, '%d-%s' % (k, os.path.basename(d)))
+            with open(defs[k], 'w', errors='surrogateescape') as f:
+                f.writelines(lines)
+    # A DLL exports what its objects define with default visibility: what
+    # it marks dllexport or dllimport (the GexLLP64 plugin's attributes) or
+    # visibility("default"); the rest is hidden, clang's wasm default, so a
+    # plain global or a C++ inline or template is not exported. Without a .def that is its export list; with
+    # one, the names the .def leaves out are added, as MSVC's link and GNU
+    # ld export a .def's entries and every dllexport (nss3's .def leaves
+    # NSPR out, which exports itself through PR_IMPLEMENT)
+    symbolic = False
+    exp = []
+    if shared:
+        for o in objs:
+            if o.endswith('.a'):
+                continue
+            for line in subprocess.run(['llvm-objdump', '-t', o], capture_output=True, text=True).stdout.splitlines():
+                w = line.split()
+                if len(w) >= 5 and w[1] == 'g' and w[-2] != '.hidden' and w[2] in ('F', 'O') and w[3] != '*UND*':
+                    exp.append((w[-1], w[2] == 'O'))
+    if shared and defs:
+        more = sorted({e for e in exp if e[0] not in listed})
+        if more:
+            k = len(defs) - 1
+            df = os.path.join(tmp, '%d-more-%s' % (k, os.path.basename(defs[k])))
+            with open(df, 'w', errors='surrogateescape') as f:
+                f.write(open(defs[k], errors='surrogateescape').read().rstrip('\n') + '\n')
+                # (an EXPORTS section of its own: the .def may end in another)
+                f.write('EXPORTS\n')
+                for n, isdata in more:
+                    f.write('  %s%s\n' % (n, ' DATA' if isdata else ''))
+            defs[k] = df
+        # (its own references to its dllexports bound locally, as below)
+        symbolic = bool(exp)
+    elif shared:
+        if exp:
+            dname = os.path.basename(out)
+            df = os.path.join(tmp, 'exports.def')
+            with open(df, 'w') as f:
+                f.write('LIBRARY %s\nEXPORTS\n' % (dname if '.' in dname else dname + '.dll'))
+                for n, data in sorted(set(exp)):
+                    f.write('  %s%s\n' % (n, ' DATA' if data else ''))
+            defs.append(df)
+            # (its own references to them bound locally, not through the GOT
+            # that default visibility makes them go through)
+            symbolic = True
     # MinGW's default libraries (its specs' *lib), after the program's: a
     # program built with MinGW names none of them (kernel32 is always
     # imported, below), and a name they define that another Wine DLL
@@ -284,6 +643,11 @@ try:
     if cxx:
         archives += [CXX + '/lib/libc++.a', CXX + '/lib/libc++abi.a', CXX + '/lib/libunwind.a']
     archives.append(LIB + '/libgexcc-win.a')
+    # (the compiler's own runtime, libgcc's part for MinGW: 128-bit
+    # arithmetic and the rest the back end calls)
+    rtb = conf['SYSROOT64'] + '/lib/libclang_rt.builtins-wasm64.a'
+    if os.path.exists(rtb):
+        archives.append(rtb)
     name = os.path.basename(out)
     if '.' not in name:
         name += '.dll' if shared else '.exe'
@@ -320,18 +684,40 @@ try:
         if os.path.exists(implib(d)):
             x = os.path.basename(os.path.dirname(implib(d)))
             deps.append(x + ('.dll' if '.' not in x else ''))
+    deps += [n for n, _ in own]
+    other = [a for n, ex in own for a in ('--other', n, ex)]
     core = ['ntdll.dll', 'kernelbase.dll', 'kernel32.dll', 'msvcrt.dll', 'ucrtbase.dll']
     env = dict(os.environ, TMPDIR=tmp, PATH=os.environ['GEX_WASM64_SYSROOT'] + '/binaryen/bin:' + os.environ['PATH'])
     log = os.path.join(tmp, 'pelink.log')
     with open(log, 'w') as lf:
         r = subprocess.call([sys.executable, W + '/pelink.py', '--wasm64', '--split', name + '.wasm', name,
-                             '--extra', name, so + '.r.o', so + '.exports', ','.join(deps), '--stub-imports', B, S,
+                             '--extra', name, so + '.r.o', so + '.exports', ','.join(deps)] + other + (['--symbolic'] if symbolic else []) + ['--stub-imports', B, S,
                              os.path.join(tmp, 'core.wasm')] + core, env=env, stdout=lf, stderr=subprocess.STDOUT)
     if r:
         sys.stderr.write(open(log).read()[-4000:]); sys.exit(r)
-    # (its warnings: the imports bound to stubs, --stub-imports)
-    sys.stderr.writelines(l for l in open(log) if l.startswith('pelink: warning:'))
+    # (its warnings: the imports bound to stubs, --stub-imports). A name no
+    # DLL or object defines ('?.name') is MinGW's undefined reference, an
+    # error, as configure's link tests need it to be; GEXCC_WIN_UNDEFINED=stub
+    # links it to a stub that raises EXCEPTION_WINE_STUB instead.
+    warns = [l for l in open(log) if l.startswith('pelink: warning:')]
+    undef = sorted({n for l in warns for n in re.findall(r'\?\.(\S+)', l)})
+    if undef and os.environ.get('GEXCC_WIN_UNDEFINED') != 'stub':
+        sys.stderr.writelines('%s: undefined reference to `%s\'\n' % (out, n) for n in undef)
+        sys.exit(1)
+    sys.stderr.writelines(warns)
     odir = os.path.dirname(os.path.abspath(out))
+    # (and beside the module, OUT.wasm.stubs: the names bound to stubs that
+    # raise EXCEPTION_WINE_STUB, which a build that hides the link's warnings,
+    # mach's, would not show)
+    # (only when there are any, so a clean module's directory, which a
+    # package may be laid out from, holds none; a stale one goes)
+    stubs = [l.split('when called: ', 1)[1].replace(' ', '\n') for l in warns if 'when called: ' in l]
+    sf = os.path.join(odir, os.path.basename(out) + '.wasm.stubs')
+    if stubs:
+        with open(sf, 'w') as f:
+            f.writelines(stubs)
+    elif os.path.exists(sf):
+        os.unlink(sf)
     # (the loader runs an exported __wasm_call_ctors when it installs the
     # module, before the DLLs the constructors call are loaded)
     subprocess.call([sys.executable, here + '/renexp.py', os.path.join(tmp, name + '.wasm'), '__wasm_call_ctors', '__gexw_ctors'])
@@ -349,10 +735,13 @@ try:
     if shared:
         spec = os.path.join(tmp, name.rsplit('.', 1)[0] + '.spec')
         with open(spec, 'w') as f:
+            seen = set()
             for line in open(so + '.exports'):
                 n, t = line.split()[:2]
-                if n.startswith('__wine') or n.startswith('__gexw'):
+                # (once each: an alias, EXTERNAL=INTERNAL, lists INTERNAL again)
+                if n.startswith('__wine') or n.startswith('__gexw') or n in seen:
                     continue
+                seen.add(n)
                 f.write('@ extern %s\n' % n if t == 'data' else '@ cdecl %s()\n' % n)
         kind = ['--dll', '-E', spec]
     skel = os.path.abspath(out)
@@ -362,6 +751,19 @@ try:
     if r: sys.exit(r)
     r = subprocess.call([sys.executable, here + '/peimports.py', skel, os.path.join(odir, name + '.wasm.undefined')],
                         stdout=subprocess.DEVNULL)
+    if r == 0 and shared and out_implib:
+        # the import library: the DLL's name, its export list and a module of
+        # only its signatures (gexw.sig64, for pelink's calls with a struct by
+        # value), as an archive programs link (-lNAME or the file)
+        d = os.path.join(tmp, 'implib')
+        os.makedirs(d)
+        with open(os.path.join(d, IMPLIB_MEMBER), 'w') as f:
+            f.write(name + '\n')
+        shutil.copy(so + '.exports', os.path.join(d, name + '.so.exports'))
+        subprocess.check_call(['llvm-objcopy', '--only-section=gexw.sig64', so, os.path.join(d, name + '.so')])
+        if os.path.exists(out_implib):
+            os.unlink(out_implib)
+        r = subprocess.call(['llvm-ar', 'rcS', os.path.abspath(out_implib), IMPLIB_MEMBER, name + '.so.exports', name + '.so'], cwd=d)
     sys.exit(r)
 finally:
     if not os.environ.get('GEXCC_WIN_KEEP'): shutil.rmtree(tmp, True)

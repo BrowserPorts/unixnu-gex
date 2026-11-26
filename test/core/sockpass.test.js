@@ -4,8 +4,8 @@
 // connection ("inet:"), or, unconnected, moved to the global kernel and held by
 // both ("inetg:"). Its remote cases go out through the page's own network
 // (sys.network), which answers each HTTP/1.0 GET.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
 
 export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 600 };
 

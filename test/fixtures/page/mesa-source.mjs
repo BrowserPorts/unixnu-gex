@@ -10,7 +10,7 @@
 import { pathToFileURL } from 'node:url';
 import { join } from 'node:path';
 const GEX_ROOT = process.env.GEX_ROOT || join(import.meta.dirname, '..', '..', '..');
-const { mesaSource, mesaSources, MESA_FILES } = await import(pathToFileURL(join(GEX_ROOT, 'page/src/mesa-source.js')).href);
+const { mesaSource, mesaSources, MESA_FILES } = await import(pathToFileURL(join(GEX_ROOT, 'runtime/src/host/mesa-source.js')).href);
 
 let bad = 0;
 const check = (name, ok, why = '') => { console.log(`${ok ? 'ok  ' : 'FAIL'} mesa source: ${name}${ok ? '' : ` (${why})`}`); if (!ok) bad++; };

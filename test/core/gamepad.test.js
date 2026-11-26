@@ -2,9 +2,9 @@
 // program without udev reads them (probe/rt-joy.c). The controllers are
 // made up here: a headless browser has none, and the Gamepad API cannot be
 // driven from outside.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
-import { Gamepads } from '../../page/runtime/src/input.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
+import { Gamepads } from '../../runtime/src/input.js';
 
 export const meta = { hosts: ['browser', 'node'], images: ['busybox'], timeout: 120 };
 

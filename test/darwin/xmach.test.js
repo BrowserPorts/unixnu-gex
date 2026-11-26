@@ -9,8 +9,8 @@
 // one process: "xmach ok"). The second's send right names the first's
 // port, the message waits in that port's queue in the global table, and
 // the first's receive, parked, is woken through its task's mailbox there.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
 
 export const meta = { hosts: ['browser'], arches: ['a64'], images: ['darwin-static'], timeout: 300 };
 

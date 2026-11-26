@@ -8,8 +8,8 @@
 // proc_pidfdlist says each is a pipe. (gexc's standard streams
 // are the host's, each shown as what it is: tests/darwin/run.sh's
 // stdstat.)
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
 
 export const meta = { hosts: ['browser'], arches: ['a64'], images: ['darwin-static'], timeout: 300 };
 

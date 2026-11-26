@@ -28,8 +28,8 @@ const guestOf = (out) => out.split('\n').filter((l) => !/^\[host\]|^\[gex\] |^\[
 export default async function (t) {
   const c = gexcc(t);
   const x86 = t.arch === 'x86';
-  const seed = join(ROOT, 'page/public/gex', `seed${x86 ? '.x86' : ''}.shared.wasm`);
-  const page = existsSync(seed) && existsSync(join(ROOT, `page/public/gex/gex_browser${x86 ? '.x86' : ''}.shared.wasm`));
+  const seed = join(ROOT, 'runtime/files/out/gex', `seed${x86 ? '.x86' : ''}.shared.wasm`);
+  const page = existsSync(seed) && existsSync(join(ROOT, `runtime/files/out/gex/gex_browser${x86 ? '.x86' : ''}.shared.wasm`));
   if (!page) t.say(`no ${seed} (make assets): the page legs are not run`);
   const busybox = process.env.BUSYBOX && existsSync(process.env.BUSYBOX) ? process.env.BUSYBOX : null;
   const srcs = readdirSync(DIR).filter((f) => /\.(c|cpp)$/.test(f)).sort();

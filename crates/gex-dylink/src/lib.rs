@@ -383,6 +383,39 @@ fn kind_of(k: wasmparser::ExternalKind) -> Kind {
     }
 }
 
+/// The field names of a module's weak imports (`dylink.0`'s
+/// WASM_DYLINK_IMPORT_INFO with [`SYM_BINDING_WEAK`]): `env.x`'s weakness is
+/// its `GOT.mem.x`'s and `GOT.func.x`'s too. Reads only `dylink.0`, for a
+/// loader that needs nothing else of [`Info`] (Wine's PE modules).
+pub fn weak_import_names(wasm: &[u8]) -> Result<HashSet<String>> {
+    let mut weak = HashSet::default();
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        if let wasmparser::Payload::CustomSection(c) = payload? {
+            if c.name() != "dylink.0" {
+                continue;
+            }
+            let mut r = wasmparser::BinaryReader::new(c.data(), 0);
+            while !r.eof() {
+                let id = r.read_u8()?;
+                let len = r.read_var_u32()? as usize;
+                let start = r.original_position();
+                if id == 4 {
+                    for _ in 0..r.read_var_u32()? {
+                        let _module = r.read_string()?;
+                        let field = r.read_string()?.to_string();
+                        if r.read_var_u32()? & SYM_BINDING_WEAK != 0 {
+                            weak.insert(field);
+                        }
+                    }
+                }
+                r.read_bytes(len - (r.original_position() - start))?;
+            }
+            break;
+        }
+    }
+    Ok(weak)
+}
+
 impl Info {
     /// Whether [`Info::parse`] reads a section (by id, and a custom
     /// section's name): a module of only these parses to the same `Info`.
@@ -1494,6 +1527,70 @@ pub fn split_relocs(wasm: &[u8]) -> Result<Option<Vec<u8>>> {
         .validate_all(&out)
         .context("split relocations: the rewritten module does not validate")?;
     Ok(Some(out))
+}
+
+/// The wasm type of each function a module's active element segments put in
+/// its table range (the slots from `__table_base`, in order, as
+/// [`Info::elem`]): an index into the returned signatures, one per distinct
+/// function type, written as [`Info::sigs`] writes them (`None` for a type
+/// with other values). A native module's class adapters are matched to its
+/// functions by these (`gex_kernel::ftab::NativeClasses`).
+pub fn slot_types(wasm: &[u8]) -> Result<(Vec<u32>, Vec<Option<String>>)> {
+    use wasmparser::{Payload, TypeRef};
+    let mut sigs: Vec<Option<String>> = Vec::new();
+    let mut seen: HashMap<Option<String>, u32> = HashMap::default();
+    // each type's distinct signature number, and each function's type
+    let mut type_sig: Vec<u32> = Vec::new();
+    let mut func_type: Vec<u32> = Vec::new();
+    let mut slots = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        match payload? {
+            Payload::TypeSection(r) => {
+                for g in r {
+                    for t in g?.into_types() {
+                        let s = match &t.composite_type.inner {
+                            wasmparser::CompositeInnerType::Func(f) => sig_text(f.params(), f.results()),
+                            _ => None,
+                        };
+                        let n = *seen.entry(s.clone()).or_insert_with(|| {
+                            sigs.push(s);
+                            sigs.len() as u32 - 1
+                        });
+                        type_sig.push(n);
+                    }
+                }
+            }
+            Payload::ImportSection(s) => {
+                for imp in s {
+                    if let TypeRef::Func(t) = imp?.ty {
+                        func_type.push(t);
+                    }
+                }
+            }
+            Payload::FunctionSection(s) => {
+                for t in s {
+                    func_type.push(t?);
+                }
+            }
+            Payload::ElementSection(s) => {
+                for el in s {
+                    let el = el?;
+                    if !matches!(el.kind, wasmparser::ElementKind::Active { .. }) {
+                        continue;
+                    }
+                    if let wasmparser::ElementItems::Functions(fs) = el.items {
+                        for f in fs {
+                            let f = f? as usize;
+                            let t = func_type.get(f).and_then(|&t| type_sig.get(t as usize)).copied();
+                            slots.push(t.unwrap_or(u32::MAX));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok((slots, sigs))
 }
 
 /// Add (or replace) a custom section at the end of a module.

@@ -7,10 +7,10 @@
 // that is about gex, not GL) must exit 0. A probe needing more GL than this
 // adapter gives (a software adapter has no dual-source blending, so GL 3.2)
 // is left out, and said so; on a GPU (`--gpu`) none may be.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
-import { CompositorWindows } from '../../page/runtime/src/windows/compositor.js';
-import { MesaGl } from '../../page/runtime/src/gl.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
+import { CompositorWindows } from '../../runtime/src/windows/compositor.js';
+import { MesaGl } from '../../runtime/src/gl.js';
 
 // Probes whose run here is known to end other than the native run does, by the
 // line it ends with here: that line exactly is a KNOWN, not a FAIL, so a change
@@ -19,7 +19,7 @@ import { MesaGl } from '../../page/runtime/src/gl.js';
 const KNOWN = {
   'gl44-two-contexts-probe': {
     line: 'SUMMARY cases=8 passed=7 failed=1',
-    why: "every context shares the first one's objects (CONTEXT_ADD), so an unshared context sees the other's buffer",
+    why: "every context is in the first one's share group (CONTEXT_CURRENT), so an unshared context sees the other's buffer",
   },
 };
 

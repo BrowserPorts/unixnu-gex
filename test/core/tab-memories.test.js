@@ -3,8 +3,8 @@
 // hold no more (a browser reserves address space for each memory, and a tab
 // runs out at about 124; `setTabMemoriesMax` stands in for that here) a new
 // process ends as a crash that says so, and its parent goes on.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
 import { setTabMemoriesMax, tabMemories } from '../../hosts/browser/js/lazy-fetch.mjs';
 
 export const meta = {

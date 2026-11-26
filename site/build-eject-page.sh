@@ -1,7 +1,7 @@
 #!/bin/sh
 # An ejected program's web build (crates/gex-eject/README.md): gex's app
-# library (page/src/app.js) built with vite into DIR as app.mjs, and the
-# offline store editor (page/runtime/src/store.js `Store`, for a dedicated
+# library (runtime/src/host/app.js) built with vite into DIR as app.mjs, and
+# the offline store editor (runtime/src/store.js `Store`, for a dedicated
 # Worker; its `baseUrl` is DIR) as store.mjs, their chunks
 # under assets/, and beside them under gex/ store.wasm, the x86 shared-memory shim, kernel
 # and seed (with the aarch64 set, the export providers), stripped of their
@@ -15,23 +15,24 @@
 #   site/build-eject-page.sh DIR
 set -e
 OUT=$(realpath -m "${1:?usage: site/build-eject-page.sh DIR}")
-WEB=$(cd "$(dirname "$0")/../page" && pwd)
+WEB=$(cd "$(dirname "$0")/../runtime" && pwd)
+PUB=$WEB/files/out/gex
 mkdir -p "$OUT"
 # GEX_PAGE_ONE_FILE=1: app.mjs one file, its lazy chunks inlined (as each
 # Worker is): a page that fetches everything its session loads up front
 # (the KDE site) then has app.mjs and one file per Worker, none importing
 # another, and no chunk imports app.mjs back (a second copy of it).
 ONE=false; [ "${GEX_PAGE_ONE_FILE:-}" = 1 ] && ONE=true
-# GEX_PAGE_MODE=mp|sp (vite.config.js): one build's code only; under mp the
+# GEX_PAGE_MODE=mp|sp (runtime/app/config.mjs): one build's code only; under mp the
 # single-thread X server (xwayland-st/) is not copied either. Unset: both.
 MODE=${GEX_PAGE_MODE:-}
-CONFIG=$(mktemp --suffix=.mjs -p "$WEB")
+CONFIG=$(mktemp --suffix=.mjs -p "$WEB/app")
 trap 'rm -f "$CONFIG"' EXIT
 cat > "$CONFIG" <<CFG
-import base from '$WEB/vite.config.js';
+import base from '$WEB/app/config.mjs';
 export default {
   ...base,
-  root: '$WEB',
+  root: '$WEB/app',
   // URLs relative to app.mjs, so the site works under any path (a host's
   // /labs/NAME/ as at its root): Workers and chunks are found beside it.
   base: './',
@@ -39,51 +40,51 @@ export default {
   logLevel: 'warn',
   build: { ...base.build, outDir: '$OUT', emptyOutDir: true,
            rollupOptions: {
-             input: { app: '$WEB/src/app.js', store: '$WEB/runtime/src/store.js' },
+             input: { app: '$WEB/src/host/app.js', store: '$WEB/src/store.js' },
              // A library: app.mjs keeps its exports (start, fromLaunch),
              // store.mjs its Store.
              preserveEntrySignatures: 'strict',
              output: { entryFileNames: (c) => (c.name === 'app' || c.name === 'store' ? \`\${c.name}.mjs\` : 'assets/[name]-[hash].js'),
-                       inlineDynamicImports: $ONE },
+                       codeSplitting: !$ONE },
            } },
 };
 CFG
-(cd "$WEB" && node_modules/.bin/vite build --config "$CONFIG")
+(cd "$WEB/app" && "$WEB/node_modules/.bin/vite" build --config "$CONFIG")
 mkdir -p "$OUT/gex" "$OUT/vendor"
 cp "$WEB/vendor/zstddec/zstddec-stream.mjs" "$WEB/vendor/zstddec/zstddec.wasm" "$WEB/vendor/zstddec/zstddec-LICENSE" "$OUT/vendor/"
 for f in gex_browser.x86.shared.wasm gex_kernel.x86.wasm seed.x86.shared.wasm; do
-    cp "$WEB/public/gex/$f" "$OUT/gex/$f"
+    cp "$PUB/$f" "$OUT/gex/$f"
 done
 # The offline store editor's module (hosts/store/build.sh), which store.mjs
 # fetches from gex/ under its baseUrl.
 rm -f "$OUT/gex/store.wasm"
-if [ -f "$WEB/public/gex/store.wasm" ]; then cp "$WEB/public/gex/store.wasm" "$OUT/gex/store.wasm"
-else echo "build-eject-page: no page/public/gex/store.wasm (hosts/store/build.sh): store.mjs will not open a store" >&2; fi
+if [ -f "$PUB/store.wasm" ]; then cp "$PUB/store.wasm" "$OUT/gex/store.wasm"
+else echo "build-eject-page: no runtime/files/out/gex/store.wasm (hosts/store/build.sh): store.mjs will not open a store" >&2; fi
 # The memory64 shim and seed, for a program that runs in a 64-bit memory
 # (runtime.js fetches them then), when this tree has them (GEX_MEM64=1
 # hosts/browser/build.sh)
 for f in gex_browser.x86.m64.shared.wasm seed.x86.m64.shared.wasm; do
     rm -f "$OUT/gex/$f"
-    [ ! -f "$WEB/public/gex/$f" ] || cp "$WEB/public/gex/$f" "$OUT/gex/$f"
+    [ ! -f "$PUB/$f" ] || cp "$PUB/$f" "$OUT/gex/$f"
 done
 # The aarch64 set, for a build whose guest is arm64 (start's build.arch),
 # when this tree has it (GEX_ARCH=aarch64 hosts/browser/build.sh)
 for f in gex_browser.shared.wasm gex_kernel.wasm seed.shared.wasm; do
     rm -f "$OUT/gex/$f"
-    [ ! -f "$WEB/public/gex/$f" ] || cp "$WEB/public/gex/$f" "$OUT/gex/$f"
+    [ ! -f "$PUB/$f" ] || cp "$PUB/$f" "$OUT/gex/$f"
 done
-# The export providers (glibc's mem*/str*, libm: page/build-assets.sh), which
+# The export providers (glibc's mem*/str*, libm: runtime/files/build-assets.sh), which
 # the page binds to a program's glibc (arm64 or x86-64) when it has no unit
 # cache of its own (runtime.js `cgen`). Without them the program runs
 # glibc's own code.
 rm -rf "$OUT/gex/cgen"
-if ls "$WEB/public/gex/cgen/providers/"*.wasm > /dev/null 2>&1; then
+if ls "$PUB/cgen/providers/"*.wasm > /dev/null 2>&1; then
     mkdir -p "$OUT/gex/cgen/providers"
-    cp "$WEB/public/gex/cgen/providers/"*.wasm "$OUT/gex/cgen/providers/"
-else echo "build-eject-page: no page/public/gex/cgen/providers (page/build-assets.sh): programs run without their providers" >&2; fi
+    cp "$PUB/cgen/providers/"*.wasm "$OUT/gex/cgen/providers/"
+else echo "build-eject-page: no runtime/files/out/gex/cgen/providers (runtime/files/build-assets.sh): programs run without their providers" >&2; fi
 for f in gex-wgpu-replay.js gex-wgpu-replay.wasm; do
-    if [ -f "$WEB/public/gex/$f" ]; then cp "$WEB/public/gex/$f" "$OUT/gex/$f"
-    else echo "build-eject-page: no page/public/gex/$f (ports/mesa/build.sh): the build has no OpenGL" >&2; fi
+    if [ -f "$PUB/$f" ]; then cp "$PUB/$f" "$OUT/gex/$f"
+    else echo "build-eject-page: no runtime/files/out/gex/$f (ports/mesa/build.sh): the build has no OpenGL" >&2; fi
 done
 # The X server for X11 programs (runtime.js: gex/xwayland/, and
 # gex/xwayland-st/ in the single-thread build; ports/xwayland/build.sh).
@@ -91,15 +92,16 @@ done
 for d in xwayland xwayland-st; do
     rm -rf "$OUT/gex/$d"
     [ "$MODE" = mp ] && [ $d = xwayland-st ] && continue
-    if [ -f "$WEB/public/gex/$d/Xwayland.mjs" ]; then cp -R "$WEB/public/gex/$d" "$OUT/gex/$d"
-    elif [ "$d" = xwayland ]; then echo "build-eject-page: no page/public/gex/$d (ports/xwayland/build.sh): the build runs no X11 programs" >&2; fi
+    if [ -f "$PUB/$d/Xwayland.mjs" ]; then cp -R "$PUB/$d" "$OUT/gex/$d"
+    elif [ "$d" = xwayland ]; then echo "build-eject-page: no runtime/files/out/gex/$d (ports/xwayland/build.sh): the build runs no X11 programs" >&2; fi
 done
 # A release page's wasm without its names and DWARF (nine tenths of the
-# shim and kernel; user 10-30: every release build), as page/runtime/build.sh
-# and page/build.sh strip theirs: the copies here, page/public keeps the
-# originals to symbolize with. Only those sections go, so the providers'
-# gex.* ones stay; Mesa's split-off half is left whole, as
-# page/build.sh leaves it. GEX_KEEP_NAMES=1 keeps them, for a debug page.
+# shim and kernel; user 10-30: every release build), as runtime/build.sh
+# and runtime/app/build.sh strip theirs: the copies here, runtime/files/out
+# keeps the originals to symbolize with. Only those sections go, so the
+# providers' gex.* ones stay; Mesa's split-off half is left whole, as
+# runtime/app/build.sh leaves it. GEX_KEEP_NAMES=1 keeps them, for a debug
+# page.
 if [ -z "${GEX_KEEP_NAMES:-}" ]; then
     command -v wasm-tools > /dev/null || { echo "build-eject-page: no wasm-tools to strip with (or GEX_KEEP_NAMES=1)" >&2; exit 1; }
     for w in "$OUT"/gex/gex_browser*.wasm "$OUT"/gex/gex_kernel*.wasm "$OUT"/gex/cgen/providers/*.wasm \
@@ -116,8 +118,8 @@ for w in "$OUT"/gex/xwayland*/gexhostwl.wasm; do
 done
 # Mesa's cold part, when the build split one off (ports/mesa/split.py).
 rm -f "$OUT/gex/gex-wgpu-replay.deferred.wasm"
-[ ! -f "$WEB/public/gex/gex-wgpu-replay.deferred.wasm" ] ||
-    cp "$WEB/public/gex/gex-wgpu-replay.deferred.wasm" "$OUT/gex/"
+[ ! -f "$PUB/gex-wgpu-replay.deferred.wasm" ] ||
+    cp "$PUB/gex-wgpu-replay.deferred.wasm" "$OUT/gex/"
 [ -f "$OUT/app.mjs" ] || { echo "build-eject-page: vite wrote no app.mjs" >&2; exit 1; }
 [ -f "$OUT/store.mjs" ] || { echo "build-eject-page: vite wrote no store.mjs" >&2; exit 1; }
 # gex's test page is not part of an ejected build.

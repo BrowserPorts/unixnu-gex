@@ -4,7 +4,7 @@
 //
 // A realm holding the store's handle (`blocksOpen`: the single-thread
 // build's system Worker) reads and writes it here, in the kernel's memory.
-// Any other asks the page's store Worker (page/src/blocks-worker.js) through
+// Any other asks the page's store Worker (runtime/src/host/blocks-worker.js) through
 // the slots in the kernel's memory (`BLOCKS_CTL`) and waits. A page's own
 // store (a `Filesystem` subclass of its own) is served from the page, the
 // slots by `serveSlots` (the default build only).

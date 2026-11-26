@@ -236,6 +236,17 @@ impl net::Transport for PageStream {
         id != 0 && unsafe { net_avail(id) } != 0
     }
 
+    /// The bytes waiting (`net_avail`: -1 is the end, which has none). A
+    /// program sizes its read by `FIONREAD`: Qt reads that many each time it
+    /// hears the socket is readable, so 1 here cost a wakeup a byte.
+    fn available(&self) -> usize {
+        let id = self.id.load(std::sync::atomic::Ordering::Acquire);
+        if id == 0 {
+            return 0;
+        }
+        unsafe { net_avail(id) }.max(0) as usize
+    }
+
     fn close(&self) {
         let id = self.id.swap(0, std::sync::atomic::Ordering::AcqRel);
         if id != 0 {
@@ -262,7 +273,7 @@ const NET_DGRAM: i32 = 0x1_0000;
 
 /// One of the page's UDP flows, as the kernel's [`net::Transport`]: a
 /// stream of datagrams, each framed as its length (two bytes, big-endian)
-/// and its bytes, both ways (page/src/net.js's `Sockets`). Nothing is kept
+/// and its bytes, both ways (runtime/src/host/net.js's `Sockets`). Nothing is kept
 /// here: a datagram is read only once all of it has arrived, so the holders
 /// of a moved socket (each its own process) read whole ones off the one
 /// stream.
@@ -460,6 +471,8 @@ extern "C" {
     /// exact, where re-reading the guest word only guesses.
     fn k_futex_wake(addr: u64);
     fn k_futex_gen(addr: u64) -> u32;
+    /// TEST: arm the global kernel's `PR_GEX_DEBUG_TRAP` (`gex_debug_panic(4)`).
+    fn k_arm_debug_trap();
     fn k_lock_call(req: gex_kernel::PAddr, req_len: u32, out: gex_kernel::PAddr, out_len: u32, caller: i32) -> i64;
     /// The Darwin system's state the page's processes share
     /// (`gex_kernel::darwin::share`): one encoded call.
@@ -535,6 +548,12 @@ extern "C" {
     fn k_fs_meta(handle: i32, at: gex_kernel::PAddr) -> i32;
     fn k_fs_truncate(handle: i32, len: u64) -> i32;
     fn k_fs_advise(handle: i32, offset: u64, len: u64, advice: u32) -> i32;
+    /// A copy of all of `src` into `dst` (empty) that shares its bytes until
+    /// written (`FileHandle::share_from`): the size, a negated errno, or
+    /// `remote::NOT_SHARED`.
+    fn k_fs_share(dst: i32, src: i32) -> i64;
+    /// `?systime=1`'s split of `fadvise64` in the kernel (its `k_advise_stat`).
+    fn k_advise_stat(on: u32, i: u32) -> u64;
     /// `fsync`/`fdatasync` of an open file, and `sync(2)`: the root's
     /// contents in the page's store made durable (0 or a negated errno).
     fn k_fs_sync(handle: i32, data_only: u32) -> i32;
@@ -606,6 +625,12 @@ extern "C" {
     /// Slots nobody else will be given, and the mark that keeps runtime
     /// allocation clear of what static recompilation already assigned.
     fn k_slot_alloc(count: u64) -> u64;
+    fn k_slot_alloc_for(count: u64, pid: i32) -> u64;
+    fn k_slot_get_held(page: u64, key: u64, pid: i32) -> u32;
+    fn k_mod_hold(id: u32, pid: i32) -> u32;
+    fn k_slot_limit(top: u64);
+    fn k_slot_top() -> u64;
+    fn k_slot_reclaimed() -> u64;
     fn k_slot_floor(floor: u64);
     /// How many slots the mark has left before it runs off the last dispatch
     /// table. Nothing gives slots back, so this only falls; see `k_slot_left`.
@@ -710,6 +735,10 @@ extern "C" {
     fn k_pty_for_sid(sid: i32) -> i32;
     fn k_last_kill() -> u64;
     fn k_last_kill_seq() -> u32;
+    /// The last kill that reached this pid or its group (`k_last_kill`'s
+    /// packing; 0 none), and its number.
+    fn k_last_kill_to(pid: i32, pgid: i32) -> u64;
+    fn k_last_kill_to_seq(pid: i32, pgid: i32) -> u32;
     fn k_pty_available(id: i32, master: i32) -> i32;
     fn k_pty_ptn(id: i32) -> i32;
     fn k_pty_get_lock(id: i32) -> i32;
@@ -776,7 +805,39 @@ extern "C" {
 fn slot_space_top() -> u64 {
     let per_table =
         (gex_abi::DISPATCH_TABLE_MAX_SLOTS / gex_abi::SLOTS_PER_PAGE) * gex_abi::SLOTS_PER_PAGE;
-    gex_abi::DISPATCH_TABLES as u64 * per_table
+    let full = gex_abi::DISPATCH_TABLES as u64 * per_table;
+    // SAFETY: scalar calls into the kernel.
+    if unsafe { k_present() } != 0 {
+        return unsafe { k_slot_top() }.min(full);
+    }
+    full
+}
+
+/// The last dispatch table's top, whatever a debug switch says.
+fn slot_space_full() -> u64 {
+    gex_abi::DISPATCH_TABLES as u64
+        * ((gex_abi::DISPATCH_TABLE_MAX_SLOTS / gex_abi::SLOTS_PER_PAGE) * gex_abi::SLOTS_PER_PAGE)
+}
+
+/// `GEX_DEBUG_SLOT_SPACE=N` in a process's environment (a debug switch, for a
+/// test that must spend the runtime dispatch slot space quickly): the space
+/// is N slots above the statically recompiled ones, for every process from
+/// the first that says so.
+fn slot_space_switch() {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if DONE.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let Some(home) = crate::sigs::home() else { return };
+    DONE.store(true, std::sync::atomic::Ordering::Relaxed);
+    let top = home
+        .envp()
+        .iter()
+        .find_map(|e| e.strip_prefix("GEX_DEBUG_SLOT_SPACE=").and_then(|v| v.parse::<u64>().ok()));
+    if let Some(top) = top {
+        // SAFETY: a scalar call into the kernel.
+        unsafe { k_slot_limit(top) };
+    }
 }
 
 /// A page table whose runtime allocations come from the system-wide counter.
@@ -793,10 +854,24 @@ fn slot_space_top() -> u64 {
 static IDENT_SNAPSHOT: SingleThreaded<Vec<(u64, u64, std::collections::hash_map::DefaultHasher, u64, String)>> =
     SingleThreaded(RefCell::new(Vec::new()));
 
+/// The map [`IDENT_SNAPSHOT`] was taken from, as its view (one per map for the
+/// map's life, a copied map's its own) and its generation: equal, the map has
+/// not changed since, and neither has the snapshot. Holding the view keeps
+/// its address from naming another map.
+static IDENT_SNAPSHOT_OF: SingleThreaded<Option<(std::sync::Arc<gex_kernel::mem::MapView>, u64)>> =
+    SingleThreaded(RefCell::new(None));
+
 fn refresh_ident_snapshot(p: &Px<'_>) {
     use std::hash::Hash;
+    let mm = p.mm.lock();
+    let at = (mm.view(), mm.generation());
+    if let Some((view, generation)) = IDENT_SNAPSHOT_OF.0.borrow().as_ref() {
+        if std::sync::Arc::ptr_eq(view, at.0) && *generation == at.1 {
+            return;
+        }
+    }
     let mut snap = Vec::new();
-    for v in p.mm.lock().vmas().iter() {
+    for v in mm.vmas().iter() {
         if v.prot & gex_kernel::mem::prot::WRITE != 0 {
             continue;
         }
@@ -806,6 +881,7 @@ fn refresh_ident_snapshot(p: &Px<'_>) {
         snap.push((v.start, v.end, hasher, *off, id.clone()));
     }
     *IDENT_SNAPSHOT.0.borrow_mut() = snap;
+    *IDENT_SNAPSHOT_OF.0.borrow_mut() = Some((std::sync::Arc::clone(at.0), at.1));
 }
 
 /// `page_identity` for a page number, from the snapshot, with the object id
@@ -815,7 +891,9 @@ fn snapshot_page_key(page: u64) -> Option<(u64, String)> {
     let alt = page & gex_abi::ALT_PAGE != 0;
     let addr = (page & !gex_abi::ALT_PAGE) * gex_abi::DISPATCH_PAGE;
     let snap = IDENT_SNAPSHOT.0.borrow();
-    let (start, _, hasher, off, id) = snap.iter().find(|(s, e, _, _, _)| addr >= *s && addr < *e)?;
+    // The mappings in address order, as the map keeps them.
+    let i = snap.partition_point(|(s, _, _, _, _)| *s <= addr);
+    let (start, _, hasher, off, id) = snap[..i].last().filter(|(_, e, _, _, _)| addr < *e)?;
     let mut hs = hasher.clone();
     (off + (addr - start)).hash(&mut hs);
     // A page key of the other mode is `key_identity`'s, whole.
@@ -846,8 +924,9 @@ fn shared_page_table(
     table.set_identity(std::sync::Arc::new(gex_xlate::Identity {
         adopt: Box::new(|page| {
             let (key, id) = snapshot_page_key(page)?;
-            // SAFETY: a lookup in the kernel's own memory, borrowing nothing here.
-            let base = unsafe { k_slot_get(page, key) };
+            // SAFETY: a lookup in the kernel's own memory, borrowing nothing
+            // here. Held: this process will use the base.
+            let base = unsafe { k_slot_get_held(page, key, crate::my_pid()) };
             if tracing() && base != 0 {
                 trace_line(&format!(
                     "[gex] page {page:#x} adopts base {base:#x} by identity {id:?} key {key:#x}\n"
@@ -869,17 +948,37 @@ fn shared_page_table(
     }));
     }
     unsafe { k_slot_floor(next_slot) };
+    slot_space_switch();
     table.set_refill(std::sync::Arc::new(gex_xlate::Refill(Box::new(|n| {
         // SAFETY: as above.
-        let base = unsafe { k_slot_alloc(n) };
-        // Each tenth of the runtime space (the upper half of the tables)
-        // spent is said once, by the allocation that crosses it (ranges are
-        // disjoint, so one in the whole system), so a run can be watched
-        // approaching the end.
+        slot_space_switch();
+        let base = unsafe { k_slot_alloc_for(n, crate::my_pid()) };
+        // Ranges of ended programs taken back to make room (the kernel's
+        // `reclaim`), said once each time.
         {
-            let runtime = slot_space_top() / 2;
-            let tenth = |s: u64| s.saturating_sub(runtime) * 10 / runtime;
-            if tenth(base + n) > tenth(base) {
+            // SAFETY: as above.
+            let now = unsafe { k_slot_reclaimed() };
+            if now != 0 {
+                warn_line(&format!(
+                    "[gex] dispatch slots: {} ranges of ended programs taken back ({} slots in all)\n",
+                    now >> 40,
+                    now & ((1u64 << 40) - 1),
+                ));
+            }
+        }
+        // Each tenth of the runtime space (the upper half of the tables)
+        // spent is said once, by the allocation from the mark that crosses
+        // it (ranges are disjoint, so one in the whole system), so a run can
+        // be watched approaching the end. A range given again is below the
+        // mark, and says nothing.
+        {
+            let start = (gex_abi::DISPATCH_TABLES as u64 / 2)
+                * ((gex_abi::DISPATCH_TABLE_MAX_SLOTS / gex_abi::SLOTS_PER_PAGE) * gex_abi::SLOTS_PER_PAGE);
+            let runtime = slot_space_top().saturating_sub(start).max(1);
+            let tenth = |s: u64| s.saturating_sub(start) * 10 / runtime;
+            // SAFETY: as above.
+            let from_mark = unsafe { k_slot_left() } == slot_space_full().saturating_sub(base + n);
+            if from_mark && tenth(base + n) > tenth(base) {
                 warn_line(&format!(
                     "[gex] dispatch slots: {}0% of the runtime space spent ({}k left)\n",
                     tenth(base + n).min(10),
@@ -901,8 +1000,8 @@ fn shared_page_table(
                 warn_line(&format!(
                     "[gex] the runtime dispatch slot space is spent: slot {base} is past \
                      the top of table {} and nothing can be translated after this. \
-                     Slots are never given back, so a page's whole life shares \
-                     {} of them; this run has used them all.\n",
+                     Only an ended program's slots are given back, and this \
+                     run's live programs hold all {} of them.\n",
                     gex_abi::DISPATCH_TABLES - 1,
                     slot_space_top(),
                 ));
@@ -1025,6 +1124,10 @@ extern "C" fn r_add_task_cpu(tid: i32, ns: u64) {
     unsafe { k_proc_add_task_cpu(tid, ns) }
 }
 extern "C" fn r_set_task_name(tid: i32, at: gex_kernel::PAddr, len: u32) {
+    // (GEX_LOG=threads: the page's live threads by name, with the exits below)
+    // (`at` is this shim's own: `ProcTable::set_task_name` passes its slice)
+    let name = unsafe { std::slice::from_raw_parts(at as usize as *const u8, len.min(15) as usize) };
+    trace_line(&format!("[threads] {} {tid} name {}", my_pid(), String::from_utf8_lossy(name)));
     unsafe { k_proc_set_task_name(tid, at, len) }
 }
 extern "C" fn r_cpu_total() -> u64 {
@@ -1195,10 +1298,20 @@ extern "C" fn rf_truncate(handle: i32, len: u64) -> i32 {
 }
 extern "C" fn rf_advise(handle: i32, offset: u64, len: u64, advice: u32) -> i32 {
     gex_kernel::phase::mark(7);
+    let timed = SYS_TIME.load(std::sync::atomic::Ordering::Relaxed);
+    let t0 = if timed { now_ns() } else { 0 };
     let r = unsafe { k_fs_advise(handle, offset, len, advice) };
+    if timed {
+        ADVISE_CALL_NS.fetch_add(now_ns().saturating_sub(t0), std::sync::atomic::Ordering::Relaxed);
+    }
     gex_kernel::phase::mark(8);
     r
 }
+extern "C" fn rf_share(dst: i32, src: i32) -> i64 {
+    unsafe { k_fs_share(dst, src) }
+}
+/// `?systime=1`: this process's time in the kernel's `posix_fadvise` (`rf_advise`).
+static ADVISE_CALL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 extern "C" fn rf_sync(handle: i32, data_only: u32) -> i32 {
     unsafe { k_fs_sync(handle, data_only) }
 }
@@ -1592,7 +1705,7 @@ fn audio_capture(pos: Option<u32>, buf: &mut [u8], format: u32, rate: u32, chann
 }
 
 /// Where the audio ring is in the global kernel's memory (0 with none), for
-/// the page's player (page/src/audio.js).
+/// the page's player (runtime/src/host/audio.js).
 #[no_mangle]
 pub extern "C" fn gex_audio_ring_addr() -> u32 {
     if unsafe { k_present() } == 0 {
@@ -2054,6 +2167,7 @@ fn global_root() -> Option<Arc<gex_kernel::vfs::RemoteFs>> {
             meta: rf_meta,
             truncate: rf_truncate,
             advise: rf_advise,
+            share: rf_share,
             sync: rf_sync,
             read_dir: rf_read_dir,
             path_meta: rf_path_meta,
@@ -2807,13 +2921,34 @@ fn grow_memory_to(end: u64) -> bool {
     // Worker grew the SharedArrayBuffer (the "OOB after syscall 222/mmap"
     // signature). Off by default; on, the memory reaches the floor once.
     let target = if pregrow() { end.max(768 * 1024 * 1024) } else { end };
-    if target <= have {
+    ASKED_TOP.fetch_max(end, std::sync::atomic::Ordering::Relaxed);
+    // Headroom: the memory is grown ahead of what is asked for, by
+    // `headroom(have)`, and grown again once a request comes within that
+    // of its end. So a small request lands in pages an earlier grow made,
+    // which every Worker has had a whole grow's interval to take the
+    // length of. That covers a thread that takes no call into the kernel
+    // (`grow_settle` waits for the others). Shared memory pages are given
+    // only when touched, so this costs address space, not resident memory.
+    // The exit line says it (`gex_headroom_mib`).
+    let room = headroom(have);
+    if target.saturating_add(room) <= have {
         return true;
     }
-    // A megabyte at a time past what was asked for: `memory.grow` may copy, so
-    // a guest mapping a page at a time should not pay per page.
-    let want = (target - have).div_ceil(PAGE).max(16);
-    let prev = warch::memory_grow(0, want as usize);
+    // At least a megabyte past what was asked for: `memory.grow` may copy,
+    // so a guest mapping a page at a time should not pay per page.
+    let need = if target > have { (target - have).div_ceil(PAGE).max(16) } else { 0 };
+    let mut want = (target + 2 * room).saturating_sub(have).div_ceil(PAGE).max(need);
+    let mut prev = warch::memory_grow(0, want as usize);
+    if prev == usize::MAX {
+        if need == 0 {
+            // Only headroom was wanted, and the memory is at its maximum.
+            return true;
+        }
+        // Near the maximum: the headroom gives way, and what was asked for
+        // is grown alone, as before there was any.
+        want = need;
+        prev = warch::memory_grow(0, want as usize);
+    }
     if prev == usize::MAX {
         grow_failed(have, have + want * PAGE);
         return false;
@@ -2824,7 +2959,60 @@ fn grow_memory_to(end: u64) -> bool {
         foreign(have.max(OWN_TOP.load(std::sync::atomic::Ordering::Relaxed)), prev);
     }
     OWN_TOP.fetch_max(prev + want * PAGE, std::sync::atomic::Ordering::AcqRel);
+    let g = GROW_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    // This Worker's own grow gives it the new length; one between its last
+    // look and this grow did not (`grow_refresh` then still grows by nothing).
+    let _ = GROW_SEEN.with(|c| if c.get() == g - 1 { c.set(g) });
+    GREW.with(|c| c.set(true));
     true
+}
+
+/// The headroom a memory of `have` bytes is grown ahead by: an eighth of
+/// it, at least 64 MiB and at most 512 MiB.
+/// None without shared memory: one Worker, so no length to go stale.
+fn headroom(have: u64) -> u64 {
+    if cfg!(feature = "shared-memory")
+        && !UNSHARED.load(std::sync::atomic::Ordering::Relaxed)
+        && !NO_HEADROOM.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        (have / 8).clamp(64 << 20, 512 << 20) & !0xffff
+    } else {
+        0
+    }
+}
+
+/// `gex_set_no_headroom(1)` (run-node's GEX_NO_HEADROOM=1): no headroom, the
+/// memory grown to what is asked only. For a test that reads a process's
+/// memory size as where its runtime placed things (test/gexcc/noplace-floor).
+static NO_HEADROOM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[no_mangle]
+pub extern "C" fn gex_set_no_headroom(on: u32) {
+    NO_HEADROOM.store(on != 0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The highest end anyone has asked the memory to cover ([`grow_memory_to`]).
+static ASKED_TOP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The end of the memory anything has asked for or grown itself: its size
+/// less the headroom ([`grow_memory_to`]), which nothing holds.
+fn used_top() -> u64 {
+    let have = warch::memory_size(0) as u64 * 65536;
+    match ASKED_TOP.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => have,
+        asked => asked.min(have),
+    }
+}
+
+/// MiB of the memory grown ahead of what was asked for (the headroom of
+/// [`grow_memory_to`]): part of its size, not of its use.
+#[no_mangle]
+pub extern "C" fn gex_headroom_mib() -> u32 {
+    let have = warch::memory_size(0) as u64 * 65536;
+    let asked = ASKED_TOP.load(std::sync::atomic::Ordering::Relaxed);
+    if asked == 0 {
+        return 0;
+    }
+    (have.saturating_sub(asked) >> 20) as u32
 }
 
 /// A grow the engine refused, said (the first few): a failed `memory.grow`
@@ -2889,6 +3077,9 @@ fn foreign(start: u64, end: u64) {
         return;
     }
     FOREIGN_BYTES.fetch_add(end - start, std::sync::atomic::Ordering::Relaxed);
+    // Someone else's grow is in use to its end, headroom or not.
+    ASKED_TOP.fetch_max(end, std::sync::atomic::Ordering::Relaxed);
+    GROW_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     memmap::claim(memmap::Kind::Foreign, 0, start, end, "grown outside the arena (std's System allocator?)");
     static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
@@ -2917,6 +3108,7 @@ fn note_foreign_growth() {
         // The first look: everything already there (the loader's, a forked
         // child's image) is accounted for elsewhere.
         let _ = OWN_TOP.compare_exchange(0, mem, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed);
+        ASKED_TOP.fetch_max(mem, std::sync::atomic::Ordering::Relaxed);
         return;
     }
     if mem > known && OWN_TOP.compare_exchange(known, mem, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed).is_ok() {
@@ -3066,6 +3258,43 @@ pub extern "C" fn gex_ctx_exited(ctx: u32) -> i32 {
     }) as i32
 }
 
+/// What the thread whose context is at `ctx` waits on, as a code the page's
+/// wait split names (gex.mjs `WAIT_KINDS`, `GEX_LOG=waits`): 0 runnable,
+/// 1 futex, 2 futex with a timeout, 3 sleep, 4 a stream read, 5 a stream
+/// write, 6 accept, 7 wait4, 8 poll or connect, 9 poll with a timeout,
+/// 10 sigsuspend, 11 sigtimedwait, 12 a file lock, 13 a priority-inheritance
+/// lock, 14 exited, 15 in another Worker; -1 with no such thread. Read only
+/// when that log is on, without the kernel lock (the thread table).
+#[no_mangle]
+pub extern "C" fn gex_wait_code(ctx: u32) -> i32 {
+    let Some(home) = sigs::home() else { return -1 };
+    let Some((_, t)) = home.table().iter().filter(|(_, t)| t.ctx_addr() == ctx as u64).last() else { return -1 };
+    let r = t.run();
+    wait_code(&r.waiting)
+}
+
+/// [`gex_wait_code`]'s code for `w`.
+pub(crate) fn wait_code(w: &Waiting) -> i32 {
+    match w {
+        Waiting::Runnable => 0,
+        Waiting::Futex { deadline: None, .. } => 1,
+        Waiting::Futex { .. } => 2,
+        Waiting::Sleep(_) => 3,
+        Waiting::Read(_) => 4,
+        Waiting::Write(_) => 5,
+        Waiting::Accept(_) => 6,
+        Waiting::Child => 7,
+        Waiting::Net(None) => 8,
+        Waiting::Net(Some(_)) => 9,
+        Waiting::Signal => 10,
+        Waiting::SigWait(_) => 11,
+        Waiting::Lock => 12,
+        Waiting::Pi { .. } => 13,
+        Waiting::Exited => 14,
+        Waiting::Elsewhere => 15,
+    }
+}
+
 /// How many of an object's stored units one dispatch miss may take, merged
 /// into a single module. See the use site in the miss path.
 const PER_MISS_N: usize = 16;
@@ -3074,6 +3303,119 @@ const PER_MISS_N: usize = 16;
 /// call returns and folded call targets breadth-first up to this). 1 lifts
 /// only the block that missed, so the blocks lifted are the blocks run.
 static LIFT_MAX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(2048);
+
+/// The hot-rewrite mode: a page whose byte guards (`Block::guard`) fire
+/// [`SMC_HOT_HITS`] times running, each within [`SMC_HOT_QUIET_NS`] of the
+/// one before (a JIT patching a constant into its code before each pass),
+/// has a miss there lift only the block that missed, not the blocks
+/// discovery reaches from it: each hit retires the page, and the next pass
+/// lifts again what it runs, one block or a few, where it lifted hundreds.
+/// Every block still checks its bytes on entry, as on any page written
+/// while executable. A page whose guards stay quiet that long leaves the
+/// mode at its next miss.
+const SMC_HOT_HITS: u32 = 8;
+const SMC_HOT_QUIET_NS: u64 = 2_000_000_000;
+/// The most blocks one miss on a hot page lifts: the block that missed and
+/// the straight-line run after it on its page (`translate_runtime_run`).
+const SMC_HOT_RUN: usize = 8;
+
+/// Per page key: guard hits running, the last one's time (`now_ns`), and
+/// (`?jitdiag=1`) the nanoseconds and blocks its hot lifts took. See
+/// [`SMC_HOT_HITS`].
+static SMC_HOT: std::sync::Mutex<Option<std::collections::HashMap<u64, SmcHot>>> = std::sync::Mutex::new(None);
+
+/// On a hot page, a block whose guard fires is retired alone (its slot
+/// moves to its new translation; the page's other blocks stay installed,
+/// each checking its own bytes). Every this many of those the page is
+/// retired whole all the same, so the modules holding the old copies of its
+/// blocks, which nothing dispatches to any more, can go.
+const SMC_HOT_PAGE_RETIRE: u32 = 256;
+
+#[derive(Default, Clone, Copy)]
+struct SmcHot {
+    hits: u32,
+    /// Blocks retired alone since the page was last retired whole.
+    alone: u32,
+    last: u64,
+    lifts: u64,
+    lift_ns: u64,
+    blocks: u64,
+}
+
+/// A guard on `page` fired. Whether to retire only the block (the page
+/// is hot, and not due its whole retire: [`SMC_HOT_PAGE_RETIRE`]).
+fn smc_hit(page: u64) -> bool {
+    let now = now_ns();
+    let mut m = SMC_HOT.lock().unwrap_or_else(|e| e.into_inner());
+    let h = m.get_or_insert_with(Default::default).entry(page).or_default();
+    let quiet = h.last != 0 && now.saturating_sub(h.last) > SMC_HOT_QUIET_NS;
+    let was = *h;
+    if quiet {
+        *h = SmcHot::default();
+    }
+    h.hits = h.hits.saturating_add(1);
+    h.last = now;
+    let alone = h.hits > SMC_HOT_HITS && h.alone < SMC_HOT_PAGE_RETIRE;
+    h.alone = if alone { h.alone + 1 } else { 0 };
+    let h = *h;
+    drop(m);
+    if quiet && was.hits >= SMC_HOT_HITS {
+        smc_cooled(page, was.hits);
+    }
+    if jit_diag() && h.hits == SMC_HOT_HITS {
+        warn_line(&format!("gex: pid {} page {page:#x} is rewritten while it runs ({SMC_HOT_HITS} guard hits running): a block whose bytes change is retired alone, and a miss there lifts only its block and the run after it\n", my_pid()));
+    }
+    if jit_diag() && h.hits >= SMC_HOT_HITS && h.hits.is_power_of_two() && h.lifts > 0 {
+        warn_line(&format!(
+            "gex: pid {} page {page:#x}: {} guard hits running, {} hot lifts of {} blocks in {} us\n",
+            my_pid(),
+            h.hits,
+            h.lifts,
+            h.blocks,
+            h.lift_ns / 1000
+        ));
+    }
+    alone
+}
+
+/// Whether a miss on `page` lifts only its block (the hot-rewrite mode); a
+/// page that has been quiet long enough leaves the mode here.
+fn smc_hot(page: u64) -> bool {
+    let mut m = SMC_HOT.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(map) = m.as_mut() else { return false };
+    let Some(h) = map.get(&page).copied() else { return false };
+    if h.hits < SMC_HOT_HITS {
+        return false;
+    }
+    if now_ns().saturating_sub(h.last) <= SMC_HOT_QUIET_NS {
+        return true;
+    }
+    map.remove(&page);
+    drop(m);
+    smc_cooled(page, h.hits);
+    false
+}
+
+/// `page` left the hot-rewrite mode, quiet after `hits` guard hits.
+fn smc_cooled(page: u64, hits: u32) {
+    if jit_diag() {
+        warn_line(&format!(
+            "gex: pid {} page {page:#x} quiet for {} ms after {hits} guard hits: misses there lift as before\n",
+            my_pid(),
+            SMC_HOT_QUIET_NS / 1_000_000
+        ));
+    }
+}
+
+/// `?jitdiag=1`: what a hot lift on `page` took.
+fn smc_lifted(page: u64, ns: u64, blocks: u64) {
+    let mut m = SMC_HOT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(h) = m.as_mut().and_then(|m| m.get_mut(&page)) {
+        h.lifts += 1;
+        h.lift_ns += ns;
+        h.blocks += blocks;
+    }
+}
 
 /// What the runtime translator did in this process, for `gex_xlate_stat`:
 /// 0 guest instructions lifted, 1 wasm bytes emitted, 2 translations (misses
@@ -3243,6 +3585,13 @@ static ARENA_NEXT: std::sync::atomic::AtomicU64 =
 /// process outgrowing its lowered memory ([`runtime_outgrow`]).
 static RUNTIME_SHORT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// gex's own memory for this process (a provider's heap or stack, mapped
+/// as guest memory) could not have `len` bytes: recorded as a runtime
+/// shortfall ([`RUNTIME_SHORT`]), as the arena's own refusal is.
+pub(crate) fn runtime_short(len: u64) {
+    RUNTIME_SHORT.fetch_max(len.max(1), std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Take `len` bytes of arena for this module's heap.
 fn arena_take(len: u64) -> Option<u64> {
     arena_take_for(len, false)
@@ -3287,7 +3636,8 @@ fn arena_take_for(len: u64, guest: bool) -> Option<u64> {
         } else {
             // Not forked: the memory is its own and nothing else is in it. Kept
             // as the floor rather than assumed, since the loader grows it.
-            gex_kernel::mem::arena_bottom().max(warch::memory_size(0) as u64 * 65536)
+            // What was asked of it, not its size: the headroom above is free.
+            gex_kernel::mem::arena_bottom().max(used_top())
         }
     } else {
         cur
@@ -3415,7 +3765,7 @@ fn arena_take_for(len: u64, guest: bool) -> Option<u64> {
         // a 64-bit memory: the trap that follows is its outgrowing the
         // lowered one, which the kernel's line says (`runtime_outgrow`).
         // SAFETY: `warn` and `debug` read the bytes and keep none of them.
-        if !guest && gex_kernel::syscalls::outgrow_armed(my_pid(), WASM32.load(std::sync::atomic::Ordering::Acquire)) {
+        if !guest && gex_kernel::syscalls::outgrow_armed(my_pid(), guest32()) {
             unsafe { debug(b.0.as_ptr() as u32, b.1 as u32) };
         } else {
             unsafe { warn(b.0.as_ptr() as u32, b.1 as u32) };
@@ -3889,6 +4239,9 @@ pub(crate) struct ThreadCell {
     /// and before it first runs. A fork does not wait for it: it parks at
     /// its return to guest code.
     out: std::sync::atomic::AtomicBool,
+    /// The [`GROW_GEN`] this thread's Worker last took the memory's length
+    /// at ([`grow_refresh`]): a grower waits for it ([`grow_settle`]).
+    grow_seen: std::sync::atomic::AtomicU32,
 }
 
 impl ThreadCell {
@@ -3900,6 +4253,7 @@ impl ThreadCell {
             hold: Default::default(),
             held: Default::default(),
             out: std::sync::atomic::AtomicBool::new(true),
+            grow_seen: Default::default(),
         }
     }
 
@@ -4454,6 +4808,9 @@ fn install_panic_hook() {
         // the process's stderr beside the guest's own complaint: a Worker's
         // console reaches no log a game run keeps.
         gex_kernel::mem::set_say(|s| unsafe { write_stderr(s) });
+        // A futex wait's cross-Worker generation, sampled by the kernel
+        // before it checks the word (BlockOp::FutexWait's `shared_gen`).
+        gex_kernel::futex::set_shared_gen(|a| if unsafe { k_present() } != 0 { unsafe { k_futex_gen(a) } } else { 0 });
         // A 64-bit guest that outgrew the lowered memory gets the 64-bit
         // one at its next start, where the page runs both.
         gex_kernel::syscalls::set_outgrow_host(gex_kernel::syscalls::OutgrowHost {
@@ -4550,12 +4907,19 @@ pub extern "C" fn gex_panic_reporting() -> u32 {
 
 /// TEST (run-node GEX_DEBUG_PANIC, a test-only switch): panic on purpose,
 /// to check that the report reaches the console. 1 a plain panic, 2 one that
-/// panics again inside the hook, 3 one with a 4 KiB message. Only a caller
-/// that asks runs it.
+/// panics again inside the hook, 3 one with a 4 KiB message; 4 none now,
+/// but a process's `prctl(PR_GEX_DEBUG_TRAP)` panics in the kernel
+/// (`debugpanic=prctl`). Only a caller that asks runs it.
 #[no_mangle]
 pub extern "C" fn gex_debug_panic(kind: u32) {
     install_panic_hook();
     match kind {
+        4 => {
+            gex_kernel::proc::arm_debug_trap();
+            if unsafe { k_present() } != 0 {
+                unsafe { k_arm_debug_trap() };
+            }
+        }
         2 => {
             DEBUG_PANIC_IN_HOOK.with(|d| d.set(true));
             panic!("gex debug panic: outer");
@@ -5135,6 +5499,14 @@ mod slots {
     /// the first time the slot is, and kept for its next holder, so the
     /// count costs nothing until that many threads are live at once.
     pub const COUNT: usize = 256;
+    /// Slots a `clone` never promises: kept for the spare Workers the host
+    /// starts ahead of a process's threads (host.mjs `SPARE_MAX`, at most
+    /// that many on the page before they claim). A spare claims a slot
+    /// promised to nobody, so one starting while every slot was held or
+    /// promised took a promised thread's, whose Worker then found none and
+    /// the thread never ran (test/x86-programs threads-many's second round
+    /// hung near 256 threads).
+    pub const SPARES: usize = 8;
     /// Words of the used-slot bitmap.
     pub const WORDS: usize = COUNT / 64;
     /// Bytes of guard pattern at the bottom of each stack.
@@ -5335,7 +5707,7 @@ fn thread_runner_take() -> bool {
     loop {
         let promised = PROMISED.load(Ordering::Acquire);
         let held: u32 = SLOT_USED.iter().map(|w| w.load(Ordering::Acquire).count_ones()).sum();
-        if (held + promised) as usize >= slots::COUNT {
+        if (held + promised) as usize >= slots::COUNT - slots::SPARES {
             return false;
         }
         if PROMISED.compare_exchange(promised, promised + 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
@@ -8383,7 +8755,60 @@ static SYS_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 
 /// Whether syscalls are timed and counted (`SYS_TOTAL_NS`, `SYS_CALLS`).
 fn sys_timed() -> bool {
-    (unsafe { HEARTBEAT } != 0) || tracing()
+    (unsafe { HEARTBEAT } != 0) || tracing() || SYS_TIME.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `?systime=1` (options.mjs `sysTime`): every syscall timed by number
+/// (`SYS_NS`, `SYS_N`), for the process's exit report (`gex_sys_times`),
+/// without a heartbeat's census lines or a trace's. Off by default, and then
+/// costs the one load `sys_timed` already makes per call.
+static SYS_TIME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[no_mangle]
+pub extern "C" fn gex_set_sys_time(on: i32) {
+    SYS_TIME.store(on != 0, std::sync::atomic::Ordering::Relaxed);
+    if on != 0 {
+        // SAFETY: a kernel import taking scalars.
+        unsafe { k_advise_stat(1, 0) };
+    }
+}
+
+/// Calls of each syscall number, beside `SYS_NS`, while `SYS_TIME` is on.
+static SYS_N: [std::sync::atomic::AtomicU32; 512] = [const { std::sync::atomic::AtomicU32::new(0) }; 512];
+
+/// This process's time in syscalls by number, its threads' together (a call
+/// that blocks counts its wait): `total MS in N calls: name=MS/N ...`, the
+/// 16 longest, into `out` (at most `max` bytes). Empty unless `SYS_TIME`.
+#[no_mangle]
+pub extern "C" fn gex_sys_times(out: u32, max: u32) -> u32 {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !SYS_TIME.load(Relaxed) {
+        return 0;
+    }
+    let mut v: Vec<(u64, u32, usize)> = (0..512)
+        .map(|i| (unsafe { SYS_NS[i] }, SYS_N[i].load(Relaxed), i))
+        .filter(|x| x.0 > 0 || x.1 > 0)
+        .collect();
+    v.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    let ms = |ns: u64| format!("{:.1}", ns as f64 / 1e6);
+    let mut text = format!(
+        "{} ms in {} calls:",
+        ms(SYS_TOTAL_NS.load(Relaxed)),
+        SYS_CALLS.load(Relaxed)
+    );
+    for (ns, n, nr) in v.into_iter().take(16) {
+        text.push_str(&format!(" {}={}/{n}", gex_kernel::syscalls::syscall_name(nr as u64), ms(ns)));
+    }
+    // fadvise64 in the kernel, every process's so far: waiting for its file
+    // to be laid, against the lazy file's own fetches.
+    // SAFETY: a kernel import taking scalars.
+    let adv = |i| unsafe { k_advise_stat(2, i) };
+    if adv(2) > 0 {
+        text.push_str(&format!("; fadvise in the kernel {} ms; every process so far: {} fadvise calls, {} waits for files not laid yet, {} ms (10 ms slices)", ms(ADVISE_CALL_NS.load(Relaxed)), adv(2), adv(1), ms(adv(0))));
+    }
+    let n = text.len().min(max as usize);
+    shim_slice_mut(out, n as u32).copy_from_slice(&text.as_bytes()[..n]);
+    n as u32
 }
 
 /// How long this process has spent in syscalls, in microseconds.
@@ -8513,6 +8938,9 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
             None => {
                 snap_carry_end();
                 growth_note();
+                if GREW.with(|c| c.replace(false)) {
+                    grow_settle();
+                }
                 enter_guest();
                 return;
             }
@@ -8539,7 +8967,8 @@ fn growth_note() {
     if !on {
         return;
     }
-    let have = warch::memory_size(0) as u64 * 65536;
+    // What was asked of the memory: the headroom is said apart.
+    let have = used_top();
     let step = have >> 26;
     if SAID.fetch_max(step, Ordering::Relaxed) >= step {
         return;
@@ -8549,10 +8978,11 @@ fn growth_note() {
     let spent: Vec<u64> = ARENA_SPENT.iter().map(|b| b.load(Ordering::Relaxed) >> 20).collect();
     let map = with_exec_lock(|h| h.kernel.mem.lock().growth_summary());
     warn_line(&format!(
-        "[gex] growth pid {} {}: memory {} MiB; shim heap reach {} MiB, live {} MiB (by size {:?}), arena taken maps/heap/stacks/largest {:?} MiB in {} refills; {map}\n",
+        "[gex] growth pid {} {}: memory {} MiB (headroom {} MiB); shim heap reach {} MiB, live {} MiB (by size {:?}), arena taken maps/heap/stacks/largest {:?} MiB in {} refills; {map}\n",
         my_pid(),
         crate::sigs::proc_home().exe(),
         have >> 20,
+        gex_headroom_mib(),
         HEAP_REACH.load(Ordering::Relaxed) >> 20,
         live >> 20,
         classes,
@@ -8764,6 +9194,9 @@ fn syscall_entry(ctx: i32, pc: i64) {
     gex_kernel::phase::mark(0);
     // The clock calls, which never take the kernel lock (`clock_syscall`).
     if !IN_PROVIDER.with(|c| c.get()) && clock_syscall(ctx) {
+        // Not through `enter_guest`: a loop that reads the clock takes a
+        // sibling's grow here.
+        MY_RUN.with(|c| grow_refresh(c.borrow().as_deref()));
         // A wasm32 program has no safepoints of its own: its loops reach
         // the kernel through a call like these (gexcc's `__gex_poll` makes a
         // `getpid`), so a signal is delivered here, as at any call's return
@@ -9124,6 +9557,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
         // kernel's `FutexTable::wake`, which recorded them.
         if unsafe { k_present() } != 0 {
             for addr in h.kernel.futexes.take_woken() {
+                waitq::split_woke(addr);
                 unsafe { k_futex_wake(addr) };
             }
         }
@@ -9179,11 +9613,12 @@ fn syscall_entry(ctx: i32, pc: i64) {
                     use std::sync::atomic::{AtomicU32, Ordering};
                     static SAID: AtomicU32 = AtomicU32::new(0);
                     if SAID.fetch_add(1, Ordering::Relaxed) < 32 {
-                        let last = if unsafe { k_present() } != 0 {
-                            let v = unsafe { k_last_kill() };
+                        // (the last kill that reached this process: `killed`'s)
+                        let last = if unsafe { k_present() } != 0 && unsafe { k_last_kill_to(h.kernel.pid, 0) } != 0 {
+                            let v = unsafe { k_last_kill_to(h.kernel.pid, 0) };
                             format!(
                                 " (signal #{}: {} from pid {} to {})",
-                                unsafe { k_last_kill_seq() },
+                                unsafe { k_last_kill_to_seq(h.kernel.pid, 0) },
                                 v & 0xff,
                                 (v >> 40) as i32,
                                 ((v >> 8) & 0xffff_ffff) as i32
@@ -9247,19 +9682,18 @@ fn syscall_entry(ctx: i32, pc: i64) {
                         deadline,
                         parked,
                         val,
+                        shared_gen,
                     } => Waiting::Futex {
                         val: *val,
-                        // The shared generation of this address, sampled now --
-                        // BEFORE parking but AFTER the kernel checked the word,
-                        // which is fine: a wake landing between the check and here
-                        // bumps the counter, so the first re-check sees the change.
-                        // (A wake between the word-check and the *kernel's*
-                        // snapshot is caught by `parked`, taken before the check.)
-                        wake_gen: if unsafe { k_present() } != 0 {
-                            unsafe { k_futex_gen(*uaddr) }
-                        } else {
-                            0
-                        },
+                        // The shared generation of this address, which the
+                        // kernel sampled BEFORE it checked the word (the
+                        // hook set in `install_panic_hook`): a wake from
+                        // another Worker either changed the word the check
+                        // saw, or moves the generation past this. Sampled
+                        // here, after the check, a wake between the two was
+                        // in the sample already and the thread slept for
+                        // good.
+                        wake_gen: *shared_gen,
                         // The place the kernel snapshotted BEFORE it checked the
                         // word -- using it (not a fresh `park` here, after the
                         // check) is what stops a wake between the check and the
@@ -9506,12 +9940,18 @@ fn syscall_entry(ctx: i32, pc: i64) {
     if timed {
         let took = now_ns().saturating_sub(began);
         SYS_TOTAL_NS.fetch_add(took, std::sync::atomic::Ordering::Relaxed);
-        if unsafe { HEARTBEAT } != 0 {
+        let by_nr = SYS_TIME.load(std::sync::atomic::Ordering::Relaxed);
+        if unsafe { HEARTBEAT } != 0 || by_nr {
             // Canonical, as the census counts it (an i386-ABI process's
-            // own numbers name other calls in the canonical table).
+            // own numbers name other calls in the canonical table). Not
+            // atomic: threads racing here may lose a little of each other's
+            // time, which a profile's milliseconds can bear.
             let nr = this_nr as usize;
             if nr < 512 {
                 unsafe { SYS_NS[nr] = SYS_NS[nr].saturating_add(took) };
+                if by_nr {
+                    SYS_N[nr].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
     }
@@ -9946,6 +10386,16 @@ fn frames_stay() -> bool {
 /// `Kernel::wasm32` of this process, for what asks it without the kernel
 /// (`frames_stay`). Set where the kernel's is, and by `set_host`.
 pub(crate) static WASM32: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// This process's wasm32 program was built LP64 and lowered (64-bit Wine):
+/// a 32-bit guest by its memory only, which a 64-bit memory can run.
+pub(crate) static LOWERED64: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this process is a 32-bit guest for moving it to a 64-bit memory
+/// (`note_runtime_short`): a wasm32 program not lowered from wasm64.
+fn guest32() -> bool {
+    WASM32.load(std::sync::atomic::Ordering::Acquire) && !LOWERED64.load(std::sync::atomic::Ordering::Acquire)
+}
 
 /// A thread or a fork a wasm32 program's syscall staged without trapping
 /// (`gex_wasmprog_staged`).
@@ -11424,6 +11874,118 @@ pub(crate) fn leave_guest() {
     });
 }
 
+/// Grows of the memory so far, by any Worker ([`grow_memory_to`], [`foreign`]).
+///
+/// A Worker's engine checks accesses to a shared memory against the length
+/// that Worker last took. After another Worker grows the memory, it takes
+/// the new length only at its own next interrupt, or when it grows the
+/// memory itself (a grow by nothing). On engines that bounds-check
+/// explicitly, and for atomics anywhere, a thread that is given a pointer
+/// into the new pages before then traps out of bounds on memory that is
+/// there. That was FL Studio's FastMM `lock cmpxchg` on arm64, and
+/// fixtures/native/stale-bound on x86-64.
+static GROW_GEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Set when this process's memory is not shared (worker.mjs,
+/// `gex_set_memory_unshared`): there is no other Worker's length to go stale.
+static UNSHARED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[no_mangle]
+pub extern "C" fn gex_set_memory_unshared(on: i32) {
+    UNSHARED.store(on != 0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether this process's memory has one length for everyone: a shim built
+/// without `shared-memory` (the single-thread build's), whatever it was
+/// told, or one told so ([`UNSHARED`]).
+fn memory_unshared() -> bool {
+    !cfg!(feature = "shared-memory") || UNSHARED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+thread_local! {
+    /// The [`GROW_GEN`] this Worker last took the memory's length at.
+    static GROW_SEEN: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+    /// Set when this Worker grew the memory in the call it is in: before the
+    /// call returns, the other threads take the new length ([`grow_settle`]).
+    static GREW: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// This Worker takes the memory's present length if anyone has grown it
+/// since it last did. A grow by nothing makes the engine refresh this
+/// Worker's bound on the memory, for all of its instances. `t`, this Worker's
+/// thread, if it has one, says so for [`grow_settle`].
+fn grow_refresh(t: Option<&ThreadCell>) {
+    // A memory that is not shared (the single-thread build's, the shared
+    // build's shim with its memory's flag cleared) has one length for
+    // everyone, and a grow by nothing would detach its buffer under every
+    // JavaScript view of it.
+    if memory_unshared() {
+        return;
+    }
+    let g = GROW_GEN.load(std::sync::atomic::Ordering::SeqCst);
+    if GROW_SEEN.with(|c| c.replace(g)) != g {
+        warch::memory_grow(0, 0);
+    }
+    if let Some(t) = t {
+        t.grow_seen.store(g, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The longest a grower waits for a thread to take the new length. A
+/// translated guest gets there at its next back-edge. Native wasm code
+/// has no safepoints, so it gets there at its next call into the kernel;
+/// meanwhile its engine's own interrupt, which comes within microseconds
+/// of a thread that runs, gives it the length. 20 ms, not 1: under load a
+/// sibling may not run for that long (1 ms and 5 ms both failed under the
+/// gate's load). The headroom (`grow_memory_to`) keeps such grows rare.
+///
+/// The gap that is left: a native wasm loop that makes no call, given a
+/// pointer into pages a grow made just now (a mapping bigger than the
+/// headroom), on a thread the machine does not run for this long. It
+/// depends on the engine's interrupt alone. Translated code (safepoints)
+/// and code that calls into the kernel get the length for certain.
+const GROW_SETTLE_MAX_NS: u64 = 20_000_000;
+
+/// After a call that grew the memory, before it returns what lies in the new
+/// pages: every other thread running guest code takes the new length first.
+/// Each one's safepoint counter is run out, as [`gex_fork_hold`] does, and
+/// the grower waits for each to pass [`enter_guest`] (or be out of guest
+/// code). A thread out of guest code takes the length at its return.
+fn grow_settle() {
+    use std::sync::atomic::Ordering::SeqCst;
+    if memory_unshared() {
+        return;
+    }
+    let g = GROW_GEN.load(SeqCst);
+    let me = cur();
+    let cells: Vec<(Arc<ThreadCell>, u64)> = with_exec_lock(|h| {
+        h.threads.iter().filter(|(i, _)| *i != me).map(|(_, t)| (t.state_arc(), t.ctx_addr())).collect()
+    });
+    let behind = |c: &ThreadCell| {
+        !(c.out.load(SeqCst) || c.held.load(SeqCst) || c.halted.load(SeqCst)) && (c.grow_seen.load(SeqCst).wrapping_sub(g) as i32) < 0
+    };
+    if !cells.iter().any(|(c, _)| behind(c)) {
+        return;
+    }
+    {
+        let mut mem = guest();
+        for (c, at) in &cells {
+            if behind(c) {
+                if let Some(w) = mem.word_mut(at.wrapping_add(ctx::SAFEPOINT_COUNTER as u64)) {
+                    gex_atomic::store_u32(w, 0, 0);
+                }
+            }
+        }
+    }
+    let until = now_ns() + GROW_SETTLE_MAX_NS;
+    let nap = std::sync::atomic::AtomicI32::new(0);
+    while cells.iter().any(|(c, _)| behind(c)) && now_ns() < until {
+        #[cfg(feature = "shared-memory")]
+        unsafe {
+            warch::memory_atomic_wait32(nap.as_ptr(), 0, 20_000)
+        };
+    }
+}
+
 /// The longest a thread stays parked at a fork's hold: past it, the fork that
 /// raised it is taken to have ended without saying so.
 const HOLD_MAX_NS: u64 = 10_000_000_000;
@@ -11436,6 +11998,9 @@ pub(crate) fn enter_guest() {
         let b = c.borrow();
         let t = b.as_ref()?;
         t.out.store(false, SeqCst);
+        // After `out` falls: a grower that read it still set sees to it
+        // that this thread takes the new length here.
+        grow_refresh(Some(t));
         (t.hold.load(SeqCst) != 0).then(|| t.clone())
     });
     let Some(t) = held else { return };
@@ -11836,7 +12401,7 @@ pub extern "C" fn gex_thread_park() -> i32 {
     IN_PROVIDER.with(|c| c.set(false));
     IN_SYSCALL.with(|c| c.set(false));
     NO_LEAVE.with(|c| c.set(false));
-    CALLOUT_GUARD.with(|c| c.set((0, false)));
+    CALLOUT_GUARD.with(|c| c.set((0, false, u64::MAX)));
     FAR_NEXT.with(|c| c.set((0, 0)));
     WOW64_WAITS.with(|c| c.set(0));
     SNAP_CARRY.with(|c| c.set(false));
@@ -12179,6 +12744,8 @@ fn exit_process(code: i32) -> i32 {
     // No kernel lock: what the end touches locks itself.
     if let Some(home) = sigs::home() {
         if home.exit().claim() {
+            END_AT.store(turn_now().max(1), std::sync::atomic::Ordering::Relaxed);
+            END_CODE.store(code, std::sync::atomic::Ordering::Relaxed);
             end_process_once(home, code);
         }
     } else {
@@ -12231,6 +12798,30 @@ fn darwin_machine_end(e: &gex_kernel::darwin::machine::Event) {
     }
     gl::DEFER.with(|d| d.set(false));
     trap();
+}
+
+/// When this process's end was claimed (`turn_now`, 0 not yet) and with what
+/// (`exit_process`'s code: a negated signal for a signal death), for a
+/// thread still running long after it (`gex_end_age_ms`). In the memory: every
+/// Worker of the process sees it.
+static END_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static END_CODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// How long ago this process's end was claimed, in ms (-1: it has not
+/// ended). A thread still running seconds after (a Worker inside a host
+/// call, a door's wait) says so (gex.mjs `#stillRunning`).
+#[no_mangle]
+pub extern "C" fn gex_end_age_ms() -> i32 {
+    match END_AT.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => -1,
+        t => (turn_now().saturating_sub(t) / 1_000_000).min(i32::MAX as u64) as i32,
+    }
+}
+
+/// The end's code (`exit_process`'s: a negated signal for a signal death).
+#[no_mangle]
+pub extern "C" fn gex_end_code() -> i32 {
+    END_CODE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// This process's memory is a forked copy of its parent's (`gex_adopt_child`):
@@ -12569,6 +13160,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // Set again when a wasm32 program is published (cgen/wasmprog.rs).
     h.kernel.wasm32 = false;
     WASM32.store(false, std::sync::atomic::Ordering::Release);
+    LOWERED64.store(false, std::sync::atomic::Ordering::Release);
     cgen::wasmprog::stage(program.as_ref());
     h.kernel.live_threads.store(1, std::sync::atomic::Ordering::Release);
     // Clones above the context this program goes on, which is the exec'ing
@@ -12579,14 +13171,30 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     let mut data = guest();
     // The new image goes where its own headers say, which for a static
     // executable is the same place the old one was.
+    // A native wasm32 program's module rides in its image (wasm-elf.py), and
+    // nothing in the guest reads it there: it is read from the file where it
+    // is needed (`wasmprog::publish`, JS), so it is not placed. Placed, it was
+    // a copy in every process's memory (8 MiB of each Wine process's).
+    let module = program.as_ref().and_then(|p| {
+        let segs: Vec<(u64, u64, u64)> = p.exe.segments.iter().zip(&ranges).map(|(s, &(o, l))| (s.vaddr, o, l)).collect();
+        let exe = p.direct.as_deref().unwrap_or(path);
+        cgen::wasmprog::module_in_file(p.exe.entry, &segs, &|o, b| h.kernel.read_file_at(exe, o, b)).map(|(at, len, _)| (at, at + len))
+    });
     for ((seg, from), &(off, len)) in program.iter().flat_map(|p| p.placements()).zip(&ranges) {
         let len = len as usize;
         if !fresh && data.zero_dirty(seg.vaddr, seg.mem_size as usize).is_err() {
             return 0;
         }
-        // From the file into place: the one copy.
+        // From the file into place: the one copy -- around the module, if it
+        // is in this segment.
         let Ok(dst) = data.read_mut(seg.vaddr, len) else { return 0 };
-        if h.kernel.read_file_at(from.unwrap_or(path), off, dst) != Some(len) {
+        let (ma, mb) = module
+            .filter(|&(a, b)| a >= seg.vaddr && b <= seg.vaddr + len as u64)
+            .map_or((len, len), |(a, b)| ((a - seg.vaddr) as usize, (b - seg.vaddr) as usize));
+        let file = from.unwrap_or(path);
+        if h.kernel.read_file_at(file, off, &mut dst[..ma]) != Some(ma)
+            || h.kernel.read_file_at(file, off + mb as u64, &mut dst[mb..]) != Some(len - mb)
+        {
             return 0;
         }
         let mut prot = 0;
@@ -12952,7 +13560,8 @@ fn shared_slot(j: &Jit, page: u64, key: u64) -> Option<u32> {
     // SAFETY: a plain lookup in the kernel's own memory, taking no borrow of
     // anything this module owns.
     if unsafe { k_present() } != 0 {
-        let base = unsafe { k_slot_get(page, key) };
+        // Held: the caller uses the base.
+        let base = unsafe { k_slot_get_held(page, key, crate::my_pid()) };
         if base != 0 {
             return Some(base);
         }
@@ -13740,6 +14349,11 @@ fn shared_modules_of_object(
                 continue;
             }
             took += len as u64;
+            // Held before it is read: its slots cannot be taken back while
+            // this process may run it. Gone from the store: not installed.
+            if k_mod_hold(id, crate::my_pid()) == 0 {
+                continue;
+            }
             let mut wasm = vec![0u8; len];
             if k_mod_read(id, wasm.as_mut_ptr() as gex_kernel::PAddr, len as u32) as usize != len {
                 continue;
@@ -13920,6 +14534,10 @@ fn shared_module_at(
         }
         let len = k_mod_len(id) as usize;
         if len == 0 {
+            return None;
+        }
+        // Held before it is read, as above.
+        if k_mod_hold(id, crate::my_pid()) == 0 {
             return None;
         }
         let mut wasm = vec![0u8; len];
@@ -14219,9 +14837,9 @@ fn wait_ready(waiting: &Waiting, blocked_on: &Option<gex_kernel::BlockOp>, now: 
                     && unsafe { k_futex_gen(parked.addr()) } != *wake_gen)
                 || (unsafe { k_present() } == 0
                     && guest()
-                        .read_u32(parked.addr())
-                        .map(|w| w != *val)
-                        .unwrap_or(false))
+                        .word_mut(parked.addr())
+                        .and_then(|w| gex_atomic::load_u32(w, 0))
+                        .is_some_and(|w| w != *val))
         }
         Waiting::Sleep(d) => now >= *d,
         Waiting::Read(handle) => handle.poll_readable(),
@@ -14621,6 +15239,11 @@ fn wait_why(r: &Run) -> u8 {
 fn schedule() -> i32 {
     let r = schedule_turn();
     if r == 1 {
+        // A thread runs: a turn that paused this Worker and a later one
+        // that resumes it, with no `gex_wake` between (a blocking call's
+        // park and second ask), left it parked to its processor time, and
+        // the thread's CPU clock stood still.
+        set_paused_to(0);
         cgen::ftab_resume();
     } else {
         cgen::ftab_out(SCHED_OVER.with(|c| c.get()));
@@ -15024,6 +15647,7 @@ fn free_syscall(ctx: i32, pc: i64, mapped: &mut Vec<gex_kernel::CodeMap>, compat
         if unsafe { k_present() } != 0 {
             if let Some(home) = sigs::home() {
                 for addr in home.futexes.take_woken() {
+                    waitq::split_woke(addr);
                     unsafe { k_futex_wake(addr) };
                 }
             }
@@ -15067,6 +15691,7 @@ fn free_syscall(ctx: i32, pc: i64, mapped: &mut Vec<gex_kernel::CodeMap>, compat
         // `exit` from one of several threads: this thread is over;
         // the last one out of the thread table ends the process.
         FreeOutcome::ThreadExit => {
+            trace_line(&format!("[threads] {} {} exit", my_pid(), my_tid()));
             if let Some(run) = MY_RUN.with(|c| c.borrow().clone()) {
                 run.lock().unwrap_or_else(|e| e.into_inner()).waiting = Waiting::Exited;
             }
@@ -15106,13 +15731,12 @@ fn park_free(op: gex_kernel::BlockOp, restore_sigmask: Option<u64>, pc: u64) -> 
         // As the kernel's park: re-checked on the scheduler's way round,
         // woken by the descriptors' queues (`waitq::queues_of`).
         gex_kernel::BlockOp::Poll { deadline, .. } => Waiting::Net(deadline.map(|d| turn_now() + d.as_nanos() as u64)),
-        // A futex wait, as the kernel's park: the shared generation of the
-        // address sampled now, after the word was checked (a wake since
-        // bumps it, so the first look sees it), and the place the call took
-        // before it checked the word (a wake between the two is seen there).
-        gex_kernel::BlockOp::FutexWait { table, uaddr, deadline, parked, val } => Waiting::Futex {
+        // A futex wait, as the kernel's park: the shared generation and the
+        // queue place the call took before it checked the word (a wake
+        // between the check and the park is seen in one or the other).
+        gex_kernel::BlockOp::FutexWait { table, uaddr, deadline, parked, val, shared_gen } => Waiting::Futex {
             val: *val,
-            wake_gen: if unsafe { k_present() } != 0 { unsafe { k_futex_gen(*uaddr) } } else { 0 },
+            wake_gen: *shared_gen,
             parked: parked.clone().unwrap_or_else(|| table.park(*uaddr)),
             deadline: deadline.map(|d| turn_now() + d.as_nanos() as u64),
         },
@@ -15279,17 +15903,27 @@ fn killed(signal: i32, at: u64) -> i32 {
     // Who sent it, if the global kernel knows: "killed by signal 1"
     // is true of a hangup, a terminal's line discipline and any
     // guest's `kill`, and they are not the same bug.
+    // The last kill that reached this process (to it, its group, or
+    // everyone), not anybody's last: a process ended by one kill was named
+    // the next one, sent to another pid (wineserver ending a program, then
+    // its conhost).
     let mut sent = None;
+    let me = home.pid();
+    let pgid = home.procs().pgid(me, me).unwrap_or(0);
     let from = if unsafe { k_present() } != 0 {
-        let v = unsafe { k_last_kill() };
-        let caller = (v >> 40) as i32;
-        let target = ((v >> 8) & 0xffff_ffff) as i32;
-        let signo = (v & 0xff) as u32;
-        sent = Some((caller, target, signo));
-        format!(
-            " (signal #{}: {signo} from pid {caller} to {target})",
-            unsafe { k_last_kill_seq() }
-        )
+        let v = unsafe { k_last_kill_to(me, pgid) };
+        if v == 0 {
+            String::new()
+        } else {
+            let caller = (v >> 40) as i32;
+            let target = ((v >> 8) & 0xffff_ffff) as i32;
+            let signo = (v & 0xff) as u32;
+            sent = Some((caller, target, signo));
+            format!(
+                " (signal #{}: {signo} from pid {caller} to {target})",
+                unsafe { k_last_kill_to_seq(me, pgid) }
+            )
+        }
     } else {
         String::new()
     };
@@ -15299,7 +15933,7 @@ fn killed(signal: i32, at: u64) -> i32 {
     let pid = home.pid();
     if matches!(sent, Some((caller, target, signo))
         if signo == signal as u32 && matches!(signo, 2 | 9 | 15)
-            && caller != pid && (target == pid || target == -pid || target == 0))
+            && caller != pid && (target == pid || target == -pid || target == -pgid || target == -1 || target == 0))
     {
         trace_line(&format!("[gex] pid {pid} ended by signal {signal}{from}\n"));
     } else if signal == 13 {
@@ -16097,7 +16731,8 @@ pub extern "C" fn gex_after_trap(installed: u32, wasmdll_have: u32, flags: u32) 
         || FORK.with(|f| f.get()[0]) != 0
         || THREAD[0].load(std::sync::atomic::Ordering::Acquire) != 0
         || cgen::fault_staged()
-        || darwin::spawn_staged();
+        || darwin::spawn_staged()
+        || fjit::helper_due();
     if busy {
         return 0;
     }
@@ -16247,6 +16882,13 @@ mod fault_code {
 /// when the process has no hook.
 #[must_use]
 fn hook_fault(pc: u64, code: u32, addr: u64, resumable: bool) -> bool {
+    hook_fault_kind(pc, code, addr, 0, resumable)
+}
+
+/// [`hook_fault`] with an access violation's kind (Windows'
+/// ExceptionInformation[0]: 0 read, 1 write, 8 execute).
+#[must_use]
+fn hook_fault_kind(pc: u64, code: u32, addr: u64, kind: u32, resumable: bool) -> bool {
     if cgen::fault_hook() == 0 {
         return false;
     }
@@ -16254,10 +16896,10 @@ fn hook_fault(pc: u64, code: u32, addr: u64, resumable: bool) -> bool {
     let mut gm = guest();
     let c = my_ctx();
     let _ = gm.write_u64(c + ctx::PC as u64, pc);
-    if resumable && cgen::fault_in_place(c, code, addr, 0) {
+    if resumable && cgen::fault_in_place(c, code, addr, kind) {
         return true;
     }
-    cgen::fault_stage(code, addr, 0);
+    cgen::fault_stage(code, addr, kind);
     set_resume(pc);
     set_resume_ctx(c);
     trap();
@@ -16435,6 +17077,8 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
             hook_fault(pc, fault_code::INT_OVERFLOW, 0, resumable)
         } else if raw == i::BRK_GENERAL_PROTECTION {
             hook_fault(pc, fault_code::ACCESS_VIOLATION, 0xffff_ffff, resumable)
+        } else if raw == i::BRK_FETCH_FAULT {
+            hook_fault_kind(pc, fault_code::ACCESS_VIOLATION, gex_abi::fetch_fault_addr(pc), 8, resumable)
         } else if raw != i::BRK_TRAP_PC && raw != i::BRK_BAD_SP && raw != i::BRK_X87_EXCEPTION {
             hook_fault(pc + 1, fault_code::BREAKPOINT, pc, resumable)
         } else {
@@ -16501,6 +17145,12 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
             pc
         ));
         set_exit(128 + 8);
+        trap();
+    }
+    // An instruction running onto memory that is not executable: SIGSEGV
+    // at the first byte of it there, for the program's handler if it has one.
+    if raw == gex_abi::imports::BRK_FETCH_FAULT {
+        segv_at(pc as u64, gex_abi::fetch_fault_addr(pc as u64));
         trap();
     }
     // A general-protection fault (a privileged instruction in user mode):
@@ -16676,17 +17326,32 @@ pub extern "C" fn gex_sysreg_write(ctx: i32, pc: i64, reg: i32, val: i64) {
 
 thread_local! {
     /// The innermost open call-out of JavaScript's loops, as the stack
-    /// pointer past which its caller's frame is unwound and whether it was
-    /// made from code in the other mode (`gex_callout_guard`); 0 for none,
-    /// or one that wants no stack.
-    static CALLOUT_GUARD: std::cell::Cell<(u64, bool)> = const { std::cell::Cell::new((0, false)) };
+    /// pointer past which its caller's frame is unwound, whether it was
+    /// made from code in the other mode, and the top of the stack it was
+    /// made on (`gex_callout_guard`); a limit of 0 for none, or one that
+    /// wants no stack.
+    static CALLOUT_GUARD: std::cell::Cell<(u64, bool, u64)> = const { std::cell::Cell::new((0, false, u64::MAX)) };
 }
 
 /// JavaScript's innermost call-out (`gex.mjs` `#calloutGuard`): `limit` the
-/// stack pointer past which its caller is unwound, 0 for none.
+/// stack pointer past which its caller is unwound, 0 for none; `top` the
+/// top of its stack (`gex_callout_stack_top`), above which the stack is
+/// another fiber's.
 #[no_mangle]
-pub extern "C" fn gex_callout_guard(limit: i64, alt: i32) {
-    CALLOUT_GUARD.with(|g| g.set((limit as u64, alt != 0)));
+pub extern "C" fn gex_callout_guard(limit: i64, alt: i32, top: i64) {
+    CALLOUT_GUARD.with(|g| g.set((limit as u64, alt != 0, top as u64)));
+}
+
+/// The top of the stack a call-out made now in `alt` mode, its caller's
+/// frame at `sp_want`, is made on (`gex_kernel::x86::callout_stack_top`):
+/// -1 (no bound) for none known.
+#[no_mangle]
+pub extern "C" fn gex_callout_stack_top(ctx: i32, alt: i32, sp_want: i64) -> i64 {
+    if !gex_abi::X86 || sp_want == 0 {
+        return -1;
+    }
+    let class32 = gex_xlate::default_compat() != (alt != 0);
+    gex_kernel::x86::callout_stack_top(&guest(), ctx as u32 as u64, class32, sp_want as u64) as i64
 }
 
 /// Whether the stack of the thread at `ctx` has unwound past the caller of
@@ -16694,12 +17359,12 @@ pub extern "C" fn gex_callout_guard(limit: i64, alt: i32) {
 /// `NtCallbackReturn`'s): a change of mode then traps, and the call-out's
 /// loop leaves, as it did when every change of mode trapped.
 fn callout_unwound(ctx: i32) -> bool {
-    let (limit, alt) = CALLOUT_GUARD.with(|g| g.get());
+    let (limit, alt, top) = CALLOUT_GUARD.with(|g| g.get());
     if limit == 0 {
         return false;
     }
     let sp = gex_callout_live_sp(ctx, alt as i32);
-    sp != -1 && sp as u64 > limit
+    sp != -1 && sp as u64 > limit && sp as u64 <= top
 }
 
 thread_local! {
@@ -16919,6 +17584,33 @@ pub(crate) static DIRS_HEALED: std::sync::atomic::AtomicU64 = std::sync::atomic:
 /// which are not a bug.
 pub(crate) static DIRS_HEALED_EARLY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// `?jitdiag=1`: a block's guard found its bytes changed. Its first 32 bytes
+/// now, and whether they are the ones its last guard hit saw, at the 1st,
+/// 8th, 64th and 512th hit: bytes that are the same hit after hit were not
+/// rewritten since the last lift, and the translation, not the program, is
+/// what keeps disagreeing with them.
+fn guard_bytes_say(addr: u64, pc: u64) {
+    thread_local!(static SEEN: std::cell::RefCell<std::collections::HashMap<u64, (u32, Vec<u8>, u32)>> = Default::default());
+    let now = guest().read(addr, 32).map(|b| b.to_vec()).unwrap_or_default();
+    let said = SEEN.with(|m| {
+        let mut m = m.borrow_mut();
+        let e = m.entry(addr).or_insert((0, Vec::new(), 0));
+        e.0 += 1;
+        if e.1 == now {
+            e.2 += 1;
+        }
+        e.1 = now.clone();
+        matches!(e.0, 1 | 8 | 64 | 512).then(|| (e.0, e.2))
+    });
+    if let Some((n, same)) = said {
+        let hex: String = now.iter().map(|b| format!("{b:02x}")).collect();
+        warn_line(&format!(
+            "gex: pid {} guard hit {n} at {addr:#x} (block {pc:#x}): bytes now {hex}; {same} of the hits saw the bytes the one before did\n",
+            my_pid()
+        ));
+    }
+}
+
 /// For a block at `start` that failed its page check: its page and the next
 /// (an instruction across the boundary), wherever the page table numbers the
 /// page and the directory does not name that base, get the directory entry
@@ -16979,6 +17671,16 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
         let write = op == gex_abi::cache_op::PERM_WRITE;
         let pc = _pc as u64;
         darwin::fault_and_leave(_ctx as u32 as u64, pc, |k, gm| k.darwin_access_fault(gm, pc, addr as u64, write).0);
+    }
+    if op == gex_abi::cache_op::TEAR_LOAD || op == gex_abi::cache_op::TEAR_STORE {
+        warn_line(&format!(
+            "gex: pid {} tear: a plain misaligned 8-byte {} at {:#x} (block {:#x})\n",
+            my_pid(),
+            if op == gex_abi::cache_op::TEAR_LOAD { "load" } else { "store" },
+            addr as u64,
+            _pc as u64
+        ));
+        return;
     }
     if op == gex_abi::cache_op::SPLIT_LOCK {
         let gm = guest();
@@ -17233,6 +17935,48 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
         });
         return;
     }
+    if op == gex_abi::cache_op::GUARD_HIT {
+        // A block's self-modifying-code guard found its bytes changed: `pc`
+        // is the block, `addr` its module (dense base, id; as `PAGE_STALE`).
+        let start = _pc as u64;
+        let alt = thread_alt();
+        if jit_diag() {
+            guard_bytes_say(start, start);
+        }
+        // On a hot page, with dense numbering (a slot map word per block that
+        // every Worker reads), only this block: its translation again, into
+        // the slot. A Worker that has not instantiated the new module finds
+        // the miss stub at its index and catches up first (`dense::missing`);
+        // one that runs another block of the page meanwhile runs a block
+        // whose bytes did not change, or whose own guard sends it here.
+        // Otherwise (classic numbering, or a page not hot) the page, below.
+        if smc_hit(gex_abi::page_key(start, alt)) && dense::on() {
+            let again = with_jit_only(|j| {
+                // The slot already names a newer block than this module's
+                // (this copy was reached by a direct jump from a sibling of
+                // its own module, which keeps jumping to it): dispatch below
+                // goes there, or catches this Worker up to it.
+                let (base, _) = ((addr as u64 >> 32) as u32, addr as u64 & 0xffff_ffff);
+                let elsewhere = base != 0 && {
+                    let d = dense::index(start);
+                    d != 0 && j.module_dense.get(&base).is_some_and(|&n| d < base || d >= base + n)
+                };
+                if !elsewhere {
+                    let key = gex_abi::addr_key(start, alt);
+                    j.translated.remove(&key);
+                    j.provider.remove(&key);
+                }
+                !elsewhere
+            });
+            if again {
+                xlate_add(3, 1);
+                gex_dispatch_miss(_ctx, start as i64);
+            }
+            return;
+        }
+        gex_cache_op(_ctx, _pc, gex_abi::cache_op::IC_INVALIDATE, _pc);
+        return;
+    }
     if op == gex_abi::cache_op::IC_INVALIDATE {
         // Self-modifying / JIT-generated guest code (PCRE2's regex JIT does this)
         // wrote new machine code to a page it had already run, and is flushing
@@ -17257,6 +18001,9 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
             if !own && !alt {
                 return;
             }
+            // A hot-tier translation made meanwhile on a helper read the old
+            // bytes: it is not published (fjit.rs `publish_made`).
+            fjit::code_changed(page, page + 1);
             let home = if jit_diag() { sigs::home() } else { None };
             let mut gm = guest();
             for (k, gone) in [(page, own), (key, alt)] {
@@ -17359,10 +18106,16 @@ fn safepoint(ctx: i32, pc: i64) {
     // translated code, so back-edges are the only place to say where it is and
     // tell a long stretch of execution from a hang.
     let every = unsafe { HEARTBEAT };
+    // The hot tier (`?fjit=hot`) counts too: its roots are these samples
+    // (fjit.rs `hot_sample`). Not a thread in the process's other mode, whose
+    // code the function JIT does not take.
+    let hot = fjit::hot() && !thread_alt();
+    // How many times this pc has been sampled, for the hot tier.
+    let mut sampled = 0u64;
     // Counting is its own switch, not a side effect of the heartbeat: "say
     // where the guest is every N safepoints" (a stuck run) and "which back
     // edges are hot" (a slow one) are different questions.
-    if every != 0 || unsafe { HOT_ON } {
+    if every != 0 || unsafe { HOT_ON } || hot {
         static mut BEAT: u64 = 0;
         let beat = unsafe {
             BEAT = BEAT.wrapping_add(1);
@@ -17375,9 +18128,11 @@ fn safepoint(ctx: i32, pc: i64) {
             let slot = (pc as u64 as usize >> gex_abi::DISPATCH_SHIFT) % HOT_SLOTS;
             if HOT_PC[slot] == pc as u64 {
                 HOT_N[slot] += 1;
+                sampled = HOT_N[slot];
             } else if HOT_N[slot] == 0 {
                 HOT_PC[slot] = pc as u64;
                 HOT_N[slot] = 1;
+                sampled = 1;
             } else {
                 // Someone else's slot: age it rather than fight, so a hot
                 // address wins within a few thousand samples.
@@ -17508,6 +18263,16 @@ fn safepoint(ctx: i32, pc: i64) {
                 trap();
             }
         }
+    }
+    // The hot tier: this sample's pc made a root, or a function was published
+    // at it since, or the process's helper is to be started. The thread leaves
+    // as a catch-up miss does and goes on at `pc` through the run loop, which
+    // installs what the log holds (the bridge in `pc`'s slot among it).
+    if hot && fjit::hot_sample(pc as u64, sampled) {
+        let _ = guest().write_u64(ctx as u32 as u64 + ctx::PC as u64, pc as u64);
+        set_resume(pc as u64);
+        set_resume_ctx(my_ctx());
+        trap();
     }
     // Preemption is the engine's job now: there is no other thread here to hand
     // the stack to, since each is a Worker already running.
@@ -17794,6 +18559,13 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         stop_gone();
         trap();
     }
+    // gex's own memory for this process could not grow (a dispatch table's
+    // slot map, say), and the process can move to a 64-bit memory: it ends
+    // here, as a trap, and the Worker records it for its next start
+    // (`gex_outgrew`). Translating on would miss here for good.
+    if gex_outgrew() == 1 {
+        warch::unreachable();
+    }
     if gex_abi::X86 && pc == gex_kernel::x86::FAR_PAD {
         return far_switch(_ctx);
     }
@@ -17905,6 +18677,15 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // process's i386 images are placed as the other mode's (`cgen::place`).
     if cgen::wine32_miss(pc) {
         miss_way(pc, 8);
+        set_resume(pc);
+        set_resume_ctx(my_ctx());
+        trap();
+    }
+    // A native function's table index (guest code calling a function pointer
+    // native code handed it), served by its class's adapter, which has no
+    // bridge until now: this Worker catches up on it and goes on at pc.
+    if !alt && cgen::bridge_native(pc) {
+        miss_way(pc, 6);
         set_resume(pc);
         set_resume_ctx(my_ctx());
         trap();
@@ -18724,7 +19505,16 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // In the mode the thread runs in (a WoW64 thread's `ctx::CS`).
     let cs = if gex_abi::X86 { guest().read_u32(my_ctx() + ctx::CS as u64).unwrap_or(0) } else { 0 };
     let _mode = gex_xlate::cs_scope(cs);
-    let (mut unit, stats) = gex_xlate::translate_runtime(
+    // (or the block runs onto it: the block before a rewritten page fails
+    // its page check at each of the page's retires, and is lifted again)
+    let hot_page = gex_abi::page_key(pc, alt);
+    let hot = smc_hot(hot_page) || smc_hot(gex_abi::page_key(pc + gex_abi::DISPATCH_PAGE, alt));
+    let lift_t0 = if hot && jit_diag() { now_ns() } else { 0 };
+    // Hot: the block and its straight-line run on the page, in one module
+    // (`SMC_HOT_RUN`); else what discovery reaches.
+    let lift: fn(&[u8], u64, &(dyn Fn(u64) -> bool + Sync), &(dyn Fn(u64) -> bool + Sync), _, _, usize, bool, &_) -> _ =
+        if hot { gex_xlate::translate_runtime_run } else { gex_xlate::translate_runtime };
+    let (mut unit, stats) = lift(
             // SAFETY: the translator takes the whole memory (`guest_whole`).
             unsafe { guest_whole() },
             pc,
@@ -18734,7 +19524,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             Default::default(),
             // A cap keeps one miss from translating a whole library at once;
             // the next miss picks up where this stopped.
-            LIFT_MAX.load(std::sync::atomic::Ordering::Relaxed),
+            if hot { SMC_HOT_RUN } else { LIFT_MAX.load(std::sync::atomic::Ordering::Relaxed) },
             // Must match the memory this shim was built against: a module the
             // translator emits is instantiated against the same memory, and an
             // import that disagrees about sharing does not link.
@@ -18744,6 +19534,9 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // The translator is the shim's deepest caller: recursive over the
         // control-flow graph of up to `LIFT_MAX` blocks.
         stack_tripwire("the end of a translation");
+        if lift_t0 != 0 {
+            smc_lifted(hot_page, now_ns().saturating_sub(lift_t0), stats.blocks as u64);
+        }
         note_kuser_folds(pc);
         if pwatched(gex_abi::dispatch_page(pc)) {
             let pg = gex_abi::dispatch_page(pc);
@@ -18864,15 +19657,17 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // How many of this unit's pages could be named: `noident` counts only
         // the miss path, so a page identifiable at fault but not at store time
         // is invisible, and the store happens here.
+        // Counted only for the message: a lookup per covered page on every
+        // store otherwise.
         {
-            let total = unit.covered.len();
-            let named = unit
-                .covered
-                .iter()
-                .filter(|(pg, _)| key_identity(px, *pg).is_some())
-                .count();
             static NTH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if tracing() && NTH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                let total = unit.covered.len();
+                let named = unit
+                    .covered
+                    .iter()
+                    .filter(|(pg, _)| key_identity(px, *pg).is_some())
+                    .count();
                 warn_line(&format!(
                     "[gex] storing a unit: {named} of {total} pages can be named\n"
                 ));
@@ -19083,9 +19878,15 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
 /// The whole process: a status set for this thread alone left the others
 /// running and its parent waiting.
 fn branch_fault(pc: u64) {
+    segv_at(pc, pc)
+}
+
+/// SIGSEGV at `pc` for an access at `addr`: the program's handler, or the
+/// process ends.
+fn segv_at(pc: u64, addr: u64) {
     let c = my_ctx();
     let mut gm = guest();
-    match sigs::fault(&mut gm, c, 11, pc, pc) {
+    match sigs::fault(&mut gm, c, 11, pc, addr) {
         gex_kernel::signal::Delivery::Resume(target) => {
             if let Some(run) = MY_RUN.with(|r| r.borrow().clone()) {
                 run.lock().unwrap_or_else(|e| e.into_inner()).pc = target;
@@ -19184,7 +19985,28 @@ fn kuser_unfolded(arg: i64, resumable: bool) {
 /// [`gex_guest_trap`] with `SIGSEGV`.
 #[no_mangle]
 pub extern "C" fn gex_guest_oob(ctx_addr: u32) -> u32 {
+    stale_bound_note();
     gex_guest_trap(ctx_addr, 11)
+}
+
+/// An access out of bounds in a Worker that has not taken the memory's
+/// length since another Worker grew it ([`GROW_GEN`]): very likely the
+/// engine's stale bound on memory that is there, not the guest's fault.
+/// The engine gives no address, so it is said as likely (the first few),
+/// and the fault goes on as the guest's.
+fn stale_bound_note() {
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let g = GROW_GEN.load(std::sync::atomic::Ordering::SeqCst);
+    let seen = GROW_SEEN.with(|c| c.get());
+    if g == seen || SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 4 {
+        return;
+    }
+    warn_line(&format!(
+        "[gex] pid {}: an access out of bounds in a Worker {} grows behind the memory's length; likely the engine's stale bound on a shared memory, not the program's fault (memory {} MiB)\n",
+        my_pid(),
+        g.wrapping_sub(seen),
+        warch::memory_size(0) as u64 * 65536 >> 20,
+    ));
 }
 
 /// A trap in guest code the run loop caught (gex.mjs `guestTrapSignal`), as
@@ -19296,6 +20118,17 @@ pub extern "C" fn gex_guest_trap(ctx_addr: u32, signo: u32) -> u32 {
 pub extern "C" fn gex_native_oob() -> u32 {
     let own = IN_SYSCALL.with(|c| c.get()) || jit_holds() || jitout::OUT.load(std::sync::atomic::Ordering::Acquire) == jit_me();
     (!own) as u32
+}
+
+/// Whether a trap on this thread now is in the program's own code: not in a
+/// syscall, translating, or after the shim's own panic. For the run loop's
+/// word on an `unreachable` that [`gex_guest_trap`] did not take (a Windows
+/// program's: its fault hook takes access violations only): the program
+/// aborted (a Rust panic under panic=abort, `abort()`, `__builtin_trap`),
+/// its crash, not gex's (gex.mjs).
+#[no_mangle]
+pub extern "C" fn gex_trap_in_program() -> u32 {
+    (gex_native_oob() == 1 && !PANICKED.with(|p| p.get())) as u32
 }
 
 /// The PE images Wine mapped in this process (`gex_image_mapped`): base,
@@ -20935,6 +21768,53 @@ pub extern "C" fn gex_slots_per_table() -> u32 {
     gex_xlate::PageTable::SLOTS_PER_TABLE as u32
 }
 
+/// The guest's accessible mappings, in MiB (its VmRSS): what its share of
+/// the memory is, in a wasm32 memory and a memory64 alike (where its mappings
+/// take no arena, so [`gex_arena_spent_mib`]'s maps stay 0). A memory's size
+/// is not it: a memory64 is 8 GiB from its first instruction, almost none of
+/// it touched.
+#[no_mangle]
+pub extern "C" fn gex_guest_mapped_mib() -> u32 {
+    (crate::sigs::proc_home().mm().lock().vm_counters().1 >> 20) as u32
+}
+
+/// The spans of this process's memory anything was handed (the guest's
+/// accessible mappings and gex's own regions, merged, in order), for a pass
+/// over them that counts what is resident (the exit line's, worker.mjs's
+/// `touchedMib`): a memory64 is 8 GiB, nearly none of it ever mapped. Taken
+/// by `gex_resident_spans` (how many; 0: the map cannot say, walk all) and
+/// read back by `gex_resident_span`.
+static RESIDENT_SPANS: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
+
+#[no_mangle]
+pub extern "C" fn gex_resident_spans() -> u32 {
+    let Some(mut v) = memmap::runtime_regions() else { return 0 };
+    for m in crate::sigs::proc_home().mm().lock().vmas() {
+        if m.prot != 0 {
+            v.push((m.start, m.end));
+        }
+    }
+    v.sort_unstable();
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(v.len());
+    for (a, b) in v {
+        match out.last_mut() {
+            Some(l) if a <= l.1 => l.1 = l.1.max(b),
+            _ => out.push((a, b)),
+        }
+    }
+    let n = out.len() as u32;
+    *RESIDENT_SPANS.lock().unwrap_or_else(|e| e.into_inner()) = out;
+    n
+}
+
+/// Span `i`'s start (`end` 0) or end (`end` 1) of the last
+/// `gex_resident_spans`; 0 past them.
+#[no_mangle]
+pub extern "C" fn gex_resident_span(i: u32, end: u32) -> u64 {
+    let s = RESIDENT_SPANS.lock().unwrap_or_else(|e| e.into_inner());
+    s.get(i as usize).map_or(0, |&(a, b)| if end != 0 { b } else { a })
+}
+
 /// What this process's address space went on, in MiB: 0 guest mappings, 1 the
 /// runtime's own heap, 2 Worker stacks.
 ///
@@ -21197,6 +22077,29 @@ pub extern "C" fn gex_dump_state() {
     })();
 }
 
+/// One more line for the crash of this Worker's process, which the Worker
+/// is about to abandon ([`gex_abandon`]): what failed, when the host knows
+/// (the global kernel's panic). `len` bytes of UTF-8 at `at`.
+#[no_mangle]
+pub extern "C" fn gex_crash_line(at: u32, len: u32) {
+    let Some(home) = sigs::home() else { return };
+    // SAFETY: the host wrote `len` bytes at `at`, in this module's memory.
+    let b = unsafe { core::slice::from_raw_parts(at as usize as *const u8, len as usize) };
+    home.procs().add_crash_line(home.pid(), &String::from_utf8_lossy(b));
+}
+
+/// This Worker's process crashed in the runtime (a trap in the shim or the
+/// global kernel, not a guest exit): its crash, said before anything else
+/// of its end, so that it is reported however the process ends -- by
+/// [`gex_abandon`], or by a sibling task's kill or exit that claimed or
+/// published the end at the same moment (the table reports a crash said
+/// after the end then: `ProcTable::set_crash`).
+#[no_mangle]
+pub extern "C" fn gex_trap_crash() {
+    let Some(home) = sigs::home() else { return };
+    home.procs().set_crash_unless_said(home.pid(), b"\0gex could not run it on");
+}
+
 /// Publish an exit for a process whose Worker is stopping without one.
 ///
 /// A process that stops existing must become collectable, however it stopped.
@@ -21219,10 +22122,10 @@ pub extern "C" fn gex_abandon(code: i32) {
     // No kernel lock: the end is claimed as `exit_process` claims it, and a
     // process already ending (or with a status) is left to that.
     let Some(home) = sigs::home() else { return };
+    let pid = home.pid();
     if home.exit().status().is_some() || !home.exit().claim() {
         return;
     }
-    let pid = home.pid();
     trace_line(&format!("[proc] abandon {pid}: the Worker stopped without an exit\n"));
     // A Darwin process's task ends with it, as a killed one's, where its
     // kernel's state allows (darwin.rs `abandoned`).
@@ -21309,7 +22212,7 @@ fn outgrow_end(pid: i32, status: i32) {
 /// its next start (`outgrow_ending`, which [`outgrow_end`] calls next).
 fn runtime_outgrow(pid: i32) -> bool {
     let len = RUNTIME_SHORT.swap(0, std::sync::atomic::Ordering::Relaxed);
-    if len == 0 || !gex_kernel::syscalls::note_runtime_short(pid, len, WASM32.load(std::sync::atomic::Ordering::Acquire)) {
+    if len == 0 || !gex_kernel::syscalls::note_runtime_short(pid, len, guest32()) {
         return false;
     }
     if let Some(home) = sigs::home() {
@@ -21326,7 +22229,7 @@ fn runtime_outgrow(pid: i32) -> bool {
 #[no_mangle]
 pub extern "C" fn gex_outgrew() -> i32 {
     (RUNTIME_SHORT.load(std::sync::atomic::Ordering::Relaxed) != 0
-        && gex_kernel::syscalls::outgrow_armed(my_pid(), WASM32.load(std::sync::atomic::Ordering::Acquire))) as i32
+        && gex_kernel::syscalls::outgrow_armed(my_pid(), guest32())) as i32
 }
 
 /// Record a guest exit, and say so where a trap handler can see it.
@@ -21907,6 +22810,32 @@ pub extern "C" fn gex_set_coherent_loads(on: i32) {
     if on != 0 {
         crate::cgen::set_tso();
     }
+}
+
+/// Debug (`?tso=2`): the coherent flavour plus misaligned accesses made
+/// whole and vector stores, copies and fills fenced (gex_emit::tier1
+/// `TSO2`). Default off.
+#[no_mangle]
+pub extern "C" fn gex_set_tso2(on: i32) {
+    gex_xlate::set_tso2(on != 0);
+    if on != 0 {
+        crate::cgen::set_tso();
+    }
+}
+
+/// Debug (`?tear=`, GEX_TEAR): 1 counts the guest's plain misaligned 8-byte
+/// loads and stores, 2 also does each as two 4-byte halves (gex_emit::tier1
+/// `TEAR`). Default 0, nothing emitted.
+#[no_mangle]
+pub extern "C" fn gex_set_tear(mode: i32) {
+    gex_xlate::set_tear(mode.clamp(0, 2) as u8);
+}
+
+/// The tear switch's count of this process's plain misaligned 8-byte loads
+/// (`which` 0) or stores (1), from `gex_abi::TEAR_COUNTS`.
+#[no_mangle]
+pub extern "C" fn gex_tear_count(which: u32) -> i64 {
+    guest().read_u64(gex_abi::TEAR_COUNTS + 8 * (which.min(1) as u64)).unwrap_or(0) as i64
 }
 
 /// Diagnostic: at each safepoint, check the running thread's SP against the

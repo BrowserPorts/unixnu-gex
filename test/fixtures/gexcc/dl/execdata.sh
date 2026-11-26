@@ -13,14 +13,14 @@
 # runtime (run-node).
 #
 #   test/fixtures/gexcc/dl/execdata.sh DIR   (gexcc on PATH; GEX_ROOT: a gex checkout
-#                                  with page/public/gex built; DIR: where gex
+#                                  with runtime/files/out/gex built; DIR: where gex
 #                                  can see, not /dev/shm)
 set -u
 command -v gexcc > /dev/null || { echo "gexcc not on PATH (toolchain/gexcc/install.sh)"; exit 2; }
 ROOT=${GEX_ROOT:?set GEX_ROOT to a gex checkout}
 ARCH=${GEX_ARCH:-x86}
 case $ARCH in x86) INFIX=.x86 ;; *) INFIX= ;; esac
-SEED=$ROOT/page/public/gex/seed$INFIX.shared.wasm
+SEED=$ROOT/runtime/files/out/gex/seed$INFIX.shared.wasm
 [ -f "$SEED" ] || { echo "no $SEED"; exit 2; }
 W=$(mktemp -d "${1:?DIR}/execdata.XXXXXX")
 trap 'rm -rf "$W"' EXIT

@@ -6,9 +6,9 @@
 // stays above it, and a press over the bare desktop reaches the desktop's
 // client (test/lib/desktop-layer.mjs). The element layout's is
 // desktop-layer-single.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
-import { CompositorWindows } from '../../page/runtime/src/windows/compositor.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
+import { CompositorWindows } from '../../runtime/src/windows/compositor.js';
 import { desktopLayer } from '../lib/desktop-layer.mjs';
 
 export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 180, html: `<style>html, body { margin: 0; }</style>

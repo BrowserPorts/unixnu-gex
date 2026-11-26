@@ -7,8 +7,8 @@
 // So the second takes later identifiers than the first, and its counter
 // runs from the same origin: at least the half second between them past
 // the first's. Each run's output and status match gexc's.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
 
 export const meta = { hosts: ['browser'], arches: ['a64'], images: ['darwin-static'], timeout: 300 };
 

@@ -110,7 +110,7 @@ pub fn on() -> bool {
 
 /// Whether directory table `k` may be dense.
 pub fn table(k: usize) -> bool {
-    on() && k >= FIRST_TABLE
+    on() && (FIRST_TABLE..gex_abi::DISPATCH_TABLES).contains(&k)
 }
 
 /// A module's dense elements, as [`SECTION`] holds them.
@@ -473,6 +473,16 @@ pub fn bridge_words(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_table_past_the_last_is_dense() {
+        let was = on();
+        set(true);
+        assert!(!table(FIRST_TABLE - 1));
+        assert!(table(FIRST_TABLE) && table(gex_abi::DISPATCH_TABLES - 1));
+        assert!(!table(gex_abi::DISPATCH_TABLES));
+        set(was);
+    }
 
     #[test]
     fn locate_finds_the_dense_segment_past_an_offset_of_0x0b() {

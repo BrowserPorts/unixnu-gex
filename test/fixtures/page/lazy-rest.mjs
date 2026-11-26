@@ -171,7 +171,7 @@ if (isMainThread) {
     owner.on('error', (e) => { console.log(`FAIL owner: ${e?.message ?? e}`); process.exit(1); });
     owner.postMessage({
       ctl, memory, cache: 'test', versions: {},
-      zstd: new URL(gexUrl('page/vendor/zstddec/zstddec-stream.mjs')).href,
+      zstd: new URL(gexUrl('runtime/vendor/zstddec/zstddec-stream.mjs')).href,
     });
     await new Promise((r) => owner.once('message', r));
     const readers = (n, from, len, url = URL_BIN + '#0') => Promise.all(Array.from({ length: n }, (_, i) => new Promise((resolve, reject) => {
@@ -213,7 +213,7 @@ if (isMainThread) {
     return new Response(r.body, { status: r.status });
   };
   globalThis.self = { postMessage: (m) => parentPort.postMessage(m) };
-  await import(gexUrl('page/src/lazy-cache-worker.js'));
+  await import(gexUrl('runtime/src/host/lazy-cache-worker.js'));
   parentPort.once('message', (data) => self.onmessage({ data }));
 } else {
   const { setLazyCache, cachedRead } = await import(gexUrl('hosts/browser/js/lazy-cache.mjs'));

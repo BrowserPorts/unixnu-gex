@@ -1,7 +1,7 @@
 # gex's tests
 
 One runner for every test, on two hosts: a headless Chromium page (`browser`)
-and a Node process (`node`), both through the runtime API (page/runtime).
+and a Node process (`node`), both through the runtime API (runtime).
 
 ```sh
 make test                                  # the same as node test/run.mjs, gexc built first
@@ -21,12 +21,12 @@ node test/run.mjs --list                   # the jobs, without running them
 | `--allow-skip` | A skipped test does not fail the run. |
 | `--verbose` | Every check line, the guest's console and Chromium's. |
 | `--work DIR` | The work directory (default a fresh temporary one, deleted after). Its images are kept and reused while their inputs are unchanged. |
-| `--port N` | vite's port (default 5411); Chromium's debugging port is N+1. |
+| `--port N` | The test server's port (default 5411); Chromium's debugging port is N+1. |
 | `--gpu` | Chromium on the machine's GPU (Vulkan), not SwiftShader. |
 | `--timed` | Only the tests whose `meta.timed` is true, which no other run includes; refused outside bench.sh (GBENCH_RUN), and implies `--gpu`. |
 | `--prebuilt` | Use the images already in `--work` as they are, building none (a bench host, with a work directory synced from where the images were built). An image whose files are not there is missing, and its tests skip (a FAIL without `--allow-skip`). |
 | `--prepare` | Make the images the chosen tests need in `--work`, run no test: the half of a `--prebuilt` run done where the images can be built. Exit 1 when one could not be made. |
-| `--package DIR` | The runtime as `page/runtime/build.sh DIR` built it, the npm package, not from source: the tests' imports of its entry modules go to DIR's, and `t.baseUrl` is none (the package's own files). Browser host only: the package's Workers are bundled for a page. Also GEX_TEST_PACKAGE. |
+| `--package DIR` | The runtime as `runtime/build.sh DIR` built it (`--single`: `build.sh --single DIR`), the npm package, which the browser host runs and needs (the node host runs the sources): the tests' imports of its entry modules go to DIR's, and `t.baseUrl` is none (the package's own files). Also GEX_TEST_PACKAGE. |
 | `--artefacts DIR` | Where screenshots go (default `artefacts/` in the work directory): `t.screenshot`'s, and `fail.png` of every browser test that fails, in `DIR/GROUP-NAME-ARCH/`. |
 
 Env: `BUSYBOX` (a wasm32 busybox, for the `busybox` image and page/wasm32-page's shell leg), `GEXCC` (gexcc,
@@ -38,8 +38,13 @@ once, default 4), `GEX_TEST_SLIM` (a directory with a Debian image,
 /usr/bin/chromium), `GEX_TEST_WINE64_DIST` and `GEX_TEST_WINE64_PREFIX` (the `wine64` image), `GEX_TEST_WOW64_DIST`, `GEX_TEST_WOW64_PREFIX` and `GEX_TEST_WOW64_MONO` (the `wow64` group: Native tests), `GEX_TEST_WOW64_BUILD32` and `GEX_TEST_WOW64_SYSROOT32` (`wow64/ptval32`: wine/dist.sh's WINE64_BUILD32 and WINE64_SYSROOT32), `GEX_TEST_GEXCC_WIN`, `GEX_TEST_WINE64_TOOLS`, `GEX_TEST_WINE64_SRC` and `GEX_TEST_WINE64_BUILD` (the `wine64` group: Native tests), `GEX_TEST_WINE64_NATIVE`, `GEX_TEST_WINE64_M64_DIST` and `GEX_TEST_WINE64_M64_PREFIX` (the `wine64-page` group), `GEX_TEST_WINE32_DIST` and `GEX_TEST_WINE32_PREFIX` (32-bit Wine and its prefix: `wine64-page/fault-nest`'s 32-bit cases), `GEX_TEST_GEXC` (the `wine64-units` image), `GEXC_X86` and `GEXC_A64` (the gexc a test's native leg runs, by arch; default `GEXC`, then target/x86/release and target/release; the `darwin-static` image's runs too), `GEX_DARWIN_BOOT` (the `darwin-static` image: a Darwin device's boot payload, as tests/darwin/run.sh takes it), `A64_ROOTFS` (an arm64 Debian root, .tar.zst, for glibc programs on a64), `GEX_WASM_SYSROOT` (page/dense-exec, native/wasm32, page/wasm32-page), `GEX_WASM64_SYSROOT` (native/wasm64, page/wasm64-page), `GEX_TEST_SQLITE_LIB` (gexcc/locks-wal: the wasm32 tree's libsqlite3.so.0 directory), `GEX_TEST_SNAP_SYSROOT` (the `snapshot` group: a snapshot-flavour sysroot), `GEX_TEST_WINE64_SERVER` (snapshot/snapshot's wineserver: wine/dist.sh's WINE64_SERVER, with GEX_TEST_WINE64_DIST), `GEX_TEST_SNAP_WINE64_DIST`, `_PREFIX` and `_NATIVE` (snapshot/snapshot's 64-bit Wine legs: an install built against the wasm64 snapshot sysroot), `GEX_TEST_NODE_ROOT` and `GEX_TEST_NODE_SH` (gexcc/node-child: a Debian arm64 tree with node, and its dash), `GEX_TEST_MESA_BUILD` (the `mesa-cold` image and the `mesa` group's replay: a directory with ports/mesa/build.sh's mesa-mt and mesa-st, default target/web-build; the replay needs mesa-mt's gex-mesa-replay.js, which a page-only build leaves out), `GEX_QEMU` (the `qemu` group's oracle, a qemu-aarch64: default ~/toolchains/qemu-aarch64, then PATH; its work directory must be on disk, as a guest's /dev/shm is its own), `GEX_TEST_NATIVE_LIBS_ROOT` and `GEX_TEST_NATIVE_LIBS_SH` (the `libs` group's native-libs: a Debian arm64 root with libz, libzstd, libsqlite3 and sqlite3, and a wasm32 sh; with toolchain/native-libs' own ZLIB_SRC, ZSTD_SRC, SQLITE_SRC, GEXCC_PREFIX and A64_SYSROOT or MUSL_SRC), `GEX_TEST_WORK`, `GEX_TEST_PORT` and `GEX_TEST_ARTEFACTS` (the
 defaults of `--work`, `--port` and `--artefacts`).
 
-The browser host is vite on page/ (cross-origin isolated, the runtime from
-source) and one headless Chromium on WebGPU. Each test gets a page in a
+The browser host is a static server and one headless Chromium on WebGPU. The
+server (cross-origin isolated, unless `--single`) gives the package at /pkg/,
+the tree's files as they are at /tree/ (the tests and the helpers they import;
+an import of one of the runtime's entry modules is sent to the package's) and
+the work directory at /__t/work/, and runtime/files/out at the root (the files of
+the internals a test imports from the tree). No bundler: a test page's import map gives
+Node's built-in modules as stubs that throw. Each test gets a page in a
 browser context of its own. The node host forks a Node process per test (and
 per phase).
 
@@ -76,8 +81,8 @@ unless `--allow-skip` is given.
 `test/GROUP/NAME.test.js`, a module with no HTML:
 
 ```js
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
 
 export const meta = { hosts: ['browser', 'node'], images: ['busybox'], timeout: 120 };
 
@@ -174,16 +179,14 @@ install's (the compact space; the native modules' host-data views),
 `units` with function-tier units built from a first run, and `mem64` the
 memory64 flavour (GEX_TEST_WINE64_M64_DIST and _PREFIX, wine/dist.sh with
 WINE64_MEM64=1). wine64/cases.mjs holds the cases both groups share.
-`site/eject-page-files` builds an ejected page and checks it carries the
-page's runtime and X server.
 
 ## Images
 
 fixtures/images.mjs:
 
-- `busybox`: `bb.tar.zst`. This is BUSYBOX and its applets, the probe programs (fixtures/probe/*.c, built with gexcc), and an `/etc/xattr` with an extended attribute. It also holds `lazy.bin` and `lazy-program.bin`, a lazy file's bytes (core/dir-times's and core/runprogram's), and `rt-side.so`, the side module core/dlopen-static's static program loads.
+- `busybox`: `bb.tar.zst`. This is BUSYBOX and its applets, the probe programs (fixtures/probe/*.c, built with gexcc), and an `/etc/xattr` with an extended attribute. It also holds `lazy.bin`, `lazy-program.bin` and `lazy-plain.bin` and `lazy-plain2.bin`, lazy files' bytes (core/dir-times's, core/spawn-layers' and core/lazy-plain's), and `rt-side.so`, the side module core/dlopen-static's static program loads.
 - `slim`: GEX_TEST_SLIM's image and repository, with `slim-repo.json` listing the repository.
-- `package`: `pkg/`, the runtime package (page/runtime/build.sh).
+- `package`: `pkg/`, the runtime package (runtime/build.sh).
 - `wine64`: `wine64.tar` and `wine64-lazy.json`. They hold 64-bit Wine's install (GEX_TEST_WINE64_DIST, wine64-dist.sh's WINE64_DIST) at /wine64 and a page prefix made from GEX_TEST_WINE64_PREFIX (wine/page-prefix.sh) at /pfx. Files over 64 KiB are lazy, served from `wine64/` in the work directory (fixtures/wine/pack.py). A link in the install that points out of it (a dist made of links into another) is packed as what it points at.
 - `win-progs`: `win-progs.tar`, the Windows test programs in fixtures/wine/src built with MinGW or clang (a source's `gex-nt-cc:` line) into `x64/` and `x86/`, or into one of them (`gex-nt-arch:`), with the libraries a `gex-nt-libs:` line names, as a DLL with `gex-nt-shared`. `win-progs.json` says which did not build, and why.
 - `wine64-units`: `wine64-units/`, function-tier units (a unit cache) for the test programs in fixtures/wine/units.mjs and Wine's core DLLs, at the bases a run of each program names (fixtures/wine/unit-bases.mjs), and the NT trampolines. Built with GEX_TEST_GEXC (default target/x86's gexc) in a few minutes.

@@ -80,6 +80,10 @@ mod stub {
         0
     }
 
+    pub(crate) fn wine64_compact_big_data() -> Option<(u64, u64)> {
+        None
+    }
+
     pub(crate) fn wine32_kuser() {}
 
     pub(crate) fn wine64_compact_on() -> bool {
@@ -265,6 +269,15 @@ mod imp {
     /// The end of 64-bit Wine's compact island, a 64 KiB guard above the window.
     const WINE64_COMPACT_ISLAND_END: u64 = WINE64_COMPACT_PE_DATA.1 + 0x1_0000;
     const _: () = assert!(WINE64_COMPACT_ISLAND_END < DLL_BAND_END && WINE64_COMPACT_IMAGES.0 > DLL_BAND);
+
+    /// 64-bit Wine's compact space: where a PE32+ module's data goes when
+    /// the window cannot hold it (Firefox's xul.dll, 46 MB): the band above
+    /// the island, a game's own DLLs' (pinned there, which no compact-space
+    /// process loads), top-down. Within 4 GiB above every image, and under
+    /// `gex_abi::KUSER_GUARD` as the window is.
+    pub(crate) fn wine64_compact_big_data() -> Option<(u64, u64)> {
+        wine64_compact_on().then_some((WINE64_COMPACT_ISLAND_END, DLL_BAND_END))
+    }
 
     /// This process's island: [`WINE32_ISLAND`], or the shorter one of
     /// 64-bit Wine's compact space.

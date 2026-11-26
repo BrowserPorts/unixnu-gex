@@ -595,6 +595,18 @@ fn forget(key: u64) {
     }
 }
 
+/// The most blocks a file holds: its block list is 4 bytes a block, so at
+/// most 64 MiB of the kernel's memory (with a page's 64 KiB blocks, a
+/// 1 TiB file).
+const MAX_BLOCKS: usize = 1 << 24;
+
+/// Block `b`'s place in a block list; one past any list when `b` does not
+/// fit a `usize` (the kernel is wasm32: a cast would wrap onto block
+/// `b mod 2^32`).
+fn slot(b: u64) -> usize {
+    usize::try_from(b).unwrap_or(usize::MAX)
+}
+
 /// A file's contents: its size and where each of its blocks is (0 a hole).
 #[derive(Debug)]
 pub struct PFile {
@@ -630,7 +642,7 @@ impl PFile {
             let from = (at % bs) as usize;
             let n = ((end - at) as usize).min(bs as usize - from);
             let o = (at - offset) as usize;
-            if self.map.get(b as usize).copied().unwrap_or(0) == 0 {
+            if self.map.get(slot(b)).copied().unwrap_or(0) == 0 {
                 buf[o..o + n].fill(0);
             } else {
                 if direct && from == 0 {
@@ -665,7 +677,7 @@ impl PFile {
         let first = self.loc(b).off;
         let mut k = 0;
         while k < max {
-            if self.map.get((b + k) as usize).copied().unwrap_or(0) == 0 {
+            if self.map.get(slot(b + k)).copied().unwrap_or(0) == 0 {
                 break;
             }
             let l = self.loc(b + k);
@@ -685,13 +697,16 @@ impl PFile {
     /// the cache, which keeps them until the store takes them).
     fn write_direct(&mut self, b: u64, max: u64, data: &[u8]) -> Result<u64, Errno> {
         let bs = block();
+        // each of these blocks is written whole by this write, here or
+        // through the cache: a shared one needs a place, not its bytes
+        self.own(b, true)?;
         self.alloc(b)?;
         let first = self.loc(b).off;
         let mut k = 1;
         while k < max {
             // Out of room part way: the run so far, and the rest through
             // the cache (which says so).
-            if self.alloc(b + k).is_err() || self.loc(b + k).off != first + k * bs {
+            if self.own(b + k, true).is_err() || self.alloc(b + k).is_err() || self.loc(b + k).off != first + k * bs {
                 break;
             }
             k += 1;
@@ -720,7 +735,7 @@ impl PFile {
         let mut n = 1;
         while n < self.ahead {
             let k = b + n;
-            if self.map.get(k as usize).copied().unwrap_or(0) == 0 {
+            if self.map.get(slot(k)).copied().unwrap_or(0) == 0 {
                 break;
             }
             let l = self.loc(k);
@@ -745,8 +760,17 @@ impl PFile {
 
     /// Block `b` given a place, when it has none.
     fn alloc(&mut self, b: u64) -> Result<bool, Errno> {
-        if self.map.len() <= b as usize {
-            self.map.resize(b as usize + 1, 0);
+        // The block list is dense, so a block far past the end costs a list
+        // that long: past MAX_BLOCKS the file is too big (EFBIG, as a file
+        // past the file system's limit), and a list the kernel's memory
+        // cannot hold is ENOSPC. Never a panic: the offset is the program's.
+        let i = slot(b);
+        if i >= MAX_BLOCKS {
+            return Err(Errno::EFBIG);
+        }
+        if self.map.len() <= i {
+            self.map.try_reserve(i + 1 - self.map.len()).map_err(|_| Errno::ENOSPC)?;
+            self.map.resize(i + 1, 0);
         }
         if self.map[b as usize] != 0 {
             return Ok(false);
@@ -781,9 +805,10 @@ impl PFile {
                 }
                 direct = false;
             }
-            let fresh = self.alloc(b)?;
             // A block wholly rewritten, or one with nothing yet, is not read.
             let whole = from == 0 && n == bs as usize;
+            self.own(b, whole)?;
+            let fresh = self.alloc(b)?;
             let fill = if fresh || whole { Fill::Zero } else { Fill::Load };
             let loc = self.loc(b);
             let touch = self.last != b;
@@ -808,6 +833,7 @@ impl PFile {
             self.map.truncate(keep);
             // The last block's tail reads as zeros if the file grows again.
             if len % bs != 0 && self.map.get(keep - 1).copied().unwrap_or(0) != 0 {
+                self.own(keep as u64 - 1, false)?;
                 let from = (len % bs) as usize;
                 let loc = self.loc(keep as u64 - 1);
                 with_block(loc, Fill::Load, false, |d, dirty| {
@@ -845,12 +871,59 @@ impl PFile {
         if self.map[b] == 0 {
             return;
         }
+        // another file's too: it keeps it, held here or not
+        if drop_ref(self.map[b] - 1) {
+            self.map[b] = 0;
+            return;
+        }
         bump(FREED, 1);
         let loc = self.loc(b as u64);
         forget(loc.key);
         forget_sum(loc.off);
         free(self.map[b] - 1);
         self.map[b] = 0;
+    }
+
+    /// A copy of this file that shares its blocks until either writes one
+    /// (the block it writes then its own: [`PFile::own`]): a file system's
+    /// clone of a whole file (`copy_file_range`), no block read or written.
+    pub fn share(&self) -> PFile {
+        for &p in &self.map {
+            if p != 0 {
+                add_ref(p - 1);
+            }
+        }
+        PFile { size: self.size, map: self.map.clone(), last: u64::MAX, ahead: 0 }
+    }
+
+    /// Block `b` this file's alone before a write to it: when another file
+    /// shares it, a place of its own, with the shared block's bytes unless
+    /// the write is of all of it (`whole`).
+    fn own(&mut self, b: u64, whole: bool) -> Result<(), Errno> {
+        let Some(&p) = self.map.get(slot(b)) else { return Ok(()) };
+        if p == 0 || !is_shared(p - 1) {
+            return Ok(());
+        }
+        let old = self.loc(b);
+        let mut bytes = Vec::new();
+        if !whole {
+            bytes = vec![0u8; block() as usize];
+            with_block(old, Fill::Load, false, |d, _| bytes.copy_from_slice(d))?;
+        }
+        self.map[b as usize] = 0;
+        if let Err(e) = self.alloc(b) {
+            self.map[b as usize] = p;
+            return Err(e);
+        }
+        drop_ref(p - 1);
+        if !whole {
+            let loc = self.loc(b);
+            with_block(loc, Fill::Zero, false, |d, dirty| {
+                d.copy_from_slice(&bytes);
+                *dirty = true;
+            })?;
+        }
+        Ok(())
     }
 
     /// A file whose contents are the store's blocks `map` (each the block
@@ -864,6 +937,49 @@ impl PFile {
     pub fn blocks(&self) -> &[u32] {
         &self.map
     }
+}
+
+/// Blocks two or more files have (a copy that shares its source's blocks
+/// until written: [`PFile::share`]), each with how many files more than one
+/// name it. A block not here has one file.
+static SHARED: Mutex<Option<HashMap<u32, u32>>> = Mutex::new(None);
+
+/// Whether block `p` has a file besides the one asking.
+fn is_shared(p: u32) -> bool {
+    SHARED.lock().unwrap().as_ref().is_some_and(|m| m.contains_key(&p))
+}
+
+/// Block `p` named by one more file.
+pub fn add_ref(p: u32) {
+    *SHARED.lock().unwrap().get_or_insert_with(Default::default).entry(p).or_insert(0) += 1;
+}
+
+/// Block `p` named by one file fewer: true when another still names it
+/// (the caller keeps it), false when the asking file was its last.
+fn drop_ref(p: u32) -> bool {
+    let mut g = SHARED.lock().unwrap();
+    let Some(m) = g.as_mut() else { return false };
+    match m.get_mut(&p) {
+        Some(n) if *n > 1 => {
+            *n -= 1;
+            true
+        }
+        Some(_) => {
+            m.remove(&p);
+            true
+        }
+        None => false,
+    }
+}
+
+/// No block shared (a load about to count them again: persist.rs).
+pub fn clear_refs() {
+    *SHARED.lock().unwrap() = None;
+}
+
+/// How many blocks are shared, and the references past the first to them.
+pub fn shared_counts() -> (u64, u64) {
+    SHARED.lock().unwrap().as_ref().map_or((0, 0), |m| (m.len() as u64, m.values().map(|&n| n as u64).sum()))
 }
 
 /// A block no longer used: free now, or, while the root is kept across loads
@@ -925,6 +1041,7 @@ pub fn reset() {
     *INDEX.lock().unwrap() = None;
     PROTECTED.store(0, Ordering::Relaxed);
     ALLOCATOR.lock().unwrap().reset();
+    clear_refs();
 }
 
 /// The store read or written at `off` directly, not through the cache nor
@@ -1067,6 +1184,35 @@ pub(crate) mod tests {
 
     /// Only a tmpfs that uses the store (the root) puts files there: one
     /// mounted beside it (`/dev/shm`, a program's own) keeps them in memory.
+    /// A write far past a file's end is EFBIG past the block list's limit,
+    /// never a panic (a wasm32 kernel's list of 2^29 blocks or more was a
+    /// capacity overflow), and below it lands where it was asked, not at
+    /// its offset wrapped to 32 bits.
+    #[test]
+    #[ignore]
+    fn a_write_far_past_the_end_is_efbig_or_lands_there() {
+        set_io(fake);
+        configure(4096, 64 * 4096, 0);
+        let fs = TmpFs::new();
+        fs.use_store();
+        let o = crate::fs::oflags::O_CREAT | crate::fs::oflags::O_RDWR;
+        let a = fs.open("far", o, 0o644).unwrap();
+        a.write_at(0, b"head").unwrap();
+        for off in [1u64 << 62, 1 << 41, (MAX_BLOCKS as u64) << 12] {
+            assert_eq!(a.write_at(off, &[7u8; 1286]).unwrap_err(), Errno::EFBIG, "at {off:#x}");
+        }
+        let off = (5u64 << 30) + 100;
+        assert_eq!(a.write_at(off, &[7u8; 1286]).unwrap(), 1286);
+        let mut got = [0u8; 1286];
+        assert_eq!(a.read_at(off, &mut got).unwrap(), 1286);
+        assert!(got.iter().all(|&x| x == 7));
+        let mut head = [0u8; 4];
+        a.read_at(0, &mut head).unwrap();
+        assert_eq!(&head, b"head");
+        fs.unlink("far").unwrap();
+        configure(0, 0, 0);
+    }
+
     #[test]
     #[ignore]
     fn only_the_root_uses_the_store() {
@@ -1144,6 +1290,84 @@ pub(crate) mod tests {
         assert!(back == more);
         assert_eq!(stats()[DIRECT_R] - r1, 256);
         drop(f);
+        configure(0, 0, 0);
+    }
+
+    /// A copy shares its source's blocks (`PFile::share`): nothing is
+    /// allocated or written for it; a write to either, small or a MiB
+    /// straight to the store, and a truncation give that file its own
+    /// blocks for what they touch, the other keeping its bytes; a block is
+    /// free again only once no file names it, its bytes kept for the other
+    /// while one still does, through the cache and from the store alike.
+    #[test]
+    #[ignore]
+    fn a_shared_block_is_each_file_s_own_once_written() {
+        set_io(fake);
+        reset();
+        configure(4096, 16 * 4096, 0);
+        let bs = 4096usize;
+        let len = (1 << 20) + 5 * bs + 100;
+        let orig: Vec<u8> = (0..len).map(|i| (i * 7 + i / 4096) as u8).collect();
+        let all = |f: &mut PFile| {
+            let mut v = vec![0u8; f.size as usize];
+            assert_eq!(f.read(0, &mut v).unwrap() as usize, v.len());
+            v
+        };
+        let mut a = PFile::new();
+        a.write(0, &orig).unwrap();
+        let blocks = a.blocks().iter().filter(|&&p| p != 0).count() as u64;
+        let (al0, w0, f0) = (stats()[ALLOC], stats()[IO_W] + stats()[DIRECT_W], stats()[FREED]);
+        let mut b = a.share();
+        assert_eq!(stats()[ALLOC], al0, "no block allocated");
+        assert_eq!(stats()[IO_W] + stats()[DIRECT_W], w0, "nothing written");
+        assert_eq!(shared_counts(), (blocks, blocks));
+        assert!(all(&mut b) == orig);
+
+        // a small write to the copy, across a block's end: two blocks its own
+        let mut want_b = orig.clone();
+        b.write(2 * bs as u64 - 3, b"COPYING").unwrap();
+        want_b[2 * bs - 3..2 * bs + 4].copy_from_slice(b"COPYING");
+        assert_eq!(stats()[ALLOC], al0 + 2);
+        assert_eq!(shared_counts().0, blocks - 2);
+        assert!(all(&mut b) == want_b);
+        assert!(all(&mut a) == orig, "the source keeps its bytes");
+
+        // a MiB straight to the store into the source: its own blocks, the
+        // copy's still the old bytes, read from the store too
+        let mut want_a = orig.clone();
+        let more: Vec<u8> = (0..1 << 20).map(|i| (i * 3) as u8).collect();
+        a.write(4 * bs as u64, &more).unwrap();
+        want_a[4 * bs..4 * bs + (1 << 20)].copy_from_slice(&more);
+        sync_all().unwrap();
+        for f in [&a, &b] {
+            for k in 0..f.map.len() {
+                if f.map[k] != 0 {
+                    forget(f.loc(k as u64).key);
+                }
+            }
+        }
+        assert!(all(&mut a) == want_a);
+        assert!(all(&mut b) == want_b, "the copy's blocks from the store");
+
+        // a truncation of the copy into a shared block, and back up
+        b.truncate(bs as u64 / 2).unwrap();
+        b.truncate(3 * bs as u64).unwrap();
+        let mut want_t = orig[..bs / 2].to_vec();
+        want_t.resize(3 * bs, 0);
+        assert!(all(&mut b) == want_t);
+        assert!(all(&mut a) == want_a, "the source past the copy's truncation");
+
+        // the source gone: the copy's blocks stay hers, the source's own freed
+        let c = b.share();
+        drop(a);
+        assert!(all(&mut b) == want_t);
+        let f1 = stats()[FREED];
+        assert!(f1 > f0, "the source's own blocks free");
+        drop(b);
+        assert_eq!(stats()[FREED], f1, "c still names b's blocks");
+        drop(c);
+        assert!(stats()[FREED] > f1);
+        assert_eq!(shared_counts(), (0, 0));
         configure(0, 0, 0);
     }
 

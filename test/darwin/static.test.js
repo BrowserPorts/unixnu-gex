@@ -12,8 +12,8 @@
 // (and one ends in EPIPE as its reader goes), each ended by the kernel;
 // ownrec's nice value and task policy are its own record's in its own
 // process table, taken from the global kernel's as it starts.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
 
 /** What gexc says of its own standard streams, its host's (darwin/hoststd.rs):
  *  not the page's, whose streams are its pipes. */

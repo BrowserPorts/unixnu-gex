@@ -102,7 +102,7 @@ void mesa_get_internal_format_iv(GLenum target, GLenum internal_format,
 enum Op : uint32_t {
     CONTEXT_CREATE = 1, SURFACE_RESIZE = 2, FINISH = 3, PRESENT = 4,
     SURFACE_ATTACH = 5, SURFACE_CURRENT = 6, SURFACE_DETACH = 7,
-    CONTEXT_DESTROY = 8,
+    CONTEXT_DESTROY = 8, CONTEXT_CURRENT = 9, CONTEXT_DROP = 10,
     CLEAR_COLOR = 16, CLEAR = 17, VIEWPORT = 18, ENABLE = 19, DISABLE = 20,
     BLEND_FUNC = 21, DEPTH_FUNC = 22, CULL_FACE = 23, FRONT_FACE = 24,
     SCISSOR = 25, PIXEL_STOREI = 26, CLEAR_DEPTH = 27, DEPTH_MASK = 28,
@@ -176,9 +176,6 @@ enum Op : uint32_t {
     /* A client-memory vertex array's bytes with its pointer command; see
      * crates/gex-gl/src/proto.rs. */
     CLIENT_ARRAY = 200,
-    /* Additional contexts, sharing the first's objects (gexgl.c's
-     * egl_context_slots). */
-    CONTEXT_ADD = 274, CONTEXT_SET_CURRENT = 275,
 };
 
 struct Reader {
@@ -254,28 +251,6 @@ struct sw_winsys* mesa_winsys = nullptr;
 #endif
 struct pipe_frontend_screen mesa_frontend_screen = {};
 struct st_context* mesa_context = nullptr;
-/* Every host GL context, with mesa_context as the first.
- *
- * The guest used to create one and alias every EGLContext to it, so a program
- * with two contexts got two handles to one pile of state -- pixel store,
- * bindings, the lot. gl44-two-contexts-probe measures it: 6/6 against native
- * Mesa and 4/6 here before this.
- *
- * Objects are shared between them on purpose. st_api_create_context takes the
- * context to share with as its fourth argument, and passing the first one
- * keeps every buffer, texture and program visible from all of them. That is
- * not what GL says an unshared context is, and it is deliberate:
- * eglCreateContext's share_context argument is not honoured yet, and because
- * every context has aliased one namespace, a toolkit that asked for sharing
- * has been getting it. Separating the namespaces without implementing sharing
- * would break exactly those programs. Sharing everything keeps them working
- * while the per-context *state* becomes real, which is the part that is
- * observably wrong.
- *
- * Per client, as mesa_context is (swap_client_state), and destroyed with it
- * (destroy_backend_contexts). */
-std::vector<struct st_context*> mesa_contexts;
-unsigned mesa_current_context = 0;
 
 /* The default framebuffer.
  *
@@ -589,6 +564,72 @@ uint32_t last_reject_client = 0;
  * afternoon. */
 bool last_reject_detailed = false;
 
+/* GL's window default: a context's viewport and scissor box take the size of
+ * the window it is first made current on. Here the bind (SURFACE_ATTACH or
+ * SURFACE_CURRENT) comes before the window's size (SURFACE_RESIZE, in the
+ * same batch), so GL's own default is the size the drawable had before -- a
+ * corner of the window for a program that never calls glViewport. So each is
+ * set again, to the window's size, at the binds and resizes up to the first
+ * PRESENT after the context is bound to a surface it has not drawn to before
+ * (a context made on a hidden window, then moved to the real one, is the
+ * common case), and never once the guest has set it itself: a program that
+ * sets the scissor box but not the viewport keeps its scissor box. The same
+ * rule as gex-gl's native host (`WindowDefault`). */
+struct window_default_state {
+    bool viewport = false, scissor = false;
+    bool guest_viewport = false, guest_scissor = false;
+    bool drawn = false;
+    std::vector<uint32_t> seen;
+};
+window_default_state window_default;
+
+/* What belongs to one *context* of a client rather than to its share group:
+ * the st context itself and the guest-name maps of the objects GL does not
+ * share between contexts (vertex arrays, framebuffers, queries, transform
+ * feedbacks, program pipelines), with the state this decoder keeps a copy of.
+ * The current context's are in the globals; the others wait here, swapped in
+ * by `use_context` (`op::CONTEXT_CURRENT`). Context 0 is the one
+ * CONTEXT_CREATE made. */
+struct context_state {
+    std::unordered_map<uint32_t, GLuint> vertex_arrays, framebuffers, queries,
+        transform_feedbacks, program_pipelines;
+    uint32_t current_guest_program = 0;
+    GLuint default_vao = 0;
+    std::vector<GLenum> current_draw_buffers{GL_BACK};
+    GLfloat current_clear_color[4] = {0.f, 0.f, 0.f, 0.f};
+    GLfloat current_clear_depth = 1.f;
+    GLint current_clear_stencil = 0;
+    gexgl_pixel_store pack_store = gexgl_default_pixel_store();
+    gexgl_pixel_store unpack_store = gexgl_default_pixel_store();
+    struct st_context* mesa_context = nullptr;
+    window_default_state window_default;
+};
+
+void swap_context_state(context_state& other) {
+    std::swap(vertex_arrays, other.vertex_arrays);
+    std::swap(framebuffers, other.framebuffers);
+    std::swap(queries, other.queries);
+    std::swap(transform_feedbacks, other.transform_feedbacks);
+    std::swap(program_pipelines, other.program_pipelines);
+    std::swap(current_guest_program, other.current_guest_program);
+    std::swap(default_vao, other.default_vao);
+    std::swap(current_draw_buffers, other.current_draw_buffers);
+    for (int i = 0; i < 4; ++i)
+        std::swap(current_clear_color[i], other.current_clear_color[i]);
+    std::swap(current_clear_depth, other.current_clear_depth);
+    std::swap(current_clear_stencil, other.current_clear_stencil);
+    std::swap(pack_store, other.pack_store);
+    std::swap(unpack_store, other.unpack_store);
+    std::swap(mesa_context, other.mesa_context);
+    std::swap(window_default, other.window_default);
+}
+
+/* The client's contexts other than the current one, and which is current. */
+std::map<uint32_t, context_state> other_contexts;
+uint32_t current_context = 0;
+/* What context 0 was made with, which the others are made like. */
+struct st_context_attribs backend_attribs = {};
+
 /* Everything above that belongs to one *client* rather than to the device.
  *
  * GL object names are the guest's to allocate -- that is the whole point of
@@ -604,6 +645,84 @@ bool last_reject_detailed = false;
  * they are; swapping maps is a pointer exchange each, and it happens once per
  * batch at most.
  */
+
+/* glViewport and glScissor: the hand-written ops, GL 4.4's and the
+ * compatibility profile's (with their indexed and array forms). */
+void window_default_guest_sets(uint32_t op) {
+    switch (op) {
+    case VIEWPORT: case 1563: case 1564: case 1565: case 11407: case 11411: case 11414:
+        window_default.guest_viewport = true;
+        window_default.viewport = false;
+        break;
+    case SCISSOR: case 1389: case 1390: case 1391: case 10511: case 10517: case 10520:
+        window_default.guest_scissor = true;
+        window_default.scissor = false;
+        break;
+    default: break;
+    }
+}
+
+/* Bound to `handle`: true when that owes the default again. */
+bool window_default_bound(uint32_t handle) {
+    window_default_state& d = window_default;
+    if (std::find(d.seen.begin(), d.seen.end(), handle) == d.seen.end()) {
+        d.seen.push_back(handle);
+        d.drawn = false;
+        d.guest_viewport = false;
+        d.guest_scissor = false;
+    }
+    if (d.drawn) return false;
+    d.viewport = !d.guest_viewport;
+    d.scissor = !d.guest_scissor;
+    return d.viewport || d.scissor;
+}
+
+void window_default_drawn() {
+    window_default.drawn = true;
+    window_default.viewport = false;
+    window_default.scissor = false;
+}
+
+/* The guest's name for the object a binding query answers with the host's:
+ * an application that saves a binding and puts it back afterwards (Qt does,
+ * around what it draws) gives back what it was told. */
+GLint guest_name_of(const std::unordered_map<uint32_t, GLuint>& names, GLint host) {
+    if (host <= 0) return host;
+    for (const auto& entry : names)
+        if ((GLint)entry.second == host) return (GLint)entry.first;
+    return host;
+}
+
+GLint guest_binding(GLenum pname, GLint host) {
+    switch (pname) {
+    case 0x8068: case 0x8069: case 0x806A: case 0x8514: case 0x84F6: /* TEXTURE_BINDING_1D, 2D, 3D, CUBE_MAP, RECTANGLE */
+    case 0x8C1C: case 0x8C1D: case 0x8C2C: case 0x900A: case 0x9104: case 0x9105: /* the array, buffer, cube array and multisample ones */
+        return guest_name_of(textures, host);
+    case 0x8894: case 0x8895: case 0x88ED: case 0x88EF: case 0x8A28: case 0x8C8F: /* ARRAY, ELEMENT_ARRAY, PIXEL_PACK, PIXEL_UNPACK, UNIFORM, TRANSFORM_FEEDBACK */
+    case 0x8F36: case 0x8F37: case 0x8F43: case 0x90D3: case 0x90EF: case 0x92C1: case 0x9193: case 0x8C2A: /* COPY_READ, COPY_WRITE, DRAW_INDIRECT, SHADER_STORAGE, DISPATCH_INDIRECT, ATOMIC_COUNTER, QUERY, TEXTURE _BUFFER(_BINDING) */
+        return guest_name_of(buffers, host);
+    case 0x8CA6: case 0x8CAA: /* DRAW_ and READ_FRAMEBUFFER_BINDING */
+        return guest_name_of(framebuffers, host);
+    case 0x8CA7: return guest_name_of(renderbuffers, host);       /* RENDERBUFFER_BINDING */
+    case 0x8919: return guest_name_of(samplers, host);            /* SAMPLER_BINDING */
+    case 0x8E25: return guest_name_of(transform_feedbacks, host); /* TRANSFORM_FEEDBACK_BINDING */
+    case 0x825A: return guest_name_of(program_pipelines, host);   /* PROGRAM_PIPELINE_BINDING */
+    case 0x8B8D: return host ? (GLint)current_guest_program : 0;  /* CURRENT_PROGRAM */
+    case 0x85B5: /* VERTEX_ARRAY_BINDING: the default one the guest's 0 stands for is 0 */
+        return host && (GLuint)host == default_vao ? 0 : guest_name_of(vertex_arrays, host);
+    default: return host;
+    }
+}
+
+/* Set what the window default still owes, to the current surface's size. */
+void window_default_apply() {
+    if (!mesa_context || !sur) return;
+    const GLsizei w = (GLsizei)sur->drawable.width, h = (GLsizei)sur->drawable.height;
+    if (w <= 0 || h <= 0) return;
+    if (window_default.viewport) glViewport(0, 0, w, h);
+    if (window_default.scissor) glScissor(0, 0, w, h);
+}
+
 struct client_state {
     std::unordered_map<uint32_t, GLuint> buffers, textures, shaders, programs,
         vertex_arrays, framebuffers, renderbuffers, samplers, queries,
@@ -625,8 +744,6 @@ struct client_state {
     int backend_height = 1;
     unsigned attached_kind = 0, attached_id = 0, attached_token = 0;
     struct st_context* mesa_context = nullptr;
-    std::vector<struct st_context*> mesa_contexts;
-    unsigned mesa_current_context = 0;
     /* A Gallium screen each: see `ensure_screen`. */
     struct pipe_frontend_screen mesa_frontend_screen = {};
 #if !defined(GEX_MESA_WGPU)
@@ -635,6 +752,10 @@ struct client_state {
     struct st_visual backend_visual = {};
     std::map<uint32_t, gex_surface> surfaces;
     uint32_t current_surface = 0;
+    window_default_state window_default;
+    std::map<uint32_t, context_state> other_contexts;
+    uint32_t current_context = 0;
+    struct st_context_attribs backend_attribs = {};
 };
 
 std::map<uint32_t, client_state> clients;
@@ -675,8 +796,6 @@ void swap_client_state(client_state& other) {
     std::swap(attached_id, other.attached_id);
     std::swap(attached_token, other.attached_token);
     std::swap(mesa_context, other.mesa_context);
-    std::swap(mesa_contexts, other.mesa_contexts);
-    std::swap(mesa_current_context, other.mesa_current_context);
     std::swap(mesa_frontend_screen, other.mesa_frontend_screen);
 #if !defined(GEX_MESA_WGPU)
     std::swap(mesa_winsys, other.mesa_winsys);
@@ -684,6 +803,10 @@ void swap_client_state(client_state& other) {
     std::swap(backend_visual, other.backend_visual);
     std::swap(surfaces, other.surfaces);
     std::swap(current_surface, other.current_surface);
+    std::swap(window_default, other.window_default);
+    std::swap(other_contexts, other.other_contexts);
+    std::swap(current_context, other.current_context);
+    std::swap(backend_attribs, other.backend_attribs);
 }
 
 /* GEX_GL_COUNTS=1 (`?mesaenv=GEX_GL_COUNTS=1`): a line per PRESENT decoded,
@@ -764,18 +887,66 @@ void use_client(uint32_t client) {
     }
 }
 
-/* Let go of this client's GL contexts: the additional ones first, then the
- * first, which they share objects with. Whichever was current, mesa_context
- * is one of them. */
-void destroy_backend_contexts() {
-    for (size_t i = mesa_contexts.size(); i-- > 0;)
-        if (mesa_contexts[i])
-            st_destroy_context(mesa_contexts[i]);
-    if (mesa_contexts.empty() && mesa_context)
-        st_destroy_context(mesa_context);
-    mesa_contexts.clear();
-    mesa_current_context = 0;
-    mesa_context = nullptr;
+/* Run what follows in this context of the client's (`op::CONTEXT_CURRENT`),
+ * made now in context 0's share group if it is new. Before context 0 exists
+ * there is nothing to share with, and the guest makes context 0 first. */
+bool use_context(uint32_t id) {
+    if (id == current_context) return true;
+    if (!mesa_context) return false;
+    struct st_context* group = mesa_context;
+    const bool fresh = other_contexts.find(id) == other_contexts.end();
+    swap_context_state(other_contexts[current_context]);
+    current_context = id;
+    swap_context_state(other_contexts[id]);
+    other_contexts.erase(id);
+    if (fresh) {
+        struct st_context_attribs attribs = backend_attribs;
+        enum st_context_error error = ST_CONTEXT_SUCCESS;
+        mesa_context = st_api_create_context(&mesa_frontend_screen, &attribs,
+                                             &error, group);
+        if (!mesa_context) {
+            fprintf(stderr, "gexgl: client %u: context %u not made: st error %d\n",
+                    current_client, id, (int)error);
+            return false;
+        }
+    }
+    gex_surface* into = surface_for(current_surface);
+    sur = into;
+    if (!st_api_make_current(mesa_context, &into->drawable.base,
+                             &into->drawable.base))
+        return false;
+    /* A core context's vertex array 0 carries no state: the default one the
+     * guest's 0 stands for, as gex_gl_init makes it for context 0. */
+    if (fresh && backend_attribs.profile == API_OPENGL_CORE) {
+        glGenVertexArrays(1, &default_vao);
+        glBindVertexArray(default_vao);
+    }
+    return true;
+}
+
+/* That context is gone (`op::CONTEXT_DROP`): its own objects go with its st
+ * context, and context 0 is current if it was. */
+void drop_context(uint32_t id) {
+    if (id == 0) return;
+    if (id == current_context && !use_context(0)) return;
+    auto it = other_contexts.find(id);
+    if (it == other_contexts.end()) return;
+    if (it->second.mesa_context) st_destroy_context(it->second.mesa_context);
+    other_contexts.erase(it);
+    /* st_destroy_context leaves no context current. */
+    if (mesa_context && sur)
+        st_api_make_current(mesa_context, &sur->drawable.base, &sur->drawable.base);
+}
+
+/* All but context 0, before the client's context itself goes. */
+void drop_other_contexts() {
+    if (current_context != 0) use_context(0);
+    while (!other_contexts.empty()) {
+        const uint32_t id = other_contexts.begin()->first;
+        if (id == 0) { other_contexts.erase(other_contexts.begin()); continue; }
+        drop_context(id);
+    }
+    current_context = 0;
 }
 
 #if defined(GEX_MESA_WGPU)
@@ -1293,6 +1464,7 @@ int create_backend_context(unsigned api, unsigned major, unsigned minor,
                 api == 1 ? "desktop GL" : "GLES", (int)error);
         return -3 - static_cast<int>(error);
     }
+    backend_attribs = attribs;
     fprintf(stderr, "gex-wgpu: negotiated %s %u.%u\n",
             api == 1 ? "desktop GL" : "GLES",
             mesa_context->ctx->Version / 10, mesa_context->ctx->Version % 10);
@@ -1346,10 +1518,6 @@ int create_backend_context(unsigned api, unsigned major, unsigned minor,
                              &into->drawable.base))
         return -9;
     note_surface_to_backend(into->uid);
-    /* Index zero. CONTEXT_ADD appends to this and CONTEXT_SET_CURRENT
-       switches between them. */
-    mesa_contexts.assign(1, mesa_context);
-    mesa_current_context = 0;
 #if defined(GEX_MESA_WGPU)
     report_version_gap();
 #endif
@@ -2055,8 +2223,10 @@ std::string fit_glsl_version(std::string src) {
 }
 
 bool one(uint32_t op, Reader& a) {
+    window_default_guest_sets(op);
     switch (op) {
     case CONTEXT_CREATE: {
+        window_default = window_default_state{};
         // The client API the application selected with eglBindAPI, and the
         // version it asked for. Only the guest knows these, which is why they
         // are on the wire; see crates/gex-gl/src/proto.rs.
@@ -2128,6 +2298,7 @@ bool one(uint32_t op, Reader& a) {
     case SURFACE_RESIZE: {
         const int width = a.i32(), height = a.i32();
         resize_drawable(width, height);
+        window_default_apply();
         break;
     }
     /* Which window on the page's screen the frames after this one belong
@@ -2148,6 +2319,7 @@ bool one(uint32_t op, Reader& a) {
          * that drawable current: this is `eglCreateWindowSurface` finishing,
          * and what the client draws next belongs to this window. */
         use_surface(handle);
+        if (window_default_bound(handle)) window_default_apply();
         sur->kind = kind;
         sur->id = id;
         sur->token = token;
@@ -2158,21 +2330,39 @@ bool one(uint32_t op, Reader& a) {
         const unsigned handle = a.u32();
         if (!a.ok) break;
         use_surface(handle);
+        if (window_default_bound(handle)) window_default_apply();
         break;
     }
     case CONTEXT_DESTROY: {
+        drop_other_contexts();
         /* Everything this client's context held goes with it: its objects
          * are named in maps that mean nothing to the next context, and the
          * next `CONTEXT_CREATE` is then a creation rather than a no-op --
          * which is what lets a toolkit read the GL strings through a
          * throwaway context and still get the profile it asks for after. */
-        destroy_backend_contexts();
+        if (mesa_context) {
+            st_destroy_context(mesa_context);
+            mesa_context = nullptr;
+        }
         reset_guest_namespace();
         for (auto& entry : surfaces) {
             for (struct pipe_resource*& attachment : entry.second.drawable.attachments)
                 pipe_resource_reference(&attachment, nullptr);
             pipe_resource_reference(&entry.second.shown, nullptr);
         }
+        break;
+    }
+    case CONTEXT_CURRENT: {
+        const uint32_t id = a.u32();
+        a.u32(); a.u32(); a.u32(); a.u32(); /* api, major, minor, profile */
+        if (!a.ok) return false;
+        use_context(id);
+        break;
+    }
+    case CONTEXT_DROP: {
+        const uint32_t id = a.u32();
+        if (!a.ok) return false;
+        drop_context(id);
         break;
     }
     case SURFACE_DETACH: {
@@ -2195,6 +2385,7 @@ bool one(uint32_t op, Reader& a) {
      * guest paces itself against: a client swapping one window must not be
      * released by another window's frame reaching the screen. */
     case PRESENT:
+        window_default_drawn();
         present_backend();
         if (gl_counts()) {
             ++gl_client_counts[current_client].second;
@@ -2844,67 +3035,8 @@ bool one(uint32_t op, Reader& a) {
         /* Room for what GL writes even where the table says less. */
         std::vector<GLint> values(std::max<size_t>(n, 16));
         if (n) glGetIntegerv(pname, values.data());
+        if (n == 1) values[0] = guest_binding(pname, values[0]);
         put_blob(values.data(), n * sizeof(values[0]));
-        break;
-    }
-    case CONTEXT_ADD: {
-        /* An additional context, sharing objects with the first. Replies with
-           its index, or with 0 when another cannot be made -- index 0 always
-           exists, so a guest that gets it back simply keeps using the context
-           it already had rather than losing its draws. */
-        if (mesa_contexts.empty() || !mesa_frontend_screen.screen) {
-            put_u32(0u);
-            break;
-        }
-        struct st_context* first = mesa_contexts[0];
-        struct st_context_attribs attribs = {};
-        /* The visual every drawable of this client is built with, so the
-           added context can be made current against the same ones. */
-        attribs.visual = backend_visual;
-        attribs.major = first->ctx->Version / 10;
-        attribs.minor = first->ctx->Version % 10;
-        /* The first context's API, so an ES one is added as ES and a core one
-           as core, with the options it was given. */
-        attribs.profile = first->ctx->API;
-        attribs.options = first->options;
-        enum st_context_error error = ST_CONTEXT_SUCCESS;
-        struct st_context* added = st_api_create_context(
-            &mesa_frontend_screen, &attribs, &error, first);
-        if (!added) {
-            fprintf(stderr, "gexgl: could not create an additional GL "
-                            "context (error %d); the guest keeps the one it "
-                            "has and its contexts stay aliased\n", (int)error);
-            put_u32(0u);
-            break;
-        }
-        mesa_contexts.push_back(added);
-        put_u32((uint32_t)(mesa_contexts.size() - 1));
-        break;
-    }
-    case CONTEXT_SET_CURRENT: {
-        const uint32_t want = a.u32();
-        if (!a.ok) break;
-        if (want >= mesa_contexts.size()) {
-            static bool said;
-            if (!said) {
-                said = true;
-                fprintf(stderr, "gexgl: context %u does not exist; staying on "
-                                "%u\n", want, mesa_current_context);
-            }
-            break;
-        }
-        if (want == mesa_current_context)
-            break;
-        gex_surface* into = sur ? sur : surface_for(current_surface);
-        sur = into;
-        if (!st_api_make_current(mesa_contexts[want], &into->drawable.base,
-                                 &into->drawable.base)) {
-            fprintf(stderr, "gexgl: could not make context %u current\n", want);
-            break;
-        }
-        mesa_current_context = want;
-        /* Everything downstream reads mesa_context, so it has to follow. */
-        mesa_context = mesa_contexts[want];
         break;
     }
     case GET_ERROR: put_u32(glGetError()); break;
@@ -3306,7 +3438,11 @@ EMSCRIPTEN_KEEPALIVE void gex_gl_forget_client(uint32_t client) {
      * empty and this looped for ever in the compositor's Worker, which then
      * drew nothing and answered nothing (the second glxgears of a session,
      * whichever way it was started). */
-    destroy_backend_contexts();
+    drop_other_contexts();
+    if (mesa_context) {
+        st_destroy_context(mesa_context);
+        mesa_context = nullptr;
+    }
     sur = nullptr;
     while (!surfaces.empty()) drop_surface(surfaces.begin()->first, false);
     current_surface = 0;
@@ -3364,7 +3500,7 @@ EMSCRIPTEN_KEEPALIVE void gex_gl_surface_canvas(uint32_t uid, uint32_t on) {
 EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_produced() { return produced; }
 /* The frames a client's D3D windows have presented that the page has not
  * shown yet: what the page paces that client's presents by
- * (page/src/d3d-pacing.js). Its windows are in the globals while it is the
+ * (runtime/src/host/d3d-pacing.js). Its windows are in the globals while it is the
  * current client, in its saved state otherwise. */
 EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_client_unshown(uint32_t client) {
     const std::map<uint32_t, gex_surface>* table = &surfaces;

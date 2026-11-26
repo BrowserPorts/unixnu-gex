@@ -642,11 +642,10 @@ p = f'{sys.argv[1]}/src/meson.build'
 s = open(p).read()
 if 'static_library' not in s:
     s = s.replace("library('xkbfile',", "static_library('xkbfile',", 1)
-    # `version` is a shared-library keyword.
-    s = s.replace("""        sources: libxkbfile_sources,
-        version: '1.0.2'
-)""", """        sources: libxkbfile_sources,
-)""", 1)
+    # `version` and `darwin_versions` are shared-library keywords (libxkbfile's
+    # master gained the second on 2026-11-23), which meson refuses here.
+    import re
+    s = re.sub(r"^\s*(version|darwin_versions):.*\n", "", s, flags=re.M)
     assert 'static_library' in s, 'libxkbfile: the library target did not match'
     open(p, 'w').write(s)
 PATCH
@@ -762,7 +761,7 @@ REMAP="--remap-path-prefix=$GEX_ROOT=/gex --remap-path-prefix=$(rustc --print sy
 HOSTWL="$GEX_ROOT/target/wasm32-unknown-unknown/release/gex_hostwl.wasm"
 
 # -- publish -----------------------------------------------------------------
-PUB="$GEX_ROOT/page/public/gex/$PUBDIR"
+PUB="$GEX_ROOT/runtime/files/out/gex/$PUBDIR"
 mkdir -p "$PUB"
 cp "$OUT/build/xserver/hw/xwayland/Xwayland.js" "$PUB/Xwayland.mjs"
 cp "$OUT/build/xserver/hw/xwayland/Xwayland.wasm" "$PUB/"
@@ -772,7 +771,7 @@ cp "$HOSTWL" "$PUB/gexhostwl.wasm"
 # a module that has to be relinked to change a keymap is a worse thing to own.
 cp "$OUT/xkb/gex.xkm" "$PUB/"
 # The licences of what the server is built from, beside it, for the npm
-# package's THIRD-PARTY (page/runtime/build.sh): each source tree's own, and
+# package's THIRD-PARTY (runtime/build.sh): each source tree's own, and
 # the keymap's, compiled from the host's xkeyboard-config.
 rm -rf "$PUB/licenses"
 mkdir -p "$PUB/licenses"

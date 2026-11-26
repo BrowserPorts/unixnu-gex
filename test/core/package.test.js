@@ -1,4 +1,4 @@
-// The package page/runtime/build.sh makes (run.mjs builds it into the work
+// The package runtime/build.sh makes (run.mjs builds it into the work
 // directory), imported as a page would, with no baseUrl: it finds its files
 // itself.
 
@@ -10,7 +10,7 @@ export default async function (t) {
   const pkg = t.work('pkg/');
   const { System } = await import(/* @vite-ignore */ `${pkg}index.mjs`);
   const { MemoryFilesystem } = await import(/* @vite-ignore */ `${pkg}fs.mjs`);
-  const sys = new System();
+  const sys = new System({ arch: t.arch });
   const fs = new MemoryFilesystem(sys);
   fs.addTar(t.work('bb.tar.zst'));
   const t0 = performance.now();

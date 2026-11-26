@@ -16,7 +16,7 @@ static BOOT: std::sync::Mutex<Vec<(String, Vec<u8>)>> = std::sync::Mutex::new(Ve
 /// does not do (`gex_darwin_set_strict`).
 static STRICT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// One of the boot payload's files (page/runtime System's `darwin.boot`),
+/// One of the boot payload's files (runtime System's `darwin.boot`),
 /// before the Darwin program's exec: `name` and the bytes, in this
 /// module's heap (`gex_alloc`).
 #[no_mangle]

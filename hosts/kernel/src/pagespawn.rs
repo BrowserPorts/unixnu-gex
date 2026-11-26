@@ -1,4 +1,4 @@
-//! A program the page starts (page/runtime programs.js `spawn`), in one call:
+//! A program the page starts (runtime programs.js `spawn`), in one call:
 //! the program found, its process made, its terminal or pipes made with the
 //! page's ends held under pid 0, and what its Worker starts from (the exec
 //! record, its descriptors, a native wasm program's image span).

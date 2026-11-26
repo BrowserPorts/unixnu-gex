@@ -60,7 +60,7 @@ def main() -> int:
     parser.add_argument(
         "--guest",
         type=pathlib.Path,
-        default=root / "page/public/fs/libGLESv2.so.2",
+        default=root / "runtime/files/out/fs/libGLESv2.so.2",
         help="built guest libGLES shared object inspected with nm -D",
     )
     parser.add_argument(

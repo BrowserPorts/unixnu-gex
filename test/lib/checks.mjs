@@ -8,7 +8,7 @@
 // `summary`: a script that prints no check lines, only a summary last, which
 // names its one check (its exit status).
 //
-//   await checks(t, join(FIXTURES, 'page/lazy-rest.mjs'));
+//   await checks(t, join(FIXTURES, 'page/drop.mjs'));
 
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync } from 'node:fs';
@@ -18,7 +18,7 @@ const ROOT = join(import.meta.dirname, '..', '..');
 export const FIXTURES = join(import.meta.dirname, '..', 'fixtures');
 
 export async function checks(t, file, { env = {}, timeout = 300000, args = [], node = [], need = [], summary = false } = {}) {
-  for (const f of need) if (!existsSync(join(ROOT, f))) t.skip(`no ${f} (make page)`);
+  for (const f of need) if (!existsSync(join(ROOT, f))) t.skip(`no ${f} (make assets, make mesa)`);
   const tmp = join(t.workDir, 'tmp');
   mkdirSync(tmp, { recursive: true });
   // Not this process's IPC channel to the runner (fork's NODE_CHANNEL_FD).

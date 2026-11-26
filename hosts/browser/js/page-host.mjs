@@ -6,7 +6,7 @@
 // guest any files this way (a package repository beside the page, which the
 // network proxy could not reach).
 //
-// A stream here has the shape page/src/net.js wires a connection as (`send`,
+// A stream here has the shape runtime/src/host/net.js wires a connection as (`send`,
 // `close`, and the `onopen`/`onmessage`/`onclose` its owner sets), so the
 // socket table holds these as it holds the network's.
 

@@ -351,8 +351,7 @@ arguments and `onExit`).
 
 **`start(options)`** resolves once the program runs, with
 `{ exited, kill(), resize(size), state, describe(), ready() }`. Its
-options, the handle and its errors are in `page/src/README.md`, beside the
-library's code. An unknown option or a wrong value is an error that names
+options, the handle and its errors are in `runtime/app/README.md`. An unknown option or a wrong value is an error that names
 it, and so is an option for a piece the build left out
 (`start({ compositor: true })` on a `"compositor": false` build names
 `"features": {"compositor": true}` in user/eject.json).
@@ -405,7 +404,7 @@ setting (`"compositor"`, say) fails the build and says where it goes.
 `"filesystem"` is required: where the guest's files are kept, `"memory"`
 (gone with the page) or `{"kind": "opfs", "name": "..."}` (the page's
 origin private file system, which keeps the whole root, a game's saves and
-the Wine prefix included, across loads; page/runtime README, "Persistence").
+the Wine prefix included, across loads; runtime/README.md, "Persistence").
 One page holds a store at a time: a second tab of the site gets the
 page's `onStoreBusy` choice, or fails with EBUSY without one.
 A new project's file says `"memory"`; a build whose file says neither
@@ -436,8 +435,8 @@ node run.mjs [--jit-fallback] [--strace] [--] [ARGS...]   # Node
 node serve.mjs 8000        # then open http://localhost:8000/ (user/index.html)
 ```
 
-`app.mjs`'s `start()` is the Linux program's (`page/src/README.md`, "A Linux
-program's build").
+`app.mjs`'s `start()` is the Linux program's (`runtime/app/README.md`, "A
+Linux program's build").
 
 The page needs cross-origin isolation (gex's runtime uses
 `SharedArrayBuffer`); `serve.mjs` sends the two headers. Replacements are
@@ -473,7 +472,7 @@ why, rather than doing nothing.
 
 | Feature | What it is | Off |
 | --- | --- | --- |
-| `compositor` | the scene compositor: every window in one WebGPU canvas, drawn by a worker, with server-side decorations, its own cursor and hit testing | each window is its own canvas in the page, laid out by `page/src/bare-desktop.js` and composited by the browser; no decorations (Wine draws its own frames). The compositor's code is not in the bundle |
+| `compositor` | the scene compositor: every window in one WebGPU canvas, drawn by a worker, with server-side decorations, its own cursor and hit testing | each window is its own canvas in the page, laid out by `runtime/src/host/bare-desktop.js` and composited by the browser; no decorations (Wine draws its own frames). The compositor's code stays in the bundle: start() starts without it |
 | `gl` | the guest's OpenGL: Mesa on WebGPU | the page ships no Mesa |
 | `multiprocess` | more than one guest process | not yet: a Wine program is several processes |
 | `translation` | run-time translation (tier-1, the function JIT) behind the units | not yet: the translator is not a separate build |
@@ -495,7 +494,7 @@ keep, and a standalone site around the project's page:
 node site/record-wine32.mjs http://127.0.0.1:8000/ rec --serve SITE --bundle app.tar \
   --boot-units-out rec/boot-units.txt
 # 2. eject: the bundle, the units it used, the runtime, a build step
-gexc eject rec --out app-project --web-src page --unit-cache UNITS --features -compositor
+gexc eject rec --out app-project --web-src runtime --unit-cache UNITS --features -compositor
 # 3. build: the page with those features, the site's inputs in build/web
 app-project/build.sh
 # 4. the static site
@@ -513,12 +512,11 @@ node gexdev/tests/eject/wine32-page.mjs site      # check: the site reaches the 
   (`bundle/rootfs.tar`, hash checked), the units (`units/KEY/`), the
   browser shim, kernel and seed (`runtime/web/gex/`), `gex-project.json` and
   the page, `user/index.html` (written once, yours). `page_source` names the
-  gex checkout's `page/`: the library is built at build time, because the
-  features decide what goes into it.
+  gex checkout's `runtime/`: the library is built at build time, because the
+  features decide how it starts.
 - **The build** (`gexc eject build`) runs `site/build-eject-page.sh` with the
   features switched off, puts the project's runtime wasm in it, drops what a
-  feature off ships (Mesa for `gl`), checks the bundler really left out what
-  `compositor` off names, and writes `build/web/` (`page/`: the app library,
+  feature off ships (Mesa for `gl`), and writes `build/web/` (`page/`: the app library,
   `rootfs.tar`, `units/`, and the launch file with user/eject.json
   `"start"`).
 - **The site** (`site/eject-site.mjs`) is the project's page at `/`, the app

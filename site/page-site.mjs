@@ -4,7 +4,7 @@
 //   node site/page-site.mjs OUT --tar BUNDLE.tar --units DIR --params FILE
 //        [--strip] [--prune] [--dedupe] [--split] [--boot-units FILE] [--level N] [--param K=V]...
 //
-// - The page: page/nt.html and the app library, built with vite into OUT as
+// - The page: runtime/app/nt.html and the app library, built with vite into OUT as
 //   gex builds its page (every feature in: translation, the function JIT);
 //   the x86 runtime (shim, kernel, seed) under gex/; the zstd decoder under
 //   vendor/.
@@ -39,7 +39,11 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildFill, buildRest, extract, hasRestOnly, pack, pruneTree, readLessRestOnly, readPathList, restOnly, splitTree, stripper, stripTree, unitGuest, walk } from './site-bundle.mjs';
 
-const web = join(dirname(fileURLToPath(import.meta.url)), '..', 'page');
+// gex's runtime/: its tools (node_modules), files (files/out), vendored
+// decoder, and the pages (app/).
+const web = join(dirname(fileURLToPath(import.meta.url)), '..', 'runtime');
+const app = join(web, 'app');
+const pub = join(web, 'files/out/gex');
 // A wine32 recording's format (site/record-wine32.mjs), and the name ones made before the rename carry.
 const WINE32_FORMATS = ['gex-wine32-session', 'gex-w3-session'];
 const av = process.argv.slice(2);
@@ -86,18 +90,18 @@ function place(src, path) {
 const strip = stripper(work, true);
 
 // The page: nt.html and the library, as gex's own build makes them.
-const config = join(web, `.page-site-${process.pid}.mjs`);
-writeFileSync(config, `import base from '${web}/vite.config.js';
-export default { ...base, root: '${web}', publicDir: false, logLevel: 'error',
-  build: { ...base.build, outDir: '${join(work, 'page')}', emptyOutDir: true, rollupOptions: { input: { nt: '${web}/nt.html' } } } };
+const config = join(app, `.page-site-${process.pid}.mjs`);
+writeFileSync(config, `import base from '${app}/config.mjs';
+export default { ...base, root: '${app}', publicDir: false, logLevel: 'error',
+  build: { ...base.build, outDir: '${join(work, 'page')}', emptyOutDir: true, rollupOptions: { input: { nt: '${app}/nt.html' } } } };
 `);
 try {
-  execFileSync(join(web, 'node_modules/.bin/vite'), ['build', '--config', config], { cwd: web, stdio: 'inherit' });
+  execFileSync(join(web, 'node_modules/.bin/vite'), ['build', '--config', config], { cwd: app, stdio: 'inherit' });
 } finally {
   rmSync(config, { force: true });
 }
 walk(join(work, 'page'), (p, rel) => { mkdirSync(dirname(join(out, rel)), { recursive: true }); copyFileSync(p, join(out, rel)); });
-for (const f of ['gex_browser.x86.shared.wasm', 'gex_kernel.x86.wasm', 'seed.x86.shared.wasm']) place(strip(join(web, 'public/gex', f)), `gex/${f}`);
+for (const f of ['gex_browser.x86.shared.wasm', 'gex_kernel.x86.wasm', 'seed.x86.shared.wasm']) place(strip(join(pub, f)), `gex/${f}`);
 mkdirSync(join(out, 'vendor'), { recursive: true });
 for (const f of ['zstddec-stream.mjs', 'zstddec.wasm', 'zstddec-LICENSE']) copyFileSync(join(web, 'vendor/zstddec', f), join(out, 'vendor', f));
 const recording = JSON.parse(readFileSync(paramsIn, 'utf8'));
@@ -105,12 +109,12 @@ const recording = JSON.parse(readFileSync(paramsIn, 'utf8'));
 // page's Mesa, which the page fetches itself, uncompressed.
 const glParam = recording.url ? new URL(recording.url).searchParams.get('gl') : recording.gl;
 if (String(glParam) === '1' || opts('--param').includes('gl=1')) {
-  const mesa = ['gex-wgpu-replay.js', 'gex-wgpu-replay.wasm', 'gex-wgpu-replay.deferred.wasm'].filter((f) => existsSync(join(web, 'public/gex', f)));
+  const mesa = ['gex-wgpu-replay.js', 'gex-wgpu-replay.wasm', 'gex-wgpu-replay.deferred.wasm'].filter((f) => existsSync(join(pub, f)));
   if (mesa.length < 2) {
-    console.error('page-site: gl=1 needs the page\'s Mesa, page/public/gex/gex-wgpu-replay.{js,wasm} (ports/mesa/build.sh)');
+    console.error('page-site: gl=1 needs the page\'s Mesa, runtime/files/out/gex/gex-wgpu-replay.{js,wasm} (ports/mesa/build.sh)');
     process.exit(1);
   }
-  for (const f of mesa) copyFileSync(join(web, 'public/gex', f), join(out, 'gex', f));
+  for (const f of mesa) copyFileSync(join(pub, f), join(out, 'gex', f));
 }
 
 // The bundle: stripped, pruned, deduplicated, and split as an ejected site's

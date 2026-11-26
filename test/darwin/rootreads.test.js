@@ -6,8 +6,8 @@
 // its neighbours are there, at their sizes. (A lazy file's bytes are read
 // by a process's Worker, never the page's thread: a program reading them
 // is the next slices'.)
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
 
 export const meta = { hosts: ['browser'], arches: ['a64'], images: ['darwin-root'], timeout: 300 };
 

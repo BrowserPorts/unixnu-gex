@@ -7,6 +7,7 @@
 //! same blocks, so both hosts install it unchanged.
 
 pub mod emit;
+pub mod ffi;
 pub mod func;
 pub mod image;
 pub mod provider;

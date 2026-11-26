@@ -1165,6 +1165,18 @@ case 1247: {
     const uint32_t rows = height > 0 ? static_cast<uint32_t>(height) : 0;
     const uint32_t images = threeDimensional && depth > 0
         ? static_cast<uint32_t>(depth) : 1;
+    // GEX_GL_READBACK (`?mesaenv=GEX_GL_READBACK=1`): each read's geometry against its level's size, the
+    // first 32 (what the guest's copy, gl44-generated.inc, then lays into the caller's buffer).
+    static const bool say_readback = getenv("GEX_GL_READBACK") != nullptr;
+    static unsigned readbacks_said;
+    if (say_readback && readbacks_said < 32) {
+        ++readbacks_said;
+        emscripten_log(EM_LOG_WARN, "gex-gl: glGetTexImage(0x%x, level %d, 0x%x/0x%x): level %dx%dx%d, "
+                       "offset %zu, rows %d of %zu bytes every %zu, images %u every %zu, %zu bytes in all%s",
+                       target, level, format, type, width, height, depth, layout.offset, height,
+                       group * (width > 0 ? (size_t)width : 0), layout.row_stride, images, layout.image_stride,
+                       layout.end, fallback.empty() ? "" : " (read without the pack buffer)");
+    }
     put_u32(static_cast<uint32_t>(layout.offset));
     put_u32(static_cast<uint32_t>(layout.row_stride));
     put_u32(static_cast<uint32_t>(group * (width > 0 ? (size_t)width : 0)));

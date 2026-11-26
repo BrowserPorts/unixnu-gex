@@ -3,7 +3,7 @@
 # prints the path it made on its last line.
 #
 # Settings (command line or environment):
-#   OUT      outputs of the targets below that are not in target/ or page/
+#   OUT      outputs of the targets below that are not in target/ or runtime/
 #            (default: out/ in this tree, gitignored)
 #   CACHE    fetched sources and their bare mirrors (default ~/.cache/gex)
 #   JOBS     parallel jobs for the long builds (default 16)
@@ -15,8 +15,9 @@
 #   *_SEED   a local clone to fill a mirror from with no network:
 #            MUSL_SEED, MUSL64_SEED, LLVM_SEED, WINE64_SEED
 #   WINE32_CACHE  32-bit Wine's sysroot, libraries and build tree (default CACHE/wine32)
-#   PAGE_FLAGS more page/build.sh flags for make page / page-sp (--no-assets after
-#            make assets, --debug)
+#   FLAVOUR  make mesa's and make xwayland's build: --mp (default), --sp or --both
+#   PAGE_FLAGS more flags for make page / page-sp: runtime/files/build.sh's
+#            (--no-assets after make assets), and --debug for runtime/app/build.sh
 #   GEX_TOOLCHAIN, GEX_X86_TOOLCHAIN  musl cross toolchains to use instead of the
 #            pinned ones make toolchains fetches
 
@@ -62,20 +63,20 @@ GEXCC_PREFIX ?= $(OUT)/gexcc
 
 help:
 	@echo 'make gexc          gexc for AArch64, x86-64 and i386 guests (target/release, target/x86/release)'
-	@echo 'make page          the page, multi-process build: hosts, guest libraries, Mesa, Xwayland, vite (page/dist)'
+	@echo 'make page          gex'"'"'s pages, multi-process build: hosts, guest libraries, Mesa, Xwayland, vite (runtime/app/dist)'
 	@echo 'make wine          64-bit Wine with WoW64, and a prefix (prints WINE64_DIST=, WINE64_PREFIX=)'
 	@echo 'make gexcc         the wasm32 C/C++ compiler, from pins (out/gexcc; GEXCC_PREFIX= elsewhere)'
-	@echo 'make mesa          Mesa for the page alone'
-	@echo 'make test          the runtime tests: node test/run.mjs (ARGS="..." passes options)'
+	@echo 'make mesa          Mesa into runtime/files/out (FLAVOUR=--mp, --sp or --both)'
+	@echo 'make test          the runtime tests: node test/run.mjs on the package make runtime builds (ARGS="..." passes options)'
 	@echo 'make help-all      every target'
 
 help-all: help
 	@echo
-	@echo 'make page-sp       the single-thread page (page/dist-sp)'
-	@echo 'make assets        the hosts, guest libraries and rootfs alone (page/public)'
-	@echo 'make xwayland      Xwayland for the page alone'
+	@echo 'make page-sp       the single-thread pages (runtime/app/dist-sp)'
+	@echo 'make assets        the hosts, guest libraries and rootfs alone (runtime/files/out)'
+	@echo 'make xwayland      Xwayland into runtime/files/out (FLAVOUR=--mp, --sp or --both)'
 	@echo 'make toolchains    the pinned musl cross toolchains the page builds guest code with (CACHE/toolchains)'
-	@echo 'make serve         serve page/dist (PORT, default 8088) and page/dist-sp (SP_PORT, 8089)'
+	@echo 'make serve         serve runtime/app/dist (PORT, default 8088) and runtime/app/dist-sp (SP_PORT, 8089)'
 	@echo 'make runtime       the npm package @gexemu/runtime (PKG=DIR, default out/runtime)'
 	@echo 'make sysroot       the wasm32 sysroot (musl at MUSL_COMMIT); SNAPSHOT=1: the snapshot flavour'
 	@echo 'make sysroot64     the LP64 sysroot (musl at MUSL64_COMMIT)'
@@ -103,16 +104,18 @@ gexc:
 	cargo build --release -p gexc --features x86 --target-dir target/x86
 	@echo $(GEXC_A64) $(GEXC_X86)
 
-# ---- the page ----
+# ---- the runtime's files (runtime/files/out) and its package ----
 # Mesa, and the Khronos registry guest/gl/build.sh generates the GL tables from
 MESA_CHECKOUT = git -C $(ROOT) submodule update --init third_party/mesa third_party/opengl-registry
-# vite and the page's other npm packages, at package-lock.json's versions
-NPM_CI = [ $(ROOT)/page/node_modules/.package-lock.json -nt $(ROOT)/page/package-lock.json ] || (cd $(ROOT)/page && npm ci --no-audit --no-fund)
+# vite and wisp-js, which runtime/build.sh builds the package with and runtime/app/build.sh
+# the pages, at package-lock.json's versions
+NPM_CI = [ $(ROOT)/runtime/node_modules/.package-lock.json -nt $(ROOT)/runtime/package-lock.json ] || (cd $(ROOT)/runtime && npm ci --no-audit --no-fund)
 # The page's guest-side cross compilers (toolchain/pins), unpacked once in
 # CACHE/toolchains; GEX_TOOLCHAIN= / GEX_X86_TOOLCHAIN= name others. Their
 # programs are i386 Linux ones: a host that does not run those (any but x86
 # Linux) uses each one's target files with its own clang and lld
-# (toolchain/musl-cross-clang.sh: TOOLCHAIN.clang).
+# (toolchain/musl-cross-clang.sh: TOOLCHAIN.clang). Their Linux headers'
+# case-only pairs are left out as they unpack (toolchain/case-pairs.sh).
 TC := $(CACHE)/toolchains
 TC_HOST := $(if $(filter Linux-x86_64 Linux-i%86,$(shell uname -s)-$(shell uname -m)),,.clang)
 GEX_TOOLCHAIN ?= $(TC)/aarch64-linux-musl-cross$(TC_HOST)
@@ -121,7 +124,9 @@ export GEX_TOOLCHAIN GEX_X86_TOOLCHAIN
 toolchains: $(foreach a,aarch64 x86_64,$(TC)/$(a)-linux-musl-cross/.pinned $(if $(TC_HOST),$(TC)/$(a)-linux-musl-cross.clang/.made))
 $(TC)/%-linux-musl-cross/.pinned:
 	$(ROOT)/wine/dl.sh $(MUSL_CROSS_$(call upper,$*)_URL) $(MUSL_CROSS_$(call upper,$*)_SHA256) $(CACHE)/dl
-	rm -rf $(TC)/$*-linux-musl-cross && mkdir -p $(TC) && tar -C $(TC) -xzf $(CACHE)/dl/$*-linux-musl-cross.tgz
+	rm -rf $(TC)/$*-linux-musl-cross && mkdir -p $(TC)
+	tar -tzf $(CACHE)/dl/$*-linux-musl-cross.tgz | sh $(ROOT)/toolchain/case-pairs.sh > $(TC)/$*-linux-musl-cross.case
+	tar -C $(TC) -xzf $(CACHE)/dl/$*-linux-musl-cross.tgz -X $(TC)/$*-linux-musl-cross.case && rm -f $(TC)/$*-linux-musl-cross.case
 	echo $(MUSL_CROSS_$(call upper,$*)_SHA256) > $@
 $(TC)/%-linux-musl-cross.clang/.made: $(TC)/%-linux-musl-cross/.pinned $(ROOT)/toolchain/musl-cross-clang.sh
 	$(ROOT)/toolchain/musl-cross-clang.sh $(TC)/$*-linux-musl-cross
@@ -137,36 +142,42 @@ GEX_MESA_PAGE_ONLY ?= 1
 export GEX_MESA_PAGE_ONLY
 PAGE_ENV = PATH=$(EMSDK)/upstream/emscripten:$(EMSDK)/upstream/bin:$$PATH
 
+# gex's pages: the runtime's files for one flavour (runtime/files/build.sh),
+# then its dist (runtime/app/build.sh).
 page: toolchains
 	@$(EMCC_CHECK)
 	$(MESA_CHECKOUT)
 	$(NPM_CI)
-	$(PAGE_ENV) $(ROOT)/page/build.sh --mp $(PAGE_FLAGS)
-	@echo $(ROOT)/page/dist
+	GEX_NO_REFRESH_DIST=1 $(PAGE_ENV) $(ROOT)/runtime/files/build.sh --mp $(filter-out --debug,$(PAGE_FLAGS))
+	$(ROOT)/runtime/app/build.sh --mp $(filter --debug,$(PAGE_FLAGS))
+	@echo $(ROOT)/runtime/app/dist
 page-sp: toolchains
 	@$(EMCC_CHECK)
 	$(MESA_CHECKOUT)
 	$(NPM_CI)
-	$(PAGE_ENV) $(ROOT)/page/build.sh --sp $(PAGE_FLAGS)
-	@echo $(ROOT)/page/dist-sp
+	GEX_NO_REFRESH_DIST=1 $(PAGE_ENV) $(ROOT)/runtime/files/build.sh --sp $(filter-out --debug,$(PAGE_FLAGS))
+	$(ROOT)/runtime/app/build.sh --sp $(filter --debug,$(PAGE_FLAGS))
+	@echo $(ROOT)/runtime/app/dist-sp
 assets: toolchains
-	$(ROOT)/page/build-assets.sh
-	@echo $(ROOT)/page/public
+	$(ROOT)/runtime/files/build-assets.sh
+	@echo $(ROOT)/runtime/files/out
+# FLAVOUR: --mp (the multi-process build's), --sp or --both
+FLAVOUR ?= --mp
 mesa:
 	$(MESA_CHECKOUT)
 	@$(EMCC_CHECK)
-	$(PAGE_ENV) $(ROOT)/page/build.sh --mp --gl-only
+	$(PAGE_ENV) $(ROOT)/runtime/files/build.sh $(FLAVOUR) --gl-only
 xwayland:
 	@$(EMCC_CHECK)
-	$(PAGE_ENV) $(ROOT)/page/build.sh --mp --x-only
+	$(PAGE_ENV) $(ROOT)/runtime/files/build.sh $(FLAVOUR) --x-only
 PORT ?= 8088
 SP_PORT ?= 8089
 serve:
-	node $(ROOT)/page/serve.mjs $(PORT) --sp-port $(SP_PORT)
+	node $(ROOT)/runtime/app/serve.mjs $(PORT) --sp-port $(SP_PORT)
 PKG ?= $(OUT)/runtime
 runtime:
 	$(NPM_CI)
-	$(ROOT)/page/runtime/build.sh $(PKG)
+	$(ROOT)/runtime/build.sh $(PKG)
 	@echo $(PKG)
 
 # ---- pinned sources ----
@@ -251,6 +262,7 @@ steam-api:
 # ---- ejected programs ----
 DIR ?= $(OUT)/eject-page
 eject-page:
+	$(NPM_CI)
 	$(ROOT)/site/build-eject-page.sh $(DIR)
 	@echo $(DIR)
 eject-site:
@@ -259,9 +271,9 @@ eject-site:
 	@echo $(SITE)
 
 # ---- tests and checks ----
-test:
+test: runtime
 	@[ -x $(GEXC_A64) ] || $(MAKE) gexc
-	$(if $(wildcard $(BUSYBOX)),BUSYBOX=$(BUSYBOX)) node $(ROOT)/test/run.mjs $(ARGS)
+	$(if $(wildcard $(BUSYBOX)),BUSYBOX=$(BUSYBOX)) node $(ROOT)/test/run.mjs --package $(PKG) $(ARGS)
 check:
 	cargo test --release --workspace --exclude gex-kmem --exclude gex-kernel-wasm --exclude gex-browser \
 	  $(if $(X86),--features gex-kernel/x86$(,)gex-xlate/x86$(,)gexc/x86$(,)gex-native/x86$(,)gex-eject/x86 --target-dir target/x86t)

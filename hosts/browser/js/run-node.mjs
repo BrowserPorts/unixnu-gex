@@ -15,7 +15,7 @@
 //                               fetched as it is read: here read from the
 //                               host file, each fetch GEX_LAZY_DELAY_MS late
 //                               (default 0), a slow link's (lazy-fetch.mjs)
-//     --tar <host.tar>          a root filesystem tar (page/src/tar.js, as the
+//     --tar <host.tar>          a root filesystem tar (runtime/src/host/tar.js, as the
 //                               page unpacks one): files, modes, empty
 //                               directories, hard and symbolic links
 //     --busybox <host>          a wasm32 busybox as /bin/busybox, hard-linked
@@ -40,7 +40,7 @@
 // under Node): enough to see the device, not to draw.
 //
 // GEX_WEB_DIR: the directory holding the shim, kernel and seed (default
-// page/public/gex of this tree; an ejected project's runtime/web).
+// runtime/files/out/gex of this tree; an ejected project's runtime/web).
 
 import { accessSync, appendFileSync, closeSync, constants as fsc, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -55,6 +55,19 @@ import { makeGlChannel } from './gl-bridge.mjs';
 
 /** GEX_PAGE_HOSTS's `name=DIR_OR_URL,...` as page-host.mjs's `pageHosts`,
  *  a directory against this one. */
+/** GEX_DEBUG_EXIT's account of a process's runtime heap: what the arena
+ *  gave it and its largest single claim (`gex_arena_spent_mib`), and its
+ *  command line. */
+/** The memory grown beyond what was asked, ahead of need (lib.rs
+ *  `grow_memory_to`'s headroom), said after the rest: address space only. */
+function headroomSaid(m) {
+  return m.headroomMib ? ` (headroom ${m.headroomMib} MiB)` : '';
+}
+
+function arenaSaid(m) {
+  return (m.touchedMib !== undefined ? `, resident ${m.touchedMib} MiB` : '') + (m.guestMib !== undefined ? `, guest maps ${m.guestMib} MiB` : '') + (m.arena ? `, arena heap ${m.arena[1]} MiB, largest claim ${m.arena[3] ?? '?'} MiB` : '') + (m.cmdline ? ` {${m.cmdline}}` : '');
+}
+
 function pageHostsFromEnv(v) {
   if (!v) return undefined;
   const map = {};
@@ -253,7 +266,7 @@ const rest = [];
       if (eq <= 0) { console.error('--extract wants <guest>=<host>'); process.exit(2); }
       extract.push([spec.slice(0, eq), spec.slice(eq + 1)]);
     } else if (av[i] === '--tar') {
-      const { untar } = await import('../../../page/src/tar.js');
+      const { untar } = await import('../../../runtime/src/host/tar.js');
       inputs.push(av[i + 1] ?? '');
       const buf = readFileSync(av[++i] ?? '');
       const tree = untar(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
@@ -313,7 +326,7 @@ function readStdin() {
 const SHARED = !!process.env.GEX_SHARED || SINGLE;
 const PUB = process.env.GEX_WEB_DIR
   ? new URL(`file://${process.env.GEX_WEB_DIR.replace(/\/?$/, '/')}`)
-  : new URL('../../../page/public/gex/', import.meta.url);
+  : new URL('../../../runtime/files/out/gex/', import.meta.url);
 const shimWasm = readFileSync(
   new URL(
     SHARED ? `gex_browser${SHIM_INFIX}.shared.wasm` : `gex_browser${ARCH_INFIX}.wasm`,
@@ -612,8 +625,10 @@ const host = new ProcessHost({
     shareTrace: process.env.GEX_SHARE_TRACE ? 1 : undefined,
     // GEX_LOG=1: gex's debug output (log.mjs); Workers see the environment too.
     log: process.env.GEX_LOG || undefined,
-    // GEX_FJIT=1: the function JIT (gexc run --fjit's browser half).
-    fjit: process.env.GEX_FJIT ? Number(process.env.GEX_FJIT) || 1 : undefined,
+    // GEX_FJIT=1: the function JIT (gexc run --fjit's browser half), at each
+    // first miss; GEX_FJIT=hot (hotsync): driven by the safepoint's samples,
+    // translated on a helper Worker (inline), as the page's `?fjit=`.
+    fjit: process.env.GEX_FJIT ? ({ hot: 3, hotsync: 5 }[process.env.GEX_FJIT] ?? (Number(process.env.GEX_FJIT) || 1)) : undefined,
     // GEX_XCACHE=name (with GEX_XCACHE_DIR): the translation cache across
     // runs, saved under that name.
     xcache: process.env.GEX_XCACHE || undefined,
@@ -671,14 +686,17 @@ const host = new ProcessHost({
     // so shared reads stay coherent under true parallelism (V8 can't hoist a
     // plain wasm load across a guest fence). Tests whether the GTK startup race
     // is plain-load coherence at guest fences. Default off.
-    coherentLoads: !!(process.env.GEX_COHERENT_LOADS || (process.env.GEX_TSO && process.env.GEX_TSO !== "0")),
+    // GEX_TEAR=1|2: count plain misaligned 8-byte guest accesses; 2 also
+    // splits each into 4-byte halves (tier1.rs `TEAR`). Debug, default off.
+    tear: Number(process.env.GEX_TEAR) || 0,
+    coherentLoads: process.env.GEX_TSO === "2" ? 2 : !!(process.env.GEX_COHERENT_LOADS || (process.env.GEX_TSO && process.env.GEX_TSO !== "0")),
     // GEX_SP_GUARD: at each safepoint, catch a worker thread whose SP has strayed
     // into the MAIN thread's stack (it would smash a canary the main thread only
     // detects later -- the complex-Qt/designer stack smash). Loud when it fires.
     spGuard: !!process.env.GEX_SP_GUARD,
     // TEST: GEX_DEBUG_PANIC=plain|nested|long makes the shim panic on purpose
     // before the guest runs.
-    debugPanic: { plain: 1, nested: 2, long: 3 }[process.env.GEX_DEBUG_PANIC ?? ''] ?? 0,
+    debugPanic: { plain: 1, nested: 2, long: 3, prctl: 4 }[process.env.GEX_DEBUG_PANIC ?? ''] ?? 0,
     // GEX_TRAP_PC=0xADDR: plant a diagnostic breakpoint at that guest pc that
     // dumps the live registers (x30 = caller) and continues. Aimed at
     // __stack_chk_fail to name the smashed function.
@@ -686,6 +704,9 @@ const host = new ProcessHost({
     // GEX_PREGROW: grow guest memory to a large floor up front so runtime
     // memory.grow stops during startup -- probes the stale-bound-after-grow race.
     pregrow: !!process.env.GEX_PREGROW,
+    // GEX_NO_HEADROOM: the shared memory grows to what is asked only, with no
+    // headroom ahead (lib.rs `headroom`), for a test that reads its size.
+    noHeadroom: !!process.env.GEX_NO_HEADROOM,
     // GEX_HOT dumps the guest's hottest back edges on exit -- the browser's
     // answer to `--sample`, since a host profile is all `wasm-function[N]`.
     hot: !!process.env.GEX_HOT,
@@ -757,7 +778,7 @@ const host = new ProcessHost({
     if (pid !== 1) {
       if (process.env.GEX_DEBUG_EXIT) {
         const mem = m.memoryMib === undefined ? '' : `, memory ${m.memoryMib} MiB`;
-        process.stderr.write(`[gex] process ${pid} exited ${m.status}${mem}\n`);
+        process.stderr.write(`[gex] process ${pid} exited ${m.status}${mem}${arenaSaid(m)}${headroomSaid(m)}\n`);
       }
       return;
     }
@@ -769,7 +790,7 @@ const host = new ProcessHost({
     }
     // What this process's memory grew to; a run costs this times its process count.
     if (process.env.GEX_DEBUG_EXIT && m.memoryMib !== undefined) {
-      process.stderr.write(`[gex] memory ${m.memoryMib} MiB\n`);
+      process.stderr.write(`[gex] memory ${m.memoryMib} MiB${arenaSaid(m)}${headroomSaid(m)}\n`);
     }
     if (process.env.GEX_HOT) {
       // An empty answer is a question about the run, not a crash.
@@ -800,7 +821,7 @@ const host = new ProcessHost({
 });
 
 // `/dev/dsp`'s rings in the global kernel (hosts/kernel/src/audio.rs,
-// layout 2), as the page plays them (page/src/audio.js). GEX_AUDIO_TAP=1
+// layout 2), as the page plays them (runtime/src/host/audio.js). GEX_AUDIO_TAP=1
 // reports, at exit, what the newest quarter second of the slot written last
 // sounds like: its rate, generation, RMS and frequency (left channel, by
 // the spacing of its zero crossings), and how many slots were ever used.

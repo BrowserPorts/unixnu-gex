@@ -11,4 +11,7 @@
 # Its asm/ directories are links into usr/lib/linux/uapi: copy with -L.
 set -eu
 HERE=$(dirname "$(realpath "$0")")
-echo "$("$HERE/debian-package.sh" LINUX_HEADERS)/usr/include"
+# An assignment, so a failure to fetch or unpack stops here (set -e) rather
+# than naming the host's own /usr/include.
+root=$("$HERE/debian-package.sh" LINUX_HEADERS)
+echo "$root/usr/include"

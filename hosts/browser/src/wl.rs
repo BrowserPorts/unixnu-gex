@@ -302,6 +302,16 @@ pub extern "C" fn gex_set_wl_scale(scale: i32) {
     OUTPUT_SCALE.store(scale.clamp(1, 8), std::sync::atomic::Ordering::Relaxed);
 }
 
+static OUTPUT_SCALE120: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// The page's real devicePixelRatio in 120ths (180 for 1.5), when it is not
+/// whole: what `wp_fractional_scale_v1` tells a client, and what surface
+/// units are in. 0: the whole scale `gex_set_wl_scale` gave.
+#[no_mangle]
+pub extern "C" fn gex_set_wl_scale120(scale120: i32) {
+    OUTPUT_SCALE120.store(if scale120 > 0 { scale120.clamp(120, 960) } else { 0 }, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// This process's name in the compositor's scene arena: its pid.
 ///
 /// It has to be the *process's* and not the Worker's. A process's threads are
@@ -1124,6 +1134,10 @@ impl HostListener for WaylandDevice {
         let (w, h) = output_size();
         client.set_default_size(w, h);
         client.set_scale(OUTPUT_SCALE.load(std::sync::atomic::Ordering::Relaxed));
+        let s120 = OUTPUT_SCALE120.load(std::sync::atomic::Ordering::Relaxed);
+        if s120 > 0 {
+            client.set_scale120(s120);
+        }
         // the browser repeats a held key itself (keydowns with `repeat`)
         client.set_key_repeat(0, 600);
         let idx = {

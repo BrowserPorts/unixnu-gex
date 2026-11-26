@@ -1323,10 +1323,27 @@ int glGetSubroutineUniformLocation(unsigned program, unsigned shadertype, const 
     put_blob(a + 2, name, blob_len);
     flush(); return (int)reply_u32();
 }
+void glGetTexLevelParameteriv(unsigned target, int level, unsigned pname, int *params);
 void glGetTexImage(unsigned target, int level, unsigned format, unsigned type,
                        void *pixels) {
     if (bound_buffer(0x88EBu)) buffer_contents_unknown();
     int pbo = bound_buffer(0x88EBu) != 0; /* GL_PIXEL_PACK_BUFFER */
+    /* What GL writes into the caller's memory: the level's size (asked
+       before the command, whose reply is read last) laid out by this side's
+       own pack state. The host's geometry is checked against it, and no
+       byte goes past its end: a reply that disagrees wrote past the
+       caller's buffer into whatever followed it. */
+    int width = 0, height = 0, depth = 1;
+    struct gexgl_pixel_layout want = {0, 0, 0, 0};
+    const int three = target == 0x806Fu || target == 0x8C1Au || target == 0x9009u; /* 3D, 2D_ARRAY, CUBE_MAP_ARRAY */
+    if (!pbo) {
+        glGetTexLevelParameteriv(target, level, 0x1000u, &width);  /* GL_TEXTURE_WIDTH */
+        glGetTexLevelParameteriv(target, level, 0x1001u, &height); /* GL_TEXTURE_HEIGHT */
+        if (three) glGetTexLevelParameteriv(target, level, 0x8071u, &depth); /* GL_TEXTURE_DEPTH */
+        if (depth < 1) depth = 1;
+        if (!gexgl_compute_pixel_layout(format, type, width, height, three ? depth : -1, &pack_store, &want))
+            want.end = 0;
+    }
     uint32_t *a = begin(1247, 7, 0);
     if (!a) return;
     a[0] = target; a[1] = (uint32_t)level; a[2] = format; a[3] = type;
@@ -1350,11 +1367,26 @@ void glGetTexImage(unsigned target, int level, unsigned format, unsigned type,
     uint32_t images = reply_u32();
     uint32_t bytes = 0; const uint8_t *source = reply_blob(&bytes);
     if (!pixels || !source || !bytes) return;
+    const size_t group = gexgl_pixel_group_bytes(format, type);
+    if (offset != want.offset || row_stride != want.row_stride || rows != (uint32_t)height ||
+        row_bytes != group * (size_t)width || images != (uint32_t)(three ? depth : 1) ||
+        (images > 1 && image_stride != want.image_stride)) {
+        static int said;
+        if (!said) {
+            said = 1;
+            fprintf(stderr, "gexgl: glGetTexImage(0x%x, level %d): the host laid out offset %u, rows %u of %u bytes "
+                            "every %u, %u images every %u, where a %dx%dx%d level is offset %zu, rows of %zu every %zu, "
+                            "%zu bytes in all: only what fits is copied\n", target, level, offset, rows, row_bytes,
+                    row_stride, images, image_stride, width, height, three ? depth : 1, want.offset,
+                    group * (size_t)width, want.row_stride, want.end);
+        }
+    }
     for (uint32_t image = 0; image < images; ++image) {
         for (uint32_t row = 0; row < rows; ++row) {
             uint64_t at = (uint64_t)image * image_stride +
                           (uint64_t)row * row_stride;
             if (at > bytes || row_bytes > bytes - at) return;
+            if ((uint64_t)offset + at + row_bytes > want.end) return;
             memcpy((uint8_t *)pixels + offset + at, source + at, row_bytes);
         }
     }

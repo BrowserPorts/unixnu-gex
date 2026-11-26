@@ -442,6 +442,10 @@ pub struct MemoryMap {
     /// Wine's ntdll makes a view of each (`gex.host_data`), so a program's
     /// statics are committed memory to it.
     host_data: Vec<(u64, u64)>,
+    /// Of those, the ones still mapped: one an `unmap` covers whole is
+    /// listed in `host_data` again the other way round, `(end, start)`,
+    /// for Wine to drop its view of it.
+    host_live: Vec<(u64, u64)>,
     /// The end of the span the cursor last handed this map (`extend_arena`):
     /// where a free tail is looked for. Not simply the highest span, which
     /// may be an island above the cursor (see `back`).
@@ -899,6 +903,7 @@ impl MemoryMap {
             take_end: 0,
             fixed_only: Vec::new(),
             host_data: Vec::new(),
+            host_live: Vec::new(),
             log: MapLog::default(),
             perms: None,
         }
@@ -1242,10 +1247,15 @@ impl MemoryMap {
     pub fn note_host_data(&mut self, start: u64, end: u64) {
         if end > start {
             self.host_data.push((start, end));
+            self.host_live.push((start, end));
         }
     }
 
-    /// The host's native-module memory, in the order mapped (see `host_data`).
+    /// The host's native-module memory, in the order mapped (see `host_data`),
+    /// and after each range unmapped since, that range as `(end, start)`
+    /// (a thread's `dlopen` TLS chunks, at its end): Wine's view of it goes
+    /// too, or an address gex hands out there again is taken for part of it
+    /// (a section's first view: `gex_section_alias` in Wine's virtual.c).
     pub fn host_data(&self) -> &[(u64, u64)] {
         &self.host_data
     }
@@ -1428,6 +1438,30 @@ impl MemoryMap {
         }
         self.fixed_only.push((lo, hi));
         self.fixed_only.sort_unstable();
+    }
+
+    /// The highest `len` free bytes in `[lo, hi)`, page-aligned, inside
+    /// this map's arena and clear of every mapping and of the fixed-only
+    /// ranges: for a mapping that has to be in a window of its own (mapped
+    /// there then with `MAP_FIXED_NOREPLACE`).
+    pub fn find_free_down(&self, lo: u64, hi: u64, len: u64) -> Option<u64> {
+        for &(a, b) in self.arena.iter().rev() {
+            let (a, b) = (a.max(lo), b.min(hi));
+            let mut candidate = b;
+            while candidate >= a + len {
+                let start = page_align_down(candidate - len);
+                if start < a {
+                    break;
+                }
+                let mapped = self.vmas.iter().filter(|v| v.start < start + len && v.end > start).map(|v| v.start);
+                let fixed = self.fixed_only.iter().filter(|&&(x, y)| x < start + len && y > start).map(|&(x, _)| x);
+                match mapped.chain(fixed).min() {
+                    Some(below) => candidate = below,
+                    None => return Some(start),
+                }
+            }
+        }
+        None
     }
 
     /// The arena spans this map has been handed (sorted, disjoint).
@@ -2279,6 +2313,16 @@ impl MemoryMap {
         }
         out.sort_by_key(|v| v.start);
         self.vmas = out;
+        if !self.host_live.is_empty() {
+            let gone = &mut self.host_data;
+            self.host_live.retain(|&(a, b)| {
+                let covered = addr <= a && b <= end;
+                if covered {
+                    gone.push((b, a));
+                }
+                !covered
+            });
+        }
         Ok(())
     }
 

@@ -1,5 +1,5 @@
 //! The page's audio device: `/dev/dsp`'s streams, mixed and played by the
-//! page's AudioWorklet (page/src/audio.js), which reads this memory through
+//! page's AudioWorklet (runtime/src/host/audio.js), which reads this memory through
 //! the global kernel's `SharedArrayBuffer`.
 //!
 //! Each open `/dev/dsp` that writes gets one of [`SLOTS`] rings of stereo

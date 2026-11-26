@@ -1,21 +1,21 @@
 // The runtime README's examples, run as written on the test page, and every
 // class and member its tables name, there. Each example is a ```js block of
-// page/runtime/README.md, in its order; a page has one System, so each phase
+// runtime/README.md, in its order; a page has one System, so each phase
 // (t.reload) runs the blocks that share one. What an example takes from the
 // page around it (a terminal widget, a desktop's frames, a button) is a stub
 // here; its `@gexemu/runtime` imports are the runtime's modules; its trees are the
 // slim Debian image (bash, uname). A block the README gains or loses fails
 // the block count, so a new example is never left unrun.
-import readme from '../../page/runtime/README.md?raw';
-import * as index from '../../page/runtime/src/index.js';
-import * as fsMod from '../../page/runtime/src/fs.js';
-import * as host from '../../page/runtime/src/windows/host.js';
-import * as single from '../../page/runtime/src/windows/single.js';
-import * as compositor from '../../page/runtime/src/windows/compositor.js';
-import * as wisp from '../../page/runtime/src/net/wisp.mjs';
-import * as audio from '../../page/runtime/src/audio.js';
-import * as gl from '../../page/runtime/src/gl.js';
-import * as input from '../../page/runtime/src/input.js';
+import * as index from '../../runtime/src/index.js';
+import * as fsMod from '../../runtime/src/fs.js';
+import * as host from '../../runtime/src/windows/host.js';
+import * as single from '../../runtime/src/windows/single.js';
+import * as compositor from '../../runtime/src/windows/compositor.js';
+import * as wisp from '../../runtime/src/net/wisp.mjs';
+import * as audio from '../../runtime/src/audio.js';
+import * as gl from '../../runtime/src/gl.js';
+import * as input from '../../runtime/src/input.js';
+import * as drop from '../../runtime/src/drop.js';
 import { SP_CODE, MP_CODE } from '../../hosts/browser/js/mode.mjs';
 
 export const meta = { hosts: ['browser'], images: ['slim'], timeout: 600 };
@@ -24,15 +24,22 @@ const M = {
   '@gexemu/runtime': index, '@gexemu/runtime/fs': fsMod, '@gexemu/runtime/windows/host': host,
   '@gexemu/runtime/windows/single': single, '@gexemu/runtime/windows/compositor': compositor,
   '@gexemu/runtime/net/wisp': wisp, '@gexemu/runtime/audio': audio, '@gexemu/runtime/gl': gl, '@gexemu/runtime/input': input,
+  '@gexemu/runtime/drop': drop,
 };
 // The single-thread build (system.js `SINGLE`).
 const SINGLE = !MP_CODE || (SP_CODE && typeof SharedArrayBuffer !== 'function');
+const readme = await (await fetch(new URL('../../runtime/README.md', import.meta.url))).text();
 const BLOCKS = [...readme.matchAll(/```js\n([\s\S]*?)```/g)].map((m) => m[1]);
 
 /** Each phase: the blocks it runs (indices into BLOCKS), what it makes
  *  first when its blocks start from a system they do not make (`pre`:
- *  'new' a System and Filesystem with the tree; 'booted' those, booted),
- *  whether they make windows (`windows`), and what is checked after. */
+ *  'new' a System and Filesystem with the tree; 'empty' those without it,
+ *  for blocks that lay it; 'booted' those, booted),
+ *  whether they make windows (`windows`), what the page around them has
+ *  (`page`: code before them), and what is checked after. A `module` is a
+ *  block that is a module of its own, not run: the blocks name it by its
+ *  file name, served from a Blob. `single`: why the single-thread build
+ *  does not run them. */
 const PHASES = [
   { blocks: [0], check: async (t, v) => {
     t.check('intro: uname -a', v.code === 0 && /Linux/.test(v.stdout), `exit ${v.code}: ${v.stdout}${JSON.stringify(v.sys.state.console.slice(-600))}`);
@@ -63,42 +70,55 @@ const PHASES = [
     const sums = r.stdout.trim().split('\n').map((l) => l.split(' ')[0]);
     t.check('a store of the page\'s own: 40 MiB copied through it', r.code === 0 && sums.length === 2 && sums[0] === sums[1], `exit ${r.code}: ${r.stdout}${r.stderr}`);
   } },
-  { blocks: [5], before: () => fsMod.OPFSFilesystem.erase('my-tree'), check: async (t, v) => {
+  { blocks: [6], module: [5, './source.js'], pre: 'empty', boot: true, lazy: true, refusedSingle: /single-thread build has no owner/, check: async (t, v) => {
+    // The lazy file's key, as the work directory has it: 3 MiB of 7s.
+    const r = await t.timeout(v.sys.run(['sh', '-c', 'head -c 4 /usr/share/big.dat | od -An -tu1'], { env: { PATH: '/usr/bin:/bin' } }), 60000, 'lazy read');
+    t.eq('lazy sources: a program reads the file from the page\'s source', [r.code, r.stdout.trim().split(/\s+/).join(' ')], [0, '7 7 7 7']);
+  } },
+  { blocks: [7], before: () => fsMod.OPFSFilesystem.erase('my-tree'), check: async (t, v) => {
     const r = await t.timeout(v.sys.run(['sh', '-c', 'echo kept > /root/kept && sync'], { env: { PATH: '/usr/bin:/bin' } }), 30000, 'kept');
     t.eq('persistence: a file written and synced', [r.code, r.stderr], [0, '']);
     t.eq('persistence: sys.sync()', await v.sys.sync().then(() => 'ok', (e) => e.code ?? e.message), 'ok');
   } },
-  { blocks: [6, 7], pre: 'booted', check: async (t, v) => {
+  { blocks: [8, 9], pre: 'booted', check: async (t, v) => {
     t.check('network: the last one set, a Wisp', v.sys.network instanceof wisp.Wisp && v.sys.network.url === 'wss://wisp.example/', String(v.sys.network?.url));
   } },
-  { blocks: [8], pre: 'booted', check: async (t, v) => {
+  { blocks: [10], pre: 'booted', check: async (t, v) => {
     // The guest half, as the README's comment has it.
-    const r = await t.timeout(v.sys.run(['sh', '-c', guestLine(BLOCKS[8], 'perl ')], { env: { PATH: '/usr/bin:/bin' } }), 30000, 'unix client');
+    const r = await t.timeout(v.sys.run(['sh', '-c', guestLine(BLOCKS[10], 'perl ')], { env: { PATH: '/usr/bin:/bin' } }), 30000, 'unix client');
     t.eq('unix sockets: a program\'s connect to sys.listen\'s, echoed', [r.code, r.stdout, r.stderr], [0, 'hello\n', '']);
     t.eq('unix sockets: the socket file', (await v.fs.stat('/run/app.sock', { follow: false })).type, 'socket');
   } },
-  { blocks: [9], pre: 'booted', prep: async (t, sys, fs) => {
+  { blocks: [11], pre: 'booted', prep: async (t, sys, fs) => {
     // The guest server the block connects to, as the README's comment has it.
-    sys.spawn(['sh', '-c', guestLine(BLOCKS[9], 'perl ')], { env: { PATH: '/usr/bin:/bin' } });
+    sys.spawn(['sh', '-c', guestLine(BLOCKS[11], 'perl ')], { env: { PATH: '/usr/bin:/bin' } });
     await t.until(async () => (await fs.stat('/run/myd.sock').catch(() => null))?.type === 'socket', 'the guest server listens', 30000);
   }, check: async (t, v) => {
     t.eq('unix sockets: sys.connect to a program\'s server', v.reply, 'HELLO\n');
   } },
-  { blocks: [10], pre: 'booted', check: async (t, v) => {
-    const r = await t.timeout(v.sys.run(['sh', '-c', guestLine(BLOCKS[10], 'exec 3<>')], { env: { PATH: '/usr/bin:/bin' } }), 30000, 'notify');
+  { blocks: [12], pre: 'booted', check: async (t, v) => {
+    const r = await t.timeout(v.sys.run(['sh', '-c', guestLine(BLOCKS[12], 'exec 3<>')], { env: { PATH: '/usr/bin:/bin' } }), 30000, 'notify');
     t.eq('host calls: the guest reads "\\0true"', [r.code, r.stdout], [0, '\0true']);
     t.eq('host calls: notify ran', v.calls.showToast, 'built');
     v.off();
     t.eq('host calls: unregistered', v.sys.hostCalls.names().includes('notify'), false);
   } },
-  { blocks: [12], windows: true, pre: 'new', after: [11], boot: true, check: async (t, v) => {
+  { blocks: [14], windows: true, pre: 'new', after: [13], boot: true, check: async (t, v) => {
     t.check('GL: a MesaGl before boot, beside its windows', !!v.gl && !!v.hw, '');
     v.button.onclick();
     t.check('audio: the click made a WebAudio', true, '');
   } },
-  { blocks: [13], windows: true, pre: 'new', check: async (t, v) => {
+  { blocks: [15], windows: true, pre: 'new', check: async (t, v) => {
     t.eq('windows: running', v.sys.state.phase, 'running');
-    t.check('windows: hw.env', !!v.hw.env.WAYLAND_DISPLAY, JSON.stringify(v.hw.env));
+    t.check('windows: hw.env, with no X display unless asked', !!v.hw.env.WAYLAND_DISPLAY && !('DISPLAY' in v.hw.env), JSON.stringify(v.hw.env));
+  } },
+  { blocks: [16], pre: 'booted', single: 'the drop Worker needs the shared kernel',
+    page: "const { HostDrop } = M['@gexemu/runtime/drop']; const windows = undefined;", check: async (t, v) => {
+    // A drop as the browser gives one: an array of Files, as a FileList would be.
+    v.canvas.on.dragover({ preventDefault() {} });
+    v.canvas.on.drop({ preventDefault() {}, dataTransfer: [new File(['dropped\n'], 'note.txt')], clientX: 5, clientY: 5 });
+    await t.until(async () => (await v.fs.stat('/root/Desktop/note.txt').catch(() => null))?.type === 'file', 'drop: the file reaches the fallback', 30000);
+    t.eq('drop: its text', await v.fs.readFile('/root/Desktop/note.txt', { encoding: 'utf-8' }), 'dropped\n');
   } },
 ];
 
@@ -129,23 +149,36 @@ const button = { onclick: null };
 const showToast = (title) => { calls.showToast = title; };
 const openBrowserWindow = (url) => { calls.openBrowserWindow = url; };
 const closeTerminalWindow = () => { calls.closeTerminalWindow = true; };
+const canvas = { on: {}, addEventListener(name, fn) { this.on[name] = fn; } };
 `;
-const NAMES = ['sys', 'fs', 'hw', 'sh', 'env', 'code', 'stdout', 'gl', 'off', 'term', 'button', 'srv', 'conn', 'reply'];
+const NAMES = ['sys', 'fs', 'hw', 'sh', 'env', 'code', 'stdout', 'gl', 'off', 'term', 'button', 'srv', 'conn', 'reply', 'canvas', 'drop'];
 
 export default async function (t) {
   const { eq, check, say } = t;
   if (t.phase === 1) {
-    eq('the README\'s examples', BLOCKS.length, 14);
+    eq('the README\'s examples', BLOCKS.length, 17);
     members(t);
   }
   const phase = PHASES[t.phase - 1];
   const tree = t.work('slim/debian-slim.tar.zst');
+  if (SINGLE && phase.single) {
+    say(`phase ${t.phase}: blocks ${phase.blocks.join(', ')} not run: ${phase.single}`);
+    return t.phase < PHASES.length ? t.reload() : undefined;
+  }
   await phase.before?.();
   const pre = phase.pre === undefined ? '' : `const { System } = M['@gexemu/runtime']; const { MemoryFilesystem } = M['@gexemu/runtime/fs'];
-const sys = new System({ baseUrl: BASE, debug: DEBUG }); const fs = new MemoryFilesystem(sys); fs.addTar(${JSON.stringify(tree)});
+const sys = new System({ baseUrl: BASE, debug: DEBUG }); const fs = new MemoryFilesystem(sys); ${phase.pre === 'empty' ? '' : `fs.addTar(${JSON.stringify(tree)});`}
 ${phase.pre === 'booted' ? 'await sys.boot();' : ''}`;
   // What the blocks need running in the guest first (`prep`).
-  const parts = [STUBS, pre, phase.prep ? 'await PREP(sys, fs);' : '', ...phase.blocks.map((i) => prepare(BLOCKS[i], tree))];
+  let blocks = phase.blocks.map((i) => prepare(BLOCKS[i], tree));
+  if (phase.module) {
+    const [i, name] = phase.module;
+    const url = URL.createObjectURL(new Blob([BLOCKS[i]], { type: 'text/javascript' }));
+    blocks = blocks.map((b) => b.replace(`new URL('${name}', import.meta.url)`, JSON.stringify(url)));
+  }
+  // A lazy file's key and base: the work directory's lazy.bin.
+  if (phase.lazy) blocks = blocks.map((b) => b.replace('location.href', JSON.stringify(t.work(''))).replace("'files/big.dat'", "'lazy.bin'"));
+  const parts = [STUBS, phase.page ?? '', pre, phase.prep ? 'await PREP(sys, fs);' : '', ...blocks];
   if (phase.boot) parts.push('await sys.boot();');
   for (const i of phase.after ?? []) parts.push(prepare(BLOCKS[i], tree));
   // `new System()` as the README has it, with the runner's base (where it
@@ -189,6 +222,7 @@ function members(t) {
     'GuestWindow': [host.GuestWindow.prototype, ['parent', 'pid', 'title', 'width', 'height', 'decorations', 'placed', 'x', 'y', 'place', 'resize', 'setStates', 'focus', 'close', 'appId']],
     'SingleCanvas': [single.SingleCanvas.prototype, ['env', 'describe', 'resized']],
     'CompositorWindows': [compositor.CompositorWindows.prototype, ['env', 'resize', 'describe']],
+    'HostDrop': [drop.HostDrop.prototype, ['drop', 'windowAt']],
   };
   for (const [name, [proto, names]] of Object.entries(want)) {
     const missing = names.filter((n) => !(n in proto));

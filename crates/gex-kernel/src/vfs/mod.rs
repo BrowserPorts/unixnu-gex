@@ -786,6 +786,18 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     fn as_inotify(self: Arc<Self>) -> Option<Arc<crate::inotify::Inotify>> {
         None
     }
+    /// This handle as itself, for a filesystem that recognises its own
+    /// handles ([`FileHandle::share_from`]).
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
+    /// This (empty) file made a copy of all of `src` that shares its bytes
+    /// until either is written, where the filesystem can: the size copied.
+    /// `None` where it cannot (another filesystem, a file whose bytes are
+    /// not all here); the caller copies them itself.
+    fn share_from(&self, _src: &dyn FileHandle) -> Option<SysResult> {
+        None
+    }
     fn as_memfd(self: Arc<Self>) -> Option<Arc<crate::unix::MemFd>> {
         None
     }
@@ -1573,6 +1585,29 @@ impl std::ops::Deref for Vfs {
     type Target = Namespace;
     fn deref(&self) -> &Namespace {
         &self.ns
+    }
+}
+
+/// The guest's own `/dev/shm` (shm_open's: a [`TmpFs`]) over the host
+/// directory `host` (the host's `/dev/shm`, when the guest's root is the
+/// host's): each directory already in `host` (a ramdisk work tree, such as
+/// a test's dist copy or a program run from there) is mounted at
+/// `<at>/<name>` as the host's, so a host path the guest is handed still
+/// opens. Before this, the TmpFs hid all of them, and a Wine whose dist was on
+/// tmpfs failed with "could not load ntdll.so". Files directly in `host`
+/// (other programs' shm objects) stay hidden, and a directory made there
+/// after start is the guest's own. Symlinks to directories count as
+/// directories.
+#[cfg(unix)]
+pub fn mount_dev_shm(vfs: &mut Vfs, at: &str, host: &std::path::Path) {
+    vfs.mount(at, Arc::new(TmpFs::new()));
+    let Ok(dir) = std::fs::read_dir(host) else { return };
+    for e in dir.flatten() {
+        let (path, name) = (e.path(), e.file_name());
+        let Some(name) = name.to_str() else { continue };
+        if std::fs::metadata(&path).is_ok_and(|m| m.is_dir()) {
+            vfs.mount(&format!("{}/{name}", at.trim_end_matches('/')), Arc::new(HostFs::new(path)));
+        }
     }
 }
 
@@ -2600,6 +2635,27 @@ mod tests {
         assert_eq!(parent_of("/a"), "/");
         assert_eq!(basename("/a/b/c"), "c");
         assert_eq!(basename("c"), "c");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dev_shm_keeps_the_hosts_directories() {
+        let host = std::env::temp_dir().join(format!("gex-shm-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&host);
+        std::fs::create_dir_all(host.join("work/dist")).unwrap();
+        std::fs::write(host.join("work/dist/ntdll.so"), b"elf").unwrap();
+        std::fs::write(host.join("other.shm"), b"x").unwrap();
+        let mut vfs = Vfs::new();
+        vfs.mount("/", Arc::new(TmpFs::new()));
+        mount_dev_shm(&mut vfs, "/dev/shm", &host);
+        // the host's directory, through the guest's /dev/shm
+        assert!(vfs.metadata("/dev/shm/work/dist/ntdll.so").is_ok());
+        assert!(vfs.open("/dev/shm/work/dist/ntdll.so", 0, 0).is_ok());
+        // a host shm object stays hidden; the guest's own go to its TmpFs
+        assert!(vfs.metadata("/dev/shm/other.shm").is_err());
+        assert!(vfs.open("/dev/shm/mine", 0o102, 0o600).is_ok());
+        assert!(!host.join("mine").exists());
+        std::fs::remove_dir_all(&host).unwrap();
     }
 
     #[test]

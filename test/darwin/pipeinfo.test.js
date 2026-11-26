@@ -8,8 +8,8 @@
 // PIPE_WSELECT, PIPE_EOF). Standard input, written and closed by the page,
 // is at its end with no peer; standard output has the page's reader for a
 // peer, and the global kernel's pipe's 64 KiB buffer.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
 
 export const meta = { hosts: ['browser'], arches: ['a64'], images: ['darwin-static'], timeout: 300 };
 

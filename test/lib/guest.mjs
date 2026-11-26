@@ -15,7 +15,7 @@ import { join, basename } from 'node:path';
 
 export const ROOT = join(import.meta.dirname, '..', '..');
 const PROGRAMS = join(import.meta.dirname, '..', 'fixtures', 'programs');
-const PUB = join(ROOT, 'page/public/gex');
+const PUB = join(ROOT, 'runtime/files/out/gex');
 
 const which = (cmd) => {
   try {
@@ -58,7 +58,7 @@ export function guest(t) {
     env: x86 ? { GEX_ARCH: 'x86' } : {},
     need,
     tool,
-    /** A file of the page's shims (`page/public/gex/NAME`, `{infix}` this
+    /** A file of the page's shims (`runtime/files/out/gex/NAME`, `{infix}` this
      *  arch's infix: '' or '.x86'), or a skip. */
     pub: (name) => need(join(PUB, name.replace('{infix}', infix))),
     /**

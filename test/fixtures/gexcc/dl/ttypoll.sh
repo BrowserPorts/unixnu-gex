@@ -5,11 +5,11 @@
 # key without it.
 #
 #   test/fixtures/gexcc/dl/ttypoll.sh DIR   (gexcc and node on PATH; GEX_ROOT: a gex
-#                                 checkout with page/public/gex built)
+#                                 checkout with runtime/files/out/gex built)
 set -u
 command -v gexcc > /dev/null || { echo "skip ttypoll: gexcc not on PATH (toolchain/gexcc/install.sh)"; exit 0; }
 ROOT=${GEX_ROOT:?set GEX_ROOT to a gex checkout}
-SEED=$ROOT/page/public/gex/seed.shared.wasm
+SEED=$ROOT/runtime/files/out/gex/seed.shared.wasm
 [ -f "$SEED" ] || { echo "skip ttypoll: no $SEED"; exit 0; }
 HERE=$(cd "$(dirname "$0")" && pwd)
 W=$(mktemp -d "${1:?DIR}/ttypoll.XXXXXX")

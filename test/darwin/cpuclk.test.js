@@ -9,8 +9,8 @@
 // THREAD_BASIC_INFO's cpu_usage needs the scheduler's load averages, which
 // no maintenance thread keeps in the page. The run is not strict: a strict
 // one stops at the first report.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
 
 export const meta = { hosts: ['browser'], arches: ['a64'], images: ['darwin-static'], timeout: 300 };
 

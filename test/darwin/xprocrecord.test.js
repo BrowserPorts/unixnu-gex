@@ -6,8 +6,8 @@
 // the global kernel its record as it changes, and the second finds the
 // first's there, and kill finds the first by it (signal 0); the run is
 // strict, so a report would stop it.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
 
 export const meta = { hosts: ['browser'], arches: ['a64'], images: ['darwin-static'], timeout: 300 };
 

@@ -11,7 +11,7 @@
 //! `exec 3<>/dev/gex-host; printf 'notify\0{"t":1}' >&3; cat <&3`.
 //!
 //! The device is there where the host serves calls: a page's runtime
-//! (page/runtime System `hostCalls`), over the channel its mounts use
+//! (runtime System `hostCalls`), over the channel its mounts use
 //! (hosts/kernel `k_host_call`).
 
 use super::{FileHandle, FileType, Metadata};

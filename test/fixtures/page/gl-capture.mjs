@@ -16,7 +16,7 @@ import { join as gexJoin } from 'node:path';
 // gex: the checkout these fixtures are in, or GEX_ROOT.
 const GEX_ROOT = process.env.GEX_ROOT || gexJoin(import.meta.dirname, '..', '..', '..');
 const gexUrl = (p) => gexPathToFileURL(gexJoin(GEX_ROOT, p)).href;
-const { GlCapture, captureIfRequested } = await import(gexUrl('page/src/gl-capture.js'));
+const { GlCapture, captureIfRequested } = await import(gexUrl('runtime/src/host/gl-capture.js'));
 
 let failed = 0;
 const check = (what, cond, detail = '') => {

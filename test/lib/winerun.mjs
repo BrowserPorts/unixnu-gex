@@ -25,7 +25,7 @@
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
-  appendFileSync, closeSync, copyFileSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync,
+  appendFileSync, closeSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync,
   renameSync, rmSync, statSync, writeFileSync,
 } from 'node:fs';
 import { basename, join } from 'node:path';
@@ -36,6 +36,10 @@ export { ROOT };
 export const FIXTURES = join(import.meta.dirname, '..', 'fixtures', 'wow64');
 /** The loader, in the install. */
 export const LOADER = 'lib/wine/x86_64-unix/wine';
+/** The Windows user a prefix's profile is made for: wine/dist.sh makes the
+ *  prefix as USER=gex, and wine/page-prefix.sh keeps that profile (PAGE_USER,
+ *  default gex). */
+export const PREFIX_USER = 'gex';
 // A run's lines saying why a process died: the runtime's, and Wine's fatal ones.
 const DEATH = /^\[gex\] pid \d+ killed by|^\[gex\] pid \d+: a vfork child|gex: (process|thread) \S+ failed|panicked at|RuntimeError|RangeError/;
 const WINE_FATAL = /^wine: |wineserver: |:err:(process|module|virtual|server|sync):/;
@@ -268,7 +272,9 @@ export function wow64(t, { mono = false } = {}) {
 }
 
 /** 64-bit Wine for a 64-bit program; `door` its WINEGEX_DOOR (the LP64
- *  door call, as the page has it; 0: none; null: not set). `native`: the install with the
+ *  door call, as the page has it; 0: none; null: not set). An install with an i386 side
+ *  (lib/wine/i386-windows) also takes 32-bit programs, as the site and wine/run.sh do
+ *  (WINEGEX_WOW64). `native`: the install with the
  *  native PE core GEX_TEST_WINE64_NATIVE in place of its own (a skip
  *  without it). `mem64`: the memory64 flavour's install and prefix,
  *  GEX_TEST_WINE64_M64_DIST and _PREFIX. */
@@ -278,7 +284,7 @@ export function wine64(t, { door = 1, native = false, mem64 = false } = {}) {
   const distSrc = env[D] || t.skip(`${D}: a 64-bit Wine install (wine/dist.sh${mem64 ? ', WINE64_MEM64=1' : ''})`);
   const pfxSrc = env[P] || t.skip(`${P}: its prefix (wine/dist.sh's WINE64_PREFIX)`);
   const nativeSrc = native ? (env.GEX_TEST_WINE64_NATIVE || t.skip('GEX_TEST_WINE64_NATIVE: a native PE core (wine/dist.sh\'s WINE64_NATIVE)')) : null;
-  return session(t, { kind: mem64 ? 'wine64-m64' : native ? 'wine64-pe' : 'wine64', distSrc, pfxSrc, nativeSrc, wineEnv: { ...WINE64_ENV, ...(door !== null && { WINEGEX_DOOR: String(door) }) }, mount: '/wine64', mingwTriple: 'x86_64' });
+  return session(t, { kind: mem64 ? 'wine64-m64' : native ? 'wine64-pe' : 'wine64', distSrc, pfxSrc, nativeSrc, wineEnv: { ...WINE64_ENV, ...(door !== null && { WINEGEX_DOOR: String(door) }), ...(existsSync(join(distSrc, 'lib/wine/i386-windows')) && { WINEGEX_WOW64: '1' }) }, mount: '/wine64', mingwTriple: 'x86_64' });
 }
 
 function session(t, { kind, distSrc, pfxSrc, monoSrc = null, nativeSrc = null, wineEnv: WENV, mount, mingwTriple }) {
@@ -378,20 +384,33 @@ function session(t, { kind, distSrc, pfxSrc, monoSrc = null, nativeSrc = null, w
       if (!existsSync(gexc)) t.skip(`${gexc} is not built`);
       const p = pfx(`${name}-pfx`, files, { userReg, from });
       await setup?.(p);
+      let wl;
       if (wayland) {
-        const wl = join(work, `${name}-wl`);
-        rmSync(wl, { recursive: true, force: true });
-        mkdirSync(wl);
-        // (--wayland names the socket, in a directory of the run's own)
-        flags = [...flags, '--wayland', join(wl, 'wayland-0'), '--wayland-size', wayland.size ?? '640x480', '--wayland-out', wayland.out ?? 'null'];
+        // --wayland names the socket, in a directory of the run's own. A socket's path must fit sun_path (108
+        // bytes with its NUL), which a deep work dir overflows, and then Wine's driver cannot connect and falls
+        // back to no display: the directory is a short one under /tmp, removed after the run.
+        wl = mkdtempSync('/tmp/gexwl-');
+        const sock = join(wl, 'wayland-0');
+        if (Buffer.byteLength(sock) + 1 > 108) {
+          rmSync(wl, { recursive: true, force: true });
+          throw new Error(`the Wayland socket path ${sock} is ${Buffer.byteLength(sock) + 1} bytes with its NUL, over sun_path's 108`);
+        }
+        flags = [...flags, '--wayland', sock, '--wayland-size', wayland.size ?? '640x480', '--wayland-out', wayland.out ?? 'null'];
       }
-      const we = { WINEPREFIX: p, ...WENV, ...wineEnv };
+      // As the user the prefix's profile is made for (PREFIX_USER): Wine names
+      // the profile after $USER, and the host's user has none in the prefix
+      // (no Desktop: a .lnk's ShellExecute fails).
+      const we = { WINEPREFIX: p, USER: PREFIX_USER, LOGNAME: PREFIX_USER, ...WENV, ...wineEnv };
       const argv = [gexc, 'run', ...flags, ...Object.entries(we).flatMap(([k, v]) => ['--env', `${k}=${v}`]), loader, ...args.map(String)];
       // Not the host's display: gexc --wayland sets WAYLAND_DISPLAY and
       // XDG_RUNTIME_DIR to its own compositor only when they are not given.
       const { WAYLAND_DISPLAY, XDG_RUNTIME_DIR, DISPLAY, ...host } = base;
-      const r = await run(argv, { cwd: cwd ?? join(p, 'drive_c'), env: { ...host, ...more }, timeout, until, file: join(work, `${name}.log`), ...(split && { errFile: join(work, `${name}.err`) }) });
-      return { ...r, pfx: p };
+      try {
+        const r = await run(argv, { cwd: cwd ?? join(p, 'drive_c'), env: { ...host, ...more }, timeout, until, file: join(work, `${name}.log`), ...(split && { errFile: join(work, `${name}.err`) }) });
+        return { ...r, pfx: p };
+      } finally {
+        if (wl) rmSync(wl, { recursive: true, force: true });
+      }
     },
     /**
      * Wine on the page's x86 shared shim with `args`: the install at
@@ -486,11 +505,11 @@ function session(t, { kind, distSrc, pfxSrc, monoSrc = null, nativeSrc = null, w
     /** `src` built with the gexcc-win install GEX_TEST_GEXCC_WIN (a skip
      *  without it) as `out` in the run's directory, beside its .wasm:
      *  `args` the compiler's (g++ for a .cpp). */
-    async gexccWin(src, out, args = []) {
+    async gexccWin(src, out, args = [], { env: more = {} } = {}) {
       const cc = env.GEX_TEST_GEXCC_WIN || t.skip('GEX_TEST_GEXCC_WIN: a gexcc-win install (toolchain/gexcc/windows/install.sh)');
       const exe = join(work, out);
       mkdirSync(join(exe, '..'), { recursive: true });
-      const r = await run([join(cc, 'bin', `x86_64-w64-mingw32-${/\.cpp$/.test(src) ? 'g++' : 'gcc'}`), ...args, '-o', exe, src], { file: `${exe}.build` });
+      const r = await run([join(cc, 'bin', `x86_64-w64-mingw32-${/\.cpp$/.test(src) ? 'g++' : 'gcc'}`), ...args, '-o', exe, src], { file: `${exe}.build`, env: { ...env, ...more } });
       if (r.code !== 0) throw new Error(`gexcc-win ${basename(src)}: ${r.out.trim().split('\n').slice(-5).join(' / ')}`);
       return exe;
     },
@@ -508,7 +527,9 @@ function session(t, { kind, distSrc, pfxSrc, monoSrc = null, nativeSrc = null, w
      * 2 GiB: a Wine that takes it for 4 GiB tries the top for each stack).
      * `env`: node's or gexc's own. Checks it, and resolves the run.
      */
-    async nt({ name, code = 0, want, exe, args = [], extra = [], nullDriver = false, wayland, gl = false, wineEnv = {}, timeout = 300000, page, env: more = {} }) {
+    async nt({ name, code = 0, want, exe, args = [], extra = [], nullDriver = false, wayland, gl = false, wineEnv = {}, timeout = 300000, page, env: more = {}, known }) {
+      // `known`: who has this run's failure (t.known), when it is one today
+      const check = known ? (what, ok, detail) => t.known(what, ok, detail, known) : (what, ok, detail) => t.check(what, ok, detail);
       let r;
       try {
         const src = exe.includes('/') ? exe : w.prog(exe);
@@ -532,12 +553,13 @@ function session(t, { kind, distSrc, pfxSrc, monoSrc = null, nativeSrc = null, w
         // (the runtime's own lines, which a GEX_LOG past `off` says on stdout, out)
         r.stdout = r.out.replace(/\r/g, '').split('\n').filter((l) => !l.startsWith('[gex] ')).join('\n').replace(/\n$/, '');
         const oom = page ? (r.err.match(/mmap\(\) error Out of memory/g) ?? []).length : 0;
-        let why = r.code !== code ? `exit ${r.code} (want ${code})` : oom ? `${oom} mmap ENOMEM ERR lines` : !new RegExp(`^(?:${want.source})$`).test(r.stdout) ? `its output is not /${want.source.slice(0, 120)}/` : '';
+        // (`code` null: any exit, but an exit)
+        let why = (code === null ? r.timedOut : r.code !== code) ? `exit ${r.code} (want ${code ?? 'any'})` : oom ? `${oom} mmap ENOMEM ERR lines` : !new RegExp(`^(?:${want.source})$`).test(r.stdout) ? `its output is not /${want.source.slice(0, 120)}/` : '';
         if (!why && out) why = frames(out, wayland.colors, wayland) ?? '';
-        t.check(`${name}: exit ${code}, its output${out ? ', its frames' : ''}`, !why, `${why}; stdout ${JSON.stringify(r.stdout.slice(-300))}; ${w.detail({ ...r, out: '' }, 6)}`);
+        check(`${name}: exit ${code ?? 'any'}, its output${out ? ', its frames' : ''}`, !why, `${why}; stdout ${JSON.stringify(r.stdout.slice(-300))}; ${w.detail({ ...r, out: '' }, 6)}`);
       } catch (e) {
         if (e instanceof Skip) throw e;
-        t.check(`${name}: exit ${code}, its output`, false, String(e?.message ?? e));
+        check(`${name}: exit ${code}, its output`, false, String(e?.message ?? e));
       }
       return r;
     },

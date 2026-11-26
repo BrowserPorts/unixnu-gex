@@ -6,8 +6,8 @@
 	url = https://github.com/KhronosGroup/VK-GL-CTS.git
 [submodule "third_party/mesa"]
 	path = third_party/mesa
-	url = https://github.com/MercuryWorkshop/mesa-wink.git
-	branch = wink
+	url = https://github.com/BrowserPorts/mesa-stellite.git
+	branch = stellite
 [submodule "third_party/WebMetal"]
 	path = third_party/WebMetal
 	url = https://github.com/BrowserPorts/WebMetal.git

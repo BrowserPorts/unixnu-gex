@@ -40,6 +40,11 @@ pub struct Remote {
     pub truncate: extern "C" fn(handle: i32, len: u64) -> i32,
     /// [`FileHandle::advise`]: 0 or a negated errno.
     pub advise: extern "C" fn(handle: i32, offset: u64, len: u64, advice: u32) -> i32,
+    /// [`FileHandle::share_from`]: handle `dst` (empty) made a copy of all
+    /// of `src` that shares its bytes until written. The size copied, a
+    /// negated errno, or [`NOT_SHARED`] where the file system cannot (the
+    /// caller copies the bytes itself).
+    pub share: extern "C" fn(dst: i32, src: i32) -> i64,
     /// [`FileHandle::sync`] (`data_only` 1 for `fdatasync`): 0 or a negated errno.
     pub sync: extern "C" fn(handle: i32, data_only: u32) -> i32,
     /// Write the directory listing at `at`, or `-ERANGE` if `cap` is short
@@ -467,9 +472,22 @@ pub fn adopt(remote: Remote, id: i32) -> Arc<dyn FileHandle> {
     Arc::new(RemoteHandle { id, remote })
 }
 
+/// [`Remote::share`]'s answer where the file system cannot share.
+pub const NOT_SHARED: i64 = i64::MIN;
+
 impl FileHandle for RemoteHandle {
     fn remote_id(&self) -> Option<i32> {
         Some(self.id)
+    }
+
+    /// Both files the global kernel's: shared there.
+    fn share_from(&self, src: &dyn FileHandle) -> Option<SysResult> {
+        let src = src.remote_id()?;
+        match (self.remote.share)(self.id, src) {
+            NOT_SHARED => None,
+            n if n < 0 => Some(Err(Errno((-n) as i32))),
+            n => Some(Ok(n as u64)),
+        }
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> SysResult {

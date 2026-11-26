@@ -8,8 +8,8 @@
 // which the global kernel's record says, and each fails with its report
 // (gex_kernel::darwin::held) where it would otherwise have found nothing.
 // The run is not strict: a strict one stops at the first report.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
 
 export const meta = { hosts: ['browser'], arches: ['a64'], images: ['darwin-static'], timeout: 300 };
 

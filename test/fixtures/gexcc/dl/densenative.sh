@@ -7,13 +7,13 @@
 # no dispatch table 1-7.
 #
 #   test/fixtures/gexcc/dl/densenative.sh DIR   (gexcc on PATH; GEX_ROOT: a gex checkout
-#                                     with page/public/gex built for x86, or
+#                                     with runtime/files/out/gex built for x86, or
 #                                     GEX_WEB_DIR; DIR: where gex can see,
 #                                     not /dev/shm)
 set -u
 command -v gexcc > /dev/null || { echo "skip densenative: gexcc not on PATH (toolchain/gexcc/install.sh)"; exit 0; }
 ROOT=${GEX_ROOT:?set GEX_ROOT to a gex checkout}
-WEB=${GEX_WEB_DIR:-$ROOT/page/public/gex}
+WEB=${GEX_WEB_DIR:-$ROOT/runtime/files/out/gex}
 SEED=$WEB/seed.x86.shared.wasm
 [ -f "$SEED" ] || { echo "skip densenative: no $SEED"; exit 0; }
 W=$(mktemp -d "${1:?DIR}/densenative.XXXXXX")

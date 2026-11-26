@@ -2,7 +2,7 @@
  * Do files dropped on the page land in the guest's filesystem, tree and bytes
  * and modes, and does an aborted drop take back what it wrote?
  *
- * handle.drop (page/src/app.js) reads a drop's tree in the page (drop.js
+ * The runtime's drop (@gexemu/runtime/drop) reads a drop's tree in the page (drop.js
  * `walk`) and has drop-worker.js write it through its own kernel instance.
  * This runs both against the kernel module in Node: `walk` over a folder as
  * a FileSystemDirectoryHandle and as a webkitGetAsEntry entry gives, and the
@@ -37,7 +37,7 @@ const gexUrl = (p) => gexPathToFileURL(gexJoin(GEX_ROOT, p)).href;
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = GEX_ROOT;
 // The kernel the checkout built: the default build's, else the x86 one.
-const built = ['gex_kernel.wasm', 'gex_kernel.x86.wasm'].map((f) => join(ROOT, 'page', 'public', 'gex', f));
+const built = ['gex_kernel.wasm', 'gex_kernel.x86.wasm'].map((f) => join(ROOT, 'runtime', 'files', 'out', 'gex', f));
 const path = process.argv[2] || built.find((f) => existsSync(f)) || built[0];
 const module = await WebAssembly.compile(await readFile(path));
 const memory = new WebAssembly.Memory({ initial: 2048, maximum: 65536, shared: true });
@@ -126,7 +126,7 @@ const entryOf = (name, body) =>
         },
       };
 
-const { walk } = await import(gexUrl('page/src/drop.js'));
+const { walk } = await import(gexUrl('runtime/src/host/drop.js'));
 const byHandle = await walk(Object.entries(tree).map(([n, b]) => ({ handle: Promise.resolve(handleOf(n, b)), entry: null, file: null })));
 const byEntry = await walk(Object.entries(tree).map(([n, b]) => ({ handle: null, entry: entryOf(n, b), file: null })));
 const paths = (l) => l.map((e) => `${e.path}${e.file ? '' : '/'}`).join(' ');
@@ -137,7 +137,7 @@ check(paths(byEntry) === paths(byHandle), `walk by entry: ${paths(byEntry)}`);
 const out = [];
 let wake = null;
 globalThis.self = { postMessage: (m) => { out.push(m); wake?.(); } };
-await import(gexUrl('page/src/drop-worker.js'));
+await import(gexUrl('runtime/src/host/drop-worker.js'));
 const send = (m) => self.onmessage({ data: m });
 const answer = async (id) => {
   for (;;) {

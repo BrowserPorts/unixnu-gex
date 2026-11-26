@@ -97,7 +97,7 @@ for m in re.finditer(r'pub const ([A-Z_0-9]+): u32 = (\d+);', errs):
     js.append(f"    {m.group(1)}: {m.group(2)},")
 js += ["};", ""]
 import os
-webdir = f'{root}/page/src'
+webdir = f'{root}/runtime/src/host'
 if os.path.isdir(webdir):
     open(f'{webdir}/gl-proto.js', 'w').write("\n".join(js))
 PYEOF

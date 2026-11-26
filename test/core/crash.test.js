@@ -2,8 +2,8 @@
 // signal ends (SIGSEGV, SIGABRT), one that traps (rt-probe trap: wasm's
 // unreachable, SIGILL), and one that is not pid 1's child. An exit, and a
 // signal that is no crash (SIGTERM), are not.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
 
 export const meta = { hosts: ['browser', 'node'], images: ['busybox'], timeout: 180 };
 
@@ -34,8 +34,9 @@ export default async function (t) {
   eq('a trap: its name', c2.name, 'rt-probe');
   check('a trap: a crash signal', [4, 11].includes(c2.signal), JSON.stringify(c2));
 
-  // a grandchild of pid 1's: its parent goes on
-  const deep = await sys.run(['sh', '-c', 'sh -c \'rt-probe kill $$ 6; echo survived\'; echo after'], { env });
+  // a grandchild of pid 1's: its parent goes on. (rt-probe's own "0" goes
+  // nowhere: it outlives the shell it kills, so it may print after "after".)
+  const deep = await sys.run(['sh', '-c', 'sh -c \'rt-probe kill $$ 6 >/dev/null; echo survived\'; echo after'], { env });
   check('a grandchild\'s crash: its parent goes on', deep.stdout.endsWith('after\n') && !deep.stdout.includes('survived'), JSON.stringify(deep.stdout));
   const c3 = await next('a grandchild\'s crash');
   eq('a grandchild\'s crash: the report', [c3.signal, c3.code], [6, 134]);

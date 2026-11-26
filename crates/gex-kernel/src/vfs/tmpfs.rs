@@ -121,6 +121,124 @@ fn note_capacity(before: usize, after: usize) {
     }
 }
 
+/// The part of a shared file's contents ([`Cow`]) a write copies: what it
+/// costs to change a byte of a copy.
+const COW_CHUNK: u64 = 64 * 1024;
+
+/// Bytes two or more files have (a copy made by [`FileHandle::share_from`]): theirs
+/// until the last of them lets go, counted once.
+#[derive(Debug)]
+struct CowBase(Vec<u8>);
+
+impl Drop for CowBase {
+    fn drop(&mut self) {
+        note_capacity(self.0.capacity(), 0);
+    }
+}
+
+/// A file's contents that are another's until written: the shared bytes up
+/// to `base_end`, zeros past them, and in `over` each [`COW_CHUNK`] this
+/// file has written (whole, zeros past `len`).
+#[derive(Debug)]
+struct Cow {
+    base: Arc<CowBase>,
+    len: u64,
+    base_end: u64,
+    over: BTreeMap<u64, Box<[u8]>>,
+}
+
+impl Drop for Cow {
+    fn drop(&mut self) {
+        note_capacity(self.over.len() * COW_CHUNK as usize, 0);
+    }
+}
+
+impl Cow {
+    fn whole(base: Arc<CowBase>) -> Cow {
+        let len = base.0.len() as u64;
+        Cow { base, len, base_end: len, over: BTreeMap::new() }
+    }
+    /// Unchanged since it was shared: what a further copy may share as is.
+    fn pristine(&self) -> bool {
+        self.over.is_empty() && self.base_end == self.len && self.len == self.base.0.len() as u64
+    }
+    fn byte_source(&self, k: u64, into: &mut [u8]) {
+        let start = k * COW_CHUNK;
+        into.fill(0);
+        if start < self.base_end {
+            let n = ((self.base_end - start) as usize).min(into.len());
+            into[..n].copy_from_slice(&self.base.0[start as usize..start as usize + n]);
+        }
+    }
+    fn read(&self, offset: u64, buf: &mut [u8]) -> u64 {
+        if offset >= self.len {
+            return 0;
+        }
+        let end = (offset + buf.len() as u64).min(self.len);
+        let mut at = offset;
+        while at < end {
+            let k = at / COW_CHUNK;
+            let in_chunk = (at % COW_CHUNK) as usize;
+            let n = ((COW_CHUNK - at % COW_CHUNK).min(end - at)) as usize;
+            let out = &mut buf[(at - offset) as usize..(at - offset) as usize + n];
+            match self.over.get(&k) {
+                Some(c) => out.copy_from_slice(&c[in_chunk..in_chunk + n]),
+                None => {
+                    let b = if at < self.base_end { ((self.base_end - at) as usize).min(n) } else { 0 };
+                    out[..b].copy_from_slice(&self.base.0[at as usize..at as usize + b]);
+                    out[b..].fill(0);
+                }
+            }
+            at += n as u64;
+        }
+        end - offset
+    }
+    fn write(&mut self, offset: u64, buf: &[u8]) {
+        let end = offset + buf.len() as u64;
+        let mut at = offset;
+        while at < end {
+            let k = at / COW_CHUNK;
+            let in_chunk = (at % COW_CHUNK) as usize;
+            let n = ((COW_CHUNK - at % COW_CHUNK).min(end - at)) as usize;
+            if !self.over.contains_key(&k) {
+                let mut c = vec![0u8; COW_CHUNK as usize].into_boxed_slice();
+                self.byte_source(k, &mut c);
+                note_capacity(0, COW_CHUNK as usize);
+                self.over.insert(k, c);
+            }
+            let c = self.over.get_mut(&k).unwrap();
+            c[in_chunk..in_chunk + n].copy_from_slice(&buf[(at - offset) as usize..(at - offset) as usize + n]);
+            at += n as u64;
+        }
+        self.len = self.len.max(end);
+    }
+    fn truncate(&mut self, len: u64) {
+        if len < self.len {
+            self.base_end = self.base_end.min(len);
+            let gone: Vec<u64> = self.over.range(len.div_ceil(COW_CHUNK)..).map(|(k, _)| *k).collect();
+            for k in gone {
+                self.over.remove(&k);
+                note_capacity(COW_CHUNK as usize, 0);
+            }
+            if let Some(c) = self.over.get_mut(&(len / COW_CHUNK)) {
+                c[(len % COW_CHUNK) as usize..].fill(0);
+            }
+        }
+        self.len = len;
+    }
+    /// Its bytes as a file's own, when a copy of them would cost no more
+    /// than what it keeps of its own already (most of it written), or for a
+    /// use that needs them in one piece.
+    fn worth_owning(&self) -> bool {
+        self.over.len() as u64 * COW_CHUNK >= self.len
+    }
+    fn to_vec(&self) -> Vec<u8> {
+        let mut v = vec![0u8; self.len as usize];
+        self.read(0, &mut v);
+        v
+    }
+}
+
 /// A file's contents, held apart from any name so an open descriptor survives
 /// `unlink`: SQLite unlinks its temp files at once and keeps writing through
 /// the descriptor it still holds.
@@ -134,6 +252,11 @@ static READ_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::
 #[derive(Debug, Default)]
 pub struct FileNode {
     data: Mutex<Vec<u8>>,
+    /// Contents shared with a copy (or the copy's, of its source) until
+    /// written ([`FileHandle::share_from`]); `data` is then empty. Never
+    /// with contents in the store, lazy or pending: a file that moves to
+    /// the store takes a copy of its bytes there.
+    cow: Mutex<Option<Cow>>,
     /// The contents as blocks in the host's store (`super::blocks`), once
     /// the file is past what stays inline while the store is on; `data` is
     /// then empty.
@@ -215,6 +338,12 @@ pub fn set_pending_hooks(h: PendingHooks) {
     let _ = PENDING_HOOKS.set(h);
 }
 
+/// `?systime=1`, every process's together: nanoseconds waited for files the
+/// bundle had not laid yet (any read's, timed by the host's `pending_wait`),
+/// those waits, and `posix_fadvise` calls. Kept only while [`ADVISE_TIMED`].
+pub static ADVISE_STATS: [core::sync::atomic::AtomicU64; 3] = [const { core::sync::atomic::AtomicU64::new(0) }; 3];
+pub static ADVISE_TIMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 fn pending_wait(word: &core::sync::atomic::AtomicU32, ino: u64) -> bool {
     match PENDING_HOOKS.get() {
         Some(h) => (h.wait)(word, ino),
@@ -254,6 +383,7 @@ impl FileNode {
     fn new(data: Vec<u8>, ino: u64, store: bool) -> FileNode {
         note_capacity(0, data.capacity());
         FileNode {
+            cow: Mutex::new(None),
             pg: Mutex::new(None),
             store,
             data: Mutex::new(data),
@@ -293,10 +423,14 @@ impl FileNode {
         let mut pg = self.pg.lock().unwrap();
         if pg.is_none() && self.store && super::blocks::wants(end) {
             let mut data = self.data.lock().unwrap();
+            let mut cow = self.cow.lock().unwrap();
             let mut p = super::blocks::PFile::new();
-            if !data.is_empty() && p.write(0, &data).is_err() {
+            let shared = cow.as_ref().map(|c| c.to_vec());
+            let bytes = shared.as_deref().unwrap_or(&data);
+            if !bytes.is_empty() && p.write(0, bytes).is_err() {
                 return pg;
             }
+            *cow = None;
             let was = data.capacity();
             *data = Vec::new();
             note_capacity(was, 0);
@@ -363,6 +497,15 @@ impl FileNode {
         *self.times.lock().unwrap()
     }
 
+    /// Its bytes kept here (not lazy, not in the store), shared or not.
+    pub(super) fn inline_bytes(&self) -> Vec<u8> {
+        let data = self.data.lock().unwrap();
+        match self.cow.lock().unwrap().as_ref() {
+            Some(c) => c.to_vec(),
+            None => data.clone(),
+        }
+    }
+
     /// The size, lazy or not, pending or not.
     fn size(&self) -> u64 {
         if self.laid.load(Ordering::Acquire) != LAID {
@@ -376,7 +519,11 @@ impl FileNode {
         if let Some(p) = self.pg.lock().unwrap().as_ref() {
             return p.size;
         }
-        self.data.lock().unwrap().len() as u64
+        let data = self.data.lock().unwrap();
+        if let Some(c) = self.cow.lock().unwrap().as_ref() {
+            return c.len;
+        }
+        data.len() as u64
     }
 
     /// A bundled copy shorter than the lazy file of `size` bytes at `url`,
@@ -1176,8 +1323,8 @@ impl TmpFs {
             return p.write(offset, bytes).map(|_| ());
         }
         let mut data = f.data.lock().unwrap();
-        let start = offset as usize;
-        let end = start + bytes.len();
+        let end = mem_end(offset, bytes.len())?;
+        let start = end - bytes.len();
         if end > data.len() {
             let was = data.capacity();
             reserve(&mut data, end)?;
@@ -1428,6 +1575,12 @@ impl TmpFs {
             if let Ok(d) = f.data.try_lock() {
                 if !d.is_empty() {
                     out.push((0, d.as_ptr() as usize, d.len(), 0, format!("/{p}")));
+                }
+            }
+            if let Ok(c) = f.cow.try_lock() {
+                // a shared copy's bytes are its source's: the same pages
+                if let Some(c) = c.as_ref().filter(|c| c.pristine()) {
+                    out.push((0, c.base.0.as_ptr() as usize, c.base.0.len(), 0, format!("/{p}")));
                 }
             }
             if let Ok(l) = f.lazy.try_lock() {
@@ -1710,6 +1863,87 @@ impl TmpHandle {
 }
 
 impl FileHandle for TmpHandle {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
+    /// A copy that shares the source's bytes until either is written (the
+    /// chunks a write touches are then its own): `copy_file_range` of a
+    /// whole file into an empty one, as a file system with reflinks does.
+    /// A source in the block store shares its blocks instead. Not for a
+    /// lazy or pending file, nor a source in memory already written since
+    /// it was shared; the caller copies those.
+    fn share_from(&self, src: &dyn FileHandle) -> Option<SysResult> {
+        let src = src.as_any()?.downcast_ref::<TmpHandle>()?;
+        let (s, d) = (src.file.as_ref()?, self.file.as_ref()?);
+        if Arc::ptr_eq(s, d) {
+            return None;
+        }
+        for f in [s, d] {
+            if f.laid.load(Ordering::Acquire) != LAID || f.lazy.lock().unwrap().is_some() {
+                return None;
+            }
+        }
+        s.mark_read();
+        // two files' locks, in inode order, each file's as a write takes
+        // them: the store's contents, the bytes, the shared bytes
+        let s_first = s.ino < d.ino;
+        let (a, b) = if s_first { (s, d) } else { (d, s) };
+        let mut a_pg = a.pg.lock().unwrap();
+        let mut a_data = a.data.lock().unwrap();
+        let mut a_cow = a.cow.lock().unwrap();
+        let mut b_pg = b.pg.lock().unwrap();
+        let mut b_data = b.data.lock().unwrap();
+        let mut b_cow = b.cow.lock().unwrap();
+        let (s_pg, d_pg, s_data, d_data, s_cow, d_cow) = if s_first {
+            (&mut *a_pg, &mut *b_pg, &mut *a_data, &mut *b_data, &mut *a_cow, &mut *b_cow)
+        } else {
+            (&mut *b_pg, &mut *a_pg, &mut *b_data, &mut *a_data, &mut *b_cow, &mut *a_cow)
+        };
+        if !d_data.is_empty() || d_cow.as_ref().is_some_and(|c| c.len != 0) || d_pg.as_ref().is_some_and(|p| p.size != 0) {
+            return None;
+        }
+        // A source in the block store: the copy names the same blocks,
+        // each the file's own once it writes it (blocks.rs)
+        if let Some(sp) = s_pg.as_ref() {
+            let len = sp.size;
+            *d_pg = Some(sp.share());
+            d.changed();
+            drop((b_cow, b_data, b_pg, a_cow, a_data, a_pg));
+            d.touch();
+            self.note_here(crate::inotify::mask::MODIFY);
+            // a write into the empty file: NOTE_EXTEND too when it grew
+            self.vnote_here(crate::vnote::note::WRITE | if len != 0 { crate::vnote::note::EXTEND } else { 0 });
+            return Some(Ok(len));
+        }
+        if d_pg.is_some() {
+            return None;
+        }
+        let base = match s_cow.as_ref() {
+            Some(c) if c.pristine() => Arc::clone(&c.base),
+            Some(_) => return None,
+            None => {
+                if s_data.is_empty() {
+                    return Some(Ok(0));
+                }
+                // its bytes, counted where they now are
+                let b = Arc::new(CowBase(std::mem::take(s_data)));
+                *s_cow = Some(Cow::whole(Arc::clone(&b)));
+                b
+            }
+        };
+        let len = base.0.len() as u64;
+        note_capacity(d_data.capacity(), 0);
+        *d_data = Vec::new();
+        *d_cow = Some(Cow::whole(base));
+        d.changed();
+        drop((b_cow, b_data, b_pg, a_cow, a_data, a_pg));
+        d.touch();
+        self.note_here(crate::inotify::mask::MODIFY);
+        self.vnote_here(crate::vnote::note::WRITE | if len != 0 { crate::vnote::note::EXTEND } else { 0 });
+        Some(Ok(len))
+    }
+
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> SysResult {
         let Some(file) = &self.file else {
             return Err(Errno::EISDIR);
@@ -1723,6 +1957,9 @@ impl FileHandle for TmpHandle {
             return p.read(offset, buf);
         }
         let data = file.data.lock().unwrap();
+        if let Some(c) = file.cow.lock().unwrap().as_ref() {
+            return Ok(c.read(offset, buf));
+        }
         let start = (offset as usize).min(data.len());
         let n = buf.len().min(data.len() - start);
         buf[..n].copy_from_slice(&data[start..start + n]);
@@ -1740,6 +1977,10 @@ impl FileHandle for TmpHandle {
             return None;
         }
         file.mark_read();
+        // (a shared file's bytes are in two places: by `read_at`)
+        if file.cow.lock().unwrap().is_some() {
+            return None;
+        }
         let data = file.data.lock().unwrap();
         let start = (offset as usize).min(data.len());
         let n = len.min(data.len() - start);
@@ -1762,6 +2003,9 @@ impl FileHandle for TmpHandle {
 
     fn advise(&self, offset: u64, len: u64, advice: u32) -> Result<(), Errno> {
         let Some(file) = &self.file else { return Ok(()) };
+        if ADVISE_TIMED.load(Ordering::Relaxed) {
+            ADVISE_STATS[2].fetch_add(1, Ordering::Relaxed);
+        }
         // The advice that fetches: a range wanted, an image mapped.
         if advice == super::FADV_WILLNEED || advice == super::FADV_GEX_IMAGE {
             file.mark_read();
@@ -1794,9 +2038,34 @@ impl FileHandle for TmpHandle {
             return Ok(buf.len() as u64);
         }
         let mut data = file.data.lock().unwrap();
-        let start = offset as usize;
+        {
+            let mut cow = file.cow.lock().unwrap();
+            if let Some(c) = cow.as_mut() {
+                // a shared file's write is its own: the chunks it touches copied first
+                mem_end(offset, buf.len())?;
+                // ubc_setsize's NOTE_EXTEND, for a write past the end.
+                let grew = offset + buf.len() as u64 > c.len;
+                c.write(offset, buf);
+                if c.worth_owning() {
+                    let v = c.to_vec();
+                    note_capacity(data.capacity(), v.capacity());
+                    *data = v;
+                    *cow = None;
+                }
+                file.changed();
+                drop(cow);
+                drop(data);
+                drop(pg);
+                file.touch();
+                self.note_here(crate::inotify::mask::MODIFY);
+                self.vnote_here(crate::vnote::note::WRITE | if grew { crate::vnote::note::EXTEND } else { 0 });
+                return Ok(buf.len() as u64);
+            }
+        }
+        let end = mem_end(offset, buf.len())?;
+        let start = end - buf.len();
         // ubc_setsize's NOTE_EXTEND, for a write past the end.
-        let grew = start + buf.len() > data.len();
+        let grew = end > data.len();
         if start + buf.len() > data.len() {
             let was = data.capacity();
             reserve(&mut data, start + buf.len())?;
@@ -1967,11 +2236,21 @@ impl FileHandle for TmpHandle {
             file.changed();
         } else {
             let mut data = file.data.lock().unwrap();
-            grew = len as usize > data.len();
-            let was = data.capacity();
-            reserve(&mut data, len as usize)?;
-            data.resize(len as usize, 0);
-            note_capacity(was, data.capacity());
+            let mut cow = file.cow.lock().unwrap();
+            if let Some(c) = cow.as_mut() {
+                grew = len > c.len;
+                c.truncate(len);
+                if len == 0 {
+                    *cow = None;
+                }
+            } else {
+                grew = len > data.len() as u64;
+                let was = data.capacity();
+                let len = mem_end(len, 0)?;
+                reserve(&mut data, len)?;
+                data.resize(len, 0);
+                note_capacity(was, data.capacity());
+            }
             file.changed();
         }
         file.touch();
@@ -2085,6 +2364,7 @@ impl TmpFs {
                                 f.changed();
                             } else {
                                 let mut data = f.data.lock().unwrap();
+                                *f.cow.lock().unwrap() = None;
                                 let was = data.capacity();
                                 data.clear();
                                 data.shrink_to_fit();
@@ -2447,6 +2727,17 @@ impl FileSystem for TmpFs {
 /// lives in the kernel's memory, and a `resize` the allocator cannot meet is an
 /// abort there, with the file's lock (and every process's kernel) held for good.
 /// The usual doubling first, then exactly `len` when doubling is what failed.
+/// Where a write of `len` bytes at `offset` ends, as an in-memory file's
+/// length: EFBIG when that does not fit the kernel's `usize` (it is wasm32,
+/// where `offset as usize` would wrap onto the start of the file).
+fn mem_end(offset: u64, len: usize) -> Result<usize, Errno> {
+    offset
+        .checked_add(len as u64)
+        .and_then(|e| usize::try_from(e).ok())
+        .filter(|&e| e <= isize::MAX as usize)
+        .ok_or(Errno::EFBIG)
+}
+
 fn reserve(data: &mut Vec<u8>, len: usize) -> Result<(), Errno> {
     let more = len.saturating_sub(data.len());
     if more == 0 || data.capacity() >= len {
@@ -2471,6 +2762,95 @@ fn reserve(data: &mut Vec<u8>, len: usize) -> Result<(), Errno> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A whole-file copy (`copy_file_range` into an empty file) shares the
+    /// source's bytes until written: each file's writes are its own, a
+    /// truncation or the source's deletion or rename leaves the other as it
+    /// was, and a file written all over owns its bytes again.
+    #[test]
+    fn a_shared_copy_is_private_once_written() {
+        use crate::fs::oflags::{O_CREAT, O_RDWR, O_TRUNC};
+        let fs = TmpFs::new();
+        let len = 3 * COW_CHUNK as usize + 123;
+        let orig: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        fs.add_file("src", orig.clone());
+        let open = |p: &str| fs.open(p, O_RDWR | O_CREAT, 0o644).unwrap();
+        let all = |h: &Arc<dyn FileHandle>| {
+            let mut v = vec![0u8; h.metadata().unwrap().size as usize];
+            assert_eq!(h.read_at(0, &mut v).unwrap() as usize, v.len());
+            v
+        };
+        let node = |h: &Arc<dyn FileHandle>| Arc::clone(h.as_any().unwrap().downcast_ref::<TmpHandle>().unwrap().file.as_ref().unwrap());
+        let (s, d) = (open("src"), open("dst"));
+        assert_eq!(d.share_from(&*s).unwrap().unwrap(), len as u64);
+        let base = |h: &Arc<dyn FileHandle>| node(h).cow.lock().unwrap().as_ref().map(|c| Arc::as_ptr(&c.base));
+        assert!(base(&s).is_some() && base(&s) == base(&d), "one copy of the bytes");
+        assert_eq!(all(&d), orig);
+        // a further copy of either shares the same bytes
+        let d2 = open("dst2");
+        assert_eq!(d2.share_from(&*d).unwrap().unwrap(), len as u64);
+        assert_eq!(base(&d2), base(&s));
+        // not into a file that has bytes, nor from itself
+        assert!(d.share_from(&*s).is_none());
+        assert!(s.share_from(&*s).is_none());
+
+        // a write to the copy, across a chunk's end
+        let at = COW_CHUNK as usize - 2;
+        d.write_at(at as u64, b"WXYZ").unwrap();
+        let mut want = orig.clone();
+        want[at..at + 4].copy_from_slice(b"WXYZ");
+        assert_eq!(all(&d), want);
+        assert_eq!(all(&s), orig, "the source keeps its bytes");
+        assert_eq!(node(&d).cow.lock().unwrap().as_ref().unwrap().over.len(), 2);
+        // a write to the source
+        s.write_at(5, b"src").unwrap();
+        let mut want_s = orig.clone();
+        want_s[5..8].copy_from_slice(b"src");
+        assert_eq!(all(&s), want_s);
+        assert_eq!(all(&d), want, "the copy keeps its bytes");
+        assert_eq!(all(&d2), orig);
+        // a written source is not shared again
+        assert!(open("dst3").share_from(&*s).is_none());
+
+        // past the end: zeros between
+        d.write_at(len as u64 + 10, b"end").unwrap();
+        want.resize(len + 10, 0);
+        want.extend_from_slice(b"end");
+        assert_eq!(all(&d), want);
+        // truncate down and back up: zeros, not the old bytes
+        d.truncate(COW_CHUNK + 1).unwrap();
+        d.truncate(len as u64).unwrap();
+        want.truncate(COW_CHUNK as usize + 1);
+        want.resize(len, 0);
+        assert_eq!(all(&d), want);
+        d.truncate(at as u64 + 1).unwrap();
+        d.truncate(COW_CHUNK + 7).unwrap();
+        want.truncate(at + 1);
+        want.resize(COW_CHUNK as usize + 7, 0);
+        assert_eq!(all(&d), want);
+
+        // the source renamed and deleted: the copies stay
+        fs.rename("src", "moved").unwrap();
+        fs.unlink("moved").unwrap();
+        drop(s);
+        assert_eq!(all(&d2), orig);
+        assert_eq!(all(&open("dst2")), orig);
+        fs.rename("dst2", "dst2b").unwrap();
+        assert_eq!(all(&open("dst2b")), orig);
+
+        // O_TRUNC of a copy empties it alone
+        let d4 = open("dst4");
+        d4.share_from(&*d2).unwrap().unwrap();
+        fs.open("dst4", O_RDWR | O_TRUNC, 0o644).unwrap();
+        assert_eq!(open("dst4").metadata().unwrap().size, 0);
+        assert_eq!(all(&d2), orig);
+
+        // written all over, a copy owns its bytes again
+        d2.write_at(0, &vec![7u8; len]).unwrap();
+        assert!(node(&d2).cow.lock().unwrap().is_none());
+        assert_eq!(all(&d2), vec![7u8; len]);
+        assert_eq!(all(&open("dst2b")), vec![7u8; len]);
+    }
 
     /// A program making or removing a name moves its directory's time, as on
     /// Linux; seeding does not. A KService database built with the image

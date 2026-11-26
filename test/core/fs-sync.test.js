@@ -8,8 +8,8 @@
 // written by a shell that stays (its builtins: no child that ends). Seen from a
 // store of the page's own, which counts what reaches it. One system per page,
 // so each phase is a load of its own (t.reload).
-import { System } from '../../page/runtime/src/index.js';
-import { Filesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { Filesystem } from '../../runtime/src/fs.js';
 
 export const meta = { hosts: ['browser'], images: ['slim'], timeout: 300,
   single: "a store of the page's own needs the default build" };

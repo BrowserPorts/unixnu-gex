@@ -29,6 +29,10 @@ thread_local! {
     static SEQ: Cell<i32> = const { Cell::new(0) };
     /// The wait this Worker's thread is in, as it was when it began.
     static WAIT: RefCell<Option<MyWait>> = const { RefCell::new(None) };
+    /// The queue list of the last wait that ended, kept for the next one:
+    /// a thread that waits over and over (a message loop, a pipe ping-pong)
+    /// makes its list once.
+    static SPARE: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
 }
 
 /// This process's wait queue (`k_proc_queue`), with the pid it is for.
@@ -126,8 +130,9 @@ pub(crate) fn publish_timer() {
 }
 
 /// The queues a wait registers on, and when it becomes ready by the clock.
-fn queues_of(waiting: &Waiting, blocked_on: &Option<gex_kernel::BlockOp>, now: u64, page: bool) -> (Vec<u32>, Option<u64>) {
-    let mut qs = vec![proc_queue()];
+fn queues_of(mut qs: Vec<u32>, waiting: &Waiting, blocked_on: &Option<gex_kernel::BlockOp>, now: u64, page: bool) -> (Vec<u32>, Option<u64>) {
+    qs.clear();
+    qs.push(proc_queue());
     let mut handle = |h: &Arc<dyn gex_kernel::vfs::FileHandle>, qs: &mut Vec<u32>| {
         let q = h.wait_queue();
         if q == 0 && !page && h.ready_in_ns().is_none() {
@@ -233,8 +238,9 @@ pub(crate) fn enter(i: usize, t: &Run, why: u8, all_blocked: bool, ends_by_itsel
         }
         if let Some(old) = w.take() {
             unregister(&old);
+            spare(old);
         }
-        let (queues, soonest) = queues_of(&t.waiting, &t.blocked_on, now, why & 4 != 0);
+        let (queues, soonest) = queues_of(SPARE.with(|s| std::mem::take(&mut *s.borrow_mut())), &t.waiting, &t.blocked_on, now, why & 4 != 0);
         let slot = slot() as u32;
         for &q in &queues {
             unsafe { k_wq_add(q, slot) };
@@ -275,6 +281,11 @@ fn same_wait(a: &Waiting, b: &Waiting) -> bool {
     }
 }
 
+/// Keep an ended wait's queue list for the next one.
+fn spare(m: MyWait) {
+    SPARE.with(|s| *s.borrow_mut() = m.queues);
+}
+
 fn unregister(m: &MyWait) {
     let slot = slot() as u32;
     for &q in &m.queues {
@@ -287,6 +298,7 @@ pub(crate) fn leave() {
     WAIT.with(|w| {
         if let Some(old) = w.borrow_mut().take() {
             unregister(&old);
+            spare(old);
         }
     });
 }
@@ -455,9 +467,129 @@ pub(crate) fn park() -> i32 {
     let now = turn_now();
     let ns = park_ns(now).map_or(-1, |n| n as i64);
     let seq = SEQ.with(|q| q.get());
+    let t = split_begin();
     let r = crate::usage::parked(|| unsafe { k_ws_park(slot(), seq, ns) });
+    split_end(t, r);
     stale_now();
     r
+}
+
+/// The wait split (`GEX_LOG=waits`, gex.mjs `#wsSay`): whether it is on,
+/// and this Worker's parks since its thread started by what the thread
+/// waited on ([`wait_code`]; past its codes, a stream read by what it reads,
+/// and last: no code), in ns and counts; and its futex waits by the thread
+/// whose wake ended them (0: none did, the wait timed out).
+static SPLIT_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// [`wait_code`]'s 16, then a read of a pipe, of a socket, of anything else; no code.
+const SPLIT_KINDS: usize = 20;
+const READ_PIPE: usize = 16;
+thread_local! {
+    static SPLIT: RefCell<([u64; SPLIT_KINDS], [u32; SPLIT_KINDS])> = const { RefCell::new(([0; SPLIT_KINDS], [0; SPLIT_KINDS])) };
+    static WAKERS: RefCell<Vec<(i32, u64, u32)>> = const { RefCell::new(Vec::new()) };
+}
+/// The thread that last woke a futex address of this process, by a hash of
+/// the address (a collision names the wrong waker now and then: debug output).
+static LAST_WAKER: [std::sync::atomic::AtomicI32; 1024] = [const { std::sync::atomic::AtomicI32::new(0) }; 1024];
+fn waker_slot(addr: u64) -> usize {
+    ((addr >> 2).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 54) as usize & 1023
+}
+
+/// This thread wakes the futex at `addr` (before the relay to other Workers).
+pub(crate) fn split_woke(addr: u64) {
+    if SPLIT_ON.load(std::sync::atomic::Ordering::Relaxed) {
+        LAST_WAKER[waker_slot(addr)].store(my_tid(), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// A park starts: what this Worker's thread waits on (and a futex's
+/// address) and when, with the split on.
+fn split_begin() -> Option<(usize, u64, u64)> {
+    if !SPLIT_ON.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let (k, addr) = MY_RUN
+        .with(|c| {
+            c.borrow().as_ref().map(|t| {
+                let r = t.run.lock().unwrap_or_else(|e| e.into_inner());
+                match &r.waiting {
+                    Waiting::Read(h) => {
+                        let k = match h.metadata().map(|m| m.file_type) {
+                            Ok(gex_kernel::vfs::FileType::Fifo) => READ_PIPE,
+                            Ok(gex_kernel::vfs::FileType::Socket) => READ_PIPE + 1,
+                            _ => READ_PIPE + 2,
+                        };
+                        (k, 0)
+                    }
+                    Waiting::Futex { parked, .. } => (wait_code(&r.waiting) as usize, parked.addr()),
+                    w => (wait_code(w).clamp(0, 15) as usize, 0),
+                }
+            })
+        })
+        .unwrap_or((SPLIT_KINDS - 1, 0));
+    Some((k, addr, now_ns()))
+}
+
+/// A park ends with the wait instruction's answer `r` (2: timed out).
+fn split_end(t: Option<(usize, u64, u64)>, r: i32) {
+    let Some((k, addr, t0)) = t else { return };
+    let d = now_ns().saturating_sub(t0);
+    SPLIT.with(|s| {
+        let mut s = s.borrow_mut();
+        s.0[k] += d;
+        s.1[k] += 1;
+    });
+    if addr != 0 {
+        let by = if r == 2 { 0 } else { LAST_WAKER[waker_slot(addr)].load(std::sync::atomic::Ordering::Relaxed) };
+        WAKERS.with(|w| {
+            let mut w = w.borrow_mut();
+            match w.iter_mut().find(|e| e.0 == by) {
+                Some(e) => {
+                    e.1 += d;
+                    e.2 += 1;
+                }
+                None => w.push((by, d, 1)),
+            }
+        });
+    }
+}
+
+/// Turn the wait split on (for every Worker of this memory; GEX_LOG=waits)
+/// and start this Worker's from nothing (its thread starts).
+#[no_mangle]
+pub extern "C" fn gex_wait_split_on() {
+    SPLIT_ON.store(true, std::sync::atomic::Ordering::Relaxed);
+    SPLIT.with(|s| *s.borrow_mut() = ([0; SPLIT_KINDS], [0; SPLIT_KINDS]));
+    WAKERS.with(|w| w.borrow_mut().clear());
+}
+
+/// This Worker's parks of kind `k` so far: ms.
+#[no_mangle]
+pub extern "C" fn gex_wait_split_ms(k: u32) -> f64 {
+    SPLIT.with(|s| s.borrow().0.get(k as usize).map_or(0.0, |&n| n as f64 / 1e6))
+}
+
+/// And how many.
+#[no_mangle]
+pub extern "C" fn gex_wait_split_n(k: u32) -> u32 {
+    SPLIT.with(|s| s.borrow().1.get(k as usize).copied().unwrap_or(0))
+}
+
+/// How many wakers this Worker's futex waits have; entry `i`'s tid, ms and count.
+#[no_mangle]
+pub extern "C" fn gex_wait_wakers() -> u32 {
+    WAKERS.with(|w| w.borrow().len() as u32)
+}
+#[no_mangle]
+pub extern "C" fn gex_wait_waker_tid(i: u32) -> i32 {
+    WAKERS.with(|w| w.borrow().get(i as usize).map_or(-1, |e| e.0))
+}
+#[no_mangle]
+pub extern "C" fn gex_wait_waker_ms(i: u32) -> f64 {
+    WAKERS.with(|w| w.borrow().get(i as usize).map_or(0.0, |e| e.1 as f64 / 1e6))
+}
+#[no_mangle]
+pub extern "C" fn gex_wait_waker_n(i: u32) -> u32 {
+    WAKERS.with(|w| w.borrow().get(i as usize).map_or(0, |e| e.2))
 }
 
 /// Park on the slot for at most `ns`: a wait on the page, from a Worker
@@ -465,7 +597,9 @@ pub(crate) fn park() -> i32 {
 pub(crate) fn park_bounded(ns: u64) -> i32 {
     let ns = park_ns(turn_now()).map_or(ns, |n| n.min(ns));
     let seq = SEQ.with(|q| q.get());
+    let t = split_begin();
     let r = crate::usage::parked(|| unsafe { k_ws_park(slot(), seq, ns as i64) });
+    split_end(t, r);
     stale_now();
     r
 }

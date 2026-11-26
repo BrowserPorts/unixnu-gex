@@ -6,10 +6,10 @@
 // spawned. Up when a window with the launch file's title shows. Then the
 // root kept by an OPFSFilesystem across a reload.
 
-import { System } from '../../page/runtime/src/index.js';
-import { OPFSFilesystem } from '../../page/runtime/src/fs.js';
-import { HostWindows } from '../../page/runtime/src/windows/host.js';
-import { MesaGl } from '../../page/runtime/src/gl.js';
+import { System } from '../../runtime/src/index.js';
+import { OPFSFilesystem } from '../../runtime/src/fs.js';
+import { HostWindows } from '../../runtime/src/windows/host.js';
+import { MesaGl } from '../../runtime/src/gl.js';
 
 // Alone: a Wine desktop's processes beside other tests' pages ran the
 // renderer out of address space.
@@ -53,7 +53,7 @@ export default async function (t) {
   const fs = new OPFSFilesystem(sys, { name: STORE });
   const tar = 'project/build/web/rootfs.tar';
   fs.addTar(at(packed(tar) ? `${tar}.zst` : tar));
-  // The bundle's larger files, kept out of its tar (eject-site.mjs --pieces):
+  // The bundle's larger files, kept out of its tar (the site's pieces):
   // the tar holds each empty, its bytes are a piece's.
   if (params.pieces) {
     const list = await (await fetch(at(params.pieces))).json();

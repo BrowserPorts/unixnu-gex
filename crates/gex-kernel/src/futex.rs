@@ -447,3 +447,18 @@ mod tests {
         assert!(f.queues.iter().all(|q| q.lock().unwrap().is_empty()));
     }
 }
+
+/// A host's per-address wake generation across Workers (the browser's
+/// `k_futex_gen`), which a futex wait samples before it checks the word
+/// ([`crate::syscalls::BlockOp::FutexWait`]'s `shared_gen`). Unset: 0.
+static SHARED_GEN: std::sync::OnceLock<fn(u64) -> u32> = std::sync::OnceLock::new();
+
+/// Set the host's generation reader ([`shared_gen`]), once at start.
+pub fn set_shared_gen(f: fn(u64) -> u32) {
+    let _ = SHARED_GEN.set(f);
+}
+
+/// The host's wake generation of `addr`, or 0 with none set.
+pub fn shared_gen(addr: u64) -> u32 {
+    SHARED_GEN.get().map_or(0, |f| f(addr))
+}

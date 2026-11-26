@@ -1,12 +1,12 @@
 target/
 /out/
 *.gexm
-page/node_modules/
-page/dist/
-page/dist-sp/
-page/public/gex/
-page/public/rootfs/
-/page/public/fs/
+runtime/node_modules/
+runtime/app/dist/
+runtime/app/dist-sp/
+runtime/files/out/gex/
+runtime/files/out/rootfs/
+/runtime/files/out/fs/
 guest/gl/out*/
 guest/glx-init/out/
 __pycache__/
@@ -21,5 +21,5 @@ logs/
 core.[0-9]*
 hs_err_pid*.log
 TestResults.qpa
-page/public/pkgs/
-page/public/gex-apt/
+runtime/files/out/pkgs/
+runtime/files/out/gex-apt/

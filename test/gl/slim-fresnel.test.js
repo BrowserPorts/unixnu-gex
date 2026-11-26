@@ -4,11 +4,11 @@
 // fresnel-gpui as a Wayland client of the page's compositor. It finds its
 // libraries only through the package's Depends: the Wayland ones it loads
 // with dlopen, which no needed-library scan sees.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
-import { CompositorWindows } from '../../page/runtime/src/windows/compositor.js';
-import { MesaGl } from '../../page/runtime/src/gl.js';
-import { RepoNetwork } from '../../page/runtime/examples/repo-network.mjs';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
+import { CompositorWindows } from '../../runtime/src/windows/compositor.js';
+import { MesaGl } from '../../runtime/src/gl.js';
+import { RepoNetwork } from '../../runtime/examples/repo-network.mjs';
 
 export const meta = { hosts: ['browser'], arches: ['x86'], images: ['slim'], timeout: 900, html: `<style>html, body { margin: 0; background: #000; }</style>
 <canvas id="out" width="1280" height="760" style="width: 1280px; height: 760px; display: block;" tabindex="0"></canvas>` };
@@ -36,7 +36,6 @@ export default async function (t) {
   eq('apt-get update', (await run(['apt-get', 'update'])).code, 0);
   eq('apt-get install fresnel', (await t.time('install', () => run(['apt-get', 'install', '-y', 'fresnel']))).code, 0);
   const env = { ...out.env, ...base, SHELL: '/bin/bash', TERM: 'xterm-256color' };
-  delete env.DISPLAY;
   const p = sys.spawn(['/usr/bin/fresnel-gpui'], { env });
   const o = t.lines(p);
   const err = t.lines(p, p.stderr);

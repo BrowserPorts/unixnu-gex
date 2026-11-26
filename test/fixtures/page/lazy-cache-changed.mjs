@@ -76,7 +76,7 @@ const prelude = `
   self.postMessage = (m) => parentPort.postMessage(m);
   import(workerData.worker).then(() => parentPort.on('message', (data) => self.onmessage({ data })));
 `;
-const worker = pathToFileURL(join(ROOT, 'page/src/lazy-cache-worker.js')).href;
+const worker = pathToFileURL(join(ROOT, 'runtime/src/host/lazy-cache-worker.js')).href;
 const memory = new WebAssembly.Memory({ initial: 64, maximum: 64, shared: true });
 
 async function visit(versions, len = statSync(file).size) {

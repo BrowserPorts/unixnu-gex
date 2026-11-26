@@ -12,7 +12,7 @@
 #   GEX_XWL_HOST_TOOLS=<prefix> ports/xwayland/build.sh
 #
 # Skips everything when <prefix>/.done matches this script, so it is cheap to
-# call on every build (page/build.sh does).
+# call on every build (runtime/files/build.sh does).
 set -eu
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"

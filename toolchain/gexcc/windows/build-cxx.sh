@@ -33,4 +33,6 @@ cmake -G Ninja -S "$SRC/runtimes" -B "$B" -DCMAKE_TOOLCHAIN_FILE="$PREFIX/share/
   -DLIBCXX_INCLUDE_BENCHMARKS=OFF -DLIBCXX_INCLUDE_TESTS=OFF -DLIBCXXABI_INCLUDE_TESTS=OFF \
   -DLIBUNWIND_INCLUDE_TESTS=OFF -DLIBCXX_INCLUDE_DOCS=OFF > "$B.cmake.log" 2>&1 || { tail -30 "$B.cmake.log"; exit 1; }
 ninja -C "$B" -j"${JOBS:-6}" install > "$B.build.log" 2>&1 || { grep -E 'error' "$B.build.log" | sort | uniq -c | sort -rn | head -20; exit 1; }
+# (which SDK's headers it was built against: gexcc-win refuses the other)
+if grep -q '^MINGW_INCLUDE=' "$PREFIX/lib/gexcc-win/config"; then echo mingw; else echo wine; fi > "$PREFIX/cxx/sdk"
 echo "libc++ (Windows): $PREFIX/cxx/lib/libc++.a"

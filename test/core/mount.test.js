@@ -1,7 +1,7 @@
 // fs.mount: the page's own filesystems in the guest's tree, before boot and
 // while it runs.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
 import { MemFs } from '../fixtures/memfs.js';
 
 export const meta = { hosts: ['browser', 'node'], images: ['busybox'], timeout: 120 };

@@ -57,16 +57,16 @@ static const struct gexgl_glx_config gexgl_glx_configs[] = {
 static const int gexgl_glx_context_token = 0;
 #define GEXGL_GLX_CONTEXT ((void *)&gexgl_glx_context_token)
 
-static void *glx_current_display;
-static unsigned long glx_current_drawable;
-static void *glx_current_context;
+static GEXGL_TLS void *glx_current_display;
+static GEXGL_TLS unsigned long glx_current_drawable;
+static GEXGL_TLS void *glx_current_context;
 /* The EGL context behind every legacy GLX context (GEXGL_GLX_CONTEXT): made
  * at the first glXMakeCurrent, and made current again after a release rather
- * than made anew. EGL contexts are contexts of their own now, each with its
- * own state (egl_context_slots), so a new one per glXMakeCurrent would start
- * a program that releases its context between frames -- Qt does -- from the
- * defaults every frame, and add a host context each time. One, as there has
- * always been. */
+ * than made anew. EGL contexts are contexts of their own, each with its own
+ * state (egl_contexts), so a new one per glXMakeCurrent would start a program
+ * that releases its context between frames -- Qt does -- from the defaults
+ * every frame, and add a host context each time. One, as there has always
+ * been. */
 static void *glx_legacy_egl_context;
 
 /* A context made by glXCreateContextAttribsARB: what it asked for, kept until
@@ -398,8 +398,7 @@ int glXMakeCurrent(void *dpy, unsigned long drawable, void *ctx) {
         context_create();
         context = (void *)3;
     } else if (!context) {
-        if (!glx_legacy_egl_context ||
-            !gexgl_context_slot_of(glx_legacy_egl_context, NULL))
+        if (!glx_legacy_egl_context || !egl_context_live(glx_legacy_egl_context))
             glx_legacy_egl_context = eglCreateContext(dpy, config, NULL, NULL);
         context = glx_legacy_egl_context;
     }

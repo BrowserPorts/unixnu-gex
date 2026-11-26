@@ -5,8 +5,8 @@
 // gexc runs it. Each process of the page has its own copy of the region's
 // pages; the store still takes the page out of the submap's into the
 // task's, as the copy-on-write of XNU's submap does.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
 import { ROOT_OWNED, tarWithXattrs } from '../fixtures/xattr-tar.js';
 
 export const meta = { hosts: ['browser'], arches: ['a64'], images: ['darwin-root', 'darwin-dyn'], timeout: 900 };

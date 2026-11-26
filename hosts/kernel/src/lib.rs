@@ -149,6 +149,13 @@ pub extern "C" fn k_futex_wake(addr: u64) {
     wait::notify(q);
 }
 
+/// TEST (`debugpanic=prctl`): let `prctl(PR_GEX_DEBUG_TRAP)` panic here, in
+/// the global kernel, where a process's prctl is answered.
+#[no_mangle]
+pub extern "C" fn k_arm_debug_trap() {
+    gex_kernel::proc::arm_debug_trap();
+}
+
 /// The generation of the futex at `addr`, sampled when a Worker parks on it and
 /// compared on every re-check.
 #[no_mangle]
@@ -297,6 +304,19 @@ pub extern "C" fn k_slot_get(page: u64, key: u64) -> u32 {
         .get(&(page, key))
         .copied()
         .unwrap_or(0)
+}
+
+/// [`k_slot_get`] for process `pid`, which will use the base it returns:
+/// `pid` holds the range the base is in from now ([`k_slot_alloc_for`]), so
+/// the base cannot be given to other code before `pid` ends.
+#[no_mangle]
+pub extern "C" fn k_slot_get_held(page: u64, key: u64, pid: i32) -> u32 {
+    let sl = slots().lock().unwrap_or_else(|e| e.into_inner());
+    let base = sl.get(&(page, key)).copied().unwrap_or(0);
+    if base != 0 {
+        slot_ranges().lock().unwrap_or_else(|e| e.into_inner()).hold(pid, base as u64);
+    }
+    base
 }
 
 /// Record it, unless that page and identity are already claimed. First writer
@@ -670,12 +690,264 @@ pub extern "C" fn k_slot_alloc(count: u64) -> u64 {
     }
 }
 
+/// The runtime slots handed out, as the ranges [`k_slot_alloc_for`] gave,
+/// each held by the live processes that may reach it: the one it was given
+/// to, each that adopted a base in it ([`k_slot_get_held`]) or installed a
+/// module whose pages are in it ([`k_mod_hold`]), and each one's forked
+/// children ([`k_spawn`]). A process lets go of all of them as it ends
+/// ([`k_exit`]). (One that ends without it, its Worker torn down, keeps
+/// them: never taken back, which is safe, as is a later process given its
+/// pid holding them.)
+///
+/// A range no live process holds stays as it is, its code cached: the next
+/// run of the same program finds its pages in the slot map and its modules
+/// in the store. Only when an allocation would take the runtime space past
+/// half spent are such ranges taken back, the oldest first ([`reclaim`]):
+/// their pages leave the slot map and their modules the store, so nothing
+/// can name them again (dispatch reads slot words without a lock, which
+/// holders make safe: no live process can reach a range nobody holds), and
+/// they are handed out again before the mark moves on.
+struct SlotRanges {
+    /// By first slot: how many slots, who holds it, and when it was given.
+    live: BTreeMap<u64, SlotRange>,
+    /// Taken back and not yet handed out again: `(first slot, count)`, each
+    /// inside one dispatch table.
+    free: Vec<(u64, u64)>,
+    seq: u64,
+    /// The runtime space's top, if a debug switch lowered it
+    /// (`GEX_DEBUG_SLOT_SPACE`, [`k_slot_limit`]); 0: the last table's top.
+    limit: u64,
+    /// Ranges and slots taken back so far, and whether that has been said
+    /// ([`k_slot_reclaimed`]).
+    reclaimed: (u64, u64),
+    said: bool,
+}
+
+struct SlotRange {
+    count: u64,
+    holders: Vec<i32>,
+    seq: u64,
+}
+
+impl SlotRanges {
+    fn hold(&mut self, pid: i32, slot: u64) {
+        if let Some((_, r)) = self.live.range_mut(..=slot).next_back().filter(|(&b, r)| slot < b + r.count) {
+            if !r.holders.contains(&pid) {
+                r.holders.push(pid);
+            }
+        }
+    }
+
+    fn top(&self) -> u64 {
+        let full = gex_abi::DISPATCH_TABLES as u64 * slots_per_table();
+        if self.limit != 0 { self.limit.min(full) } else { full }
+    }
+}
+
+fn slot_ranges() -> &'static Mutex<SlotRanges> {
+    note_panics();
+    static R: OnceLock<Mutex<SlotRanges>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(SlotRanges { live: BTreeMap::new(), free: Vec::new(), seq: 1, limit: 0, reclaimed: (0, 0), said: true }))
+}
+
+fn slots_per_table() -> u64 {
+    (gex_abi::DISPATCH_TABLE_MAX_SLOTS / gex_abi::SLOTS_PER_PAGE) * gex_abi::SLOTS_PER_PAGE
+}
+
+/// Take back the oldest ranges no live process holds until `want` slots are
+/// free (or none is left to take): out of the slot map, their modules made
+/// empty in the store (an id stays an id; its bytes, pages and claims go, and
+/// an object any of them was part of is no longer translated whole), onto
+/// the free list. The caller holds the store, the slot map and the ranges,
+/// in that order (as `k_store_restore` takes the first two). A save after
+/// this writes the store as it now is; one before was a whole store of its
+/// own, so no saved cache ever names a range given again.
+fn reclaim(m: &mut ModStore, sl: &mut BTreeMap<(u64, u64), u32>, r: &mut SlotRanges, want: u64) {
+    let mut have: u64 = r.free.iter().map(|f| f.1).sum();
+    if have >= want {
+        return;
+    }
+    let mut dead: Vec<(u64, u64, u64)> = r.live.iter().filter(|(_, x)| x.holders.is_empty()).map(|(&b, x)| (x.seq, b, x.count)).collect();
+    dead.sort_unstable();
+    let mut gone: Vec<(u64, u64)> = Vec::new();
+    for (_, b, c) in dead {
+        if have >= want {
+            break;
+        }
+        r.live.remove(&b);
+        gone.push((b, c));
+        have += c;
+    }
+    if gone.is_empty() {
+        return;
+    }
+    gone.sort_unstable();
+    let inside = |slot: u64| {
+        let i = gone.partition_point(|&(b, _)| b <= slot);
+        i > 0 && slot < gone[i - 1].0 + gone[i - 1].1
+    };
+    sl.retain(|_, base| !inside(*base as u64));
+    let mut dropped: BTreeSet<u32> = BTreeSet::new();
+    for (i, sm) in m.mods.iter_mut().enumerate().skip(1) {
+        if sm.dirs.iter().any(|&(_, base)| inside(base as u64)) {
+            if sm.at.0 != u32::MAX {
+                m.total -= sm.at.2 as usize;
+            }
+            *sm = SharedModule { at: (u32::MAX, 0, 0), slots: 0, dirs: Vec::new() };
+            dropped.insert(i as u32 + 1);
+        }
+    }
+    if !dropped.is_empty() {
+        m.by_page.retain(|_, ids| {
+            ids.retain(|id| !dropped.contains(id));
+            !ids.is_empty()
+        });
+        let mut partial = Vec::new();
+        m.by_object.retain(|obj, ids| {
+            let n = ids.len();
+            ids.retain(|id| !dropped.contains(id));
+            if ids.len() != n {
+                partial.push(*obj);
+            }
+            !ids.is_empty()
+        });
+        for obj in partial {
+            m.translated.remove(&obj);
+        }
+    }
+    r.reclaimed.0 += gone.len() as u64;
+    r.reclaimed.1 += gone.iter().map(|g| g.1).sum::<u64>();
+    r.said = false;
+    r.free.extend(gone);
+    // neighbours in one table join, so a request larger than any one range
+    // taken back can still be met from them
+    r.free.sort_unstable();
+    let per = slots_per_table();
+    let mut joined: Vec<(u64, u64)> = Vec::with_capacity(r.free.len());
+    for (b, c) in r.free.drain(..) {
+        match joined.last_mut() {
+            Some(l) if l.0 + l.1 == b && l.0 / per == b / per => l.1 += c,
+            _ => joined.push((b, c)),
+        }
+    }
+    r.free = joined;
+}
+
+/// [`k_slot_alloc`] for process `pid`, which holds the range from now. Past
+/// half the runtime space, ranges no live process holds are taken back
+/// first ([`reclaim`]), and a free one that is large enough is handed out
+/// before the mark moves.
+#[no_mangle]
+pub extern "C" fn k_slot_alloc_for(count: u64, pid: i32) -> u64 {
+    let mark = slot_mark().load(core::sync::atomic::Ordering::SeqCst);
+    let (pressed, has_dead) = {
+        let r = slot_ranges().lock().unwrap_or_else(|e| e.into_inner());
+        let floor = slot_floor().load(core::sync::atomic::Ordering::SeqCst);
+        let half = floor + r.top().saturating_sub(floor) / 2;
+        (mark + count > half, !r.free.is_empty() || r.live.values().any(|x| x.holders.is_empty()))
+    };
+    let base = if pressed && has_dead {
+        let mut m = modules().lock().unwrap_or_else(|e| e.into_inner());
+        let mut sl = slots().lock().unwrap_or_else(|e| e.into_inner());
+        let mut r = slot_ranges().lock().unwrap_or_else(|e| e.into_inner());
+        // a tenth of the runtime space at a time, so a run of small
+        // allocations does not walk the store each time
+        let floor = slot_floor().load(core::sync::atomic::Ordering::SeqCst);
+        let want = count.max(r.top().saturating_sub(floor) / 10);
+        reclaim(&mut m, &mut sl, &mut r, want);
+        drop(sl);
+        drop(m);
+        match r.free.iter().position(|f| f.1 >= count) {
+            Some(i) => {
+                let (b, c) = r.free[i];
+                if c > count {
+                    r.free[i] = (b + count, c - count);
+                } else {
+                    r.free.swap_remove(i);
+                }
+                let seq = r.seq;
+                r.seq += 1;
+                r.live.insert(b, SlotRange { count, holders: vec![pid], seq });
+                return b;
+            }
+            None => k_slot_alloc(count),
+        }
+    } else {
+        k_slot_alloc(count)
+    };
+    let mut r = slot_ranges().lock().unwrap_or_else(|e| e.into_inner());
+    let seq = r.seq;
+    r.seq += 1;
+    r.live.insert(base, SlotRange { count, holders: vec![pid], seq });
+    base
+}
+
+/// Module `id` is about to be installed by process `pid`: `pid` holds every
+/// range its pages are in. 0 (install nothing) when it is gone from the
+/// store, taken back with its range ([`reclaim`]).
+#[no_mangle]
+pub extern "C" fn k_mod_hold(id: u32, pid: i32) -> u32 {
+    let m = modules().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(sm) = m.mods.get((id as usize).wrapping_sub(1)) else { return 0 };
+    if sm.at.0 == u32::MAX && sm.dirs.is_empty() {
+        return 0;
+    }
+    let mut r = slot_ranges().lock().unwrap_or_else(|e| e.into_inner());
+    for &(_, base) in &sm.dirs {
+        r.hold(pid, base as u64);
+    }
+    1
+}
+
+/// Make the runtime space `room` slots, from the floor (a debug switch, for
+/// a test that must spend it quickly); the first asked for stands.
+#[no_mangle]
+pub extern "C" fn k_slot_limit(room: u64) {
+    let mut r = slot_ranges().lock().unwrap_or_else(|e| e.into_inner());
+    if r.limit == 0 && room > 0 {
+        r.limit = slot_floor().load(core::sync::atomic::Ordering::SeqCst) + room;
+    }
+}
+
+/// The runtime space's top ([`k_slot_limit`]).
+#[no_mangle]
+pub extern "C" fn k_slot_top() -> u64 {
+    slot_ranges().lock().unwrap_or_else(|e| e.into_inner()).top()
+}
+
+/// How many ranges, and slots, have been taken back ([`reclaim`]), packed
+/// `ranges << 40 | slots`, to the first caller since the last reclaim; 0 to
+/// the rest, so it is said once in the whole system.
+#[no_mangle]
+pub extern "C" fn k_slot_reclaimed() -> u64 {
+    let mut r = slot_ranges().lock().unwrap_or_else(|e| e.into_inner());
+    if std::mem::replace(&mut r.said, true) {
+        return 0;
+    }
+    (r.reclaimed.0 << 40) | (r.reclaimed.1 & ((1 << 40) - 1))
+}
+
+/// Process `pid` has ended: it holds no range now.
+fn slot_release(pid: i32) {
+    let mut r = slot_ranges().lock().unwrap_or_else(|e| e.into_inner());
+    for x in r.live.values_mut() {
+        x.holders.retain(|&h| h != pid);
+    }
+}
+
 /// Raise the mark so nothing is handed out below `floor` -- above every
 /// statically recompiled image's baked-in slot range, or a runtime allocation
 /// would land on one.
 #[no_mangle]
 pub extern "C" fn k_slot_floor(floor: u64) {
     slot_mark().fetch_max(floor, core::sync::atomic::Ordering::SeqCst);
+    slot_floor().fetch_max(floor, core::sync::atomic::Ordering::SeqCst);
+}
+
+/// The highest floor asked for: where the runtime space really starts.
+fn slot_floor() -> &'static core::sync::atomic::AtomicU64 {
+    static FLOOR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(RUNTIME_SLOT_BASE);
+    &FLOOR
 }
 
 /// Runtime slots nobody has claimed yet: from the mark to the top of the last
@@ -1429,6 +1701,19 @@ pub extern "C" fn k_store_restore() -> i32 {
         m.by_object = by_object;
         m.translated = translated;
         slot_mark().fetch_max(mark, core::sync::atomic::Ordering::SeqCst);
+        // What the saved run handed out, as ranges no process holds yet, a
+        // dispatch table's share at a time, older than anything this load
+        // hands out: taken back first if this load runs short.
+        {
+            let mut rg = slot_ranges().lock().unwrap_or_else(|e| e.into_inner());
+            let per = slots_per_table();
+            let mut b = RUNTIME_SLOT_BASE;
+            while b < mark {
+                let end = ((b / per + 1) * per).min(mark);
+                rg.live.insert(b, SlotRange { count: end - b, holders: Vec::new(), seq: 0 });
+                b = end;
+            }
+        }
         Some(kept)
     })();
     x.saved_mods = m.mods.len();
@@ -1659,7 +1944,18 @@ static mut SCRATCH: [u8; 4096] = [0; 4096];
 /// Create a process with `ppid` as its parent. Returns the new pid.
 #[no_mangle]
 pub extern "C" fn k_spawn(ppid: i32) -> i32 {
-    procs().spawn(ppid)
+    let pid = procs().spawn(ppid);
+    // A forked child starts with its parent's translations: it holds what
+    // the parent holds.
+    if pid > 0 {
+        let mut r = slot_ranges().lock().unwrap_or_else(|e| e.into_inner());
+        for x in r.live.values_mut() {
+            if x.holders.contains(&ppid) && !x.holders.contains(&pid) {
+                x.holders.push(pid);
+            }
+        }
+    }
+    pid
 }
 
 /// A new thread of `pid`, numbered with the processes
@@ -1760,6 +2056,8 @@ pub extern "C" fn k_exit(pid: i32, status: i32) {
     note_kill(pid, procs().ppid(pid), gex_kernel::signal::sig::SIGCHLD);
     // Its record locks, however it ended.
     locks().release_pid(pid, None);
+    // and its dispatch slots
+    slot_release(pid);
     // What it held of the Darwin system's state that ends with it; the IPC
     // table (or another it takes whole), if it held it, to the processes
     // waiting for it.
@@ -1847,12 +2145,62 @@ pub extern "C" fn k_kill(caller: i32, target: i32, signo: u32) -> i32 {
     }
 }
 
+/// Send signal `signo` to every live process named the `len` bytes at `at`:
+/// the name it published (its info's first line) or its program's file name
+/// (the last `/`-part of its first argument). The number signalled, or a
+/// negative errno. A page asks a daemon it did not start by name this way
+/// (sys.signal), since it knows no pid.
+#[no_mangle]
+pub extern "C" fn k_kill_named(caller: i32, at: gex_kmem::PAddr, len: u32, signo: u32) -> i32 {
+    let len = len.min(256);
+    let mut name = vec![0u8; len as usize];
+    if len > 0 {
+        unsafe { gex_kmem::pull_checked(name.as_mut_ptr(), at, len) };
+    }
+    if name.is_empty() {
+        return -22;
+    }
+    let mut n = 0;
+    for e in procs().entries() {
+        if e.zombie || !named(&e.info, &name) {
+            continue;
+        }
+        if signo != 0 {
+            note_kill(caller, e.pid, signo);
+        }
+        if let Ok(k) = procs().kill(caller, e.pid, signo) {
+            n += k as i32;
+        }
+    }
+    n
+}
+
+/// Whether a process's published info (`name\nargs`, NUL-separated) names
+/// `want`: as its name, or as its first argument's file name.
+fn named(info: &[u8], want: &[u8]) -> bool {
+    let nl = info.iter().position(|&b| b == b'\n').unwrap_or(info.len());
+    if &info[..nl] == want {
+        return true;
+    }
+    let args = info.get(nl + 1..).unwrap_or(&[]);
+    let argv0 = &args[..args.iter().position(|&b| b == 0).unwrap_or(args.len())];
+    let base = &argv0[argv0.iter().rposition(|&b| b == b'/').map_or(0, |i| i + 1)..];
+    base == want
+}
+
 /// The last signal this kernel handed to anyone: caller, target, number.
 ///
 /// "Killed by signal 1" says nothing about who decided that, and the senders
 /// are spread out -- the shared terminal's line discipline, a pty hangup, and
 /// any guest's own `kill`. The shim reads this for its death report.
 static LAST_KILL: Mutex<(i32, i32, u32)> = Mutex::new((0, 0, 0));
+
+/// The last kills, with their numbers ([`KILL_SEQ`]), for a report about
+/// one process ([`k_last_kill_to`]): [`LAST_KILL`] is anybody's, and a
+/// process that died of a kill named the one sent to another pid after it
+/// (wineserver ending a crashed program and then its conhost).
+const KILLS_KEPT: usize = 64;
+static KILLS: Mutex<std::collections::VecDeque<(i32, i32, u32, u32)>> = Mutex::new(std::collections::VecDeque::new());
 /// How many signals have been sent, so notes from different Workers can be put
 /// in order -- which is the whole question when one process's signal makes
 /// another one misbehave.
@@ -1861,7 +2209,12 @@ static KILL_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::ne
 fn note_kill(caller: i32, target: i32, signo: u32) {
     if signo != 0 {
         *LAST_KILL.lock().unwrap_or_else(|e| e.into_inner()) = (caller, target, signo);
-        KILL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Release);
+        let seq = KILL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Release) + 1;
+        let mut k = KILLS.lock().unwrap_or_else(|e| e.into_inner());
+        if k.len() >= KILLS_KEPT {
+            k.pop_front();
+        }
+        k.push_back((caller, target, signo, seq));
     }
 }
 
@@ -1869,6 +2222,26 @@ fn note_kill(caller: i32, target: i32, signo: u32) {
 #[no_mangle]
 pub extern "C" fn k_last_kill_seq() -> u32 {
     KILL_SEQ.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// The last kill that reached `pid` (of [`KILLS_KEPT`]): sent to it, to its
+/// process group `pgid`, or to everyone (`kill(-1)`); as [`k_last_kill`]
+/// packs one, 0 for none. Its number from [`k_last_kill_to_seq`].
+#[no_mangle]
+pub extern "C" fn k_last_kill_to(pid: i32, pgid: i32) -> u64 {
+    last_kill_to(pid, pgid).map_or(0, |(caller, target, signo, _)| {
+        ((caller as i64 as u64) << 40) | (((target as i64 as u64) & 0xffff_ffff) << 8) | (signo as u64 & 0xff)
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn k_last_kill_to_seq(pid: i32, pgid: i32) -> u32 {
+    last_kill_to(pid, pgid).map_or(0, |k| k.3)
+}
+
+fn last_kill_to(pid: i32, pgid: i32) -> Option<(i32, i32, u32, u32)> {
+    let k = KILLS.lock().unwrap_or_else(|e| e.into_inner());
+    k.iter().rev().find(|&&(_, t, _, _)| t == pid || t == -1 || (pgid > 0 && t == -pgid)).copied()
 }
 
 /// Caller in the high bits, target in the middle, signal in the low byte. A
@@ -3287,12 +3660,37 @@ pub extern "C" fn k_fs_truncate(handle: i32, len: u64) -> i32 {
     as_unit(h.truncate(len))
 }
 
+/// `?systime=1`: count from now on (`on` 1), or read
+/// (`gex_kernel::vfs::tmpfs::ADVISE_STATS[i]`, `on` 2: laid-wait ns, laid waits, fadvise calls).
+#[no_mangle]
+pub extern "C" fn k_advise_stat(on: u32, i: u32) -> u64 {
+    use core::sync::atomic::Ordering::Relaxed;
+    if on == 1 {
+        gex_kernel::vfs::tmpfs::ADVISE_TIMED.store(true, Relaxed);
+        return 0;
+    }
+    gex_kernel::vfs::tmpfs::ADVISE_STATS.get(i as usize).map_or(0, |s| s.load(Relaxed))
+}
+
 /// `posix_fadvise` of an open file (`FileHandle::advise`): a lazy file fetches
 /// what is asked now, in the caller's Worker.
 #[no_mangle]
 pub extern "C" fn k_fs_advise(handle: i32, offset: u64, len: u64, advice: u32) -> i32 {
     let Some(h) = handle_at(handle) else { return -9 };
     as_unit(h.advise(offset, len, advice))
+}
+
+/// A copy of all of open file `src` into `dst` (empty) that shares its bytes
+/// until written (`FileHandle::share_from`): the size, a negated errno, or
+/// `remote::NOT_SHARED` where the file system cannot.
+#[no_mangle]
+pub extern "C" fn k_fs_share(dst: i32, src: i32) -> i64 {
+    let (Some(d), Some(s)) = (handle_at(dst), handle_at(src)) else { return -9 };
+    match d.share_from(&*s) {
+        Some(Ok(n)) => n as i64,
+        Some(Err(e)) => -(e.0 as i64),
+        None => gex_kernel::vfs::remote::NOT_SHARED,
+    }
 }
 
 /// A directory listing, or `-ERANGE` when `cap` will not hold it.
@@ -3324,7 +3722,7 @@ pub extern "C" fn k_fs_read_dir(handle: i32, at: gex_kmem::PAddr, cap: u32) -> i
 /// written into; an open or a stat alone does not count), one path a line, at
 /// `at`; their length, or `-ERANGE` with nothing written when `cap` will not
 /// hold them (ask again with more). A recorded run's read set: gex-eject's
-/// bundle split (page/src/fs-opened.js asks).
+/// bundle split (runtime/src/host/fs-opened.js asks).
 #[no_mangle]
 pub extern "C" fn k_fs_opened(at: gex_kmem::PAddr, cap: u32) -> i32 {
     let mut b = rootfs().read_set().join("\n");
@@ -3923,7 +4321,9 @@ fn pending_wait(word: &core::sync::atomic::AtomicU32, ino: u64) -> bool {
     }
     // Traced ([`k_fs_pending_trace`]): in 10 ms slices, each wait kept.
     let traced = PENDING_TRACE.load(core::sync::atomic::Ordering::Relaxed);
-    let (slice, per_sec) = if traced { (10_000_000i64, 100u32) } else { (1_000_000_000, 1) };
+    // (`?systime=1`: timed in 10 ms slices too, into ADVISE_STATS)
+    let timed = gex_kernel::vfs::tmpfs::ADVISE_TIMED.load(core::sync::atomic::Ordering::Relaxed);
+    let (slice, per_sec) = if traced || timed { (10_000_000i64, 100u32) } else { (1_000_000_000, 1) };
     let start = traced.then(|| (rootfs().pending_path(ino), FILLED.load(core::sync::atomic::Ordering::Relaxed)));
     let mut n = 0u32;
     while word.load(Acquire) == gex_kernel::vfs::tmpfs::PENDING {
@@ -3934,6 +4334,11 @@ fn pending_wait(word: &core::sync::atomic::AtomicU32, ino: u64) -> bool {
         if n == 30 * per_sec {
             PENDING_LONG.store(ino, core::sync::atomic::Ordering::Relaxed);
         }
+    }
+    if timed && n > 0 {
+        let st = &gex_kernel::vfs::tmpfs::ADVISE_STATS;
+        st[0].fetch_add(n as u64 * 10_000_000, core::sync::atomic::Ordering::Relaxed);
+        st[1].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
     if let Some((path, at)) = start {
         let path = path.unwrap_or_else(|| format!("inode {ino}"));

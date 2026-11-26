@@ -36,9 +36,18 @@ configure() { # DIR STAMP CMD...
     echo "$stamp" > "$dir/.wine32-configure"
   fi
 }
+# SRC as named, a link kept (cd, not realpath, as dist.sh takes it): Wine's
+# makedep splits a makefile's include flags at spaces, so a tree reached
+# through a spaceless link (a checkout under a directory whose name has a
+# space) builds only by that link's path.
+srcdir() {
+  local d; d=$(cd "${1:?SRC}" && pwd) || exit 1
+  case $d in *[[:space:]]*) echo "wine32/wine-build: $d has a space; name the Wine source by a path without one (a link)" >&2; exit 1 ;; esac
+  printf %s "$d"
+}
 case $1 in
 tools)
-  src=$(realpath "$2") tools=$(realpath -m "$3")
+  src=$(srcdir "$2") || exit 1; tools=$(realpath -m "$3")
   o="$OPTS --without-freetype --without-wayland --without-opengl"
   # (Wine's configure wants a PE arch on macOS and ARM hosts, even for a
   # tree only the tools are made in: x86_64's there, MinGW's, which
@@ -51,7 +60,7 @@ tools)
   make -C "$tools" -j"$J" __tooldeps__ > "$tools/make.log" 2>&1 || { echo "wine32/wine-build: tools make failed ($tools/make.log)" >&2; exit 1; }
   ;;
 wasm|configure)
-  src=$(realpath "$2") tools=$(realpath "$3") build=$(realpath -m "$4") deps=$(realpath "$5")
+  src=$(srcdir "$2") || exit 1; tools=$(realpath "$3") build=$(realpath -m "$4") deps=$(realpath "$5")
   : "${GEX_WASM_SYSROOT:?}"
   # dpnsvr and twain_32: i386 builtins configure enables for i386 alone
   # (wasm32 serves i386 programs); dmsynth and its FluidSynth, which it

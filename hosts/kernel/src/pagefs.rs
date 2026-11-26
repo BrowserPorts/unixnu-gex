@@ -4,7 +4,7 @@
 //! The page answers asynchronously, and a guest's call blocks the thread
 //! that made it, so each call here is one request handed to the host
 //! (`env.page_fs`), which waits in the calling Worker until the page has
-//! answered (page/runtime/src/mount.js). Nothing else waits: another thread,
+//! answered (runtime/src/mount.js). Nothing else waits: another thread,
 //! another process, a call elsewhere in the tree all go on.
 //!
 //! Mounted here rather than in each process's mount table so that every

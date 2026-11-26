@@ -44,6 +44,10 @@ pub(super) struct Prog {
     pub len: u32,
     /// The file's identity (inode, mtime, size) when they went.
     pub gone: Option<(u64, i64, u64)>,
+    /// Where in `path` the module starts: 0 for a library (the whole file),
+    /// past the ELF headers for a program, whose module rides in its image
+    /// (wasm-elf.py) and is read from there ([`module_in_file`]).
+    pub off: u64,
 }
 
 /// Whether `wasm` imports `env.__memory_base` as an i64: a module built for
@@ -228,6 +232,71 @@ fn wine64_native_ntdll(exe: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Where a native wasm32 program's module is in its file, from the GEXWASM
+/// header as the file holds it: (its address in the image, its length, its
+/// offset in the file). `segs` is the image's segments as planned: (address,
+/// file offset, bytes in the file); `read` reads the file. `None` for a
+/// program without the header, or a module that is not all in the file.
+pub(crate) fn module_in_file(entry: u64, segs: &[(u64, u64, u64)], read: &dyn Fn(u64, &mut [u8]) -> Option<usize>) -> Option<(u64, u64, u64)> {
+    let file_at = |a: u64, n: u64| segs.iter().find(|&&(v, _, l)| a >= v && a + n <= v + l).map(|&(v, o, _)| o + (a - v));
+    let mut h = [0u8; 36];
+    let hat = entry.wrapping_sub(0x40);
+    if read(file_at(hat, 36)?, &mut h)? != 36 {
+        return None;
+    }
+    let (at, len) = gex_cgen::image::program_flags::module_at(&h)?;
+    let off = file_at(at, len)?;
+    let mut m = [0u8; 4];
+    (read(off, &mut m)? == 4 && &m == b"\0asm").then_some((at, len, off))
+}
+
+/// [`module_in_file`] of the program file `path` (its headers read again).
+fn module_of_file(path: &str, entry: u64) -> Option<(u64, u64, u64)> {
+    let home = crate::sigs::proc_home();
+    let read = |o: u64, b: &mut [u8]| home.read_file_at(path, o, b);
+    let (image, ranges) = gex_ld::elf::plan(&read, gex_abi::PIE_BASE).ok()?;
+    let segs: Vec<(u64, u64, u64)> = image.segments.iter().zip(&ranges).map(|(s, &(o, l))| (s.vaddr, o, l)).collect();
+    module_in_file(entry, &segs, &read)
+}
+
+/// `len` bytes of file `path` from `off`, whole, or `None`.
+fn read_range(path: &str, off: u64, len: usize) -> Option<Vec<u8>> {
+    let mut b = vec![0u8; len];
+    (crate::sigs::proc_home().read_file_at(path, off, &mut b)? == len).then_some(b)
+}
+
+/// The module of `len` bytes at `off` in file `path` without its code and
+/// data sections' contents (the sections themselves left out): what a
+/// program's publishing parses (imports, table, element segments, names,
+/// custom sections), a tenth of the bytes. Read in pieces, never whole.
+fn module_skeleton(path: &str, off: u64, len: u64) -> Option<Vec<u8>> {
+    let mut out = read_range(path, off, 8)?;
+    let mut p = 8u64;
+    while p < len {
+        let head = read_range(path, off + p, ((len - p) as usize).min(6))?;
+        let (mut size, mut shift, mut used) = (0u64, 0, 0usize);
+        loop {
+            let b = *head.get(1 + used)?;
+            size |= ((b & 0x7f) as u64) << shift;
+            used += 1;
+            shift += 7;
+            if b & 0x80 == 0 {
+                break;
+            }
+        }
+        let total = 1 + used as u64 + size;
+        if p + total > len {
+            return None;
+        }
+        // 10 code, 11 data
+        if head[0] != 10 && head[0] != 11 {
+            out.extend(read_range(path, off + p, total as usize)?);
+        }
+        p += total;
+    }
+    Some(out)
+}
+
 fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, String> {
     let mem = crate::guest();
     let h = mem.read(entry.wrapping_sub(0x40), 36).map_err(|_| "header outside memory")?;
@@ -296,7 +365,18 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
             mm.insert(TRAMPOLINES, TRAMPOLINES_END, gex_kernel::mem::prot::READ | gex_kernel::mem::prot::EXEC, "[nt-trampolines]");
         }
     }
-    let wasm = mem.read(wasm_at, wasm_len as usize).map_err(|_| "module outside memory")?.to_vec();
+    // The module from the program's file, as much of it as is parsed here:
+    // the image's placement leaves it out (`module_in_file`), and held here it
+    // was a second copy in every process's memory. JS reads it from the file
+    // when the page has not compiled it yet. From memory only for an image
+    // that has it there (one placed whole, or no file to read).
+    let path = exe_path();
+    let in_file = module_of_file(&path, entry).filter(|&(at, len, _)| at == wasm_at && len == wasm_len).map(|(_, _, off)| off);
+    let held = in_file.is_none() || !mem.read(wasm_at, 4).is_ok_and(|m| m != b"\0asm");
+    let wasm = match in_file {
+        Some(off) if !held => module_skeleton(&path, off, wasm_len).ok_or_else(|| format!("{path}: its module could not be read"))?,
+        _ => mem.read(wasm_at, wasm_len as usize).map_err(|_| "module outside memory")?.to_vec(),
+    };
     // Wine's loader: refused when its inline probe reads another layout. Every
     // 32-bit guest program is Wine's loader; a 64-bit one is when it is bound
     // to the probe layout (abi_bound: its gex.abi section, or its gex.call_out
@@ -313,8 +393,13 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
         Some(i) if !i.needed.is_empty() => (None, Some(i)),
         other => (other, None),
     };
-    // One that names shared libraries: gex's loader (`dylink`).
+    // One that names shared libraries: gex's loader (`dylink`), which takes
+    // the whole module.
     if let Some(info) = libs {
+        let wasm = match in_file {
+            Some(off) if !held => read_range(&path, off, wasm_len as usize).ok_or_else(|| format!("{path}: its module could not be read"))?,
+            _ => wasm,
+        };
         let n = if relocate {
             super::dylink::install(wasm, info, mem_base as u32, entry, thread_entry)
         } else {
@@ -344,12 +429,22 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
     let base = ftab(|m| m.install(install).base);
     CURRENT_BASE.store(base, Ordering::Relaxed);
     let (regs, dirs, slots) = entry_bridges(&[entry, thread_entry]);
-    let path = exe_path();
     super::dylink::static_published(number, info, &path, base, mem_base as u32);
     // The bytes before the record: a Worker catching up takes the record
     // (`gex_cgen_pmod_ready`) as the sign that both are there.
     let lowered = is_lowered(&wasm);
-    lock(&PROGS).push(Prog { number, len: wasm.len() as u32, wasm, relocate, relocating: false, key: None, path: path.clone(), lowered, from_file: false, gone: None });
+    crate::LOWERED64.store(lowered, Ordering::Release);
+    // Read from the file: kept as the file's, the key from it in pieces
+    // (or the system-wide cache), the bytes not at all.
+    let (wasm, from_file, key, gone, off) = match in_file {
+        Some(off) => {
+            let id = file_identity(&path).ok_or_else(|| format!("{path}: gone"))?;
+            let key = file_key_streamed_at(&path, off, wasm_len).ok_or_else(|| format!("{path}: its module could not be read to key it"))?;
+            (Vec::new(), true, Some(key), Some(id), off)
+        }
+        _ => (wasm, false, None, None, 0),
+    };
+    lock(&PROGS).push(Prog { number, len: wasm_len as u32, wasm, relocate, relocating: false, key, path: path.clone(), lowered, from_file, gone, off });
     lock(&PROVIDERS).push(ProviderModule { file: format!("wasmprog:{path}"), regs, dirs, slots, memory_base: mem_base as u32 as u64 });
     CURRENT.store(entry, Ordering::Relaxed);
     Ok(number)
@@ -445,20 +540,44 @@ pub(super) fn len(number: u32) -> Option<u32> {
 /// not do: another Worker of the process instantiating the same module
 /// releases them, which freed them under a Worker still copying them out.
 pub(super) fn owned(number: u32) -> Option<Vec<u8>> {
-    let (path, id, len) = {
+    let (path, id, len, off) = {
         let g = lock(&PROGS);
         let p = g.iter().find(|p| p.number == number)?;
         match p.gone {
             None => return Some(p.wasm.clone()),
-            Some(id) => (p.path.clone(), id, p.len),
+            Some(id) => (p.path.clone(), id, p.len, p.off),
         }
     };
     let same = file_id(&path).is_some_and(|(_, ino, mtime, size)| (ino, mtime, size) == id);
-    let b = super::dylink::read(&path).filter(|b| same && b.len() as u32 == len);
+    let b = if off == 0 { super::dylink::read(&path) } else { read_range(&path, off, len as usize) }.filter(|b| same && b.len() as u32 == len);
     if b.is_none() {
         crate::warn_line(&format!("gex: {path}: changed since it was loaded\n"));
     }
     b
+}
+
+/// A wasm32 library's file for JS to read its bytes from
+/// (`gex_cgen_pmod_read`): its path, its identity when its bytes went (else
+/// the file's now), its length and where in the file it starts. `None` for
+/// a program's whose bytes are its image's, from memory, a library's
+/// rewritten for checked calls, or a module that is not a wasm32 one.
+pub(super) fn file_of(number: u32) -> Option<(String, Option<(u64, i64, u64)>, u32, u64)> {
+    let (path, gone, len, off) = {
+        let g = lock(&PROGS);
+        let p = g.iter().find(|p| p.number == number && p.from_file)?;
+        (p.path.clone(), p.gone, p.len, p.off)
+    };
+    // (a program's module is only in its file: never rewritten)
+    if off == 0 && super::dylink::checked_on() {
+        return None;
+    }
+    let id = gone.or_else(|| file_identity(&path));
+    Some((path, id, len, off))
+}
+
+/// File `path`'s identity (inode, mtime, size), as [`file_id`].
+pub(super) fn file_identity(path: &str) -> Option<(u64, i64, u64)> {
+    file_id(path).map(|(_, ino, mtime, size)| (ino, mtime, size))
 }
 
 /// [`owned`] for JS: the bytes in a block of exactly the module's length,
@@ -496,14 +615,13 @@ pub(super) fn shed(path: &str, bytes: &[u8]) -> Option<Shed> {
     Some(Shed { len: bytes.len() as u32, key: file_key(path, bytes), gone: (ino, mtime, size) })
 }
 
-/// [`shed`] for a library whose bytes were not read: a process made its
-/// file's key already ([`known_key`]), so nothing here needs them. `None`
-/// for a file no process has hashed (it is read whole, and hashed then).
-pub(super) fn shed_known(path: &str) -> Option<Shed> {
-    let id = file_id(path)?;
-    let (_, ino, mtime, size) = id;
+/// [`shed`] for a library whose bytes are not read whole: its file's key
+/// from the system-wide cache, or made from the file in pieces
+/// ([`file_key_streamed`]). `None` when the file cannot be read.
+pub(super) fn shed_file(path: &str) -> Option<Shed> {
+    let (_, ino, mtime, size) = file_id(path)?;
     let len = u32::try_from(size).ok()?;
-    let key = known_key(&id, len)?;
+    let key = file_key_streamed(path, size)?;
     Some(Shed { len, key, gone: (ino, mtime, size) })
 }
 
@@ -527,21 +645,101 @@ pub extern "C" fn gex_wasmprog_release(number: u32) {
 /// trace of `apt-get update`, and copied the bytes out first even when the
 /// page already had the module.
 pub(super) fn content_key(b: &[u8]) -> (u64, u64) {
-    let (mut a, mut c) = (0xcbf2_9ce4_8422_2325u64, 0x9e37_79b9_7f4a_7c15u64);
-    let words = b.chunks_exact(8);
-    let tail = words.remainder();
-    for (i, w) in words.enumerate() {
-        let x = u64::from_le_bytes(w.try_into().unwrap());
-        a = (a ^ x).wrapping_mul(0x0000_0100_0000_01b3);
-        c = (c ^ x.rotate_left(29) ^ i as u64).wrapping_mul(0xff51_afd7_ed55_8ccd);
-        c ^= c >> 32;
+    let mut h = KeyHasher::new();
+    h.update(b);
+    h.finish()
+}
+
+/// [`content_key`] over bytes given in pieces (a file read in chunks): the
+/// same key as the whole at once, whatever the pieces' lengths.
+pub(super) struct KeyHasher {
+    a: u64,
+    c: u64,
+    /// Words hashed so far.
+    i: u64,
+    /// A word's bytes not yet complete.
+    part: [u8; 8],
+    have: usize,
+}
+
+impl KeyHasher {
+    pub(super) fn new() -> Self {
+        KeyHasher { a: 0xcbf2_9ce4_8422_2325, c: 0x9e37_79b9_7f4a_7c15, i: 0, part: [0; 8], have: 0 }
     }
-    for (i, &x) in tail.iter().enumerate() {
-        a = (a ^ x as u64).wrapping_mul(0x0000_0100_0000_01b3);
-        c = (c ^ ((x as u64) << (i * 8)) ^ 0xa5).wrapping_mul(0xff51_afd7_ed55_8ccd);
-        c ^= c >> 32;
+
+    fn word(&mut self, x: u64) {
+        self.a = (self.a ^ x).wrapping_mul(0x0000_0100_0000_01b3);
+        self.c = (self.c ^ x.rotate_left(29) ^ self.i).wrapping_mul(0xff51_afd7_ed55_8ccd);
+        self.c ^= self.c >> 32;
+        self.i += 1;
     }
-    (a, c)
+
+    pub(super) fn update(&mut self, mut b: &[u8]) {
+        if self.have > 0 {
+            let n = (8 - self.have).min(b.len());
+            self.part[self.have..self.have + n].copy_from_slice(&b[..n]);
+            self.have += n;
+            b = &b[n..];
+            if self.have < 8 {
+                return;
+            }
+            self.word(u64::from_le_bytes(self.part));
+            self.have = 0;
+        }
+        let words = b.chunks_exact(8);
+        let tail = words.remainder();
+        for w in words {
+            self.word(u64::from_le_bytes(w.try_into().unwrap()));
+        }
+        self.part[..tail.len()].copy_from_slice(tail);
+        self.have = tail.len();
+    }
+
+    pub(super) fn finish(self) -> (u64, u64) {
+        let (mut a, mut c) = (self.a, self.c);
+        for (i, &x) in self.part[..self.have].iter().enumerate() {
+            a = (a ^ x as u64).wrapping_mul(0x0000_0100_0000_01b3);
+            c = (c ^ ((x as u64) << (i * 8)) ^ 0xa5).wrapping_mul(0xff51_afd7_ed55_8ccd);
+            c ^= c >> 32;
+        }
+        (a, c)
+    }
+}
+
+/// The content key of file `path` (`len` bytes), read in pieces through a
+/// buffer of 1 MiB, never whole: from the system-wide cache when some process
+/// already made it for the same file, else made and noted there. `None` when
+/// the file cannot be read to its length.
+pub(super) fn file_key_streamed(path: &str, len: u64) -> Option<(u64, u64)> {
+    file_key_streamed_at(path, 0, len)
+}
+
+/// [`file_key_streamed`] of the `len` bytes at `off` in `path` (a program's
+/// module in its image): the same key as those bytes whole.
+pub(super) fn file_key_streamed_at(path: &str, at: u64, len: u64) -> Option<(u64, u64)> {
+    let id = file_id(path);
+    let len32 = u32::try_from(len).ok()?;
+    if let Some(k) = id.as_ref().and_then(|id| known_key(id, len32)) {
+        return Some(k);
+    }
+    let home = crate::sigs::proc_home();
+    let mut buf = vec![0u8; (1usize << 20).min(len as usize).max(1)];
+    let mut h = KeyHasher::new();
+    let mut off = 0u64;
+    while off < len {
+        let want = ((len - off) as usize).min(buf.len());
+        let n = home.read_file_at(path, at + off, &mut buf[..want])?;
+        if n == 0 {
+            return None;
+        }
+        h.update(&buf[..n]);
+        off += n as u64;
+    }
+    let k = h.finish();
+    if let Some(id) = &id {
+        note_key(id, len32, k);
+    }
+    Some(k)
 }
 
 /// Lane `lane` (0 or 1) of wasm32 program `number`'s content key, or of

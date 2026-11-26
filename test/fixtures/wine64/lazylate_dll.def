@@ -1,0 +1,6 @@
+LIBRARY lazylate_dll.dll
+EXPORTS
+  lazy_make
+  lazy_cmp
+  lazy_thread
+  lazy_fnptr DATA

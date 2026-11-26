@@ -15,8 +15,8 @@ import assert from 'node:assert/strict';
 const GEX_ROOT = process.env.GEX_ROOT || join(import.meta.dirname, '..', '..', '..');
 if (typeof gc !== 'function') throw new Error('run with node --expose-gc');
 if (typeof zstdCompressSync !== 'function') { console.log('skip zstd-free: this node has no zstd'); process.exit(0); }
-const { zstdLoader } = await import(pathToFileURL(join(GEX_ROOT, 'page/src/zstd-loader.js')).href);
-const src = pathToFileURL(join(GEX_ROOT, 'page/vendor/zstddec/zstddec-stream.mjs')).href;
+const { zstdLoader } = await import(pathToFileURL(join(GEX_ROOT, 'runtime/src/host/zstd-loader.js')).href);
+const src = pathToFileURL(join(GEX_ROOT, 'runtime/vendor/zstddec/zstddec-stream.mjs')).href;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // The loader's idle timer, by hand: its setTimeout of IDLE ms is queued here

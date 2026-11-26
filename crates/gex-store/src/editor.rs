@@ -92,6 +92,10 @@ pub struct Editor<I: Io> {
     /// Blocks taken since the last generation: no generation names them, so
     /// they may be written over.
     fresh: HashSet<u32>,
+    /// Blocks two or more files name (the kernel's copy that shares its
+    /// source's blocks), each with how many files past the first: a file
+    /// letting one go counts it down, the block kept for the others.
+    shared: HashMap<u32, u32>,
     next_ino: u64,
     inline: u64,
 }
@@ -141,7 +145,7 @@ impl<I: Io> Editor<I> {
         // A file is one `ino` among the records as read (format::load numbers
         // them afresh), shared by its hard links: a new file gets the next.
         let next_ino = l.recs.values().filter_map(|r| if let Rec::File { ino, .. } = r { Some(ino + 1) } else { None }).max().unwrap_or(1);
-        Ok(Editor { s, journal: l.journal, found: l.found, recs: l.recs, puts: BTreeSet::new(), drops: BTreeSet::new(), fresh: HashSet::new(), next_ino, inline })
+        Ok(Editor { s, journal: l.journal, found: l.found, recs: l.recs, puts: BTreeSet::new(), drops: BTreeSet::new(), fresh: HashSet::new(), shared: l.shared, next_ino, inline })
     }
 
     /// What the open found: a fresh store, its newest generation, or the
@@ -278,6 +282,12 @@ impl<I: Io> Editor<I> {
         if self.fresh.remove(&b) {
             // Never named by a generation: free at once.
             self.s.alloc.release([b]);
+        } else if let Some(n) = self.shared.get_mut(&b) {
+            // Another file's too: it keeps it.
+            *n -= 1;
+            if *n == 0 {
+                self.shared.remove(&b);
+            }
         } else {
             self.s.alloc.free(b);
         }
@@ -740,6 +750,43 @@ mod tests {
         want[10..17].copy_from_slice(b"changed");
         want.extend_from_slice(b"appended");
         assert_eq!(read_all(&mut e, "/f"), want);
+    }
+
+    /// Two files naming the same blocks (the kernel's copy that shares its
+    /// source's blocks until written) are read back as such: a block one of
+    /// them lets go, by a write or a removal, stays the other's, and a hard
+    /// link is the same file, not a second.
+    #[test]
+    fn a_block_two_files_share_stays_until_neither_names_it() {
+        let mut m = Mem::default();
+        let mut e = Editor::open(&mut m, BS, 512).unwrap();
+        let n = 3 * BS as usize + 100;
+        e.write("/src", 0, &big(n, 4), 0o644, 0, true).unwrap();
+        e.commit(false).unwrap();
+        // The kernel's copy, and a hard link to the source written with it.
+        let src = e.recs["src"].clone();
+        let Rec::File { body: Body::Blocks(size, map), .. } = src.clone() else { panic!() };
+        e.put("dst".into(), Rec::File { ino: 1000, mode: 0o644, mtime: 0, body: Body::Blocks(size, map.clone()), xattrs: Vec::new() });
+        e.put("link".into(), src.clone());
+        e.put("src".into(), src);
+        e.commit(false).unwrap();
+
+        let mut e = Editor::open(&mut m, BS, 512).unwrap();
+        assert_eq!(e.shared.len(), map.iter().filter(|&&b| b != 0).count());
+        assert!(e.shared.values().all(|&k| k == 1), "the link is not counted");
+        e.write("/dst", 10, b"dst", 0o644, 0, false).unwrap();
+        e.remove("/src", false).unwrap();
+        e.remove("/link", false).unwrap();
+        e.commit(false).unwrap();
+        // The source's own blocks free again, and taken: the copy's are not.
+        e.write("/new", 0, &big(n, 9), 0o644, 0, true).unwrap();
+        e.commit(false).unwrap();
+        let mut want = big(n, 4);
+        want[10..13].copy_from_slice(b"dst");
+        let mut e = Editor::open(&mut m, BS, 512).unwrap();
+        assert_eq!(read_all(&mut e, "/dst"), want);
+        assert_eq!(read_all(&mut e, "/new"), big(n, 9));
+        assert!(e.shared.is_empty());
     }
 
     #[test]

@@ -129,7 +129,7 @@ function parse(bytes) {
 
 const shimPath = process.argv[2];
 const kernelPath = process.argv[3]
-  || join(ROOT, 'page', 'public', 'gex', 'gex_kernel.plain.wasm');
+  || join(ROOT, 'runtime', 'files', 'out', 'gex', 'gex_kernel.plain.wasm');
 
 const shim = parse(new Uint8Array(await readFile(shimPath)));
 const kernel = parse(new Uint8Array(await readFile(kernelPath)));

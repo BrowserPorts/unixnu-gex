@@ -18,6 +18,7 @@
 #include <EGL/egl.h>
 
 #include <algorithm>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -27,6 +28,17 @@
 #include <vector>
 
 #include "../../../guest/gl/gexgl-pixel.h"
+
+// The generated cases log as the page's Mesa does; here that goes to stderr.
+#define EM_LOG_WARN 0
+#define EM_LOG_ERROR 0
+static void emscripten_log(int, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+}
 
 namespace {
 

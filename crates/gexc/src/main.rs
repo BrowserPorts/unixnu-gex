@@ -260,7 +260,7 @@ usage:
 {}
   gexc disasm <elf>                disassemble the executable segments
   gexc ir     <elf> --at <addr>    print the GIR for one basic block
-  gexc cgen-image <pe> [--pe-base HEX] [--jobs N] [--max-insns N] [--clang-mem-mb N] [--mem64] [--wine32-kuser] [--wine64-compact] [--entries FILE]
+  gexc cgen-image <pe> [--pe-base HEX] [--jobs N] [--max-insns N] [--clang-mem-mb N] [--mem64] [--wine32-kuser] [--wine64-compact] [--entries FILE] [--functions FILE]
                                    build a PE image's function-tier unit (the
                                    whole image, as C, compiled and cached) for
                                    `gexc run`, which installs it when Wine maps
@@ -274,7 +274,11 @@ usage:
                                    entry page after it folded). --entries:
                                    region entries too, at the hex addresses
                                    in FILE (resumes a run without translation
-                                   makes inside the image's functions)
+                                   makes inside the image's functions).
+                                   --functions: compile only the functions
+                                   at the hex addresses in FILE (`gexc
+                                   hotset`'s output); the others leave for
+                                   tier-1, and the set is in the unit's key
   gexc cgen-image --nt-trampolines32|--nt-trampolines64 [--jobs N]
                                    the NT trampoline page's unit, which the
                                    native host builds at boot; the browser
@@ -2540,6 +2544,15 @@ fn cmd_cgen_image(args: &[String]) -> Result<()> {
             "--clang-mem-mb" => {
                 i += 1;
                 gex_cgen::toolchain::set_clang_mem_mb(args.get(i).context("--clang-mem-mb needs a number")?.parse()?);
+            }
+            // `--functions FILE`: compile only these functions (hex entry
+            // addresses, `#` comments: `gexc hotset`'s output, which holds
+            // each hot function's direct callees too); the image's others
+            // leave for tier-1. The set is part of the unit's key.
+            "--functions" => {
+                i += 1;
+                let p = args.get(i).context("--functions needs a file of hex addresses")?;
+                gex_native::pe_units::set_functions(Some(read_addr_list(p)?.into_iter().collect()));
             }
             // `--entries FILE`: hex addresses, one per line, the unit has no
             // entry for and a run without translation resumes at (a call's

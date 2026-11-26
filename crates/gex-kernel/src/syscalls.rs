@@ -10924,6 +10924,10 @@ impl Kernel {
             if self.darwin_sigwait_given(tid) {
                 return true;
             }
+            // A call a close's drain woke: its wait is over too.
+            if self.darwin_fp_drained(tid) {
+                return true;
+            }
         }
         if tid == self.sig_tid {
             return self.signals.would_deliver();
@@ -12567,6 +12571,8 @@ impl Kernel {
             let tid = self.tid;
             self.darwin_set_offcpu(m, tid, false);
         }
+        // A call a close's drain ended: the drain's result.
+        let r = if self.darwin { self.darwin_fp_drained_result(r) } else { r };
         let out = self.finish_blocking_inner(m, r);
         if self.darwin {
             if let SyscallOutcome::Blocking(op) = &out {

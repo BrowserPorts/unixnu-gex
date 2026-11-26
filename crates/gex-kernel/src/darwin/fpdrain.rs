@@ -13,6 +13,11 @@
 //! (`knote_fdclose`), and drains it: its type's `fo_drain` wakes the
 //! call, and the close sleeps until the calls have left. Then the number
 //! is free again (`fdrelse`) and the file is let go (`fg_drop`).
+//!
+//! A call the drain wakes in the host (a stream's read or write, a
+//! socket's accept) is marked with what the drain makes of it
+//! ([`Drained`]) and ended as a signal ends a wait; its result is then
+//! the drain's. A `select` asleep in the kernel is woken there.
 
 use super::procinfo::dtype;
 use super::sysno as sys;
@@ -41,6 +46,48 @@ const KEVENT_FLAG_WORKQ: u64 = 0x020;
 /// The calls `select` makes its scan in, which mark each descriptor of
 /// their sets `FP_INSELECT`.
 const SELECTS: &[u64] = &[sys::SELECT, sys::SELECT_NOCANCEL, sys::PSELECT, sys::PSELECT_NOCANCEL];
+
+/// What a drain makes of a call it wakes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Drained {
+    /// A pipe read with nothing to read (`pipe_read`'s break on
+    /// `FPV_DRAIN`): 0.
+    Eof,
+    /// A pipe write (`pipe_write`'s `FPV_DRAIN`): EPIPE.
+    Epipe,
+    /// A socket's `sbwait` (`SS_DRAINING`), and a `select`, whose scan
+    /// after the wakeup finds the descriptor gone: EBADF.
+    Ebadf,
+    /// `accept`'s and `connect`'s sleep on `so_timeo` (`SS_DRAINING`):
+    /// ECONNABORTED.
+    Econnaborted,
+}
+
+impl Drained {
+    /// The call's result.
+    pub fn result(self) -> crate::errno::SysResult {
+        match self {
+            Drained::Eof => Ok(0),
+            Drained::Epipe => Err(crate::errno::Errno::EPIPE),
+            Drained::Ebadf => Err(crate::errno::Errno::EBADF),
+            Drained::Econnaborted => Err(crate::errno::Errno::ECONNABORTED),
+        }
+    }
+}
+
+/// The calls that write (a pipe's drain is EPIPE for them).
+const WRITES: &[u64] = &[
+    sys::WRITE, sys::WRITE_NOCANCEL, sys::WRITEV, sys::WRITEV_NOCANCEL, sys::PWRITE, sys::PWRITE_NOCANCEL,
+    sys::GUARDED_WRITE_NP, sys::GUARDED_PWRITE_NP, sys::GUARDED_WRITEV_NP,
+    sys::SENDTO, sys::SENDTO_NOCANCEL, sys::SENDMSG, sys::SENDMSG_NOCANCEL,
+];
+
+/// The calls that wait in a socket's buffers (`sbwait`): its reads and
+/// writes.
+fn sbwaits(code: u64) -> bool {
+    WRITES.contains(&code)
+        || [sys::READ, sys::READ_NOCANCEL, sys::READV, sys::READV_NOCANCEL, sys::RECVFROM, sys::RECVFROM_NOCANCEL, sys::RECVMSG, sys::RECVMSG_NOCANCEL].contains(&code)
+}
 
 /// A close draining its descriptor: the number it holds back and the file
 /// it holds until `fg_drop`.
@@ -84,13 +131,65 @@ impl Kernel {
         } else {
             return;
         };
-        let held: Vec<(i32, usize)> = fds.into_iter().filter_map(|fd| self.fds.get(fd).ok().map(|f| key(fd, &f))).collect();
-        self.darwin_me().fp_call = held;
+        let files: Vec<(i32, Arc<OpenFile>)> = fds.into_iter().filter_map(|fd| self.fds.get(fd).ok().map(|f| (fd, f))).collect();
+        // sbwait on a socket already draining fails at once (EBADF); a
+        // call with data or room has not come to it.
+        if sbwaits(code) && files.iter().any(|(_, f)| f.darwin_so_draining.load(std::sync::atomic::Ordering::Acquire)) {
+            self.darwin_me().fp_drained = Some(Drained::Ebadf);
+        }
+        self.darwin_me().fp_call = files.iter().map(|(fd, f)| key(*fd, f)).collect();
+    }
+
+    /// The result a drain gives the calling thread's call, which the host
+    /// ended as a signal does (`r` EINTR), the drain's mark taken. A call
+    /// asleep in the kernel takes its mark where its wait ends.
+    pub(crate) fn darwin_fp_drained_result(&mut self, r: crate::errno::SysResult) -> crate::errno::SysResult {
+        if r != Err(crate::errno::Errno::EINTR) || self.darwin_finish.is_some() {
+            return r;
+        }
+        match self.darwin_me().fp_drained.take() {
+            Some(d) => d.result(),
+            None => r,
+        }
+    }
+
+    /// Whether thread `tid`'s call, waiting in the host, has been drained
+    /// (which ends its wait as a pending signal would).
+    pub(crate) fn darwin_fp_drained(&self, tid: i32) -> bool {
+        !self.dtask.waits.waiting(tid) && self.dtask.threads.map.get(&tid).is_some_and(|t| t.fp_drained.is_some())
+    }
+
+    /// Mark thread `tid`'s call with what the drain makes of it, and wake
+    /// it: one asleep in the kernel by its wait queue, one in the host by
+    /// the readiness wake that has it look at its signals.
+    fn darwin_fp_mark(&mut self, m: &mut GuestMem<'_>, tid: i32, d: Drained) {
+        if let Some(t) = self.dtask.threads.map.get_mut(&tid) {
+            t.fp_drained = Some(d);
+        }
+        if self.dtask.waits.waiting(tid) {
+            self.darwin_wake(m, tid, WaitResult::Interrupted);
+        }
+        self.fd_activity = true;
+    }
+
+    /// The threads other than the caller in a call holding fileproc `k`
+    /// (or, `any_fd`, any descriptor of the file `k` names), with their
+    /// calls.
+    fn darwin_fp_holders(&self, k: (i32, usize), any_fd: bool) -> Vec<(i32, u64)> {
+        let me = self.tid;
+        self.dtask
+            .threads
+            .map
+            .iter()
+            .filter(|(&tid, t)| tid != me && t.fp_call.iter().any(|&h| h == k || (any_fd && h.1 == k.1)))
+            .map(|(&tid, t)| (tid, t.syscall_code))
+            .collect()
     }
 
     /// The calling thread's call has returned (`fp_drop`): a close waiting
     /// for the calls in one of its fileprocs to leave looks again.
     pub(crate) fn darwin_fp_leave(&mut self, m: &mut GuestMem<'_>) {
+        self.darwin_me().fp_drained = None;
         let held = std::mem::take(&mut self.darwin_me().fp_call);
         if held.is_empty() {
             return;
@@ -108,19 +207,11 @@ impl Kernel {
         }
     }
 
-    /// The threads other than the caller in a call on fileproc `k`, and
-    /// whether any of them holds it from `select`.
-    fn darwin_fp_callers(&mut self, k: (i32, usize)) -> (usize, bool) {
+    /// How many threads other than the caller are in a call on fileproc
+    /// `k` (its `fp_iocount` less the caller's own).
+    fn darwin_fp_callers(&self, k: (i32, usize)) -> usize {
         let me = self.tid;
-        let mut n = 0;
-        let mut select = false;
-        for (&tid, t) in &self.dtask.threads.map {
-            if tid != me && t.fp_call.contains(&k) {
-                n += 1;
-                select |= SELECTS.contains(&t.syscall_code);
-            }
-        }
-        (n, select)
+        self.dtask.threads.map.iter().filter(|(&tid, t)| tid != me && t.fp_call.contains(&k)).count()
     }
 
     /// Whether another thread is in a call on descriptor `fd` (its
@@ -131,7 +222,7 @@ impl Kernel {
         if self.darwin_tty_of(fd as u64).is_some() {
             return false;
         }
-        self.darwin_fp_callers(key(fd, &file)).0 > 0
+        self.darwin_fp_callers(key(fd, &file)) > 0
     }
 
     /// `close` of descriptor `fd`, which another thread is in a call on:
@@ -141,39 +232,13 @@ impl Kernel {
     /// close made as one without a drain.
     pub(crate) fn darwin_close_drain(&mut self, m: &mut GuestMem<'_>, fd: i32) -> Option<SyscallOutcome> {
         let file = self.fds.get(fd).ok()?;
-        let (_, select) = self.darwin_fp_callers(key(fd, &file));
-        if select {
-            self.darwin_unimplemented(format!("close of descriptor {fd} while another thread's select has it in its sets (fileproc_drain's wakeup of the select, FP_INSELECT): the select is not woken"));
+        let k = key(fd, &file);
+        let ty = super::procinfo::fdtype(&file);
+        if ty == dtype::KQUEUE {
+            self.darwin_unimplemented(format!("close of descriptor {fd}, a kqueue, while another thread is in a call on it (kqueue_drain, KQ_DRAIN): the call is not woken"));
             return None;
         }
-        // fo_drain, as the file's type has it.
         let last = file.fg_count() == 1;
-        let drain: Option<Arc<crate::pipe::Pipe>> = match super::procinfo::fdtype(&file) {
-            dtype::PIPE => match file.handle.pipe_end() {
-                // pipe_drain: the pipe's last descriptor is going, so both
-                // sides drain.
-                Some((p, _)) if p.is_xnu() && last => Some(p),
-                Some((p, _)) if p.is_xnu() => {
-                    self.darwin_unimplemented(format!("close of descriptor {fd} while another thread is in a call on it, its pipe end also held elsewhere (fileproc_drain's FPV_DRAIN alone): the call is not woken"));
-                    return None;
-                }
-                _ => {
-                    self.darwin_unimplemented(format!("close of descriptor {fd}, a pipe the page's global kernel holds, while another thread is in a call on it (pipe_drain): the call is not woken"));
-                    return None;
-                }
-            },
-            dtype::SOCKET => {
-                self.darwin_unimplemented(format!("close of descriptor {fd}, a socket, while another thread is in a call on it (soo_drain, SS_DRAINING): the call is not woken"));
-                return None;
-            }
-            dtype::KQUEUE => {
-                self.darwin_unimplemented(format!("close of descriptor {fd}, a kqueue, while another thread is in a call on it (kqueue_drain, KQ_DRAIN): the call is not woken"));
-                return None;
-            }
-            // fo_no_drain (a vnode's, a POSIX semaphore's or shared memory
-            // object's): nothing wakes the call; the close waits for it.
-            _ => None,
-        };
         // UF_RESERVED|UF_CLOSING: lookups of it fail, its number is kept;
         // the fileproc's hold on the file stays until fg_drop.
         file.fg_retain();
@@ -182,8 +247,40 @@ impl Kernel {
             return None;
         }
         self.darwin_knote_fdclose(fd);
-        if let (Some(p), Some((_, write))) = (&drain, file.handle.pipe_end()) {
-            p.drain(write);
+        // FPV_DRAIN, then fo_drain as the file's type has it.
+        let pipe = file.handle.pipe_end().filter(|(p, _)| p.is_xnu());
+        for (tid, code) in self.darwin_fp_holders(k, ty == dtype::SOCKET) {
+            // A select's wakeup (FP_INSELECT): its scan finds the
+            // descriptor gone.
+            if SELECTS.contains(&code) {
+                self.darwin_fp_mark(m, tid, Drained::Ebadf);
+                continue;
+            }
+            let d = match ty {
+                // pipe_drain of its last descriptor drains the pipe itself,
+                // which ends the call; else FPV_DRAIN ends the call in this
+                // descriptor.
+                dtype::PIPE if pipe.is_some() && last => None,
+                dtype::PIPE => Some(if WRITES.contains(&code) { Drained::Epipe } else { Drained::Eof }),
+                // soo_drain: SS_DRAINING, every sleeper on the socket woken.
+                dtype::SOCKET if [sys::ACCEPT, sys::ACCEPT_NOCANCEL, sys::CONNECT, sys::CONNECT_NOCANCEL].contains(&code) => Some(Drained::Econnaborted),
+                dtype::SOCKET if sbwaits(code) => Some(Drained::Ebadf),
+                dtype::SOCKET => {
+                    self.darwin_unimplemented(format!("close of descriptor {fd}, a socket, while another thread is in call {code} on it (soo_drain's wakeup of it)"));
+                    None
+                }
+                // fo_no_drain: nothing wakes the call; the close waits.
+                _ => None,
+            };
+            if let Some(d) = d {
+                self.darwin_fp_mark(m, tid, d);
+            }
+        }
+        if ty == dtype::SOCKET {
+            file.darwin_so_draining.store(true, std::sync::atomic::Ordering::Release);
+        }
+        if let (Some((p, write)), true) = (&pipe, last) {
+            p.drain(*write);
         }
         self.darwin_me().fp_closing = Some(Closing { fd, file });
         Some(self.darwin_fpdrain_wait(m))
@@ -196,7 +293,7 @@ impl Kernel {
     fn darwin_fpdrain_wait(&mut self, m: &mut GuestMem<'_>) -> SyscallOutcome {
         let Some(c) = self.darwin_me().fp_closing.as_ref() else { return SyscallOutcome::Continue };
         let (fd, file) = (c.fd, Arc::clone(&c.file));
-        if self.darwin_fp_callers(key(fd, &file)).0 > 0 {
+        if self.darwin_fp_callers(key(fd, &file)) > 0 {
             // pipe_drain again: the close's hold is the fileproc's, so a
             // count of one is still its last descriptor's.
             if let Some((p, write)) = file.handle.pipe_end().filter(|(p, _)| p.is_xnu() && file.fg_count() == 1) {

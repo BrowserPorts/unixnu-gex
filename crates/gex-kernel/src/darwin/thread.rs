@@ -253,6 +253,8 @@ pub struct DThread {
     pub fp_call: Vec<(i32, usize)>,
     /// Its close draining a descriptor ([`super::fpdrain::Closing`]).
     pub fp_closing: Option<super::fpdrain::Closing>,
+    /// What a close's drain made of its call ([`super::fpdrain::Drained`]).
+    pub fp_drained: Option<super::fpdrain::Drained>,
     /// `AST_KEVENT_*` owed on its way back to user space.
     pub astkevent: u16,
     /// The voucher it adopted (`ith_voucher`) and the name it gave

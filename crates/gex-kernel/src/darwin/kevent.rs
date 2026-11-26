@@ -2371,6 +2371,9 @@ impl Kernel {
                         Err(e) => Err(e),
                     },
                     WaitResult::TimedOut => Ok(()),
+                    // A select a close's drain woke: its scan finds the
+                    // descriptor gone (fileproc_drain's FP_INSELECT wakeup).
+                    WaitResult::Interrupted if self.darwin_me().fp_drained.take().is_some() => Err(Errno::EBADF),
                     // poll is not restarted after signals.
                     WaitResult::Interrupted | WaitResult::Restart => Err(Errno::EINTR),
                 };

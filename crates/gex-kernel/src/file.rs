@@ -54,6 +54,10 @@ pub struct OpenFile {
     fg_count: std::sync::atomic::AtomicU32,
     /// Its `vn_closefile` has run.
     darwin_closed: std::sync::atomic::AtomicBool,
+    /// A Darwin socket's `SS_DRAINING`, which `soo_drain` sets for a close
+    /// draining a descriptor of it and nothing clears: a wait in its
+    /// buffers fails with EBADF from then on.
+    pub darwin_so_draining: std::sync::atomic::AtomicBool,
     /// A Darwin system's file opened for writing whose open its vnode's
     /// write count holds ([`crate::darwin::pagecache::open_writer`]),
     /// until its last descriptor closes.
@@ -277,6 +281,7 @@ impl OpenFile {
             darwin_sockev: Mutex::new(Default::default()),
             fg_count: std::sync::atomic::AtomicU32::new(0),
             darwin_closed: std::sync::atomic::AtomicBool::new(false),
+            darwin_so_draining: std::sync::atomic::AtomicBool::new(false),
             darwin_writer: std::sync::atomic::AtomicBool::new(false),
             darwin_mounts_seen: crate::darwin::kern::mount_count(),
         })
@@ -312,6 +317,7 @@ impl OpenFile {
             darwin_sockev: Mutex::new(Default::default()),
             fg_count: std::sync::atomic::AtomicU32::new(0),
             darwin_closed: std::sync::atomic::AtomicBool::new(false),
+            darwin_so_draining: std::sync::atomic::AtomicBool::new(false),
             darwin_writer: std::sync::atomic::AtomicBool::new(false),
             darwin_mounts_seen: crate::darwin::kern::mount_count(),
         })

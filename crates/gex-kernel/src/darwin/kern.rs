@@ -1343,6 +1343,9 @@ impl Kernel {
                 Err(e) => neg(e),
             },
             sys::DUP2 => {
+                if self.fds.is_reserved(a[1] as i32) {
+                    self.darwin_unimplemented(format!("dup2 onto descriptor {}, which a close is draining (dup2's wait for UF_RESERVED to clear): it is taken at once", a[1] as i32));
+                }
                 // The descriptor it replaces is closed (closef_locked).
                 if self.fds.get(a[0] as i32).is_ok() {
                     self.darwin_closing(a[1] as i32);

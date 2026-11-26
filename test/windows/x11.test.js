@@ -1,8 +1,8 @@
 // X11 with windows: the runtime's X server, started for the first X client,
 // and that client's window handed to the page as any other.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
-import { HostWindows } from '../../page/runtime/src/windows/host.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
+import { HostWindows } from '../../runtime/src/windows/host.js';
 
 export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 120, html: `<style>html, body { margin: 0; } #desk { position: relative; width: 800px; height: 600px; }</style>
 <div id="desk"></div>` };
@@ -12,7 +12,7 @@ export default async function (t) {
   const sys = new System({ baseUrl: t.baseUrl, debug: t.debug() });
   const fs = new MemoryFilesystem(sys);
   fs.addTar(t.work('bb.tar.zst'));
-  const hw = new HostWindows(sys, { width: 800, height: 600, scale: 1 });
+  const hw = new HostWindows(sys, { width: 800, height: 600, scale: 1, x11: 'rootless' });
   const desk = document.getElementById('desk');
   const wins = [];
   hw.addEventListener('window', (e) => {

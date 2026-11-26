@@ -1,11 +1,11 @@
-// handle.drop()'s argument checks (page/src/drop.js checkDrop): what passes,
+// handle.drop()'s argument checks (runtime/src/host/drop.js checkDrop): what passes,
 // and what each mistake says. node test/fixtures/page/drop-options.mjs
 import { pathToFileURL as gexPathToFileURL } from 'node:url';
 import { join as gexJoin } from 'node:path';
 // gex: the checkout these fixtures are in, or GEX_ROOT.
 const GEX_ROOT = process.env.GEX_ROOT || gexJoin(import.meta.dirname, '..', '..', '..');
 const gexUrl = (p) => gexPathToFileURL(gexJoin(GEX_ROOT, p)).href;
-const { checkDrop } = await import(gexUrl('page/src/drop.js'));
+const { checkDrop } = await import(gexUrl('runtime/src/host/drop.js'));
 
 let failed = 0;
 const files = [new File(['a'], 'a.txt')];

@@ -16,7 +16,7 @@ static BOOT: std::sync::Mutex<Vec<(String, Vec<u8>)>> = std::sync::Mutex::new(Ve
 /// does not do (`gex_darwin_set_strict`).
 static STRICT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// One of the boot payload's files (page/runtime System's `darwin.boot`),
+/// One of the boot payload's files (runtime System's `darwin.boot`),
 /// before the Darwin program's exec: `name` and the bytes, in this
 /// module's heap (`gex_alloc`).
 #[no_mangle]
@@ -1176,9 +1176,12 @@ fn on_stream(op: &gex_kernel::BlockOp) -> bool {
 fn waiting_of(op: &gex_kernel::BlockOp) -> Waiting {
     use gex_kernel::BlockOp;
     match op {
-        BlockOp::FutexWait { table, uaddr, deadline, parked, val } => Waiting::Futex {
+        // The shared generation the kernel sampled before it read the word
+        // (lib.rs's own futex park says why: one sampled here, after it, may
+        // already hold the wake).
+        BlockOp::FutexWait { table, uaddr, deadline, parked, val, shared_gen } => Waiting::Futex {
             val: *val,
-            wake_gen: unsafe { k_futex_gen(*uaddr) },
+            wake_gen: *shared_gen,
             parked: parked.clone().unwrap_or_else(|| table.park(*uaddr)),
             deadline: deadline.map(|d| turn_now() + d.as_nanos() as u64),
         },
@@ -1626,10 +1629,10 @@ pub(crate) fn adopted(i: usize) -> Option<u64> {
                 }
                 // Parked from the start: the context's pc is where it goes
                 // once its wait ends (`finished`).
-                let gex_kernel::BlockOp::FutexWait { table, uaddr, deadline, parked, val } = &op else { unreachable!("a Darwin wait the page parks is a futex wait") };
+                let gex_kernel::BlockOp::FutexWait { table, uaddr, deadline, parked, val, shared_gen } = &op else { unreachable!("a Darwin wait the page parks is a futex wait") };
                 let waiting = Waiting::Futex {
                     val: *val,
-                    wake_gen: unsafe { k_futex_gen(*uaddr) },
+                    wake_gen: *shared_gen,
                     parked: parked.clone().unwrap_or_else(|| table.park(*uaddr)),
                     deadline: deadline.map(|d| turn_now() + d.as_nanos() as u64),
                 };

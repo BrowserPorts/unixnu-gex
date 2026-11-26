@@ -160,7 +160,7 @@ if [ "$MEDIA" != 0 ]; then WGST=-wgf; B64_MODS="$B64_MODS --enable-winegstreamer
 # the prefix keeps winebus's root device, but with "DemandStart"=1 on its
 # service: services.exe does not start it at boot, so a session with no
 # controller runs no winedevice for it and fetches no SDL. The page starts it
-# (`sc start winebus`, WineControllers in page/runtime/src/input.js) once a controller is
+# (`sc start winebus`, WineControllers in runtime/src/input.js) once a controller is
 # there. -sdl in the name. WINE64_PADS=off leaves all three out, as does
 # the memory64 flavour and the default for a Wine tree whose services.exe
 # has no DemandStart (it would start winebus at every boot).
@@ -488,7 +488,7 @@ dist_make() {
 	mkdir -p lib/wine/x86_64-unix share
 	cp -p "$C/b64-$K-$S"/out/wine* lib/wine/x86_64-unix/
 	# (gex-rest-only: a site keeps the side modules out of its boot bundle, in
-	# the rest bundle, fetched on the first dlopen: site/site-bundle.mjs)
+	# the rest bundle, fetched on the first dlopen)
 	rm -f lib/wine/x86_64-unix/gex-rest-only
 	[ -z "$GS" ] || { cp -p "$C/b64-$K-$S"/out/winegstreamer.so lib/wine/x86_64-unix/ &&
 		echo winegstreamer.so >> lib/wine/x86_64-unix/gex-rest-only; }
@@ -571,7 +571,15 @@ else
 		XK=" exports $(sort -u "$PELINK_EXPORTS" | sha256sum | cut -c1-10)"
 	fi
 fi
-NK=$( { echo "$S $D${SP:+ split $SP}${SPA:+ split all$W16$WICU$WGST}$XK"; cat "$here"/pelink.py "$here"/pesym.py "$here"/stage-native.sh; } | sha256sum | cut -c1-10)
+# WINE64_EXTRA_DLLS=DIR: DLLs built outside the tree that stage-native.sh links
+# into the core (dirk's d3d11.dll and dxgi.dll), by their bytes: a core staged
+# without them, or with an older build of them, is another core.
+EK=
+if [ -n "${WINE64_EXTRA_DLLS:-}" ]; then
+	ls "$WINE64_EXTRA_DLLS"/*.so.r.o >/dev/null 2>&1 || { log "no NAME.so.r.o in WINE64_EXTRA_DLLS $WINE64_EXTRA_DLLS"; exit 1; }
+	EK=" extra $(cd "$WINE64_EXTRA_DLLS" && cat *.so.r.o *.so.exports *.spec *.imports | sha256sum | cut -c1-10)"
+fi
+NK=$( { echo "$S $D${SP:+ split $SP}${SPA:+ split all$W16$WICU$WGST}$XK$EK"; cat "$here"/pelink.py "$here"/pesym.py "$here"/stage-native.sh; } | sha256sum | cut -c1-10)
 DIST=$C/dist64-$K-$S-f$F-s$V$WS$WD$W16$WICU$WIL$WGST$PADT$WMONO
 pe_native() {
 	# The native PE core: each DLL's relocatable object and export list
@@ -653,8 +661,14 @@ if [ "$M64" != 0 ]; then
 	if [ "${WINE64_M64_NATIVE:-0}" != 0 ]; then
 		log "native PE core ($K, $NK)"; step pen64-$K-$NK pe_native
 	fi
-	"$here/prefix-key.sh" --add "$C/pfx64-$PX/pfx" "$DIST" || exit 1
-	echo "WINE64_DIST=$DIST"; echo "WINE64_PREFIX=$C/pfx64-$PX/pfx"; echo "WINE64_TOOLS=$T"; echo "WINE64_SRC=$W"
+	# No prefix of its own: PX is prefix_steps', which this branch does not
+	# run, and a twin takes the main install's prefix (it reads only the
+	# dist and the PE core from here)
+	if [ -n "${PX:-}" ]; then
+		"$here/prefix-key.sh" --add "$C/pfx64-$PX/pfx" "$DIST" || exit 1
+		echo "WINE64_PREFIX=$C/pfx64-$PX/pfx"
+	fi
+	echo "WINE64_DIST=$DIST"; echo "WINE64_TOOLS=$T"; echo "WINE64_SRC=$W"
 	echo "WINE64_BUILD=$C/b64-$K-$S"
 	[ "${WINE64_M64_NATIVE:-0}" = 0 ] || echo "WINE64_NATIVE=$NATIVE"
 	exit 0

@@ -3,8 +3,8 @@
 // ends, and the page reloads at once, as a killed tab: without a shutdown, a
 // sync (the page's flush on pagehide does nothing here) or a write-back tick
 // (ten minutes here). The next load has every file, byte for byte.
-import { System } from '../../page/runtime/src/index.js';
-import { OPFSFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { OPFSFilesystem } from '../../runtime/src/fs.js';
 
 export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 300 };
 

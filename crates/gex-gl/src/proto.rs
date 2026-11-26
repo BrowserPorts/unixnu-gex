@@ -154,6 +154,18 @@ pub mod op {
     /// it -- the page notices the process is gone and says so instead (see
     /// `gex_gl_forget_client`).
     pub const SURFACE_DETACH: u32 = 7;
+    /// `{ context, api, major, minor, profile }` -- run what follows in this
+    /// context of the client's, made now if it is new. Context 0 is the one
+    /// `CONTEXT_CREATE` made; every other is in its share group (textures,
+    /// buffers, programs, shaders, renderbuffers, samplers are the group's),
+    /// with its own state and its own vertex arrays, framebuffers, queries,
+    /// transform feedbacks and program pipelines. A guest that never sends it
+    /// has the one context it always had. The version words are what the
+    /// guest asked for; the host makes it like context 0.
+    pub const CONTEXT_CURRENT: u32 = 9;
+    /// `{ context }` -- that context (not 0) is gone, and its own objects
+    /// with it; context 0 is current after it if it was.
+    pub const CONTEXT_DROP: u32 = 10;
 
     // -- state ------------------------------------------------------------
     pub const CLEAR_COLOR: u32 = 16; // { r, g, b, a } as floats
@@ -431,25 +443,6 @@ pub mod op {
     /// array, instead of the guest rewriting a buffer of its own before each
     /// draw (which a batched backend has to stage and copy).
     pub const CLIENT_ARRAY: u32 = 200;
-
-    /// Create an *additional* host GL context, sharing objects with the
-    /// first, and reply with its index.
-    ///
-    /// Not CONTEXT_CREATE: that opcode means "a new guest process starts
-    /// here" and resets the whole object namespace, so sending it a second
-    /// time would destroy the buffers and textures the application still
-    /// holds names for. This one adds a context and touches nothing else.
-    ///
-    /// Objects stay shared deliberately. `eglCreateContext`'s share_context
-    /// argument is not yet honoured, and because every context has aliased
-    /// one namespace until now, a toolkit that asked for sharing has been
-    /// getting it. Separating the namespaces without implementing sharing
-    /// would break those programs; sharing everything keeps them working
-    /// while the per-context *state* becomes real, which is the observable
-    /// bug (gl44-two-contexts-probe).
-    pub const CONTEXT_ADD: u32 = 274;
-    /// Make one of those contexts current, by index.
-    pub const CONTEXT_SET_CURRENT: u32 = 275;
 }
 
 /// Writes commands into a batch. For the host's tests: the guest half is C,

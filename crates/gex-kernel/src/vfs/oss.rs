@@ -927,7 +927,7 @@ mod tests {
         assert!(h.write_at(0, &vec![0u8; 1000]).unwrap() > 0);
     }
 
-    /// The page's player as page/src/audio.js plays one stream at its own
+    /// The page's player as runtime/src/host/audio.js plays one stream at its own
     /// rate: it starts (and starts again after running dry) once 6 ms of
     /// frames are queued, or (`stalls`) once its writer has added none for
     /// 6 ms with two or more queued; then it reads a render quantum at a

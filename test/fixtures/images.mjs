@@ -12,7 +12,7 @@
 //            while its inputs are unchanged, so a run without gexcc can reuse it.
 //   slim     slim/ (debian-slim.tar.zst, repo/) from GEX_TEST_SLIM, and
 //            slim-repo.json listing the repository.
-//   package  pkg/: the runtime package, page/runtime/build.sh (--single:
+//   package  pkg/: the runtime package, runtime/build.sh (--single:
 //            @gexemu/runtime-single).
 //   win-progs  win-progs.tar: the Windows test programs (fixtures/wine/src)
 //            built with MinGW for x64/ and x86/ (a source's `gex-nt-cc:`,
@@ -45,8 +45,9 @@
 //            EGL_EXT_platform_xcb, and gles-window-fbo-xcb
 //            (/probes/gles-window-fbo-xcb), that presenting as wgpu does,
 //            and gles-window-xcb-under (/probes/gles-window-xcb-under), one
-//            at an offset with a window over part of it, when the host has
-//            Xlib.
+//            at an offset with a window over part of it, and gles-twowin
+//            (/probes/gles-twowin), two windows drawn with one context, when
+//            the host has Xlib.
 //            Needs gcc, the host's EGL and GL headers and libraries, and
 //            third_party/opengl-registry.
 
@@ -62,11 +63,15 @@ const ROOT = join(HERE, '..', '..');
 
 /** The probe programs and the libraries each links. */
 const PROBES = {
-  'rt-probe': ['-lm'],
+  'rt-probe': ['-lm', '-pthread'],
   'rt-wl': ['-lwayland-client', '-lffi'],
   'rt-joy': [],
   'rt-truncate': [],
+  'rt-bigwrite': [],
   'rt-sockpass': [],
+  'rt-clonecopy': [],
+  'rt-stalebound': ['-pthread'],
+  'rt-killwait': ['-pthread'],
   'rt-repaint': [],
   'rt-deadclient': [],
   'rt-unix': [],
@@ -93,7 +98,7 @@ const MEDIA = {
 // program spends its calls), beside the test programs (wine/units.mjs).
 const UNIT_DLLS = ['ntdll.dll', 'kernelbase.dll', 'kernel32.dll', 'msvcrt.dll', 'ucrtbase.dll'];
 
-export const outputs = { busybox: ['bb.tar.zst', 'rt-side.so'], slim: ['slim'], package: ['pkg', 'pkg-no-m64'], 'gl-probes': ['gl-probes.json'], wine64: ['wine64.tar', 'wine64-lazy.json', 'wine64'], 'win-progs': ['win-progs.tar'], 'win-media': ['win-media.tar'], 'wine64-units': ['wine64-units'], kde: ['kde'], 'wine-site': ['wine-site'], mem64: ['mem64-pick.x86', 'mem64-miss.x86', 'mem64-retry.x86', 'no-m64'], 'mesa-cold': ['mesa-cold'], 'native-progs': ['mount-tmpfs.x86', 'mount-tmpfs.a64', 'truncate-path.x86', 'truncate-path.a64'], 'darwin-static': ['darwin-static.json', 'darwin-static'], 'darwin-root': ['darwin-root'], 'darwin-disk': ['darwin-disk.json', 'darwin-disk'], 'darwin-dyn': ['darwin-dyn.json', 'darwin-dyn'] };
+export const outputs = { busybox: ['bb.tar.zst', 'rt-side.so'], slim: ['slim'], package: ['pkg', 'pkg-no-m64'], 'gl-probes': ['gl-probes.json'], wine64: ['wine64.tar', 'wine64-lazy.json', 'wine64'], 'win-progs': ['win-progs.tar'], 'win-media': ['win-media.tar'], 'wine64-units': ['wine64-units'], kde: ['kde'], 'wine-site': ['wine-site'], mem64: ['mem64-pick.x86', 'mem64-miss.x86', 'mem64-retry.x86', 'no-m64'], 'mesa-cold': ['mesa-cold'], 'native-progs': ['mount-tmpfs.x86', 'mount-tmpfs.a64', 'truncate-path.x86', 'truncate-path.a64', 'big-write.x86', 'big-write.a64'], 'darwin-static': ['darwin-static.json', 'darwin-static'], 'darwin-root': ['darwin-root'], 'darwin-disk': ['darwin-disk.json', 'darwin-disk'], 'darwin-dyn': ['darwin-dyn.json', 'darwin-dyn'] };
 
 /** The `darwin-static` image's programs (tests/darwin/bin, as
  *  tests/darwin/build.sh builds them), and the boot payload's files
@@ -170,7 +175,7 @@ export const images = {
   // test/fixtures/programs/mem64-pick.c as an x86-64 program (static musl,
   // zig), for core/mem64: a system's memory64 process through the API.
   // And no-m64/: the runtime's files as gex's site lays them out (gex/...,
-  // links to page/public/gex), less the memory64 shim, for core/mem64-missing
+  // links to runtime/files/out/gex), less the memory64 shim, for core/mem64-missing
   // (and core/mem64-retry, which links it in later).
   async mem64(work) {
     const zig = process.env.ZIG || 'zig';
@@ -183,7 +188,7 @@ export const images = {
       if (r.status !== 0) throw new Error(`${name}.c: ${r.stderr}`);
       writeFileSync(keyFile, key);
     }
-    const pub = join(ROOT, 'page/public/gex'), site = join(work, 'no-m64');
+    const pub = join(ROOT, 'runtime/files/out/gex'), site = join(work, 'no-m64');
     rmSync(site, { recursive: true, force: true });
     mkdirSync(join(site, 'gex'), { recursive: true });
     for (const f of readdirSync(pub)) {
@@ -192,12 +197,13 @@ export const images = {
     return null;
   },
 
-  // test/fixtures/programs/mount-tmpfs.c and truncate-path.c as static musl
-  // programs for each translated architecture (zig), for core/mount-tmpfs
-  // and core/truncate-path: the native ABIs' own syscall numbers.
+  // test/fixtures/programs/mount-tmpfs.c, truncate-path.c and big-write.c as
+  // static musl programs for each translated architecture (zig), for
+  // core/mount-tmpfs, core/truncate-path and core/big-write: the native
+  // ABIs' own syscall numbers.
   async 'native-progs'(work) {
     const zig = process.env.ZIG || 'zig';
-    for (const name of ['mount-tmpfs', 'truncate-path']) {
+    for (const name of ['mount-tmpfs', 'truncate-path', 'big-write']) {
       const src = join(HERE, `programs/${name}.c`);
       const key = createHash('sha256').update(readFileSync(src)).digest('hex');
       for (const [arch, target] of [['x86', 'x86_64-linux-musl'], ['a64', 'aarch64-linux-musl']]) {
@@ -406,6 +412,8 @@ export const images = {
     for (const name of [...Object.keys(PROBES), ...SIDES]) h.update(readFileSync(join(HERE, 'probe', `${name}.c`)));
     // rt-truncate.c is programs/truncate-path.c.
     h.update(readFileSync(join(HERE, 'programs/truncate-path.c')));
+    // rt-bigwrite.c is programs/big-write.c.
+    h.update(readFileSync(join(HERE, 'programs/big-write.c')));
     // rt-sockpass.c is native/wasm32/sockpass.c.
     h.update(readFileSync(join(HERE, 'native/wasm32/sockpass.c')));
     for (const n of ['repaint', 'deadclient']) h.update(readFileSync(join(HERE, `programs/${n}.c`)));
@@ -413,9 +421,14 @@ export const images = {
     const key = h.digest('hex');
     const keyFile = join(work, 'bb.key');
     writeFileSync(join(work, 'lazy.bin'), Buffer.alloc(3 << 20, 7));
-    // The same for core/runprogram, which reads it, apart from core/dir-times's
+    // The same for core/spawn-layers, which reads it, apart from core/dir-times's
     // lazy.bin while the two may run at once.
     writeFileSync(join(work, 'lazy-program.bin'), Buffer.alloc(3 << 20, 7));
+    // core/fs-persist-written's lazy file, one for each arch: it counts the
+    // requests for it, which another test's or arch's reads would add to.
+    for (const a of ['aarch64', 'x86']) writeFileSync(join(work, `lazy-written-${a}.bin`), Buffer.alloc(3 << 20, 7));
+    // core/lazy-plain's two, for each arch: it counts their requests too.
+    for (const a of ['aarch64', 'x86']) for (const n of [`lazy-plain-${a}.bin`, `lazy-plain2-${a}.bin`]) writeFileSync(join(work, n), Buffer.alloc(3 << 20, 9));
     const have = existsSync(join(work, 'bb.tar.zst')) && existsSync(keyFile) && readFileSync(keyFile, 'utf8');
     // Without busybox here, what a run before made (a copy where there is no
     // gexcc); else only if made from the same inputs.
@@ -487,6 +500,8 @@ export const images = {
     h.update(readFileSync(windowFboXcb));
     const windowXcbUnder = join(probes, 'gles-window-xcb-under.c');
     h.update(readFileSync(windowXcbUnder));
+    const twowin = join(probes, 'gles-twowin.c');
+    h.update(readFileSync(twowin));
     h.update(readFileSync(new URL(import.meta.url))); // how it is built
     h.update(String(existsSync(musl)));
     const key = h.digest('hex');
@@ -558,6 +573,7 @@ export const images = {
         run(x.cc, ['-O2', `-I${reg}`, `-I${inc}`, '-o', join(tree, 'probes/gles-window-xcb'), windowXcb, `-L${gl}`, '-l:libEGL.so.1', '-l:libGLESv2.so.2', '-ldl']);
         run(x.cc, ['-O2', `-I${reg}`, `-I${inc}`, '-o', join(tree, 'probes/gles-window-fbo-xcb'), windowFboXcb, `-L${gl}`, '-l:libEGL.so.1', '-l:libGLESv2.so.2', '-ldl']);
         run(x.cc, ['-O2', `-I${reg}`, `-I${inc}`, '-o', join(tree, 'probes/gles-window-xcb-under'), windowXcbUnder, `-L${gl}`, '-l:libEGL.so.1', '-l:libGLESv2.so.2', '-ldl']);
+        run(x.cc, ['-O2', `-I${reg}`, `-I${inc}`, '-o', join(tree, 'probes/gles-twowin'), twowin, `-L${gl}`, '-l:libEGL.so.1', '-l:libGLESv2.so.2', '-ldl']);
       }
       execFileSync('tar', ['-cf', join(work, `gl-probes-${a}.tar`), '-C', tree, '.']);
     }
@@ -756,7 +772,7 @@ export const images = {
   // `single`: the runner's --single, whose pages have no SharedArrayBuffer:
   // @gexemu/runtime-single.
   async package(work, { single = false } = {}) {
-    execFileSync(join(ROOT, 'page/runtime/build.sh'), [...(single ? ['--single'] : []), join(work, 'pkg')], { stdio: ['ignore', 'ignore', 'inherit'] });
+    execFileSync(join(ROOT, 'runtime/build.sh'), [...(single ? ['--single'] : []), join(work, 'pkg')], { stdio: ['ignore', 'ignore', 'inherit'] });
     // A copy without the memory64 shim, for core/mem64-missing.
     const less = join(work, 'pkg-no-m64');
     rmSync(less, { recursive: true, force: true });

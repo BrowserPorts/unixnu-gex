@@ -1,4 +1,4 @@
-// The GL device's WebGPU validation policy (page/src/gl-validation.js): errors
+// The GL device's WebGPU validation policy (runtime/src/host/gl-validation.js): errors
 // are counted and the first kept, the first few logged, then one line per
 // interval however many arrive. `node test/fixtures/page/gl-validation.mjs`; prints
 // "gl-validation ok".
@@ -7,7 +7,7 @@ import { join as gexJoin } from 'node:path';
 // gex: the checkout these fixtures are in, or GEX_ROOT.
 const GEX_ROOT = process.env.GEX_ROOT || gexJoin(import.meta.dirname, '..', '..', '..');
 const gexUrl = (p) => gexPathToFileURL(gexJoin(GEX_ROOT, p)).href;
-const { ValidationLog } = await import(gexUrl('page/src/gl-validation.js'));
+const { ValidationLog } = await import(gexUrl('runtime/src/host/gl-validation.js'));
 
 let failed = 0;
 const check = (name, cond) => { console.log(`${cond ? 'ok  ' : 'FAIL'} ${name}`); if (!cond) failed++; };

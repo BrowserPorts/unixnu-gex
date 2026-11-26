@@ -57,7 +57,23 @@ SPLIT = {}  # DLL -> the module of its own it is linked into, not the core (--sp
 STATIC = {}  # DLL -> the static libraries its IMPORTS name (libuuid.a), as paths (pelink's main)
 KEEP_EXPORTS = set()  # names the core exports if it defines them (--exports-of)
 STUB_IMPORTS = False  # a program's missing imports bound to stubs (--stub-imports)
+SYMBOLIC = False  # a --split module's own symbols bound locally (--symbolic)
+OTHER_NATIVE = {}  # function or data name -> the --other DLL that exports it (pelink's main)
 EXTRA = set()  # the --extra DLLs (pelink's main)
+# their objects' weak undefined names, by module: data (WEAK_UNDEF) and
+# functions (WEAK_UNDEF_FUNCS: no stub, their address 0), and the names they
+# reference strongly (STRONG_UNDEF), which another module's weak reference
+# does not excuse
+WEAK_UNDEF = {}
+WEAK_UNDEF_FUNCS = {}
+STRONG_UNDEF = {}
+
+
+def weak_of(table, mods):
+    """The names weak in `table` for modules `mods` (one linked module):
+    weak in one of them and referenced strongly by none."""
+    weak = set().union(*(table.get(m, set()) for m in mods))
+    return weak - set().union(*(STRONG_UNDEF.get(m, set()) for m in mods))
 
 
 def cc(*args):
@@ -82,6 +98,117 @@ def enc_leb(v):
 def enc_name(s):
     b = s.encode()
     return enc_leb(len(b)) + b
+
+
+def wasm_data_segments(path):
+    """A wasm file's data segments as (name, bytes): named by the name
+    section's data segment names in a linked module, by the linking
+    section's segment info in an object. Not a wasm file: none."""
+    b = open(path, 'rb').read()
+    if b[:4] != b'\0asm':
+        return []
+
+    def leb(i):
+        r = sh = 0
+        while True:
+            x = b[i]
+            i += 1
+            r |= (x & 0x7f) << sh
+            sh += 7
+            if x < 0x80:
+                return r, i
+
+    def expr(i):
+        # a constant expression: i32/i64.const (signed LEB) or global.get, then end
+        while b[i] != 0x0b:
+            op = b[i]
+            i += 1
+            if op in (0x41, 0x42, 0x23):
+                _, i = leb(i)
+            else:
+                raise ValueError(f'{path}: data segment offset opcode {op:#x}')
+        return i + 1
+
+    def string(i):
+        n, i = leb(i)
+        return b[i:i + n].decode(errors='replace'), i + n
+
+    datas, names, i = [], {}, 8
+    while i < len(b):
+        sid = b[i]
+        size, i = leb(i + 1)
+        end = i + size
+        if sid == 11:
+            n, j = leb(i)
+            for _ in range(n):
+                flag, j = leb(j)
+                if flag == 2:
+                    _, j = leb(j)
+                if flag != 1:
+                    j = expr(j)
+                ln, j = leb(j)
+                datas.append(b[j:j + ln])
+                j += ln
+        elif sid == 0:
+            name, j = string(i)
+            if name == 'name':
+                while j < end:
+                    sub, j = b[j], j + 1
+                    ln, j = leb(j)
+                    if sub == 9:
+                        n, k = leb(j)
+                        for _ in range(n):
+                            idx, k = leb(k)
+                            names[idx], k = string(k)
+                    j += ln
+            elif name == 'linking':
+                _, j = leb(j)
+                while j < end:
+                    sub, j = b[j], j + 1
+                    ln, j = leb(j)
+                    if sub == 5:
+                        n, k = leb(j)
+                        for idx in range(n):
+                            names[idx], k = string(k)
+                            _, k = leb(k)
+                            _, k = leb(k)
+                    j += ln
+        i = end
+    return [(names.get(k, ''), d) for k, d in enumerate(datas)]
+
+
+def check_record_runs(out, inputs, secs, width):
+    """The link kept every record its inputs had of each section of `secs`
+    ({ section: (words a record, whether an all-zero record is a loss) }):
+    the section's bytes in `out` are no fewer than in `inputs` together, and,
+    where it counts, no record is all zero save gexrt's anchor of
+    gexw_entries (a declaration's pair may name no function, so
+    gexw_entries_decl's do not count). A record the final link collects goes
+    silently otherwise (a function handed out with no entry thunk): `wasm-ld
+    -r` drops the segments' retain flag, so a run lives only while something
+    else keeps it. A loss fails the link here."""
+    had = {sec: 0 for sec in secs}
+    anchors = 0
+    for o in inputs:
+        for name, d in wasm_data_segments(o):
+            if name in had:
+                had[name] += len(d)
+        anchors += o.endswith(('.o', '.a')) and b'gexw_entries_anchor' in open(o, 'rb').read()
+    got = {sec: b'' for sec in secs}
+    for name, d in wasm_data_segments(out):
+        if name in got:
+            got[name] += d
+    bad = []
+    for sec, (words, zero_counts) in secs.items():
+        rec = words * width
+        recs = [got[sec][k:k + rec] for k in range(0, len(got[sec]) - rec + 1, rec)]
+        zero = sum(1 for r in recs if not any(r)) if zero_counts else 0
+        allowed = anchors if sec == 'gexw_entries' else 0
+        if len(got[sec]) < had[sec] - allowed * rec or zero > allowed:
+            bad.append(f'{sec}: {len(got[sec])} bytes linked of {had[sec]} in its inputs, '
+                       f'{zero} all-zero records (allowed {allowed})')
+    if bad:
+        sys.exit(f'pelink: {out}: the link lost records: ' + '; '.join(bad))
 
 
 def makefile_var(path, var):
@@ -285,11 +412,33 @@ def main():
     # bound, as Wine's loader binds an import its DLL does not export, to a
     # stub that raises EXCEPTION_WINE_STUB when called; each is listed. The
     # core and the tree's DLLs stay checked (check_imports).
+    # --other NAME EXPORTS: a DLL that isn't linked here and isn't the tree's
+    # (a program's own DLL, gexcc-win's import library of it): its exports
+    # are what the program's imports of it bind to, as an i386 DLL's are
+    other = []
+    while sys.argv[1] == '--other':
+        other.append((sys.argv[2], sys.argv[3]))
+        del sys.argv[1:4]
+    # --symbolic (gexcc-win's DLL whose exports are its default-visibility
+    # symbols): the split module's own references to what it defines bound
+    # to it, not through the GOT
+    global SYMBOLIC
+    if sys.argv[1] == '--symbolic':
+        SYMBOLIC = True
+        del sys.argv[1]
     global STUB_IMPORTS
     if sys.argv[1] == '--stub-imports':
         STUB_IMPORTS = True
         del sys.argv[1]
     EXTRA.update(e[0] for e in extra)
+    # (their weak undefined names, which may stay undefined)
+    for mod, ro, _, _ in extra:
+        # (wasm-objdump's linking section: llvm-objdump refuses a wasm64 -r
+        # output, "invalid function symbol index")
+        sym = subprocess.run(['wasm-objdump', '-x', '-j', 'linking', ro], capture_output=True, text=True).stdout
+        WEAK_UNDEF[mod] = set(re.findall(r'- \d+: D <([^>]+)> \[ undefined binding=weak', sym))
+        WEAK_UNDEF_FUNCS[mod] = set(re.findall(r'- \d+: F <([^>]+)> func=\d+ \[ undefined binding=weak', sym))
+        STRONG_UNDEF[mod] = set(re.findall(r'- \d+: [DF] <([^>]+)> (?:func=\d+ )?\[ undefined binding=global', sym))
     build, src, out = sys.argv[1:4]
     global SRC, BUILD
     SRC = src
@@ -383,6 +532,12 @@ def main():
                     others[mod[0]] = ex
     for mod, ro, ex, imports in extra:
         others[mod] = ex
+    for mod, ex in other:
+        others[mod] = ex
+        for line in open(ex):
+            w = line.split()
+            if len(w) >= 2 and w[1] in ('data', 'func') and not w[0].startswith('__gexw'):
+                OTHER_NATIVE.setdefault(w[0], mod)
     link(dlls, out, os.path.join(build, 'libs', 'gexrt', 'libgexrt.a'), others)
 
 
@@ -857,11 +1012,12 @@ def stub_imports(objs, dlls, grp, sigs, syms, shim, elsewhere, gexrt, needs, tmp
         if not g or not mods or not all(m in EXTRA for m in mods):
             continue
         undef = syms(objs[g], '--undefined-only') - syms(objs[g], '--defined-only')
+        weak = weak_of(WEAK_UNDEF_FUNCS, mods)
         gaps = {}
         for m in mods:
             for (n, k), sig in sigs.get(m, {}).items():
                 if (k == 'undefined' and n in undef and '!' not in n and n not in elsewhere and n not in rt
-                        and n not in shim and n not in LOADER_IMPORTS and n not in WEAK_IMPORTS
+                        and n not in shim and n not in LOADER_IMPORTS and n not in WEAK_IMPORTS and n not in weak
                         and n not in CROSS_MODE and not n.startswith(('__gexw_', 'gexw_', '__wasm'))):
                     gaps.setdefault(n, sig)
         if not gaps:
@@ -1079,7 +1235,7 @@ def link(dlls, out, gexrt, others=None):
             continue
         for line in open(oex):
             parts = line.split()
-            if len(parts) >= 2 and parts[1] in ('func', 'forward'):
+            if len(parts) >= 2 and parts[1] in ('func', 'forward') and OTHER_NATIVE.get(parts[0]) != omod:
                 owner_of.setdefault(parts[0], []).append(omod)
     # A forward to what the native DLL itself takes from an i386 one
     # (user32's BeginPaint is win32u's NtUserBeginPaint): that DLL's export,
@@ -1206,6 +1362,14 @@ def link(dlls, out, gexrt, others=None):
         with open(mapfile, 'w') as f:
             # its entry point's binding of its static guest imports (winebuild)
             f.write(f'wine_gexw_bind_imports gexw-bind {mod}\n')
+            # an --other DLL's functions and data (a program's own DLL, native
+            # code too): imports named DLL!name, which gex binds to that
+            # DLL's exports, its data through GOT.mem. First, ahead of the
+            # Wine DLLs': MinGW's link takes a program's own libraries before
+            # its default ones (tcl86's crc32 is zlib1's, not ntdll's)
+            if mod in EXTRA:
+                for name, owner in sorted(OTHER_NATIVE.items()):
+                    f.write(f'{name} {owner}\n')
             for name, owners in exporters.items():
                 if fwd_first(mod, imports, name):
                     continue  # bound by its forward, below
@@ -1742,12 +1906,25 @@ static void *gexw_ntdll_proc(const char *name)
                         w = line.split()
                         if w and not w[0].startswith('__wine'):
                             f.write(f'--export-if-defined={mod}!{w[0]}\n')
+            # an --extra DLL's exports (a program's own DLL, a .def's
+            # exports too): its programs' and other DLLs' imports of it
+            # bind to them (--other)
+            for mod, _, ex, _ in dlls:
+                if mod in EXTRA and grp(mod) == g and not os.environ.get('PELINK_EXPORT_ALL'):
+                    for line in open(ex):
+                        w = line.split()
+                        if len(w) >= 2 and w[1] == 'func' and not w[0].startswith(('__wine', '__gexw')):
+                            f.write(f'--export-if-defined={mod}!{w[0]}\n')
             # what the other mode's modules call (wasmdll's CROSS_MODE)
             for n in CROSS_MODE:
                 f.write(f'--export-if-defined={n}\n')
             # gexrt's bounds of the entry-thunk pairs (gexw_entries)
             f.write('--export-if-defined=__gexw_entries\n')
             f.write('--export-if-defined=__gexw_entries_decl\n')
+            # the ICALL pass's class adapters' directory and facts (its
+            # wasm64 default), whose bounds its objects define
+            f.write('--export-if-defined=__gexw_adapters\n')
+            f.write('--export-if-defined=__gexw_facts\n')
             # a module with thread-local data (a gexcc-win program's C++
             # runtime): the host gives each thread's instance a block of
             # its own (wasmdll), as wasm-ld's start function does only for
@@ -1757,7 +1934,7 @@ static void *gexw_ntdll_proc(const char *name)
         cmd = ['wasm-ld'] + (['-mwasm64'] if WINE64 else []) + ['--experimental-pic', '-shared', '--shared-memory',
                '--import-memory', '--max-memory=' + ('17179869184' if M64 else '4294967296'),
                '--unresolved-symbols=import-dynamic', '-o', out, '-Map=' + out + '.map',
-               f'@{rsp}'] + objs[g] + ([gexrt] if gexrt else [])
+               f'@{rsp}'] + (['-Bsymbolic'] if SYMBOLIC and g else []) + objs[g] + ([gexrt] if gexrt else [])
         # compiler-rt's builtins (__multi3 and the like), from the toolchain's
         # sysroot (toolchain/sysroot/build32.sh, build64.sh)
         sysroot = os.environ.get('GEX_WASM64_SYSROOT' if WINE64 else 'GEX_WASM_SYSROOT')
@@ -1807,6 +1984,8 @@ static void *gexw_ntdll_proc(const char *name)
             cmd.insert(cmd.index(f'@{rsp}') + 1, obj)
             subprocess.check_call(cmd)
             print(f'{out}: {len(gaps)} functions nothing defines, trapping: {" ".join(n for n, _ in gaps)}')
+        check_record_runs(out, objs[g] + ([gexrt] if gexrt else []),
+                          {'gexw_entries': (2, True), 'gexw_entries_decl': (2, False)}, 8 if WINE64 else 4)
         # Each DLL's table slots and data (`gexw.dllslots`), read from the
         # link as it is: wasm-opt keeps slots and data offsets, not function
         # numbers.
@@ -1888,7 +2067,8 @@ static void *gexw_ntdll_proc(const char *name)
         # a module calls into before it
         if SPLIT:
             core_file = os.path.basename(out) if not g else os.path.basename(main_out)
-            mods = '\n'.join(f'{d} {SPLIT.get(d) or core_file}' for d in sorted({m for m, _, _, _ in dlls}))
+            mods = '\n'.join([f'{d} {SPLIT.get(d) or core_file}' for d in sorted({m for m, _, _, _ in dlls})] +
+                             [f'{d} {d}.wasm' for d in sorted(set(OTHER_NATIVE.values()))])
             payload = enc_name('gexw.modules') + mods.encode() + b'\n'
             with open(out, 'ab') as f:
                 f.write(bytes([0]) + enc_leb(len(payload)) + payload)
@@ -1896,8 +2076,28 @@ static void *gexw_ntdll_proc(const char *name)
             name_imports(out)
         undefined = subprocess.run(['wasm-objdump', '-x', '-j', 'Import', out], capture_output=True, text=True).stdout
         names = sorted(set(re.findall(r'<- env\.(\S+)', undefined)) - {'memory', '__indirect_function_table',
-                       '__stack_pointer', '__memory_base', '__table_base'})
+                       '__stack_pointer', '__memory_base', '__table_base'}
+                       | {n for n in re.findall(r'<- GOT\.mem\.(\S+)', undefined) if n.split('!')[0] in OTHER_NATIVE.values()}
+                       # (and an address of one of their functions: a program
+                       # that only takes &f of a DLL's export, a table for
+                       # libffi, still has Wine load that DLL, whose install
+                       # fills the slot)
+                       | {n for n in re.findall(r'<- GOT\.func\.(\S+)', undefined) if n.split('!')[0] in OTHER_NATIVE.values()})
         open(out + '.undefined', 'w').write('\n'.join(names) + '\n')
+        # (a program module's data import that no DLL exports and no object
+        # defines, GOT.mem.NAME with no DLL!: an undefined reference, as an
+        # undefined function is; nothing could bind it at load, and xul.dll's
+        # mingw GUIDs, IID_ILatLongReport and the rest, failed only there)
+        own = [m for m, _, _, _ in dlls if grp(m) == g]
+        if own and all(m in EXTRA for m in own):
+            # (a weak one, `extern int x __attribute__((weak))` tested by
+            # &x, may: it binds to 0)
+            weak = weak_of(WEAK_UNDEF, own)
+            lost = sorted(n for n in re.findall(r'<- GOT\.mem\.(\S+)', undefined) if '!' not in n and n not in weak)
+            if lost:
+                for n in lost:
+                    print(f'pelink: error: {out}: undefined data reference to `{n}\'', file=sys.stderr)
+                sys.exit(1)
         print(f'{out}: {sum(grp(d[0]) == g for d in dlls)} DLLs, {os.path.getsize(out) >> 20} MiB, {len(names)} undefined '
               f'(listed in {out}.undefined)')
 
@@ -2007,13 +2207,42 @@ def check_imports(core, splits):
                     k += 1
                     _, k = leb_at(body, k)
         return names
+    def weak_imports(path):
+        # (dylink.0's import info: the module's own weak imports, as the
+        # loaders read them; a name another module references weakly does
+        # not excuse this one's strong import)
+        names = set()
+        for body in section(path, 0):
+            nl, k = leb_at(body, 0)
+            if body[k:k + nl] != b'dylink.0':
+                continue
+            k += nl
+            while k < len(body):
+                sub = body[k]
+                size, k = leb_at(body, k + 1)
+                end = k + size
+                if sub == 4:
+                    cnt, j = leb_at(body, k)
+                    for _ in range(cnt):
+                        ml, j = leb_at(body, j)
+                        j += ml
+                        fl, j = leb_at(body, j)
+                        field = body[j:j + fl].decode()
+                        j += fl
+                        flags, j = leb_at(body, j)
+                        if flags & 1:
+                            names.add(field)
+                k = end
+        return names
     mods = [core] + splits
     have = {m: exports(m) for m in mods}
     bad = []
     for m in mods:
         others = set().union(*(have[o] for o in mods if o != m))
+        weak = weak_imports(m)
         gaps = sorted({n for n in func_imports(m) if n not in others and n not in LOADER_IMPORTS
-                       and n not in WEAK_IMPORTS and n not in CROSS_MODE})
+                       and n not in WEAK_IMPORTS and n not in weak and n not in CROSS_MODE
+                       and n.split('!')[0] not in OTHER_NATIVE.values()})
         if gaps:
             bad.append(f'{os.path.basename(m)}: {" ".join(gaps[:20])}' + (f' (and {len(gaps) - 20} more)' if len(gaps) > 20 else ''))
     if bad:

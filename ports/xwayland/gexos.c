@@ -634,7 +634,7 @@ int
 gex_shm_unmap(void *addr, size_t size)
 {
     (void) size;
-    /* A mapping is one of the pool's references (page/src/hostx.js `#pools`):
+    /* A mapping is one of the pool's references (runtime/src/host/hostx.js `#pools`):
      * the server closes the descriptor right after making the pool and draws
      * through the mapping until the pixmap goes, and the compositor holds its
      * own. The pixels are freed when the last of them lets go. */

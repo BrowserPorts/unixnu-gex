@@ -72,7 +72,12 @@ export const R_DAMAGE_H = 15;
 export const R_FLAGS = 16;
 /** The X window this surface is, or zero. See `F_EXTERNAL`. */
 export const R_XID = 17;
-// Words 18..25 are free (the title's, before it had room).
+/** Device pixels per surface unit times 120 (`wp_fractional_scale_v1`), or 0
+ *  where the writer does not say (an X window: device pixels throughout). */
+export const R_SCALE120 = 18;
+/** The surface's viewport destination, `w | h << 16` in surface units, or 0. */
+export const R_VIEW = 19;
+// Words 20..25 are free (the title's, before it had room).
 export const R_TITLE = 38;
 export const R_TITLE_WORDS = 64;
 export const R_APP_ID = 102;
@@ -174,7 +179,7 @@ export const EV_CONFIGURE = 7;
 export const EV_CLOSE = 8;
 export const EV_DISMISS_POPUP = 9;
 export const EV_MOVED = 10;
-/** The page's drag of host files (page/src/drag.js): enters a surface at
+/** The page's drag of host files (runtime/src/host/drag.js): enters a surface at
  *  (x, y) with the page's serial for it (its data is `setDragData`'s),
  *  moves (x, y, time), is dropped (serial), leaves. */
 export const EV_DRAG_ENTER = 11;
@@ -200,7 +205,9 @@ const M_OUT_H = 1;
 /** Bumped and notified by every publish, so a compositor can draw on the
  * publish instead of at its next animation frame (`waitPublish`). */
 const M_PUB = 2;
-/** Device pixels per surface unit for guest Wayland clients (wl_output.scale). */
+/** Device pixels per surface unit for guest Wayland clients, in 120ths (180
+ *  at devicePixelRatio 1.5): `wp_fractional_scale_v1`'s preferred scale, and
+ *  rounded up, `wl_output.scale`. */
 const M_SCALE = 3;
 /** Set by the first process to hand the page the global kernel's memory, so
  *  every other one (and every thread) does not send another copy of it. */
@@ -356,7 +363,8 @@ export function setOutputSize(channel, w, h, scale) {
   const was = [Atomics.load(a, M_OUT_W), Atomics.load(a, M_OUT_H)];
   Atomics.store(a, M_OUT_W, w | 0);
   Atomics.store(a, M_OUT_H, h | 0);
-  if (scale) Atomics.store(a, M_SCALE, Math.max(1, scale | 0));
+  // `scale`: device pixels per CSS pixel, any real value from 1 (kept in 120ths).
+  if (scale) Atomics.store(a, M_SCALE, scale120(scale));
   // A resize, not the first size: every process with a block takes a turn,
   // whose pump tells its clients (`WlProxy.outputSize`). One whose threads
   // are all parked would otherwise hear of it only at its next wake.
@@ -380,10 +388,17 @@ export async function waitPublish(channel, seen) {
   return Atomics.load(a, M_PUB);
 }
 
+/** A scale (device pixels per CSS pixel) as `wp_fractional_scale_v1` says
+ *  it: 120ths, from 1 to 8. */
+export const scale120 = (scale) => Math.min(960, Math.max(120, Math.round((Number(scale) || 1) * 120)));
+
+/** The output's size in device pixels, and its scale: `scale120` in 120ths
+ *  and `scale` that rounded up (wl_output.scale). */
 export function outputSize(channel) {
   const a = new Int32Array(channel.arena);
+  const s120 = Atomics.load(a, M_SCALE) || 120;
   return { w: Atomics.load(a, M_OUT_W) || 640, h: Atomics.load(a, M_OUT_H) || 480,
-    scale: Atomics.load(a, M_SCALE) || 1 };
+    scale: Math.ceil(s120 / 120), scale120: s120 };
 }
 
 const decoder = new TextDecoder();
@@ -459,6 +474,8 @@ export function readScene(channel, { onlyChanged = false } = {}) {
         },
         flags: a[r + R_FLAGS],
         xid: a[r + R_XID] >>> 0,
+        scale120: a[r + R_SCALE120],
+        view: a[r + R_VIEW] ? { w: a[r + R_VIEW] & 0xffff, h: a[r + R_VIEW] >>> 16 } : null,
         external: (a[r + R_FLAGS] & F_EXTERNAL) !== 0,
         glRect: (a[r + R_FLAGS] & F_EXTERNAL) && a[r + R_GL_SIZE]
           ? {
@@ -1326,7 +1343,7 @@ export function mergeDamage(a, b) {
 // -- the single-thread build's page: a mirror of the arena ------------------
 //
 // The arena and the guests' memories are in the system Worker, which the
-// page's DOM desktop (page/src/dom-compositor.js) cannot read. The Worker
+// page's DOM desktop (runtime/src/host/dom-compositor.js) cannot read. The Worker
 // sends the page what changed (`mirrorTake`): each block's header, a changed
 // block's records, and the damaged rows of each surface's pixels, copied out
 // of its process's memory into a buffer per surface, which the records then

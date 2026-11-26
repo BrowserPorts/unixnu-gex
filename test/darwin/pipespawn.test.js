@@ -5,8 +5,8 @@
 // have closed, and its answer comes back through the second, as gexc runs
 // it. The page makes a Darwin process's pipe in its global kernel, with
 // XNU's rules there, so that the child's ends are the same pipe's.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
 import { ROOT_OWNED, tarWithXattrs } from '../fixtures/xattr-tar.js';
 
 export const meta = { hosts: ['browser'], arches: ['a64'], images: ['darwin-root', 'darwin-dyn'], timeout: 900 };

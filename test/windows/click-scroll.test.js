@@ -6,9 +6,9 @@
 // focus() without preventScroll scrolled the page 34 px before the press was
 // mapped, so the guest got it 34 px low). SwiftShader here; on a GPU through
 // bench.sh.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
-import { CompositorWindows } from '../../page/runtime/src/windows/compositor.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
+import { CompositorWindows } from '../../runtime/src/windows/compositor.js';
 
 export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 180, html: `<style>html, body { margin: 0; } #bar { height: 34px; }</style>
 <div id="bar"></div><canvas id="out" width="1280" height="720"></canvas>` };
@@ -19,7 +19,7 @@ export default async function (t) {
   const sys = new System({ baseUrl: t.baseUrl, debug: t.debug() });
   new MemoryFilesystem(sys).addTar(t.work('bb.tar.zst'));
   const canvas = document.getElementById('out');
-  const out = new CompositorWindows(sys, { canvas });
+  const out = new CompositorWindows(sys, { canvas, x11: 'rootless' });
   await timeout(sys.boot(), 60000, 'boot');
   const p = sys.spawn(['rt-x11', 'clicked', 'at'], { env: { PATH: '/bin', HOME: '/root', ...out.env } });
   const said = lines(p);

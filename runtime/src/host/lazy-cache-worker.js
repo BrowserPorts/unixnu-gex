@@ -1,0 +1,734 @@
+// The owner of the lazy files' cache (hosts/browser/js/lazy-cache.mjs): a
+// Worker's read of a lazy file asks here, through the control buffer's
+// slots, and waits; this answers from the page's Cache Storage, or fetches
+// what it lacks (one ranged request a run of missing chunks), keeps it, and
+// writes the bytes into the kernel's memory. No service worker.
+//
+// A file in the site's rest bundle (`BUNDLE#OFFSET`, lazy-fetch.mjs) is read
+// here too: its frames fetched, decoded with the one decoder here and the
+// last few kept decoded, for every Worker. A decoder in each Worker was an
+// engine memory reservation in each, and a desktop's few hundred Workers ran
+// the page out of them.
+//
+// In: { ctl: SharedArrayBuffer, memory: the kernel's WebAssembly.Memory,
+//       cache: the Cache Storage name, versions: { URL path: version } of
+//       the lazy files (lazy-cache.mjs lazyVersion), zstd: the decoder's
+//       module URL, or true for the one bundled here, for a rest bundle }
+// Out: { kind: 'ready', ok, why? } once; then { kind: 'bytes', net, cached }
+//      now and then (bytes from the network, from the cache, since the last).
+
+import { CHUNK, SLOTS, HEAD, SLOT, FREE, ASKED, TAKEN, WRITING, DONE, GIVEN_UP, chunkKey, FailedFrames, retryAsync } from '../../../hosts/browser/js/lazy-cache.mjs';
+
+let net = 0, kept = 0, posted = 0;
+const report = () => {
+  if (net + kept === 0 || performance.now() - posted < 250) return;
+  posted = performance.now();
+  self.postMessage({ kind: 'bytes', net, cached: kept });
+  net = 0;
+  kept = 0;
+};
+setInterval(() => { posted = 0; report(); }, 1000);
+
+let versions = {};
+const keyOf = (url, k) => {
+  let path = url;
+  try { path = new URL(url).pathname; } catch { /* a path already */ }
+  return chunkKey(url, versions[path], k);
+};
+
+// A host that answers a ranged request with the whole file (200: no Range
+// support, or a CDN that drops the header) is read once: that one answer is
+// kept as it streams in, and every later range of the URL is cut from it as
+// its bytes arrive, never fetched again (a whole download a read was the
+// rest bundle again and again). Said once per URL.
+const wholes = new Map();
+class Whole {
+  constructor(res) {
+    this.buf = new Uint8Array(Number(res.headers.get('Content-Length')) || (1 << 20));
+    this.have = 0;
+    this.done = false;
+    this.err = null;
+    this.waits = [];
+    this.finished = this.pump(res.body.getReader());
+  }
+  async pump(rd) {
+    try {
+      for (;;) {
+        const { done, value } = await rd.read();
+        if (done) break;
+        if (this.have + value.length > this.buf.length) {
+          const nb = new Uint8Array(Math.max(this.buf.length * 2, this.have + value.length));
+          nb.set(this.buf.subarray(0, this.have));
+          this.buf = nb;
+        }
+        this.buf.set(value, this.have);
+        this.have += value.length;
+        net += value.length;
+        this.wake();
+      }
+      this.done = true;
+    } catch (e) {
+      this.err = e ?? new Error('cut short');
+    }
+    this.wake();
+    return this.done;
+  }
+  wake() {
+    this.waits = this.waits.filter((w) => (this.have >= w.hi || this.done || this.err ? (w.r(), false) : true));
+  }
+  /** Bytes [lo, hi) once they are here; short at the file's end. */
+  async slice(lo, hi) {
+    if (this.have < hi && !this.done && !this.err) await new Promise((r) => this.waits.push({ hi, r }));
+    if (this.have >= hi || this.done) return this.buf.slice(lo, Math.min(hi, this.have));
+    throw this.err;
+  }
+}
+/** Bytes [lo, hi) of `url` from the network (or its kept whole answer):
+ *  null if the host gave nothing usable. */
+async function fetchRange(url, lo, hi, priority) {
+  let w = wholes.get(url);
+  if (!w) {
+    const res = await fetch(url, { headers: { Range: `bytes=${lo}-${hi - 1}` }, cache: 'no-store', ...(priority ? { priority } : {}) });
+    if (res.status === 206) {
+      const b = new Uint8Array(await res.arrayBuffer());
+      net += b.length;
+      return b;
+    }
+    if (res.status !== 200 || !res.body) {
+      res.body?.cancel().catch(() => {});
+      return null;
+    }
+    w = wholes.get(url);
+    // Another read's whole answer is on its way already: this one is let go.
+    if (w) res.body.cancel().catch(() => {});
+    else {
+      w = new Whole(res);
+      wholes.set(url, w);
+      console.warn(`[lazy-cache] ${url}: the host ignores Range; its whole answer is kept and read from`);
+    }
+  }
+  try {
+    return await w.slice(lo, hi);
+  } catch {
+    if (wholes.get(url) === w) wholes.delete(url);
+    return null;
+  }
+}
+
+/** The bytes of `url` from `from`, `len` of them: each chunk from the cache,
+ *  the missing ones fetched in runs and kept. */
+async function read(cache, url, from, len) {
+  const first = Math.floor(from / CHUNK), last = Math.floor((from + len - 1) / CHUNK);
+  const chunks = new Map();
+  await Promise.all(Array.from({ length: last - first + 1 }, async (_, i) => {
+    const k = first + i;
+    const r = await cache.match(keyOf(url, k)).catch(() => null);
+    if (r?.ok) {
+      const b = new Uint8Array(await r.arrayBuffer());
+      chunks.set(k, b);
+      kept += b.length;
+    }
+  }));
+  for (let k = first; k <= last;) {
+    if (chunks.has(k)) { k++; continue; }
+    let stop = k;
+    while (stop < last && !chunks.has(stop + 1)) stop++;
+    const lo = k * CHUNK, hi = (stop + 1) * CHUNK - 1;
+    // Tried a few times with waits between, then held as failed by chunk
+    // (as a rest bundle's frame): reads of it fail at once until the hold ends.
+    for (let c = k; c <= stop; c++) if (failed.held(`${url}#c${c}`)) throw heldError;
+    demandBegin();
+    let got;
+    try {
+      got = await retryAsync(() => fetchRange(url, lo, hi + 1));
+    } finally {
+      demandEnd();
+    }
+    if (!got) {
+      for (let c = k; c <= stop; c++) failed.failed(`${url}#c${c}`);
+      throw new Error(`${url} @${lo}: no answer`);
+    }
+    for (let c = k; c <= stop; c++) {
+      const b = got.slice((c - k) * CHUNK, (c - k + 1) * CHUNK);
+      if (!b.length) break;
+      chunks.set(c, b);
+      // The file's end: a short last chunk is whole; any other is not kept.
+      if (b.length === CHUNK || c === stop) cache.put(keyOf(url, c), new Response(b)).catch(() => {});
+    }
+    k = stop + 1;
+  }
+  const out = new Uint8Array(len);
+  for (let at = from; at < from + len;) {
+    const k = Math.floor(at / CHUNK);
+    const b = chunks.get(k);
+    const off = at - k * CHUNK;
+    if (!b || off >= b.length) throw new Error(`${url} @${at}: short`);
+    const n = Math.min(b.length - off, from + len - at);
+    out.set(b.subarray(off, off + n), at - from);
+    at += n;
+  }
+  return out;
+}
+
+// The rest bundles: URL -> { frame, frames } from BUNDLE.json, as a promise.
+const bundles = new Map();
+// Decoded frames, `URL#k` -> promise of the bytes, most recently used last.
+const decoded = new Map();
+// Kept by bytes, not count (8 MiB frames: eight of them): a program's start maps image after image, each
+// image's headers in another frame, and four kept made a WinSCP install decode 64 frames again from their
+// held compressed bytes (?systime=1). At least two, whatever their size.
+const DECODED_BUDGET = globalThis.GEX_DECODED_BUDGET ?? 64 << 20;
+const FRAMES_KEPT_MIN = 2;
+// Decoded frames' sizes, `URL#k` -> bytes, once each is decoded.
+const decodedBytes = new Map();
+let decodedTotal = 0;
+function dropDecoded(key) {
+  decoded.delete(key);
+  const n = decodedBytes.get(key);
+  if (n !== undefined) { decodedBytes.delete(key); decodedTotal -= n; }
+}
+function trimDecoded() {
+  for (const k of decoded.keys()) {
+    if (decodedTotal <= DECODED_BUDGET || decoded.size <= FRAMES_KEPT_MIN) break;
+    dropDecoded(k);
+  }
+}
+// Fetched frames as they came, compressed, `URL#k` -> bytes, most recently
+// used last, up to PACKED_BUDGET bytes: a decoded frame that was let go is
+// decoded again from here, not fetched again. Only the last few frames are
+// kept decoded (8 MiB each), and a program's reads move between frames, so
+// a launch fetched the same frames over and over (Notepad++ in the Wine
+// desktop page: 33 fetches of 17 frames, about 43 MB for 24).
+const packed = new Map();
+// (a test sets GEX_PACKED_BUDGET, to fill it with a small bundle)
+const PACKED_BUDGET = globalThis.GEX_PACKED_BUDGET ?? 96 << 20;
+let packedBytes = 0;
+function keepPacked(key, z) {
+  if (z.length > PACKED_BUDGET) return;
+  // (a read's frame is kept here before its store; a store that fails keeps it again)
+  const old = packed.get(key);
+  if (old) { packed.delete(key); packedBytes -= old.length; }
+  packed.set(key, z);
+  packedBytes += z.length;
+  for (const [k, v] of packed) {
+    if (packedBytes <= PACKED_BUDGET) break;
+    packed.delete(k);
+    packedBytes -= v.length;
+  }
+}
+function packedFrame(key) {
+  const z = packed.get(key);
+  if (z) {
+    packed.delete(key);
+    packed.set(key, z);
+  }
+  return z;
+}
+let zstdUrl = null, zstd = null;
+async function decoder() {
+  // `true`: the one bundled with this Worker (the runtime package's).
+  zstd ??= (zstdUrl === true ? import('../../vendor/zstddec/zstddec-stream.mjs') : import(zstdUrl))
+    .then(async ({ ZSTDDecoder }) => { const d = new ZSTDDecoder(); await d.init(); return d; });
+  return zstd;
+}
+// The bundles' index and frames given up (lazy-cache.mjs FailedFrames):
+// a read of one fails at once until its hold ends, and quietly (the give-up
+// said so once).
+const failed = new FailedFrames();
+const heldError = new Error('given up a moment ago');
+async function getRange(url, lo, hi, priority) {
+  const body = await retryAsync(async () => {
+    // Never the HTTP cache's copy: a range of an older bundle under the same
+    // URL would decode as garbage. A bundle with a hash keeps its frames in
+    // the page's own cache (`frameOf`) instead.
+    const b = await fetchRange(url, lo, hi, priority);
+    return b && b.length === hi - lo ? b : null;
+  });
+  if (!body) throw new Error(`${url} @${lo}: no answer`);
+  return body;
+}
+// A rest bundle whose index names its bytes' hash (BUNDLE.json `h`,
+// kde/mksite.sh) keeps its compressed frames in the page's Cache Storage
+// under the bundle's URL with that hash and the frame's number, so a second
+// visit reads them from there whatever caching headers the host sends, and a
+// new bundle (another hash) is never read from an old one's frames, which go
+// once it is seen. Without a hash, or a cache, frames come from the network.
+let store_ = null;
+// What a relative URL is relative to: the Worker's own URL, or, for one a
+// page started from a blob (its copy of this file), the URL it stands for.
+// (none in a realm without a location, a test's: absolute URLs only)
+const here = () => globalThis.GEX_BASE ?? self.location?.href;
+const frameKey = (url, b, k) => {
+  const u = new URL(url, here());
+  u.hash = '';
+  u.search = `h=${b.h}&f=${k}`;
+  return u.href;
+};
+const kept_ = (n) => { kept += n; };
+async function storedHas(url, b, k) {
+  if (!store_ || !b.h) return false;
+  try { return !!(await store_.match(frameKey(url, b, k))); } catch { return false; }
+}
+async function stored(url, b, k) {
+  if (!store_ || !b.h) return null;
+  try {
+    const r = await store_.match(frameKey(url, b, k));
+    return r?.ok ? new Uint8Array(await r.arrayBuffer()) : null;
+  } catch { return null; }
+}
+// Frames of this visit held by now, `URL#k`, however they came (the stream, a read, the page's cache): the
+// background download never fetches one of them again, and its progress counts them.
+const got = new Set();
+function store(url, b, k, bytes) {
+  got.add(`${url}#${k}`);
+  // A store that fails (the origin's quota) keeps the bytes packed instead, up to that budget: the frame is
+  // held for this visit either way, and nothing fetches it again because its put failed.
+  if (store_ && b.h) store_.put(frameKey(url, b, k), new Response(bytes)).catch(() => keepPacked(`${url}#${k}`, bytes));
+}
+/** Frames of `url` under another hash than `h`: an earlier build's. */
+async function dropOld(url, h) {
+  if (!store_) return;
+  try {
+    const path = new URL(url, here()).pathname;
+    for (const r of await store_.keys()) {
+      const u = new URL(r.url);
+      if (u.pathname === path && u.searchParams.has('f') && u.searchParams.get('h') !== h) await store_.delete(r);
+    }
+  } catch { /* kept */ }
+}
+
+// A bundle read whole (a host that ignores Range): once all of it is here,
+// every frame is kept in the page's cache, so a later visit reads none of it
+// from the network again.
+const storedWhole = new Set();
+function storeWhole(url, b) {
+  const w = wholes.get(url);
+  if (!w || !b.h || storedWhole.has(w)) return;
+  storedWhole.add(w);
+  w.finished.then((ok) => {
+    if (ok) b.frames.forEach(([o, n], k) => store(url, b, k, w.buf.slice(o, o + n)));
+  });
+}
+
+// A frame's compressed bytes from the network, one request however many want it (`URL#k` -> promise while in
+// flight): a read's (`ahead` false), kept packed and stored, or the background's (`ahead`), stored only when the
+// page's cache holds the bundle's frames (packed otherwise).
+const fetching = new Map();
+// Reads in flight (a frame or a lazy file's bytes a reader waits for): while there is one, the background
+// download stops, its window in flight cut short (taken up after from the byte it reached), so a read's
+// bytes never queue behind background ones on the connection.
+let demand = 0, yielded = false;
+function demandBegin() {
+  demand++;
+  if (aheadAbort) {
+    yielded = true;
+    aheadAbort.abort();
+  }
+}
+function demandEnd() {
+  demand--;
+  wakeAhead();
+}
+function fetchFrame(url, b, k, ahead) {
+  const key = `${url}#${k}`;
+  let p = fetching.get(key);
+  if (p) return p;
+  const [o, n] = b.frames[k];
+  if (!ahead) demandBegin();
+  p = getRange(url, o, o + n, ahead ? 'low' : undefined).then((got) => {
+    if (!ahead || !store_ || !b.h) keepPacked(key, got);
+    store(url, b, k, got);
+    storeWhole(url, b);
+    return got;
+  }).finally(() => {
+    fetching.delete(key);
+    if (!ahead) demandEnd();
+  });
+  fetching.set(key, p);
+  return p;
+}
+
+// The rest bundles fetched in the background as soon as the page asks (`{kind: 'ahead', bundles}`, once the
+// title files are in), into the same store a read looks in, so the reads after find their frames here and a
+// later visit fetches none of them. A bundle with a hash, in a page cache that holds: windows of up to
+// aheadWindow() bytes (4 MiB), each one ranged request at low priority over a run of frames none of which is held or
+// being fetched, from the first such frame on, each frame stored as it completes (a frame read while its store
+// is in flight is answered from `streamed`); what is held is looked at again before every window, so no frame
+// held already (from the cache, a read, an earlier window) is fetched again. A read's frame the download has
+// not reached yet goes out at once, in its own ranged request: the only bytes fetched twice are those of the
+// window in flight then. Otherwise every frame not held, one request each, none while a read's is in flight,
+// kept packed up to the budget. Stopped while the page is hidden (`{kind: 'ahead', paused}`), the window in
+// flight cut short, and taken up again from the first frame not held; none on a save-data or 2G connection.
+// The page hears `{kind: 'rest', done, total}` now and then: `total` the compressed bytes of the frames this
+// visit did not hold when the download began, `done` those of them held by now, whichever way they came (it
+// never goes back, and ends equal to `total`); and `{kind: 'ahead', frames, bytes, done: true}` at the end.
+let aheadPaused = false, aheadRunning = false, aheadWaiter = null, aheadAbort = null, aheadUrls = [];
+// (a test sets GEX_AHEAD_WINDOW, to see the windows of a small bundle)
+const aheadWindow = () => globalThis.GEX_AHEAD_WINDOW ?? 4 << 20;
+function wakeAhead() {
+  const w = aheadWaiter;
+  aheadWaiter = null;
+  w?.();
+}
+const thrifty = () => {
+  const c = globalThis.navigator?.connection;
+  return !!(c && (c.saveData || /(^|-)2g$/.test(c.effectiveType ?? '')));
+};
+const aheadState = { frames: 0, bytes: 0, done: false };
+// `URL#k` -> bytes of a streamed frame while its store is in flight
+const streamed = new Map();
+let restPosted = 0;
+// this visit's download: URL -> the frames it did not hold when it began (`k` -> compressed size)
+const visit = new Map();
+const restSum = () => {
+  let done = 0, total = 0;
+  for (const [url, want] of visit) for (const [k, n] of want) { total += n; if (got.has(`${url}#${k}`)) done += n; }
+  return { done, total };
+};
+const restProgress = (force) => {
+  if (!force && performance.now() - restPosted < 250) return;
+  restPosted = performance.now();
+  self.postMessage({ kind: 'rest', ...restSum() });
+};
+const held = async (url, b, k) => {
+  const key = `${url}#${k}`;
+  if (got.has(key) || packed.has(key) || streamed.has(key)) return true;
+  if (!(await storedHas(url, b, k))) return false;
+  got.add(key);
+  return true;
+};
+/** The next window of `url`'s frames to fetch: [first, end) of frames neither held nor being fetched, at most
+ *  aheadWindow() bytes (one frame at least); null when every frame is held, [] when the rest are in flight. */
+async function nextWindow(url, b) {
+  let first = 0, busy = false;
+  for (; first < b.frames.length; first++) {
+    if (await held(url, b, first)) continue;
+    if (fetching.has(`${url}#${first}`)) { busy = true; continue; }
+    break;
+  }
+  if (first === b.frames.length) return busy ? [] : null;
+  let end = first + 1, bytes = b.frames[first][1];
+  while (end < b.frames.length && bytes + b.frames[end][1] <= aheadWindow()
+    && !fetching.has(`${url}#${end}`) && !(await held(url, b, end))) bytes += b.frames[end++][1];
+  return [first, end];
+}
+// URL -> { k, buf, have } of a window cut short in the middle of frame k: the next window from k asks only for
+// the bytes after `have`.
+const partial = new Map();
+/** Frames [first, end) of `url` in one ranged request, each stored as it completes: true when all came. */
+async function streamWindow(url, b, first, end) {
+  const part = partial.get(url)?.k === first ? partial.get(url) : null;
+  partial.delete(url);
+  const lo = b.frames[first][0] + (part?.have ?? 0), hi = b.frames[end - 1][0] + b.frames[end - 1][1];
+  const ac = (aheadAbort = new AbortController());
+  let res;
+  try {
+    res = await fetch(url, { headers: { Range: `bytes=${lo}-${hi - 1}` }, cache: 'no-store', priority: 'low', signal: ac.signal });
+  } catch { if (part) partial.set(url, part); return false; }
+  if (res.status === 200 && res.body) {
+    // A host that ignores Range answers the whole bundle: kept as it comes (fetchRange's whole answer), every
+    // frame not held cut from it and stored, and every window after is cut from it too, never asked again.
+    if (wholes.has(url)) res.body.cancel().catch(() => {});
+    else {
+      wholes.set(url, new Whole(res));
+      console.warn(`[lazy-cache] ${url}: the host ignores Range; its whole answer is kept and read from`);
+    }
+  }
+  const w = wholes.get(url);
+  if (w) {
+    for (let k = first; k < end; k++) {
+      const key = `${url}#${k}`;
+      if (got.has(key)) continue;
+      const [o, n] = b.frames[k];
+      let bytes;
+      try { bytes = await w.slice(o, o + n); } catch { return false; }
+      if (bytes.length !== n) return false;
+      store(url, b, k, bytes);
+      aheadState.frames++;
+      aheadState.bytes += n;
+      restProgress();
+    }
+    return true;
+  }
+  if (res.status !== 206 || !res.body) { res.body?.cancel().catch(() => {}); if (part) partial.set(url, part); return false; }
+  const rd = res.body.getReader();
+  let k = first, at = lo, buf = part?.buf ?? new Uint8Array(b.frames[k][1]), have = part?.have ?? 0;
+  try {
+    for (;;) {
+      const { done, value } = await rd.read();
+      if (done) break;
+      net += value.length;
+      for (let i = 0; i < value.length && k < end;) {
+        const n = b.frames[k][1];
+        const take = Math.min(n - have, value.length - i);
+        buf.set(value.subarray(i, i + take), have);
+        have += take; at += take; i += take;
+        if (have === n) {
+          const key = `${url}#${k}`, bytes = buf;
+          // (a read's own request may have brought it meanwhile)
+          if (!got.has(key) && !packed.has(key)) {
+            streamed.set(key, bytes);
+            got.add(key);
+            store_.put(frameKey(url, b, k), new Response(bytes)).catch(() => keepPacked(key, bytes)).finally(() => streamed.delete(key));
+            aheadState.frames++;
+            aheadState.bytes += n;
+          }
+          k++;
+          if (k < end) { buf = new Uint8Array(b.frames[k][1]); have = 0; }
+        }
+      }
+      report();
+      restProgress();
+    }
+  } catch {
+    if (k < end && have > 0) partial.set(url, { k, buf, have });
+    return false;
+  } finally { if (aheadAbort === ac) aheadAbort = null; }
+  return k === end;
+}
+async function ahead(urls) {
+  if (aheadRunning) return;
+  aheadRunning = true;
+  try {
+    const indexes = [];
+    for (const url of urls) {
+      let b;
+      try { b = await bundleIndex(url); } catch { continue; }
+      indexes.push([url, b]);
+      // this visit's total, once: the frames not held as the download begins
+      if (!visit.has(url)) {
+        const want = new Map();
+        for (let k = 0; k < b.frames.length; k++) {
+          if (!(await held(url, b, k)) && !(!(store_ && b.h) && packedBytes + b.frames[k][1] > PACKED_BUDGET)) want.set(k, b.frames[k][1]);
+        }
+        visit.set(url, want);
+      }
+    }
+    restProgress(true);
+    for (const [url, b] of indexes) {
+      if (store_ && b.h) {
+        // window after window; one cut short is taken up again from the first frame not held, a few times
+        for (let fails = 0; ;) {
+          while (aheadPaused || demand > 0) await new Promise((r) => { aheadWaiter = r; });
+          if (thrifty()) return;
+          const win = await nextWindow(url, b);
+          if (!win) break;
+          // the frames left are a read's, in flight: their end is waited for (one that fails is fetched here)
+          if (!win.length) { await Promise.allSettled([...fetching].filter(([k]) => k.startsWith(`${url}#`)).map(([, p]) => p)); continue; }
+          if (await streamWindow(url, b, win[0], win[1])) { fails = 0; continue; }
+          // (cut short for a read, or by a pause: no failure)
+          if (aheadPaused || yielded) { yielded = false; continue; }
+          if (++fails > 4) break;
+          await new Promise((r) => setTimeout(r, 2000 << (fails - 1)));
+        }
+        continue;
+      }
+      for (let k = 0; k < b.frames.length; k++) {
+        const key = `${url}#${k}`;
+        while (aheadPaused || demand > 0) await new Promise((r) => { aheadWaiter = r; });
+        if (thrifty()) return;
+        if (got.has(key) || packed.has(key) || fetching.has(key) || failed.held(key)) continue;
+        if (packedBytes + b.frames[k][1] > PACKED_BUDGET) break;
+        try {
+          await fetchFrame(url, b, k, true);
+          aheadState.frames++;
+          aheadState.bytes += b.frames[k][1];
+          restProgress();
+        } catch { /* a read of it tries again */ }
+      }
+    }
+    restProgress(true);
+    aheadState.done = true;
+    self.postMessage({ kind: 'ahead', ...aheadState });
+  } finally {
+    aheadRunning = false;
+  }
+}
+
+// One fetch a frame however many readers want it: they share its promise
+// (`decoded`) while it is in flight.
+// `?systime=1` (start's `sysTime`): what the owner's reads cost, said every 10 s while reads come.
+const sys = { on: false, reads: 0, ms: 0, frames: 0, hit: 0, packed: 0, stored: 0, net: 0, netMs: 0, decodeMs: 0, said: 0 };
+function frameOf(url, b, k) {
+  const key = `${url}#${k}`;
+  let f = decoded.get(key);
+  if (sys.on) sys.frames++;
+  if (f) {
+    // (moved to the end: most recently used; its size stays counted)
+    if (sys.on) sys.hit++;
+    decoded.delete(key);
+  } else {
+    if (failed.held(key)) return Promise.reject(heldError);
+    const kept = packedFrame(key) ?? streamed.get(key);
+    if (sys.on && kept) sys.packed++;
+    const z = kept ? Promise.resolve(kept) : stored(url, b, k).then((have) => {
+      if (have) {
+        if (sys.on) sys.stored++;
+        kept_(have.length);
+        keepPacked(key, have);
+        return have;
+      }
+      const t = performance.now();
+      if (sys.on) sys.net++;
+      return fetchFrame(url, b, k, false).then((v) => { if (sys.on) sys.netMs += performance.now() - t; return v; });
+    });
+    f = Promise.all([z, decoder()]).then(([zb, d]) => {
+      const t = performance.now();
+      const v = d.decode(zb, k === b.frames.length - 1 ? 0 : b.frame);
+      if (sys.on) sys.decodeMs += performance.now() - t;
+      return v;
+    });
+    f.then((v) => {
+      // (still kept: counted, and the budget kept)
+      if (decoded.get(key) !== f || decodedBytes.has(key)) return;
+      decodedBytes.set(key, v.length); decodedTotal += v.length; trimDecoded();
+    }, () => { if (decoded.get(key) === f) dropDecoded(key); failed.failed(key); });
+  }
+  decoded.set(key, f);
+  trimDecoded();
+  return f;
+}
+/** A rest bundle's index (BUNDLE.json), fetched once. */
+function bundleIndex(url) {
+  let b = bundles.get(url);
+  if (!b) {
+    const key = `${url}.json`;
+    if (failed.held(key)) return Promise.reject(heldError);
+    b = retryAsync(async () => {
+      // The index of this deploy's bundle, never an older cached one.
+      const r = await fetch(key, { cache: 'no-cache' });
+      return r.ok ? r.json() : null;
+    }).then((j) => j ?? Promise.reject(new Error(`${key}: no answer`)));
+    b.then((j) => { if (j.h) dropOld(url, j.h); }, () => {});
+    bundles.set(url, b);
+    b.catch(() => { bundles.delete(url); failed.failed(key); });
+  }
+  return b;
+}
+/** `len` bytes at `from` of the file at `href` (`BUNDLE#OFFSET`). `st.step`
+ *  says what it waits on now (`slowReads`). */
+async function bundleRead(href, from, len, st = {}) {
+  const cut = href.lastIndexOf('#');
+  const url = href.slice(0, cut), start = Number(href.slice(cut + 1)) + from;
+  st.step = 'the bundle\'s index';
+  const b = await bundleIndex(url);
+  const first = Math.floor(start / b.frame), last = Math.floor((start + len - 1) / b.frame);
+  const out = new Uint8Array(len);
+  for (let k = first, at = start; k <= last; k++) {
+    const key = `${url}#${k}`;
+    st.step = `frame ${k} (${fetching.has(key) ? 'its fetch in flight' : packed.has(key) || streamed.has(key) ? 'held, decoding' : 'from the cache or the network'})`;
+    const f = await frameOf(url, b, k);
+    const a = at - k * b.frame, n = Math.min(f.length - a, start + len - at);
+    if (n <= 0) throw new Error(`${href} @${from}: short`);
+    out.set(f.subarray(a, a + n), at - start);
+    at += n;
+  }
+  return out;
+}
+
+// The first message sets the owner up (`start`); then the page's `{kind: 'ahead', bundles?, paused?}`.
+self.onmessage = ({ data: m }) => {
+  if (m?.kind !== 'ahead') return start(m);
+  if ('paused' in m) {
+    aheadPaused = !!m.paused;
+    if (aheadPaused) aheadAbort?.abort();
+  }
+  wakeAhead();
+  // as a read names them (lazy-fetch.mjs: absolute), so the two share one index and the frames streamed
+  if (m.bundles?.length) aheadUrls = m.bundles.map((u) => { try { return new URL(u, here()).href; } catch { return u; } });
+  if (!aheadPaused && aheadUrls.length) ahead(aheadUrls);
+};
+async function start(m) {
+  const ctl = new Int32Array(m.ctl);
+  const raw = new Uint8Array(m.ctl);
+  const memory = m.memory;
+  versions = m.versions ?? {};
+  zstdUrl = m.zstd ?? null;
+  let cache = null;
+  try {
+    cache = await caches.open(m.cache);
+    // A store that opens but cannot hold anything (some insecure origins).
+    const base = here();
+    const probe = base ? new URL('/__gex-probe', base).href : '/__gex-probe';
+    await cache.put(probe, new Response('1'));
+    await cache.delete(probe);
+  } catch (e) {
+    self.postMessage({ kind: 'ready', ok: false, why: String(e?.message ?? e) });
+    return;
+  }
+  if (typeof Atomics.waitAsync !== 'function') {
+    self.postMessage({ kind: 'ready', ok: false, why: 'no Atomics.waitAsync' });
+    return;
+  }
+  store_ = cache;
+  self.postMessage({ kind: 'ready', ok: true });
+  const busy = new Set();
+  // Reads taken and not answered: each said once, when it has waited 10 s,
+  // with what it waits on (a stalled read is a program stalled on a file,
+  // which otherwise says nothing at all).
+  const slowReads = new Set();
+  sys.on = !!m.sysTime;
+  if (sys.on) setInterval(() => {
+    if (sys.reads === sys.said) return;
+    sys.said = sys.reads;
+    const f = (x) => x.toFixed(0);
+    console.log(`[lazy-cache] systime: ${sys.reads} reads served in ${f(sys.ms)} ms; frames ${sys.frames} (decoded kept ${sys.hit}, packed ${sys.packed}, page cache ${sys.stored}, network ${sys.net} in ${f(sys.netMs)} ms); decoding ${f(sys.decodeMs)} ms`);
+  }, 10000);
+  setInterval(() => {
+    const now = performance.now();
+    for (const st of slowReads) {
+      if (st.said || now - st.t0 < 10000) continue;
+      st.said = true;
+      console.warn(`[lazy-cache] a read of ${st.url} @${st.from} (${st.len} bytes) has waited ${Math.round((now - st.t0) / 1000)} s, on ${st.step}`);
+    }
+  }, 2000);
+  const serve = async (i) => {
+    const base = (HEAD + i * SLOT) / 4;
+    // Taken: the reader waits for this answer now, not its own fetch.
+    if (Atomics.compareExchange(ctl, base, ASKED, TAKEN) !== ASKED) {
+      if (Atomics.load(ctl, base) === GIVEN_UP) Atomics.store(ctl, base, FREE);
+      busy.delete(i);
+      return;
+    }
+    const len = ctl[base + 3] >>> 0, dst = ctl[base + 2] >>> 0, ul = ctl[base + 4];
+    const from = new Float64Array(m.ctl, HEAD + i * SLOT + 24, 1)[0];
+    const url = new TextDecoder().decode(raw.slice(HEAD + i * SLOT + 32, HEAD + i * SLOT + 32 + ul));
+    let bytes = null;
+    const st = { url, from, len, t0: performance.now(), step: 'the network', said: false };
+    slowReads.add(st);
+    const t0 = performance.now();
+    try {
+      bytes = url.includes('#') && zstdUrl ? await bundleRead(url, from, len, st) : await read(cache, url, from, len);
+    } catch (e) {
+      if (e !== heldError) console.warn(`[lazy-cache] ${e?.message ?? e}`);
+    }
+    slowReads.delete(st);
+    if (sys.on) { sys.reads++; sys.ms += performance.now() - t0; }
+    if (st.said) console.warn(`[lazy-cache] the read of ${url} @${from} came after ${Math.round((performance.now() - st.t0) / 1000)} s`);
+    // (A reader no longer gives up once its ask is taken; should one ever,
+    // nothing is written into its buffer, which may be gone.)
+    if (Atomics.compareExchange(ctl, base, TAKEN, WRITING) !== TAKEN) {
+      Atomics.store(ctl, base, FREE);
+    } else {
+      if (bytes) new Uint8Array(memory.buffer, dst, len).set(bytes);
+      ctl[base + 1] = bytes ? len : -1;
+      Atomics.store(ctl, base, DONE);
+      Atomics.notify(ctl, base);
+    }
+    busy.delete(i);
+    report();
+  };
+  for (;;) {
+    const seen = Atomics.load(ctl, 0);
+    for (let i = 0; i < SLOTS; i++) {
+      const st = Atomics.load(ctl, (HEAD + i * SLOT) / 4);
+      if (st === GIVEN_UP && !busy.has(i)) Atomics.store(ctl, (HEAD + i * SLOT) / 4, FREE);
+      else if (st === ASKED && !busy.has(i)) {
+        busy.add(i);
+        serve(i);
+      }
+    }
+    const w = Atomics.waitAsync(ctl, 0, seen);
+    if (w.async) await w.value;
+  }
+}

@@ -6,7 +6,7 @@ scripts/prof-report.py                     symbolise a GEX_PROF profile (crates/
 wine/dll-bases.py      pinned DLL addresses for a 64-bit Wine or WoW64 prefix (dll-bases)
 wine/legacy32/dll-bases.py      the same for a 32-bit Wine bundle (legacy)
 wine/page-prefix.sh           a Wine prefix template for the page
-wine/run.sh                   run a Windows program on a Wine dist (natively, or --page)
+wine/run.sh                   run a Windows program on a Wine dist, natively
 site/record-wine32.mjs            record a 32-bit Wine page session for gex-eject (legacy)
 site/page-site.mjs                        a Wine program as a static site on nt.html (soju's WoW64 Paint pipeline)
 wine/wcc                      clang for gex wasm32 programs, as Wine's build uses it

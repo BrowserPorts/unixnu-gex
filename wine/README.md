@@ -45,10 +45,10 @@ pin; another GCC version builds different PE files.
 
 ```console
 $ . out/wine.env
-$ wine/run.sh --page TREE --dist $WINE64_DIST --prefix $WINE64_PREFIX app.exe
+$ wine/run.sh --dist $WINE64_DIST --prefix $WINE64_PREFIX app.exe
 ```
 
-That runs `app.exe` in the page on a bench box (`BENCH_SH`; `run.sh -h`).
+That runs `app.exe` natively under gexc (`run.sh -h`).
 A 32-bit program runs in the 64-bit process through WoW64.
 
 ## Known gaps

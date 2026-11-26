@@ -121,7 +121,7 @@ function judge(what, r) {
 
 // -- 2. the browser shim under node ----------------------------------------------
 if (parts.includes('node')) {
-  const seed = join(GEX_ROOT, 'page/public/gex/seed.x86.shared.wasm');
+  const seed = join(GEX_ROOT, 'runtime/files/out/gex/seed.x86.shared.wasm');
   const bin = existsSync(seed) ? buildClient() : null;
   if (!bin) {
     skip('node', 'no x86 shared seed or gcc');

@@ -9,7 +9,7 @@
 #   test/fixtures/gexcc/dl/rpath.sh DIR    (gexcc on PATH; DIR: where gex can see,
 #                                not /dev/shm)
 #   BROWSER=ROOT: the loads in the browser runtime of gex checkout ROOT
-#   (hosts/browser/js/run-node.mjs, the shim and seed in its page/public/gex;
+#   (hosts/browser/js/run-node.mjs, the shim and seed in its runtime/files/out/gex;
 #   GEX_ARCH=x86 for the x86 build's)
 set -u
 command -v gexcc > /dev/null || { echo "gexcc not on PATH (toolchain/gexcc/install.sh)"; exit 2; }
@@ -49,7 +49,7 @@ if [ -n "${BROWSER:-}" ]; then
     case ${GEX_ARCH:-aarch64} in x86) infix=.x86 ;; *) infix= ;; esac
     libc=$(dirname "$(command -v gexcc)")/../sysroot/lib/libc.so
     run() { (GEX_SHARED=1 GEX_LOG=off timeout 300 node "$BROWSER/hosts/browser/js/run-node.mjs" --dir "$W=$W" \
-        --file "/usr/lib/wasm32-linux-musl/libc.so=$libc" "$BROWSER/page/public/gex/seed$infix.shared.wasm" "$@" 2>&1) |
+        --file "/usr/lib/wasm32-linux-musl/libc.so=$libc" "$BROWSER/runtime/files/out/gex/seed$infix.shared.wasm" "$@" 2>&1) |
         grep -v '^\[host\]\|^\[worker\] \|^\[gex-console' | tail -1; }
 else
     run() { (cd "$W" && gexcc-exec "$@" 2>&1) | tail -1; }

@@ -105,11 +105,11 @@ const ownerSrc = `
 const { makeControl: mk } = { makeControl };
 const memory = new WebAssembly.Memory({ initial: 256, maximum: 256, shared: true }); // 16 MiB
 const ctl = mk();
-const owner = new Worker(ownerSrc, { eval: true, workerData: { store, worker: gexUrl('page/src/lazy-cache-worker.js') } });
+const owner = new Worker(ownerSrc, { eval: true, workerData: { store, worker: gexUrl('runtime/src/host/lazy-cache-worker.js') } });
 const ready = await new Promise((r) => {
   owner.on('message', (m) => { if (m.kind === 'ready') r(m); });
   owner.once('error', (e) => r({ ok: false, why: String(e) }));
-  owner.postMessage({ ctl, memory, cache: 'gex-pieces', versions: {}, zstd: gexUrl('page/vendor/zstddec/zstddec-stream.mjs') });
+  owner.postMessage({ ctl, memory, cache: 'gex-pieces', versions: {}, zstd: gexUrl('runtime/vendor/zstddec/zstddec-stream.mjs') });
 });
 if (!ready.ok) fail(`owner not ready: ${ready.why}`);
 // A 64 KiB span in the middle of each frame: forward, back, then the first again.

@@ -4,7 +4,7 @@
 // program that started it hears the exception's code (crashlaunch.c). An
 // i386 program through WoW64 and an x64 one, a phase each.
 import { bootWine } from '../lib/wine.mjs';
-import { HostWindows } from '../../page/runtime/src/windows/host.js';
+import { HostWindows } from '../../runtime/src/windows/host.js';
 
 export const meta = { hosts: ['browser'], arches: ['x86'], images: ['wine64', 'win-progs'], timeout: 1800, alone: true };
 

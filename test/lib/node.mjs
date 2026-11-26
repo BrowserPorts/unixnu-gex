@@ -12,7 +12,7 @@ let logsAsked = 0;
 import { makeT, runTest } from './t.js';
 
 const file = process.argv[2];
-const PUBLIC = pathToFileURL(join(import.meta.dirname, '../../page/public/')).href;
+const PUBLIC = pathToFileURL(join(import.meta.dirname, '../../runtime/files/out/')).href;
 
 // A lazy file's URL is a host path here (hosts/browser/js/lazy-fetch.mjs).
 process.env.GEX_NODE_LAZY = '1';

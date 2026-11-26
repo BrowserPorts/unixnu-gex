@@ -24,7 +24,7 @@
 //! A record names a path without its leading `/`.
 
 use crate::{Errno, OP_FLUSH, OP_READ, OP_WRITE};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 const SB_MAGIC: &[u8; 8] = b"gexroot\x01";
 pub const SB_LEN: usize = 60;
@@ -537,14 +537,17 @@ impl Journal {
     }
 }
 
-/// What [`load`] read: what it found, the generation, its records, and
-/// which blocks they and their chain take (block 0 included).
+/// What [`load`] read: what it found, the generation, its records, which
+/// blocks they and their chain take (block 0 included), and the blocks two
+/// or more files name (a copy that shares its source's blocks until either
+/// writes one), each with how many files past the first name it.
 #[derive(Debug)]
 pub struct Loaded {
     pub found: Found,
     pub journal: Journal,
     pub recs: BTreeMap<String, Rec>,
     pub used: Vec<bool>,
+    pub shared: HashMap<u32, u32>,
 }
 
 /// The store's newest generation that reads whole, else the one before it.
@@ -568,25 +571,31 @@ pub fn load(s: &mut impl Blocks) -> Loaded {
         journal: Journal { sb: Sb { gen: max_gen, ..Default::default() }, chain: Vec::new() },
         recs: BTreeMap::new(),
         used: vec![true],
+        shared: HashMap::new(),
     };
     for (i, sb) in ok.iter().enumerate() {
         let Ok((stream, chain)) = read_chain(s, sb) else { continue };
         let Ok(recs) = replay(&stream) else { continue };
-        let mut mark = |b: u32| {
+        // Block `b` taken: whether something took it before.
+        let mark = |used: &mut Vec<bool>, b: u32| {
             let i = b as usize;
-            if out.used.len() <= i {
-                out.used.resize(i + 1, false);
+            if used.len() <= i {
+                used.resize(i + 1, false);
             }
-            out.used[i] = true;
+            std::mem::replace(&mut used[i], true)
         };
         for &b in &chain {
-            mark(b);
+            mark(&mut out.used, b);
         }
+        // A file's paths (its hard links) are one file: its blocks shared
+        // only with another file.
+        let mut files = HashSet::new();
         for r in recs.values() {
-            if let Rec::File { body: Body::Blocks(_, map), .. } = r {
+            if let Rec::File { ino, body: Body::Blocks(_, map), .. } = r {
+                let first = files.insert(*ino);
                 for &b in map {
-                    if b != 0 {
-                        mark(b - 1);
+                    if b != 0 && mark(&mut out.used, b - 1) && first {
+                        *out.shared.entry(b - 1).or_insert(0) += 1;
                     }
                 }
             }

@@ -1,9 +1,9 @@
 // Zed as a Wayland client of the page's compositor (no
 // X: DISPLAY unset), its tree from WORK/fresnel-tree.tar, a file to edit.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
-import { CompositorWindows } from '../../page/runtime/src/windows/compositor.js';
-import { MesaGl } from '../../page/runtime/src/gl.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
+import { CompositorWindows } from '../../runtime/src/windows/compositor.js';
+import { MesaGl } from '../../runtime/src/gl.js';
 
 export const meta = { hosts: ['browser'], arches: ['x86'], images: [], timeout: 900, html: `<style>html, body { margin: 0; background: #000; }</style>
 <canvas id="out" width="1540" height="1100" style="width: 1540px; height: 1100px; display: block;" tabindex="0"></canvas>` };
@@ -25,7 +25,6 @@ export default async function (t) {
   new MesaGl(sys);
   await t.time('boot', () => t.timeout(sys.boot(), 120000, 'boot'));
   const env = { ...out.env, HOME: '/root', PATH: '/usr/bin:/bin', SHELL: '/bin/bash', TERM: 'xterm-256color', ZED_ALLOW_EMULATED_GPU: '1', ZED_ALLOW_ROOT: 'true', ZED_LOG: 'info' };
-  delete env.DISPLAY;
   const p = sys.spawn(['/usr/bin/zed', '/work/hello.rs'], { env });
   const o = t.lines(p);
   const err = t.lines(p, p.stderr);

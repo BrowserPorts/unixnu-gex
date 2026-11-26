@@ -1,0 +1,14 @@
+{
+  "name": "gex-runtime-build",
+  "version": "1.0.0",
+  "description": "The tools runtime/build.sh builds the @gexemu/runtime package with",
+  "keywords": [],
+  "author": "Puter Technologies Inc.",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "devDependencies": {
+    "@mercuryworkshop/wisp-js": "^0.4.1",
+    "vite": "^8.2.0"
+  },
+  "private": true
+}

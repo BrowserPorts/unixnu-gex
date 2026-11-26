@@ -11,8 +11,8 @@
 // entered at their first access). The time the run took (most of it mapping
 // the cache and translating dyld's and the cache's code) is said, against
 // gexc's.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
 import { ROOT_OWNED, tarWithXattrs } from '../fixtures/xattr-tar.js';
 
 /** What gexc says of its own standard streams, its host's (darwin/hoststd.rs):

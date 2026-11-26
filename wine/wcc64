@@ -123,25 +123,69 @@ for k, s in enumerate(srcs):
         sys.exit(r)
     objs.append(o)
 
-def ld(cmd, name):
+def ld(cmd, name, relocatable=False):
     """wasm-ld CMD; a direct call whose type is not its callee's fails the
     link. wasm-ld only warns ("function signature mismatch") and links the
     call to a stub that traps: a Wine DLL declaring a function apart from
-    its definition (msvcp60's string destructors) traps on the first call."""
+    its definition (msvcp60's string destructors) traps on the first call.
+    In a relocatable object (-r) the stub becomes an adapter where the
+    target ABI's slot semantics make the call work (sigadapt.py: a K&R
+    definition called with arguments, an int of the other width); the rest
+    still fail. GEX_WCC_VERBOSE=1 lists each adapter."""
+    path = cmd[cmd.index('-o') + 1]
+    if relocatable:
+        # (a list from an earlier build must not excuse this one's .so)
+        try:
+            os.unlink(path + '.adapted')
+        except OSError:
+            pass
     p = subprocess.run(cmd, stderr=subprocess.PIPE, text=True)
-    sys.stderr.write(p.stderr)
     if p.returncode:
+        sys.stderr.write(p.stderr)
         return p.returncode
     # A configure test links a function through autoconf's own `char f();`
     # on purpose (it only asks whether the symbol exists), so its program
     # is not judged.
     # The C runtime calls main or wmain with every argument it has; a
     # program's own main may take fewer, as C allows.
-    out = os.path.basename(cmd[cmd.index('-o') + 1])
+    out = os.path.basename(path)
     bad = [m for m in re.findall(r'function signature mismatch: (\S+)', p.stderr) if m not in ('main', 'wmain')]
+    err = p.stderr
+    if bad and relocatable and not out.startswith('conftest'):
+        sys.path.insert(0, here)
+        import sigadapt
+        res = sigadapt.adapt(path, set(bad))
+        done = {r[0] for r in res if r[3] is None}
+        refused = {r[0] for r in res if r[3] is not None}
+        # (an adapted mismatch's warning is not printed: the adapter is the answer)
+        err = re.sub(r'wasm-ld: warning: function signature mismatch: (\S+)\n(>>> [^\n]*\n)*\n?',
+                     lambda m: '' if m.group(1) in done and m.group(1) not in refused else m.group(0), err)
+        for r in res:
+            if r[3] is not None:
+                err += '%s: %s: %s calls %s: not adapted: %s\n' % (name, r[0], r[1], r[2], r[3])
+            elif os.environ.get('GEX_WCC_VERBOSE'):
+                err += '%s: %s: adapted %s to %s\n' % (name, r[0], r[1], r[2])
+        bad = [m for m in bad if m not in done or m in refused]
+        # (for the same module's other link, below)
+        with open(path + '.adapted', 'w') as f:
+            f.write(''.join(n + '\n' for n in sorted(done - refused)))
+    elif bad and not relocatable:
+        # winegcc's second link of a module (its .so, of which only the
+        # signatures are kept) after the relocatable object that runs: what
+        # that object adapted is not an error here
+        base = re.sub(r'(\.64)?\.wasm$', '', path)
+        try:
+            done = set(open(base + '.r.o.adapted').read().split())
+        except OSError:
+            done = set()
+        if done:
+            err = re.sub(r'wasm-ld: warning: function signature mismatch: (\S+)\n(>>> [^\n]*\n)*\n?',
+                         lambda m: '' if m.group(1) in done else m.group(0), err)
+            bad = [m for m in bad if m not in done]
+    sys.stderr.write(err)
     if bad and not out.startswith('conftest'):
         sys.stderr.write('%s: %s: a call through a declaration whose type is not the function\'s '
-                         '(wasm-ld links it to a trap); make the two agree\n' % (name, cmd[cmd.index('-o') + 1]))
+                         '(wasm-ld links it to a trap); make the two agree\n' % (name, path))
         return 1
     return 0
 
@@ -154,8 +198,10 @@ feats = ['--enable-threads', '--enable-bulk-memory', '--enable-mutable-globals',
 if relocatable:
     # one relocatable object of the inputs (an archive's members only as
     # referenced): a DLL for pelink.py, lowered with the whole PE module
-    cmd = ['wasm-ld', '-mwasm64', '-r', '-L' + lib, '-o', out] + objs + ld_in + [f for f in ld_flags if not f.startswith('--export')]
-    sys.exit(ld(cmd, 'wcc64'))
+    # (--no-demangle: a C++ signature mismatch's stub named by its symbol,
+    # signature_mismatch:_Z..., as sigadapt.py finds the definition)
+    cmd = ['wasm-ld', '-mwasm64', '-r', '--no-demangle', '-L' + lib, '-o', out] + objs + ld_in + [f for f in ld_flags if not f.startswith('--export')]
+    sys.exit(ld(cmd, 'wcc64', relocatable=True))
 if shared:
     # a side module (a DLL's code behind its skeleton), lowered in place
     w64 = out + '.64.wasm'

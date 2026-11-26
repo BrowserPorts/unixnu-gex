@@ -14,7 +14,7 @@
 #                                 libglib-2.0.so.0, libgobject-2.0.so.0,
 #                                 libffi.so.8 and libpcre2-8.so.0, without
 #                                 it the test is skipped; GEX_ROOT: a gex
-#                                 checkout with page/public/gex built; DIR:
+#                                 checkout with runtime/files/out/gex built; DIR:
 #                                 where gex can see, not /dev/shm)
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -23,7 +23,7 @@ command -v gexcc > /dev/null || { echo "gexcc not on PATH (toolchain/gexcc/insta
 ROOT=${GEX_ROOT:?set GEX_ROOT to a gex checkout}
 ARCH=${GEX_ARCH:-x86}
 case $ARCH in x86) INFIX=.x86 ;; *) INFIX= ;; esac
-SEED=$ROOT/page/public/gex/seed$INFIX.shared.wasm
+SEED=$ROOT/runtime/files/out/gex/seed$INFIX.shared.wasm
 [ -f "$SEED" ] || { echo "no $SEED"; exit 2; }
 G=${GEXC:-gexc}
 W=$(mktemp -d "${1:?DIR}/gobject.XXXXXX")

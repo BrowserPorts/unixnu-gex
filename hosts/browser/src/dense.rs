@@ -94,7 +94,10 @@ const _: () = assert!(MAP_PAGES <= u16::MAX as u64);
 static WIN: [AtomicU32; dense::TABLES] = [const { AtomicU32::new(0) }; dense::TABLES];
 
 fn window(k: usize) -> (u64, u64) {
-    let w = WIN[k - dense::FIRST_TABLE].load(Ordering::Acquire);
+    // (a table past the last, from a slot past the runtime space: no map;
+    // the refill that handed the slot out has said the space is spent)
+    let Some(w) = k.checked_sub(dense::FIRST_TABLE).and_then(|i| WIN.get(i)) else { return (0, 0) };
+    let w = w.load(Ordering::Acquire);
     ((w & 0xffff) as u64, (w >> 16) as u64)
 }
 

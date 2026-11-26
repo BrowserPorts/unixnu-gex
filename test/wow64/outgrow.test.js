@@ -12,6 +12,12 @@
 // (WINE64_TWIN=1). Each second start comes the moment the first ends,
 // so the record must be made before anything can see the first gone:
 // on the page, a run of copies started that way, each found recorded.
+// One whose thread gex has no memory of its own for (outgrow thread)
+// outgrows it the same way. One that asks for the same refused block
+// again and again (outgrow retry) is recorded at the second ask and
+// started again at once by Wine, in a 64-bit memory, with no crash. One built as a native wasm32 module, with no
+// memory64 build, is never moved: it ends saying so, as does a 32-bit
+// program (its Wine core has none).
 import { copyFileSync, existsSync, mkdirSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
@@ -22,7 +28,10 @@ export const meta = { hosts: ['node'], arches: ['x86'], timeout: 1500 };
 
 const SRC = fileURLToPath(new URL('../fixtures/wine/src/outgrow.c', import.meta.url));
 const SAID = /outgrow\.exe needs 64-bit memory \(a reservation of 0xe0000000 bytes did not fit\); it gets it from its next start/;
+const RESTARTED = /outgrow\.exe needs 64-bit memory \(a reservation of 0xe0000000 bytes did not fit\); started again in one/;
 const NOTICE = /needs 64-bit memory; it will get it the next time it starts/;
+const NO64 = /outgrow\.exe ran out of memory \(2 GiB\); \S*outgrow\.exe\.wasm has no 64-bit memory build/;
+const I386_NO64 = /outgrow\.exe ran out of memory \(2 GiB\); \S*i386-windows\/winepe\.wasm has no 64-bit memory build/;
 const lines = (out) => out.replace(/\r/g, '').split('\n').filter((l) => l.startsWith('outgrow ')).join('\n');
 // (where the fallback's blocks ended is checked on the page only)
 const fell = (out) => lines(out).split('\n').filter((l) => l !== 'outgrow reached 2g').join('\n');
@@ -80,5 +89,54 @@ export default async function (t) {
   t.check('page: reaching the old KUSER page without units says nothing by default', !KUSER_LINE.test(pf.out + pf.err), w.detail(pf));
   const pd = await w.page(['/t/outgrow.exe', 'fallback'], { files: { '/t/outgrow.exe': exe }, env: { GEX_LOG: 'debug' }, name: 'page-fallback-debug', timeout: 600000 });
   t.check('page: and says it as debug output', KUSER_LINE.test(pd.out + pd.err), w.detail(pd));
+  // gex's own memory for a thread (its provider stack) with no room left
+  // in the lowered memory: 64-bit Wine's loader is a wasm32 program, but
+  // one lowered from wasm64, so the process outgrew it as a program whose
+  // reservation did not fit does, and its next start has a 64-bit memory
+  const pr = await w.page(['/t/outgrow.exe', 'twice', 'thread'], { files: { '/t/outgrow.exe': exe }, name: 'page-runtime', timeout: 600000 });
+  const run = lines(pr.out).split('\n');
+  t.check('page: a thread gex has no memory for ends the first start', run[0] === 'outgrow filling' && /^outgrow child exit (?!00000000)/.test(run[1] ?? ''), w.detail(pr));
+  t.eq('page: and its next start, in a 64-bit memory, runs the thread', run.slice(2).join('\n'), 'outgrow filling\noutgrow thread ran\noutgrow child exit 00000000', w.detail(pr));
+  t.check("page: gex says its own memory for it could not grow", /outgrow\.exe needs 64-bit memory \(gex's own memory for it could not grow by 0x[0-9a-f]+ bytes\); it gets it from its next start/.test(pr.out), w.detail(pr));
+  // the same refused block asked for again and again, as OpenBLAS's
+  // allocator does: gex records it at the second ask, and Wine starts it
+  // again at once, in a 64-bit memory, where the block fits; the first
+  // start's end is no crash (its parent sees it exit 0)
+  const pq = await w.page(['/t/outgrow.exe', 'late', 'retry'], { files: { '/t/outgrow.exe': exe }, name: 'page-retry', timeout: 900000 });
+  const rq = lines(pq.out).split('\n');
+  t.eq('page: one asking again for the same refused block is started again in a 64-bit memory', [...rq].sort().join('\n'),
+    ['outgrow big high', 'outgrow child exit 00000000', 'outgrow late done', 'outgrow retrying', 'outgrow retrying'].join('\n'), w.detail(pq));
+  t.check('page: gex says it was started again, with no crash notice',
+    RESTARTED.test(pq.out) && !NOTICE.test(pq.out) && !/ended by gex/.test(pq.out + (pq.err ?? '')), w.detail(pq));
+  // a 32-bit program (PE32, the WoW64 process's i386 side, whose Wine core
+  // has no memory64 build) that runs out of gex's own memory cannot move
+  // either: it ends saying so, and its next start is lowered again, never
+  // the memory64 twin
+  const xexe = await w.mingw('outgrow', { src: SRC, out: 'i386/outgrow.exe' });
+  const px = await w.page(['/t/outgrow.exe', 'twice', 'thread'], { files: { '/t/outgrow.exe': xexe }, name: 'page-i386', timeout: 600000 });
+  t.check('page: a 32-bit program that runs out says its Wine core has no 64-bit memory build, and is never moved',
+    I386_NO64.test(px.out) && !SAID.test(px.out) && !/exec \S*wine\.m64 /.test(px.out) && (lines(px.out).match(/^outgrow child exit (?!00000000)/gm) ?? []).length === 2, w.detail(px));
+  // a program built as a native wasm32 module (gexcc-win, no memory64
+  // build beside it) cannot move: it ends saying so, is not recorded, and
+  // its next start is in the lowered memory again (GEX_TEST_GEXCC_WIN)
+  const nexe = await w.gexccWin(SRC, 'native/outgrow.exe', ['-O1']);
+  const nfiles = { '/t/outgrow.exe': nexe, '/t/outgrow.exe.wasm': `${nexe}.wasm` };
+  const pn = await w.page(['/t/outgrow.exe', 'twice', 'crash'], { files: nfiles, name: 'page-no64', timeout: 600000 });
+  t.eq('page: a program with no memory64 build falls short both times, never moved', lines(pn.out),
+    'outgrow short\noutgrow child exit c0000005\noutgrow short\noutgrow child exit c0000005', w.detail(pn));
+  t.check('page: gex says it has no 64-bit memory build', NO64.test(pn.out) && !SAID.test(pn.out), w.detail(pn));
+  // ended for asking again, it says so too, never ending silently
+  const pnq = await w.page(['/t/outgrow.exe', 'retry'], { files: nfiles, name: 'page-no64-retry', timeout: 600000 });
+  t.check('page: a program with no memory64 build asking again is ended and says it has no 64-bit memory build',
+    lines(pnq.out) === 'outgrow retrying' && NO64.test(pnq.out) && !SAID.test(pnq.out), w.detail(pnq));
+  // (its skeleton names its module outgrow.exe.wasm, found beside it)
+  const nkeep = join(t.workDir, 'outgrow-keep-native');
+  mkdirSync(nkeep, { recursive: true });
+  copyFileSync(nexe, join(nkeep, 'outgrow.exe'));
+  copyFileSync(`${nexe}.wasm`, join(nkeep, 'outgrow.exe.wasm'));
+  const nn = await w.native([dos(join(nkeep, 'outgrow.exe')), 'crash'], { name: 'native-no64' });
+  t.eq('native: a program with no memory64 build falls short and crashes', lines(nn.out), 'outgrow short', w.detail(nn));
+  t.check('native: its crash says it has no 64-bit memory build', /ran out of memory \(2 GiB\); this program has no 64-bit memory build/.test(nn.out + (nn.err ?? '')), w.detail(nn));
+  t.eq('native: and it is not recorded', recorded(join(nkeep, 'outgrow.exe')), null, w.detail(nn));
   w.clean();
 }

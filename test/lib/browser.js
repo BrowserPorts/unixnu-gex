@@ -21,16 +21,19 @@ const emit = (s) => {
 const t = makeT({ host: 'browser', arch: q.get('arch'), gpu: q.has('gpu'), timed: q.has('timed'), phase: kept?.phase ?? 1, state: kept?.state ?? null, res, emit });
 
 Object.assign(t, {
-  /** The runtime's assets, as a System's `baseUrl` (`--package`: none, the
-   *  package's own). */
-  baseUrl: q.has('pkg') ? undefined : (q.get('base') ?? '/'),
-  /** The runtime's debug switches for this run: vite dev's Workers need
-   *  workergraph=0; `arch` the runner's. */
+  /** The runtime's assets, as a System's `baseUrl`: none, the package's own. */
+  baseUrl: undefined,
+  /** The runtime's debug switches for this run: a runtime from the tree's
+   *  sources (a test of its internals) needs workergraph=0, its Workers'
+   *  modules not bundled; `arch` the runner's. */
   debug: (more = {}) => ({ workergraph: '0', ...(t.arch ? { arch: t.arch } : {}), ...more }),
   /** A file of the runner's work directory (fixtures/images.mjs), as a URL. */
   work: (name) => new URL(`/__t/work/${name}`, location.href).href,
   /** How many times the page asked for work file `name`. */
   hits: async (name) => (await fetch(`/__t/hits?${encodeURIComponent(name)}`)).json(),
+  /** The work files the page asked for whose names hold `part`, in the
+   *  order the requests came (one entry a request). */
+  asked: async (part = '') => (await fetch(`/__t/order?${encodeURIComponent(part)}`)).json(),
   /** Run this test again in a fresh page, as phase `t.phase + 1`, with
    *  `state` as `t.state`; what was checked so far is kept. */
   reload(state = null) {
@@ -136,7 +139,7 @@ function vk(code, key) {
 (async () => {
   let r;
   try {
-    const mod = await import(/* @vite-ignore */ q.get('src'));
+    const mod = await import(q.get('src'));
     // The page's own elements (`meta.html`), before the test looks for them.
     if (mod.meta?.html) document.body.insertAdjacentHTML('beforeend', mod.meta.html);
     r = await runTest(mod.default, t, res);

@@ -8,21 +8,17 @@ import { join as gexJoin } from 'node:path';
 // gex: the checkout these fixtures are in, or GEX_ROOT.
 const GEX_ROOT = process.env.GEX_ROOT || gexJoin(import.meta.dirname, '..', '..', '..');
 const gexUrl = (p) => gexPathToFileURL(gexJoin(GEX_ROOT, p)).href;
-// The page's switches onto the runtime's globals: what app.js `start()`
-// calls, in a module of its own (no page needed). An older checkout had it
-// in app.js, which imports the runtime as `@gex/...`.
+// The page's switches onto the runtime's globals (page-globals.js).
 import { existsSync } from 'node:fs';
 import { register } from 'node:module';
 const js = gexUrl('hosts/browser/js/');
 register(`data:text/javascript,${encodeURIComponent(`export async function resolve(s, c, next) {
   return next(s.startsWith('@gex/') ? ${JSON.stringify(js)} + s.slice(5) : s, c);
 }`)}`);
-const mod = existsSync(gexJoin(GEX_ROOT, 'page/src/page-globals.js'))
-  ? await import(gexUrl('page/src/page-globals.js'))
-  : await import(gexUrl('page/src/app.js'));
+const mod = await import(gexUrl('runtime/src/host/page-globals.js'));
 // Newer: the settings are page-config.js's `page`, not globals.
-const { page } = existsSync(gexJoin(GEX_ROOT, 'page/src/page-config.js'))
-  ? await import(gexUrl('page/src/page-config.js'))
+const { page } = existsSync(gexJoin(GEX_ROOT, 'runtime/src/host/page-config.js'))
+  ? await import(gexUrl('runtime/src/host/page-config.js'))
   : { page: null };
 const setGlobals = mod.setPageConfig ?? mod.setGlobals;
 

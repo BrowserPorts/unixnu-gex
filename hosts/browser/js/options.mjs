@@ -27,6 +27,9 @@ export const OPTIONS = [
   ['doorStats',      'GEX_DOOR_STATS',       'doorstats',     'GEX_DOOR_STATS',        'numor1', 'extra', true],
   // The function probe cache's misses, every 10 s (cgen.rs `fcache_stat`).
   ['fcacheStats',    'GEX_FCACHE_STATS',     'fcachestats',   'GEX_FCACHE_STATS',      'flag',   'extra', false],
+  // Every process's time in syscalls, by call, on its exit (the shim's
+  // `gex_sys_times`): what a slow run spent writing files against the rest.
+  ['sysTime',        'GEX_SYS_TIME',         'systime',       'GEX_SYS_TIME',          'flag',   'extra', true],
   // Label process and thread Worker exits, without the debug option's
   // mirroring of every guest write.
   ['exitTrace',      'GEX_EXIT_TRACE',       'exittrace',     null,                    'flag',   'extra', false],
@@ -55,6 +58,10 @@ export const OPTIONS = [
   ['pinRegion',      'GEX_PIN_REGION',       'pinregion',     'GEX_PIN_REGION',        'num',    'extra', true],
   // A crash report names the SEH chain and a longjmp's jmp_buf.
   ['sehReport',      'GEX_SEH_REPORT',       'sehreport',     'GEX_SEH_REPORT',        'one',    'extra', true],
+  // A running thread's Worker installs each Wine PE module its process
+  // loads at once, not at the thread's first call into it (gex.mjs
+  // `#lateDefer`): a debugging opt-in, off by default.
+  ['eagerLate',      'GEX_EAGER_LATE',       'eagerlate',     'GEX_EAGER_LATE',        'one',    'extra', true],
   // The processors every process is told it has (`gex_kernel::cpus`), in
   // place of navigator.hardwareConcurrency: for a page that wants fewer.
   ['cpus',           'GEX_CPUS',             'cpus',          'GEX_CPUS',              'num',    'extra', false],

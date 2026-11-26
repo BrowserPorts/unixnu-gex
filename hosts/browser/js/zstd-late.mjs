@@ -1,4 +1,4 @@
-// A zstddec decoder (page/vendor/zstddec, the package as published) whose
+// A zstddec decoder (runtime/vendor/zstddec, the package as published) whose
 // instance, and the wasm memory it makes, come at its first decode. An
 // engine reserves the same address space for any memory however small,
 // and a tab has room for about 124: a decoder made in every Worker at its

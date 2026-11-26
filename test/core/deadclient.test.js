@@ -5,9 +5,9 @@
 // and stays up. The compositor's windows (describe().titles) are taken at
 // each phase line: all four shown, and afterwards only the live parent's,
 // with both dead children reaped. SwiftShader here; on a GPU through bench.sh.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
-import { CompositorWindows } from '../../page/runtime/src/windows/compositor.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
+import { CompositorWindows } from '../../runtime/src/windows/compositor.js';
 
 export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 300, html: '<canvas id="out" width="1280" height="720"></canvas>' };
 

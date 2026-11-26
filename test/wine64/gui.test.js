@@ -9,6 +9,8 @@
 //   visual style, Wine's own, draws the caption: white, its frame #909090);
 // - user_win, gdi, input: USER, GDI and input on the display (they check
 //   themselves);
+// - capkeep: a captioned window's caption kept in the work area, and the
+//   windows that rule leaves alone (it checks itself);
 // - desktop: explorer's tray window, the screen the display's size;
 // - display: the display devices and modes a fullscreen game asks for (at
 //   1024x768: emulated modes go up to the output's size).
@@ -26,6 +28,7 @@ const CASES = [
   { name: 'user_win', want: allOk, exe: 'user_win.exe', wayland: {} },
   { name: 'gdi', want: allOk, exe: 'gdi.exe', wayland: {} },
   { name: 'input', want: allOk, exe: 'input.exe', wayland: {} },
+  { name: 'capkeep', want: allOk, exe: 'capkeep.exe', wayland: {} },
   { name: 'desktop', want: allOk, exe: 'desktop.exe', args: ['640', '480'], wayland: {} },
   { name: 'display', want: allOk, exe: 'display.exe', wayland: { size: '1024x768' } },
 ];

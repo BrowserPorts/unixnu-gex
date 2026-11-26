@@ -357,6 +357,20 @@ pub fn compile_all(dir: &Path, sources: &[PathBuf]) -> Result<Vec<PathBuf>> {
     Ok(objs)
 }
 
+/// One argument of a response file, quoted: wasm-ld reads one GNU-style,
+/// splitting at whitespace outside quotes, so a path with a space (a unit
+/// cache under a directory whose name has one) would be two.
+fn rsp_arg(text: &mut String, arg: &str) {
+    text.push('"');
+    for c in arg.chars() {
+        if c == '"' || c == '\\' {
+            text.push('\\');
+        }
+        text.push(c);
+    }
+    text.push_str("\"\n");
+}
+
 /// Link objects into one module exporting `exports`.
 pub fn link(dir: &Path, objs: &[PathBuf], exports: &[String], out: &Path) -> Result<()> {
     link_with_table(dir, objs, exports, out, false)
@@ -369,8 +383,7 @@ pub fn link_image(dir: &Path, objs: &[PathBuf], out: &Path) -> Result<()> {
     let rsp = dir.join("link.rsp");
     let mut text = String::new();
     for o in objs {
-        text.push_str(&o.to_string_lossy());
-        text.push('\n');
+        rsp_arg(&mut text, &o.to_string_lossy());
     }
     std::fs::write(&rsp, text)?;
     let mut cmd = Command::new(wasm_ld());
@@ -400,8 +413,7 @@ pub fn link_with_table(dir: &Path, objs: &[PathBuf], exports: &[String], out: &P
         text.push('\n');
     }
     for o in objs {
-        text.push_str(&o.to_string_lossy());
-        text.push('\n');
+        rsp_arg(&mut text, &o.to_string_lossy());
     }
     std::fs::write(&rsp, text)?;
     let mut cmd = Command::new(wasm_ld());

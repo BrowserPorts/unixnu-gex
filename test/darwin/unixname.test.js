@@ -4,8 +4,8 @@
 // every one (the global kernel's follow Linux's), so the page answers each
 // call as gexc does: the program's output and status match gexc's, and the
 // run is strict, so anything the kernel reports as not done stops it.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
 
 export const meta = { hosts: ['browser'], arches: ['a64'], images: ['darwin-static'], timeout: 300 };
 

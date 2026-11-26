@@ -155,11 +155,11 @@ if (none.decoders !== 0) fail(`a site with no rest bundle: a Worker loaded ${non
 // 2. A rest bundle and the owner: three Workers read (at once) spans of
 // the three files, across frames; none loads a decoder, the owner one.
 const ctl = makeControl();
-const owner = new Worker(ownerSrc, { eval: true, workerData: { store, worker: gexUrl('page/src/lazy-cache-worker.js') } });
+const owner = new Worker(ownerSrc, { eval: true, workerData: { store, worker: gexUrl('runtime/src/host/lazy-cache-worker.js') } });
 const ready = await new Promise((r) => {
   owner.on('message', (m) => { if (m.kind === 'ready') r(m); });
   owner.once('error', (e) => r({ ok: false, why: String(e) }));
-  owner.postMessage({ ctl, memory, cache: 'gex-pieces', versions: {}, zstd: gexUrl('page/vendor/zstddec/zstddec-stream.mjs') });
+  owner.postMessage({ ctl, memory, cache: 'gex-pieces', versions: {}, zstd: gexUrl('runtime/vendor/zstddec/zstddec-stream.mjs') });
 });
 if (!ready.ok) fail(`owner not ready: ${ready.why}`);
 const spans = [[0, 0, files[0].length], [1, 1000, FRAME + 5000], [2, 0, files[2].length], [1, FRAME * 2, 4096]];

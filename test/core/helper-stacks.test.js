@@ -10,7 +10,7 @@
 // The test's own kernel calls run in a Worker too, on the slot a first guest
 // Worker would have.
 import { PageTty } from '../../hosts/browser/js/tty.mjs';
-import { openedFiles } from '../../page/src/fs-opened.js';
+import { openedFiles } from '../../runtime/src/host/fs-opened.js';
 import { HELPER_STACKS, helperStackTop } from '../../hosts/browser/js/lazy-fetch.mjs';
 
 export const meta = { hosts: ['browser'], arches: ['x86'], timeout: 240,

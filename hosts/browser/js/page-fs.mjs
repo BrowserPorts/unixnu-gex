@@ -1,8 +1,8 @@
 // The global kernel's `env.page_fs` (hosts/kernel/src/pagefs.rs): a call on a
-// directory the page serves (page/runtime `fs.mount`), handed to the page and
+// directory the page serves (runtime `fs.mount`), handed to the page and
 // waited for. The page's filesystem answers asynchronously and the guest's
 // call is synchronous, so the Worker making it fills a slot in a
-// SharedArrayBuffer, wakes the page and waits; the page (page/runtime/src/
+// SharedArrayBuffer, wakes the page and waits; the page (runtime/src/
 // mount.js) answers into the slot. Only the calling thread waits.
 //
 // `ctl`, an Int32Array on a SharedArrayBuffer of HEAD + SLOTS * SLOT bytes.

@@ -26,6 +26,7 @@ function narrate(text) {
 import { single } from './single.mjs';
 import { SP_CODE } from './mode.mjs';
 import { forkTransfer } from './fork-transfer.mjs';
+import { UsdClock } from './usd-clock.mjs';
 import { HELPER_STACK_COUNT, wasmMemory } from './lazy-fetch.mjs';
 import { logNamed, logOn, logQuiet, logRoutine } from './log.mjs';
 import { XC_STOP, xcBusy, xcGate, xcSleep } from './xcache.mjs';
@@ -77,12 +78,67 @@ function watchLibraries() {
   libChannel.onmessage = (ev) => seeLibrary(ev.data?.status);
 }
 /** A Worker's note (fetch-note.mjs): seen here, and said on the channel for
- *  the page (app.js `watchFetches`), which this side's own channel is not
+ *  the page, which this side's own channel is not
  *  handed back. */
-function relayNote(note) {
+function relayNote(note, pid) {
   seeLibrary(note?.status);
+  watchWait(note, pid);
   watchLibraries();
   try { libChannel?.postMessage(note); } catch {}
+}
+
+// A Worker's fetch or wait that has gone on for WAIT_SAY_MS (a noted fetch,
+// fetch-note.mjs: a lazy file's read, a unit's file, the fill), said once
+// with what it waits on and for which process, and again when it ends: a
+// process stuck in one shows up as that line, not as silence.
+const WAIT_SAY_MS = 10_000;
+const waits = new Map();
+const waitSums = new Map();
+let waitTimer = null;
+function watchWait(note, pid) {
+  if (!note?.id || (note.phase !== 'start' && note.phase !== 'end')) return;
+  if (note.phase === 'end') {
+    const w = waits.get(note.id);
+    waits.delete(note.id);
+    if (w?.said) inform(`[gex] pid ${w.pid}: done waiting on ${w.what} after ${((performance.now() - w.t0) / 1000).toFixed(1)} s`);
+    // Short waits that add up: a process making one blocking fetch after
+    // another (each image's unit file) on a slow link.
+    else if (w) {
+      const a = waitSums.get(w.pid) ?? { n: 0, ms: 0, from: w.t0 };
+      a.n++;
+      a.ms += performance.now() - w.t0;
+      a.last = w.what;
+      waitSums.set(w.pid, a);
+      if (a.ms >= WAIT_SAY_MS) {
+        inform(`[gex] pid ${w.pid}: ${a.n} fetches waited ${(a.ms / 1000).toFixed(1)} s in the last ${((performance.now() - a.from) / 1000).toFixed(0)} s (the last ${a.last})`);
+        waitSums.delete(w.pid);
+      }
+    }
+  } else waits.set(note.id, { what: note.what, owner: note.owner, pid: pid ?? '?', t0: performance.now(), said: false });
+  if ((waits.size || waitSums.size) && !waitTimer) {
+    waitTimer = setInterval(() => {
+      const now = performance.now();
+      // (a sum as old as a minute starts again)
+      for (const [pid, a] of waitSums) if (now - a.from > 60_000) waitSums.delete(pid);
+      for (const w of waits.values()) {
+        if (w.said || now - w.t0 < WAIT_SAY_MS) continue;
+        w.said = true;
+        inform(`[gex] pid ${w.pid}${w.owner ? ` (${w.owner})` : ''}: waiting ${((now - w.t0) / 1000).toFixed(0)} s on ${w.what}`);
+      }
+      if (!waits.size && !waitSums.size) { clearInterval(waitTimer); waitTimer = null; }
+    }, 2000);
+    waitTimer.unref?.();
+  }
+}
+
+/** A process or thread Worker's `error` or `messageerror` event, said
+ *  always (a critical error): before this a process Worker's was only a
+ *  rejected promise nobody may await, and the process looked hung. Where the
+ *  event says, the script and line it came from. */
+function workerFailed(pid, role, e) {
+  const what = e?.message ?? (e?.type === 'messageerror' ? 'a message that could not be read' : String(e));
+  const at = e?.filename ? ` (${e.filename}:${e.lineno ?? '?'}:${e.colno ?? '?'})` : '';
+  console.error(`[gex] pid ${pid} (${role} Worker): failed: ${what}${at}`);
 }
 
 function crashed(what) {
@@ -138,7 +194,8 @@ const SAVE_WAIT_MS = 60_000;
  *  those processes ran, not more. */
 const RECYCLE_COUNT = 4;
 /** How many spare thread Workers (`#startSpare`) the page keeps waiting at
- *  once; past it the oldest is let go. */
+ *  once; past it the oldest is let go. The shim keeps as many of a
+ *  process's slots for them (lib.rs `slots::SPARES`): raise both together. */
 const SPARE_MAX = 8;
 /** How long output waits for a write numbered before it (`#inOrder`). */
 const OUTPUT_GAP_MS = 200;
@@ -151,6 +208,12 @@ const SPARE_IDLE_MS = 5000;
  *  next threads (`park`), within SPARE_MAX. A program that starts short
  *  threads one after another needs one. */
 const PARKED_MAX = 2;
+/** How many spares one process keeps ready in a burst of thread starts
+ *  (`#topUpSpares`: two within SPARE_RATE_MS), within SPARE_MAX. Firefox starts ~120 threads in 18 s, in bursts; with one spare at a
+ *  time nearly every start found it taken and waited ~0.65 s for a fresh
+ *  Worker. */
+const SPARES_PER_PROC = 4;
+const SPARE_RATE_MS = 2000;
 /// How many threads a Worker has run (`park`), the last included.
 const THREADS_RUN = Symbol('gex.threadsRun');
 /** A test-only switch: whether a running fork child's
@@ -399,7 +462,7 @@ export class ProcessHost {
     }, OUTPUT_GAP_MS);
     this.#outputGap.unref?.();
   }
-  #onOutput; #onFork; #onExit; #readStdin; #onOther;
+  #onOutput; #onFork; #onExit; #readStdin; #onOther; #onNote;
   #workers = new Map();
   /** The wineserver's door, once published (`doorPublish`). */
   #door = null;
@@ -627,6 +690,9 @@ export class ProcessHost {
   #spareRec = new Map();
   /** How many threads each process with a spare record has started. */
   #threadsOf = new Map();
+  /** When each process with a spare record started its recent threads
+   *  (`#topUpSpares`), oldest first. */
+  #startsOf = new Map();
   // The global kernel's per-Worker stacks, as the first Worker reported them.
   // Each Worker's kernel instance has its own `__stack_pointer` global, all
   // pointing into the shared memory, so each needs its own slice or two Workers
@@ -695,6 +761,9 @@ export class ProcessHost {
     // is fetched and compiled, when not with fetch and WebAssembly.compile
     // here (a compressed one, decoded elsewhere).
     unitModule = null,
+    // `(note, pid)`: each note a process's Worker says (fetch-note.mjs: a
+    // fetch, an image installed), besides the page's channel.
+    onNote = null,
   }) {
     this.#other = other;
     this.#darwinSeed = darwinSeed;
@@ -712,6 +781,7 @@ export class ProcessHost {
     this.#readStdin = readStdin;
     this.#extra = extra;
     this.#onOther = onMessage;
+    this.#onNote = onNote;
   }
 
   /**
@@ -943,6 +1013,13 @@ export class ProcessHost {
     if (this.#restored) return { refused: SNAP_RESTORED, stopMs: 0 };
     const st = this.#stacks;
     if (!this.#kernel?.memory || !st?.snapWord) throw new Error('snapshot: no global kernel with a snapshot word');
+    // Spares hold no thread: let go rather than stopped (one waits for its
+    // thread in JS, not at the snapshot word). Their processes start new
+    // ones as their next threads come, restored ones too (`atThread`).
+    const spares = this.#spares.splice(0);
+    for (const sp of spares) this.#letSpareGo(sp);
+    const t00 = performance.now();
+    while (spares.some((sp) => this.#workers.has(sp.ref.key)) && performance.now() - t00 < timeout) await new Promise((r) => setTimeout(r, 10));
     if (this.#pending.size) return { refused: `still starting: ${[...this.#pending.keys()].join(' ')}`, stopMs: 0 };
     const want = [...this.#workers.keys()].map(String);
     const parked = new Map();
@@ -1143,6 +1220,9 @@ export class ProcessHost {
     // Including the warm ones nobody claimed.
     for (const w of this.#warm) w.terminate();
     this.#warm = [];
+    this.#usdClock?.terminate();
+    this.#usdClock = null;
+    this.#usdPids.clear();
     // A later `start` saves again (a Worker cut off inside a save left its count).
     if (this.#saveGate) this.#saveGate.fill(0);
   }
@@ -1166,11 +1246,13 @@ export class ProcessHost {
       w.addEventListener?.('message', onEvent);
       w.on?.('message', onMsg);
       const fail = (e) => {
+        workerFailed(pid, 'process', e);
         this.#workers.delete(pid);
         reject(e instanceof Error ? e : new Error(e?.message ?? String(e)));
       };
       w.addEventListener?.('error', fail);
       w.on?.('error', fail);
+      w.addEventListener?.('messageerror', fail);
       w[LISTENING] = { onEvent, onMsg, fail };
       this.#pending.set(pid, { ...msg, pid });
       const kind = msg.kind;
@@ -1292,6 +1374,7 @@ export class ProcessHost {
     w.removeEventListener?.('message', l.onEvent);
     w.off?.('message', l.onMsg);
     w.removeEventListener?.('error', l.fail);
+    w.removeEventListener?.('messageerror', l.fail);
     w.off?.('error', l.fail);
     w[REUSES] = n;
     this.#reused++;
@@ -1383,7 +1466,7 @@ export class ProcessHost {
   /**
    * A kernel stack slice for something that is not a guest Worker but calls
    * into the global kernel from a realm of its own (a page's drop Worker,
-   * `page/src/drop.js`). Undefined until the first Worker has said
+   * `runtime/src/host/drop.js`). Undefined until the first Worker has said
    * where the stacks are. Give it back with `releaseKernelStack(key)`.
    */
   takeKernelStack(key) {
@@ -1462,10 +1545,12 @@ export class ProcessHost {
     // A thread that throws, said out loud: a thread Worker had no `error`
     // listener, so an exception was swallowed and read as a hang.
     const threadFailed = (e) => {
+      workerFailed(pid, `thread ${ref.key}`, e);
       this.#onOutput(2, `gex: thread ${ref.key} failed: ${e?.message ?? String(e)}\n`, pid);
       crashed(`thread ${ref.key}: ${e?.message ?? String(e)}`);
     };
     w2.addEventListener?.('error', threadFailed);
+    w2.addEventListener?.('messageerror', threadFailed);
     w2.on?.('error', threadFailed);
     // Sent from the `ready` case, which finds it here.
     this.#pending.set(key, rec);
@@ -1502,6 +1587,22 @@ export class ProcessHost {
     this.#spareIdle(sp);
     if (logNamed('spare')) console.warn(`[spare] ${key}: started (${this.#spares.length} waiting on the page)`);
     while (this.#spares.length > SPARE_MAX) this.#letSpareGo(this.#spares.shift());
+  }
+
+  /** Process `proc` has started a thread, `before` before it: from its
+   *  second thread on it keeps a spare, and once it starts two within
+   *  SPARE_RATE_MS (a burst) SPARES_PER_PROC of them, all started at once,
+   *  since a spare takes longer to come up than a burst's next start; parked
+   *  Workers counted. */
+  #topUpSpares(proc, before) {
+    const now = Date.now();
+    const starts = (this.#startsOf.get(proc) ?? []).filter((t) => now - t < SPARE_RATE_MS);
+    starts.push(now);
+    this.#startsOf.set(proc, starts);
+    if (before < 1) return;
+    const want = starts.length >= 2 ? SPARES_PER_PROC : 1;
+    let have = this.#spares.filter((x) => x.proc === proc).length;
+    for (; have < want && this.#spareRec.has(proc); have++) this.#startSpare(proc);
   }
 
   /** Spare `sp` let go when SPARE_IDLE_MS passes without a thread for it. */
@@ -1558,8 +1659,10 @@ export class ProcessHost {
   /** Process `proc`'s spare for a thread of its program `gen`, taken; null
    *  with none (one caught up with an earlier program is let go). */
   #takeSpare(proc, gen) {
-    // A ready one first: a parked Worker, or a spare that has started.
-    let i = this.#spares.findIndex((x) => x.proc === proc && (x.parked || !this.#pending.has(x.ref.key)));
+    // A ready one first: a parked Worker, or a spare caught up and waiting
+    // (`spareWaiting`); then one still catching up; then one still starting.
+    let i = this.#spares.findIndex((x) => x.proc === proc && (x.parked || x.waiting));
+    if (i < 0) i = this.#spares.findIndex((x) => x.proc === proc && !this.#pending.has(x.ref.key));
     if (i < 0) i = this.#spares.findIndex((x) => x.proc === proc);
     if (i < 0) return null;
     const [sp] = this.#spares.splice(i, 1);
@@ -1584,6 +1687,7 @@ export class ProcessHost {
   #dropSpares(proc) {
     this.#spareRec.delete(proc);
     this.#threadsOf.delete(proc);
+    this.#startsOf.delete(proc);
     const mine = this.#spares.filter((x) => x.proc === proc);
     if (!mine.length) return;
     this.#spares = this.#spares.filter((x) => x.proc !== proc);
@@ -1604,6 +1708,7 @@ export class ProcessHost {
     if (left.length && left.every((k) => this.#spares.some((x) => x.ref.key === k))) {
       this.#spareRec.delete(proc);
       this.#threadsOf.delete(proc);
+      this.#startsOf.delete(proc);
       for (const sp of this.#spares.filter((x) => x.proc === proc)) {
         this.#workers.delete(sp.ref.key);
         this.#pending.delete(sp.ref.key);
@@ -1671,6 +1776,45 @@ export class ProcessHost {
       }
     }
     return best < 0 ? undefined : this.#recycled.splice(best, 1)[0];
+  }
+
+  /** The one Worker that advances every Wine process's KUSER_SHARED_DATA
+   *  clocks (usd-clock.mjs), made at the first process that asks
+   *  (`gex.usd_tick`); it holds no runtime. In the single-thread build, the
+   *  clock itself, driven the same way. */
+  #usdClock = null;
+  #usdPids = new Set();
+  #usdTick(pid, m) {
+    if (!(m.memory instanceof WebAssembly.Memory)) return;
+    const proc = Number(String(pid).split(':')[0]);
+    if (!this.#usdClock) {
+      // The single-thread build's processes are fibers of this realm: the
+      // clock is here, its timer stopped with the host (a fiber's end would
+      // leave it running, and Node's run with it).
+      this.#usdClock = SP_CODE && single.on ? UsdClock.inRealm() : this.#makeWorker();
+      if (this.#door) this.#usdClock.postMessage({ kind: 'usdClock', op: 'door', door: this.#door });
+    }
+    this.#usdPids.add(proc);
+    this.#usdClock.postMessage({ kind: 'usdClock', op: 'add', pid: proc, memory: m.memory, at: m.at, clock: m.clock });
+  }
+  /** The Worker `pid` ended (no other Worker carries its process on): the
+   *  process has ended when that was its own Worker, or a thread's with
+   *  none of the process's other threads left (its first thread had gone
+   *  before it). A thread that ends while its process runs leaves the page. */
+  #usdEnded(pid) {
+    const key = String(pid), proc = key.split(':')[0];
+    if (key !== proc) {
+      for (const k of this.#workers.keys()) {
+        const o = String(k);
+        if (o !== key && o.split(':')[0] === proc && !o.includes(':spare')) return;
+      }
+    }
+    this.#usdDrop(Number(proc));
+  }
+  /** Process proc ended: its page is no longer written (nor its memory held). */
+  #usdDrop(proc) {
+    if (!this.#usdPids.delete(proc)) return;
+    this.#usdClock?.postMessage({ kind: 'usdClock', op: 'drop', pid: proc });
   }
 
   #onMessage(pid, w, m, resolve, reject) {
@@ -1754,11 +1898,15 @@ export class ProcessHost {
         break;
       }
       case 'note':
-        relayNote(m.note);
+        relayNote(m.note, pid);
+        this.#onNote?.(m.note, pid);
         break;
       case 'loadOther':
         // An exec waits on the gate (`#otherGate`) for the answer.
         this.#loadOther().catch(() => {});
+        break;
+      case 'usdTick':
+        this.#usdTick(pid, m);
         break;
       case 'doorPublish': {
         // The wineserver's door: every Worker of
@@ -1766,6 +1914,7 @@ export class ProcessHost {
         this.#door = m.door;
         narrate(`[host] wineserver pid ${m.door?.pid} published its door`);
         for (const [, other] of this.#workers) other.postMessage({ kind: 'door', door: m.door });
+        this.#usdClock?.postMessage({ kind: 'usdClock', op: 'door', door: m.door });
         break;
       }
       case 'wantLibrary':
@@ -2039,14 +2188,20 @@ export class ProcessHost {
             this.#pending.set(key, held);
           }
           spare.ref.key = key;
-          if (logNamed('spare')) console.warn(`[spare] ${key}: on ${spare.key}, ${held ? 'still starting' : 'ready'}`);
-          const { tid, ctx, pc, procOpts } = m.thread;
-          spare.w.postMessage({ kind: 'spareGo', thread: { tid, ctx, pc, procOpts } });
+          if (logNamed('spare')) console.warn(`[spare] ${key}: on ${spare.key}, ${spare.parked || spare.waiting ? 'ready' : held ? 'still starting' : 'catching up'}`);
+          const { tid, ctx, pc, procOpts, cloneAt } = m.thread;
+          spare.w.postMessage({ kind: 'spareGo', thread: { tid, ctx, pc, procOpts, cloneAt } });
         } else {
           this.#threadWorker(pid, key, { kind: 'thread', ...m.thread, park: !this.#foreign(proc) && !!this.#extra?.shared && !(SP_CODE && single.on) });
         }
-        // The next spare, for a process that starts more than one thread.
-        if (before >= 1 && !this.#spares.some((x) => x.proc === proc)) this.#startSpare(proc);
+        // The next spares, for a process that starts more than one thread.
+        if (before !== undefined) this.#topUpSpares(proc, before);
+        break;
+      }
+      case 'spareWaiting': {
+        // A spare has caught up with its process and waits for a thread.
+        const sp = this.#spares.find((x) => x.w === w);
+        if (sp) sp.waiting = true;
         break;
       }
       case 'park': {
@@ -2060,11 +2215,42 @@ export class ProcessHost {
         // A program with many modules has started (`Gex#offerSpare`): a
         // Worker for its first thread, caught up with them meanwhile.
         const proc = String(pid).split(':')[0];
+        // Offered again at a thread's start (`atThread`) by each Worker
+        // that starts threads: the record the process has is kept.
+        if (m.spare.atThread && this.#spareRec.get(proc)?.execGen === m.spare.execGen) break;
         this.#dropSpares(proc);
         if (this.#foreign(proc) || !this.#extra?.shared || (SP_CODE && single.on)) break;
         this.#spareRec.set(proc, m.spare);
         this.#threadsOf.set(proc, 0);
-        this.#startSpare(proc);
+        // A program served with many modules: one for its first thread. At
+        // a thread's start, spares come as its next threads do.
+        if (!m.spare.atThread) this.#startSpare(proc);
+        break;
+      }
+      case 'fjitHelper': {
+        // The hot tier's helper for a process (`Gex#fjitHelperDue`): a
+        // Worker on its memory, started as a spare is but never given a
+        // thread (not among `#spares`), that translates and compiles what
+        // the process's safepoints find hot (`Gex#fjitServe`) until the
+        // process exits or runs another program. Where a spare could not be
+        // started, nor can it: the process then translates inline.
+        const proc = String(pid).split(':')[0];
+        if (this.#foreign(proc) || !this.#extra?.shared || (SP_CODE && single.on)) {
+          w.postMessage({ kind: 'fjitHelperNo' });
+          break;
+        }
+        const s = m.spare;
+        this.#threadWorker(proc, `${proc}:fjit${++this.#spareSeq}`, {
+          kind: 'thread',
+          spare: true,
+          fjitHelper: true,
+          memory: s.memory,
+          moduleStore: s.moduleStore,
+          compat: s.compat,
+          procOpts: s.procOpts,
+          execGen: s.execGen,
+          park: false,
+        });
         break;
       }
       case 'stdin': {
@@ -2102,6 +2288,7 @@ export class ProcessHost {
           const c = this.#carried.get(proc);
           this.#onExit(m, proc);
           forgetMemory(proc);
+          this.#usdDrop(proc);
           this.#release(pid, w);
           if (c?.resolve) {
             this.#carried.delete(proc);
@@ -2127,7 +2314,9 @@ export class ProcessHost {
           Atomics.notify(i32, a);
           this.#door = null;
           for (const [, other] of this.#workers) other.postMessage({ kind: 'door', door: null });
+          this.#usdClock?.postMessage({ kind: 'usdClock', op: 'door', door: null });
         }
+        this.#usdEnded(pid);
         // Kept for the page flavour's fork children only.
         if (m.recycle instanceof WebAssembly.Memory && !this.#foreign(pid)) this.#keepMemory(m.recycle);
         if (this.#extra?.exitTrace) {
@@ -2145,6 +2334,9 @@ export class ProcessHost {
           const t = m.traps;
           console.error(`[gex] pid ${pid}: traps straight on/through each step: run loop ${t.loop}/${t.loopFull}, call-outs ${t.callout}/${t.calloutFull}, native calls ${t.native}/${t.nativeFull}`);
         }
+        // `?systime=1`: where the process's syscall time went, by call (asked
+        // for, so said whatever the log level).
+        if (m.sysTimes) console.log(`[gex] pid ${pid}: syscalls ${m.sysTimes}${m.cmdline ? ` {${m.cmdline}}` : ''}`);
         // The page passes no `onExit`, so these per-process numbers were
         // computed and thrown away. Printed here, except under run-node
         // (`ownExitLines`), which prints its own.
@@ -2168,10 +2360,17 @@ export class ProcessHost {
               (m.slotsLeftK >= 0 ? `, ${m.slotsLeftK}k dispatch slots left` : '') +
               // What this process's memory grew to. One memory per process, so
               // this times the number live at once is what the tab costs.
-              (m.memoryMib !== undefined ? `, memory ${m.memoryMib} MiB` : '') +
+              // Its size, not what is used: a memory64 is 8 GiB from the start.
+              (m.memoryMib !== undefined ? `, memory size ${m.memoryMib} MiB` : '') +
+              // Its pages that hold anything: what the browser keeps resident.
+              (m.touchedMib !== undefined ? `, resident ${m.touchedMib} MiB` : '') +
+              // The memory grown beyond that, ahead of need (address space only).
+              (m.headroomMib ? `, headroom ${m.headroomMib} MiB` : '') +
               // And what that memory went on, which is the only way to tell a
-              // guest that really maps a lot from a runtime spending it.
-              (m.arena ? ` (maps ${m.arena[0]}, heap ${m.arena[1]}, stacks ${m.arena[2]})` : '') +
+              // guest that really maps a lot from a runtime spending it: the
+              // guest's accessible mappings (its VmRSS, in either memory
+              // flavour), the runtime's heap, Worker stacks.
+              (m.arena ? `, in use ${(m.guestMib ?? m.arena[0]) + m.arena[1] + m.arena[2]} MiB (maps ${m.guestMib ?? m.arena[0]}, heap ${m.arena[1]}, stacks ${m.arena[2]})` : '') +
               // Dense modules this Worker left for a miss, and those a miss took.
               (m.fill?.denseLeft ? `, dense modules ${m.fill.denseWanted} wanted of ${m.fill.denseLeft} left (${m.fill.denseAsks} asks, ${m.fill.denseFillMs.toFixed(1)} ms, worst ${m.fill.denseFillWorst.toFixed(2)} ms)` : '') +
               (m.fill ? `, tables blocks ${m.fill.blocksLen} ftab ${m.fill.ftabLen}` : '') +
@@ -2251,7 +2450,9 @@ export class ProcessHost {
         }
         // Before the release: releasing terminates the Worker.
         this.#onExit(m, pid);
-        forgetMemory(pid);
+        // A thread's Worker ending (a thread's end, a spare let go) is not
+        // its process's: the process's memory stays where a harness reads it.
+        if (!String(pid).includes(':')) forgetMemory(pid);
         this.#release(pid, w, !!m.giveBack);
         resolve(m.status);
         break;

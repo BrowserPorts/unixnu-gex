@@ -128,6 +128,8 @@ pub(crate) struct WinePe {
     data_size: u64,
     /// Each DLL's table slots and data (pelink's `gexw.dllslots`).
     dll_slots: Arc<Vec<DllRange>>,
+    /// Its slots' wasm types, when it has class adapters ([`bind_classes`]).
+    slot_types: Option<Arc<(Vec<u32>, Vec<Option<String>>)>>,
     /// Each DLL's data as it was before its first load ran anything
     /// ([`DataSnap`]), to start it afresh when it is loaded again; and the
     /// DLLs whose snapshot the next [`apply_pending`] takes.
@@ -325,7 +327,48 @@ fn apply_pending_one(wp: &Arc<WinePe>, shared: &Arc<Mutex<JitShared>>, memory: &
         if let Err(e) = bind_entry_thunks(wp, shared, memory) {
             eprintln!("gex-pe: Wine's PE module {}: entry thunks: {e:#}", wp.file.display());
         }
+        if let Err(e) = bind_classes(wp, shared, memory) {
+            eprintln!("gex-pe: Wine's PE module {}: class adapters: {e:#}", wp.file.display());
+        }
     }
+}
+
+/// The ICALL pass's class adapters (its wasm64 default): guest
+/// code calls any of the module's functions, its table index as an address,
+/// through the adapter of its class -- its wasm type and the facts its type
+/// does not say (`gex_kernel::ftab::facts`). `__gexw_adapters` bounds the
+/// directory, `{ adapter, witness, facts }` records (a witness is a function
+/// of the class's wasm type), and `__gexw_facts` the `{ function, facts }`
+/// records of functions whose facts are not 0; pointer-sized words,
+/// relocated with the data. Nothing is bound per function: a lookup of the
+/// address finds the adapter (`FuncMap::get`).
+fn bind_classes(wp: &WinePe, shared: &Arc<Mutex<JitShared>>, memory: &gex_mem::GuestMemory) -> Result<()> {
+    let (Some(types), Some(&dir)) = (wp.slot_types.as_ref(), wp.data_exports.get("__gexw_adapters")) else { return Ok(()) };
+    let w = if wp.ptr64 { 8 } else { 4 };
+    let base = shared.lock().unwrap_or_else(|e| e.into_inner()).ftab.map.install(wp.install).base;
+    // `n`-word records between the bounds at `off` in the module's data
+    let records = |off: u32, n: u64| -> Result<Vec<Vec<u32>>> {
+        let at = wp.data + off as u64;
+        let (start, stop) = (memory_u32(memory, at)? as u64, memory_u32(memory, at + w)? as u64);
+        let mut out = Vec::new();
+        let mut a = start;
+        while start != 0 && a + n * w <= stop {
+            out.push((0..n).map(|k| memory_u32(memory, a + k * w)).collect::<Result<Vec<u32>>>()?);
+            a += n * w;
+        }
+        Ok(out)
+    };
+    let slot = |f: u32| f.checked_sub(base).filter(|_| f != 0);
+    let adapters: Vec<(u32, u32, u32)> = records(dir, 3)?.into_iter().filter_map(|r| Some((slot(r[0])?, slot(r[1])?, r[2]))).collect();
+    let facts: Vec<(u32, u32)> = match wp.data_exports.get("__gexw_facts") {
+        Some(&off) => records(off, 2)?.into_iter().filter_map(|r| Some((slot(r[0])?, r[1]))).collect(),
+        None => Vec::new(),
+    };
+    let n = shared.lock().unwrap_or_else(|e| e.into_inner()).ftab.map.set_native(wp.install, &types.0, &types.1, &facts, &adapters);
+    if std::env::var_os("GEX_WASM_TRACE").is_some() {
+        eprintln!("gex: wine PE: {n} class adapters, {} functions with facts", facts.len());
+    }
+    Ok(())
 }
 
 /// The ICALL pass's entry thunks (toolchain/sysroot/icall): native functions
@@ -432,6 +475,12 @@ struct ParsedModule {
     /// With modules of their own (pelink's `gexw.modules`): each DLL's module file.
     modules: std::collections::HashMap<String, String>,
     dll_slots: Arc<Vec<DllRange>>,
+    /// Its slots' wasm types (`gex_dylink::slot_types`), when it has class
+    /// adapters (`__gexw_adapters`).
+    slot_types: Option<Arc<(Vec<u32>, Vec<Option<String>>)>>,
+    /// Its weak undefined names (`dylink.0` import info): a data one no
+    /// module defines binds to address 0, as a weak symbol does.
+    weak: gex_dylink::HashSet<String>,
     module: wasmtime::Module,
 }
 
@@ -498,15 +547,19 @@ fn parsed_module(file: &std::path::Path, engine: &wasmtime::Engine, t0: std::tim
             t2.elapsed().as_secs_f64()
         );
     }
+    let data_exports = exported_offsets(&wasm)?;
+    let slot_types = if data_exports.contains_key("__gexw_adapters") { Some(Arc::new(gex_dylink::slot_types(&wasm)?)) } else { None };
     let pm = Arc::new(ParsedModule {
         size: size as u32,
         align: align as u32,
         n_names: names.len() as u32,
         slots,
         any_dll,
-        data_exports: exported_offsets(&wasm)?,
+        data_exports,
         modules,
         dll_slots: Arc::new(dll_slots(&wasm)),
+        slot_types,
+        weak: gex_dylink::weak_import_names(&wasm)?,
         module,
     });
     MEMO.lock().unwrap_or_else(|e| e.into_inner()).push((id, engine.clone(), Arc::clone(&pm)));
@@ -848,6 +901,13 @@ fn install_module(
     memory: &gex_mem::GuestMemory,
 ) -> Result<Arc<WinePe>> {
     let t0 = std::time::Instant::now();
+    // whether it has a memory64 build: the outgrow record's (a program's
+    // own module, built for a wasm32 memory only, cannot move)
+    if !gex_abi::mem64() {
+        let m64 = file.file_name().is_some_and(|n| file.with_file_name(format!("{}.m64", n.to_string_lossy())).is_file());
+        let pid = state.with_kernel(|k| k.pid);
+        gex_kernel::syscalls::outgrow_module(pid, &file.to_string_lossy(), m64);
+    }
     let alt = module_alt(is64);
     if alt {
         crate::ensure_alt_dir_in(state, shared)?;
@@ -879,8 +939,10 @@ fn install_module(
     // first (no code of theirs runs until Wine loads their DLLs): its
     // imports then bind to their functions directly, and a function
     // address is the defining module's own. Only a cycle's far side is
-    // left to `Late` slots.
-    if core.is_some() {
+    // left to `Late` slots. (A program installed without a core beside
+    // it, its own DLLs beside it: theirs too, a GOT.mem import of their
+    // data has no `Late` binding.)
+    if core.is_some() || file.file_name().is_some_and(|n| n != CORE_MODULE) {
         thread_local! {
             static BUSY: std::cell::RefCell<Vec<std::path::PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
         }
@@ -891,7 +953,7 @@ fn install_module(
         let delayed: std::collections::HashSet<&str> =
             module.exports().filter_map(|e| e.name().strip_prefix("gexw-delay!")).collect();
         for imp in module.imports() {
-            if let (true, Some((dll, _))) = (matches!(imp.module(), "env" | "GOT.func"), imp.name().split_once('!')) {
+            if let (true, Some((dll, _))) = (matches!(imp.module(), "env" | "GOT.func" | "GOT.mem"), imp.name().split_once('!')) {
                 if delayed.contains(dll) {
                     continue;
                 }
@@ -948,6 +1010,20 @@ fn install_module(
         let b = if m == "GOT.func" {
             gots.push((imports.len(), name.clone()));
             crate::dylink::NBind::Shim
+        } else if m == "GOT.mem" && name.contains('!') {
+            // another module's data export (a program's DLL's): its address,
+            // that module's data plus the export's offset
+            let s = shared.lock().unwrap_or_else(|e| e.into_inner());
+            let a = s
+                .wine_pe
+                .iter()
+                .chain(s.wine_pe_split.iter())
+                .filter(|wp| wp.ptr64 == is64)
+                .find_map(|wp| wp.data_exports.get(&name).map(|&off| wp.data + off as u64));
+            match a {
+                Some(a) => crate::dylink::NBind::Addr(a),
+                None => bail!("{}: GOT.mem::{name}: no installed module exports it", file.display()),
+            }
         } else if m == "env" && core.is_some() && have_core.contains(&name) {
             crate::dylink::NBind::Export { module: core.as_ref().unwrap().module, name: name.clone() }
         } else if m == "env" && matches!(imp.ty(), wasmtime::ExternType::Func(_)) && !gex_dylink::shim_import(&m, &name) {
@@ -969,6 +1045,18 @@ fn install_module(
                     crate::dylink::NBind::LateOwn(len - 1)
                 }
             }
+        } else if m == "GOT.mem" && pm.weak.contains(&name) {
+            // weak undefined data, `extern int x __attribute__((weak))`: an
+            // installed module's export of it if one has it, else null, as a
+            // weak symbol nothing defines is (pelink refuses a strong one)
+            let s = shared.lock().unwrap_or_else(|e| e.into_inner());
+            let a = s
+                .wine_pe
+                .iter()
+                .chain(s.wine_pe_split.iter())
+                .filter(|wp| wp.ptr64 == is64)
+                .find_map(|wp| wp.data_exports.get(&name).map(|&off| wp.data + off as u64));
+            crate::dylink::NBind::Addr(a.unwrap_or(0))
         } else {
             crate::dylink::NBind::Shim
         };
@@ -995,6 +1083,19 @@ fn install_module(
             let b = match (own, theirs, s.wine_pe_canon.get(&(is64, name.clone())).copied()) {
                 (Some(k), _, _) => crate::dylink::NBind::OwnSlot(k),
                 (None, Some(v), _) => crate::dylink::NBind::Global(v),
+                // a weak name nothing defines, in a module other than the
+                // core (a program's or DLL's: `if (&f)`, C++'s thread_local
+                // init functions): null, as on the page. The core's weak C
+                // mains stay late slots, which the program fills.
+                (None, None, None)
+                    if pm.weak.contains(&name)
+                        && !name.contains('!')
+                        && !mine.contains(&name)
+                        && others.get(&name).is_none()
+                        && file.file_name().is_some_and(|n| n != CORE_MODULE) =>
+                {
+                    crate::dylink::NBind::Global(0)
+                }
                 (None, None, c) => match c {
                 Some((owner, off)) => {
                     let base = s.ftab.map.installs().iter().find(|x| x.module == owner).map(|x| x.base);
@@ -1081,6 +1182,7 @@ fn install_module(
         mapped: Default::default(),
         data_size: size as u64,
         dll_slots: Arc::clone(&pm.dll_slots),
+        slot_types: pm.slot_types.clone(),
         snaps: Default::default(),
         snap_todo: Default::default(),
     });

@@ -1,4 +1,4 @@
-// site/build-eject-page.sh carries everything page/public/gex has that an
+// site/build-eject-page.sh carries everything runtime/files/out/gex has that an
 // ejected page loads: the x86 shared shim, kernel and seed, and the X server
 // (gex/xwayland/, and gex/xwayland-st/ when built). Without the X server a
 // site's X11 program stopped at "x11 not available". A .wasm is compared with
@@ -14,9 +14,9 @@ export const meta = { hosts: ['node'], arches: ['x86'], timeout: 600 };
 const ROOT = join(import.meta.dirname, '..', '..');
 
 export default async function (t) {
-  const pub = join(ROOT, 'page/public/gex');
-  if (!existsSync(join(pub, 'gex_browser.x86.shared.wasm'))) t.skip('no page/public/gex x86 shim (make assets)');
-  if (!existsSync(join(ROOT, 'page/node_modules/.bin/vite'))) t.skip('no page/node_modules (npm ci in page/)');
+  const pub = join(ROOT, 'runtime/files/out/gex');
+  if (!existsSync(join(pub, 'gex_browser.x86.shared.wasm'))) t.skip('no runtime/files/out/gex x86 shim (make assets)');
+  if (!existsSync(join(ROOT, 'runtime/node_modules/.bin/vite'))) t.skip('no runtime/node_modules (npm ci in runtime/)');
   const keep = !!process.env.GEX_KEEP_NAMES;
   if (!keep && spawnSync('wasm-tools', ['--version']).status !== 0) t.skip('no wasm-tools (cargo install wasm-tools)');
   const out = join(t.workDir, 'eject-page-files');
@@ -44,7 +44,7 @@ export default async function (t) {
       n++;
     }
   }
-  if (!existsSync(join(pub, 'xwayland'))) t.say('no page/public/gex/xwayland here: the X server is not checked (make page)');
+  if (!existsSync(join(pub, 'xwayland'))) t.say('no runtime/files/out/gex/xwayland here: the X server is not checked (make xwayland)');
   t.say(`${n} X server files checked`);
   rmSync(out, { recursive: true, force: true });
 }

@@ -1,4 +1,4 @@
-// The page's audio player (page/src/audio.js's worklet) starting a stream.
+// The page's audio player (runtime/src/host/audio.js's worklet) starting a stream.
 //
 //   node test/fixtures/page/audio-worklet.mjs
 //
@@ -16,7 +16,7 @@ const gexUrl = (p) => gexPathToFileURL(gexJoin(GEX_ROOT, p)).href;
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
-const src = readFileSync(new URL(gexUrl('page/src/audio.js')), 'utf8');
+const src = readFileSync(new URL(gexUrl('runtime/src/host/audio.js')), 'utf8');
 const m = src.match(/const WORKLET = `([\s\S]*?)`;\n/);
 assert.ok(m, 'audio.js has its WORKLET');
 // The template literal's text, as the page hands it to addModule.

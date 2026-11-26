@@ -1,9 +1,9 @@
-// D3D presents paced in the compositor (page/src/d3d-pacing.js): a client's
+// D3D presents paced in the compositor (runtime/src/host/d3d-pacing.js): a client's
 // reply is held while it has as many frames presented and unshown as its swap
 // interval, released when the page shows them or after the cap, and never
 // held at interval 0. The interval comes from Mesa's environment
 // (GEXGL_SWAP_INTERVAL in `?mesaenv=`).
-import { D3dPacer, d3dSwapInterval } from '../../page/src/d3d-pacing.js';
+import { D3dPacer, d3dSwapInterval } from '../../runtime/src/host/d3d-pacing.js';
 
 export const meta = { hosts: ['node'], arches: ['a64'], timeout: 60 };
 

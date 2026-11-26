@@ -7,8 +7,8 @@
 // calls run, and the second waits for it, as it waits for the table's lock
 // natively; the first then reads its own nice value. Strict: a report
 // would stop either.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
 
 export const meta = { hosts: ['browser'], arches: ['a64'], images: ['darwin-static'], timeout: 300 };
 

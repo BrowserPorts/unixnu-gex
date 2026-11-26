@@ -1,7 +1,7 @@
 // The page at either end of a program's unix stream socket: sys.listen and
 // sys.connect, with fixtures/probe/rt-unix.c the program.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
 
 export const meta = { hosts: ['browser', 'node'], images: ['busybox'], timeout: 300 };
 

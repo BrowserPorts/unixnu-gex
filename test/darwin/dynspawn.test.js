@@ -9,8 +9,8 @@
 // gexc's, its cache its parent's, and its time among the reaped children's
 // (getrusage RUSAGE_CHILDREN): the child's threads' Workers' busy time (a
 // Worker has no processor clock), which the kernel says stands in.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
 import { ROOT_OWNED, tarWithXattrs } from '../fixtures/xattr-tar.js';
 
 export const meta = { hosts: ['browser'], arches: ['a64'], images: ['darwin-root', 'darwin-dyn'], timeout: 900 };

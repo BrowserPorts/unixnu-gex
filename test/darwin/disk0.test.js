@@ -11,8 +11,8 @@
 // container (the global kernel's) holds Preboot read-write already and
 // whose grafts' trust caches are loaded, so its boot neither mounts nor
 // loads again, and it reports nothing the first did not.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
 
 /** What gexc says of its own standard streams, its host's (darwin/hoststd.rs):
  *  not the page's, whose streams are its pipes. */

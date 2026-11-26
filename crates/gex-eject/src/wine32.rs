@@ -86,8 +86,9 @@ pub fn is_project(dir: &Path) -> bool {
 }
 
 pub struct Wine32Options {
-    /// The gex checkout's `page/` directory: the page's source, and the
-    /// built runtime under `public/gex/` (`../site/build-eject-page.sh` beside it).
+    /// The gex checkout's `runtime/` directory: the app library's source
+    /// (`src/host/app.js`), and the built runtime under `files/out/gex/`
+    /// (`../site/build-eject-page.sh` beside it).
     pub web_src: PathBuf,
     /// Where the units the recording names are (a unit cache: KEY/c.wasm).
     pub unit_cache: Vec<PathBuf>,
@@ -318,12 +319,12 @@ pub fn eject(record: &Path, out: &Path, runtime: &Path, o: &Wine32Options) -> Re
         add_trampolines(&mut units, &o.unit_cache)?;
     }
     for f in runtime_wasm(wine64) {
-        if !o.web_src.join("public/gex").join(f).is_file() {
-            bail!("{}: no public/gex/{f}: build the shim and kernel first (hosts/browser/build.sh, hosts/kernel/build.sh)", o.web_src.display());
+        if !o.web_src.join("files/out/gex").join(f).is_file() {
+            bail!("{}: no files/out/gex/{f}: build the shim and kernel first (hosts/browser/build.sh, hosts/kernel/build.sh)", o.web_src.display());
         }
     }
     if !o.web_src.join("../site/build-eject-page.sh").is_file() {
-        bail!("{} is not gex's page/ directory (no ../site/build-eject-page.sh)", o.web_src.display());
+        bail!("{} is not gex's runtime/ directory (no ../site/build-eject-page.sh)", o.web_src.display());
     }
     crate::features::check(&o.features_off)?;
 
@@ -376,7 +377,7 @@ pub fn eject(record: &Path, out: &Path, runtime: &Path, o: &Wine32Options) -> Re
     // The runtime: the browser shim, kernel and seed this page runs, and the
     // gexc that builds it.
     for f in runtime_wasm(wine64) {
-        link_or_copy(&o.web_src.join("public/gex").join(f), &out.join("runtime/web/gex").join(f))?;
+        link_or_copy(&o.web_src.join("files/out/gex").join(f), &out.join("runtime/web/gex").join(f))?;
     }
     link_or_copy(runtime, &out.join("runtime/gexc"))?;
 
@@ -1225,10 +1226,17 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
     }
     std::fs::create_dir_all(&web)?;
 
-    // The page, built with the features kept: a feature off is code the
-    // bundler leaves out (GEX_FEATURES_OFF, vite's define) or files not
-    // shipped.
-    let src = PathBuf::from(json::str_field(&v, "page_source", what)?);
+    // The page, built with the features kept: a feature off is start()'s
+    // choice made when it is built (GEX_FEATURES_OFF, the bundler's define)
+    // or files not shipped.
+    let mut src = PathBuf::from(json::str_field(&v, "page_source", what)?);
+    // A project ejected before gex's page/ became runtime/ names <gex>/page:
+    // the same checkout's runtime/ is its source now.
+    if !src.join("../site/build-eject-page.sh").is_file() {
+        if let Some(gex) = src.parent().filter(|g| g.join("site/build-eject-page.sh").is_file()) {
+            src = gex.join("runtime");
+        }
+    }
     let page = web.join("page");
     let st = std::process::Command::new("sh")
         .arg(src.join("../site/build-eject-page.sh"))
@@ -1263,15 +1271,9 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
             }
         }
     }
-    if !has("compositor") {
-        // What the define should have taken out: say so if it did not.
-        for e in std::fs::read_dir(page.join("assets"))? {
-            let n = e?.file_name().to_string_lossy().to_string();
-            if n.starts_with("compositor-") || n.starts_with("gpu-device-") {
-                bail!("the page still has {n} with \"compositor\": false (an import the define does not guard)");
-            }
-        }
-    }
+    // `"compositor": false` leaves the library's code as it is (no bundle is
+    // built without the compositor now): the launch file's features make
+    // start() draw each window into the page instead.
     if !page.join("app.mjs").is_file() {
         bail!("{}/../site/build-eject-page.sh made no app.mjs (an older gex checkout? the page is the app library now)", src.display());
     }
@@ -1505,7 +1507,7 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
     };
     // Split units: the page fetches their cold clusters (gex.mjs `gex.cold`).
     let mut params = params;
-    // Translation off: nothing is translated at run time (app.js `aot`).
+    // Translation off: nothing is translated at run time (`aot`).
     params.retain(|(k, _)| k != "aot");
     if aot {
         params.push(("aot".to_string(), s("1")));

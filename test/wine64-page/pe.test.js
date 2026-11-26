@@ -7,7 +7,8 @@
 // gex's memory outside every image (hostdata), and gexcc-win programs'
 // own native modules (GEX_TEST_GEXCC_WIN; skipped without it), one with
 // more data than the PE data window holds (bigdata), one installed under
-// other case than its link names its module (modcase); and the
+// other case than its link names its module (modcase), one linked
+// against its own DLL's import library, the DLL's data shared (owndll); and the
 // console set, with the audio player on (compact.test.js runs it without).
 import { allOk, asio, CONSOLE, each, gexccWin } from '../wine64/cases.mjs';
 import { wine64 } from '../lib/winerun.mjs';
@@ -25,7 +26,7 @@ export default async function (t) {
   await asio(t, w, o, pre);
   await each(w, ['fromaddr', 'hostdata', 'stalebind', 'dllreload'].map((n) => ({ name: n, want: allOk, exe: `${n}.exe` })), o, pre);
   try {
-    await gexccWin(t, w, o, pre, ['cxxcatch', 'xthr', 'xhoist', 'cxxthr', 'dllimps', 'lresult', 'cbfault', 'ptval', 'selfaddr', 'bigdata', 'modcase']);
+    await gexccWin(t, w, o, pre, ['cxxcatch', 'xthr', 'xhoist', 'lazylate', 'cxxthr', 'dllimps', 'lresult', 'cbfault', 'ptval', 'selfaddr', 'exitshape', 'bigdata', 'modcase', 'fontset', 'glyphs', 'owndll', 'vtdecl', 'imagebase']);
   } catch (e) {
     if (!(e instanceof Skip)) throw e;
     t.say(`${pre}gexcc-win: ${e.message}`);

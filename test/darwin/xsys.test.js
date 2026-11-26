@@ -6,8 +6,8 @@
 // instance of its own; the persona registry and the jetsam table are the
 // global kernel's, which each takes whole for as long as natively their
 // lock is held (gexc's run of xsys does both in one process: "xsys ok").
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
 
 export const meta = { hosts: ['browser'], arches: ['a64'], images: ['darwin-static'], timeout: 300 };
 

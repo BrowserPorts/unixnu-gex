@@ -74,3 +74,8 @@ template <typename T, typename U> bool operator!=(const ComPtr<T> &a, const ComP
 template <typename T> bool operator!=(const ComPtr<T> &a, std::nullptr_t) noexcept { return a.Get() != nullptr; }
 
 } } /* namespace Microsoft::WRL */
+
+template <typename C> void **IID_PPV_ARGS_Helper(::Microsoft::WRL::ComPtrRef<C> p) noexcept
+{
+    return static_cast<void **>(p);
+}

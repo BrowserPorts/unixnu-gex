@@ -348,3 +348,21 @@ fn skip_locked(mut at: u64, len: u64) -> u64 {
         }
     }
 }
+
+/// The regions gex's own memory holds (everything but the guest's: its
+/// fixed regions, the shim's data and heap, Workers' stacks and
+/// thread-local blocks, foreign growth), for the exit line's resident count.
+/// `None` when the table overflowed, and so cannot say.
+pub fn runtime_regions() -> Option<Vec<(u64, u64)>> {
+    let _h = Held::take();
+    if T.full_said.load(Ordering::Relaxed) != 0 {
+        return None;
+    }
+    let n = T.len.load(Ordering::Relaxed) as usize;
+    Some(
+        (0..n)
+            .filter(|&i| !Kind::from(T.tag[i].load(Ordering::Relaxed) >> 32).guests())
+            .map(|i| (T.start[i].load(Ordering::Relaxed), T.end[i].load(Ordering::Relaxed)))
+            .collect(),
+    )
+}

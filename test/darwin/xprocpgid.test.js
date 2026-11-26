@@ -11,8 +11,8 @@
 // static image), nor can EACCES for a child that has exec'd be had here:
 // the share op's unit test covers both. The run is strict, so a report
 // would stop it.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
 
 export const meta = { hosts: ['browser'], arches: ['a64'], images: ['darwin-static'], timeout: 300 };
 

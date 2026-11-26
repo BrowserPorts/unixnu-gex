@@ -12,14 +12,14 @@
 # having no wasm32-linux-musl directory of its own).
 #
 #   test/fixtures/gexcc/dl/forklink.sh DIR   (gexcc and node on PATH; GEX_ROOT: a gex
-#                                 checkout with page/public/gex built; DIR: where gex
+#                                 checkout with runtime/files/out/gex built; DIR: where gex
 #                                 can see, not /dev/shm)
 set -u
 command -v gexcc > /dev/null || { echo "skip forklink: gexcc not on PATH (toolchain/gexcc/install.sh)"; exit 0; }
 ROOT=${GEX_ROOT:?set GEX_ROOT to a gex checkout}
 ARCH=${GEX_ARCH:-x86}
 case $ARCH in x86) INFIX=.x86 ;; *) INFIX= ;; esac
-SEED=$ROOT/page/public/gex/seed$INFIX.shared.wasm
+SEED=$ROOT/runtime/files/out/gex/seed$INFIX.shared.wasm
 [ -f "$SEED" ] || { echo "skip forklink: no $SEED"; exit 0; }
 W=$(mktemp -d "${1:?DIR}/forklink.XXXXXX")
 trap 'rm -rf "$W"' EXIT

@@ -213,7 +213,7 @@ pub fn cmd_units(args: &[String]) -> Result<()> {
                 }
             }
             // `--preload PREFIX`: OUT/preload.json, the page's list of what to
-            // fetch and compile while it loads (app.js `preloadUnits`), every
+            // fetch and compile while it loads, every
             // unit and provider under PREFIX, the URL the page serves OUT at
             // (its `cgenurl`): no unit is a synchronous fetch at first map.
             // With a selection, only its units and the whole ones: a unit of

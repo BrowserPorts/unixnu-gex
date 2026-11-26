@@ -1,4 +1,4 @@
-// The page's time zone as a POSIX TZ string (page/src/posix-tz.js): for each
+// The page's time zone as a POSIX TZ string (runtime/src/host/posix-tz.js): for each
 // zone, the string's offset (evaluated as musl does a TZ rule) is Intl's at
 // every hour of this year. Zones: no daylight time, both hemispheres, half
 // and quarter hours, a 30-minute daylight shift, rules that changed.
@@ -18,7 +18,7 @@ import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 // gex: the checkout these fixtures are in, or GEX_ROOT.
 const GEX_ROOT = process.env.GEX_ROOT || join(import.meta.dirname, '..', '..', '..');
-const { posixTz, offsetAt, transitions } = await import(pathToFileURL(join(GEX_ROOT, 'page/src/posix-tz.js')).href);
+const { posixTz, offsetAt, transitions } = await import(pathToFileURL(join(GEX_ROOT, 'runtime/src/host/posix-tz.js')).href);
 
 const ZONES = [
   'UTC', 'Etc/GMT+5', 'Asia/Tokyo', 'Asia/Kolkata', 'Asia/Kathmandu', 'Asia/Shanghai', 'America/Phoenix',

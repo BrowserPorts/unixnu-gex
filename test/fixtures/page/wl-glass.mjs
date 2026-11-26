@@ -19,7 +19,7 @@ import { join as gexJoin } from 'node:path';
 const GEX_ROOT = process.env.GEX_ROOT || gexJoin(import.meta.dirname, '..', '..', '..');
 const gexUrl = (p) => gexPathToFileURL(gexJoin(GEX_ROOT, p)).href;
 const wl = await import(gexUrl('hosts/browser/js/wl-bridge.mjs'));
-const { attachDwmIcon } = await import(gexUrl('page/src/dwm-frame.js'));
+const { attachDwmIcon } = await import(gexUrl('runtime/src/host/dwm-frame.js'));
 const {
   makeWlChannel, WlProxy, readScene, mirrorState, mirrorTake, mirrorChannel, mirrorApply,
   REC, R_CLIENT, R_SURFACE, R_ROLE, R_WIDTH, R_HEIGHT, R_ADDR, R_STRIDE, R_SERIAL, R_DAMAGE_W, R_DAMAGE_H,

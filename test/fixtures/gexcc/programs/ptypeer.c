@@ -34,7 +34,9 @@ int main(void) {
     printf("an unknown flag: %s\n", bad >= 0 ? "opened" : err());
     printf("slave is the master's: %s\n", write(slave, "x\n", 2) == 2 ? "written" : err());
     char buf[8] = {0};
+    /* How many bytes one read returns depends on when the line discipline
+       has passed them on (Linux's flush is asynchronous); the first is 'x'. */
     int n = read(master, buf, sizeof buf - 1);
-    printf("master read %d bytes\n", n);
+    printf("master read: %s\n", n > 0 && buf[0] == 'x' ? "x" : err());
     return 0;
 }

@@ -6,7 +6,7 @@
 import { noteFetch } from './fetch-note.mjs';
 import { logNamed } from './log.mjs';
 import { lateZstd } from './zstd-late.mjs';
-import { CHUNK, OWNER_FAILED, cachedRead, lazyCacheOn, FailedFrames, retrySync } from './lazy-cache.mjs';
+import { CHUNK, OWNER_FAILED, cachedRead, lazyCacheOn, lazyOwnerOnly, FailedFrames, retrySync } from './lazy-cache.mjs';
 
 // The background fill (app.js `fill`): lazy files the page downloads, packed
 // one after another in one stream, while the guest runs. `buf` (a
@@ -20,14 +20,21 @@ export function setFill(f) {
   if (!f?.buf || !f?.at || !f?.files) return;
   fill = { buf: new Uint8Array(f.buf), at: f.at, files: new Map(f.files.map(([path, off, size]) => [path, [off, size]])) };
 }
-// Wait until the fill holds `end` bytes; false if it failed or stalled.
-function fillHas(end) {
-  for (;;) {
-    const at = Atomics.load(fill.at, 0);
-    if (at < 0) return false;
-    if (at >= end) return true;
-    // Workers may block; the page's thread never reads lazy files.
-    if (Atomics.wait(fill.at, 0, at, 10000) === 'timed-out' && Atomics.load(fill.at, 0) === at) return false;
+// Wait until the fill holds `end` bytes; false if it failed or stalled. A
+// wait is noted (`what`, the file it is for), as a fetch is.
+function fillHas(end, what) {
+  let done = null;
+  try {
+    for (;;) {
+      const at = Atomics.load(fill.at, 0);
+      if (at < 0) return false;
+      if (at >= end) return true;
+      done ??= noteFetch(`fill:${what}`, end - at);
+      // Workers may block; the page's thread never reads lazy files.
+      if (Atomics.wait(fill.at, 0, at, 10000) === 'timed-out' && Atomics.load(fill.at, 0) === at) return false;
+    }
+  } finally {
+    done?.();
   }
 }
 /** A fill entry that is not a lazy file (`unit:KEY/c.wasm`, a late unit's
@@ -35,7 +42,7 @@ function fillHas(end) {
  *  or null when the fill has no such entry. */
 export function fillFile(name) {
   const f = fill?.files.get(name);
-  if (!f || !fillHas(f[0] + f[1])) return null;
+  if (!f || !fillHas(f[0] + f[1], name)) return null;
   return fill.buf.slice(f[0], f[0] + f[1]);
 }
 function fromFill(href, from, memory, dst, len) {
@@ -45,7 +52,7 @@ function fromFill(href, from, memory, dst, len) {
   const f = fill.files.get(path);
   if (!f || from + len > f[1]) return -1;
   const end = f[0] + from + len;
-  if (!fillHas(end)) return -1;
+  if (!fillHas(end, path)) return -1;
   new Uint8Array(memory.buffer, dst, len).set(fill.buf.subarray(f[0] + from, end));
   return len;
 }
@@ -96,7 +103,7 @@ let zstdLoad = null;
  *  decode (zstd-late.mjs). */
 export function lazyReady() {
   if (lazyCacheOn() || !globalThis.GEX_REST_BUNDLE) return Promise.resolve();
-  zstdLoad ??= lateZstd(import('../../../page/vendor/zstddec/zstddec-stream.mjs'), new URL('../../../page/vendor/zstddec/zstddec.wasm', import.meta.url).href)
+  zstdLoad ??= lateZstd(import('../../../runtime/vendor/zstddec/zstddec-stream.mjs'), new URL('../../../runtime/vendor/zstddec/zstddec.wasm', import.meta.url).href)
     .then((d) => { zstd = d; })
     .catch((e) => { console.error(`[lazy] no zstd decoder: ${e?.message ?? e}`); });
   return zstdLoad;
@@ -416,6 +423,23 @@ function deviceRead(href, from, memory, dst, len) {
 
 /** `lazy_fetch(url, urlLen, offset, dst, len)` against the kernel memory `memory`. */
 export function lazyFetch(memory) {
+  const read = lazyRead(memory);
+  // `?systime=1`: this Worker's lazy reads, by how they were served (lazyStats)
+  return (url, urlLen, offset, dst, len) => {
+    if (!globalThis.GEX_SYS_TIME) return read(url, urlLen, offset, dst, len);
+    const t0 = performance.now();
+    readKind = 'xhr';
+    const n = read(url, urlLen, offset, dst, len);
+    const s = (lazyStats[readKind] ??= [0, 0, 0]);
+    s[0]++; s[1] += performance.now() - t0; s[2] += Math.max(0, n);
+    return n;
+  };
+}
+/** `?systime=1`: this Worker's lazy reads so far, by kind (fill, bundle,
+ *  cache, xhr): [reads, ms, bytes]. */
+export const lazyStats = {};
+let readKind = 'xhr';
+function lazyRead(memory) {
   return (url, urlLen, offset, dst, len) => {
     url >>>= 0; urlLen >>>= 0; dst >>>= 0; len >>>= 0;
     const from = Number(offset);
@@ -427,11 +451,22 @@ export function lazyFetch(memory) {
       return n;
     }
     if (fill) {
+      readKind = 'fill';
       const n = fromFill(href, from, memory, dst, len);
       if (n >= 0) return n;
+      readKind = 'xhr';
     }
     const done = noteFetch(href, len);
+    // The page's own source (fs.js setLazySource): the key is its, and the
+    // owner is the only one who can read it.
+    if (lazyOwnerOnly()) {
+      const c = cachedRead(href, from, dst, len);
+      done(c === len ? len : 0);
+      if (c !== len) sayOnce(href, `[lazy] ${href.replace(/^\/=/, '')} @${from}+${len}: the page's lazy source failed`);
+      return c === len ? len : -1;
+    }
     if (href.includes('#')) {
+      readKind = 'bundle';
       // The owner's decoder, when the page has one; this Worker's own if not.
       const c = cachedRead(absolute(href), from, dst, len);
       if (c === len) {
@@ -446,6 +481,7 @@ export function lazyFetch(memory) {
     // The page's cache of lazy files, when it keeps one (lazy-cache.mjs):
     // its answer, or its failure (it tried the server already).
     const c = cachedRead(absolute(href), from, dst, len);
+    if (c === len) readKind = 'cache';
     if (c === len || c === OWNER_FAILED) {
       done(c === len ? len : 0);
       return c === len ? len : -1;

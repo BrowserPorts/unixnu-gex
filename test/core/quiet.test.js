@@ -2,8 +2,8 @@
 // line at the console's log, info, warning or error level (browser), none on
 // the process's output (node). Programs run with pipes and on a terminal, a
 // pipeline ends, a program is killed. A program that crashes is still said.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
 
 export const meta = { hosts: ['browser', 'node'], images: ['busybox'], timeout: 180 };
 

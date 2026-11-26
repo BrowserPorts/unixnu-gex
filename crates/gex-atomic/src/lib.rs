@@ -57,6 +57,19 @@ pub fn load_u32(bytes: &mut [u8], off: u64) -> Option<u32> {
     Some(word(bytes, off)?.load(Ordering::SeqCst))
 }
 
+/// An atomic load through a shared borrow (a futex word checked before a
+/// wait, which the kernel reads without a writable view): `bytes` is the
+/// word itself, four bytes, 4-aligned.
+pub fn load_word(bytes: &[u8]) -> Option<u32> {
+    let p = bytes.as_ptr();
+    if bytes.len() != 4 || p as usize % 4 != 0 {
+        return None;
+    }
+    // SAFETY: as `word`'s; an atomic load only reads, so the shared borrow
+    // is enough, and other threads touch the word only through atomics.
+    Some(unsafe { AtomicU32::from_ptr(p as *mut u32) }.load(Ordering::SeqCst))
+}
+
 /// An atomic store (release, and every earlier store of this thread's with
 /// it: a lock word's release).
 pub fn store_u32(bytes: &mut [u8], off: u64, v: u32) -> Option<()> {

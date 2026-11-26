@@ -1323,16 +1323,25 @@ pub fn pe_input(pe: &gex_ld::pe::PeImage, base: u64) -> Result<(Image, PeSeeds),
             o += 1;
         }
     }
-    let mut fdes: Vec<ehframe::Fde> = pe
-        .pdata
-        .iter()
-        .filter(|f| f.end_rva > f.begin_rva)
-        .map(|f| ehframe::Fde {
-            start: base + f.begin_rva as u64,
-            end: base + f.end_rva as u64,
-            lsda: None,
-        })
-        .collect();
+    // An entry with chained unwind info (`UNW_FLAG_CHAININFO`) is a further
+    // piece of the function before it, not a function: MSVC splits a
+    // function's range where its unwind state changes, and four in ten of an
+    // Unreal Engine game's entries are such pieces. One that follows its
+    // function directly lengthens it; one set apart (a cold part moved
+    // away) is no function start either, and is reached by its branches.
+    // Taken as functions, a branch into a piece entered it as a call would,
+    // on a stack with no return address on top.
+    let mut fdes: Vec<ehframe::Fde> = Vec::with_capacity(pe.pdata.len());
+    for f in pe.pdata.iter().filter(|f| f.end_rva > f.begin_rva) {
+        let (start, end) = (base + f.begin_rva as u64, base + f.end_rva as u64);
+        if f.unwind_flags.is_some_and(|x| x & 4 != 0) {
+            if let Some(last) = fdes.last_mut().filter(|l| l.end == start) {
+                last.end = end;
+            }
+            continue;
+        }
+        fdes.push(ehframe::Fde { start, end, lsda: None });
+    }
     // MinGW keeps DWARF CFI in an `.eh_frame` section.
     if let Some(s) = pe.sections.iter().find(|s| pe_section_name(pe, &s.name) == ".eh_frame") {
         let lo = s.rva as usize;

@@ -462,12 +462,22 @@ pub struct Gl {
     frame: Option<Frame>,
     /// PRESENTs so far.
     pub presents: u64,
+    /// The window default still owed (see [`WindowDefault`]).
+    window_default: WindowDefault,
     /// `op::CLIENT_ARRAY`'s bytes by slot: GL keeps the pointer, so they
     /// stay until the slot's next one.
     client_arrays: std::collections::HashMap<u32, Vec<u8>>,
     /// Per opcode: commands run and nanoseconds in them, when asked for
     /// ([`Gl::time_ops`]; the replay tool's profile).
     op_times: Option<std::collections::HashMap<u32, (u64, u64)>>,
+    /// The guest's other contexts (`op::CONTEXT_CURRENT`), in this one's share
+    /// group, each with its pixel-store state and window default; `context` is
+    /// `context_id`'s.
+    others: std::collections::HashMap<u32, (EGLContext, PixelStore, PixelStore, WindowDefault)>,
+    context_id: u32,
+    /// What `context` was made with, so the others are made like it.
+    context_api: EGLenum,
+    context_attrs: Vec<EGLint>,
 }
 
 /// `GEX_GL_READBACK_EVERY=N`: read back (and hand on) only every Nth
@@ -667,8 +677,13 @@ impl Gl {
                 keep_frames: false,
                 frame: None,
                 presents: 0,
+                window_default: WindowDefault::default(),
                 client_arrays: std::collections::HashMap::new(),
                 op_times: None,
+                others: std::collections::HashMap::new(),
+                context_id: 0,
+                context_api: EGL_OPENGL_ES_API,
+                context_attrs: ctx_attrs.to_vec(),
             })
         }
     }
@@ -694,6 +709,7 @@ impl Gl {
             self.width = width;
             self.height = height;
         }
+        self.window_default.apply(width, height);
         Ok(())
     }
 
@@ -720,6 +736,8 @@ impl Gl {
             if eglChooseConfig(self.display, attrs.as_ptr(), &mut config, 1, &mut num) == 0 || num < 1 {
                 return Err("no OpenGL ES EGL config".into());
             }
+            self.drop_others();
+            eglBindAPI(EGL_OPENGL_ES_API);
             let ctx_attrs = [EGL_CONTEXT_CLIENT_VERSION, major.max(2) as EGLint, EGL_NONE];
             let context = eglCreateContext(self.display, config, std::ptr::null_mut(), ctx_attrs.as_ptr());
             if context.is_null() {
@@ -742,6 +760,8 @@ impl Gl {
             self.current_on = Some(std::thread::current().id());
             self.compat = None;
             self.desktop = None;
+            self.context_api = EGL_OPENGL_ES_API;
+            self.context_attrs = ctx_attrs.to_vec();
             self.vendor = gl_string(0x1F00);
             self.renderer = gl_string(0x1F01);
             self.version = gl_string(0x1F02);
@@ -800,9 +820,13 @@ impl Gl {
                 a.push(EGL_NONE);
                 a
             };
-            let mut context = eglCreateContext(self.display, config, std::ptr::null_mut(), attrs_for(false).as_ptr());
+            self.drop_others();
+            eglBindAPI(EGL_OPENGL_API);
+            let mut made_attrs = attrs_for(false);
+            let mut context = eglCreateContext(self.display, config, std::ptr::null_mut(), made_attrs.as_ptr());
             if context.is_null() && (major > 3 || (major == 3 && minor >= 2)) {
-                context = eglCreateContext(self.display, config, std::ptr::null_mut(), attrs_for(true).as_ptr());
+                made_attrs = attrs_for(true);
+                context = eglCreateContext(self.display, config, std::ptr::null_mut(), made_attrs.as_ptr());
             }
             if context.is_null() {
                 eglBindAPI(EGL_OPENGL_ES_API);
@@ -828,12 +852,75 @@ impl Gl {
             self.unpack_store = PixelStore::default();
             self.current_on = Some(std::thread::current().id());
             self.compat = Compat::load();
+            self.context_api = EGL_OPENGL_API;
+            self.context_attrs = made_attrs;
             self.desktop = Some((major, minor, compat || !(major > 3 || (major == 3 && minor >= 2))));
             self.vendor = gl_string(0x1F00);
             self.renderer = gl_string(0x1F01);
             self.version = gl_string(0x1F02);
         }
         Ok(())
+    }
+
+    /// Run what follows in the guest's context `id` (`op::CONTEXT_CURRENT`),
+    /// made now in this one's share group if it is new.
+    fn use_context(&mut self, id: u32) {
+        if id == self.context_id {
+            return;
+        }
+        unsafe {
+            let next = match self.others.remove(&id) {
+                Some(next) => next,
+                None => {
+                    eglBindAPI(self.context_api);
+                    let c = eglCreateContext(self.display, self.config, self.context, self.context_attrs.as_ptr());
+                    if c.is_null() {
+                        eprintln!("gex-gl: context {id} not made: {:#x}", eglGetError());
+                        return;
+                    }
+                    (c, PixelStore::default(), PixelStore::default(), WindowDefault::default())
+                }
+            };
+            if eglMakeCurrent(self.display, self.surface, self.surface, next.0) == 0 {
+                eprintln!("gex-gl: context {id} not made current: {:#x}", eglGetError());
+                self.others.insert(id, next);
+                return;
+            }
+            let prev = (self.context, self.pack_store, self.unpack_store, std::mem::take(&mut self.window_default));
+            self.others.insert(self.context_id, prev);
+            (self.context, self.pack_store, self.unpack_store, self.window_default) = next;
+            self.context_id = id;
+            self.current_on = Some(std::thread::current().id());
+        }
+    }
+
+    /// The guest's context `id` is gone (`op::CONTEXT_DROP`).
+    fn drop_context(&mut self, id: u32) {
+        if id == 0 {
+            return;
+        }
+        if id == self.context_id {
+            self.use_context(0);
+            if self.context_id != 0 {
+                return;
+            }
+        }
+        if let Some((c, ..)) = self.others.remove(&id) {
+            unsafe { eglDestroyContext(self.display, c) };
+        }
+    }
+
+    /// All but context 0, which is current after.
+    fn drop_others(&mut self) {
+        if self.context_id != 0 {
+            self.use_context(0);
+        }
+        let ids: Vec<u32> = self.others.keys().copied().filter(|&i| i != 0).collect();
+        for id in ids {
+            self.drop_context(id);
+        }
+        self.others.clear();
+        self.context_id = 0;
     }
 
     /// Time every command by opcode from now on ([`Gl::take_op_times`]).
@@ -944,9 +1031,11 @@ impl Gl {
     /// stream the host cannot keep reading.
     fn one(&mut self, opcode: u32, body: &[u8], reply: &mut Reply) -> bool {
         let mut a = Args::new(body);
+        self.window_default.guest_sets(opcode);
         unsafe {
             match opcode {
                 op::CONTEXT_CREATE => {
+                    self.window_default = WindowDefault::default();
                     // This host brings up a GLES context at startup; a guest
                     // that asks for desktop GL gets a desktop compatibility
                     // context in its place.
@@ -986,17 +1075,29 @@ impl Gl {
                 }
                 // This host has one drawable, the pbuffer: every surface
                 // draws into it, and a frame is what it holds at a PRESENT.
-                op::SURFACE_ATTACH | op::SURFACE_CURRENT | op::SURFACE_DETACH | op::CONTEXT_DESTROY => {}
-                // One GL context serves every guest context here: asked for
-                // another, this host answers with the one it has (index 0),
-                // which the guest takes as "keep using it", and switching
-                // to it is nothing. Both still have to be read, or a
-                // program with two contexts ends its stream at the first.
-                op::CONTEXT_ADD => reply.u32(0),
-                op::CONTEXT_SET_CURRENT => {
-                    let _ = a.u32();
+                // The drawable keeps its size, so a surface bound here owes the
+                // window default now at that size, and again at its own
+                // SURFACE_RESIZE.
+                op::SURFACE_ATTACH | op::SURFACE_CURRENT => {
+                    let handle = if opcode == op::SURFACE_ATTACH { a.u32(); a.u32(); a.u32(); a.u32() } else { a.u32() };
+                    if let Some(h) = handle {
+                        if self.window_default.bound(h) {
+                            self.window_default.apply(self.width, self.height);
+                        }
+                    }
+                }
+                op::SURFACE_DETACH => {}
+                op::CONTEXT_DESTROY => self.drop_others(),
+                op::CONTEXT_CURRENT => {
+                    let Some(id) = a.u32() else { return true };
+                    self.use_context(id);
+                }
+                op::CONTEXT_DROP => {
+                    let Some(id) = a.u32() else { return true };
+                    self.drop_context(id);
                 }
                 op::PRESENT => {
+                    self.window_default.drawn();
                     self.presents += 1;
                     present_meter(self.presents);
                     if self.keep_frames && readback_due(self.presents) {
@@ -1880,6 +1981,85 @@ impl Header {
     pub const SIZE: usize = 32;
 }
 
+/// GL's window default: a context's viewport and scissor box take the size of
+/// the window it is first made current on. Here the context is current on a
+/// drawable of the size it last had before the guest's window says its own
+/// (SURFACE_RESIZE, after the bind in the same batch), so GL's own default is
+/// the old size -- 1x1 on a fresh host -- and a program that never calls
+/// glViewport draws into a corner of its window. So each is set again, to
+/// the window's size, at the binds and resizes up to the context's first
+/// PRESENT after it is bound to a surface it has not drawn to before (a
+/// context made on a hidden window and then moved to the real one is the
+/// common case), and never once the guest has set it itself: a program that
+/// sets the scissor box but not the viewport keeps its scissor box.
+#[derive(Default)]
+pub(crate) struct WindowDefault {
+    /// Still owed: the viewport, the scissor box.
+    viewport: bool,
+    scissor: bool,
+    /// The guest set it since the context was bound to its latest new surface.
+    guest_viewport: bool,
+    guest_scissor: bool,
+    /// The surfaces this context has been bound to.
+    seen: Vec<u32>,
+    /// The latest new surface has been drawn to (a PRESENT since it was bound).
+    drawn: bool,
+}
+
+impl WindowDefault {
+    /// The commands that set the viewport or the scissor box: the hand-written
+    /// op, GL 4.4's and the compatibility profile's (glViewport, glScissor and
+    /// their indexed and array forms).
+    pub(crate) const VIEWPORT_OPS: [u32; 7] = [op::VIEWPORT, 1563, 1564, 1565, 11407, 11411, 11414];
+    pub(crate) const SCISSOR_OPS: [u32; 7] = [op::SCISSOR, 1389, 1390, 1391, 10511, 10517, 10520];
+
+    pub(crate) fn guest_sets(&mut self, opcode: u32) {
+        if Self::VIEWPORT_OPS.contains(&opcode) {
+            self.guest_viewport = true;
+            self.viewport = false;
+        } else if Self::SCISSOR_OPS.contains(&opcode) {
+            self.guest_scissor = true;
+            self.scissor = false;
+        }
+    }
+
+    /// The context is now bound to `handle`; true when that opens the window
+    /// default again (a surface it was never bound to, or none drawn yet).
+    pub(crate) fn bound(&mut self, handle: u32) -> bool {
+        if !self.seen.contains(&handle) {
+            self.seen.push(handle);
+            self.drawn = false;
+            self.guest_viewport = false;
+            self.guest_scissor = false;
+        }
+        if self.drawn {
+            return false;
+        }
+        self.viewport = !self.guest_viewport;
+        self.scissor = !self.guest_scissor;
+        self.viewport || self.scissor
+    }
+
+    /// A PRESENT: the size the program drew its frame at is its window's.
+    pub(crate) fn drawn(&mut self) {
+        self.drawn = true;
+        self.viewport = false;
+        self.scissor = false;
+    }
+
+    /// Set what is still owed to a `width` x `height` window.
+    pub(crate) fn apply(&self, width: i32, height: i32) {
+        unsafe {
+            if self.viewport {
+                glViewport(0, 0, width, height);
+            }
+            if self.scissor {
+                glScissor(0, 0, width, height);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1979,37 +2159,6 @@ mod tests {
         let pixels = read_blob(r, &mut at);
         assert_eq!(read_u32(r, &mut at), 0, "GL reported no error");
         assert_eq!(&pixels[(2 * 64 + 2) * 4..(2 * 64 + 2) * 4 + 4], &[0, 255, 0, 255], "the indexed triangle");
-    }
-
-    /// A guest with a second EGL context sends CONTEXT_ADD and
-    /// CONTEXT_SET_CURRENT. This host has one GL context for all of them: it
-    /// answers CONTEXT_ADD with that one (index 0), switching is nothing, and
-    /// the stream goes on -- an unknown opcode would end it there.
-    #[test]
-    fn a_second_guest_context_is_the_one_context_and_the_stream_goes_on() {
-        let _serial = gl_lock();
-        let mut gl = match Gl::new(16, 16) {
-            Ok(g) => g,
-            Err(e) => {
-                eprintln!("skipping: no host GL ({e})");
-                return;
-            }
-        };
-        let mut b = Batch::new();
-        b.cmd(op::CONTEXT_CREATE, &[client_api::ES, 0, 0]);
-        b.cmd(op::CONTEXT_ADD, &[]);
-        b.cmd(op::CONTEXT_SET_CURRENT, &[1]);
-        b.cmd(op::CONTEXT_SET_CURRENT, &[0]);
-        b.cmd(op::GET_ERROR, &[]);
-        let (reply, status, _) = gl.run(b.bytes());
-        assert_eq!(status, error::NONE);
-        let r = reply.bytes();
-        let mut at = 0;
-        for _ in 0..3 {
-            read_blob(r, &mut at); // vendor, renderer, version
-        }
-        assert_eq!(read_u32(r, &mut at), 0, "CONTEXT_ADD: the one context there is");
-        assert_eq!(read_u32(r, &mut at), 0, "GL reported no error");
     }
 
     /// The whole path: bring up a context, compile the application's own
@@ -2168,6 +2317,184 @@ mod tests {
 
     fn read_back(b: &mut Batch) {
         b.cmd(op::READ_PIXELS, &[0, 0, 16, 16, GL_RGBA, GL_UNSIGNED_BYTE, 0, 0, 0]);
+    }
+
+    /// A desktop context on a host drawable of `size`, or None (no host GL).
+    fn desktop_on(size: i32) -> Option<Gl> {
+        let mut gl = Gl::new(size, size).ok()?;
+        let mut b = Batch::new();
+        b.cmd(op::CONTEXT_CREATE, &[client_api::DESKTOP, 2, 1]);
+        let (_, status, _) = gl.run(b.bytes());
+        assert_eq!(status, error::NONE);
+        gl.is_desktop().then_some(gl)
+    }
+
+    /// Clear to black, then a white triangle strip over the whole viewport.
+    fn fill_viewport(b: &mut Batch) {
+        const GL_TRIANGLE_STRIP: u32 = 0x0005;
+        b.cmd(op::CLEAR_COLOR, &[0, 0, 0, 1.0f32.to_bits()]);
+        b.cmd(op::CLEAR, &[GL_COLOR_BUFFER_BIT]);
+        b.cmd(op::BEGIN, &[GL_TRIANGLE_STRIP]);
+        for (x, y) in [(-1.0f32, -1.0f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+            b.cmd(op::VERTEX3F, &[x.to_bits(), y.to_bits(), 0]);
+        }
+        b.cmd(op::END, &[]);
+    }
+
+    fn pixels_of(gl: &mut Gl, mut b: Batch) -> Vec<u8> {
+        read_back(&mut b);
+        let (reply, status, _) = gl.run(b.bytes());
+        assert_eq!(status, error::NONE, "every command was understood");
+        let mut at = 0;
+        let _offset = read_u32(reply.bytes(), &mut at);
+        read_blob(reply.bytes(), &mut at)
+    }
+
+    /// A program that never calls glViewport draws over its whole window: the
+    /// viewport is the window's size, not the size the host's drawable had
+    /// when the context was bound to it (a 1x1 corner before), and a context
+    /// moved to a new window gets that window's size too.
+    #[test]
+    fn the_viewport_is_the_window_a_context_is_bound_to() {
+        let _serial = gl_lock();
+        let Some(mut gl) = desktop_on(2) else {
+            eprintln!("skipping: no desktop host GL");
+            return;
+        };
+        // Bound, then sized: the order a guest sends them in.
+        let mut b = Batch::new();
+        b.cmd(op::SURFACE_ATTACH, &[0, 7, 1, 1]);
+        b.cmd(op::SURFACE_RESIZE, &[16, 16]);
+        fill_viewport(&mut b);
+        let px = pixels_of(&mut gl, b);
+        assert_eq!(pixel16(&px, 1, 1), (255, 255, 255, 255), "the corner");
+        assert_eq!(pixel16(&px, 8, 8), (255, 255, 255, 255), "the middle, outside the 2x2 drawable it was bound to");
+        assert_eq!(pixel16(&px, 15, 15), (255, 255, 255, 255), "the far corner");
+
+        // A viewport of its own, a frame, and then a new window: the window's
+        // size again, though the program set one for the first.
+        let mut b = Batch::new();
+        b.cmd(op::VIEWPORT, &[0, 0, 4, 4]);
+        b.cmd(op::PRESENT, &[]);
+        b.cmd(op::SURFACE_ATTACH, &[0, 8, 1, 2]);
+        fill_viewport(&mut b);
+        let px = pixels_of(&mut gl, b);
+        assert_eq!(pixel16(&px, 12, 12), (255, 255, 255, 255), "the new window's viewport is its whole size");
+
+        // Back on the first window after drawing on it: its program's state
+        // stays, as GL keeps it after the first bind.
+        let mut b = Batch::new();
+        b.cmd(op::PRESENT, &[]);
+        b.cmd(op::VIEWPORT, &[0, 0, 4, 4]);
+        b.cmd(op::SURFACE_CURRENT, &[1]);
+        b.cmd(op::SURFACE_RESIZE, &[16, 16]);
+        fill_viewport(&mut b);
+        let px = pixels_of(&mut gl, b);
+        assert_eq!(pixel16(&px, 1, 1), (255, 255, 255, 255), "inside the program's viewport");
+        assert_eq!(pixel16(&px, 12, 12), (0, 0, 0, 255), "outside it: the program's viewport was kept");
+    }
+
+    /// Two contexts (op::CONTEXT_CURRENT) share their textures and keep their
+    /// own state: context 1 clears a texture green through a framebuffer of
+    /// its own, and context 0 reads it through one of its own; each context's
+    /// viewport and blend enable are what it set.
+    #[test]
+    fn contexts_share_objects_and_keep_their_own_state() {
+        let _serial = gl_lock();
+        const GL_TEXTURE_2D: u32 = 0x0DE1;
+        const GL_FRAMEBUFFER: u32 = 0x8D40;
+        const GL_BLEND: u32 = 0x0BE2;
+        const GL_VIEWPORT: u32 = 0x0BA2;
+        let Some(mut gl) = desktop_on(16) else {
+            eprintln!("skipping: no desktop host GL");
+            return;
+        };
+        let ints = |gl: &mut Gl, pname: u32| -> Vec<i32> {
+            let mut b = Batch::new();
+            b.cmd(op::GET_INTEGERV, &[pname]);
+            let (reply, status, _) = gl.run(b.bytes());
+            assert_eq!(status, error::NONE);
+            let mut at = 0;
+            read_blob(reply.bytes(), &mut at).chunks(4).map(|c| i32::from_le_bytes(c.try_into().unwrap())).collect()
+        };
+        let mut b = Batch::new();
+        b.cmd(op::SURFACE_ATTACH, &[0, 7, 1, 1]);
+        b.cmd(op::SURFACE_RESIZE, &[16, 16]);
+        b.cmd(op::VIEWPORT, &[1, 2, 3, 4]);
+        b.cmd(op::DISABLE, &[GL_BLEND]);
+        b.cmd(op::CONTEXT_CURRENT, &[1, client_api::DESKTOP, 2, 1, 1]);
+        b.cmd(op::ENABLE, &[GL_BLEND]);
+        b.cmd(op::GEN_TEXTURES, &[1, 50]);
+        b.cmd(op::BIND_TEXTURE, &[GL_TEXTURE_2D, 50]);
+        b.cmd(op::TEX_IMAGE_2D, &[GL_TEXTURE_2D, 0, 0x8058, 16, 16, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0, 0, 0, 0]);
+        b.cmd(op::GEN_FRAMEBUFFERS, &[1, 60]);
+        b.cmd(op::BIND_FRAMEBUFFER, &[GL_FRAMEBUFFER, 60]);
+        b.cmd(op::FRAMEBUFFER_TEXTURE_2D, &[GL_FRAMEBUFFER, 0x8CE0, GL_TEXTURE_2D, 50, 0]);
+        b.cmd(op::VIEWPORT, &[0, 0, 16, 16]);
+        b.cmd(op::CLEAR_COLOR, &[0, 1.0f32.to_bits(), 0, 1.0f32.to_bits()]);
+        b.cmd(op::CLEAR, &[GL_COLOR_BUFFER_BIT]);
+        b.cmd(op::BIND_FRAMEBUFFER, &[GL_FRAMEBUFFER, 0]);
+        b.cmd(op::FINISH, &[]);
+        b.cmd(op::VIEWPORT, &[5, 6, 7, 8]);
+        b.cmd(op::CONTEXT_CURRENT, &[0, client_api::DESKTOP, 2, 1, 1]);
+        let (_, status, _) = gl.run(b.bytes());
+        assert_eq!(status, error::NONE, "every command was understood");
+        assert_eq!(ints(&mut gl, GL_VIEWPORT), vec![1, 2, 3, 4], "context 0's viewport");
+        assert_eq!(ints(&mut gl, GL_BLEND)[0], 0, "context 0's blend enable");
+        let mut b = Batch::new();
+        b.cmd(op::GEN_FRAMEBUFFERS, &[1, 61]);
+        b.cmd(op::BIND_FRAMEBUFFER, &[GL_FRAMEBUFFER, 61]);
+        b.cmd(op::FRAMEBUFFER_TEXTURE_2D, &[GL_FRAMEBUFFER, 0x8CE0, GL_TEXTURE_2D, 50, 0]);
+        let px = pixels_of(&mut gl, b);
+        assert_eq!(pixel16(&px, 8, 8), (0, 255, 0, 255), "context 0 reads the texture context 1 rendered");
+        let mut b = Batch::new();
+        b.cmd(op::BIND_FRAMEBUFFER, &[GL_FRAMEBUFFER, 0]);
+        b.cmd(op::CONTEXT_CURRENT, &[1, client_api::DESKTOP, 2, 1, 1]);
+        let (_, status, _) = gl.run(b.bytes());
+        assert_eq!(status, error::NONE);
+        assert_eq!(ints(&mut gl, GL_VIEWPORT), vec![5, 6, 7, 8], "context 1's viewport");
+        assert_eq!(ints(&mut gl, GL_BLEND)[0], 1, "context 1's blend enable");
+        let mut b = Batch::new();
+        b.cmd(op::CONTEXT_DROP, &[1]);
+        let (_, status, _) = gl.run(b.bytes());
+        assert_eq!(status, error::NONE);
+        assert_eq!(ints(&mut gl, GL_VIEWPORT), vec![1, 2, 3, 4], "context 0 is current after context 1 is dropped");
+    }
+
+    /// The scissor box is the window's too, unless the program set its own:
+    /// a program that sets the scissor box but not the viewport keeps its box.
+    #[test]
+    fn a_scissor_box_the_program_set_is_kept() {
+        let _serial = gl_lock();
+        const GL_SCISSOR_TEST: u32 = 0x0C11;
+        let Some(mut gl) = desktop_on(2) else {
+            eprintln!("skipping: no desktop host GL");
+            return;
+        };
+        let mut b = Batch::new();
+        // Set after the bind and before the window's size arrives.
+        b.cmd(op::SURFACE_ATTACH, &[0, 7, 1, 1]);
+        b.cmd(op::SCISSOR, &[0, 0, 8, 16]);
+        b.cmd(op::SURFACE_RESIZE, &[16, 16]);
+        b.cmd(op::CLEAR_COLOR, &[0, 0, 0, 1.0f32.to_bits()]);
+        b.cmd(op::CLEAR, &[GL_COLOR_BUFFER_BIT]);
+        b.cmd(op::ENABLE, &[GL_SCISSOR_TEST]);
+        b.cmd(op::CLEAR_COLOR, &[1.0f32.to_bits(), 1.0f32.to_bits(), 1.0f32.to_bits(), 1.0f32.to_bits()]);
+        b.cmd(op::CLEAR, &[GL_COLOR_BUFFER_BIT]);
+        let px = pixels_of(&mut gl, b);
+        assert_eq!(pixel16(&px, 3, 8), (255, 255, 255, 255), "inside the program's box");
+        assert_eq!(pixel16(&px, 12, 8), (0, 0, 0, 255), "outside it");
+
+        // The scissor box with no box of the program's: the whole window.
+        let Some(mut gl) = desktop_on(2) else { return };
+        let mut b = Batch::new();
+        b.cmd(op::SURFACE_ATTACH, &[0, 7, 1, 1]);
+        b.cmd(op::SURFACE_RESIZE, &[16, 16]);
+        b.cmd(op::ENABLE, &[GL_SCISSOR_TEST]);
+        b.cmd(op::CLEAR_COLOR, &[1.0f32.to_bits(), 1.0f32.to_bits(), 1.0f32.to_bits(), 1.0f32.to_bits()]);
+        b.cmd(op::CLEAR, &[GL_COLOR_BUFFER_BIT]);
+        let px = pixels_of(&mut gl, b);
+        assert_eq!(pixel16(&px, 12, 12), (255, 255, 255, 255), "the default box is the whole window");
     }
 
     /// A guest asking for desktop GL gets a compatibility context: immediate

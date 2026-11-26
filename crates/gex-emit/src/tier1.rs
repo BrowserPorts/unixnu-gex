@@ -431,6 +431,46 @@ pub fn set_coherent_loads(on: bool) {
     COHERENT_LOADS.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Debug (`?tso=2`, default OFF, nothing emitted when off): what the
+/// coherent flavour leaves plain, ordered and made whole as x86 makes it.
+/// A misaligned scalar load or store is one atomic access of the aligned
+/// word holding it (a compare-exchange; across two words, under the split
+/// lock), so another thread never sees half of it -- x86 makes a misaligned
+/// access inside a cache line atomic, an arm64 host only an aligned one. A
+/// vector store, `memory.copy` and `memory.fill` are followed by a fence and
+/// a vector load preceded by one, so a store of the guest's that publishes
+/// through them is ordered as on x86. For finding a weakly ordered host's
+/// bug, not shipping: every guest access pays for it.
+static TSO2: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_tso2(on: bool) {
+    TSO2.store(on, std::sync::atomic::Ordering::Relaxed);
+    if on {
+        set_coherent_loads(true);
+    }
+}
+
+fn tso2() -> bool {
+    TSO2.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Debug (`?tear=`, GEX_TEAR, default 0, nothing emitted at 0): plain
+/// misaligned 8-byte guest loads and stores, which x86 makes whole inside a
+/// cache line and an arm64 host does not. 1 counts them per process
+/// (`gex_abi::TEAR_COUNTS`; the first few say where); 2 counts them and
+/// also does each as two 4-byte halves, so on an x86 host another thread
+/// can see half an update as on arm64. Aligned and locked accesses, and
+/// the coherent flavours' atomic ones, are left as they are.
+static TEAR: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn set_tear(mode: u8) {
+    TEAR.store(mode.min(2), std::sync::atomic::Ordering::Relaxed);
+}
+
+fn tear() -> u8 {
+    TEAR.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn coherent_loads() -> bool {
     static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENV.get_or_init(|| std::env::var_os("GEX_COHERENT_LOADS").is_some())
@@ -1185,6 +1225,22 @@ impl<'a> Emitter<'a> {
             reads.sort_by_key(|r| Self::reg_offset(*r));
             for r in reads {
                 self.reg_local(r);
+            }
+            // Every register the body writes is held in its local from the
+            // loop's head, and counts as dirty there: an earlier iteration
+            // may have written it after a point where this one faults (a
+            // post-indexed store's base, written after the store), and a
+            // fault path writes back only what is dirty. The emitter sees
+            // the body once, so at a fault before the write it would think
+            // the register clean, and the handler would see the value from
+            // before the loop; the retry then stores to the wrong place.
+            let mut writes = written_registers(block);
+            writes.sort_by_key(|r| Self::reg_offset(*r));
+            for r in writes {
+                self.reg_local(r);
+                if let Some(c) = self.regs.get_mut(&r) {
+                    c.dirty = true;
+                }
             }
             let counter = self.alloc(Ty::I32);
             self.f.i32_const(loop_poll());
@@ -2237,6 +2293,8 @@ impl<'a> Emitter<'a> {
                 if *order == Order::SeqCst {
                     let sub = atomic_store_op(ty, *sz);
                     self.f.atomic(sub, natural_align(*sz), static_off);
+                } else if tear() != 0 && ty == Ty::I64 && *sz == MemSz::B8 && !tso2() {
+                    self.emit_tear_store(static_off);
                 } else if coherent_loads() {
                     self.emit_coherent_store(ty, *sz, static_off);
                 } else {
@@ -2307,6 +2365,9 @@ impl<'a> Emitter<'a> {
                     };
                     self.f.simd_mem_lane(sub, align, static_off, 0);
                 }
+                if tso2() {
+                    self.f.atomic_fence();
+                }
             }
             // A Darwin process's accesses are each checked against its
             // pages' protections (`Stmt::MemCheck`); a bulk one's range is
@@ -2334,6 +2395,9 @@ impl<'a> Emitter<'a> {
                 self.f.u32(code::MEMORY_COPY);
                 self.f.byte(0); // destination memory
                 self.f.byte(0); // source memory
+                if tso2() {
+                    self.f.atomic_fence();
+                }
             }
             Stmt::MemFill { dst, val, len } => {
                 let d = if gex_abi::mem64() { self.scratch_addr.0 } else { self.scratch_i32 };
@@ -2348,6 +2412,9 @@ impl<'a> Emitter<'a> {
                 self.f.byte(crate::wasm::op::MISC_PREFIX);
                 self.f.u32(code::MEMORY_FILL);
                 self.f.byte(0); // memory
+                if tso2() {
+                    self.f.atomic_fence();
+                }
             }
             Stmt::MemCmp { dst, a, b, len } => self.emit_memcmp(*dst, *a, *b, *len),
             Stmt::Fence => self.f.atomic_fence(),
@@ -2836,7 +2903,10 @@ impl<'a> Emitter<'a> {
     /// under one global lock word ([`gex_abi::SPLIT_LOCK`]): atomic against
     /// every other locked access that spans words, not against a plain
     /// access racing it, which a real split lock also excludes -- so the
-    /// first one says so (`cache_op::SPLIT_LOCK`). Leaves the old value.
+    /// first one says so (`cache_op::SPLIT_LOCK`). Each of the two words is
+    /// written by a compare-exchange, so what another thread writes to the
+    /// bytes around the value meanwhile (an aligned access, locked or not,
+    /// to a neighbouring field) is kept. Leaves the old value.
     fn emit_misaligned_atomic(&mut self, a: u32, ty: Ty, sz: MemSz, static_off: u32, kind: Misaligned) {
         let bytes = 1u32 << natural_align(sz);
         let ea = self.alloc(Self::addr_ir_ty());
@@ -2883,49 +2953,7 @@ impl<'a> Emitter<'a> {
             self.f.byte(0x83); // i64.and
             self.f.local_set(f);
             // The field's new value, on the stack.
-            match kind {
-                Misaligned::Cas { expected, replacement } => {
-                    // Unequal: done, nothing written.
-                    self.f.local_get(f);
-                    self.f.local_get(expected);
-                    if ty == Ty::I32 {
-                        self.f.byte(code::I64_EXTEND_I32_U);
-                    }
-                    self.f.i64_const(field);
-                    self.f.byte(0x83); // i64.and
-                    self.f.byte(0x52); // i64.ne
-                    self.f.br_if(1);
-                    self.f.local_get(replacement);
-                    if ty == Ty::I32 {
-                        self.f.byte(code::I64_EXTEND_I32_U);
-                    }
-                }
-                Misaligned::Rmw { op, val } => match op {
-                    RmwOp::Xchg => {
-                        self.f.local_get(val);
-                        if ty == Ty::I32 {
-                            self.f.byte(code::I64_EXTEND_I32_U);
-                        }
-                    }
-                    _ => {
-                        self.f.local_get(f);
-                        self.f.local_get(val);
-                        if ty == Ty::I32 {
-                            self.f.byte(code::I64_EXTEND_I32_U);
-                        }
-                        let b = match op {
-                            RmwOp::Add => BinOp::Add,
-                            RmwOp::Sub => BinOp::Sub,
-                            RmwOp::And => BinOp::And,
-                            RmwOp::Or => BinOp::Or,
-                            _ => BinOp::Xor,
-                        };
-                        self.f.byte(bin_op(b, Ty::I64));
-                    }
-                },
-            }
-            self.f.i64_const(field);
-            self.f.byte(0x83); // i64.and
+            self.misaligned_new_value(kind, ty, f, field);
             self.f.local_get(sh);
             self.f.byte(0x86); // i64.shl
             // | (w & !(field << sh))
@@ -2980,40 +3008,160 @@ impl<'a> Emitter<'a> {
             self.f.atomic(atomic_cmpxchg_op(Ty::I32, MemSz::B4), 2, 0);
             self.f.br_if(0);
             self.f.end();
+            // Each word written by a compare-exchange, which keeps what
+            // others wrote to the bytes around the value meanwhile. The
+            // value's low part is the first word's top `lo` bits, its high
+            // part the second word's low bits (`m1`).
+            let field: i64 = if bytes >= 8 { -1 } else { ((1u64 << (bytes * 8)) - 1) as i64 };
+            let [wa, sh, lo, keep0, m1, w0, w1, o, nv, n0, got] = [
+                Self::addr_ir_ty(), Ty::I64, Ty::I64, Ty::I64, Ty::I64, Ty::I64, Ty::I64, Ty::I64, Ty::I64, Ty::I64, Ty::I64,
+            ]
+            .map(|t| self.alloc(t));
             self.f.local_get(ea);
-            self.f.load(load_op(ty, sz, false), 0, 0);
-            self.f.local_set(old);
-            match kind {
-                Misaligned::Cas { expected, replacement } => {
-                    self.f.local_get(old);
-                    self.f.local_get(expected);
-                    self.f.byte(if ty == Ty::I64 { 0x51 } else { 0x46 }); // eq
-                    self.f.if_void();
-                    self.f.local_get(ea);
-                    self.f.local_get(replacement);
-                    self.f.store(store_op(ty, sz), 0, 0);
-                    self.f.end();
+            self.f.addr_and_const(!7);
+            self.f.local_set(wa);
+            self.f.local_get(ea);
+            self.f.addr_low32();
+            self.f.i32_const(7);
+            self.f.byte(0x71); // i32.and
+            self.f.i32_const(3);
+            self.f.byte(0x74); // i32.shl
+            self.f.byte(code::I64_EXTEND_I32_U);
+            self.f.local_set(sh);
+            self.f.i64_const(64);
+            self.f.local_get(sh);
+            self.f.byte(0x7d); // i64.sub
+            self.f.local_set(lo);
+            // keep0 = (1 << sh) - 1; m1 = (1 << (sh + bytes * 8 - 64)) - 1
+            for (to, extra) in [(keep0, 0i64), (m1, bytes as i64 * 8 - 64)] {
+                self.f.i64_const(1);
+                self.f.local_get(sh);
+                if extra != 0 {
+                    self.f.i64_const(extra);
+                    self.f.byte(0x7c); // i64.add
                 }
-                Misaligned::Rmw { op, val } => {
-                    self.f.local_get(ea);
-                    match op {
-                        RmwOp::Xchg => self.f.local_get(val),
-                        _ => {
-                            self.f.local_get(old);
-                            self.f.local_get(val);
-                            let b = match op {
-                                RmwOp::Add => BinOp::Add,
-                                RmwOp::Sub => BinOp::Sub,
-                                RmwOp::And => BinOp::And,
-                                RmwOp::Or => BinOp::Or,
-                                _ => BinOp::Xor,
-                            };
-                            self.f.byte(bin_op(b, ty));
-                        }
-                    }
-                    self.f.store(store_op(ty, sz), 0, 0);
-                }
+                self.f.byte(0x86); // i64.shl
+                self.f.i64_const(1);
+                self.f.byte(0x7d); // i64.sub
+                self.f.local_set(to);
             }
+            self.f.block_void();
+            self.f.loop_void();
+            for (to, off) in [(w0, 0), (w1, 8)] {
+                self.f.local_get(wa);
+                self.f.atomic(atomic_load_op(Ty::I64, MemSz::B8), 3, off);
+                self.f.local_set(to);
+            }
+            // o = ((w0 >> sh) | (w1 << lo)) & field
+            self.f.local_get(w0);
+            self.f.local_get(sh);
+            self.f.byte(0x88); // i64.shr_u
+            self.f.local_get(w1);
+            self.f.local_get(lo);
+            self.f.byte(0x86); // i64.shl
+            self.f.byte(0x84); // i64.or
+            self.f.i64_const(field);
+            self.f.byte(0x83); // i64.and
+            self.f.local_set(o);
+            self.misaligned_new_value(kind, ty, o, field);
+            self.f.local_set(nv);
+            // The first word: changed since, all again.
+            self.f.local_get(w0);
+            self.f.local_get(keep0);
+            self.f.byte(0x83); // i64.and
+            self.f.local_get(nv);
+            self.f.local_get(sh);
+            self.f.byte(0x86); // i64.shl
+            self.f.byte(0x84); // i64.or
+            self.f.local_set(n0);
+            self.f.local_get(wa);
+            self.f.local_get(w0);
+            self.f.local_get(n0);
+            self.f.atomic(atomic_cmpxchg_op(Ty::I64, MemSz::B8), 3, 0);
+            self.f.local_get(w0);
+            self.f.byte(0x52); // i64.ne
+            self.f.br_if(0);
+            // The second: again with what it holds now around the value.
+            self.f.loop_void();
+            self.f.local_get(wa);
+            self.f.local_get(w1);
+            self.f.local_get(w1);
+            self.f.local_get(m1);
+            self.f.i64_const(-1);
+            self.f.byte(0x85); // i64.xor
+            self.f.byte(0x83); // i64.and
+            self.f.local_get(nv);
+            self.f.local_get(lo);
+            self.f.byte(0x88); // i64.shr_u
+            self.f.byte(0x84); // i64.or
+            self.f.atomic(atomic_cmpxchg_op(Ty::I64, MemSz::B8), 3, 8);
+            self.f.local_tee(got);
+            self.f.local_get(w1);
+            self.f.byte(0x52); // i64.ne
+            self.f.if_void();
+            {
+                // The value's own bytes there changed: its bytes in the
+                // first word put back while they hold what this wrote, and
+                // all again. (`got` then follows the first word, `nv` is
+                // spare.)
+                self.f.local_get(got);
+                self.f.local_get(w1);
+                self.f.byte(0x85); // i64.xor
+                self.f.local_get(m1);
+                self.f.byte(0x83); // i64.and
+                self.f.i64_const(0);
+                self.f.byte(0x52); // i64.ne
+                self.f.if_void();
+                self.f.local_get(n0);
+                self.f.local_set(got);
+                self.f.block_void();
+                self.f.loop_void();
+                self.f.local_get(got);
+                self.f.local_get(n0);
+                self.f.byte(0x85); // i64.xor
+                self.f.local_get(keep0);
+                self.f.i64_const(-1);
+                self.f.byte(0x85); // i64.xor
+                self.f.byte(0x83); // i64.and
+                self.f.i64_const(0);
+                self.f.byte(0x52); // i64.ne
+                self.f.br_if(1);
+                self.f.local_get(wa);
+                self.f.local_get(got);
+                self.f.local_get(got);
+                self.f.local_get(keep0);
+                self.f.byte(0x83); // i64.and
+                self.f.local_get(w0);
+                self.f.local_get(keep0);
+                self.f.i64_const(-1);
+                self.f.byte(0x85); // i64.xor
+                self.f.byte(0x83); // i64.and
+                self.f.byte(0x84); // i64.or
+                self.f.atomic(atomic_cmpxchg_op(Ty::I64, MemSz::B8), 3, 0);
+                self.f.local_tee(nv);
+                self.f.local_get(got);
+                self.f.byte(0x51); // i64.eq
+                self.f.br_if(1);
+                self.f.local_get(nv);
+                self.f.local_set(got);
+                self.f.br(0);
+                self.f.end(); // loop
+                self.f.end(); // block
+                self.f.br(3); // (the outer loop)
+                self.f.end();
+                self.f.local_get(got);
+                self.f.local_set(w1);
+                self.f.br(1); // (this loop)
+            }
+            self.f.end(); // if
+            self.f.end(); // loop (second word)
+            self.f.end(); // loop
+            self.f.end(); // block
+            self.f.local_get(o);
+            if ty == Ty::I32 {
+                self.f.byte(code::I32_WRAP_I64);
+            }
+            self.f.local_set(old);
             // Let it go.
             self.f.addr_const(gex_abi::SPLIT_LOCK);
             self.f.i32_const(0);
@@ -3021,6 +3169,56 @@ impl<'a> Emitter<'a> {
         }
         self.f.end();
         self.f.local_get(old);
+    }
+
+    /// A misaligned locked access's new value for the old one in local `f`
+    /// (i64, masked to the access's `field`), masked, on the stack. A
+    /// compare-exchange whose expected value differs leaves instead, by
+    /// `br_if 1` (to the end of the block around the caller's loop).
+    fn misaligned_new_value(&mut self, kind: Misaligned, ty: Ty, f: u32, field: i64) {
+        match kind {
+            Misaligned::Cas { expected, replacement } => {
+                // Unequal: done, nothing written.
+                self.f.local_get(f);
+                self.f.local_get(expected);
+                if ty == Ty::I32 {
+                    self.f.byte(code::I64_EXTEND_I32_U);
+                }
+                self.f.i64_const(field);
+                self.f.byte(0x83); // i64.and
+                self.f.byte(0x52); // i64.ne
+                self.f.br_if(1);
+                self.f.local_get(replacement);
+                if ty == Ty::I32 {
+                    self.f.byte(code::I64_EXTEND_I32_U);
+                }
+            }
+            Misaligned::Rmw { op, val } => match op {
+                RmwOp::Xchg => {
+                    self.f.local_get(val);
+                    if ty == Ty::I32 {
+                        self.f.byte(code::I64_EXTEND_I32_U);
+                    }
+                }
+                _ => {
+                    self.f.local_get(f);
+                    self.f.local_get(val);
+                    if ty == Ty::I32 {
+                        self.f.byte(code::I64_EXTEND_I32_U);
+                    }
+                    let b = match op {
+                        RmwOp::Add => BinOp::Add,
+                        RmwOp::Sub => BinOp::Sub,
+                        RmwOp::And => BinOp::And,
+                        RmwOp::Or => BinOp::Or,
+                        _ => BinOp::Xor,
+                    };
+                    self.f.byte(bin_op(b, Ty::I64));
+                }
+            },
+        }
+        self.f.i64_const(field);
+        self.f.byte(0x83); // i64.and
     }
 
     /// Coherent (atomic-when-aligned) load. `addr` (i32) is on the stack; the
@@ -3047,15 +3245,122 @@ impl<'a> Emitter<'a> {
         self.f.i32_const(mask);
         self.f.byte(0x71); // i32.and
         self.f.if_result(val_type(ty));
-        // unaligned: plain load (handles signed natively)
-        self.f.local_get(a);
-        self.f.load(load_op(ty, sz, signed), alogp, static_off);
+        if tso2() {
+            // unaligned, whole: an atomic `or 0` of the word(s) holding it
+            let z = self.alloc(ty);
+            if ty == Ty::I64 { self.f.i64_const(0) } else { self.f.i32_const(0) }
+            self.f.local_set(z);
+            self.emit_misaligned_atomic(a, ty, sz, static_off, Misaligned::Rmw { op: RmwOp::Or, val: z });
+            if signed {
+                self.sign_extend_after_atomic(ty, sz);
+            }
+        } else {
+            // unaligned: plain load (handles signed natively)
+            self.f.local_get(a);
+            self.f.load(load_op(ty, sz, signed), alogp, static_off);
+        }
         self.f.else_();
         // aligned: atomic (unsigned) load, then sign-extend if needed
         self.f.local_get(a);
         self.f.atomic(atomic_load_op(ty, sz), alogp, static_off);
         if signed {
             self.sign_extend_after_atomic(ty, sz);
+        }
+        self.f.end();
+    }
+
+    /// The tear switch's count of a plain misaligned 8-byte access (`TEAR`):
+    /// one atomic add to its counter, and the first eight of a process said
+    /// (`cache_op::TEAR_LOAD`/`TEAR_STORE`, with the address in `a`).
+    fn emit_tear_count(&mut self, a: u32, static_off: u32, store: bool) {
+        self.f.addr_const(gex_abi::TEAR_COUNTS + if store { 8 } else { 0 });
+        self.f.i64_const(1);
+        self.f.atomic(atomic_rmw_op(RmwOp::Add, Ty::I64, MemSz::B8), 3, 0);
+        self.f.i64_const(8);
+        self.f.byte(0x54); // i64.lt_u
+        self.f.if_void();
+        self.f.local_get(self.ctx_local);
+        self.f.i64_const(self.block_start as i64);
+        self.f.i32_const(if store { gex_abi::cache_op::TEAR_STORE } else { gex_abi::cache_op::TEAR_LOAD });
+        self.f.local_get(a);
+        self.f.addr_add_const(static_off);
+        self.f.addr_to_i64();
+        self.f.call(self.cx.cache_op);
+        self.f.end();
+    }
+
+    /// A plain 8-byte load under the tear switch: aligned, as ever; misaligned,
+    /// counted, and at 2 done as two 4-byte halves, low first. The address is
+    /// on the stack; leaves the value.
+    fn emit_tear_load(&mut self, static_off: u32) {
+        let a = self.alloc(Self::addr_ir_ty());
+        self.f.local_set(a);
+        self.f.local_get(a);
+        self.f.addr_add_const(static_off);
+        self.f.addr_low32();
+        self.f.i32_const(7);
+        self.f.byte(0x71); // i32.and
+        self.f.if_result(val_type(Ty::I64));
+        self.emit_tear_count(a, static_off, false);
+        if tear() >= 2 {
+            self.f.local_get(a);
+            self.f.load(load_op(Ty::I64, MemSz::B4, false), 0, static_off);
+            self.f.local_get(a);
+            self.f.load(load_op(Ty::I64, MemSz::B4, false), 0, static_off + 4);
+            self.f.i64_const(32);
+            self.f.byte(code::I64_SHL);
+            self.f.byte(code::I64_OR);
+        } else {
+            self.f.local_get(a);
+            self.f.load(load_op(Ty::I64, MemSz::B8, false), 0, static_off);
+        }
+        self.f.else_();
+        // aligned: as without the switch (atomic under tso=1)
+        self.f.local_get(a);
+        if coherent_loads() {
+            self.f.atomic(atomic_load_op(Ty::I64, MemSz::B8), 3, static_off);
+        } else {
+            self.f.load(load_op(Ty::I64, MemSz::B8, false), 3, static_off);
+        }
+        self.f.end();
+    }
+
+    /// A plain 8-byte store under the tear switch, as [`Self::emit_tear_load`]:
+    /// the stack holds `[addr, val(i64)]`.
+    fn emit_tear_store(&mut self, static_off: u32) {
+        let v = self.alloc(Ty::I64);
+        self.f.local_set(v);
+        let a = self.alloc(Self::addr_ir_ty());
+        self.f.local_set(a);
+        self.f.local_get(a);
+        self.f.addr_add_const(static_off);
+        self.f.addr_low32();
+        self.f.i32_const(7);
+        self.f.byte(0x71); // i32.and
+        self.f.if_void();
+        self.emit_tear_count(a, static_off, true);
+        if tear() >= 2 {
+            self.f.local_get(a);
+            self.f.local_get(v);
+            self.f.store(store_op(Ty::I64, MemSz::B4), 0, static_off);
+            self.f.local_get(a);
+            self.f.local_get(v);
+            self.f.i64_const(32);
+            self.f.byte(0x88); // i64.shr_u
+            self.f.store(store_op(Ty::I64, MemSz::B4), 0, static_off + 4);
+        } else {
+            self.f.local_get(a);
+            self.f.local_get(v);
+            self.f.store(store_op(Ty::I64, MemSz::B8), 0, static_off);
+        }
+        self.f.else_();
+        // aligned: as without the switch (atomic under tso=1)
+        self.f.local_get(a);
+        self.f.local_get(v);
+        if coherent_loads() {
+            self.f.atomic(atomic_store_op(Ty::I64, MemSz::B8), 3, static_off);
+        } else {
+            self.f.store(store_op(Ty::I64, MemSz::B8), 3, static_off);
         }
         self.f.end();
     }
@@ -3081,10 +3386,16 @@ impl<'a> Emitter<'a> {
         self.f.i32_const(mask);
         self.f.byte(0x71); // i32.and
         self.f.if_void();
-        // unaligned: plain store
-        self.f.local_get(a);
-        self.f.local_get(v);
-        self.f.store(store_op(ty, sz), alogp, static_off);
+        if tso2() {
+            // unaligned, whole: an atomic exchange of the word(s) holding it
+            self.emit_misaligned_atomic(a, ty, sz, static_off, Misaligned::Rmw { op: RmwOp::Xchg, val: v });
+            self.f.drop_();
+        } else {
+            // unaligned: plain store
+            self.f.local_get(a);
+            self.f.local_get(v);
+            self.f.store(store_op(ty, sz), alogp, static_off);
+        }
         self.f.else_();
         // aligned: atomic store
         self.f.local_get(a);
@@ -3306,6 +3617,8 @@ impl<'a> Emitter<'a> {
                     // no signed load-acquire either.
                     let sub = atomic_load_op(*ty, *sz);
                     self.f.atomic(sub, natural_align(*sz), static_off);
+                } else if tear() != 0 && *ty == Ty::I64 && *sz == MemSz::B8 && !tso2() {
+                    self.emit_tear_load(static_off);
                 } else if coherent_loads() {
                     self.emit_coherent_load(*ty, *sz, *signed, static_off);
                 } else {
@@ -3356,7 +3669,12 @@ impl<'a> Emitter<'a> {
                 addr,
                 offset,
                 bytes,
-            } => self.emit_vload(*addr, *offset, *bytes),
+            } => {
+                if tso2() {
+                    self.f.atomic_fence();
+                }
+                self.emit_vload(*addr, *offset, *bytes)
+            }
             Expr::VConst(b) => self.f.v128_const(b),
             Expr::VSplat { a, lane_bytes } => {
                 self.push(*a);
@@ -5430,17 +5748,18 @@ impl<'a> Emitter<'a> {
                 // already the target (stored above) and the registers are
                 // flushed, so the slow path may deliver a signal and unwind.
                 // The pc handed to the poll is what the host writes back as
-                // the context PC, and what a dispatch miss right after this
-                // resumes from. On A64 the branch's own address serves: the
-                // instruction is re-executed and re-reads its register. On
-                // x86-64 `end - 1` is inside the branch instruction, so the
-                // poll gets the target itself -- the value the PC already
-                // holds, and the only address that is safe to resume at.
-                if gex_abi::X86 {
-                    self.emit_safepoint_no_flush_dynamic();
-                } else {
-                    self.emit_safepoint_no_flush(block.end - gex_abi::INST_ALIGN, 1);
-                }
+                // the context PC, and what the miss stub hands the host when
+                // the dispatch right after this misses: so it is the target,
+                // the value the PC already holds. The branch has been taken,
+                // and a signal here is one between it and the instruction at
+                // its target, as on hardware. (A64 once passed the branch's
+                // own address, to be run again. A miss after an expired
+                // countdown was then reported at the branch: a target that
+                // always misses, the signal-return trampoline at a handler's
+                // `ret`, translated the `ret` anew each time, and after 64
+                // such the host took it for a livelock and ended the
+                // process.)
+                self.emit_safepoint_no_flush_dynamic();
                 self.emit_dispatch_tail_call();
             }
             Term::Syscall { next } => {
@@ -5485,24 +5804,10 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// The safepoint countdown, for a caller that has already flushed and
-    /// carries on rather than jumping.
-    ///
-    /// Unlike [`Self::emit_safepoint`] this never flushes -- an indirect branch
-    /// has flushed already and its target is in a local -- so it emits only the
-    /// counter and the call.
-    ///
-    /// `unretired`: the instructions from `pc` to the block's end, which a
-    /// signal delivered at `pc` runs again: not retired while the host has
-    /// the thread, retired if it returns here.
-    fn emit_safepoint_no_flush(&mut self, pc: u64, unretired: i64) {
-        let before = self.f.code.len();
-        self.emit_safepoint_no_flush_inner(pc, unretired);
-        SAFEPOINT_BYTES.fetch_add(self.f.code.len() - before, Ordering::Relaxed);
-    }
-
-    /// The poll with the pc taken from `scratch_i64` (the branch target an
-    /// indirect terminator has just stored) rather than a constant.
+    /// The safepoint countdown for an indirect branch, which has flushed
+    /// already and carries on to dispatch: unlike [`Self::emit_safepoint`] it
+    /// never flushes, and the poll's pc is the branch target `scratch_i64`
+    /// holds (and the context's PC already says), not a constant.
     fn emit_safepoint_no_flush_dynamic(&mut self) {
         let before = self.f.code.len();
         self.ctx_base();
@@ -5521,26 +5826,6 @@ impl<'a> Emitter<'a> {
         self.f.call(self.cx.safepoint);
         self.f.end();
         SAFEPOINT_BYTES.fetch_add(self.f.code.len() - before, Ordering::Relaxed);
-    }
-
-    fn emit_safepoint_no_flush_inner(&mut self, pc: u64, unretired: i64) {
-        self.ctx_base();
-        self.ctx_base();
-        self.f.load(0x28, 2, ctx::SAFEPOINT_COUNTER as u32);
-        self.f.i32_const(1);
-        self.f.byte(0x6b); // i32.sub
-        self.f.local_tee(self.scratch_i32);
-        self.f.store(0x36, 2, ctx::SAFEPOINT_COUNTER as u32);
-        self.f.local_get(self.scratch_i32);
-        self.f.i32_const(0);
-        self.f.byte(0x4c); // i32.le_s
-        self.f.if_void();
-        self.emit_count(-unretired);
-        self.f.local_get(self.ctx_local);
-        self.f.i64_const(pc as i64);
-        self.f.call(self.cx.safepoint);
-        self.emit_count(unretired);
-        self.f.end();
     }
 
     /// Poll for a pending signal before a backward jump.
@@ -5789,9 +6074,10 @@ impl<'a> Emitter<'a> {
     }
 
     /// The self-modifying-code guard (`Block::guard`): compare the block's
-    /// code bytes with what was lifted; on a difference tell the host to
-    /// re-lift the page (`cache_op` IC_INVALIDATE, the same path `ic ivau`
-    /// takes on AArch64) and dispatch to this address again, which now misses.
+    /// code bytes with what was lifted; on a difference tell the host
+    /// (`cache_op` GUARD_HIT, with this module), which retires the block or
+    /// its page, and dispatch to this address again, which now reaches the
+    /// bytes as they are.
     fn emit_guard(&mut self, start: u64, bytes: &[u8]) {
         self.f.i64_const(0);
         self.f.local_set(self.scratch_i64);
@@ -5819,8 +6105,8 @@ impl<'a> Emitter<'a> {
         self.f.if_void();
         self.f.local_get(self.ctx_local);
         self.f.i64_const(start as i64);
-        self.f.i32_const(gex_abi::cache_op::IC_INVALIDATE);
-        self.f.i64_const(start as i64);
+        self.f.i32_const(gex_abi::cache_op::GUARD_HIT);
+        self.module_arg();
         self.f.call(self.cx.cache_op);
         // The dispatch below now misses, and a miss translates the address in
         // the context's PC: this one, not the last one stored (a direct jump
@@ -5889,20 +6175,7 @@ impl<'a> Emitter<'a> {
             // another, modules restored from the translation cache), so ids
             // repeat; it only decides whether to translate again, never
             // whether to resume from JavaScript (`gex_cache_op`).
-            match self.cx.module_id_global {
-                Some(g) => {
-                    self.f.global_get(g);
-                    self.f.byte(0xad); // i64.extend_i32_u
-                }
-                None => self.f.i64_const((self.cx.module_id & 0xffff_ffff) as i64),
-            }
-            if let Some(g) = self.cx.dense_global {
-                self.f.global_get(g);
-                self.f.byte(0xad); // i64.extend_i32_u
-                self.f.i64_const(32);
-                self.f.byte(0x86); // i64.shl
-                self.f.byte(0x84); // i64.or
-            }
+            self.module_arg();
             self.f.call(self.cx.cache_op);
         }
         self.store_pc(start);
@@ -5915,6 +6188,26 @@ impl<'a> Emitter<'a> {
         }
         self.emit_dispatch_tail_call();
         self.f.end();
+    }
+
+    /// This module, as `PAGE_STALE` and `GUARD_HIT` name it: its dense base
+    /// (high half, read at run time: where its blocks are in the process
+    /// running it, unique there by construction) and its id (low half).
+    fn module_arg(&mut self) {
+        match self.cx.module_id_global {
+            Some(g) => {
+                self.f.global_get(g);
+                self.f.byte(0xad); // i64.extend_i32_u
+            }
+            None => self.f.i64_const((self.cx.module_id & 0xffff_ffff) as i64),
+        }
+        if let Some(g) = self.cx.dense_global {
+            self.f.global_get(g);
+            self.f.byte(0xad); // i64.extend_i32_u
+            self.f.i64_const(32);
+            self.f.byte(0x86); // i64.shl
+            self.f.byte(0x84); // i64.or
+        }
     }
 
     fn emit_dispatch_tail_call(&mut self) {
@@ -6285,6 +6578,19 @@ pub fn clobbers_guest_state(s: &Stmt) -> bool {
 /// context is left stale inside it. A register written before reading needs no
 /// preload, and leaving it out matters: every preloaded register stays live
 /// across the whole loop, costing the host's allocator a machine register.
+/// The registers `block`'s statements write, once each, in order.
+fn written_registers(block: &Block) -> Vec<GuestReg> {
+    let mut written = Vec::new();
+    for s in &block.stmts {
+        if let Stmt::WriteReg { reg, .. } = s {
+            if !written.contains(reg) {
+                written.push(*reg);
+            }
+        }
+    }
+    written
+}
+
 fn live_in_registers(block: &Block) -> Vec<GuestReg> {
     let mut live_in = Vec::new();
     let mut written = Vec::new();

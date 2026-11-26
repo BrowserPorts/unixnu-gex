@@ -75,13 +75,26 @@ pub fn build_lock() -> Result<BuildLock> {
         match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(mut f) => {
                 use std::io::Write;
-                let _ = write!(f, "{}", std::process::id());
+                // A lock without its pid would be left to wait on: none is kept
+                if let Err(e) = write!(f, "{}", std::process::id()).and_then(|()| f.flush()) {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(anyhow!("{}: {e}", path.display()));
+                }
                 return Ok(BuildLock(path));
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 let holder = std::fs::read_to_string(&path).unwrap_or_default();
                 let alive = holder.trim().parse::<u32>().is_ok_and(gex_kernel::hostos::calls().alive);
-                if !alive && !holder.is_empty() {
+                // A builder writes its pid as soon as it has made the file, so
+                // one still empty after a while is a builder that died between
+                // the two, and holds nothing
+                let abandoned = holder.is_empty()
+                    && std::fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|age| age > std::time::Duration::from_secs(10));
+                if (!alive && !holder.is_empty()) || abandoned {
                     let _ = std::fs::remove_file(&path);
                     continue;
                 }
@@ -172,9 +185,63 @@ fn provided(pe: &gex_ld::pe::PeImage, base: u64) -> Provided {
 /// The key of `image`'s unit built around `pv`'s providers and its
 /// indirect-call profile (`icall_hints`): the image's own key when there
 /// are neither.
+/// The functions the next units built in this process compile, when not
+/// all of them ([`set_functions`]).
+static FUNCTIONS: Mutex<Option<std::collections::BTreeSet<u64>>> = Mutex::new(None);
+
+/// Compile only `functions` into the units built from here on (`gexc
+/// cgen-image --functions`, a hot set from `gexc hotset`): the image's other
+/// functions leave for tier-1 (`gex_cgen::image::build_c_module_only`).
+/// The set, not where it came from, is part of the unit's key, so units of
+/// different sets of one image never stand in for each other. `None`: every
+/// function, as before.
+pub fn set_functions(functions: Option<std::collections::BTreeSet<u64>>) {
+    *FUNCTIONS.lock().unwrap() = functions;
+}
+
+/// The functions the unit of the image keyed `image` is made of, when not
+/// all of them: this process's ([`set_functions`]), else the set the image's
+/// unit was last built from here, which a build writes beside the units as
+/// `sets/<image key>`. That is how a run, which is given no set, finds the
+/// unit `gexc cgen-image --functions` built for an image and leaves every
+/// other image on its whole unit. Read once per image.
+fn functions_of(image: &str) -> Option<Arc<std::collections::BTreeSet<u64>>> {
+    if let Some(only) = FUNCTIONS.lock().unwrap().as_ref() {
+        return Some(Arc::new(only.clone()));
+    }
+    static SETS: Mutex<Option<HashMap<String, Option<Arc<std::collections::BTreeSet<u64>>>>>> = Mutex::new(None);
+    let mut sets = SETS.lock().unwrap_or_else(|e| e.into_inner());
+    sets.get_or_insert_with(HashMap::new)
+        .entry(image.to_string())
+        .or_insert_with(|| {
+            let text = std::fs::read_to_string(cache_root().ok()?.join("sets").join(image)).ok()?;
+            Some(Arc::new(text.lines().filter_map(|l| u64::from_str_radix(l.trim(), 16).ok()).collect()))
+        })
+        .clone()
+}
+
+/// Write down the set this process builds `image`'s unit from
+/// ([`functions_of`] reads it back in a run).
+fn remember_functions(image: &str) -> Result<()> {
+    let Some(only) = FUNCTIONS.lock().unwrap().clone() else { return Ok(()) };
+    let dir = cache_root()?.join("sets");
+    std::fs::create_dir_all(&dir)?;
+    let text: String = only.iter().map(|a| format!("{a:x}\n")).collect();
+    std::fs::write(dir.join(image), text).with_context(|| format!("writing the function set of {image}"))?;
+    // The keys runs remembered (`remembered_unit_key`) were made without
+    // this set: forgotten, so the next run works them out again.
+    let _ = std::fs::remove_dir_all(cache_root()?.join("w3keys"));
+    Ok(())
+}
+
 fn unit_key(image: &gex_ld::Image, pv: &Provided) -> String {
     use std::hash::{Hash, Hasher};
     let mut key = image_key(image);
+    if let Some(only) = functions_of(&key) {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        only.hash(&mut h);
+        key = format!("{key}-s{:016x}", h.finish());
+    }
     if !pv.stubs.is_empty() {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         pv.stubs.hash(&mut h);
@@ -847,6 +914,7 @@ fn prepare_with(
     let root = cache_root()?;
     let dir = root.join(&key);
     let out = dir.join("c.wasm");
+    remember_functions(&image_key(image))?;
     if out.exists() {
         return Ok(out);
     }
@@ -889,7 +957,8 @@ fn prepare_with(
     };
     let stubs: std::collections::HashSet<u64> = pv.stubs.iter().chain(&pv.twins).copied().collect();
     let hints = icall_hints(image);
-    let stats = gex_cgen::image::build_c_module(&recovery, &work, &root.join("objects"), &out, jobs, &byte, &stubs, &hints)?;
+    let only: Option<std::collections::HashSet<u64>> = functions_of(&image_key(image)).map(|s| s.iter().copied().collect());
+    let stats = gex_cgen::image::build_c_module_only(&recovery, &work, &root.join("objects"), &out, jobs, &byte, &stubs, &hints, only.as_ref())?;
     // GEX_CGEN_KEEP: keep the generated C (dir/work) to read.
     if std::env::var_os("GEX_CGEN_KEEP").is_none() {
         let _ = std::fs::remove_dir_all(&work);
@@ -1026,6 +1095,23 @@ fn read_unit(path: &std::path::Path, stubs: &[u64]) -> Result<Option<(std::path:
     for a in entries.iter_mut() {
         if stubs.binary_search(a).is_ok() {
             *a = 0;
+        }
+    }
+    // `GEX_UNIT_ENTRIES=LO:HI`: of a unit built from a function set, only
+    // the entries numbered LO up to HI are bound, the others staying on
+    // tier-1 (bisecting a unit down to the function a program fails in,
+    // without building it again).
+    static ONLY: OnceLock<Option<(usize, usize)>> = OnceLock::new();
+    let only = *ONLY.get_or_init(|| {
+        let v = std::env::var("GEX_UNIT_ENTRIES").ok()?;
+        let (lo, hi) = v.split_once(':')?;
+        Some((lo.parse().ok()?, hi.parse().ok()?))
+    });
+    if let (Some((lo, hi)), true) = (only, path.parent().and_then(|d| d.file_name()).and_then(|n| n.to_str()).is_some_and(|n| n.contains("-s"))) {
+        for (i, a) in entries.iter_mut().enumerate() {
+            if i < lo || i >= hi {
+                *a = 0;
+            }
         }
     }
     Ok(Some((path.to_path_buf(), Arc::new(cwasm), entries)))

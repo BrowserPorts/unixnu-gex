@@ -9,7 +9,7 @@ MESA=$ROOT/third_party/mesa
 SANITIZE=${GEX_MESA_SANITIZE:-0}
 # GEX_MESA_THREADS=0: the single-thread build's Mesa,
 # without -pthread -- a plain memory, no glthread -- and Wink's `st` Tint.
-# Built in its own directory and published under page/public/gex/st/, beside
+# Built in its own directory and published under runtime/files/out/gex/st/, beside
 # the threaded one.
 # GEX_MESA_PAGE_ONLY=1: link only the page's gex-wgpu-replay (a page-only web build), not
 # the softpipe replay and smokes the Mesa tests use.
@@ -102,31 +102,39 @@ fi
 # directory compiled with other ones is cleaned below.
 export EMCC_CFLAGS="${EMCC_CFLAGS:+$EMCC_CFLAGS }-ffile-prefix-map=${WINK_CACHE:-$(dirname "$TINT_OUT")}=/tint -ffile-prefix-map=$ROOT=/gex"
 
-# A build directory set up from files that are no longer there (its cross or
-# native file, or the source tree, at an old path, as after the tree's files
-# moved) cannot be reconfigured: it is set up afresh.
+# A build directory set up from other files than this build's -- its source
+# tree or cross file gone (the tree's files moved), or another checkout's (a
+# build directory copied from another worktree, whose Mesa and gex sources it
+# then went on compiling, under this tree's cache key) -- cannot be
+# reconfigured: it is set up afresh.
 if [ -f "$BUILD/build.ninja" ]; then
-    gone=$(python3 -I - "$BUILD" <<'PY'
+    other=$(python3 -I - "$BUILD" "$MESA" "$CROSS" <<'PY'
 import ast, configparser, json, os, sys
-b = sys.argv[1]
-paths = []
+b, mesa, cross = sys.argv[1:4]
+real = lambda p: os.path.realpath(p)
+out = []
 try:
-    paths.append(json.load(open(os.path.join(b, 'meson-info', 'meson-info.json')))['directories']['source'])
+    src = json.load(open(os.path.join(b, 'meson-info', 'meson-info.json')))['directories']['source']
+    if not os.path.exists(src) or real(src) != real(mesa):
+        out.append(f'source {src}')
 except (OSError, ValueError, KeyError):
-    paths.append(os.path.join(b, 'meson-info', 'meson-info.json'))
+    out.append('no meson-info.json')
 c = configparser.ConfigParser()
 c.read(os.path.join(b, 'meson-private', 'cmd_line.txt'))
 for k in ('cross_file', 'native_file'):
     v = c.get('properties', k, fallback='[]')
     try:
-        paths += ast.literal_eval(v)
+        ps = ast.literal_eval(v)
     except (ValueError, SyntaxError):
-        paths.append(v)
-print(' '.join(p for p in paths if not os.path.exists(p)))
+        ps = [v]
+    for p in ps:
+        if not os.path.exists(p) or (k == 'cross_file' and real(p) != real(cross)):
+            out.append(f'{k} {p}')
+print('; '.join(out))
 PY
 )
-    if [ -n "$gone" ]; then
-        echo "$BUILD was set up from files no longer there ($gone): setting it up again" >&2
+    if [ -n "$other" ]; then
+        echo "$BUILD was set up from other files than this build's ($other): setting it up again" >&2
         rm -rf "${BUILD:?}"
     fi
 fi
@@ -277,7 +285,7 @@ if [ "$SANITIZE" != 1 ] && [ -f "$TGT/gex-wgpu-replay.wasm.orig" ]; then
     [ -f "$TGT/split/gex-wgpu-replay.deferred.wasm" ] &&
         cp "$TGT/split/gex-wgpu-replay.deferred.wasm" "$TGT/gex-wgpu-replay.deferred.wasm"
 fi
-PUB="$ROOT/page/public/gex"
+PUB="$ROOT/runtime/files/out/gex"
 [ "$THREADS" = 0 ] && [ -d "$PUB" ] && PUB="$PUB/st" && mkdir -p "$PUB"
 # A link without -sSPLIT_MODULE=1 (the mesa-wink tree's) leaves no
 # .wasm.orig and so no split: its .wasm is the plain module, and that is what
@@ -294,7 +302,7 @@ if [ -d "$PUB" ] && [ -f "$FROM/gex-wgpu-replay.wasm" ]; then
         echo "  published $PUB/$f"
     done
     # The licences of what the replay is built from, beside it, for the npm
-    # package's THIRD-PARTY (page/runtime/build.sh): Mesa's, Dawn's (Tint is
+    # package's THIRD-PARTY (runtime/build.sh): Mesa's, Dawn's (Tint is
     # Dawn's) and emdawnwebgpu's.
     L=$PUB/licenses
     rm -rf "$L/mesa" "$L/dawn" "$L/emdawnwebgpu"

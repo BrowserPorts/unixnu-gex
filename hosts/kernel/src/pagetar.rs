@@ -1,4 +1,4 @@
-//! A tar laid into the root from the page (page/runtime kfs.js `addTar`),
+//! A tar laid into the root from the page (runtime kfs.js `addTar`),
 //! sent in parts as it is fetched and unpacked (`gex_kernel::tar::Reader`):
 //! directories, files, modes, times, symbolic and hard links, extended
 //! attributes. Over whatever is there: a later tar's path wins. Seeding,

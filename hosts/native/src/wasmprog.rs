@@ -95,11 +95,14 @@ pub(crate) fn install(store: &mut Store<HostState>, memory: &gex_mem::GuestMemor
         (w(12), w(16), w(20), w(24), w(28), w(32))
     };
     let (wasm_at, wasm_len, mem_base, _mem_size, entry, thread_entry) = hdr;
-    let wasm = memory
-        .bytes()
-        .get(wasm_at as usize..(wasm_at + wasm_len) as usize)
-        .ok_or_else(|| anyhow!("wasm32 program: module outside memory"))?
-        .to_vec();
+    // From the program, not memory: the image's placement leaves it out.
+    let wasm = program
+        .exe
+        .segments
+        .iter()
+        .find(|s| wasm_at >= s.vaddr && wasm_at + wasm_len <= s.vaddr + s.bytes.len() as u64)
+        .map(|s| s.bytes[(wasm_at - s.vaddr) as usize..(wasm_at - s.vaddr + wasm_len) as usize].to_vec())
+        .ok_or_else(|| anyhow!("wasm32 program: module outside its image"))?;
     // A wasm32 module imports a 32-bit memory: one host process is one
     // memory flavour, so a run that started with a 64-bit memory (`--mem64`,
     // or what an earlier run of its first program learned) cannot run it.

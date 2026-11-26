@@ -1,7 +1,9 @@
-// Lazy files kept in the page's Cache Storage (app.js `lazyCache`). A lazy
-// file's read happens in a Worker blocked in the kernel (lazy-fetch.mjs),
-// which cannot wait on a promise; the cache is asynchronous. So the read is
-// asked of one Worker that owns the cache (page/src/lazy-cache-worker.js)
+// Lazy files kept in the page's Cache Storage (app.js `lazyCache`), or read
+// from a page's own lazy source (fs.js setLazySource,
+// runtime/src/lazy-source-worker.js). A lazy file's read happens in a Worker
+// blocked in the kernel (lazy-fetch.mjs), which cannot wait on a promise; the
+// cache and the source are asynchronous. So the read is asked of one Worker
+// that owns them (runtime/src/host/lazy-cache-worker.js, or the source's)
 // through slots in a SharedArrayBuffer: the reader fills a slot, wakes the
 // owner and waits; the owner answers from the cache, or fetches what the
 // cache lacks (a ranged request, as the reader would have made) and keeps
@@ -16,7 +18,8 @@
 //
 // The slots: `ctl`, an Int32Array on a SharedArrayBuffer of SLOTS * SLOT
 // bytes after a header of HEAD bytes. ctl[0] counts requests (the owner
-// waits on it). A slot, i32 at SLOT/4 * i + HEAD/4:
+// waits on it); ctl[1] counts slots freed (a reader with nowhere else to go
+// waits on it for a free slot). A slot, i32 at SLOT/4 * i + HEAD/4:
 //   [0] state: FREE, ASKED (the reader waits), TAKEN (the owner reads the
 //       cache or fetches; the reader keeps waiting), WRITING (the owner
 //       copies), DONE, GIVEN_UP (no owner took the ask in time and the
@@ -52,6 +55,9 @@ export function makeControl() {
 
 let ctl = null;
 let raw = null;
+/** Whether the owner is the only way to a lazy file's bytes: a page's own
+ *  source (fs.js setLazySource), whose keys are not URLs. */
+let only = false;
 /** Whether this Worker has an owner to ask (`setLazyCache`). */
 export function lazyCacheOn() {
   return ctl !== null;
@@ -62,6 +68,12 @@ export function setLazyCache(c) {
   if (!c?.ctl) return;
   ctl = new Int32Array(c.ctl);
   raw = new Uint8Array(c.ctl);
+  only = !!c.only;
+}
+
+/** Whether a read must go to the owner and nowhere else (`only`). */
+export function lazyOwnerOnly() {
+  return only;
 }
 
 // How long a reader waits for the owner to take its ask before it asks the
@@ -85,8 +97,14 @@ export function cachedRead(href, from, dst, len) {
   const url = new TextEncoder().encode(href);
   if (url.length > URL_MAX) return -1;
   let s = -1;
-  for (let i = 0; i < SLOTS; i++) {
-    if (Atomics.compareExchange(ctl, (HEAD + i * SLOT) / 4, FREE, ASKED + 100) === FREE) { s = i; break; }
+  for (;;) {
+    const freed = Atomics.load(ctl, 1);
+    for (let i = 0; i < SLOTS; i++) {
+      if (Atomics.compareExchange(ctl, (HEAD + i * SLOT) / 4, FREE, ASKED + 100) === FREE) { s = i; break; }
+    }
+    // With no other way to the bytes, a full set of slots is waited out.
+    if (s >= 0 || !only) break;
+    Atomics.wait(ctl, 1, freed, 1000);
   }
   if (s < 0) return -1;
   const base = (HEAD + s * SLOT) / 4;
@@ -101,10 +119,16 @@ export function cachedRead(href, from, dst, len) {
   Atomics.add(ctl, 0, 1);
   Atomics.notify(ctl, 0);
   const t0 = Date.now();
+  let said = false;
   for (;;) {
     const st = Atomics.load(ctl, base);
     if (st === DONE) break;
-    if (st === ASKED && Date.now() - t0 > WAIT_MS) {
+    // a read that stalls its program, said once (the owner says on what)
+    if (!said && Date.now() - t0 > 10000) {
+      said = true;
+      console.warn(`[gex] a read of ${href} @${from} has waited 10 s for the page's lazy files (${st === ASKED ? 'not taken yet' : 'taken'})`);
+    }
+    if (st === ASKED && !only && Date.now() - t0 > WAIT_MS) {
       if (Atomics.compareExchange(ctl, base, ASKED, GIVEN_UP) === ASKED) return -1;
       continue;
     }
@@ -112,6 +136,8 @@ export function cachedRead(href, from, dst, len) {
   }
   const n = ctl[base + 1];
   Atomics.store(ctl, base, FREE);
+  Atomics.add(ctl, 1, 1);
+  Atomics.notify(ctl, 1);
   return n < 0 ? OWNER_FAILED : n;
 }
 

@@ -1,5 +1,5 @@
 //! store.wasm: gex-store's offline editor ([`gex_store::editor`]) for the
-//! page (page/runtime/src/store.js), one store per instance.
+//! page (runtime/src/store.js), one store per instance.
 //!
 //! The page answers `store.io(which, op, offset, ptr, len)` against a store
 //! file's sync access handle (`blocks.mjs` `handleOp`): 0, or a negative

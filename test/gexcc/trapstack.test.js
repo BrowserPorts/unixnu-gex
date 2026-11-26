@@ -13,7 +13,7 @@ const ROOT = join(import.meta.dirname, '..', '..');
 export default async function (t) {
   const c = gexcc(t);
   const x86 = t.arch === 'x86';
-  const seed = join(ROOT, 'page/public/gex', `seed${x86 ? '.x86' : ''}.shared.wasm`);
+  const seed = join(ROOT, 'runtime/files/out/gex', `seed${x86 ? '.x86' : ''}.shared.wasm`);
   if (!existsSync(seed)) t.skip(`no ${seed} (make assets)`);
   const d = c.dir('trapstack');
   await c.build(['-O1', '-w', '-o', `${d}/faultsig`, join(FIXTURES, 'programs', 'faultsig.c')]);

@@ -313,6 +313,15 @@ pub struct SurfaceInfo {
     /// pixels per surface unit. The host draws a surface at
     /// `width * client_scale / buffer_scale` device pixels.
     pub client_scale: i32,
+    /// The real scale the client was told, in 120ths
+    /// (`wp_fractional_scale_v1`): device pixels per surface unit times 120.
+    /// The host draws a surface at its size in surface units times
+    /// `scale120 / 120`.
+    pub scale120: i32,
+    /// `wp_viewport.set_destination`: the surface's size in surface units,
+    /// when its client said (a fractional-scale client's buffer is in device
+    /// pixels, its destination in units).
+    pub view: Option<(i32, i32)>,
     /// Where the client says the surface is and what it is stacked under
     /// (`gex_window_placement_v1`), when it says so.
     pub placement: Placement,
@@ -579,6 +588,11 @@ pub fn push_record(out: &mut Vec<i32>, client: u32, info: &SurfaceInfo) {
     // Which X window this is, for a host that knows a drawable and not a
     // surface -- an OpenGL client naming what it draws into.
     r[17] = info.xid as i32;
+    // The real scale in 120ths, and the viewport's destination (`w | h <<
+    // 16`, 0 for none): the size the surface shows at is the destination, or
+    // the buffer over its scale, in surface units, times scale120 / 120.
+    r[18] = info.scale120;
+    r[19] = info.view.map_or(0, |(w, h)| (w & 0xffff) | ((h & 0xffff) << 16));
     // Where its client placed it, if it did (`gex_window_placement_v1`).
     r[28..33].copy_from_slice(&info.placement.record_words());
     // Where it takes the pointer, when its client said (`flags` bit 7).
@@ -719,6 +733,13 @@ const GLOBALS: &[(&str, u32)] = &[
     // Windows 7's glass: blur-behind and tint for parts of a surface. See
     // `protocols/gex-glass-v1.xml`.
     ("gex_glass_manager_v1", 1),
+    // A scale that is not a whole number (a page at devicePixelRatio 1.5):
+    // `preferred_scale` in 120ths. A client that takes it draws at device
+    // size and sets its viewport's destination in surface units, so it is
+    // shown 1:1; one that does not draws at `wl_output.scale` (the scale
+    // rounded up) and is sampled down to it. Last, so the names before it
+    // keep their numbers.
+    ("wp_fractional_scale_manager_v1", 1),
 ];
 
 /// What an object id currently is.
@@ -752,6 +773,8 @@ enum Object {
     Subsurface { surface: u32 },
     Viewporter,
     Viewport { surface: u32 },
+    FractionalScaleManager,
+    FractionalScale,
     DecorationManager,
     Decoration { surface: u32 },
     PlacementManager,
@@ -943,6 +966,16 @@ struct SurfaceState {
     /// whole surface), and the committed region (`None`: the whole surface).
     pending_input: Option<Option<Region>>,
     input: Option<Region>,
+    /// Whether the client has committed this surface at all. One it never
+    /// committed is not mapped and takes no pointer, though a host may show
+    /// it: a surface whose frames are the host's GL (`external`) is listed
+    /// from its attach on, before its client's first commit, which carries
+    /// its input region (Wine's GL subsurface sets an empty one at create and
+    /// commits it only with a frame). Listed with no region it took every
+    /// click over its window while its program had not drawn: MuseScore's
+    /// telemetry dialog, whose GL child presented nothing, was dead to the
+    /// mouse.
+    committed: bool,
 }
 
 /// Whether a surface's pixels are the host's. A free function because the
@@ -974,9 +1007,14 @@ pub struct Client {
     /// Surfaces whose fullscreen state the client changed and the host has
     /// not taken yet ([`Client::take_fullscreen_changes`]), one entry each.
     fullscreen_changes: Vec<(u32, bool)>,
-    /// Device pixels per surface unit: what `wl_output.scale` says. A
-    /// toplevel's configure is in surface units, so `default_size / scale`.
+    /// Device pixels per surface unit, rounded up: what `wl_output.scale`
+    /// says.
     scale: i32,
+    /// Device pixels per surface unit in 120ths (`wp_fractional_scale_v1`'s
+    /// `preferred_scale`): the real scale, which surface units are in. A
+    /// toplevel's configure is in surface units, so `default_size * 120 /
+    /// scale120`.
+    scale120: i32,
     /// `wl_keyboard.repeat_info`: keys a second and the delay in ms (rate 0:
     /// the client repeats nothing, the host sends each repeat as a press).
     key_repeat: (i32, i32),
@@ -1069,6 +1107,7 @@ impl Client {
             default_size: (640, 480),
             fullscreen_changes: Vec::new(),
             scale: 1,
+            scale120: 120,
             key_repeat: (25, 600),
             wm_base_version: 0,
             placement_version: 0,
@@ -1127,8 +1166,9 @@ impl Client {
     /// host draws around a window (a title bar and a border, `FRAME_*`).
     fn bounds(&self) -> (i32, i32) {
         let (w, h) = self.default_size;
-        let k = self.scale.max(1);
-        ((w - FRAME_W * k).max(k) / k, (h - FRAME_H * k).max(k) / k)
+        let k = self.scale120.max(120);
+        let unit = |px: i32| (px.max(1) * 120 / k).max(1);
+        (unit(w - FRAME_W * k / 120), unit(h - FRAME_H * k / 120))
     }
 
     /// The surfaces whose fullscreen state changed since the last call, and
@@ -1143,6 +1183,16 @@ impl Client {
     /// the client binds the output.
     pub fn set_scale(&mut self, scale: i32) {
         self.scale = scale.clamp(1, 8);
+        self.scale120 = self.scale * 120;
+    }
+
+    /// The real scale, in 120ths (180 for 1.5), for a host whose output is
+    /// in device pixels at a scale that need not be whole: surface units are
+    /// device pixels / (scale120 / 120), and `wl_output.scale` is that
+    /// rounded up. Set before the client binds the output.
+    pub fn set_scale120(&mut self, scale120: i32) {
+        self.scale120 = scale120.clamp(120, 960);
+        self.scale = (self.scale120 + 119) / 120;
     }
 
     /// The key repeat this client is told (`wl_keyboard.repeat_info`): `rate`
@@ -1306,6 +1356,8 @@ impl Client {
                 Object::Subcompositor => self.subcompositor(opcode, &mut r),
                 Object::Viewporter => self.viewporter(object, opcode, &mut r),
                 Object::Viewport { surface } => self.viewport(object, surface, opcode, &mut r),
+                Object::FractionalScaleManager => self.fractional_scale_manager(object, opcode, &mut r),
+                Object::FractionalScale => self.fractional_scale(object, opcode),
                 Object::Positioner => self.positioner(object, opcode, &mut r),
                 Object::Region => self.region(object, opcode, &mut r),
                 Object::Buffer(_) => {
@@ -1527,6 +1579,9 @@ impl Client {
             }
             "wp_viewporter" => {
                 self.objects.insert(id, Object::Viewporter);
+            }
+            "wp_fractional_scale_manager_v1" => {
+                self.objects.insert(id, Object::FractionalScaleManager);
             }
             "zxdg_decoration_manager_v1" => {
                 self.objects.insert(id, Object::DecorationManager);
@@ -1822,6 +1877,10 @@ impl Client {
     fn commit(&mut self, surface: u32, buffers: &dyn Buffers) {
         // The buffer scale is double-buffered state like the rest.
         if let Some(s) = self.surfaces.get_mut(&surface) {
+            if !s.committed {
+                s.committed = true;
+                self.dirty = true;
+            }
             if let Some(k) = s.pending_scale.take() {
                 if k != s.buffer_scale.max(1) {
                     self.dirty = true;
@@ -2585,6 +2644,40 @@ impl Client {
         }
     }
 
+    /// `wp_fractional_scale_manager_v1`: destroy(0),
+    /// get_fractional_scale(1), whose object is told the scale at once
+    /// (`preferred_scale`), as there is one output and it does not change
+    /// under a client.
+    fn fractional_scale_manager(&mut self, object: u32, opcode: u16, r: &mut Reader<'_>) -> bool {
+        match opcode {
+            0 => {
+                self.objects.remove(&object);
+                self.delete_id(object);
+                true
+            }
+            1 => {
+                let (Some(id), Some(_surface)) = (r.new_id(), r.object()) else {
+                    return false;
+                };
+                self.objects.insert(id, Object::FractionalScale);
+                let ev = Writer::new(id, 0).uint(self.scale120 as u32);
+                self.send(ev);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// `wp_fractional_scale_v1`: destroy(0).
+    fn fractional_scale(&mut self, object: u32, opcode: u16) -> bool {
+        if opcode != 0 {
+            return false;
+        }
+        self.objects.remove(&object);
+        self.delete_id(object);
+        true
+    }
+
     /// `wp_viewport`: destroy(0), set_source(1), set_destination(2). The
     /// destination is recorded on the surface (-1, -1 unsets it).
     fn viewport(&mut self, object: u32, surface: u32, opcode: u16, r: &mut Reader<'_>) -> bool {
@@ -3067,8 +3160,11 @@ impl Client {
                 external: external.is_some(),
                 buffer_scale: s.buffer_scale.max(1),
                 client_scale: self.scale,
+                scale120: self.scale120,
+                view: s.viewport,
                 placement: s.placement,
-                input: s.input.clone(),
+                // Not committed yet: not mapped, so no input anywhere.
+                input: if s.committed { s.input.clone() } else { Some(Region::default()) },
                 pointer_lock: self.wants_lock(*id),
                 glass: s.glass,
                 glass_icon: s.glass_icon.as_ref().map_or(0, |p| p.as_ptr() as usize),
@@ -4395,6 +4491,32 @@ mod tests {
     }
 
     #[test]
+    fn a_gl_subsurface_never_committed_takes_no_pointer() {
+        let pool = Placed(0x6000, 8192);
+        let (mut c, _) = placed_window(200, 100, 800);
+        // Wine's GL child: a subsurface of the window with an empty input
+        // region set, then the GL device's attach -- and no commit, as when
+        // the program has not presented a frame yet.
+        c.receive(&Writer::new(2, 0).uint(7).string("wl_subcompositor").uint(1).new_id(30).finish(), &[], &pool);
+        c.receive(&Writer::new(3, 0).new_id(31).finish(), &[], &pool);
+        c.receive(&Writer::new(3, 1).new_id(40).finish(), &[], &pool);
+        c.receive(&Writer::new(31, 5).object(40).finish(), &[], &pool);
+        c.receive(&Writer::new(40, 0).finish(), &[], &pool);
+        c.receive(&Writer::new(30, 1).new_id(32).object(31).object(6).finish(), &[], &pool);
+        c.attach_external(31, 200, 100);
+        let sub = |c: &Client| c.scene().into_iter().find(|s| s.surface == 31).expect("the GL subsurface is not listed");
+        let input = sub(&c).input.expect("an uncommitted surface takes the pointer everywhere");
+        assert!(!input.contains(0, 0) && !input.contains(100, 50), "an uncommitted surface takes the pointer");
+        // Its first commit applies the region it set: still none.
+        c.receive(&Writer::new(31, 6).finish(), &[], &pool);
+        assert!(!sub(&c).input.expect("the empty region lost at the commit").contains(100, 50));
+        // A committed surface with no region is the whole surface, as before.
+        c.receive(&Writer::new(31, 5).object(0).finish(), &[], &pool);
+        c.receive(&Writer::new(31, 6).finish(), &[], &pool);
+        assert_eq!(sub(&c).input, None);
+    }
+
+    #[test]
     fn an_input_region_takes_effect_at_commit() {
         let pool = Placed(0x6000, 8192);
         let (mut c, _) = placed_window(200, 100, 800);
@@ -4426,6 +4548,35 @@ mod tests {
         c.receive(&Writer::new(6, 6).finish(), &[], &pool);
         assert_eq!(input(&c), None);
         assert_eq!(c.scene().into_iter().find(|s| s.surface == 6).unwrap().flags() & 0x80, 0);
+    }
+
+    #[test]
+    fn a_fractional_scale_is_told_and_the_viewport_sizes_the_surface() {
+        // At devicePixelRatio 1.5: wl_output.scale 2, preferred_scale 180.
+        // winewayland binds the manager (the last global), gets a
+        // fractional scale for its window and a viewport, and sets the
+        // destination in surface units; the record carries both.
+        let pool = Placed(0x6000, 8192);
+        let (mut c, _) = placed_window(300, 150, 1200);
+        c.set_scale120(180);
+        assert_eq!(c.scale, 2);
+        c.take_outgoing();
+        let name = GLOBALS.iter().position(|g| g.0 == "wp_fractional_scale_manager_v1").unwrap() as u32 + 1;
+        c.receive(&Writer::new(2, 0).uint(name).string("wp_fractional_scale_manager_v1").uint(1).new_id(60).finish(), &[], &pool);
+        c.receive(&Writer::new(60, 1).new_id(61).object(6).finish(), &[], &pool);
+        let told = messages(&c.take_outgoing());
+        let scale = told.iter().find(|(id, op, _)| *id == 61 && *op == 0).expect("no preferred_scale");
+        assert_eq!(u32::from_ne_bytes(scale.2[..4].try_into().unwrap()), 180);
+        c.receive(&Writer::new(2, 0).uint(9).string("wp_viewporter").uint(1).new_id(50).finish(), &[], &pool);
+        c.receive(&Writer::new(50, 1).new_id(51).object(6).finish(), &[], &pool);
+        c.receive(&Writer::new(51, 2).int(200).int(100).finish(), &[], &pool);
+        let s = c.scene().into_iter().find(|s| s.surface == 6).expect("the window went away");
+        assert_eq!((s.scale120, s.view, s.client_scale), (180, Some((200, 100)), 2));
+        let mut rec = Vec::new();
+        push_record(&mut rec, 1, &s);
+        assert_eq!((rec[18], rec[19]), (180, 200 | (100 << 16)));
+        c.receive(&Writer::new(61, 0).finish(), &[], &pool);
+        assert!(!c.objects.contains_key(&61), "the fractional scale outlived its destroy");
     }
 
     #[test]

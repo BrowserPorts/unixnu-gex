@@ -77,7 +77,7 @@ async function forkBulkIn(child) {
 // Static, not a run-time specifier: a bundler cannot resolve `import(msg.url)`,
 // so the built Worker chunk 404'd on a bare `./gex.mjs` and rejected where
 // nobody listened. This file and `gex.mjs` are siblings everywhere.
-import { setFill, fillFile, lazyReady, kernelThread, lazyFetch, processMemories } from './lazy-fetch.mjs';
+import { setFill, fillFile, lazyReady, kernelThread, lazyFetch, lazyStats, processMemories } from './lazy-fetch.mjs';
 import { blockIo } from './blocks.mjs';
 import { lateZstd } from './zstd-late.mjs';
 import { forkTransfer } from './fork-transfer.mjs';
@@ -90,9 +90,39 @@ const perf = globalThis.performance;
 import { noteFetch, noteStatus, setNoteSink } from './fetch-note.mjs';
 import { workerOptions } from './options.mjs';
 import { Gex, Env, utf8, narrate, hostNowNs, vforkTrace } from './gex.mjs';
+import { UsdClock } from './usd-clock.mjs';
 import { single, registerWorkerMain, sched } from './single.mjs';
 import { SP_CODE } from './mode.mjs';
-import { logNamed, setLog } from './log.mjs';
+import { logNamed, logOn, setLog } from './log.mjs';
+
+/** The MiB of `memory` in 64 KiB pages not all zero: what a browser holds
+ *  resident for it, near enough (a page written and zeroed again is the only
+ *  miss). Only the spans anything was handed (`exports`' gex_resident_spans:
+ *  the guest's accessible mappings, gex's own regions): a memory64 is 8 GiB,
+ *  nearly none of it ever mapped, and a pass over all of it took seconds per
+ *  exit. The whole memory when the map cannot say. */
+function touchedMib(memory, exports) {
+  const words = new Uint32Array(memory.buffer);
+  const spans = [];
+  const n = exports?.gex_resident_spans ? exports.gex_resident_spans() : 0;
+  for (let i = 0; i < n; i++) {
+    const a = Number(exports.gex_resident_span(i, 0)), b = Number(exports.gex_resident_span(i, 1));
+    if (b > a) spans.push([Math.floor(a / 65536), Math.ceil(Math.min(b, memory.buffer.byteLength) / 65536)]);
+  }
+  if (!spans.length) spans.push([0, words.length / 16384]);
+  spans.sort((x, y) => x[0] - y[0]);
+  let pages = 0, done = 0;
+  for (const [a, b] of spans) {
+    for (let pg = Math.max(a, done); pg < b; pg++) {
+      const end = Math.min((pg + 1) * 16384, words.length);
+      for (let i = pg * 16384; i < end; i++) {
+        if (words[i]) { pages++; break; }
+      }
+    }
+    done = Math.max(done, b);
+  }
+  return Math.round(pages / 16);
+}
 // GEX_WATCH_DIR=<page>: narrate every write to that page's directory entry.
 if (typeof process !== 'undefined' && process.env?.GEX_WATCH_DIR) {
   Gex.watchDir = Number(process.env.GEX_WATCH_DIR);
@@ -190,6 +220,8 @@ if (!(SP_CODE && single.on)) setNoteSink((note) => port.post({ kind: 'note', not
 // This Worker's runtime, once its start message builds it. Module-scope so a
 // `sharedModule` message (relayed sibling-Worker compiles) can reach it.
 let workerGex = null;
+/// The host's USD clock, in the one Worker the host keeps for it.
+let usdClock = null;
 /// The unit cache's small files the page's Workers read before this one
 /// started (host.mjs `#unitFiles`), by path; null for one the cache lacks.
 const unitFiles = new Map();
@@ -423,6 +455,12 @@ async function handle(msg) {
     for (const [key, mod] of msg.entries ?? []) pooled.set(key, mod);
     return;
   }
+  // The host will not start the hot tier's helper this Worker asked for
+  // (`startFjitHelper`): its process translates inline.
+  if (msg?.kind === 'fjitHelperNo') {
+    workerGex?.fjitHelperRefused();
+    return;
+  }
   // While this Worker waits in the pool: the kernel, shim and guest
   // instances on a fresh memory, which `attach` would otherwise make after
   // the process arrived (3.3 ms of an exec'd child's 10.6 ms start).
@@ -458,6 +496,15 @@ async function handle(msg) {
       console.error(`[gex] a pooled Worker could not prepare a runtime: ${err?.message ?? err}`);
       return null;
     });
+    return;
+  }
+  // The host's clock of the Wine processes' user shared data pages
+  // (usd-clock.mjs): this Worker runs no process, only that.
+  if (msg?.kind === 'usdClock') {
+    usdClock ??= new UsdClock();
+    if (msg.op === 'add') usdClock.add(msg.pid, msg.memory, msg.at, msg.clock);
+    else if (msg.op === 'drop') usdClock.drop(msg.pid);
+    else if (msg.op === 'door') usdClock.door(msg.door);
     return;
   }
   // The wineserver's door, from the host: this Worker's door calls go to it
@@ -653,6 +700,13 @@ async function handle(msg) {
       recyclable = false;
       port.post({ kind: 'threadSpare', spare });
     }
+    // The hot tier's helper for this process (`Gex#fjitHelperDue`): a Worker
+    // on its memory, started by the host as a spare is, that runs no thread
+    // (`Gex#fjitServe`). The host answers `fjitHelperNo` when it will not.
+    startFjitHelper(spare) {
+      recyclable = false;
+      port.post({ kind: 'fjitHelper', spare });
+    }
     // A module this Worker just compiled, up to the host to relay to the sibling
     // Workers of the same process so they reuse it rather than recompiling the
     // same registry bytes. A `WebAssembly.Module` crosses `postMessage` by
@@ -664,6 +718,12 @@ async function handle(msg) {
     // the host forgets them too, or its relay keeps their code alive.
     dropModules(keys) {
       port.post({ kind: 'droppedModules', keys });
+    }
+    // This process's KUSER_SHARED_DATA copy (`gex.usd_tick`): up to the
+    // host, whose clock advances it from now on.
+    // (Its own memory: the single-thread build's fibers share this module.)
+    usdTick(at, clock, memory) {
+      port.post({ kind: 'usdTick', at, clock, memory: memory ?? workerGex?.memory });
     }
     // The wineserver published its door: up to
     // the host, which hands it to every Worker of the session.
@@ -689,6 +749,12 @@ async function handle(msg) {
     // page's server only, not the page's own preloaded files.
     prefetchUnit(key) {
       const c = msg.cgen;
+      // A late unit (app.js: one the page names by its own URL, compiling it
+      // while the guest runs): the host hands its Module over when it is in.
+      if (c?.late?.[key] && !preFiles.has(`${key}/c.wasm`)) {
+        port.post({ kind: 'prefetchUnit', key, url: c.late[key] });
+        return;
+      }
       if (!c?.url || preClosed || preFiles.has(`${key}/c.wasm`)) return;
       let url;
       try { url = new URL(`${c.url}/${key}/c.wasm${c.zst ? '.zst' : ''}`, globalThis.location?.href).href; } catch { return; }
@@ -764,6 +830,21 @@ async function handle(msg) {
       // before the page had compiled it waits for its bytes there.
       const late = fillFile(`unit:${rel}`);
       if (late) return late;
+      // A late unit's module wanted before the page's compiled one reached
+      // this Worker: its bytes from its own URL, here.
+      const lateUrl = rel.endsWith('/c.wasm') ? c.late?.[rel.slice(0, -'/c.wasm'.length)] : null;
+      if (lateUrl) {
+        const x = new XMLHttpRequest();
+        x.open('GET', lateUrl, false);
+        x.responseType = 'arraybuffer';
+        const done = noteFetch(`unit:${rel}`, 0, this.owner);
+        try {
+          x.send();
+        } finally {
+          done(x.response?.byteLength ?? 0);
+        }
+        return x.status === 200 ? new Uint8Array(x.response) : null;
+      }
       if (preClosed) return null;
       if (unitFiles.has(rel)) {
         const b = unitFiles.get(rel);
@@ -829,6 +910,9 @@ async function handle(msg) {
   }
   // Which flavours the page runs, for an exec's choice (vfork.rs `exec_target`).
   if (msg.pageFlavours !== undefined) globalThis.GEX_PAGE_FLAVOURS = msg.pageFlavours;
+  // A test's: no headroom (lib.rs `headroom`), from the runtime's start, since
+  // the loader grows the memory.
+  if (msg.noHeadroom) globalThis.GEX_NO_HEADROOM = 1;
   otherGate(msg);
   if (msg.wasmDlls) Gex.wasmDlls = msg.wasmDlls;
   if (msg.elfUnits) Gex.elfUnits = msg.elfUnits;
@@ -848,7 +932,7 @@ async function handle(msg) {
   if (msg.fill) setFill(msg.fill);
   // The page's cache of lazy files (app.js `lazyCache`, lazy-cache.mjs).
   if (msg.lazyCache) setLazyCache(msg.lazyCache);
-  // The directories the page serves (page/runtime fs.mount, page-fs.mjs).
+  // The directories the page serves (runtime fs.mount, page-fs.mjs).
   if (msg.pageFs) setPageFs(msg.pageFs);
   // A rest bundle's files among the lazy ones (lazy-fetch.mjs `lazyReady`).
   // Its decoder now: a runtime the pool made ahead for an exec'd child
@@ -903,6 +987,8 @@ async function handle(msg) {
     throw e;
   }
   if (gex === pre?.gex) gex.setEnv(new WorkerEnv());
+  // A runtime made ahead of the message (`preattach`) has its shim already.
+  if (msg.noHeadroom) gex.shim?.exports.gex_set_no_headroom?.(1);
   // Module-scope, so a `sharedModule` message (which arrives outside this
   // handler's run/adopt/thread path) can reach this Worker's runtime.
   workerGex = gex;
@@ -920,7 +1006,7 @@ async function handle(msg) {
   // must run before `load` -- which mounts /dev/gex-gl only when the flag is on.
   if (msg.glChannel?.inRealm) {
     // The single-thread build: the compositor's Mesa is in this realm
-    // (page/src/compositor-worker.js `glInRealm`), and a submit is a promise
+    // (runtime/src/host/compositor-worker.js `glInRealm`), and a submit is a promise
     // the Suspending `gl_submit` waits on. A batch is run straight out of
     // this process's memory: no copy, and no batch in flight unwaited.
     // An unwaited batch is waited for all the same; its answer is what the
@@ -956,7 +1042,7 @@ async function handle(msg) {
     gex.useWl(proxy);
     // The output size a toplevel is configured to, before the guest runs.
     const out = outputSize(msg.wlChannel);
-    gex.wlOutput(out.w, out.h, out.scale);
+    gex.wlOutput(out.w, out.h, out.scale, out.scale120);
     // Sent when the token is known, which is after load: `onLoaded` is the
     // first moment this process has a pid. With pixel buffers in the channel
     // (wl-bridge.mjs) the compositor never needs this process's memory --
@@ -1124,7 +1210,7 @@ async function handle(msg) {
     gex.useNetwork(new NetProxy(msg.netChannel, msg.child?.pid ?? msg.pid ?? 1), { shared: true });
   } else if (msg.pageHosts && !msg.network) {
     // Only the page-served hosts, where the page cannot serve its sockets.
-    const { Sockets } = await import('../../../page/src/net.js');
+    const { Sockets } = await import('../../../runtime/src/host/net.js');
     const net = new Sockets(null, { pageHosts: msg.pageHosts, onEvent: (e) => port.post({ kind: 'net', event: e }) });
     gex.useNetwork(net);
   }
@@ -1155,7 +1241,12 @@ async function handle(msg) {
       const _t = (s) => { if (globalThis.GEX_ATTACH_TRACE) console.error(`[thr ${msg.tid}] ${s}`); };
       _t(`adopt start pc=0x${(msg.pc??0n).toString(16)} ctx=0x${(msg.ctx??0n).toString(16)}`);
       if (msg.spare) {
-        msg.spareGo = () => (spareGot ? Promise.resolve(spareGot.thread ?? null) : new Promise((r) => { spareWaiter = r; }));
+        // Caught up and waiting from here: the host counts it ready (`spareWaiting`).
+        msg.spareGo = () => {
+          if (spareGot) return Promise.resolve(spareGot.thread ?? null);
+          port.post({ kind: 'spareWaiting' });
+          return new Promise((r) => { spareWaiter = r; });
+        };
       }
       ({ entry, ctx, gone } = await (msg.snap ? gex.snapThread(msg.shim, msg.guest, msg) : gex.adoptThread(msg.shim, msg.guest, msg)));
       if (msg.snap) {
@@ -1280,6 +1371,7 @@ async function handle(msg) {
     if (msg.inPlace === 0) gex.shim.exports.gex_set_in_place?.(0);
     if (msg.excTrace) gex.shim.exports.gex_set_exc_trace?.(1);
     if (msg.fcacheStats) gex.shim.exports.gex_set_fcache_stats?.(1);
+    if (msg.sysTime) gex.shim.exports.gex_set_sys_time?.(1);
     if (msg.winsize) {
       gex.shim.exports.gex_set_winsize?.(msg.winsize.rows, msg.winsize.cols);
     }
@@ -1320,7 +1412,15 @@ async function handle(msg) {
     // their dispatch); on keeps tables small across a many-fork run like apt.
     if (msg.claimPages !== undefined) ex.gex_set_claim_pages?.(msg.claimPages);
     if (msg.copyLoop) ex.gex_set_copy_loop?.(1);
-    if (msg.coherentLoads) ex.gex_set_coherent_loads?.(1);
+    // `?tear=1|2`, GEX_TEAR (tier1.rs `TEAR`): count plain misaligned 8-byte
+    // accesses, and at 2 split each into 4-byte halves.
+    if (msg.tear) ex.gex_set_tear?.(msg.tear | 0);
+    if (msg.coherentLoads === 2 && ex.gex_set_tso2) ex.gex_set_tso2(1);
+    else if (msg.coherentLoads) ex.gex_set_coherent_loads?.(1);
+    // A memory that is not shared (the single-thread build): the shim never
+    // grows it by nothing to take another Worker's length (lib.rs
+    // `grow_refresh`), which would detach its buffer.
+    if (!(typeof SharedArrayBuffer === 'function' && gex.memory?.buffer instanceof SharedArrayBuffer)) ex.gex_set_memory_unshared?.(1);
     // TEST (GEX_DEBUG_PANIC, a test-only switch): the shim panics on purpose.
     if (msg.debugPanic) {
       try {
@@ -1343,7 +1443,8 @@ async function handle(msg) {
     if (msg.debugExit) {
       // Before the guest runs an instruction: memory decides how many processes
       // a browser holds, so whether the cost is placing the image or running it.
-      port.post({ kind: 'loaded', memoryMib: gex.memory.buffer.byteLength / (1 << 20) });
+      // Without the headroom (lib.rs `grow_memory_to`), as the exit line.
+      port.post({ kind: 'loaded', memoryMib: gex.memory.buffer.byteLength / (1 << 20) - (gex.shim.exports.gex_headroom_mib?.() ?? 0) });
     }
     // Around `gex.run` alone: everything before it is loading and module
     // compilation, so a codegen A/B measured through the total is a third
@@ -1466,6 +1567,12 @@ async function handle(msg) {
     // `close` before reporting: it drops the tick channel, a live handle that
     // would otherwise keep a Node Worker up.
     gex.close?.();
+    // The tear debug switch's counts (`?tear=`, GEX_TEAR): the process's plain
+    // misaligned 8-byte loads and stores, said at its end when there were any.
+    if (!thread && msg.tear) {
+      const n = [0, 1].map((i) => Number(ex.gex_tear_count?.(i) ?? 0));
+      if (n[0] || n[1]) console.warn(`[gex] pid ${ex.gex_my_pid?.() ?? '?'}: tear=${msg.tear}: ${n[0]} plain misaligned 8-byte loads, ${n[1]} stores`);
+    }
     // A thread of a program an `execve` replaced: the shim's state is the new
     // program's (its heap and JIT state started again), so nothing more is
     // read from it here.
@@ -1476,6 +1583,18 @@ async function handle(msg) {
       threadGone: thread && !asThread ? true : undefined,
       carries: carries || undefined,
       guestMillis,
+      // `?systime=1`: the process's syscalls by time (the shim's `gex_sys_times`).
+      sysTimes: msg.sysTime && !thread ? (() => {
+        const e = gex.shim.exports;
+        if (!e.gex_sys_times) return undefined;
+        const p = e.gex_alloc(2048) >>> 0;
+        const n = e.gex_sys_times(p, 2048) >>> 0;
+        const t = new TextDecoder().decode(new Uint8Array(gex.memory.buffer, p, n).slice());
+        e.gex_free?.(p, 2048);
+        // and this Worker's lazy file reads, by how they were served
+        const l = Object.entries(lazyStats).map(([k, [n, ms, b]]) => `${k} ${n} reads ${ms.toFixed(1)} ms ${(b / 1048576).toFixed(1)} MiB`).join(', ');
+        return t ? t + (l ? `; this Worker's lazy reads: ${l}` : '') : undefined;
+      })() : undefined,
       exitPc: msg.exitTrace ? Number(ex.gex_current_pc?.() ?? 0n) : undefined,
       // Whatever the runner asked to be read out of the guest before its
       // address space goes away with this thread.
@@ -1543,9 +1662,18 @@ async function handle(msg) {
       // How much of this process's memory the shim used: a memory per process
       // decides how many processes a browser holds at once.
       heapKib: Number(gex.shim.exports.gex_heap_used_kib?.() ?? -1),
-      // What this process's memory grew to -- the question is whether a forked
-      // child pays the same again.
-      memoryMib: Math.round(gex.memory.buffer.byteLength / (1 << 20)),
+      // What this process's memory grew to for what it asked -- the question
+      // is whether a forked child pays the same again. Without the headroom
+      // (below), so the number means what it did before there was any.
+      memoryMib: Math.round(gex.memory.buffer.byteLength / (1 << 20)) - (gex.shim.exports.gex_headroom_mib?.() ?? 0),
+      // And beyond that, what was grown ahead of what was asked for (lib.rs
+      // `grow_memory_to`'s headroom): address space, not use.
+      headroomMib: gex.shim.exports.gex_headroom_mib?.(),
+      // And what of it holds anything: its pages not all zero, MiB, which is
+      // what the browser keeps resident for it (a memory's size is not: a
+      // memory64 is 8 GiB from its first instruction). Only where the exit
+      // line is said: a pass over the whole memory.
+      touchedMib: logOn('debug') || logNamed('touched') || globalThis.process?.env?.GEX_DEBUG_EXIT ? touchedMib(gex.memory, gex.shim.exports) : undefined,
       // Dispatch slots the page has left, in thousands. A budget nothing
       // refills: when it runs out, the next module names a table that does not
       // exist and the engine refuses it. Per process, because the question is
@@ -1559,8 +1687,12 @@ async function handle(msg) {
       forkZeros: gex.forkZeroBytes,
       // A posix_spawn child that ran in its parent's Worker until this exec.
       vforkMs: msg.child?.vforkMs,
+      // (and the largest single claim of the four)
+      // The guest's accessible mappings (VmRSS), MiB: its share of `arena`'s
+      // total in either memory flavour.
+      guestMib: gex.shim.exports.gex_guest_mapped_mib ? Number(gex.shim.exports.gex_guest_mapped_mib()) : undefined,
       arena: gex.shim.exports.gex_arena_spent_mib
-        ? [0, 1, 2].map((i) => Number(gex.shim.exports.gex_arena_spent_mib(i)))
+        ? [0, 1, 2, 3].map((i) => Number(gex.shim.exports.gex_arena_spent_mib(i)))
         : null,
     };
     // Last: nothing calls into this instance after (`releaseWorker`).
@@ -1619,14 +1751,17 @@ async function handle(msg) {
     // The global kernel has no console of its own, so a panic there unwinds to
     // a bare `unreachable`. Its message is in its own memory, readable here
     // because this Worker made the instance.
+    // What the crash notice says of it (`gex_crash_line`): the panic's own
+    // words, its last line ("capacity overflow"), not its source path.
+    let kernelWhy = '';
     try {
       const k = gex.kernel;
       if (k?.k_panic_len?.()) {
         const n = k.k_panic_len() >>> 0;
         const at = k.k_panic_ptr() >>> 0;
-        where += ` -- the global kernel panicked: ${utf8(
-          new Uint8Array(msg.kernel.memory.buffer, at, n),
-        )}`;
+        const text = utf8(new Uint8Array(msg.kernel.memory.buffer, at, n));
+        where += ` -- the global kernel panicked: ${text}`;
+        kernelWhy = `the gex kernel failed: ${text.trim().split('\n').at(-1).slice(0, 200)}`;
       }
     } catch {
       // Nothing to add.
@@ -1644,6 +1779,20 @@ async function handle(msg) {
       // process runs on in its other Workers.
       if (!inert) {
         if (!outgrew) gex?.shim?.exports?.gex_dump_state?.();
+        const ex = gex?.shim?.exports;
+        // A crash in the runtime is said first, so that a kill of the
+        // process at the same moment does not end it as a plain SIGKILL.
+        if (e?.gexRuntimeTrap) ex?.gex_trap_crash?.();
+        if (kernelWhy && ex?.gex_crash_line && ex.gex_alloc) {
+          try {
+            const bytes = new TextEncoder().encode(kernelWhy);
+            const p = ex.gex_alloc(bytes.length) >>> 0;
+            new Uint8Array(gex.memory.buffer, p, bytes.length).set(bytes);
+            ex.gex_crash_line(p, bytes.length);
+          } catch {
+            // The notice keeps its plain words.
+          }
+        }
         const abandon = gex?.shim?.exports?.gex_abandon;
         // In the single-thread build the kernel's calls may suspend, which
         // needs a stack of its own (`WebAssembly.promising`).

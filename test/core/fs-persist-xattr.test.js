@@ -6,8 +6,8 @@
 //      bytes), on a file of a tar laid after boot, and on a file written
 //      here; synced, then the page reloads without a shutdown;
 //   2. each file has it, and the tar's file still has the tar's bytes.
-import { System } from '../../page/runtime/src/index.js';
-import { OPFSFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { OPFSFilesystem } from '../../runtime/src/fs.js';
 
 export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 300 };
 

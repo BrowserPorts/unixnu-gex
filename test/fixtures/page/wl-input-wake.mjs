@@ -39,7 +39,7 @@ async function instantiate(module, memory, process_) {
 }
 
 if (isMainThread) {
-  const path = process.argv[2] || join(ROOT, 'page', 'public', 'gex', 'gex_kernel.wasm');
+  const path = process.argv[2] || join(ROOT, 'runtime', 'files', 'out', 'gex', 'gex_kernel.wasm');
   const module = await WebAssembly.compile(await readFile(path));
   const memory = new WebAssembly.Memory({ initial: 2048, maximum: 65536, shared: true });
   const process_ = new WebAssembly.Memory({ initial: 1, maximum: 65535, shared: true });

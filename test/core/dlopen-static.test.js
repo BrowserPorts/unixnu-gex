@@ -4,50 +4,25 @@
 // dlopen reads it, found by its bare name beside the program (a static
 // program's run path is its own directory); calls into it from two threads, each calling back into
 // the program's libc; its constructor, its data and a second dlopen.
-import { runProgram } from '../../page/src/run.js';
-import { setGlobals } from '../../page/src/page-globals.js';
-import { untar } from '../../page/src/tar.js';
-import { unzstd } from '../../page/src/zfetch.js';
-import { bytesOf } from '../../page/runtime/src/internal.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
+import { bytesOf } from '../../runtime/src/internal.js';
 
 export const meta = { hosts: ['browser', 'node'], images: ['busybox'], timeout: 180 };
 
 export default async function (t) {
   const { say, check, eq, timeout } = t;
-  const dbg = t.debug();
-  const sw = Object.fromEntries(Object.entries(dbg).filter(([k]) => k !== 'arch'));
-  globalThis.GEX_PAGE_SEARCH = `?${new URLSearchParams(sw)}`;
-  globalThis.GEX_ASSET_BASE = t.baseUrl;
-  setGlobals((n) => sw[n] ?? null, { arch: dbg.arch ?? 'aarch64' });
-  const tree = untar(await unzstd(await bytesOf(t.work('bb.tar.zst'))));
   const side = await bytesOf(t.work('rt-side.so'));
-  const sideUrl = new URL(t.work('rt-side.so'));
-  const sideAt = sideUrl.protocol === 'file:' ? decodeURIComponent(sideUrl.pathname) : sideUrl.pathname;
-  let out = '';
-  const term = {
-    rows: 24, cols: 80,
-    write: (s) => { out += typeof s === 'string' ? s : new TextDecoder().decode(s); },
-    writeln: (s) => { out += `${s}\n`; },
-    onData: () => ({ dispose() {} }),
-    onResize: () => ({ dispose() {} }),
-    focus() {},
-  };
+  const sys = new System({ baseUrl: t.baseUrl, debug: t.debug() });
+  const fs = new MemoryFilesystem(sys);
+  fs.addTar(t.work('bb.tar.zst'), { lazy: [['/bin/rt-side.so', side.length, t.work('rt-side.so')]] });
+  await timeout(sys.boot(), 60000, 'boot');
   const t0 = performance.now();
-  const run = runProgram(term, {
-    filesystem: 'memory',
-    elf: tree.files['/bin/rt-dlstatic'],
-    args: ['/bin/rt-dlstatic', 'rt-side.so'],
-    files: tree.files,
-    dirs: tree.dirs ?? [],
-    modes: tree.modes,
-    hard: tree.hard,
-    symlinks: tree.links ?? {},
-    lazy: [['/bin/rt-side.so', side.length, sideAt]],
-    env: ['PATH=/bin:/usr/bin', 'HOME=/root'],
-    cwd: '/',
-  });
-  run.catch((e) => { out += `\n[runProgram threw: ${e?.stack ?? e}]`; });
+  let out = '';
+  const run = sys.run(['/bin/rt-dlstatic', 'rt-side.so'], { env: ['PATH=/bin:/usr/bin', 'HOME=/root'], cwd: '/' })
+    .then((r) => { out = r.stdout + r.stderr; return { status: r.code }; });
   const r = await timeout(run, 120000, 'the end').catch((e) => { throw new Error(`${e.message}: ${out.slice(-600)}`); });
+  await sys.shutdown();
   const lines = out.replace(/\r/g, '');
   say(lines.split('\n').map((l) => `  | ${l}`).join('\n'));
   say(`the program ran in ${(performance.now() - t0).toFixed(0)} ms`);

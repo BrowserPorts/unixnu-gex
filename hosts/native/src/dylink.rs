@@ -45,6 +45,8 @@ pub(crate) struct Binds {
 pub(crate) enum NBind {
     Shim,
     Global(u32),
+    /// An address in the process's memory (another module's data export).
+    Addr(u64),
     /// The module's own table base plus this (a slot after its own).
     OwnSlot(u32),
     /// A call through the module's own table base plus this, a slot filled
@@ -555,6 +557,14 @@ pub(crate) fn define_imports(
             (NBind::Shim, _) => {}
             (NBind::Global(v), wasmtime::ExternType::Global(g)) => {
                 let g = wasmtime::Global::new(&mut *c, g.clone(), val(g, *v))?;
+                l.define(&mut *c, m, name, g)?;
+            }
+            (NBind::Addr(a), wasmtime::ExternType::Global(g)) => {
+                let v = match g.content() {
+                    wasmtime::ValType::I64 => Val::I64(*a as i64),
+                    _ => Val::I32(u32::try_from(*a).map_err(|_| anyhow!("{}: GOT.mem::{name}: its module's data is above 4 GiB, out of a 32-bit global's reach", dy.path))? as i32),
+                };
+                let g = wasmtime::Global::new(&mut *c, g.clone(), v)?;
                 l.define(&mut *c, m, name, g)?;
             }
             (NBind::OwnSlot(o), wasmtime::ExternType::Global(g)) => {

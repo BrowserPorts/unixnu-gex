@@ -10,14 +10,14 @@
 # AArch64 shim, GEX_FJIT=1, every program given a spare).
 #
 #   test/fixtures/gexcc/dl/poolflavour.sh DIR   (gexcc and zig on PATH; GEX_ROOT: a gex
-#                                     checkout with page/public/gex built;
+#                                     checkout with runtime/files/out/gex built;
 #                                     A64_ROOTFS as tests/browser-reuse.sh;
 #                                     DIR: where gex can see, not /dev/shm)
 set -u
 command -v gexcc > /dev/null || { echo "skip poolflavour: gexcc not on PATH (toolchain/gexcc/install.sh)"; exit 0; }
 command -v zig > /dev/null || { echo "skip poolflavour: no zig"; exit 0; }
 ROOT=${GEX_ROOT:?set GEX_ROOT to a gex checkout}
-SEED=$ROOT/page/public/gex/seed.shared.wasm
+SEED=$ROOT/runtime/files/out/gex/seed.shared.wasm
 A64_ROOTFS=${A64_ROOTFS:-$HOME/gex-sandbox/scratch/gate/a64-base.tar.zst}
 [ -f "$SEED" ] && [ -f "$A64_ROOTFS" ] || { echo "skip poolflavour: no $SEED or $A64_ROOTFS"; exit 0; }
 W=$(mktemp -d "${1:?DIR}/poolflavour.XXXXXX")

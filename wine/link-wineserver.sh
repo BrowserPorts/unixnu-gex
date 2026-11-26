@@ -15,7 +15,9 @@
 # Env: GEX_WASM_SYSROOT (the 32-bit Wine sysroot), JOBS (default 6).
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
-B=$(realpath "${1:?BUILD}"); F=$(realpath "${2:?SRC}"); O=$(realpath -m "${3:?OBJ}"); DIST=$(realpath -m "${4:?DIST}")
+# SRC as named, a link kept, as build32.sh configured BUILD against it (make -n
+# names it below).
+B=$(realpath "${1:?BUILD}"); F=$(cd "${2:?SRC}" && pwd) || exit 1; O=$(realpath -m "${3:?OBJ}"); DIST=$(realpath -m "${4:?DIST}")
 : "${GEX_WASM_SYSROOT:?set GEX_WASM_SYSROOT to the wine32 sysroot}"
 [ -f "$F/server/door.c" ] || { echo "link-wineserver: $F has no server/door.c" >&2; exit 1; }
 mkdir -p "$O"; cd "$B" || exit 1

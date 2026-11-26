@@ -858,9 +858,26 @@ def guest_function(command: dict, opcode: int) -> str:
 }}
 """
     if name == "glGetTexImage":
-        return f"""void {name}(unsigned target, int level, unsigned format, unsigned type,
+        return f"""void glGetTexLevelParameteriv(unsigned target, int level, unsigned pname, int *params);
+void {name}(unsigned target, int level, unsigned format, unsigned type,
                        void *pixels) {{
     int pbo = bound_buffer(0x88EBu) != 0; /* GL_PIXEL_PACK_BUFFER */
+    /* What GL writes into the caller's memory: the level's size (asked
+       before the command, whose reply is read last) laid out by this side's
+       own pack state. The host's geometry is checked against it, and no
+       byte goes past its end: a reply that disagrees wrote past the
+       caller's buffer into whatever followed it. */
+    int width = 0, height = 0, depth = 1;
+    struct gexgl_pixel_layout want = {{0, 0, 0, 0}};
+    const int three = target == 0x806Fu || target == 0x8C1Au || target == 0x9009u; /* 3D, 2D_ARRAY, CUBE_MAP_ARRAY */
+    if (!pbo) {{
+        glGetTexLevelParameteriv(target, level, 0x1000u, &width);  /* GL_TEXTURE_WIDTH */
+        glGetTexLevelParameteriv(target, level, 0x1001u, &height); /* GL_TEXTURE_HEIGHT */
+        if (three) glGetTexLevelParameteriv(target, level, 0x8071u, &depth); /* GL_TEXTURE_DEPTH */
+        if (depth < 1) depth = 1;
+        if (!gexgl_compute_pixel_layout(format, type, width, height, three ? depth : -1, &pack_store, &want))
+            want.end = 0;
+    }}
     uint32_t *a = begin({opcode}, 7, 0);
     if (!a) return;
     a[0] = target; a[1] = (uint32_t)level; a[2] = format; a[3] = type;
@@ -884,11 +901,26 @@ def guest_function(command: dict, opcode: int) -> str:
     uint32_t images = reply_u32();
     uint32_t bytes = 0; const uint8_t *source = reply_blob(&bytes);
     if (!pixels || !source || !bytes) return;
+    const size_t group = gexgl_pixel_group_bytes(format, type);
+    if (offset != want.offset || row_stride != want.row_stride || rows != (uint32_t)height ||
+        row_bytes != group * (size_t)width || images != (uint32_t)(three ? depth : 1) ||
+        (images > 1 && image_stride != want.image_stride)) {{
+        static int said;
+        if (!said) {{
+            said = 1;
+            fprintf(stderr, "gexgl: glGetTexImage(0x%x, level %d): the host laid out offset %u, rows %u of %u bytes "
+                            "every %u, %u images every %u, where a %dx%dx%d level is offset %zu, rows of %zu every %zu, "
+                            "%zu bytes in all: only what fits is copied\\n", target, level, offset, rows, row_bytes,
+                    row_stride, images, image_stride, width, height, three ? depth : 1, want.offset,
+                    group * (size_t)width, want.row_stride, want.end);
+        }}
+    }}
     for (uint32_t image = 0; image < images; ++image) {{
         for (uint32_t row = 0; row < rows; ++row) {{
             uint64_t at = (uint64_t)image * image_stride +
                           (uint64_t)row * row_stride;
             if (at > bytes || row_bytes > bytes - at) return;
+            if ((uint64_t)offset + at + row_bytes > want.end) return;
             memcpy((uint8_t *)pixels + offset + at, source + at, row_bytes);
         }}
     }}
@@ -1464,6 +1496,18 @@ def host_case(command: dict, opcode: int) -> str:
     const uint32_t rows = height > 0 ? static_cast<uint32_t>(height) : 0;
     const uint32_t images = threeDimensional && depth > 0
         ? static_cast<uint32_t>(depth) : 1;
+    // GEX_GL_READBACK (`?mesaenv=GEX_GL_READBACK=1`): each read's geometry against its level's size, the
+    // first 32 (what the guest's copy, gl44-generated.inc, then lays into the caller's buffer).
+    static const bool say_readback = getenv("GEX_GL_READBACK") != nullptr;
+    static unsigned readbacks_said;
+    if (say_readback && readbacks_said < 32) {{
+        ++readbacks_said;
+        emscripten_log(EM_LOG_WARN, "gex-gl: glGetTexImage(0x%x, level %d, 0x%x/0x%x): level %dx%dx%d, "
+                       "offset %zu, rows %d of %zu bytes every %zu, images %u every %zu, %zu bytes in all%s",
+                       target, level, format, type, width, height, depth, layout.offset, height,
+                       group * (width > 0 ? (size_t)width : 0), layout.row_stride, images, layout.image_stride,
+                       layout.end, fallback.empty() ? "" : " (read without the pack buffer)");
+    }}
     put_u32(static_cast<uint32_t>(layout.offset));
     put_u32(static_cast<uint32_t>(layout.row_stride));
     put_u32(static_cast<uint32_t>(group * (width > 0 ? (size_t)width : 0)));

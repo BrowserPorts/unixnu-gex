@@ -39,7 +39,19 @@ struct Proc {
     said: u64,
     /// When it was first seen (monotonic).
     start_ns: u64,
+    /// Its sizes as last asked of its map ([`gex_kernel::mem::MemoryMap::vm_counters`]:
+    /// resident and mapped), and when: asked again only after
+    /// [`SIZES_EVERY`].
+    sizes: Option<(Instant, u64, u64)>,
 }
+
+/// How often a process's sizes are asked of its map for its usage: the
+/// resident size is the host's `mincore` over every mapping, under the
+/// map's lock, which for ART's gigabytes of reservations is long, and
+/// every thread of the process waits on the lock meanwhile. Asked at each
+/// of a busy process's ticks (`SAY_EVERY_NS`), it held the zygote's other
+/// threads for most of the time it ran.
+const SIZES_EVERY: Duration = Duration::from_secs(1);
 
 static PROCS: LazyLock<Mutex<HashMap<i32, Proc>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -176,13 +188,22 @@ fn say_task(mine: &mut Mine, now: u64, at_least: u64) {
 }
 
 fn say(mine: &Mine, total: u64) {
-    let start = {
+    let (start, kept) = {
         let mut all = PROCS.lock().unwrap_or_else(|e| e.into_inner());
         let Some(p) = all.get_mut(&mine.pid) else { return };
         p.said = p.said.max(total);
-        p.start_ns
+        (p.start_ns, p.sizes.filter(|&(at, _, _)| at.elapsed() < SIZES_EVERY))
     };
-    let (size, rss, _) = mine.mm.lock().vm_counters();
+    let (size, rss) = match kept {
+        Some((_, size, rss)) => (size, rss),
+        None => {
+            let (size, rss, _) = mine.mm.lock().vm_counters();
+            if let Some(p) = PROCS.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&mine.pid) {
+                p.sizes = Some((Instant::now(), size, rss));
+            }
+            (size, rss)
+        }
+    };
     mine.procs.set_usage(mine.pid, total, rss, size, start);
 }
 

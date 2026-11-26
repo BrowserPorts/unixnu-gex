@@ -57,6 +57,16 @@
 #include <sys/wait.h>
 #include <sys/xattr.h>
 #include <unistd.h>
+#include <sys/prctl.h>
+#include <pthread.h>
+
+static int killrace_up, killrace_go;
+static void *killrace_killer(void *_) {
+  __atomic_store_n(&killrace_up, 1, __ATOMIC_SEQ_CST);
+  while (!__atomic_load_n(&killrace_go, __ATOMIC_SEQ_CST)) { }
+  kill(getpid(), SIGKILL);
+  return 0;
+}
 
 int main(int argc, char **argv) {
   const char *what = argc > 1 ? argv[1] : "";
@@ -104,6 +114,30 @@ int main(int argc, char **argv) {
     }
   } else if (!strcmp(what, "trap")) {
     __builtin_trap();
+  } else if (!strcmp(what, "killrace") && argc == 3) {
+    /* N rounds of a child that crashes the runtime (prctl
+     * PR_GEX_DEBUG_TRAP, armed by the page's debugpanic=prctl) while its
+     * other thread, in a Worker of its own, sends the process SIGKILL the
+     * moment it sees the crash begin: the kill ends the process there
+     * while the crashed thread's Worker is still on its way to its end.
+     * Each child's pid, for the test to match against the crash reports. */
+    int n = atoi(argv[2]);
+    for (int r = 0; r < n; r++) {
+      killrace_go = 0;
+      pid_t a = fork();
+      if (a == 0) {
+        pthread_t t;
+        pthread_create(&t, 0, killrace_killer, 0);
+        while (!__atomic_load_n(&killrace_up, __ATOMIC_SEQ_CST)) { }
+        __atomic_store_n(&killrace_go, 1, __ATOMIC_SEQ_CST);
+        prctl(0x474500f0, 0, 0, 0, 0);
+        _exit(42); /* not armed */
+      }
+      int st;
+      waitpid(a, &st, 0);
+      int sa = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
+      printf("round %d pid %d %d\n", r, (int)a, sa);
+    }
   } else if (!strcmp(what, "sigpipe")) {
     int p[2];
     signal(SIGPIPE, SIG_DFL);

@@ -4236,6 +4236,7 @@ impl PathIo<'_> {
         // A pipe the page's global kernel holds: `pipe_stat`'s.
         if self.darwin {
             if let Some(st) = crate::darwin::pipe::held_pipe_stat(&file, self.creds.uid(), self.creds.gid()) {
+                crate::darwin::pipe::mac_pipe_check_stat()?;
                 m.write(buf, &self.encode_stat(&st, &md, None, None))?;
                 return Ok(0);
             }
@@ -10923,6 +10924,10 @@ impl Kernel {
             if self.darwin_sigwait_given(tid) {
                 return true;
             }
+            // A call a close's drain woke: its wait is over too.
+            if self.darwin_fp_drained(tid) {
+                return true;
+            }
         }
         if tid == self.sig_tid {
             return self.signals.would_deliver();
@@ -11735,6 +11740,7 @@ impl Kernel {
         if self.darwin {
             if let SyscallOutcome::Blocking(op) = &out {
                 self.darwin_note_wait(op);
+                self.darwin_fp_enter(m);
                 self.darwin_workq_sched_block();
                 let tid = self.tid;
                 self.darwin_set_offcpu(m, tid, true);
@@ -11853,6 +11859,7 @@ impl Kernel {
                         }
                         self.darwin_arg_base = first;
                         self.darwin_set_syscall_code(nr);
+                        self.darwin_me().syscall_args = a;
                         nr
                     }
                     crate::darwin::Bsd::Enosys => {
@@ -12564,6 +12571,8 @@ impl Kernel {
             let tid = self.tid;
             self.darwin_set_offcpu(m, tid, false);
         }
+        // A call a close's drain ended: the drain's result.
+        let r = if self.darwin { self.darwin_fp_drained_result(r) } else { r };
         let out = self.finish_blocking_inner(m, r);
         if self.darwin {
             if let SyscallOutcome::Blocking(op) = &out {
@@ -12571,6 +12580,9 @@ impl Kernel {
                 self.darwin_workq_sched_block();
                 let tid = self.tid;
                 self.darwin_set_offcpu(m, tid, true);
+            } else {
+                // The call is over: its fp_drop.
+                self.darwin_fp_leave(m);
             }
         }
         out

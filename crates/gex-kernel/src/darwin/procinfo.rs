@@ -1552,7 +1552,7 @@ fn vnode_info(st: &[u8], ty: crate::vfs::FileType, fsid: u32, fsid2: u32) -> [u8
 }
 
 /// `DTYPE_*`: a file's kind.
-mod dtype {
+pub(crate) mod dtype {
     pub const VNODE: u32 = 1;
     pub const SOCKET: u32 = 2;
     pub const PSXSHM: u32 = 3;
@@ -1567,7 +1567,7 @@ pub(crate) fn fg_sendable(f: &Arc<crate::file::OpenFile>) -> bool {
     matches!(fdtype(f), dtype::VNODE | dtype::SOCKET | dtype::PIPE | dtype::PSXSHM)
 }
 
-fn fdtype(f: &Arc<crate::file::OpenFile>) -> u32 {
+pub(crate) fn fdtype(f: &Arc<crate::file::OpenFile>) -> u32 {
     // One of the host's standard streams is what the host's XNU says it
     // is; a pipe the page's global kernel holds is a pipe.
     match f.handle.host_kind() {

@@ -1198,13 +1198,18 @@ impl Kernel {
     /// A descriptor of this process is about to close: its POSIX locks on
     /// the file go with it (`closef_locked`), whichever descriptor took them.
     pub(crate) fn darwin_closing(&mut self, fd: i32) {
+        if let Ok(file) = self.fds.get(fd) {
+            self.darwin_closing_file(&file);
+        }
+    }
+
+    /// [`Self::darwin_closing`] of the file a closing descriptor named.
+    pub(crate) fn darwin_closing_file(&mut self, file: &Arc<crate::file::OpenFile>) {
         if !self.dtask.ladvlock {
             return;
         }
-        if let Ok(file) = self.fds.get(fd) {
-            if let Target::Lockf(v) = self.darwin_lock_target(&file) {
-                unlock_all(v, Id::Proc(self.pid), lf::F_POSIX);
-            }
+        if let Target::Lockf(v) = self.darwin_lock_target(file) {
+            unlock_all(v, Id::Proc(self.pid), lf::F_POSIX);
         }
     }
 }

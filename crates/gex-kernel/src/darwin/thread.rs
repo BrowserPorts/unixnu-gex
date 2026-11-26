@@ -246,6 +246,15 @@ pub struct DThread {
     pub overrides: Vec<super::workq::QosOverride>,
     /// The BSD call it is in or last made (`uu_syscall_code`).
     pub syscall_code: u64,
+    /// That call's arguments (`uu_arg`).
+    pub syscall_args: [u64; 6],
+    /// The fileprocs its call, asleep, holds I/O references on: each one's
+    /// descriptor and the file it named ([`super::fpdrain`]).
+    pub fp_call: Vec<(i32, usize)>,
+    /// Its close draining a descriptor ([`super::fpdrain::Closing`]).
+    pub fp_closing: Option<super::fpdrain::Closing>,
+    /// What a close's drain made of its call ([`super::fpdrain::Drained`]).
+    pub fp_drained: Option<super::fpdrain::Drained>,
     /// `AST_KEVENT_*` owed on its way back to user space.
     pub astkevent: u16,
     /// The voucher it adopted (`ith_voucher`) and the name it gave
@@ -358,6 +367,9 @@ pub enum Finish {
     /// `task_enqueue_exception_with_corpse`'s corpse fork, made by the
     /// host ([`super::corpsefork`]).
     CorpseFork,
+    /// A close's `fileproc_drain`, waiting for the calls in its descriptor
+    /// to leave ([`super::fpdrain`]).
+    FpDrain,
 }
 
 /// `wait_result_to_return_code` (`sys_ulock.c`).
@@ -477,6 +489,9 @@ impl Kernel {
             sys::REVOKE => Some(self.darwin_revoke(m, a)),
             // A replica's or the console's last close may drain its
             // output, as this call.
+            // Another thread in a call on it: the close drains it (else, its
+            // drain not done here, it closes as one with no call in it).
+            sys::CLOSE | sys::CLOSE_NOCANCEL if self.darwin_fp_busy(a[0] as i32) => self.darwin_close_drain(m, a[0] as i32),
             sys::CLOSE | sys::CLOSE_NOCANCEL if self.darwin_tty_of(a[0]).is_some_and(|(_, d)| matches!(d.node, super::ttydev::Node::Pts(_) | super::ttydev::Node::Ptyp(_) | super::ttydev::Node::Console)) => Some(self.darwin_tty_close(m, a)),
             sys::KEVENT => Some(<Kq as KQueue>::kevent_legacy(self, m, a, false)),
             sys::POLL | sys::POLL_NOCANCEL => Some(self.darwin_poll(m, a)),
@@ -938,6 +953,7 @@ impl Kernel {
             Finish::Psynch(c) => self.darwin_psynch_wait_done(m, c, res),
             Finish::Sigwait { siglist, sig } => return self.darwin_sigwait_done(m, siglist, sig, res),
             Finish::Tty => return self.darwin_tty_wait_done(m, res),
+            Finish::FpDrain => return self.darwin_fpdrain_done(m, res),
             Finish::CorpseFork => return self.darwin_corpse_fork_wait_done(m),
             Finish::Ulock { addr, no_errno } => {
                 // A waiter that was not woken is still on the queue.

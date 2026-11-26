@@ -46,6 +46,9 @@ pub mod xnu {
         pub const WANTR: u32 = 0x008;
         pub const WANTW: u32 = 0x010;
         pub const EOF: u32 = 0x080;
+        /// `PIPE_DRAIN`: the last descriptor of one end is closing while a
+        /// call is in it (`pipe_drain`); taken as EOF until `pipeclose`.
+        pub const DRAIN: u32 = 0x2000;
         pub const WSELECT: u32 = 0x4000;
     }
 
@@ -106,6 +109,12 @@ struct State {
     xnu_bits: [u32; 2],
     /// What names a Darwin pipe in every process ([`Pipe::set_ident`]).
     ident: [u64; 2],
+}
+
+/// Whether the read side's struct, which every read and write of the pipe
+/// checks (`rpipe` and the writer's `wpipe`), has `PIPE_DRAIN`.
+fn drained(s: &State) -> bool {
+    s.xnu_bits[0] & xnu::state::DRAIN != 0
 }
 
 /// One pipe, shared by both ends.
@@ -219,6 +228,31 @@ impl Pipe {
         }
     }
 
+    /// `pipe_drain` of a Darwin pipe end whose last descriptor is closing
+    /// while a call is in it: `PIPE_DRAIN` on its side's struct and its
+    /// peer's, their `PIPE_WANTR` and `PIPE_WANTW` cleared, and both woken.
+    /// A sleeping read then ends with what it has and a write with EPIPE.
+    pub fn drain(&self, write: bool) {
+        let mut s = self.state.lock().unwrap();
+        let peer_open = if write { s.readers } else { s.writers } > 0;
+        for side in [write, !write] {
+            if side == write || peer_open {
+                let b = &mut s.xnu_bits[usize::from(side)];
+                *b |= xnu::state::DRAIN;
+                *b &= !(xnu::state::WANTR | xnu::state::WANTW);
+            }
+        }
+        drop(s);
+        self.ready.notify_all();
+        self.queue.notify();
+    }
+
+    /// Whether either side has `PIPE_DRAIN` (`filt_pipe_draincommon`'s EOF).
+    pub fn draining(&self) -> bool {
+        let s = self.state.lock().unwrap();
+        (s.xnu_bits[0] | s.xnu_bits[1]) & xnu::state::DRAIN != 0
+    }
+
     /// The `pipe_state` of side `write`'s struct (`fill_pipeinfo`'s
     /// `pipe_status`): the bits its sleepers and `select` set, `PIPE_ASYNC`
     /// as `FIOASYNC` set it, and `PIPE_EOF` once the other side has closed
@@ -284,7 +318,7 @@ impl Pipe {
     /// system's pipes have room.
     pub fn xnu_begin_write(&self, orig: usize) -> Result<(), Errno> {
         let mut s = self.state.lock().unwrap();
-        if s.readers == 0 {
+        if s.readers == 0 || drained(&s) {
             s.broken += 1;
             return Err(Errno::EPIPE);
         }
@@ -307,7 +341,7 @@ impl Pipe {
     /// `EAGAIN` for none, `EPIPE` with no reader left.
     pub fn xnu_write_with(&self, left: usize, orig: usize, fill: impl FnMut(&mut [u8], usize)) -> SysResult {
         let mut s = self.state.lock().unwrap();
-        if s.readers == 0 {
+        if s.readers == 0 || drained(&s) {
             s.broken += 1;
             return Err(Errno::EPIPE);
         }
@@ -345,7 +379,7 @@ impl Pipe {
         let s = self.state.lock().unwrap();
         let size = s.xnu_size.unwrap_or(0);
         let space = size.saturating_sub(s.buf.len());
-        s.readers == 0 || (space > 0 && !(space < left && orig <= xnu::PIPE_BUF))
+        s.readers == 0 || drained(&s) || (space > 0 && !(space < left && orig <= xnu::PIPE_BUF))
     }
 
     /// Append `n` bytes that `fill` copies in.
@@ -410,6 +444,11 @@ impl Pipe {
             }
         }
         let last = if write { s.writers == 0 } else { s.readers == 0 };
+        // pipeclose: PIPE_EOF in place of PIPE_DRAIN, on both sides.
+        if last {
+            s.xnu_bits[0] &= !xnu::state::DRAIN;
+            s.xnu_bits[1] &= !xnu::state::DRAIN;
+        }
         drop(s);
         // Waking both sides is what turns the last close into an EOF or an
         // EPIPE rather than a hang.
@@ -444,7 +483,7 @@ impl Pipe {
         }
         let mut s = self.state.lock().unwrap();
         if s.buf.is_empty() {
-            return if s.writers == 0 { Ok(0) } else { Err(Errno::EAGAIN) };
+            return if s.writers == 0 || drained(&s) { Ok(0) } else { Err(Errno::EAGAIN) };
         }
         let n = max.min(s.buf.len());
         let (front, back) = s.buf.as_slices();
@@ -481,8 +520,9 @@ impl Pipe {
                 self.queue.notify();
                 return Ok(n as u64);
             }
-            // No data: end of file once no writer can ever supply any.
-            if s.writers == 0 {
+            // No data: end of file once no writer can ever supply any, or
+            // while the pipe drains for a close (pipe_read's PIPE_DRAIN).
+            if s.writers == 0 || drained(&s) {
                 return Ok(0);
             }
             // Never wait here: this runs with the kernel locked and the writer
@@ -627,7 +667,7 @@ impl Pipe {
     /// True when a reader would not block: data present, or no writers left.
     pub fn readable(&self) -> bool {
         let s = self.state.lock().unwrap();
-        !s.buf.is_empty() || s.writers == 0
+        !s.buf.is_empty() || s.writers == 0 || drained(&s)
     }
 
     /// True when every write end is closed.
@@ -646,7 +686,7 @@ impl Pipe {
     pub fn writable(&self) -> bool {
         let s = self.state.lock().unwrap();
         if let Some(size) = s.xnu_size {
-            return s.readers == 0 || size.max(xnu::PIPE_SIZE).saturating_sub(s.buf.len()) >= xnu::PIPE_BUF;
+            return s.readers == 0 || drained(&s) || size.max(xnu::PIPE_SIZE).saturating_sub(s.buf.len()) >= xnu::PIPE_BUF;
         }
         PIPE_BUF.saturating_sub(s.buf.len()) >= PIPE_ATOMIC || s.readers == 0
     }

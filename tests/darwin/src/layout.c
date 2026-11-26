@@ -15,8 +15,15 @@
 //   main image's slide (kern.usrstack64).
 // - vm_shared_region_enter nests the whole shared region, from
 //   SHARED_REGION_BASE_ARM64 (0x180000000) for SHARED_REGION_SIZE_ARM64
-//   (0x180000000), as one read-only entry inherited by share. The cache in
-//   it is slid once a boot: dyld passes the cache's maxSlide and
+//   (0x180000000), as one read-only entry inherited by share. A task's
+//   first write to a writable mapping in it (dyld's and libSystem's
+//   initializers write their __DATA there) unnests the pmap's 32 MiB
+//   granule around the page (vm_map_lookup_and_lock_object,
+//   vm_map_clip_unnest): the entry is clipped at the granule, and the part
+//   of the granule that mapping covers becomes the task's own entry,
+//   inherited by copy. So the region is the submap's entries and those
+//   copies, end to end, from its start to its end. The cache in it is slid
+//   once a boot: dyld passes the cache's maxSlide and
 //   shared_region_map_and_slide_2_np picks the slide below it, on a 16 KiB
 //   boundary; every task of the boot sees the same.
 // - libmalloc's nano allocator follows the shared region: 512 MiB at
@@ -174,12 +181,26 @@ static int check_layout(int dyld_on_disk) {
     if (memcmp(hdr, "dyld_v1", 7) || linked != REGION_BASE) return bad("the shared cache's header", linked);
     cache_slide = start - linked;
     if (cache_slide % PAGE || cache_slide >= max_slide || cache_slide != ai->sharedCacheSlide) return bad("the shared cache's slide", cache_slide);
-    raddr = REGION_BASE + 0x1000;
-    count = VM_REGION_BASIC_INFO_COUNT_64;
-    kr = vm_region_64(mach_task_self(), &raddr, &rsize, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &obj);
-    if (kr != KERN_SUCCESS || raddr != REGION_BASE || rsize != REGION_SIZE) return bad("the shared region's entry", raddr ^ rsize);
-    if (info.protection != VM_PROT_READ || info.max_protection != VM_PROT_READ || info.inheritance != VM_INHERIT_SHARE || !info.reserved || info.shared)
-        return bad("the shared region's entry's attributes", info.protection | info.max_protection << 4 | info.inheritance << 8 | info.reserved << 12 | info.shared << 16);
+    // Its entries, from its start to its end with no gap: the submap's
+    // (read-only, inherited by share, reserved) or, inside an unnested
+    // 32 MiB granule, a task copy of a writable mapping's part of it
+    // (inherited by copy, not reserved, readable).
+    vm_address_t next = REGION_BASE;
+    while (next < REGION_BASE + REGION_SIZE) {
+        raddr = next == REGION_BASE ? REGION_BASE + 0x1000 : next;
+        count = VM_REGION_BASIC_INFO_COUNT_64;
+        kr = vm_region_64(mach_task_self(), &raddr, &rsize, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &obj);
+        if (kr != KERN_SUCCESS || raddr != next || rsize == 0 || raddr + rsize > REGION_BASE + REGION_SIZE) return bad("the shared region's entry", raddr ^ rsize);
+        if (info.reserved) {
+            if (info.protection != VM_PROT_READ || info.max_protection != VM_PROT_READ || info.inheritance != VM_INHERIT_SHARE || info.shared)
+                return bad("the shared region's entry's attributes", info.protection | info.max_protection << 4 | info.inheritance << 8 | info.reserved << 12 | info.shared << 16);
+        } else {
+            const uint64_t granule = 0x2000000;
+            if (!(info.protection & VM_PROT_READ) || info.inheritance != VM_INHERIT_COPY || raddr / granule != (raddr + rsize - 1) / granule)
+                return bad("an unnested granule's copy", info.protection | info.max_protection << 4 | info.inheritance << 8 | (uint64_t)raddr << 12);
+        }
+        next = raddr + rsize;
+    }
     at = REGION_BASE + REGION_SIZE - PAGE;
     if ((kr = vm_allocate(mach_task_self(), &at, PAGE, VM_FLAGS_FIXED)) != KERN_NO_SPACE) return bad("a fixed allocation in the shared region's last page", kr);
     return 0;

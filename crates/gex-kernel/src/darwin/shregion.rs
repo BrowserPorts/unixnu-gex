@@ -1375,7 +1375,7 @@ impl Kernel {
                 continue;
             }
             let file = self.fds.get(srf.fd)?;
-            if file.handle.pipe_end().is_some() || Arc::clone(&file.handle).as_kqueue().is_some() {
+            if file.handle.pipe_end().is_some() || super::pipe::held_elsewhere(&file) || Arc::clone(&file.handle).as_kqueue().is_some() {
                 return Err(Errno::EINVAL);
             }
             if !file.readable {

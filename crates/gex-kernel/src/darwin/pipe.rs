@@ -82,17 +82,20 @@ static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(
 /// `pipe_stat` of a pipe the page's global kernel holds
 /// ([`held_elsewhere`]), for a caller of ids `uid`, `gid`: a FIFO of the
 /// caller's, whose size is what is buffered and whose block size is the
-/// size of its buffer (the global kernel's pipe's,
-/// [`crate::pipe::PIPE_BUF`]); for the write end, its peer's while it has
-/// a reader, else none (the default size). Its times are none, as an iOS
-/// pipe's (`pipe_touch` is macOS's only).
+/// size of its buffer (`MAX_PIPESIZE` of a Darwin process's pipe there,
+/// else the global kernel's pipe's, [`crate::pipe::PIPE_BUF`]); for the
+/// write end, its peer's while it has a reader, else none (the default
+/// size). Its times are none, as an iOS pipe's (`pipe_touch` is macOS's
+/// only).
 pub(crate) fn held_pipe_stat(file: &OpenFile, uid: u32, gid: u32) -> Option<crate::fs::Stat> {
     if !held_elsewhere(file) {
         return None;
     }
     let st = file.handle.pipe_state()?;
     let md = file.handle.metadata().ok()?;
-    let (count, size) = if !file.writable || !st.closed { (st.buffered as usize, crate::pipe::PIPE_BUF) } else { (0, xnu::PIPE_SIZE.max(xnu::BLOCKS[0])) };
+    // A Darwin process's pipe there keeps XNU's sizes: MAX_PIPESIZE.
+    let max = file.handle.as_remote_pipe().and_then(|r| r.xnu_sizes()).map_or(crate::pipe::PIPE_BUF, |(_, max, _)| max);
+    let (count, size) = if !file.writable || !st.closed { (st.buffered as usize, max) } else { (0, xnu::PIPE_SIZE.max(xnu::BLOCKS[0])) };
     Some(crate::fs::Stat {
         ino: md.ino,
         mode: 0o010000 | 0o660,
@@ -106,12 +109,26 @@ pub(crate) fn held_pipe_stat(file: &OpenFile, uid: u32, gid: u32) -> Option<crat
 }
 
 impl Kernel {
-    /// `pipe()`: the read end in x0, the write end in x1.
+    /// `pipe()`: the read end in x0, the write end in x1. In the page the
+    /// pipe is the global kernel's, with XNU's rules there, as every pipe
+    /// of the page is: another process (a posix_spawn's child) may hold an
+    /// end of it, in a memory of its own.
     pub(crate) fn darwin_pipe(&mut self, m: &mut GuestMem<'_>) -> Result<u64, Errno> {
-        let p = Arc::new(Pipe::new_xnu());
-        p.set_ident([self.dtask.uniqueid, SERIAL.fetch_add(1, Ordering::Relaxed)]);
-        let r = OpenFile::new(Arc::new(PipeEnd { pipe: Arc::clone(&p), write: false }), "pipe:[0]".into(), oflags::O_RDONLY, true, false);
-        let w = OpenFile::new(Arc::new(PipeEnd { pipe: p, write: true }), "pipe:[0]".into(), oflags::O_WRONLY, false, true);
+        let (r, w) = if let Some(remote) = self.pipes {
+            // pipepair_alloc's failure.
+            let id = (remote.new_xnu)(self.pid);
+            if id < 0 {
+                return Err(Errno::ENOMEM);
+            }
+            let end = |write: bool| Arc::new(crate::pipe::RemotePipeEnd { id, write, remote });
+            let path = format!("pipe:[{id}]");
+            (OpenFile::new(end(false), path.clone(), oflags::O_RDONLY, true, false), OpenFile::new(end(true), path, oflags::O_WRONLY, false, true))
+        } else {
+            let p = Arc::new(Pipe::new_xnu());
+            p.set_ident([self.dtask.uniqueid, SERIAL.fetch_add(1, Ordering::Relaxed)]);
+            let r = OpenFile::new(Arc::new(PipeEnd { pipe: Arc::clone(&p), write: false }), "pipe:[0]".into(), oflags::O_RDONLY, true, false);
+            (r, OpenFile::new(Arc::new(PipeEnd { pipe: p, write: true }), "pipe:[0]".into(), oflags::O_WRONLY, false, true))
+        };
         let rfd = self.fds.insert(r, false)?;
         let wfd = match self.fds.insert(w, false) {
             Ok(fd) => fd,
@@ -131,6 +148,16 @@ impl Kernel {
         pipe.is_xnu().then_some((file, pipe, write))
     }
 
+    /// The Darwin pipe descriptor `fd` is on, this kernel's or one the
+    /// page's global kernel holds with XNU's rules, if it is one.
+    pub(crate) fn darwin_xnu_pipe_of(&self, fd: u64) -> Option<Arc<OpenFile>> {
+        if let Some((file, ..)) = self.darwin_pipe_of(fd) {
+            return Some(file);
+        }
+        let file = self.fds.get(fd as i32).ok()?;
+        (held_elsewhere(&file) && file.handle.as_remote_pipe()?.xnu_sizes().is_some()).then_some(file)
+    }
+
     /// `write` or `writev` (`raw`) to a Darwin pipe.
     pub(crate) fn darwin_pipe_write(&mut self, m: &mut GuestMem<'_>, raw: u64, a: &[u64; 6]) -> SyscallOutcome {
         match self.darwin_pipe_write_inner(m, raw, a) {
@@ -143,7 +170,7 @@ impl Kernel {
     }
 
     fn darwin_pipe_write_inner(&mut self, m: &mut GuestMem<'_>, raw: u64, a: &[u64; 6]) -> Result<SyscallOutcome, Errno> {
-        let (file, pipe, _) = self.darwin_pipe_of(a[0]).ok_or(Errno::EBADF)?;
+        let file = self.darwin_xnu_pipe_of(a[0]).ok_or(Errno::EBADF)?;
         if !file.writable {
             return Err(Errno::EBADF);
         }
@@ -172,13 +199,21 @@ impl Kernel {
         };
         let orig = data.len();
         let nosigpipe = file.darwin_lflags.load(Ordering::Acquire) & FG_NOSIGPIPE != 0;
-        if let Err(e) = pipe.xnu_begin_write(orig) {
+        let begun = match (file.handle.pipe_end(), file.handle.as_remote_pipe()) {
+            (Some((pipe, _)), _) => pipe.xnu_begin_write(orig),
+            (None, Some(r)) => match (r.remote.xnu_begin)(r.id, orig as u32) {
+                0 => Ok(()),
+                e => Err(Errno(-e)),
+            },
+            (None, None) => Err(Errno::EBADF),
+        };
+        if let Err(e) = begun {
             return Err(self.darwin_write_error(e, nosigpipe));
         }
         let mut done = 0usize;
         // One pass: what fits (pipe_write sleeps when that is not all).
         if orig > 0 {
-            match pipe.xnu_write_with(orig, orig, |dst, from| dst.copy_from_slice(&data[from..from + dst.len()])) {
+            match file.handle.write_part(&data, orig) {
                 Ok(n) => done = n as usize,
                 Err(Errno::EAGAIN) => {}
                 Err(e) => return Err(self.darwin_write_error(e, nosigpipe)),
@@ -263,14 +298,18 @@ impl Kernel {
             let [owner, serial] = pipe.ident();
             ([0, owner, serial], write, cnt, max, pipe.pipe_status(write))
         } else if let Some(r) = file.handle.as_remote_pipe() {
-            // The global kernel's pipe: its buffer is the size of the
-            // pipe's (crate::pipe::PIPE_BUF), which MAX_PIPESIZE is.
+            // The global kernel's pipe: a Darwin process's keeps XNU's
+            // MAX_PIPESIZE; another's buffer is the size of the pipe's
+            // (crate::pipe::PIPE_BUF), which MAX_PIPESIZE is.
             let status = (r.remote.status)(r.id, i32::from(r.write));
             if status < 0 {
                 return Err(super::errno::to_darwin(-status));
             }
-            let cnt = (r.remote.buffered)(r.id).max(0) as usize;
-            ([1, r.id as u64, 0], r.write, cnt, crate::pipe::PIPE_BUF.max(xnu::PIPE_SIZE), status as u32)
+            let (cnt, max) = match r.xnu_sizes() {
+                Some((_, max, cnt)) => (cnt, max),
+                None => ((r.remote.buffered)(r.id).max(0) as usize, crate::pipe::PIPE_BUF.max(xnu::PIPE_SIZE)),
+            };
+            ([1, r.id as u64, 0], r.write, cnt, max, status as u32)
         } else {
             return Ok(None);
         };

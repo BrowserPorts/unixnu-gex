@@ -177,6 +177,9 @@ impl Kernel {
         if let Some((_, write_end)) = file.handle.pipe_end() {
             return set == 1 && !write_end;
         }
+        if super::pipe::held_elsewhere(&file) {
+            return set == 1 && !file.handle.as_remote_pipe().is_some_and(|r| r.write);
+        }
         if self.darwin_vnode_of(&file).is_none() || file.is_tty() {
             return false;
         }

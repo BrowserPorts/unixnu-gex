@@ -841,7 +841,7 @@ pub struct Cont {
 impl Kernel {
     /// `fp`'s vnode for locking, and what kind it is.
     fn darwin_lock_target(&mut self, file: &Arc<OpenFile>) -> Target {
-        if file.handle.pipe_end().is_some() || Arc::clone(&file.handle).as_kqueue().is_some() || Arc::clone(&file.handle).as_posix_shm().is_some() {
+        if file.handle.pipe_end().is_some() || super::pipe::held_elsewhere(file) || Arc::clone(&file.handle).as_kqueue().is_some() || Arc::clone(&file.handle).as_posix_shm().is_some() {
             return Target::NotVnode;
         }
         let Ok(md) = file.handle.metadata() else { return Target::NotVnode };

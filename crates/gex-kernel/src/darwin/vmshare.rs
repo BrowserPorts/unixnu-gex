@@ -64,6 +64,31 @@ pub(crate) struct Extracted {
     pub src_kind: u8,
 }
 
+/// The extracted entries' references to their objects, as
+/// `vm_map_remap_extract` takes one for each copy entry it makes, given
+/// back once the remap's own entries hold theirs: an object whose last
+/// entry the remap's target replaces (a remap over its own source) lives on
+/// in the new entries.
+struct ExtractRefs(Vec<u64>);
+
+impl ExtractRefs {
+    fn take(extracted: &[Extracted]) -> ExtractRefs {
+        let objs: Vec<u64> = extracted.iter().map(|x| x.attrs.obj).collect();
+        for &o in &objs {
+            super::vmobject::reference(o);
+        }
+        ExtractRefs(objs)
+    }
+}
+
+impl Drop for ExtractRefs {
+    fn drop(&mut self) {
+        for &o in &self.0 {
+            super::vmobject::release(o);
+        }
+    }
+}
+
 /// What a remap from another task's map took of it: the new entries, the
 /// host's hold of its pages, and its absent pages and pages the file still
 /// holds over the range (by address, and by page).
@@ -321,6 +346,7 @@ impl Kernel {
                 Err(k) => return k,
             },
         };
+        let _refs = ExtractRefs::take(&extracted);
         let end = start + size;
         // What the host must do: share the pages, or copy them on write.
         if !a.copy && !crate::host_can_remap() {
@@ -399,6 +425,16 @@ impl Kernel {
         // A copy the host cannot make on write: the bytes, read first.
         let bytes = if crate::host_can_remap() || other.is_some() { None } else { m.kernel().read(start, size as usize).ok().map(<[u8]>::to_vec) };
         let lprot = |p: u64| p & prot::ALL;
+        // What the source's objects lack past a file's end, and its pages
+        // the file's still, as they are before the target's entries go
+        // (vm_map_delete takes them from a target over the source).
+        let (absent, pending) = match &other {
+            Some(o) => (o.absent.clone(), std::sync::Arc::new(o.pending.clone())),
+            None => {
+                let mut mm = self.mem.lock();
+                (mm.absent_ranges(), mm.copy_pending_runs())
+            }
+        };
         let made = if in_place {
             // Over itself: the entries change and the pages are copied in
             // place; the pmap's entries go (vm_map_delete).
@@ -445,10 +481,6 @@ impl Kernel {
             // as from their source; a copy's pages of a file are the file's
             // until written (a private source's own copies are not).
             let mut mm = self.mem.lock();
-            let (absent, pending) = match &other {
-                Some(o) => (o.absent.clone(), std::sync::Arc::new(o.pending.clone())),
-                None => (mm.absent_ranges(), mm.copy_pending_runs()),
-            };
             mm.set_unentered(at, tend);
             for (s, e) in absent {
                 let (lo, hi) = (s.max(start), e.min(end));

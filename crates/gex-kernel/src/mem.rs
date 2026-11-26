@@ -454,6 +454,16 @@ pub struct MemoryMap {
     perms: Option<Perms>,
 }
 
+/// What [`MemoryMap::entries_removed`] took of a range's entries' objects,
+/// by page: their pages past a file's end and their pages the file's
+/// still.
+#[derive(Debug, Default)]
+pub struct RemovedEntries {
+    absent: Vec<(u64, u64)>,
+    copy_pending: Vec<(u64, u64)>,
+    range: Option<(u64, u64)>,
+}
+
 /// A Darwin process's page protections as its table
 /// (`gex_abi::PERM_TABLE64`) was last written, and the ranges written over
 /// since by a change to the map that its kernel has still to write.
@@ -1049,6 +1059,49 @@ impl MemoryMap {
     /// The runs of absent pages, by address, `[start, end)`.
     pub fn absent_ranges(&self) -> Vec<(u64, u64)> {
         self.perms.as_ref().map_or_else(Vec::new, |p| p.absent.iter().map(|(&a, &b)| (a << gex_abi::PERM_PAGE_SHIFT, b << gex_abi::PERM_PAGE_SHIFT)).collect())
+    }
+
+    /// `vm_map_delete` of the entries over `[start, end)` (page aligned),
+    /// a mapping over them to follow: their `pmap_remove`, which takes what
+    /// was waiting to be entered there, and their objects, with what the
+    /// map kept of them (pages past a file's end, a private mapping's pages
+    /// the file's still). What it took, for [`Self::entries_back`].
+    pub fn entries_removed(&mut self, start: u64, end: u64) -> RemovedEntries {
+        let Some(p) = &mut self.perms else { return RemovedEntries::default() };
+        let (a, b) = (start >> gex_abi::PERM_PAGE_SHIFT, (end + gex_abi::PERM_PAGE - 1) >> gex_abi::PERM_PAGE_SHIFT);
+        let take = |runs: &mut std::collections::BTreeMap<u64, u64>| {
+            let had: Vec<(u64, u64)> = runs.range(..b).filter(|(_, &e)| e > a).map(|(&s, &e)| (s.max(a), e.min(b))).collect();
+            runs_remove(runs, a, b);
+            had
+        };
+        let out = RemovedEntries { absent: take(&mut p.absent), copy_pending: take(&mut p.copy_pending), range: Some((start, end)) };
+        runs_remove(&mut p.unentered, a, b);
+        p.unentered_view = None;
+        p.copy_view = None;
+        p.dirty.push((start, end));
+        out
+    }
+
+    /// The entries [`Self::entries_removed`] took are back (the mapping
+    /// that was to replace them failed, as `vm_map_enter` puts back the
+    /// entries its overwrite zapped): their objects' state as it was, and
+    /// none of their pages entered, the `pmap_remove` having been made.
+    pub fn entries_back(&mut self, gone: RemovedEntries) {
+        let Some((start, end)) = gone.range else { return };
+        let Some(p) = &mut self.perms else { return };
+        for (s, e) in gone.absent {
+            runs_add(&mut p.absent, s, e);
+        }
+        for (s, e) in gone.copy_pending {
+            runs_add(&mut p.copy_pending, s, e);
+        }
+        p.copy_view = None;
+        p.dirty.push((start, end));
+        let i = p.shown.partition_point(|&(_, e, _)| e <= start);
+        let mapped: Vec<(u64, u64)> = p.shown[i..].iter().take_while(|&&(s, _, _)| s < end).map(|&(s, e, _)| (s.max(start), e.min(end))).collect();
+        for (s, e) in mapped {
+            self.set_unentered(s, e);
+        }
     }
 
     /// The runs of pages not entered, by address, `[start, end)`.
@@ -2527,6 +2580,33 @@ mod tests {
         assert_eq!(m.unentered_ranges(), vec![(at + 2 * PERM_PAGE, at + 3 * PERM_PAGE)]);
         m.unmap(at, 4 * PERM_PAGE).unwrap();
         assert!(m.unentered_ranges().is_empty(), "unmapped, no page to enter");
+    }
+
+    /// A mapping over a file's takes what the map kept of the file's
+    /// object (its pages past the file's end, its pages the file's still)
+    /// with the old entries; a mapping that fails gives it back, its pages
+    /// not entered.
+    #[test]
+    fn entries_removed_take_their_objects_state() {
+        use gex_abi::{PERM_PAGE, PERM_PAGE_SHIFT};
+        let mut m = MemoryMap::new(0x100_0000);
+        m.set_page(PERM_PAGE);
+        m.set_high_arena(gex_abi::DARWIN_GUEST_FLOOR, gex_abi::LIMIT64);
+        m.keep_perms();
+        let at = gex_abi::DARWIN_GUEST_FLOOR + 0x1000_0000;
+        let p0 = at >> PERM_PAGE_SHIFT;
+        m.mmap(at, 4 * PERM_PAGE, prot::READ | prot::WRITE, flags::PRIVATE | flags::ANONYMOUS | flags::FIXED, "").unwrap();
+        m.set_unentered(at, at + 2 * PERM_PAGE);
+        m.set_copy_pending(at, at + 2 * PERM_PAGE);
+        m.set_absent(at + 2 * PERM_PAGE, at + 4 * PERM_PAGE);
+        assert!(m.enter_page(p0));
+        let gone = m.entries_removed(at + PERM_PAGE, at + 3 * PERM_PAGE);
+        assert!(!m.is_unentered(p0 + 1) && !m.is_copy_pending(p0 + 1) && !m.is_absent(p0 + 2));
+        assert!(m.is_copy_pending(p0) && m.is_absent(p0 + 3), "outside the range, kept");
+        m.entries_back(gone);
+        assert!(m.is_copy_pending(p0 + 1) && m.is_absent(p0 + 2));
+        assert!(m.is_unentered(p0 + 1) && !m.is_unentered(p0 + 2), "not entered again; an absent page none to enter");
+        assert!(!m.is_unentered(p0), "outside the range, as it was");
     }
 
     /// A refused large mapping explains what holds the space, once, without

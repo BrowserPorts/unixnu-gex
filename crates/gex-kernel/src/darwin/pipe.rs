@@ -108,6 +108,16 @@ pub(crate) fn held_pipe_stat(file: &OpenFile, uid: u32, gid: u32) -> Option<crat
     })
 }
 
+/// `mac_pipe_check_stat`, which `pipe_stat` and `fill_pipeinfo` make
+/// before they read the pipe: the policies' `mpo_pipe_check_stat`. None
+/// of this kernel's policies has one: AMFI's operations (filled in by its
+/// start, `0xfffffff005ab4b2c` on), Sandbox's (`0xfffffff006f8b9b8`) and
+/// AppleImage4's (`0xfffffff006cf33a8`, its sysctl check alone) leave
+/// slot 105 of `struct mac_policy_ops` NULL, so the check allows.
+pub(crate) fn mac_pipe_check_stat() -> Result<(), Errno> {
+    Ok(())
+}
+
 impl Kernel {
     /// `pipe()`: the read end in x0, the write end in x1. In the page the
     /// pipe is the global kernel's, with XNU's rules there, as every pipe
@@ -263,6 +273,7 @@ impl Kernel {
     /// is buffered and whose block size is `MAX_PIPESIZE`.
     pub(crate) fn darwin_pipe_stat(&mut self, m: &mut GuestMem<'_>, fd: u64, buf: u64) -> Result<u64, Errno> {
         let (_, pipe, write) = self.darwin_pipe_of(fd).ok_or(Errno::EBADF)?;
+        mac_pipe_check_stat()?;
         let (readers, _) = pipe.ends();
         let (size, max, cnt) = pipe.xnu_sizes().expect("a Darwin pipe");
         // The write end has no buffer: its peer's, while there is one.
@@ -295,12 +306,14 @@ impl Kernel {
         // buffer holds and its MAX_PIPESIZE, and the side's state.
         let (ident, write, count, max, status) = if let Some((pipe, write)) = file.handle.pipe_end() {
             let Some((_, max, cnt)) = pipe.xnu_sizes() else { return Ok(None) };
+            mac_pipe_check_stat().map_err(|e| super::errno::to_darwin(e.0))?;
             let [owner, serial] = pipe.ident();
             ([0, owner, serial], write, cnt, max, pipe.pipe_status(write))
         } else if let Some(r) = file.handle.as_remote_pipe() {
             // The global kernel's pipe: a Darwin process's keeps XNU's
             // MAX_PIPESIZE; another's buffer is the size of the pipe's
             // (crate::pipe::PIPE_BUF), which MAX_PIPESIZE is.
+            mac_pipe_check_stat().map_err(|e| super::errno::to_darwin(e.0))?;
             let status = (r.remote.status)(r.id, i32::from(r.write));
             if status < 0 {
                 return Err(super::errno::to_darwin(-status));

@@ -4236,6 +4236,7 @@ impl PathIo<'_> {
         // A pipe the page's global kernel holds: `pipe_stat`'s.
         if self.darwin {
             if let Some(st) = crate::darwin::pipe::held_pipe_stat(&file, self.creds.uid(), self.creds.gid()) {
+                crate::darwin::pipe::mac_pipe_check_stat()?;
                 m.write(buf, &self.encode_stat(&st, &md, None, None))?;
                 return Ok(0);
             }

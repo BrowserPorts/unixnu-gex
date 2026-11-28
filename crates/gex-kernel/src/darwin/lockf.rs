@@ -1180,9 +1180,14 @@ impl Kernel {
         }
     }
 
-    /// The open file at address `fg` among the process's descriptors.
+    /// The open file at address `fg` among the process's descriptors,
+    /// those a close is draining (`UF_RESERVED`, its fileproc still the
+    /// call's) among them.
     fn fds_by_ptr(&self, fg: usize) -> Result<Arc<OpenFile>, Errno> {
-        self.fds.list().into_iter().find_map(|(fd, _)| self.fds.get(fd).ok().filter(|f| Arc::as_ptr(f) as usize == fg)).ok_or(Errno::EBADF)
+        if let Some(f) = self.fds.list().into_iter().find_map(|(fd, _)| self.fds.get(fd).ok().filter(|f| Arc::as_ptr(f) as usize == fg)) {
+            return Ok(f);
+        }
+        self.dtask.threads.map.values().find_map(|t| t.fp_closing.as_ref().filter(|c| Arc::as_ptr(&c.file) as usize == fg).map(|c| Arc::clone(&c.file))).ok_or(Errno::EBADF)
     }
 
     /// The vnodes the process's descriptors reach, for an exec's

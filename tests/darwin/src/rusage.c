@@ -217,6 +217,20 @@ static int instructions(void) {
     pthread_create(&th, NULL, counting_thread, (void *)(uintptr_t)3000000);
     pthread_join(th, NULL);
     if (insns() - j0 < 6000000) return bad("an ended thread's instructions", (long)(insns() - j0), 6000000);
+    // Threads made and ended one after another, the count read as each is
+    // joined: each one's once, gone from the task's threads with its end
+    // (never a second time, and never less as the next reuses its place).
+    // The rise above the thread's 2n is its making, joining and end, and
+    // the reads: under 400,000 on the host (EL1 too), against another 2n
+    // for a thread counted twice.
+    for (int i = 0; i < 100; i++) {
+        uint64_t r0 = insns();
+        pthread_create(&th, NULL, counting_thread, (void *)(uintptr_t)1000000);
+        pthread_join(th, NULL);
+        uint64_t rise = insns() - r0;
+        if (rise < 2000000) return bad("a joined thread's instructions", (long)rise, 2000000);
+        if (rise >= 3000000) return bad("a joined thread's instructions, at most", (long)rise, 3000000);
+    }
     // A fork's child starts from none; an exec keeps the count.
     int pp[2];
     pipe(pp);

@@ -361,6 +361,10 @@ struct HostState {
     /// Set with `exit` when only this thread ends (`exit` with others left),
     /// not the process.
     pub(crate) thread_only: bool,
+    /// Set once the kernel has ended this thread (its `exit`, with others
+    /// left): it is gone from its task, so what still runs on this host
+    /// thread enters the kernel as no thread ([`HostState::with_kernel`]).
+    thread_gone: bool,
     /// Set when a host function wants execution to continue elsewhere.
     resume_at: Option<u64>,
     /// Why `resume_at` was set (GEX_WIN_STATS only; `note_resume`).
@@ -732,10 +736,20 @@ impl HostState {
     /// Every path into the kernel goes through here, which is what makes the
     /// per-thread fields safe to keep in a shared structure: they are only
     /// ever read while the lock that installed them is held.
+    ///
+    /// A thread the kernel has ended ([`HostState::thread_gone`]) is not
+    /// installed: what is left of its last call (the housekeeping after it)
+    /// and of its host thread is the process's. Installing it would make it
+    /// one of its task's threads again, its signal state and its context's
+    /// instruction count back in the task's lists after its count was
+    /// rolled into the task's (`thread_terminate_self` takes a thread off
+    /// its task for good).
     fn with_kernel<R>(&mut self, f: impl FnOnce(&mut Kernel) -> R) -> R {
         let shared = Arc::clone(&self.kernel);
         let mut k = shared.lock().unwrap_or_else(|e| e.into_inner());
-        k.enter_thread(&self.thread);
+        if !self.thread_gone {
+            k.enter_thread(&self.thread);
+        }
         let r = f(&mut k);
         k.darwin_ipc_leave();
         r
@@ -1659,6 +1673,7 @@ fn run_process(
             proc_state,
             exit: None,
             thread_only: false,
+            thread_gone: false,
             resume_at: None,
             resume_cause: None,
             callouts: Vec::new(),
@@ -4064,6 +4079,7 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
             proc_state: Arc::clone(&cx.proc_state),
             exit: None,
             thread_only: false,
+            thread_gone: false,
             resume_at: None,
             resume_cause: None,
             callouts: Vec::new(),
@@ -4520,6 +4536,7 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<Option
             proc_state: Arc::clone(&cx.proc_state),
             exit: None,
             thread_only: false,
+            thread_gone: false,
             resume_at: None,
             resume_cause: None,
             callouts: Vec::new(),
@@ -6232,6 +6249,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 outcome = caller
                     .data_mut()
                     .with_kernel(|k| k.finish_blocking(&mut gm, r));
+            }
+            if matches!(outcome, SyscallOutcome::ThreadExit) {
+                caller.data_mut().thread_gone = true;
             }
             // Threads the call made for after it (a Darwin thread resumed,
             // the workqueue's).

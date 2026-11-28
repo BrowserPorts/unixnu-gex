@@ -234,10 +234,6 @@ impl Kernel {
         let file = self.fds.get(fd).ok()?;
         let k = key(fd, &file);
         let ty = super::procinfo::fdtype(&file);
-        if ty == dtype::KQUEUE {
-            self.darwin_unimplemented(format!("close of descriptor {fd}, a kqueue, while another thread is in a call on it (kqueue_drain, KQ_DRAIN): the call is not woken"));
-            return None;
-        }
         let last = file.fg_count() == 1;
         // UF_RESERVED|UF_CLOSING: lookups of it fail, its number is kept;
         // the fileproc's hold on the file stays until fg_drop.
@@ -269,6 +265,8 @@ impl Kernel {
                     self.darwin_unimplemented(format!("close of descriptor {fd}, a socket, while another thread is in call {code} on it (soo_drain's wakeup of it)"));
                     None
                 }
+                // kqueue_drain, below, wakes the kqueue's kevent calls.
+                dtype::KQUEUE => None,
                 // fo_no_drain: nothing wakes the call; the close waits.
                 _ => None,
             };
@@ -278,6 +276,10 @@ impl Kernel {
         }
         if ty == dtype::SOCKET {
             file.darwin_so_draining.store(true, std::sync::atomic::Ordering::Release);
+        }
+        // kqueue_drain: KQ_DRAIN, its kevent calls woken to fail (EBADF).
+        if ty == dtype::KQUEUE {
+            self.darwin_kqueue_drain(m, &file);
         }
         if let (Some((p, write)), true) = (&pipe, last) {
             p.drain(*write);
@@ -299,6 +301,10 @@ impl Kernel {
             if let Some((p, write)) = file.handle.pipe_end().filter(|(p, _)| p.is_xnu() && file.fg_count() == 1) {
                 p.drain(write);
             }
+            // kqueue_drain again, as each pass of the loop has it.
+            if super::procinfo::fdtype(&file) == dtype::KQUEUE {
+                self.darwin_kqueue_drain(m, &file);
+            }
             return self.darwin_block(m, Wait { deadline: None, cont: Finish::FpDrain });
         }
         // fdrelse, then fg_drop: closef_locked's release of the process's
@@ -306,6 +312,11 @@ impl Kernel {
         // hold.
         let c = self.darwin_me().fp_closing.take().expect("taken above");
         self.fds.release_reserved(c.fd);
+        // procfdtbl_releasefd's wakeup of a dup2 waiting for it.
+        let waiting: Vec<i32> = self.dtask.threads.map.iter().filter(|(_, t)| t.dup2_wait == Some(c.fd)).map(|(&tid, _)| tid).collect();
+        for tid in waiting {
+            self.darwin_wake(m, tid, WaitResult::Awakened);
+        }
         self.darwin_closing_file(&c.file);
         let settle = c.file.undoes_on_last_close();
         c.file.fg_drop();
@@ -315,6 +326,31 @@ impl Kernel {
         }
         let _ = super::set_result(m, self.ctx_addr, 0);
         SyscallOutcome::Continue
+    }
+
+    /// `dup2(old, new)` with `new` held reserved by a close draining it:
+    /// `procfdtbl_waitfd`'s sleep (`UF_RESVWAIT`, which no signal ends)
+    /// until the close releases it, then `dup2` from its start.
+    pub(crate) fn darwin_dup2_wait(&mut self, m: &mut GuestMem<'_>, old: i32, new: i32) -> SyscallOutcome {
+        self.darwin_me().dup2_wait = Some(new);
+        self.darwin_block(m, Wait { deadline: None, cont: Finish::Dup2Wait { old, new } })
+    }
+
+    /// A `dup2`'s wait for a reserved descriptor has ended: `startover`.
+    pub(crate) fn darwin_dup2_wait_done(&mut self, m: &mut GuestMem<'_>, old: i32, new: i32) -> Option<SyscallOutcome> {
+        self.darwin_me().dup2_wait = None;
+        if self.fds.is_reserved(new) && self.fds.get(old).is_ok() {
+            return Some(self.darwin_dup2_wait(m, old, new));
+        }
+        let r = self.darwin_dup2_guards(old, new).and_then(|()| {
+            // The descriptor it replaces is closed (closef_locked).
+            if self.fds.get(old).is_ok() {
+                self.darwin_closing(new);
+            }
+            self.canonical(m, crate::syscalls::nr::DUP3, [old as u64, new as u64, 0, 0, 0, 0])
+        });
+        super::thread::bsd_result(m, self.ctx_addr, r, false);
+        Some(SyscallOutcome::Continue)
     }
 
     /// The close's sleep has ended (only a wakeup ends it).

@@ -678,6 +678,21 @@ impl Kernel {
         }
     }
 
+    /// `kqueue_drain` of the file kqueue `file` is, for a close draining a
+    /// descriptor of it: `KQ_DRAIN`, which nothing clears (its processing
+    /// fails with EBADF from then on), and its sleepers woken with
+    /// `THREAD_RESTART` before the close sleeps.
+    pub(crate) fn darwin_kqueue_drain(&mut self, m: &mut GuestMem<'_>, file: &Arc<crate::file::OpenFile>) {
+        let Some(h) = Arc::clone(&file.handle).as_kqueue() else { return };
+        let id = h.id();
+        if !self.kq_exists(id) {
+            return;
+        }
+        self.kq(id).state |= kq::DRAIN;
+        self.kqfile_wakeup(id, true);
+        self.darwin_kevent_settle(m);
+    }
+
     /// Free the file kqueues whose last descriptor went: `kqueue_drain`
     /// (its sleepers restart), then `kqueue_dealloc` (its knotes dropped).
     pub(crate) fn darwin_kqueue_reap(&mut self) {

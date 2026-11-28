@@ -313,8 +313,9 @@ impl Kernel {
             return match w.cont {
                 // kern_lockf.c's msleep, kern_aio.c's aio_suspend msleep1,
                 // kern_sig.c's __sigwait msleep, tty.c's ttysleep msleep0.
-                // kern_descrip.c's fileproc_drain msleep too.
-                Finish::Lockf(_) | Finish::AioSuspend(_) | Finish::Sigwait { .. } | Finish::Tty | Finish::FpDrain => true,
+                // kern_descrip.c's fileproc_drain and procfdtbl_waitfd
+                // msleeps too.
+                Finish::Lockf(_) | Finish::AioSuspend(_) | Finish::Sigwait { .. } | Finish::Tty | Finish::FpDrain | Finish::Dup2Wait { .. } => true,
                 // select's tsleep1 (sys_generic.c); poll's scan blocks on
                 // the kqueue's waitq.
                 Finish::Kevent(super::kevent::Cont::Poll { .. }) => matches!(self.darwin_uu_syscall_code(), sys::SELECT | sys::SELECT_NOCANCEL | sys::PSELECT | sys::PSELECT_NOCANCEL),
@@ -364,8 +365,9 @@ impl Kernel {
                 Finish::Sleep(_) => Discarded,
                 // pthread_workqueue.c: workq_unpark_continue.
                 Finish::WorkqPark => Discarded,
-                // kern_descrip.c: fileproc_drain's msleep, no continuation.
-                Finish::FpDrain => Kept,
+                // kern_descrip.c: fileproc_drain's and procfdtbl_waitfd's
+                // msleeps, no continuation.
+                Finish::FpDrain | Finish::Dup2Wait { .. } => Kept,
                 // kern_event.c: kqueue_scan_continue; a workloop's
                 // waiter's filt_wlwait_continue (thread_handoff_parameter).
                 // poll's scan (KEVENT_FLAG_POLL) blocks with none, select's

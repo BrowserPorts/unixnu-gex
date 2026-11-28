@@ -76,7 +76,7 @@ impl Wait {
     /// exception `task_exception_notify` raised, which it waits for at that
     /// interrupt level (`thread_interrupt_level(THREAD_UNINT)`).
     pub fn uninterruptible(&self) -> bool {
-        matches!(self.cont, super::thread::Finish::Exception(p) if p.uninterruptible()) || matches!(self.cont, super::thread::Finish::CorpseFork | super::thread::Finish::FpDrain)
+        matches!(self.cont, super::thread::Finish::Exception(p) if p.uninterruptible()) || matches!(self.cont, super::thread::Finish::CorpseFork | super::thread::Finish::FpDrain | super::thread::Finish::Dup2Wait { .. })
     }
 }
 

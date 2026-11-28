@@ -255,6 +255,8 @@ pub struct DThread {
     pub fp_closing: Option<super::fpdrain::Closing>,
     /// What a close's drain made of its call ([`super::fpdrain::Drained`]).
     pub fp_drained: Option<super::fpdrain::Drained>,
+    /// The reserved descriptor its `dup2` waits for (`UF_RESVWAIT`).
+    pub dup2_wait: Option<i32>,
     /// `AST_KEVENT_*` owed on its way back to user space.
     pub astkevent: u16,
     /// The voucher it adopted (`ith_voucher`) and the name it gave
@@ -370,6 +372,9 @@ pub enum Finish {
     /// A close's `fileproc_drain`, waiting for the calls in its descriptor
     /// to leave ([`super::fpdrain`]).
     FpDrain,
+    /// `dup2` onto a descriptor a close holds reserved, waiting for its
+    /// release (`procfdtbl_waitfd`).
+    Dup2Wait { old: i32, new: i32 },
 }
 
 /// `wait_result_to_return_code` (`sys_ulock.c`).
@@ -492,6 +497,8 @@ impl Kernel {
             // Another thread in a call on it: the close drains it (else, its
             // drain not done here, it closes as one with no call in it).
             sys::CLOSE | sys::CLOSE_NOCANCEL if self.darwin_fp_busy(a[0] as i32) => self.darwin_close_drain(m, a[0] as i32),
+            // dup2 onto a descriptor a close is draining: its wait.
+            sys::DUP2 if self.fds.is_reserved(a[1] as i32) && self.fds.get(a[0] as i32).is_ok() => Some(self.darwin_dup2_wait(m, a[0] as i32, a[1] as i32)),
             sys::CLOSE | sys::CLOSE_NOCANCEL if self.darwin_tty_of(a[0]).is_some_and(|(_, d)| matches!(d.node, super::ttydev::Node::Pts(_) | super::ttydev::Node::Ptyp(_) | super::ttydev::Node::Console)) => Some(self.darwin_tty_close(m, a)),
             sys::KEVENT => Some(<Kq as KQueue>::kevent_legacy(self, m, a, false)),
             sys::POLL | sys::POLL_NOCANCEL => Some(self.darwin_poll(m, a)),
@@ -954,6 +961,7 @@ impl Kernel {
             Finish::Sigwait { siglist, sig } => return self.darwin_sigwait_done(m, siglist, sig, res),
             Finish::Tty => return self.darwin_tty_wait_done(m, res),
             Finish::FpDrain => return self.darwin_fpdrain_done(m, res),
+            Finish::Dup2Wait { old, new } => return self.darwin_dup2_wait_done(m, old, new),
             Finish::CorpseFork => return self.darwin_corpse_fork_wait_done(m),
             Finish::Ulock { addr, no_errno } => {
                 // A waiter that was not woken is still on the queue.
